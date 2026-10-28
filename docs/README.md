@@ -17,8 +17,8 @@ material-based writing and limited reproduction. Reuse existing results and requ
 
 ## Look something up
 
-- [Command reference](CLI_REFERENCE.md): everyday commands, recovery, standalone tools and compatibility interfaces.
-- [Configuration reference](CONFIG_REFERENCE.md): model connections, task fields, execution scope and trusted local packages.
+- [Command reference](CLI_REFERENCE.md): what each command does, its parameters and examples, including continuation and standalone tools.
+- [Configuration reference](CONFIG_REFERENCE.md): where credentials, model and task settings live, what fields mean, their defaults and when changes take effect.
 - [Changelog](../CHANGELOG.md): dated changes that affect users.
 
 ## Contribute

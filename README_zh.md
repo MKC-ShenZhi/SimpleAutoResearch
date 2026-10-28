@@ -1,4 +1,6 @@
-# SimpleAutoResearch
+![SimpleAutoResearch](docs/assets/simpleautoresearch-logo.png)
+
+ # SimpleAutoResearch
 
 **持续科研助手：围绕同一任务组合资料、代码、数据、图形与可编辑报告。**
 

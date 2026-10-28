@@ -1,4 +1,6 @@
-# SimpleAutoResearch
+![SimpleAutoResearch](docs/assets/simpleautoresearch-logo.png)
+
+ # SimpleAutoResearch
 
 **A continuing research assistant that works across sources, code, data, figures and editable reports.**
 

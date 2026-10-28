@@ -2,212 +2,231 @@
 
 [中文版本](CLI_REFERENCE_zh.md) · [Usage](USAGE.md) · [Configuration](CONFIG_REFERENCE.md)
 
-Use this page for syntax, options and recovery rules. Prefix examples with `uv run` when running from a checkout. `SESSION` is the printed full session path; `RUN_DIR` is a run directory. Put `--command ARGV...` last: everything after it belongs to the child command, without shell interpretation.
+Look up syntax, parameters and recovery limits here. Prefix examples with `uv run` from a checkout. SESSION and RUN_DIR mean full saved directory paths; replace uppercase placeholders. Quote paths containing spaces. All commands accept `-h / --help`. Put research/start `--command ARGV...` last; subsequent tokens belong to the child argv without shell interpretation.
 
-## Everyday use
-
-Most work uses four commands:
+## Everyday commands
 
 | Need | Command |
 | --- | --- |
-| Start, continue or give feedback | [start](#guided-entry) |
-| View deliverables and continuation | [results](#simple-ar-status) |
-| View stop conditions and retained work | [status](#simple-ar-status) |
-| Inspect local model configuration | [models](#simple-ar-models) |
+| Start a goal-driven task, continue saved work or give feedback | [`simple-ar start`](#simple-ar-start) |
+| List current reusable delivery files, limitations and continuation commands without executing work. | [`simple-ar results`](#simple-ar-results) |
+| Read saved progress, stop conditions and resource use without model calls | [`simple-ar status`](#simple-ar-status) |
+| Inspect local connections, routes and credential presence without API calls or provider tests. | [`simple-ar models`](#simple-ar-models) |
+
+## Standalone tools
+
+| Need | Command |
+| --- | --- |
+| Generate or edit one concept image with a named Images profile; keep each version separately. | [`simple-ar image`](#simple-ar-image) |
+| Review rendered figures with a vision model and save feedback without editing originals | [`simple-ar image-review`](#simple-ar-image-review) |
+| Read project instructions, dependencies, entry candidates and named data locations without installation or execution. | [`simple-ar project-info`](#simple-ar-project-info) |
+| Export an assembled report to editable LaTeX, optionally compiling PDF; no model or experiment calls. | [`simple-ar report-export`](#simple-ar-report-export) |
+| Write an artifact index with metadata and bounded previews, not full-text reading. | [`simple-ar inspect`](#simple-ar-inspect) |
+| Search artifacts lexically with a fresh index; operational metadata is excluded unless requested. | [`simple-ar search-artifacts`](#simple-ar-search-artifacts) |
+| Preview and remove recognized rebuildable caches, retaining the run, evidence and deliveries | [`simple-ar clean`](#simple-ar-clean) |
+
+## Advanced and compatibility interfaces
+
+| Need | Command |
+| --- | --- |
+| Use exact structured inputs or continue saved research work | [`simple-ar research-session`](#simple-ar-research-session) |
+| Generate or refresh a report for a saved legacy session with ready analysis | [`simple-ar research-report`](#simple-ar-research-report) |
+| Compatibility spelling for a new summary-only session; inherits research-session parameters with the limits below. | [`simple-ar research-brief`](#simple-ar-research-brief) |
+| Run one corrected explicit experiment after a failed/timed-out simple experiment in a saved canonical session. | [`simple-ar research-session-continue`](#simple-ar-research-session-continue) |
+| Create a successor from a read-only v1 session, importing only named small artifacts without changing the source. | [`simple-ar research-session-migrate`](#simple-ar-research-session-migrate) |
+| Prepare an isolated workspace for an explicit existing-project or greenfield contract. | [`simple-ar code-task init`](#simple-ar-code-task-init) |
+| Continue bounded planning, review, edits and benchmarks for a saved CodeTask. | [`simple-ar code-task execute`](#simple-ar-code-task-execute) |
+| Record a human decision on the current patch plan. | [`simple-ar code-task decide-plan`](#simple-ar-code-task-decide-plan) |
+| Inspect runtime/environment without installing dependencies or running benchmarks. | [`simple-ar code-task probe`](#simple-ar-code-task-probe) |
+| Rebuild the workspace repository map and index. | [`simple-ar code-task map`](#simple-ar-code-task-map) |
+| Rank likely editable files and read-only evidence. | [`simple-ar code-task locate`](#simple-ar-code-task-locate) |
+| Build a bounded prompt context pack from located files. | [`simple-ar code-task context`](#simple-ar-code-task-context) |
+| Generate a batch-oriented implementation work plan. | [`simple-ar code-task work-plan`](#simple-ar-code-task-work-plan) |
+| Create an attempt/batch for one work-plan item. | [`simple-ar code-task batch`](#simple-ar-code-task-batch) |
+| Generate a patch plan for human review. | [`simple-ar code-task plan`](#simple-ar-code-task-plan) |
+| Propose controlled old/new text edits without applying them. | [`simple-ar code-task propose-edits`](#simple-ar-code-task-propose-edits) |
+| Apply a reviewed edit proposal inside the allowed workspace scope. | [`simple-ar code-task apply-edits`](#simple-ar-code-task-apply-edits) |
+| Run lightweight static validation; passing is not runtime proof. | [`simple-ar code-task validate`](#simple-ar-code-task-validate) |
+| Run the saved benchmark before edits. | [`simple-ar code-task baseline`](#simple-ar-code-task-baseline) |
+| Run the saved benchmark after edits and compare available baseline metrics. | [`simple-ar code-task run`](#simple-ar-code-task-run) |
+| Summarize the latest validation/benchmark failure deterministically. | [`simple-ar code-task analyze-failure`](#simple-ar-code-task-analyze-failure) |
+| Propose bounded repair edits; review and apply separately. | [`simple-ar code-task repair`](#simple-ar-code-task-repair) |
+| Export registered read-only tool schemas to stdout or a file. | [`simple-ar tools schema`](#simple-ar-tools-schema) |
+| Call one registered read-only tool with a JSON object and save its trace. | [`simple-ar tools call`](#simple-ar-tools-call) |
+| Serve registered read-only run tools over MCP stdio; no shell, write, network or installation capability is granted. | [`simple-ar tools serve-mcp`](#simple-ar-tools-serve-mcp) |
+
+---
+
+<a id="guided-entry"></a>
+<a id="native-task-entry-experimental"></a>
+<a id="native-recovery"></a>
+<a id="resume-and-feedback"></a>
+<a id="add-remaining-allowance"></a>
+<a id="switch-a-configured-connection"></a>
+<a id="retry-a-failed-model-decision"></a>
+<a id="supply-missing-or-revised-contracts"></a>
+<a id="structured-compatibility-selection"></a>
+<a id="existing-data-no-api"></a>
+<a id="goal-driven-code-analysis-and-figures"></a>
+
+### `simple-ar start`
+
+Start a goal-driven task, continue saved work or give feedback. Bare start asks for a goal; ordinary --kind selects an outcome preference.
+
+```text
+simple-ar start [REQUEST] [OPTIONS]
+simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
+```
+
+#### Goal, materials and creation
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `REQUEST` | New task goal, or feedback on resume; do not also pass --goal. | Unset |
+| `--task-config PATH` | Load editable [task] TOML to create a new native task; CLI overrides it. | Unset |
+| `--write-task-config PATH` | Export annotated native creation TOML and exit; does not revise existing tasks. | Unset |
+| `--source PATH` | Read-only local file/directory mount; repeatable. Resume confirms added materials. | [] |
+| `--guided` | Interactively select an outcome preference for a native task. | Off |
+| `--kind CHOICE` | Outcome preference; exact protocol options can select structured compatibility. Does not grant access. Choices: `survey`, `bug_fix`, `reproduction`, `writing`, `data_analysis`, `figure`, `code`. | Unset |
+| `--from-session PATH` | Reuse deliveries from this session; pair with --reuse. | Unset |
+| `--reuse NAME` | Registered result name shown by results; repeatable. code_project retains its edit scope/checker. | [] |
+| `--scripted` | With --kind data_analysis, use native code/analysis; commands still need individual approval. | Off |
+| `--goal TEXT` | Goal text, instead of the positional request. | Unset |
+| `--document PATH` | Local reference paper; repeatable. Ordinary native input rejects URLs; reproduction --chat can acquire public HTTPS papers after confirmation. | [] |
+| `--material PATH` | Notes, drafts or an analysis package; repeatable. Ordinary materials are unverified, not bibliographic papers. | [] |
+| `--project PATH` | Existing project; ordinary goals mount it read-only, explicit repair/reproduction uses an isolated candidate. | Unset |
+| `--project-python PATH` | Existing execution interpreter; reproduction venv uses it as base Python. | Unset |
+| `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME. | env |
+| `--output-root PATH` | Parent directory for a new task/run. | runs/assistant |
+| `--prepare-only` | Save/preview without model/process calls; new native tasks still check credentials. | Off |
+| `--yes` | Accept displayed creation/access/resource summary; never approves a pending native process. | Off |
+
+#### Access and resource allowances
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--max-processes N` | Cumulative native process count, including search backends; zero disables processes. | 10 × max-turns unless a contract sets it |
+| `--max-process-seconds N` | Cumulative process wall time in seconds; not a per-command timeout. | 300 × max-turns unless a contract sets it |
+| `--allow-execution` | Allow process proposals; each command still needs exact approval. Execution is not an OS sandbox. | Off |
+| `--allow-network` | Authorize public-source search/acquisition; not package installation or arbitrary commands. | Off |
+| `--allow-vision` | Send mounted rendered PNG/JPEG/WebP to the vision route; shares the model budget. | Off |
+| `--max-images N` | Image generation/edit submissions through the image route; separate from visual inspection. | 0 |
+| `--max-turns N` | Cumulative native model-request allowance, including feedback. | 30 |
+| `--max-tokens N` | Cumulative native model-token allowance, including feedback. | 600000 |
+
+#### Explicit structured compatibility
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--chat` | Model-assisted setup for explicit structured protocols; requires a terminal and model. | Off |
+| `--resume-setup PATH` | Continue saved structured setup/accounting; not task execution recovery. | Unset |
+| `--with-report` | Explicitly request a model-authored report; data analysis otherwise delivers analysis only. | Off |
+| `--asset-max-mb N` | Chat per-project/data acquisition capacity; ZIP expansion limited to four times this. Not download permission. | 20 in chat setup |
+| `--template NAME_OR_PATH` | Report template name or Markdown path. | Unset |
+| `--sources CHOICE` | Structured survey policy: supplied documents only or online sources. Choices: `materials`, `search`. | Unset |
+| `--fulltext` | Structured full-text/PDF permission; reproduction --chat URLs still require confirmation. | Off |
+| `--web-extract-backend CHOICE` | Public-page extraction backend; separate from PDF acquisition. Choices: `direct`, `tavily_basic`. | Unset |
+| `--max-cited-sources N` | Maximum distinct cited sources in the report. | Unset |
+| `--validate VALUE` | Explicit validator; strict reproduction keeps validation distinct from formal measurement. | Unset |
+| `--allow VALUE` | Editable project-relative path/glob; repeatable. | [] |
+| `--hypothesis TEXT` | Published conclusion to check in prepared reproduction. | Unset |
+| `--dataset TEXT` | Data description and accepted adaptation. | Unset |
+| `--expected-outcome TEXT` | Declared comparison criterion, not an invented result. | Unset |
+| `--metric NAME` | Required emitted metric name; repeatable. | [] |
+| `--output-files JSON` | JSON name-to-relative-file map under SIMPLE_AR_OUTPUT_DIR; no output-path inference. | {} |
+| `--metric-sources JSON` | Explicit JSON/CSV selectors for registered output metrics. | {} |
+| `--cwd PATH` | Declared command working directory. | Current directory for prepared reproduction |
+| `--timeout-sec N` | Per-process time limit in seconds. | 300 for prepared reproduction |
+| `--environment CHOICE` | Use current environment or explicitly create a task-local reproduction venv. Choices: `current`, `venv`. | current |
+| `--requirements PATH` | Project-relative requirements file; repeatable. Venv defaults to requirements.txt if present, otherwise a bare venv. | [] |
+| `--install-project` | Install reproduction project in its task venv; needs packaging metadata and can execute build code/network. | Off |
+| `--check-argv JSON` | Explicit short pre-measurement environment check as JSON argv; not scientific evidence. | Unset |
+| `--interaction CHOICE` | Design/protocol confirmation policy; new native tasks have no stage/delivery milestone dialogs. Never grants process permission. Choices: `assisted`, `checkpoints`, `autonomous`. | checkpoints |
+| `--command ARGV...` | Explicit argv; put last because all following tokens belong to the command. Research/start argv has no shell interpretation. | Unset |
+
+#### Continue, approve and recover
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--resume-task PATH` | Resume a saved native task; with --tasks-in, also accepts an exact displayed name. | Unset |
+| `--tasks-in PATH` | List native tasks here and in immediate children, at most 256 entries; no recursive search. | Unset |
+| `--select-task` | Interactively select from --tasks-in; blank input cancels. | Off |
+| `--supply-task PATH` | On resume, record TOML contracts or first model binding without execution; replace_existing=true revises contracts, retaining evidence/accounting. | Requires --resume-task; separate operation |
+| `--retry-model` | On resume, retry a terminated failed model decision with remaining budget; optional --model changes to a compatible Chat connection. | Off |
+| `--switch-model profile:NAME` | On resume, record profile:NAME or route:NAME text connection change; requires switch ID/reason. Records only, no execution. | Unset |
+| `--switch-id NAME` | Stable idempotency key for --switch-model. | Unset |
+| `--switch-reason TEXT` | Human-readable reason for --switch-model. | Unset |
+| `--authorize-remaining DIMENSION=AMOUNT` | New remaining allowance as DIMENSION=AMOUNT; repeatable. Retains prior usage/unknown reservations. | Unset |
+| `--authorization-id NAME` | Stable idempotency key; identical ID/terms do not replenish spent capacity. | Unset |
+| `--authorization-reason TEXT` | Human-readable reason for remaining-allowance changes. | Unset |
+| `--approve-execution VALUE` | Exact printed token for the pending command; requires --resume-task. | Requires --resume-task and exact token |
+| `--decision-id NAME` | Exact pending design/protocol decision ID; native replies require --resume-task. | Unset |
+| `--decision-response CHOICE` | Reply to the pending decision; accepting a design does not approve a process. Choices: `accept`, `reject`, `revise`. | Unset |
+| `--decision-guidance TEXT` | Facts or revised direction with --decision-response revise. | Unset |
+
+#### Explicit table analysis
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--data-file PATH` | UTF-8 CSV/TSV or JSON records. Explicit table selectors choose the no-API shortcut; --kind data_analysis alone does not. | Unset |
+| `--data-attribution TEXT` | User-declared source/credit/version; retained without independent verification. | Empty |
+| `--value-column NAME` | Explicit numeric column; repeat for multiple metrics or matrix/coordinate columns. | [] |
+| `--group-column NAME` | Category/group column; values bar/heatmap needs unique row labels. | Empty |
+| `--observation-unit TEXT` | What one row represents; required for the table shortcut. | Empty |
+| `--value-unit TEXT` | Selected value columns' unit; omission is unknown. | Empty |
+| `--paired-baseline NAME` | Explicit same-row baseline among selected observation columns sharing a quantity/unit. | Empty |
+| `--data-association CHOICE` | Opt-in descriptive Pearson r for line/scatter pairs; no significance/causal inference. Choices: `none`, `pearson`. | none |
+| `--data-mode CHOICE` | observations aggregates rows; values retains supplied numbers without inferred aggregation. Choices: `observations`, `values`. | observations |
+| `--data-missing CHOICE` | Reject missing values or explicitly omit them; missing y breaks lines. Choices: `reject`, `omit`. | reject |
+| `--figure-width CHOICE` | Generic column (3.5 inch) or wide (7 inch) figure width. Choices: `column`, `wide`. | wide |
+| `--data-max-mb N` | Physical input size limit in MiB. | 20 |
+| `--data-max-figures N` | Physical SVG page limit; excess fails without dropping categories. | 100 |
+| `--data-plot CHOICE` | bar: means/values; box: observation quartiles/min-max; line/scatter: explicit coordinates; heatmap: supplied matrix. Choices: `bar`, `box`, `line`, `scatter`, `heatmap`. | bar |
+| `--x-column NAME` | Numeric x for values-mode line/scatter; distinct from value/group columns. | Empty |
+| `--x-unit TEXT` | Declared x-coordinate unit; omission is unknown. | Empty |
+| `--data-max-points N` | Physical coordinate points per figure; excess fails without sampling. | 10000 |
+| `--series-layout CHOICE` | Separate axes, or shared axes for line/scatter columns with a common declared unit. Choices: `separate`, `shared`. | separate |
+| `--data-path PATH` | Existing data file/directory; repeatable. Does not rewrite commands or automatically copy external data. | [] |
+
+Ordinary goals, --guided and ordinary --kind preferences use native tasks. Explicit protocol controls, --chat and explicit table selectors choose supported structured paths. --kind data_analysis alone remains model-driven; --value-column/--x-column/--paired-baseline explicitly chooses the deterministic table shortcut unless --scripted is used. The shortcut requires --data-file, --value-column and --observation-unit; it makes no task API calls unless a report is requested.
+
+New tasks read .env from the current working directory. Source mounts reject symlinks and private/runtime paths; native data-file preferences retain a 20 MiB bound. Put public URLs in the goal with network authorization rather than passing ordinary document URLs.
+
+Resume retains model, interpreter and cumulative budgets. Use --authorize-remaining, not creation limits, to add resources. Supported dimensions include llm_requests, total_tokens, process_invocations, process_wall_seconds and image_requests. Stable ID/reason are required; prior charges and unknown reservations remain. This grants capacity, not access or command approval. Confirm added access/resources separately from --approve-execution.
+
+Keep --retry-model separate from feedback, access/resource grants and command approval. It retries only a terminated failed decision without an accepted reply and with sufficient saved finite capacity; it does not replay tools. Cached replies use ordinary resume. In-flight requests, unbounded charges and unknown process side effects require reconciliation. --switch-model is record-only and separate from feedback, retry, supply, --model and grants.
+
+For new native tasks, assisted/checkpoints wait for design/protocol replies; autonomous can accept valid designs within saved limits. There are no extra stage/delivery milestone dialogs. Design acceptance does not approve a process. Exact pending command tokens are required even with --yes.
+
+Examples:
 
 ```bash
 simple-ar start "Explain these results" --source ./results --model profile:daily
-simple-ar status "SESSION"
-simple-ar results "SESSION"
-simple-ar start --resume-task "SESSION" "Revise the legend and keep the original"
-```
-
-Use the [tutorial](USAGE.md) for first-time setup, then look up [recovery and authorization](#native-recovery) when needed.
-Local model inspection does not send a test request; actual tasks can incur charges.
-
-## Standalone tools and advanced interfaces
-
-These support specific operations, automation and compatibility tasks. They are not a menu of mandatory research stages.
-
-| Need | Reference |
-| --- | --- |
-| Reuse delivered work | [Reuse](#reuse-deliveries) |
-| Image generation, editing or visual review | [Image tools](#concept-images) |
-| Inspect project entry points and dependencies | [Project preparation](#project-preparation) |
-| Export an existing manuscript | [report-export](#simple-ar-report-export) |
-| Exact research protocols or saved research sessions | [Research commands](#research-commands) |
-| Code tasks with explicit scope | [CodeTask commands](#code-task-commands) |
-| Search artifacts, inspect indexes or clean caches | [Artifact tools](#artifact-tools) |
-| Tool schemas, read-only calls and MCP | [Tools and MCP](#tools-and-mcp) |
-| Legacy command migration | [Historical commands](#historical-and-development-commands) |
-
-Command `--help` describes the installed version. Native tool parameters are supplied through the tool catalog.
-For integration, start with [code ownership and tool interfaces](DEVELOPMENT.md#implement-a-change), rather than hand-wiring tool JSON.
-
-## Guided entry
-
-~~~bash
-simple-ar start
-simple-ar start --guided
-simple-ar start "Explain these results" --source results/ --model profile:daily
-simple-ar start --kind writing --material notes.md --prepare-only
-~~~
-
-Bare start asks for a goal. A positional request or ordinary `--goal` enters the native action loop. `--guided` and ordinary kinds select an outcome preference for that same loop; they do not grant access.
-
-### Native task entry (experimental)
-
-#### Goal and materials
-
-| Option | Meaning / default |
-| --- | --- |
-| `REQUEST`, `--goal TEXT` | Natural-language goal |
-| `--guided`, `--kind KIND` | Preferences: survey, bug_fix, reproduction, writing, data_analysis, figure, code |
-| `--model SELECTOR` | env by default; catalog or legacy connection. Native decisions require Chat |
-| `--output-root PATH` | Default runs/assistant |
-| `--source PATH` | Repeatable read-only regular file/directory mount |
-| `--document PATH`, `--material PATH`, `--project PATH`, `--data-path PATH`, `--data-file PATH` | Ordinary preference inputs become read-only mounts with declared roles |
-| `--project-python PATH` | Existing process interpreter; no installation or environment creation |
-
-#### Access and limits
-
-| Option | Meaning / default |
-| --- | --- |
-| `--allow-network` | Public source search/acquisition; separate from process access |
-| `--allow-execution` | Allow process proposals; every command still needs approval |
-| `--allow-vision` | Send mounted PNG/JPEG/WebP to configured vision route |
-| `--max-images N` | Generation/edit submission allowance; default 0. Does not disable separately authorized vision |
-| `--max-turns N`, `--max-tokens N` | Saved task-wide allowances: 30 model requests, 600000 tokens |
-| `--prepare-only` | Save/preview without calls or execution; new native tasks still preflight connection/credentials |
-| `--yes` | Accept displayed task/access/resource summary, not command approval |
-
-#### Saved tasks and continuation
-
-| Option | Meaning / default |
-| --- | --- |
-| `--resume-task SESSION` | Resume saved native state, optionally with feedback |
-| `--tasks-in PATH`, `--select-task` | Read-only native task listing in a directory and direct children; select interactively or use `--resume-task EXACT_NAME` |
-| `--write-task-config PATH`, `--task-config PATH` | Export annotated native creation TOML and exit; load after review, with explicit CLI values taking precedence; not a saved-task reset |
-| `--max-processes N`, `--max-process-seconds N` | Cumulative native creation process count/wall-second caps, including search backends; zero is respected; resume keeps its ledger |
-| `--supply-task PATH` | With native resume, confirm a TOML supply of missing contracts; records only, no work is executed |
-| `--approve-execution TOKEN` | Exact current printed approval token; requires native resume |
-| `--decision-id ID`, `--decision-response accept\|reject\|revise`, `--decision-guidance TEXT` | Reply to a frozen research design on resume; guidance accompanies revise. Not process approval |
-| `--retry-model` | Explicitly retry a closed failed model decision; see recovery below |
-| `--switch-model profile:NAME`, `--switch-id ID`, `--switch-reason TEXT` | Native resume: record an explicit named text-connection change at a reconciled point; no request/tool/feedback, retained delivery and accounting; separate from retry/feedback/authorization |
-| `--authorize-remaining DIMENSION=AMOUNT` | Repeatable new remaining allowance on resume |
-| `--authorization-id ID`, `--authorization-reason TEXT` | Required stable ID/reason for allowance changes |
-
-New source mounts reject symlinks and private/runtime paths. Outputs belong in `workspace/`. Data-file preference inputs retain a 20 MiB bound; use source mounts for larger bounded investigation. Public document URLs are refused by the ordinary preference adapter: put URLs in the goal and grant network acquisition separately.
-
-### Goal-driven code, analysis and figures
-
-~~~bash
-simple-ar start --kind figure --document method.md --goal "Draw observations → comparison → evidence" --allow-execution
-simple-ar start --kind code --material requirements.md --goal "Build a reusable CSV validator" --allow-execution
-simple-ar start --kind data_analysis --scripted --data-file measurements.csv --goal "Compare cost and quality" --allow-execution
-~~~
-
-Figure work requests layout/code, PNG, editable SVG and explanation. Scripted analysis requests runnable source, computed results and explanation. Preferences do not restrict tools or plot types, grant permissions, manufacture data or prove completion. Explicit column/unit/pairing/presentation declarations are retained in the goal; unprovided preset defaults do not restrict native work. `--scripted` requires data_analysis.
-
-### Native recovery
-
-Use the action that matches the saved boundary. Check `status` and `results` first;
-confirm that an interrupted worker has stopped before continuing. In-flight requests,
-unaccepted results and unknown process side effects must be reconciled before new work.
-
-#### Resume and feedback
-
-```bash
-simple-ar status SESSION
-simple-ar results SESSION
-simple-ar start --resume-task SESSION
-simple-ar start --resume-task SESSION "Shorten the explanation without rerunning"
+simple-ar start --write-task-config task.toml
+simple-ar start --task-config task.toml --yes
+simple-ar start --resume-task SESSION "Shorten the explanation"
 simple-ar start --resume-task SESSION --approve-execution TOKEN
-simple-ar start --resume-task SESSION --source notes/ --allow-network --yes
-```
-
-Ordinary resume consumes saved boundaries. A completed task with no pending work
-returns its terminal state without replay. Feedback shares the original budget and
-cancels only unstarted proposals. An old delivery during a paused revision does not
-complete the new request.
-
-Adding sources/network/execution/vision needs confirmation; invalid additions leave
-mounts, permissions and ledger unchanged. The saved model, interpreter, work and
-budgets remain. On resume, `--prepare-only` previews without applying access or
-resources. Confirm grants separately from exact command approval.
-
-#### Add remaining allowance
-
-Required arguments are repeatable `--authorize-remaining DIMENSION=AMOUNT`, a stable
-`--authorization-id ID` and `--authorization-reason TEXT`:
-
-```bash
 simple-ar start --resume-task SESSION --authorize-remaining llm_requests=10 --authorize-remaining total_tokens=100000 --authorization-id continuation-1 --authorization-reason "Finish the saved goal" --yes
+simple-ar start --kind data_analysis --data-file measurements.csv --value-column score --observation-unit "one independent run" --yes
 ```
 
-New remaining allowances are future capacity, not historical totals. ID/reason without
-allowances fails. Replaying an ID does not replenish spent capacity; creation options
-`--max-turns`/`--max-tokens` cannot add resources on resume. Original charges remain.
+#### Supply missing task settings (advanced)
 
-After a model operation is confirmed closed and journalled, explicit authorization can
-establish a new allowance while its historical bill remains unknown. Unknown use in
-the current allowance still blocks capacity.
-
-#### Switch a configured connection
-
-At a reconciled boundary, record the change, then resume separately:
-
-```bash
-simple-ar start --resume-task SESSION --switch-model profile:another --switch-id connection-1 --switch-reason "Use another configured service"
-simple-ar start --resume-task SESSION
-```
-
-This changes text/code/writing bindings without a request, tool replay, feedback or
-budget renewal. Saved vision bindings, delivery and accounting remain. Closed
-professional calls can retain uncertain historical fees. Each switch ID has one
-immutable intent; replaying an older ID does not revert a later change.
-For a terminated failed decision, use the retry operation below.
-
-#### Retry a failed model decision
-
-```bash
-simple-ar start --resume-task SESSION --retry-model
-simple-ar start --resume-task SESSION --retry-model --model profile:another
-```
-
-Retry requires a terminated failure without an accepted reply, the saved finite output
-cap and remaining capacity. It retries a decision, not tools or whole tasks. Cached
-replies use ordinary recovery. In-flight requests, unconfirmed reservations, unbounded
-charges and pending tools refuse retry. Keep retry separate from feedback, grants
-and command approval; `--prepare-only` makes no retry or mutation.
-
-Only for this closed failure, `--model profile:NAME` or `route:NAME` can replace the Chat
-connection using the same finite output cap. Text/code/writing bindings and transition
-are saved together; vision stays bound. Replacement starts a new provider-native
-conversation in the same task. Prior replies remain in the journal and `read_history`;
-authorized, version-checked materials remain reusable. Missing reasoning is not
-fabricated. Cached replies cannot switch. A different explicit model without retry
-is rejected; omission retains the saved selector.
-
-#### Supply missing or revised contracts
-
-Use `--supply-task PATH` to confirm a TOML supply for a caller-directed native task.
-It records conditions without executing work. For a first model binding:
+Use this only when an existing task is missing settings. It records them without running the task. Example for a first model binding:
 
 ```toml
 supply_id = "first-model"
-reason = "Continue from the retained materials"
+reason = "Continue retained work"
 
 [changes]
 model = "profile:daily"
-allow_execution = true
 
 [resource_allowances]
 llm_requests = 20
 total_tokens = 600000
-process_invocations = 8
-process_wall_seconds = 600
 ```
+
+Supply requires supply_id, reason and [changes]; source aliases resolve from the supply file. By default it fills missing contracts. Explicit replace_existing = true revises saved contracts; replacing sources requires the complete alias map. Evidence and charges remain. New protocols may need fresh acceptance; processes need separate approval. Keep supply separate from feedback, retry, CLI grants and command approval.
 
 ```bash
 simple-ar start --resume-task SESSION --supply-task supply.toml --prepare-only
@@ -215,765 +234,1092 @@ simple-ar start --resume-task SESSION --supply-task supply.toml --yes
 simple-ar start --resume-task SESSION
 ```
 
-Supply uses native creation validation. `changes` also accepts `sources`,
-`execution_contract`, `code_task`, `research_policy`, `table_analysis`,
-`report_requirement` and `max_output_tokens`.
 
-- By default, supply fills missing contracts. To replace existing ones, set top-level
-  `replace_existing = true` with a new ID/reason. Only named fields change; replacement
-  `sources` is the complete alias map, not a merge.
-- Source paths resolve from the supply file. Execution cwd must be an existing absolute
-  directory; argv stays literal. Changed protocols need fresh acceptance when required;
-  actual execution needs its own exact approval.
-- First model binding needs positive request and token allowances. Resource continuation
-  alone cannot grant model access. Later model changes use the separate recovery controls.
-- Old records and charges remain history. Report-only changes retain valid measurements.
-  They do not turn prior confirmation or evidence into acceptance of new conditions.
+<a id="reuse-deliveries"></a>
 
-The same ID/terms are idempotent, including an interruption after the grant but before
-config commit. Complete an interrupted supply before other work. Supply is separate
-from feedback, retry, resource flags and command approval; it does not modify saved
-legacy ResearchApplication protocols.
 
-### Structured compatibility selection
+### `simple-ar results`
 
-Most explicit protocol controls select structured input adaptation, even if an explicitly supplied value equals a parser default; new tasks still use the common task owner. Source/retrieval policies, report templates/limits, reproduction commands/metrics/environment, table physical limits and interaction settings retain exact semantics and cannot mix with native access/budget controls. Figure/scripted requests with incompatible strict controls fail before creation. Creation preferences cannot change a resumed native task.
+List current reusable delivery files, limitations and continuation commands without executing work.
 
-New `--kind bug_fix` with `--project`, `--allow` and `--validate` together uses the native session and the exact CodeTask owner. The work, original source, validator and environment require explicit approval; generic workspace writes/processes are unavailable under this frozen contract. Feedback may reference a validated candidate for a separately approved revision. Additional unmapped protocol controls are rejected, not ignored. Registered legacy project reuse retains its original editing/budget policy.
+```text
+simple-ar results SESSION [OPTIONS]
+```
 
-`--chat` requires a terminal/model and uses structured technical setup; `--resume-setup PATH` resumes its saved draft, not execution. Do not combine chat and prepare-only. Setup may inspect materials and propose settings but does not execute or install. Explicit user options remain authoritative.
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `SESSION` | Session directory whose current deliveries are listed. | Required |
 
-| Structured start options | Meaning |
-| --- | --- |
-| `--sources materials\|search`, `--document PATH`, `--fulltext`, `--web-extract-backend direct\|tavily_basic`, `--max-cited-sources N` | Source policy, repeatable papers, full text, page acquisition backend, final citation cap |
-| `--material PATH`, `--template NAME_OR_PATH` | Repeatable notes/drafts/results and report form |
-| `--project PATH`, `--allow PATTERN`, `--validate TEXT` | Project, repeatable exact edit scope, independent validator |
-| `--data-path PATH`, `--project-python PATH` | Repeatable execution input locations, existing interpreter |
-| `--hypothesis TEXT`, `--dataset TEXT`, `--expected-outcome TEXT`, `--metric NAME` | Prepared reproduction conclusion/conditions/criteria and repeatable metrics |
-| `--cwd PATH`, `--timeout-sec N` | Reproduction directory, per-process timeout (default 300) |
-| `--output-files JSON`, `--metric-sources JSON` | Registered producer files and explicit JSON/unique-row numeric selectors |
-| `--environment current\|venv`, `--requirements PATH`, `--install-project` | Explicit dependency preparation; repeatable requirements |
-| `--check-argv JSON` | Independent short premeasurement check; no inferred command or scientific metrics |
-| `--command ARGV...` | Formal command, last option |
-| `--interaction assisted\|checkpoints\|autonomous` | Protocol/design confirmation policy for new tasks; legacy milestones follow the saved owner |
-| `--with-report` | Data/repair report from saved results; requires model |
-| `--asset-max-mb N` | Chat project/data download capacity; default 20 MiB, ZIP expansion 4×; not download permission |
+Examples:
 
-#### Scoped reproduction adaptation
-
-Scoped reproduction adaptation requires project + allow + independent validate. Validator must differ from formal command after interpreter resolution; cwd must match project. Protected tests/secrets/data remain read-only, edits occur in isolated worktree/copy, and validation precedes measurement. Use current/existing Python or explicit task venv preparation; installation failure stops work. Do not add a second check-argv beside CodeTask validation. No scientific method/split/condition change is authorized.
-
-Chat may propose exact new Python adapter paths and a source-backed validator; confirmation saves them. Place outputs outside the author project. Without a creation declaration, allow paths must already exist. Project-python selects an existing interpreter, or the venv base when explicit preparation is chosen; setup cannot select an interpreter from untrusted source instructions.
-
-#### Asset and material acquisition
-
-Chat acquisition proposals require separate asset confirmation and inspected literal URLs. Only public HTTPS is accepted; userinfo/fragments/credential-bearing or signed links are refused. Project assets support direct ZIP or GitHub default-branch snapshot, not pinned commits. Data remains one file without unpacking. Default limits: 3 assets, 20 MiB each, project expansion 80 MiB/5000 entries. ZIP format is checked from bytes; configured limits persist for recovery.
-
-Supporting material uses one public GET without redirects and separate PDF permission. Preview is 8000 characters/three PDF pages; expanded local extraction needs confirmation (≤40 PDF pages/20 MiB). Question reads send bounded excerpts. Setup discovery permits two rounds, two queries per round, five results per query/provider; Tavily+OpenAlex with Tavily key, otherwise arXiv+OpenAlex. Responses/acquisition receipts are reused; unknown interruptions are not resent. A failed paper may be explicitly skipped while its receipt/unknown consumption remain. accept-proposal adopts displayed assumptions, not missing facts or execution permission.
-
-### Existing data (no API)
-
-~~~bash
-simple-ar start --kind data_analysis --data-file observations.csv --value-column score --observation-unit "one run"
-~~~
-
-Explicit value-column/x-column/paired-baseline without scripted selects deterministic TableSpec analysis; a path alone remains a native preference. Add with-report and model for writing. These options are also available on research-session.
-
-| Option | Default / purpose |
-| --- | --- |
-| `--data-file PATH` | UTF-8 CSV/TSV or JSON records |
-| `--value-column NAME`, `--group-column NAME` | Repeatable numeric columns; optional grouping |
-| `--observation-unit TEXT`, `--value-unit TEXT`, `--data-attribution TEXT` | Required row meaning, declared units/source |
-| `--data-mode observations\|values`, `--data-plot bar\|box\|heatmap\|line\|scatter` | observations, bar |
-| `--data-missing reject\|omit` | reject |
-| `--paired-baseline COLUMN` | Same-row candidate-minus-baseline comparison |
-| `--x-column NAME`, `--x-unit TEXT`, `--data-association none\|pearson` | Coordinates; association default none |
-| `--series-layout separate\|shared`, `--figure-width column\|wide` | separate, wide |
-| `--data-max-mb N`, `--data-max-points N`, `--data-max-figures N` | 20 MiB, 10000 positions/cells, 100 figures; no sampling on overflow |
-
-Report context uses material/document on start, material/local-document on research-session. Analysis-only ignores model settings. [Transformation constraints](CONFIG_REFERENCE.md#existing-data-descriptive-analysis) define valid combinations and statistical meaning.
-
-### `simple-ar models`
-
-~~~bash
-simple-ar models --config models.toml
-simple-ar models --config models.toml --profile daily --purpose writing
-~~~
-
-This command inspects named connections locally without API calls or exposing credentials.
-
-| Option | Purpose |
-| --- | --- |
-| `--config PATH` | Catalog TOML; otherwise use `SIMPLE_AR_MODELS_CONFIG` or the user configuration |
-| `--profile NAME` | Inspect one named profile |
-| `--purpose text\|code\|writing\|vision\|image` | Connection purpose; default `text` |
-
-See [named model connections](CONFIG_REFERENCE.md#named-model-connections) for catalog fields and routing rules.
-
-## Reuse deliveries
-
-~~~bash
+```bash
 simple-ar results SESSION
-simple-ar start --from-session SESSION --reuse data_analysis --goal "Explain the trade-off"
-simple-ar start --from-session SESSION --reuse report --goal "Reorganize the discussion"
-simple-ar start --from-session SESSION --reuse code_project --goal "Revise the implementation and validate it"
-~~~
-
-Repeat reuse selectors from data_analysis, report, summary, code_analysis. Ordinary writing creates a new native task with registered packages, not the prior ledger. Original delivery remains; valid measurements are not rerun. Reports retain source passages/citation identities/evidence, with old prose separately treated as a draft. Analysis packages recheck copied data. Metadata is not primary evidence or independent verification.
-
-code_analysis packages retain scripts/data/results/PNG/vector exports; analysis.py is the entry, src helpers/layout sources travel with it. Results may register figures with package-relative path/caption and citation_map.v1. Authored captions/known references are retained; missing bibliography is not invented. Legacy deliveries without packages keep text/JSON reuse.
-
-code_project starts an isolated revision, preserving registered scope, protected files, validator, interpreter and patch policy. Ordinary revisions use the native task owner, without intermediate TOML or the old research plan; commands still need approval. Both structured results and current formally delivered native CodeTask projects with a fixed scope and validator can be selected. Changed/incomplete candidates are not offered; the original task and ledger remain unchanged. Do not mix it with writing selectors or override project/scope/validator.
-
-A validated single-command reproduction project can be selected with kind reproduction, document and goal to repeat its saved protocol/interpreter/output selectors; confirm execution.
-
-Scientific reproduction and explicit technical controls retain their structured contract. Paired/extended protocols stay on original resume.
-
-Survey follow-up with kind survey + reuse report uses its original source bundle, excludes drafts/derived attachments and defaults to online search. Text versions are not merged across versions; sources still need new relevance checks. Reuse is distinct from interrupted execution recovery.
-
-## Concept images
-
-~~~bash
-simple-ar image --config models.toml --prompt "A method overview" --output figures/v1
-simple-ar image --config models.toml --input figures/v1/image.png --prompt "Keep layout; use green" --output figures/v2
-~~~
-
-| image option | Purpose |
-| --- | --- |
-| `--prompt TEXT`, `--output PATH` | Required prompt and new version directory |
-| `--input PATH` | Optional edit source; original preserved |
-| `--config PATH`, `--model SELECTOR` | Catalog / explicit profile; default image route |
-
-Generation/edit capabilities must match. Identical completed requests restore without calls; failed/unknown submissions are not resent. openai_images requires base64 output, rejects URL-only. Explicit cctq_images_async saves task ID and recovers the same-origin files/0 through authenticated GET, without another POST or API/provider fallback. Completed IDs download directly; timeout/HTTP settings may change for recovery. Unknown dispatch without ID is not resubmitted. Raster concepts are not measurements or editable vectors.
-
-### Inspect a rendered figure
-
-~~~bash
-simple-ar image-review --config models.toml --input figures/v1/image.png --goal "Check labels and arrows" --output figures/review-v1
-~~~
-
-Required input (repeat up to four), goal and output; optional config/model selects vision route. Static PNG/JPEG/WebP limits: combined 20 MiB, each ≤4,194,304 pixels. Review uses connection cap or 3000-token fallback, records absent usage as unknown and saves originals/raw response/review.json/feedback.md. Invalid responses stay in rejected-response.json. Identical completed requests reuse; raw responses can normalize offline; changed inputs need new version. Interrupted requests without response are not resent. Review does not edit or certify figures.
-
-## Project preparation
-
-`simple-ar project-info --project DIR [--data-path PATH ...] --output NEW_DIR` saves preparation.json/.md: indexed entries/dependencies/excerpts/declared data locations. Relative data paths use project root. It neither imports/runs project code nor installs/downloads; inspecting-interpreter observations do not prove target readiness. Use an unused output directory.
-
-## Research Commands
-
-<a id="simple-ar-research-session-canonical-task-driven-entry"></a>
-
-### `simple-ar research-session` (structured and compatibility entry)
-
-~~~bash
-simple-ar research-session --config research.toml
-simple-ar research-session --config research.toml --session-root SESSION --model env
-~~~
-
-This is the exact structured interface. Explicit CLI overrides research TOML; omitted model on a direct new command is deterministic, while file config defaults env. Model failures remain failures. All new tasks use the common action owner, combining materials, summary, code and experiments within their declared contracts.
-
-Reading sources does not itself require a scientific design. Unsupported declarations fail before creation, without an old-controller fallback. Tables can run without a model; authored reports require one.
-
-A no-model experiment request can retain materials and pause with requested work incomplete. Continue that same task with the printed `start --resume-task SESSION` and [explicit supply](#native-recovery) for missing contracts or model authorization; collection is not experiment/report completion. Saved historical sessions retain their original owner.
-
-Research design replies use `start --resume-task SESSION --decision-id ID --decision-response accept|reject|revise`; add `--decision-guidance TEXT` for revise. The ID binds actual design/protocol bytes. Confirmation does not run or authorize a process. Resume keeps frozen contracts; use ordinary native feedback for text changes, not creation flags. Intact table results can be reused for report feedback without recomputation. See [interaction policies](#interaction-policies-and-pending-decisions) for new and legacy confirmation scope.
-
-| Option group | Options / defaults |
-| --- | --- |
-| Task | `--config PATH`, `--topic TEXT`, `--task-kind KIND` (auto), `--outputs OUTPUT ...`, `--output-root PATH` (runs/research-session) |
-| Models / API budget | `--model SELECTOR`, `--feasibility-review-model NAME`, `--total-tokens N`, `--llm-requests N`, `--max-output-tokens N` |
-| Process budget | `--process-invocations N`, `--process-wall-seconds N` |
-| Sources | Repeat `--local-document PATH`, `--material PATH`, `--data-path PATH`, `--query TEXT`, `--provider NAME`; `--cache-dir PATH` |
-| Retrieval bounds | `--max-results N` (10), `--max-chunks N` (300), `--idea-limit N` (3), `--max-fulltext-documents N`, `--max-pdf-mb N`, `--web-extract-backend direct\|tavily_basic` |
-| Research | `--max-research-iterations N` (1), `--interaction POLICY` (checkpoints) |
-| Execution | `--cwd PATH` (.), `--timeout-sec N`, `--label TEXT` (research-session), `--primary-metric NAME`, repeat `--metric NAME` and `--metric-direction NAME=DIRECTION`; `--code-task-config PATH` or final `--command ARGV...` |
-| Reporting | `--with-report` / `--no-report`; explicit outputs cannot combine with either. Model-backed tasks normally request report, except data analysis needs explicit request |
-| Resume / decisions | `--session-root PATH`, `--recover-interrupted`, `--reanalyze`, `--decision-id ID`, `--decision-response accept\|reject\|revise`, `--decision-guidance TEXT` |
-| Continuation | `--authorization-id ID`, `--authorization-reason TEXT`, repeat `--authorize-remaining DIMENSION=AMOUNT`, `--additional-attempts N`, `--additional-no-progress N` |
-
-Data options are shared with the table above. Full-text permissions, page extraction, paired protocols, output files and environment preparation are available through [research TOML](CONFIG_REFERENCE.md#research-toml-sections-and-defaults), not invented CLI flags.
-
-Historical structured sessions retain their bounded plan correction and attempts/plan-*/task_plan_proposals.json records. New tasks use the common action journal instead. CodeTask retains its configured project/workspace/benchmark/scope; reviewed large edits require execute.allow_large_edits=true. The actual execution owner computes omitted process limits, including preparation and repair/retests; explicit limits, including zero, win.
-
-#### Resume and reanalysis
-
-For saved legacy sessions owned by ResearchApplication, resume preserves history and reuses measurements only with matching command/schema/protocol/preparation/protected assets. Explicit goal/outputs/local-paper/execution revisions replan dependent work; task-kind changes need a new session. Incompatible search/ingestion changes fail. Omitted report settings stay saved; report changes rebuild report outputs only.
-
-For those legacy sessions, recover-interrupted confirms the old worker has stopped and closes a running attempt lacking result within the same ledger. Apply input revisions separately. Persisted API failures use ordinary resume. Reanalyze is separate from revisions/authorizations: it reconsiders saved measurements and may lead to authorized future experiments, without requesting a report. Pending follow-ups must continue first. New common tasks use [native recovery](#native-recovery).
-
-### Report controls
-
-| research-session | research-report | Meaning |
-| --- | --- | --- |
-| `--report-writing-method article\|sections` | Saved method retained | New article; explicit sectional controls select sections; incompatible article options fail |
-| `--report-template NAME_OR_PATH` | `--template NAME_OR_PATH` | Structure, session default auto; omitted report-resume option keeps saved choice |
-| `--report-reviewer llm\|disabled` | `--reviewer llm\|disabled` | Document review/scope enables article inspection; zero rounds inspect only, positive rounds permit bounded complete candidates |
-| `--max-review-iterations N` | Same | Candidate/correction limit; CLI 1 when requested; failed proposals still count |
-| `--max-section-tokens N` | Same | 0/unset no per-call cap; positive bounds current writing unit |
-| `--report-document-review` / `--no-report-document-review` | `--document-review` / `--no-document-review` | Whole-document review |
-| `--report-review-scope section\|document` | `--review-scope section\|document` | Review timing |
-| `--report-draft-scope section\|document\|auto` | `--draft-scope section\|document\|auto` | Section/joint/≤2000 planned words joint |
-| `--report-outline-strategy auto\|template\|adaptive` | `--outline-strategy auto\|template\|adaptive` | Outline selection |
-| `--report-data-tables linked\|full` | `--data-tables linked\|full` | Linked records or tables too |
-| `--max-document-review-prompt-chars N` | Same | Optional complete review-request ceiling |
-
-Sections default to section drafting/review, no document review, auto outline, linked tables, no extra review ceiling. Joint drafting requires document review/scope and full source strategy. Historical methods/checkpoints remain. Article defaults to deterministic assembly/audit; explicit document inspection and bounded corrections use the common writing owner. [Report contracts](CONFIG_REFERENCE.md#writing-from-supplied-material).
-
-#### Interaction policies and pending decisions
-
-For new common tasks, `interaction` controls protocol/design confirmation only. `assisted` and `checkpoints` wait for a reply to a generated design; `autonomous` accepts a valid generated design within the saved contract. It does not add stage or delivery milestones or grant process permission. Missing facts, assets or permissions still block the affected work.
-
-Fixed-measurement creation requests protocol confirmation when `--interaction checkpoints` or `assisted` is explicitly supplied. The common task freezes the caller's actual protocol and prints its decision ID. Resume with the printed `start --resume-task ... --decision-id ... --decision-response accept`, then separately approve the pending process with its exact token. Acceptance retains the queued commands; it does not run them or fabricate a research design. Identical caller replies after delivery are idempotent.
-
-Saved legacy sessions continuing under ResearchApplication retain their milestone policy: `assisted` confirms protocol, delivery and supplementary/revision research choices; `checkpoints` confirms the first protocol, candidate revisions and delivery changes while permitting bounded same-protocol supplements; `autonomous` selects valid options within saved limits. The following legacy reply examples and delivery/mode-change rules apply to those sessions:
-
-~~~bash
-simple-ar research-session --session-root SESSION --model env --decision-id ID --decision-response accept
-simple-ar research-session --session-root SESSION --model env --decision-id ID --decision-response revise --decision-guidance "Revised direction"
-~~~
-
-Rich displays decisions but does not wait for stdin. Delivery revise also needs report setting. Answers and proposals persist separately; exact replay restores saved interrupted revisions, changed terms/inputs refuse old decisions. Mode changes must be separate from reanalyze/report-only refresh, except a delivery answer may include report/mode changes.
-
-Legacy continuation allowances need stable ID/reason; prior usage/unknown charges/counters remain. Same ID/terms are idempotent and cannot replenish spent capacity. Attempt/no-progress additions raise caps. Authorization alone does not reopen completed work; authorize before report refresh (normally writer/assembly/audit: three attempts, failures extra). Report-only needs no process expansion. Do not edit ledger/manifest.
-
-### Prepared reproduction
-
-Use task-kind reproduction with local sources and fixed protocol; measurement executes caller-declared command(s) and can optionally author a report with a configured model. Neither implies arbitrary-paper environment discovery or scientific success. Configuration defines independent validation, adapter creation, interpreter and metric selectors. [Exact contracts](CONFIG_REFERENCE.md#execution-and-report).
-
-#### Single-candidate repair and reproduction
-
-An explicit single-candidate reproduction with CodeTask, a distinct declared validator and a flat formal command now uses the common task owner, including an optional frozen report. The validator, formal metrics/protocol and actual candidate remain separately bound; internal absolute project paths target the isolated candidate, while external inputs and the selected interpreter retain their identity. Feedback can revise only the report without repeating measurement. A delivered compatible single-command protocol can be reused with `--reuse code_project --kind reproduction`; it does not import the old ledger.
-
-Explicit environment setup and adapter files use this same owner; choose auto rather than the strict reproduction shortcut for comparisons. Ordinary open-ended tasks are not reduced to this expert contract.
-
-#### Fixed measurement conditions
-
-A new `measurement` request without CodeTask uses the common task owner for a flat command or an explicit baseline-run comparison (`pairs`, or compact seeds with a declared seed flag). Each literal caller condition authorizes one initial execution; cwd, argv and inherited environment are preserved unless an explicit task-venv profile selects its actual interpreter. Protocol seeds without an argv binding describe an internal batch, not extra process runs. The frozen set cannot be silently reduced or re-paired: complete delivery requires the actual conditions and their matching deterministic analysis; missing/failed or incomparable evidence remains disclosed.
-
-Ordinary CodeTask benchmarks also use the common owner when validator and formal argv match; they still require separate physical calls and ledger records, and validation is not measurement. Strict reproduction retains its distinct-command requirement.
-
-Required new Python files and one explicit current/venv preparation can accompany declared conditions without changing the task category; exact scope and source checks still apply. Default budgets include preparation, never override explicit limits, and a managed venv preserves Python aliases until its owner selects the actual interpreter.
-
-Greenfield `copy`/`sparse_copy` with a real source project can measure source baselines (`source="preparation"`, `before_implementation=true`): prepare, finish all declared baselines, then call `implement(prepared_result)` with actual successful baseline facts. Failed/missing baselines prevent generation. An empty/source-less project cannot invent an unchanged-source baseline; supply real source or independently verified external evidence.
-
-Exact argv's existing external file operands are retained as individual read-only inputs and hash-bound during approval, including `--option=FILE`. This does not mount their parent directories or infer directory access; supply data/material directories explicitly. Restoring a missing domain summary reuses an intact saved observation after artifact/candidate checks, without rerunning the model or validator.
-
-With a model, interpretation and follow-up tools share this task and ledger and require a Chat profile with finite request/token allowances. Without one, declared measurements and deterministic analysis can run through caller actions, while missing model/design/report work remains pending. Resume using the printed start --resume-task command; unknown operations are never replayed.
-
-For measurement plus writing, use `--task-kind measurement --outputs experiments report --model SELECTOR` and the usual report controls. No code modification is required: the writer consumes actual measurements and their matching deterministic analysis. Include supplied references as local documents/materials. Feedback needs a new canonical composition and preserves the original results, manuscript and ledger without rerunning measurements. Missing analysis or a stale manuscript cannot count as completed report delivery.
-
-#### Prepare a measurement environment
-
-A measurement may include `execution.environment`: a current-environment check or task venv, declared requirements/project installation and short check.
-
-For a frozen multi-condition set, one actual attempt owns preparation; all conditions must share the declared cwd/profile and compatible interpreter. Later conditions reuse its verified receipt, not another installation. The full set plus preparation must fit the finite process allowance before setup; explicit limits, including zero, take precedence. Changed sources/preparation, interrupted or unaccounted processes block reuse. Setup metrics are not formal measurements. Installation may run build code/network and is not an OS sandbox; a CodeTask-owned environment cannot be replaced here.
-
-### `simple-ar research-report`
-
-For saved ResearchApplication sessions, `simple-ar research-report --session-root SESSION --model SELECTOR [--refresh]` adds a missing report to a ready analysis handoff. Report controls above apply. Omitted options retain saved settings. Existing completed reports are idempotent; refresh creates new report/audit attempts from saved evidence without rerunning measurements/analysis. Exhausted attempt/no-progress caps require explicit session authorization. Disabled reviewer does not disable audit. Legacy v1 records remain read-only; invalid sessions do not fall back to another executor. New common tasks request writing through [native feedback or supply](#native-recovery) and continue under the same owner.
-
-### `simple-ar report-export`
-
-Convert an assembled report to a movable LaTeX project, optionally compiling a PDF.
-Input requires `report_body.md` and a bibliography when cited. This converts existing
-text without model or experiment calls; it is not an arbitrary Markdown converter.
-
-| Argument | Meaning / default |
-| --- | --- |
-| `--report-dir PATH`, `--output PATH` | Required assembled input and new output directory |
-| `--title TEXT`, `--compile` | Optional title and PDF compilation |
-| `--latex-template PATH` | Trusted Pandoc LaTeX template, relative to report directory; otherwise single-column ACM |
-| `--template-asset FILE` | Repeatable flat companion beside template; requires `--latex-template` |
-| `--tex-engine pdflatex\|xelatex` | Default pdflatex; explicit option requires `--latex-template` |
-| `--citation-style numeric\|template` | Optional presentation choice; omission retains historical rendering |
-
-```bash
-simple-ar report-export --report-dir REPORT_ATTEMPT --output NEW_DIR --compile
-simple-ar report-export --report-dir REPORT_ATTEMPT --output NEW_DIR --latex-template layout/article.latex --citation-style numeric --compile
+simple-ar start --from-session SESSION --reuse code_project --goal "Revise the figure legend"
 ```
 
-#### Template and citation requirements
-
-Templates need `$body$` after `\begin{document}` and
-`$for(header-includes)$$header-includes$$endfor$` in the preamble. Class, body layout
-and literal bibliography styles belong to the template. The bounded template bundle
-allows at most 32 flat companions/16 MB, without partials, scripts or custom build commands.
-The exporter does not discover templates or download dependencies. Trusted TeX is not a sandbox.
-
-`numeric` configures natbib after template setup for square-bracket numbers, including
-narrative and suppress-author citations. Templates must load natbib; an already-loaded
-package is configured without conflicting reload options. Authorless records show numbers
-rather than source IDs. Citation keys and BibTeX records remain exact; no author/year is inferred.
-
-`template` retains template defaults; built-in ACM uses `acmnumeric`. For `$biblio-style$`,
-the default is plainnat, or **plainurl** with explicit numeric mode. plainurl needs the
-TeX Live/MiKTeX **urlbst** package and retains URL/DOI locators without printing authorless
-identity keys. There is no fallback to plain. A literal custom style still owns its format.
-
-Only an explicit choice adds `citation_style` to `export.json`. The native `export_report`
-tool also accepts `citation_style: "numeric" | "template" | null` with its template bundle;
-it can select a style from an ordinary publication goal without user-entered hashes.
-Omission/null stays absent from serialized requests/input bindings, preserving historical
-hashes. Explicit choices bind approval, request and manifest; changing style needs a new
-export identity/output. Recovery never restyles or recompiles old artifacts.
-
-#### Files and compilation
-
-Preserve the entire output: `main.tex`, `body.tex`, `source.md`, bibliography, figures,
-`export.json` and `code/block-*.txt` for literal code. Local figures and registered vector
-variants are copied; SVG conversion needs `rsvg-convert`. Remote images are not fetched.
-External evidence links become labels with targets in `export.json`, not copied datasets.
-
-Recorded captions bind exports. Only exact adjacent duplicate captions are removed;
-without a manifest, captions remain. Figures use `htbp`, without forced placement.
-
-Compilation needs Pandoc, `pdflatex`/BibTeX/`acmart`, `fvextra`, `seqsplit`, `etoolbox` and
-scalable fallback fonts (full `cm-super` on Debian/Ubuntu). Missing tools or failed compilation
-return nonzero, retain source and write `diagnostics/build.log` when applicable. Non-Latin
-text may need engine/font adaptation. Install missing dependencies before compiling.
-Inspect every page: compilation does not certify quality, page count or conference options.
-Use a new directory for each export.
-
-## Code Task Commands
-
-CodeTask prepares an isolated workspace and never directly edits the source project. Existing default auto prefers detached worktree and records copy fallback; explicit git_worktree fails instead. Greenfield starts empty and generates there. Isolation is not an OS sandbox.
-
-### High-Level Orchestration
-
-Existing-project execute normally uses one patch plan. Work-plan/batch is opt-in via to-step or saved work plan. Interactive terminals ask at plan/proposal/large-edit gates; noninteractive runs stop unless yes is intentional. Execute's yes auto-approves review gates, unlike native start's yes. No-review-inline stops at gates; interactive confirms primitive steps for debugging.
-
-#### Planning failures and method migration
-
-Planning failures preserve artifacts; complete response corrections are bounded, and offline fallback requires explicit no-llm/allow-planning-fallback. Transport/unknown/deadline failures are not fallback success. Greenfield compact replaces retired stages/review; tool_agent and nonzero planning-review-rounds emit migration notices without extra calls. Retired model-stage routes fail. Generated projects/immutable accepted planning are reused without generation; old plans/failures remain in planning/method_migration.json and retired_method.
-
-#### Review and repair
-
-Dependency advice is inspection only, never installation. Post-apply and post-run reviews record findings under memory; review is not acceptance. Review contract changes preserve history. Bounded repairs check inputs/bytes, keep snapshots/rollback and code_artifacts.json synchronized; interrupted candidates are not blindly replayed. Offline scaffolds fail before emitting fake metrics.
-
-#### `simple-ar code-task init`
-
-create a code-task run, prepare the editable workspace, and build the first code index.
-
-```bash
-uv run simple-ar code-task init --config examples/code_task_medium_review/configs/code_task.toml
-uv run simple-ar code-task init --code-root path/to/project --task-file task.md --benchmark-command "python main.py"
-uv run simple-ar code-task init --kind greenfield --task-file task.md --benchmark-command "python generated_project/main.py"
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `--config PATH` | path | TOML config for init settings. CLI flags override config values. |
-| `--kind MODE` | enum | `existing_project` for patching an existing codebase, or `greenfield` for from-scratch generation. |
-| `--code-root DIR` | path | Source project. Required for `existing_project`; optional scaffold/source root for `greenfield`. |
-| `--task-file PATH` | path | Markdown/text task description. Required unless set in config. |
-| `--output-root DIR` | path | Directory where the code-task run is created. |
-| `--name TEXT` | string | Run name suffix. |
-| `--benchmark-command TEXT` | string | Command run inside the workspace before and after edits. |
-| `--primary-metric NAME` | string | Primary metric for before/after verdicts. |
-| `--metric-direction NAME=DIRECTION` | repeatable | Metric direction: `higher`, `lower`, `resource`, or `ignore`. |
-| `--env-mode MODE` | enum | `current` or `external`. |
-| `--python PATH` | path | Python executable for `--env-mode external`. |
-| `--workspace-mode MODE` | enum | `auto`, `copy`, `git_worktree`, `sparse_copy`. Greenfield defaults to empty through TOML; CLI does not accept empty. |
-| `--workspace-include GLOB` | repeatable | Include pattern for `sparse_copy`. |
-| `--workspace-exclude GLOB` | repeatable | Additional exclude pattern for `sparse_copy`. |
-| `--workspace-reuse-source-venv` | flag | Reuse a detected source `.venv` Python as external execution policy. |
-| `--max-file-bytes N` | int | Maximum copied file size in copy/sparse modes. Use `0` to disable. |
-
-Outputs: `code_task/manifest.json`; `code_task/task.md`; `code_task/workspace/`; `code_task/meta/codebase_index.json`; `code_task/meta/repo_map.json`; `code_task/meta/repo_map_summary.md`.
-
-#### `simple-ar code-task execute`
-
-advance a code-task run to the next safe stop based on current artifacts.
-
-```bash
-uv run simple-ar code-task execute runs/<run-id> --config examples/code_task_medium_review/configs/code_task.toml
-uv run simple-ar code-task execute runs/<run-id> --to-step propose-edits
-uv run simple-ar code-task execute runs/<run-id> --apply-proposed-edits --timeout 60
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-| `--config PATH` | path | Optional TOML for model routing, budget, and runtime settings. |
-| `--to-step STEP` | enum | Stop no later than `probe`, `baseline`, `work-plan`, `batch`, `plan`, `propose-edits`, `apply-edits`, `review`, `validate`, `run`, `analyze-failure`, or `repair`. |
-| `--dry-run` | flag | Print the next action without writing artifacts. |
-| `--model NAME` | string | Model override for LLM-backed steps. |
-| `--no-llm` | flag | Use deterministic fallbacks where possible. |
-| `--timeout N` | int | Benchmark timeout. |
-| `--baseline-policy MODE` | enum | Existing-project baseline handling: `auto`, `run`, `skip`, `provided`, or `none`. Use `skip`/`none` for expensive baselines, or `provided` with a metrics file. |
-| `--baseline-metrics-file PATH` | path | JSON or metric-line file used when `--baseline-policy provided`. |
-| `--reuse-planning-from PATH` | path | Import immutable accepted greenfield planning after task-contract hash checks; no generated code, memory, findings or repair history. |
-| `--review-gate strict\|runtime` | enum | Strict blocks all blocking review findings; runtime blocks safety/direct executability, retaining packaging/report gaps. |
-| `--planning-review-rounds N` | int | Deprecated; use 0. Nonzero grants no calls. |
-| `--planning-mode MODE` | enum | Greenfield complete architecture work unit; default `compact`. `tool_agent` is a deprecated alias with a visible method migration notice. |
-| `--yes` | flag | Auto-approve inline review gates in normal execute mode; with `--interactive`, auto-continue primitive prompts. Use only after you are comfortable approving the reviewed plan/proposal. |
-| `--interactive` | flag | Debug mode: confirm each primitive step instead of running continuously to the next review gate. |
-| `--no-review-inline` | flag | Disable inline review prompts and stop at review gates instead. |
-| `--skip-validation` | flag | Run benchmark even when static validation has not passed. |
-| `--strict-validation` | flag | Treat higher-risk validation warnings as errors. |
-| `--validation-max-file-bytes N` | int | Max file size scanned by static validation. |
-| `--apply-proposed-edits` | flag | Apply reviewed `proposed_edits.json` after plan approval. |
-| `--allow-large-edits` | flag | Allow a reviewed proposal that exceeds the normal edit budget. |
-| `--allow-planning-fallback` | flag | Allow explicit offline planning or fallback after known, complete response-format failures; not after provider, budget, deadline or partial-stream failures. |
-| `--llm-retry-attempts N` | int | Bound completed-response corrections for work/patch planning and greenfield generation, including the first attempt. Transport retries belong to the shared model connection; unreconciled operations prevent correction and fallback. |
-| `--repair-rounds N` | int | Number of bounded repair proposals after failure. |
-| `--max-files N` | int | Context file budget for LLM steps. |
-| `--max-source-chars-per-file N` | int | Per-file source context budget. |
-| `--env-mode MODE` | enum | `current` or `external`. |
-| `--python PATH` | path | Python executable for external env mode. |
-
-Outputs: `code_task/work_plan.md` and `work_plan.json`; `code_task/attempts/attempt-*/batches/batch-*/batch_state.json`; `code_task/patch_plan.md`; `code_task/meta/proposed_edits.json`; `code_task/meta/applied_edits.json`; `code_task/meta/review_report.json` and `review_report_post_run.json`; `code_task/meta/validation_report.json`; `code_task/meta/resource_probe.json` and `resource_decision.json` after `probe`; `code_task/memory/task_memory.md`, `compressed_memory.md`, and `review_findings.jsonl`; `code_task/run/baseline/`, `code_task/run/patched/`, `code_task/run/comparison.json`; `code_task/summary.md`.
-
-#### `simple-ar code-task decide-plan`
-
-record a human decision for the current patch plan.
-
-```bash
-uv run simple-ar code-task decide-plan runs/<run-id> --decision approve
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-| `--decision VALUE` | enum | `approve`, `reject`, or `revise`. Required. |
-| `--note TEXT` | string | Optional review note. |
-| `--reviewer TEXT` | string | Reviewer label. Default: `user`. |
-
-Outputs: updates plan decision state in `manifest.json`.
-
-### Low-Level Primitives
-
-These commands accept RUN_DIR and are normally managed by execute. Planning/proposal commands share model, no-llm and bounded context settings; force regenerates their saved proposal where supported. Benchmark success differs from objective improvement.
-
-#### `simple-ar code-task map`
-
-rebuild repo-map artifacts from the editable workspace.
-
-```bash
-uv run simple-ar code-task map runs/<run-id> --show-summary
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-| `--no-refresh-index` | flag | Reuse the existing `codebase_index.json`. |
-| `--show-summary` | flag | Print `repo_map_summary.md`. |
-
-Outputs: `code_task/meta/codebase_index.json`; `code_task/meta/repo_map.json`; `code_task/meta/repo_map_summary.md`.
-
-#### `simple-ar code-task locate`
-
-rank likely editable files and read-only evidence from the repo map.
-
-```bash
-uv run simple-ar code-task locate runs/<run-id> --query "improve classifier"
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-| `--query TEXT` | string | Locate query. Defaults to `code_task/task.md`. |
-| `--top-k N` | int | Candidate count per group. Default: `8`. |
-| `--refresh-map` | flag | Rebuild index and repo map before ranking. |
-| `--no-read-only` | flag | Omit protected read-only evidence files. |
-| `--show-summary` | flag | Print `locate_results.md`. |
-
-Outputs: `code_task/meta/locate_results.json`; `code_task/meta/locate_results.md`.
-
-#### `simple-ar code-task context`
-
-build a bounded prompt-ready context pack.
-
-```bash
-uv run simple-ar code-task context runs/<run-id> --max-files 8 --max-total-chars 20000
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-| `--query TEXT` | string | Locate query. Defaults to `task.md`. |
-| `--top-k N` | int | Locate candidate budget. |
-| `--max-files N` | int | Maximum snippets included. |
-| `--max-source-chars-per-file N` | int | Per-file snippet budget. |
-| `--max-total-chars N` | int | Total snippet budget. |
-| `--refresh-map` | flag | Rebuild map before packing context. |
-| `--show-prompt` | flag | Print `prompt_context.md`. |
-
-Outputs: `code_task/context_packs/context-NNN/context_pack.json`; `code_task/context_packs/context-NNN/prompt_context.md`; `code_task/context_packs/context-NNN/selected_snippets.jsonl`.
-
-#### `simple-ar code-task probe`
-
-inspect runtime and project environment signals.
-
-```bash
-uv run simple-ar code-task probe runs/<run-id>
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-| `--env-mode MODE` | enum | `current` or `external`. |
-| `--python PATH` | path | Python executable for external env mode. |
-
-Outputs: `code_task/meta/environment_report.json`; `code_task/meta/resource_probe.json`; `code_task/meta/resource_decision.json`.
-
-#### `simple-ar code-task baseline`
-
-run the recorded benchmark before applying edits.
-
-```bash
-uv run simple-ar code-task baseline runs/<run-id> --timeout 60
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-| `--command TEXT` | string | Override the benchmark command for this run. |
-| `--timeout N` | int | Benchmark timeout. |
-| `--skip-validation` | flag | Run even when static validation has not passed. |
-| `--env-mode MODE` | enum | `current` or `external`. |
-| `--python PATH` | path | Python executable for external env mode. |
-
-Outputs: `code_task/run/baseline/execution_report.json`; `code_task/run/baseline/stdout.txt`; `code_task/run/baseline/stderr.txt`; `code_task/run/baseline/metrics.json`.
-
-#### `simple-ar code-task work-plan`
-
-generate a batch-oriented implementation work plan.
-
-```bash
-uv run simple-ar code-task work-plan runs/<run-id>
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-| `--model NAME` | string | Model override. |
-| `--no-llm` | flag | Use fallback planning. |
-| `--force` | flag | Regenerate existing work-plan artifacts. |
-| `--allow-planning-fallback` | flag | Allow fallback after known, complete work-plan response-format failures, not transport failures. |
-| `--llm-retry-attempts N` | int | Completed-response work-plan correction bound, including the first attempt; no additional transport retry layer. |
-| `--max-files N` | int | Planning context file budget. |
-| `--max-source-chars-per-file N` | int | Per-file source context budget. |
-
-Outputs: `code_task/work_plan.json`; `code_task/work_plan.md`.
-
-#### `simple-ar code-task batch`
-
-create an attempt/batch state directory for one work-plan item.
-
-```bash
-uv run simple-ar code-task batch runs/<run-id> --work-item W1
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-| `--work-item ID` | string | Work-plan item id, such as `W1`. Required. |
-| `--attempt-id ID` | string | Optional attempt id, such as `attempt-001`. |
-| `--force` | flag | Create a new batch even when one already exists. |
-
-Outputs: `code_task/attempts/attempt-NNN/attempt_state.json`; `code_task/attempts/attempt-NNN/batches/batch-NNN/batch_state.json`.
-
-#### `simple-ar code-task plan`
-
-generate a human-reviewable patch plan for the active batch.
-
-```bash
-uv run simple-ar code-task plan runs/<run-id>
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-| `--model NAME` | string | Model override. |
-| `--no-llm` | flag | Use fallback plan. |
-| `--force` | flag | Regenerate existing plan. |
-| `--allow-planning-fallback` | flag | Allow fallback after known, complete patch-plan response-format failures, not transport failures. |
-| `--llm-retry-attempts N` | int | Completed-response patch-plan correction bound, including the first attempt; no additional transport retry layer. |
-| `--max-files N` | int | Context file budget. |
-| `--max-source-chars-per-file N` | int | Per-file source context budget. |
-
-Outputs: `code_task/patch_plan.md`.
-
-#### `simple-ar code-task propose-edits`
-
-ask the model to produce controlled old/new text edits.
-
-```bash
-uv run simple-ar code-task propose-edits runs/<run-id>
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-| `--model NAME` | string | Model override. |
-| `--no-llm` | flag | Write deterministic empty proposal. |
-| `--force` | flag | Regenerate existing proposal. |
-| `--max-files N` | int | Editable context file budget. |
-| `--max-source-chars-per-file N` | int | Per-file source context budget. |
-| `--allow-large-edits` | flag | Accept a large but bounded proposal after review. |
-
-Outputs: `code_task/meta/proposed_edits.json`; `code_task/meta/proposal_warnings.json`; per-batch proposal artifacts when an active batch exists.
-
-#### `simple-ar code-task apply-edits`
-
-safely apply controlled old/new text edits inside the workspace.
-
-```bash
-uv run simple-ar code-task apply-edits runs/<run-id>
-uv run simple-ar code-task apply-edits runs/<run-id> --edits-file runs/<run-id>/code_task/repairs/repair-001/proposed_edits.json
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-| `--edits-file PATH` | path | Specific proposal file to apply. |
-| `--allow-unapproved-plan` | flag | Bypass plan approval for local tests/demos. |
-| `--allow-large-edits` | flag | Apply a reviewed proposal that requires large-edit approval. |
-
-Outputs: modifies files under `code_task/workspace`; `code_task/meta/applied_edits.json`; `code_task/patch.diff`.
-
-#### `simple-ar code-task validate`
-
-run lightweight static validation over the workspace.
-
-```bash
-uv run simple-ar code-task validate runs/<run-id> --strict
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-| `--strict` | flag | Treat higher-risk warnings as errors. |
-| `--max-file-bytes N` | int | Maximum file size scanned. |
-
-Outputs: `code_task/meta/validation_report.json`.
-
-#### `simple-ar code-task run`
-
-run the benchmark after edits.
-
-```bash
-uv run simple-ar code-task run runs/<run-id> --timeout 60
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-| `--command TEXT` | string | Override recorded benchmark command. |
-| `--timeout N` | int | Benchmark timeout. |
-| `--skip-validation` | flag | Run even when static validation has not passed. |
-| `--env-mode MODE` | enum | `current` or `external`. |
-| `--python PATH` | path | Python executable for external env mode. |
-
-Outputs: `code_task/run/patched/execution_report.json`; `code_task/run/patched/stdout.txt`; `code_task/run/patched/stderr.txt`; `code_task/run/patched/metrics.json`; `code_task/run/comparison.json` when baseline metrics also exist.
-
-#### `simple-ar code-task analyze-failure`
-
-summarize the latest failed validation or benchmark result.
-
-```bash
-uv run simple-ar code-task analyze-failure runs/<run-id>
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-
-Outputs: `code_task/run/patched/failure_analysis.md` or `code_task/meta/failure_analysis.md`.
-
-#### `simple-ar code-task repair`
-
-propose bounded repair edits from the latest failure context.
-
-```bash
-uv run simple-ar code-task repair runs/<run-id>
-```
-
-| Option | Type | Description |
-| --- | --- | --- |
-| `RUN_DIR` | path | Code-task run directory. |
-| `--model NAME` | string | Model override. |
-| `--no-llm` | flag | Write deterministic empty repair proposal. |
-| `--max-files N` | int | Repair context file budget. |
-| `--max-source-chars-per-file N` | int | Per-file source context budget. |
-
-Outputs: `code_task/repairs/repair-NNN/proposed_edits.json`; updates `code_task/summary.md`.
-
-
-Apply-edits checks paths, scope, unique old text and budgets before writing. Empty old creates an absent allowed file, never replaces existing; new files require explicit scope/batch target and share snapshots/rollback. Repair proposals are not applied automatically; review then apply with edits-file. Static validation is conservative, not runtime proof. Probe installs nothing and runs no benchmark. See [configuration scope](CONFIG_REFERENCE.md#edit-scope-behavior).
-
-## Artifact Tools
-
-### `simple-ar inspect`
-
-`simple-ar inspect RUN_DIR` writes artifact_index.json with metadata/bounded previews. It does not follow symlinks or special files, and defaults sha256 to null; Python callers can explicitly enable hash_files. This is not full-text reading.
-
-### `simple-ar search-artifacts`
-
-`simple-ar search-artifacts RUN_DIR QUERY [--top-k N] [--include-operational]` builds its own current index; top-k defaults 8. Operational files are excluded unless requested. It prints chunks/paths and writes artifact_index.json, artifact_chunks.jsonl, artifact_search_results.json. Binary files are not chunked; >8 MiB files are reported file_too_large rather than searched as a complete prefix.
-
-### `simple-ar clean`
-
-~~~bash
-simple-ar clean RUN_DIR
-simple-ar clean RUN_DIR --all-caches
-simple-ar clean --shared-index
-simple-ar clean --shared-cache
-~~~
-
-| Option | Effect |
-| --- | --- |
-| `RUN_DIR` | Optional only for shared cleanup |
-| `--yes` | Delete previewed targets without interactive yes |
-| `--all-caches` | Broader run-local rebuildable caches/index/context |
-| `--shared-index` | Clear historical shared SQLite/LanceDB stores across runs |
-| `--shared-cache` | Also clear literature provider cache and agent_handoff_archives |
-| `--index-root PATH` | Environment index root or .simple_ar_cache/research_index |
-| `--literature-cache-root PATH` | Default .simple_ar_cache/literature |
-| `--allow-external-index-root` | Permit shared cleanup outside workspace |
-
-Cleanup previews targets and retains the run itself/reports/manifests/evidence. Current v2 removes recognized cache/literature query metadata and artifact_search_results; all-caches additionally removes artifact indexes/chunks. Attempts/outputs/documents/full text/unrecognized files remain; custom external caches are not followed. Query metadata >1 MiB remains uninspected, never deleted by filename alone. Workspace-local shared SQLite rows may be removed through index_meta.
-
-Historical layouts remove recognized fulltext/extracted caches; all-caches can remove portable research_index/chunks.jsonl plus repo-map/locate/context caches, while retaining final reports/metadata/benchmark/audit artifacts. Shared cleanup leaves run-local artifacts. Historical persistent indexes no longer serve source queries; clearing provider caches may require new queries. Shared-cache also deletes retained external-agent transcripts.
 
 ### `simple-ar status`
 
-`simple-ar status RUN_DIR` and `simple-ar results SESSION` read saved state without model calls. Status handles native/research/CodeTask and historical layouts. Canonical v2 includes state/current attempt/budget/counters/last decision; v1 is read-only. Handoff/continuation hints do not mean a background worker is running. Results lists current delivery files/limitations/resume command; a paused feedback revision does not present old delivery as current completion.
+Read saved progress, stop conditions and resource use without model calls. A resume hint does not mean a worker is running.
 
-## Tools And MCP
+```text
+simple-ar status RUN_DIR [OPTIONS]
+```
 
-### `simple-ar tools schema`
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
 
-`simple-ar tools schema [--format mcp|openai] [--output PATH]` exports registered schemas; default mcp, stdout if output omitted.
+Examples:
 
-### `simple-ar tools call`
+```bash
+simple-ar status SESSION
+```
 
-`simple-ar tools call RUN_DIR TOOL_NAME [--args-json JSON | --args-file PATH] [--debug-payloads]` calls a registered read-only run tool. Arguments are a JSON object; args-file avoids shell quoting problems. Prints JSON and writes RUN_DIR/tools/tool_trace.jsonl; debug retains larger payloads.
 
-### `simple-ar tools serve-mcp`
+### `simple-ar models`
 
-`simple-ar tools serve-mcp RUN_DIR [--debug-payloads]` serves read-only registered experiment tools over stdio. Methods: initialize, ping, tools/list, tools/call. It enables no write/shell/network/install capability.
+Inspect local connections, routes and credential presence without API calls or provider tests.
 
-## Historical and development commands
+```text
+simple-ar models [OPTIONS]
+```
 
-### `simple-ar research-brief` (compatibility alias)
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--config PATH` | This command's TOML configuration; explicit CLI options take precedence. | SIMPLE_AR_MODELS_CONFIG, then user models.toml |
+| `--profile NAME` | Inspect one named connection without exposing credentials. | Unset |
+| `--purpose CHOICE` | Capability for selecting --profile; listing profiles does not probe providers. Choices: `text`, `code`, `writing`, `vision`, `image`. | text |
 
-`research-brief` is a summary-only compatibility alias, retaining its default `runs/research-brief` output directory and optional model. It creates a common task, retaining original documents, reading/synthesis and summary artifacts without a second controller or a mandatory planning call. Missing coverage stays qualified. Model omission is deterministic, not model-failure fallback. Resume with the printed `start --resume-task SESSION`; `research-session --session-root SESSION` also selects the saved owner. Historical attempts and ledgers remain intact.
+Examples:
+
+```bash
+simple-ar models
+simple-ar models --config models.toml --profile daily --purpose text
+```
+
+<a id="concept-images"></a>
+
+### `simple-ar image`
+
+Generate or edit one concept image with a named Images profile; keep each version separately.
+
+```text
+simple-ar image --prompt TEXT --output PATH [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--prompt TEXT` | Image description or edit instructions. | Required |
+| `--input PATH` | Source image to edit or rendered image to review; originals retained. | Unset |
+| `--output PATH` | This command's output directory/file. | Required |
+| `--config PATH` | This command's TOML configuration; explicit CLI options take precedence. | Unset |
+| `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME. | Configured image route |
+
+Use a new output directory for each changed request. Identical saved completed requests recover without another submission; unknown requests are not automatically replayed. Each output has a one-image-request ledger beside it. Requires a named Images connection/image route. Raster output is not measured data or editable vector layers.
+
+Examples:
+
+```bash
+simple-ar image --prompt "Concept sketch" --output figures/v1 --model profile:illustration
+simple-ar image --prompt "Larger labels" --input SOURCE_IMAGE --output figures/v2
+```
+
+<a id="inspect-a-rendered-figure"></a>
+
+### `simple-ar image-review`
+
+Review rendered figures with a vision model and save feedback without editing originals. Model opinion is not scientific verification.
+
+```text
+simple-ar image-review --input PATH --goal TEXT --output PATH [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--input PATH` | Source image to edit or rendered image to review; originals retained. Repeatable. | Required |
+| `--goal TEXT` | Goal text, instead of the positional request. | Required |
+| `--output PATH` | This command's output directory/file. | Required |
+| `--config PATH` | This command's TOML configuration; explicit CLI options take precedence. | Unset |
+| `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME. | Configured vision route |
+
+Repeat --input for up to four PNG/JPEG/WebP images. Changed inputs need a new review directory; identical completed inputs recover without another call. Each output saves a budget of one model request and 40000 tokens.
+
+Examples:
+
+```bash
+simple-ar image-review --input figure.png --goal "Check labels and hierarchy" --output reviews/v1
+```
+
+<a id="project-preparation"></a>
+
+### `simple-ar project-info`
+
+Read project instructions, dependencies, entry candidates and named data locations without installation or execution.
+
+```text
+simple-ar project-info --project PATH --output PATH [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--project PATH` | Existing project; ordinary goals mount it read-only, explicit repair/reproduction uses an isolated candidate. | Required |
+| `--data-path PATH` | Existing data file/directory; repeatable. Does not rewrite commands or automatically copy external data. | [] |
+| `--output PATH` | This command's output directory/file. | Required |
+
+--output must not exist. Data paths resolve relative to the project and their contents are not read. Writes preparation.md and preparation.json, reusable as writing materials.
+
+Examples:
+
+```bash
+simple-ar project-info --project ./project --data-path ./data --output preparation/v1
+```
+
+
+### `simple-ar report-export`
+
+Export an assembled report to editable LaTeX, optionally compiling PDF; no model or experiment calls.
+
+```text
+simple-ar report-export --report-dir PATH --output PATH [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--report-dir PATH` | Assembled report with report_body.md and bibliography for citations. | Required |
+| `--output PATH` | This command's output directory/file. | Required |
+| `--title TEXT` | Reader-facing publication title. | Unset |
+| `--citation-style CHOICE` | Numeric natbib display or template defaults; source citation keys unchanged. Choices: `numeric`, `template`. | Unset |
+| `--latex-template PATH` | Trusted Pandoc LaTeX template relative to --report-dir; otherwise ACM. | Unset |
+| `--template-asset NAME` | Flat companion filename beside template; repeatable; requires --latex-template. | [] |
+| `--tex-engine CHOICE` | Installed engine for custom template; requires --latex-template; BibTeX bibliography. Choices: `pdflatex`, `xelatex`. | Unset |
+| `--compile` | Compile with installed TeX/BibTeX; retain source/logs on failure. | Off |
+
+Output must be new. Custom templates need $body$ in the document and $for(header-includes)$$header-includes$$endfor$ in the preamble. Companions must be flat filenames beside the template. Dependencies are not discovered automatically; custom build commands are not run. Compilation needs installed TeX/BibTeX; failures retain source/logs and return failure.
+
+Examples:
+
+```bash
+simple-ar report-export --report-dir REPORT_DIR --output publication/v1 --compile
+simple-ar report-export --report-dir REPORT_DIR --output publication/v2 --latex-template layout/article.latex --citation-style numeric --compile
+```
+
+<a id="artifact-tools"></a>
+
+### `simple-ar inspect`
+
+Write an artifact index with metadata and bounded previews, not full-text reading.
+
+```text
+simple-ar inspect RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+
+Does not follow symlinks/special files or hash full files by default. Writes artifact_index.json.
+
+Examples:
+
+```bash
+simple-ar inspect RUN_DIR
+```
+
+
+### `simple-ar search-artifacts`
+
+Search artifacts lexically with a fresh index; operational metadata is excluded unless requested.
+
+```text
+simple-ar search-artifacts RUN_DIR QUERY [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `QUERY` | Text query for run artifacts. | Required |
+| `--top-k N` | Maximum returned search results. | 8 |
+| `--include-operational` | Also search operational metadata such as manifests. | Off |
+
+Writes artifact_index.json, artifact_chunks.jsonl and artifact_search_results.json. Binary files are not chunked; oversized files are reported rather than treated as fully searched.
+
+Examples:
+
+```bash
+simple-ar search-artifacts RUN_DIR "validation results" --top-k 5
+```
+
+
+### `simple-ar clean`
+
+Preview and remove recognized rebuildable caches, retaining the run, evidence and deliveries. Shared cleanup affects multiple runs.
+
+```text
+simple-ar clean [RUN_DIR] [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required unless shared cleanup selected |
+| `--yes` | Accept displayed creation/access/resource summary; never approves a pending native process. | Off; confirms deletion only after preview |
+| `--all-caches` | Include all recognized rebuildable run caches/index/context; retain evidence/deliveries. | Off |
+| `--shared-index` | Clear shared research index across runs. | Off |
+| `--shared-cache` | Clear shared indexes, literature-provider cache and retained external-agent transcripts. | Off |
+| `--index-root PATH` | Shared index root for shared cleanup. | SIMPLE_AR_RESEARCH_INDEX_ROOT or .simple_ar_cache/research_index |
+| `--literature-cache-root PATH` | Literature-provider cache root for --shared-cache. | .simple_ar_cache/literature |
+| `--allow-external-index-root` | Allow shared cleanup outside the current workspace. | Off |
+
+Without --yes, deletion requires confirmation after preview. Omit RUN_DIR only for shared cleanup. Current native evidence/documents/full text/attempts and unrecognized files remain. --all-caches also includes artifact indexes/chunks; recognized legacy rebuildable targets can be broader. Shared cleanup leaves run-local deliveries but can require new provider queries.
+
+Examples:
+
+```bash
+simple-ar clean RUN_DIR
+simple-ar clean RUN_DIR --all-caches
+simple-ar clean --shared-cache
+```
+
+<a id="research-commands"></a>
+<a id="report-controls"></a>
+<a id="interaction-policies-and-pending-decisions"></a>
+<a id="prepared-reproduction"></a>
+<a id="simple-ar-research-session-canonical-task-driven-entry"></a>
+<a id="simple-ar-research-session-structured-and-compatibility-entry"></a>
+
+### `simple-ar research-session`
+
+Use exact structured inputs or continue saved research work. New tasks share the native task owner; follow the printed continuation command.
+
+```text
+simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
+```
+
+#### Goal, materials and creation
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--config PATH` | This command's TOML configuration; explicit CLI options take precedence. | Unset |
+| `--interaction CHOICE` | Design/protocol confirmation policy; new native tasks have no stage/delivery milestone dialogs. Never grants process permission. Choices: `assisted`, `checkpoints`, `autonomous`. | checkpoints for creation; saved policy on resume |
+| `--topic TEXT` | Research goal; required for creation unless supplied by TOML; optional on resume. | Required for creation unless in TOML; optional on resume |
+| `--task-kind CHOICE` | Explicit structured task category. Choices: `auto`, `survey`, `bug_fix`, `measurement`, `reproduction`, `writing`, `data_analysis`. | auto |
+| `--outputs CHOICE ...` | Requested outputs; cannot combine with --with-report or --no-report. Choices: `summary`, `report`, `experiments`, `bug_fix`, `code_task`, `data_analysis`. | Unset |
+| `--material PATH` | Notes, drafts or an analysis package; repeatable. Ordinary materials are unverified, not bibliographic papers. | [] |
+| `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME. | Direct CLI: none; TOML normally env; resume keeps model |
+| `--feasibility-review-model SELECTOR` | Independent model for source-backed feasibility review. | Unset |
+| `--output-root PATH` | Parent directory for a new task/run. | runs/research-session |
+| `--cache-dir PATH` | Optional shared full-text cache location. | Session-local cache |
+| `--local-document PATH` | Local Markdown/text reference; repeatable. | [] |
+| `--query TEXT` | Override search query; repeatable. | [] |
+| `--provider NAME` | Override search provider; repeatable. | [] |
+| `--max-results N` | Search result count limit. | 10 |
+| `--max-chunks N` | Ingestion chunk count limit. | 300 |
+| `--max-fulltext-documents N` | Remote full-text document count cap. | No count cap if omitted |
+| `--max-pdf-mb N` | Per-fetched-PDF size cap in MiB. | No size cap if omitted |
+| `--web-extract-backend CHOICE` | Public-page extraction backend; separate from PDF acquisition. Choices: `direct`, `tavily_basic`. | Unset |
+| `--idea-limit N` | Structured idea candidate limit. | 3 |
+| `--max-research-iterations N` | Additional rounds after first analysis; zero stops after first analysis. | 1 |
+| `--cwd PATH` | Declared command working directory. | . |
+| `--timeout-sec N` | Per-process time limit in seconds. | Unset |
+| `--label NAME` | Declared experiment label. | research-session |
+| `--primary-metric NAME` | Primary comparison metric. | Unset |
+| `--metric NAME` | Required emitted metric name; repeatable. | [] |
+| `--metric-direction NAME=DIRECTION` | NAME=DIRECTION; repeatable. Directions include higher, lower, resource and ignore. | [] |
+| `--code-task-config PATH` | Explicit CodeTask TOML for implementing the selected direction. | Unset |
+| `--command ARGV...` | Explicit argv; put last because all following tokens belong to the command. Research/start argv has no shell interpretation. | Unset |
+
+#### Access and resource allowances
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--total-tokens N` | Shared API token budget; resume retains accounting. | No cap if omitted on direct CLI; config/resume may set one |
+| `--llm-requests N` | Shared API request budget. | No cap if omitted on direct CLI; config/resume may set one |
+| `--max-output-tokens N` | Per-model-response output cap. | Unset |
+| `--process-invocations N` | Cumulative process invocation allowance; explicit zero is respected. | Owner computes if omitted; zero is respected |
+| `--process-wall-seconds N` | Cumulative process wall-time allowance in seconds. | Owner computes if omitted; zero is respected |
+
+#### Continue, approve and recover
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--session-root PATH` | Saved research session; follow its printed resume command. Common tasks resume with start --resume-task. | Unset |
+| `--recover-interrupted` | Legacy only: confirm prior worker stopped before closing its running attempt without a result. | Off |
+| `--reanalyze` | Legacy: reconsider saved measurements, separately from revisions/allowances/report requests. | Off |
+| `--authorization-id NAME` | Stable idempotency key; identical ID/terms do not replenish spent capacity. | Unset |
+| `--authorization-reason TEXT` | Human-readable reason for remaining-allowance changes. | Unset |
+| `--authorize-remaining DIMENSION=AMOUNT` | New remaining allowance as DIMENSION=AMOUNT; repeatable. Retains prior usage/unknown reservations. | Unset |
+| `--additional-attempts N` | Increase legacy total attempt cap without erasing prior attempts. | 0 |
+| `--additional-no-progress N` | Increase legacy consecutive no-progress cap. | 0 |
+| `--decision-id NAME` | Exact pending design/protocol decision ID; native replies require --resume-task. | Unset |
+| `--decision-response CHOICE` | Reply to the pending decision; accepting a design does not approve a process. Choices: `accept`, `reject`, `revise`. | Unset |
+| `--decision-guidance TEXT` | Facts or revised direction with --decision-response revise. | Unset |
+
+#### Explicit table analysis
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--data-file PATH` | UTF-8 CSV/TSV or JSON records. Explicit table selectors choose the no-API shortcut; --kind data_analysis alone does not. | Unset |
+| `--data-attribution TEXT` | User-declared source/credit/version; retained without independent verification. | Empty |
+| `--value-column NAME` | Explicit numeric column; repeat for multiple metrics or matrix/coordinate columns. | [] |
+| `--group-column NAME` | Category/group column; values bar/heatmap needs unique row labels. | Empty |
+| `--observation-unit TEXT` | What one row represents; required for the table shortcut. | Empty |
+| `--value-unit TEXT` | Selected value columns' unit; omission is unknown. | Empty |
+| `--paired-baseline NAME` | Explicit same-row baseline among selected observation columns sharing a quantity/unit. | Empty |
+| `--data-association CHOICE` | Opt-in descriptive Pearson r for line/scatter pairs; no significance/causal inference. Choices: `none`, `pearson`. | none |
+| `--data-mode CHOICE` | observations aggregates rows; values retains supplied numbers without inferred aggregation. Choices: `observations`, `values`. | observations |
+| `--data-missing CHOICE` | Reject missing values or explicitly omit them; missing y breaks lines. Choices: `reject`, `omit`. | reject |
+| `--figure-width CHOICE` | Generic column (3.5 inch) or wide (7 inch) figure width. Choices: `column`, `wide`. | wide |
+| `--data-max-mb N` | Physical input size limit in MiB. | 20 |
+| `--data-max-figures N` | Physical SVG page limit; excess fails without dropping categories. | 100 |
+| `--data-plot CHOICE` | bar: means/values; box: observation quartiles/min-max; line/scatter: explicit coordinates; heatmap: supplied matrix. Choices: `bar`, `box`, `line`, `scatter`, `heatmap`. | bar |
+| `--x-column NAME` | Numeric x for values-mode line/scatter; distinct from value/group columns. | Empty |
+| `--x-unit TEXT` | Declared x-coordinate unit; omission is unknown. | Empty |
+| `--data-max-points N` | Physical coordinate points per figure; excess fails without sampling. | 10000 |
+| `--series-layout CHOICE` | Separate axes, or shared axes for line/scatter columns with a common declared unit. Choices: `separate`, `shared`. | separate |
+| `--data-path PATH` | Existing data file/directory; repeatable. Does not rewrite commands or automatically copy external data. | [] |
+
+#### Report controls
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--report-writing-method CHOICE` | New reports use article; explicit sectional controls select sections. Resume retains the saved method. Choices: `article`, `sections`. | New article; sections with explicit sectional controls |
+| `--max-section-tokens N` | Output cap per writing unit; zero/unset omits this extra cap. | Unset |
+| `--with-report` | Explicitly request a model-authored report; data analysis otherwise delivers analysis only. | Off |
+| `--no-report` | Skip report writing in a model-backed session. | Off |
+| `--report-template NAME_OR_PATH` | Report structure name or Markdown path. | auto |
+| `--report-reviewer CHOICE` | Report reviewer; disabled retains deterministic audit. Choices: `llm`, `disabled`. | llm |
+| `--max-review-iterations N` | Report revision/correction bound; failed proposals count too. | 1 |
+| `--report-document-review / --no-report-document-review` | Enable/disable bounded whole-document review/revision. | Off for sections; retained on resume |
+| `--report-review-scope CHOICE` | section or document; document requires document-review. Choices: `section`, `document`. | section for sections; retained on resume |
+| `--report-draft-scope CHOICE` | section, joint document or auto (joint up to 2000 planned words); document/auto requires document review and scope. Choices: `section`, `document`, `auto`. | section for sections; retained on resume |
+| `--max-document-review-prompt-chars N` | Full review request character ceiling; zero uses client/session capacity without truncating evidence. | Unset |
+| `--report-outline-strategy CHOICE` | Template outline or evidence-organized outline planning. Choices: `auto`, `template`, `adaptive`. | auto for sections; retained on resume |
+| `--report-data-tables CHOICE` | Link complete copied analysis records, or also repeat full tables in the report. Choices: `linked`, `full`. | linked for sections; retained on resume |
+
+Explicit CLI options override research TOML. A direct new command without --model uses deterministic collection/analysis; research TOML normally defaults the model to env. Collection without a model is not completion of requested experiments/reports. Supply missing contracts/model authorization and continue with the printed start --resume-task command. Model failure does not silently fall back.
+
+Model-backed sessions normally request a report, except data analysis needs an explicit request. --outputs cannot combine with --with-report/--no-report. Detailed paired protocols, output-file selectors and environment preparation belong in research TOML, not invented CLI flags. Exact process contracts do not establish scientific success.
+
+New tasks use start decision/approval rules. Legacy sessions retain saved milestone policies: assisted confirms protocol/delivery/follow-ups; checkpoints confirms first protocol/candidate revisions/delivery changes while allowing bounded same-protocol supplements; autonomous chooses within saved limits. --session-root preserves evidence/accounting. Use --recover-interrupted only after the old worker stops, separately from input revisions. --reanalyze is separate from revisions/authorization/report refresh; only compatible measurements are reused.
+
+Omitted report options on resume retain saved choices. New article reports use complete-article work units; explicit sectional controls select sections. Section defaults are section drafting/review, document review off, auto outline and linked tables. Joint drafting needs document review/scope and compatible full-source settings. Disabled review retains audit. Authorize resources separately before report refresh; authorization alone does not reopen completed work.
+
+Examples:
+
+```bash
+simple-ar research-session --config research.toml
+simple-ar research-session --config examples/data-curves/research.toml
+simple-ar research-session --topic "Summarize local sources" --local-document paper.md --outputs summary
+```
+
+
+### `simple-ar research-report`
+
+Generate or refresh a report for a saved legacy session with ready analysis. Common native tasks request writing through start feedback or supply.
+
+```text
+simple-ar research-report --session-root PATH --model SELECTOR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--session-root PATH` | Saved research session; follow its printed resume command. Common tasks resume with start --resume-task. | Required |
+| `--refresh` | New report/audit attempts from saved evidence; keeps old reports without repeating experiments. | Off |
+| `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME. | Required |
+| `--template NAME_OR_PATH` | Report template name or Markdown path. | experiment |
+| `--reviewer CHOICE` | Report reviewer; disabled retains audit. Choices: `llm`, `disabled`. | llm |
+| `--max-review-iterations N` | Report revision/correction bound; failed proposals count too. | 1 |
+| `--document-review / --no-document-review` | Enable/disable bounded whole-document review/revision. | Off for sections; retained on resume |
+| `--review-scope CHOICE` | section or document; document requires document-review. Choices: `section`, `document`. | section for sections; retained on resume |
+| `--draft-scope CHOICE` | section, joint document or auto (joint up to 2000 planned words); document/auto requires document review and scope. Choices: `section`, `document`, `auto`. | section for sections; retained on resume |
+| `--max-document-review-prompt-chars N` | Full review request character ceiling; zero uses client/session capacity without truncating evidence. | Unset |
+| `--outline-strategy CHOICE` | Template outline or evidence-organized outline planning. Choices: `auto`, `template`, `adaptive`. | auto for sections; retained on resume |
+| `--data-tables CHOICE` | Link complete copied analysis records, or also repeat full tables in the report. Choices: `linked`, `full`. | linked for sections; retained on resume |
+| `--max-section-tokens N` | Output cap per writing unit; zero/unset omits this extra cap. | Unset |
+
+Requires a ready-for-report legacy session; v1 is read-only. Existing reports are idempotent unless --refresh is supplied. Omitted options retain saved settings. Refresh consumes saved attempt/API budgets without rerunning experiments; authorize resources separately if exhausted. Disabled reviewer retains audit.
+
+Examples:
+
+```bash
+simple-ar research-report --session-root SESSION --model profile:daily --refresh
+```
+
+<a id="historical-and-development-commands"></a>
+<a id="simple-ar-research-brief-compatibility-alias"></a>
+
+### `simple-ar research-brief`
+
+Compatibility spelling for a new summary-only session; inherits research-session parameters with the limits below.
+
+```text
+simple-ar research-brief --topic TEXT [OPTIONS]
+```
+
+#### Goal, materials and creation
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--config PATH` | This command's TOML configuration; explicit CLI options take precedence. | Unset |
+| `--interaction CHOICE` | Design/protocol confirmation policy; new native tasks have no stage/delivery milestone dialogs. Never grants process permission. Choices: `assisted`, `checkpoints`, `autonomous`. | autonomous |
+| `--topic TEXT` | Research goal; required for creation unless supplied by TOML; optional on resume. | Required for creation unless in TOML; optional on resume |
+| `--task-kind CHOICE` | Explicit structured task category. Choices: `auto`, `survey`, `bug_fix`, `measurement`, `reproduction`, `writing`, `data_analysis`. | auto |
+| `--outputs CHOICE ...` | Requested outputs; cannot combine with --with-report or --no-report. Choices: `summary`, `report`, `experiments`, `bug_fix`, `code_task`, `data_analysis`. | summary only |
+| `--material PATH` | Notes, drafts or an analysis package; repeatable. Ordinary materials are unverified, not bibliographic papers. | [] |
+| `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME. | Direct CLI: none; TOML normally env; resume keeps model |
+| `--feasibility-review-model SELECTOR` | Independent model for source-backed feasibility review. | Unset |
+| `--output-root PATH` | Parent directory for a new task/run. | runs/research-brief |
+| `--cache-dir PATH` | Optional shared full-text cache location. | Session-local cache |
+| `--local-document PATH` | Local Markdown/text reference; repeatable. | [] |
+| `--query TEXT` | Override search query; repeatable. | [] |
+| `--provider NAME` | Override search provider; repeatable. | [] |
+| `--max-results N` | Search result count limit. | 10 |
+| `--max-chunks N` | Ingestion chunk count limit. | 300 |
+| `--max-fulltext-documents N` | Remote full-text document count cap. | No count cap if omitted |
+| `--max-pdf-mb N` | Per-fetched-PDF size cap in MiB. | No size cap if omitted |
+| `--web-extract-backend CHOICE` | Public-page extraction backend; separate from PDF acquisition. Choices: `direct`, `tavily_basic`. | Unset |
+| `--idea-limit N` | Structured idea candidate limit. | 3 |
+| `--max-research-iterations N` | Additional rounds after first analysis; zero stops after first analysis. | 1 |
+| `--cwd PATH` | Declared command working directory. | . |
+| `--timeout-sec N` | Per-process time limit in seconds. | Unset |
+| `--label NAME` | Declared experiment label. | research-session |
+| `--primary-metric NAME` | Primary comparison metric. | Unset |
+| `--metric NAME` | Required emitted metric name; repeatable. | [] |
+| `--metric-direction NAME=DIRECTION` | NAME=DIRECTION; repeatable. Directions include higher, lower, resource and ignore. | [] |
+| `--code-task-config PATH` | Explicit CodeTask TOML for implementing the selected direction. | Unset |
+| `--command ARGV...` | Explicit argv; put last because all following tokens belong to the command. Research/start argv has no shell interpretation. | Unset |
+
+#### Access and resource allowances
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--total-tokens N` | Shared API token budget; resume retains accounting. | No cap if omitted on direct CLI; config/resume may set one |
+| `--llm-requests N` | Shared API request budget. | No cap if omitted on direct CLI; config/resume may set one |
+| `--max-output-tokens N` | Per-model-response output cap. | Unset |
+| `--process-invocations N` | Cumulative process invocation allowance; explicit zero is respected. | Owner computes if omitted; zero is respected |
+| `--process-wall-seconds N` | Cumulative process wall-time allowance in seconds. | Owner computes if omitted; zero is respected |
+
+#### Continue, approve and recover
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--session-root PATH` | Saved research session; follow its printed resume command. Common tasks resume with start --resume-task. | Rejected by this alias |
+| `--recover-interrupted` | Legacy only: confirm prior worker stopped before closing its running attempt without a result. | Off |
+| `--reanalyze` | Legacy: reconsider saved measurements, separately from revisions/allowances/report requests. | Off |
+| `--authorization-id NAME` | Stable idempotency key; identical ID/terms do not replenish spent capacity. | Unset |
+| `--authorization-reason TEXT` | Human-readable reason for remaining-allowance changes. | Unset |
+| `--authorize-remaining DIMENSION=AMOUNT` | New remaining allowance as DIMENSION=AMOUNT; repeatable. Retains prior usage/unknown reservations. | Unset |
+| `--additional-attempts N` | Increase legacy total attempt cap without erasing prior attempts. | 0 |
+| `--additional-no-progress N` | Increase legacy consecutive no-progress cap. | 0 |
+| `--decision-id NAME` | Exact pending design/protocol decision ID; native replies require --resume-task. | Unset |
+| `--decision-response CHOICE` | Reply to the pending decision; accepting a design does not approve a process. Choices: `accept`, `reject`, `revise`. | Unset |
+| `--decision-guidance TEXT` | Facts or revised direction with --decision-response revise. | Unset |
+
+#### Explicit table analysis
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--data-file PATH` | UTF-8 CSV/TSV or JSON records. Explicit table selectors choose the no-API shortcut; --kind data_analysis alone does not. | Unset |
+| `--data-attribution TEXT` | User-declared source/credit/version; retained without independent verification. | Empty |
+| `--value-column NAME` | Explicit numeric column; repeat for multiple metrics or matrix/coordinate columns. | [] |
+| `--group-column NAME` | Category/group column; values bar/heatmap needs unique row labels. | Empty |
+| `--observation-unit TEXT` | What one row represents; required for the table shortcut. | Empty |
+| `--value-unit TEXT` | Selected value columns' unit; omission is unknown. | Empty |
+| `--paired-baseline NAME` | Explicit same-row baseline among selected observation columns sharing a quantity/unit. | Empty |
+| `--data-association CHOICE` | Opt-in descriptive Pearson r for line/scatter pairs; no significance/causal inference. Choices: `none`, `pearson`. | none |
+| `--data-mode CHOICE` | observations aggregates rows; values retains supplied numbers without inferred aggregation. Choices: `observations`, `values`. | observations |
+| `--data-missing CHOICE` | Reject missing values or explicitly omit them; missing y breaks lines. Choices: `reject`, `omit`. | reject |
+| `--figure-width CHOICE` | Generic column (3.5 inch) or wide (7 inch) figure width. Choices: `column`, `wide`. | wide |
+| `--data-max-mb N` | Physical input size limit in MiB. | 20 |
+| `--data-max-figures N` | Physical SVG page limit; excess fails without dropping categories. | 100 |
+| `--data-plot CHOICE` | bar: means/values; box: observation quartiles/min-max; line/scatter: explicit coordinates; heatmap: supplied matrix. Choices: `bar`, `box`, `line`, `scatter`, `heatmap`. | bar |
+| `--x-column NAME` | Numeric x for values-mode line/scatter; distinct from value/group columns. | Empty |
+| `--x-unit TEXT` | Declared x-coordinate unit; omission is unknown. | Empty |
+| `--data-max-points N` | Physical coordinate points per figure; excess fails without sampling. | 10000 |
+| `--series-layout CHOICE` | Separate axes, or shared axes for line/scatter columns with a common declared unit. Choices: `separate`, `shared`. | separate |
+| `--data-path PATH` | Existing data file/directory; repeatable. Does not rewrite commands or automatically copy external data. | [] |
+
+#### Report controls
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--report-writing-method CHOICE` | New reports use article; explicit sectional controls select sections. Resume retains the saved method. Choices: `article`, `sections`. | New article; sections with explicit sectional controls |
+| `--max-section-tokens N` | Output cap per writing unit; zero/unset omits this extra cap. | Unset |
+| `--with-report` | Explicitly request a model-authored report; data analysis otherwise delivers analysis only. | Off |
+| `--no-report` | Skip report writing in a model-backed session. | Off |
+| `--report-template NAME_OR_PATH` | Report structure name or Markdown path. | auto |
+| `--report-reviewer CHOICE` | Report reviewer; disabled retains deterministic audit. Choices: `llm`, `disabled`. | llm |
+| `--max-review-iterations N` | Report revision/correction bound; failed proposals count too. | 1 |
+| `--report-document-review / --no-report-document-review` | Enable/disable bounded whole-document review/revision. | Off for sections; retained on resume |
+| `--report-review-scope CHOICE` | section or document; document requires document-review. Choices: `section`, `document`. | section for sections; retained on resume |
+| `--report-draft-scope CHOICE` | section, joint document or auto (joint up to 2000 planned words); document/auto requires document review and scope. Choices: `section`, `document`, `auto`. | section for sections; retained on resume |
+| `--max-document-review-prompt-chars N` | Full review request character ceiling; zero uses client/session capacity without truncating evidence. | Unset |
+| `--report-outline-strategy CHOICE` | Template outline or evidence-organized outline planning. Choices: `auto`, `template`, `adaptive`. | auto for sections; retained on resume |
+| `--report-data-tables CHOICE` | Link complete copied analysis records, or also repeat full tables in the report. Choices: `linked`, `full`. | linked for sections; retained on resume |
+
+The entry forces summary-only output, defaults to runs/research-brief and autonomous interaction, and rejects --session-root or outputs other than summary. The table lists inherited parser parameters; execution/report/recovery options still undergo research-session validation. Resume using the printed start --resume-task command.
+
+Examples:
+
+```bash
+simple-ar research-brief --topic "Summarize local sources" --local-document paper.md
+```
+
 
 ### `simple-ar research-session-continue`
 
-`simple-ar research-session-continue --session-root SESSION [--parent-attempt-id ID] [--model SELECTOR] [--cwd PATH] [--timeout-sec N] [--label TEXT] [--primary-metric NAME] [--metric NAME ...] [--metric-direction NAME=DIRECTION ...] --command ARGV...`
+Run one corrected explicit experiment after a failed/timed-out simple experiment in a saved canonical session.
 
-This compatibility command uses the saved ResearchApplication owner (canonical v2), permitting one corrected simple explicit experiment after a failed/timed_out technical candidate; scientific negative results are evidence. Cwd defaults ., timeout 300, label research-session-recovery. Latest candidate/schema retained unless explicitly overridden. Parent attempt/literature remain; deterministic analysis reruns. Paired/prepared-data/CodeTask failures use their own bounded paths. V1 execution is retired; new common tasks use native recovery.
+```text
+simple-ar research-session-continue --session-root PATH [OPTIONS] --command ARGV...
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--session-root PATH` | Saved research session; follow its printed resume command. Common tasks resume with start --resume-task. | Required |
+| `--parent-attempt-id NAME` | Failed experiment to branch from; latest canonical experiment, or experiment-001 for old layouts. | Latest experiment; experiment-001 for old layouts |
+| `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME. | Unset |
+| `--cwd PATH` | Declared command working directory. | . |
+| `--timeout-sec N` | Per-process time limit in seconds. | 300 |
+| `--label NAME` | Declared experiment label. | research-session-recovery |
+| `--primary-metric NAME` | Primary comparison metric. | Unset |
+| `--metric NAME` | Required emitted metric name; repeatable. | [] |
+| `--metric-direction NAME=DIRECTION` | NAME=DIRECTION; repeatable. Directions include higher, lower, resource and ignore. | [] |
+| `--command ARGV...` | Explicit argv; put last because all following tokens belong to the command. Research/start argv has no shell interpretation. | Required |
+
+Only a corrected simple explicit experiment is supported. Scientific negative results are not technical failures. Paired/prepared-data/CodeTask failures use their own continuation path. Retains parent evidence/schema unless explicitly overridden. V1 cannot execute; native tasks use start --resume-task.
+
+Examples:
+
+```bash
+simple-ar research-session-continue --session-root SESSION --metric accuracy --command python experiment.py
+```
+
 
 ### `simple-ar research-session-migrate`
 
-`simple-ar research-session-migrate --source-root OLD --destination-root NEW [--artifact NAME ...] [--requested-output NAME ...] [--max-artifact-bytes N]` creates a common-tool successor without changing v1. Default import cap 2 MiB; only explicitly named small files copied. Destination must be empty/outside old root. Parent/imported/skipped counts and unknown_not_imported historical budget are recorded, never guessed.
+Create a successor from a read-only v1 session, importing only named small artifacts without changing the source.
 
-### Retired `simple-ar research-experiment`
+```text
+simple-ar research-session-migrate --source-root PATH --destination-root PATH [OPTIONS]
+```
 
-Use research-session; old synthesis-file is not translated. Historical artifacts remain readable, library capabilities composable.
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--source-root PATH` | Read-only historical session containing session_manifest.v1. | Required |
+| `--destination-root PATH` | New empty successor directory, outside source root. | Required |
+| `--artifact NAME` | Explicitly named small artifact to import; repeatable. | [] |
+| `--requested-output NAME` | Requested successor output; repeatable. | Legacy brief or research_summary |
+| `--max-artifact-bytes N` | Byte limit per explicitly imported artifact. | 2097152 |
 
-### Retired segmented CodeTask command
+Only explicitly named, size-bounded artifacts are copied. Skipped facts and unknown historical budget remain disclosed, never guessed or reset.
 
-research-code-task and its independent executor are retired. Use research-session with code-task-config or standalone code-task. Historical results remain readable.
+Examples:
+
+```bash
+simple-ar research-session-migrate --source-root OLD_SESSION --destination-root NEW_SESSION --artifact research_summary.md
+```
+
+<a id="code-task-commands"></a>
+<a id="high-level-orchestration"></a>
+<a id="low-level-primitives"></a>
+
+### `simple-ar code-task init`
+
+Prepare an isolated workspace for an explicit existing-project or greenfield contract.
+
+```text
+simple-ar code-task init [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--config PATH` | TOML config for init settings. CLI flags override config values. | Unset |
+| `--code-root PATH` | Source project. Required for `existing_project`; optional scaffold/source root for `greenfield`. | Unset |
+| `--kind CHOICE` | `existing_project` for patching an existing codebase, or `greenfield` for from-scratch generation. Choices: `existing_project`, `greenfield`. | Unset |
+| `--task-file PATH` | Markdown/text task description. Required unless set in config. | Unset |
+| `--output-root PATH` | Directory where the code-task run is created. | Unset |
+| `--name NAME` | Run name suffix. | Unset |
+| `--benchmark-command VALUE` | Command run inside the workspace before and after edits. | Unset |
+| `--primary-metric NAME` | Primary metric for before/after verdicts. | Unset |
+| `--metric-direction METRIC=DIRECTION` | Metric direction: `higher`, `lower`, `resource`, or `ignore`. Repeatable. | [] |
+| `--env-mode CHOICE` | `current` or `external`. Choices: `current`, `external`. | Saved/config policy; current if unset |
+| `--python PATH` | Python executable for `--env-mode external`. | Saved/config interpreter; external policy needs one |
+| `--workspace-mode CHOICE` | `auto`, `copy`, `git_worktree`, `sparse_copy`. Greenfield defaults to empty through TOML; CLI does not accept empty. Choices: `auto`, `copy`, `git_worktree`, `sparse_copy`. | Unset |
+| `--workspace-include VALUE` | Include pattern for `sparse_copy`. Repeatable. | Unset |
+| `--workspace-exclude VALUE` | Additional exclude pattern for `sparse_copy`. Repeatable. | Unset |
+| `--workspace-reuse-source-venv` | Reuse a detected source `.venv` Python as external execution policy. | Unset |
+| `--max-file-bytes N` | Maximum copied file size in copy/sparse modes. Use `0` to disable. | Unset |
+
+Examples:
+
+```bash
+simple-ar code-task init --config code-task.toml
+```
+
+
+### `simple-ar code-task execute`
+
+Continue bounded planning, review, edits and benchmarks for a saved CodeTask.
+
+```text
+simple-ar code-task execute RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--config PATH` | Optional TOML for model routing, budget, and runtime settings. | Unset |
+| `--to-step CHOICE` | Stop no later than `probe`, `baseline`, `work-plan`, `batch`, `plan`, `propose-edits`, `apply-edits`, `review`, `validate`, `run`, `analyze-failure`, or `repair`. Choices: `probe`, `baseline`, `work-plan`, `batch`, `plan`, `propose-edits`, `apply-edits`, `review`, `validate`, `run`, `analyze-failure`, `repair`. | Config or run |
+| `--dry-run` | Print the next action without writing artifacts. | Off |
+| `--model SELECTOR` | Model override for LLM-backed steps. | Unset |
+| `--no-llm` | Use deterministic fallbacks where possible. | Off |
+| `--timeout N` | Benchmark timeout. | 60 |
+| `--yes` | Auto-approve inline review gates in normal execute mode; with `--interactive`, auto-continue primitive prompts. Use only after you are comfortable approving the reviewed plan/proposal. | Off |
+| `--interactive` | Debug mode: confirm each primitive step instead of running continuously to the next review gate. | Off |
+| `--no-review-inline` | Disable inline review prompts and stop at review gates instead. | Off |
+| `--skip-validation` | Run benchmark even when static validation has not passed. | Off |
+| `--strict-validation` | Treat higher-risk validation warnings as errors. | Off |
+| `--validation-max-file-bytes N` | Max file size scanned by static validation. | 500000 |
+| `--apply-proposed-edits` | Apply reviewed `proposed_edits.json` after plan approval. | Off |
+| `--allow-large-edits` | Allow a reviewed proposal that exceeds the normal edit budget. | Off |
+| `--allow-planning-fallback` | Allow offline plans after known complete response-format failures only. | Off |
+| `--planning-mode CHOICE` | Greenfield architecture planning; tool_agent is a deprecated alias for compact. Choices: `tool_agent`, `compact`. | Config or compact |
+| `--llm-retry-attempts N` | Completed-response correction bound including the first attempt; transport retries use model settings. | Config or 3 |
+| `--planning-review-rounds N` | Deprecated; nonzero only emits a notice, granting no review calls. | Config or 0; retired |
+| `--repair-rounds N` | Number of bounded repair proposals after failure. | Config or 0 |
+| `--reuse-planning-from PATH` | Import immutable accepted greenfield planning after task-contract hash checks; no generated code, memory, findings or repair history. | Unset |
+| `--review-gate CHOICE` | Strict blocks all blocking review findings; runtime blocks safety/direct executability, retaining packaging/report gaps. Choices: `strict`, `runtime`. | Config or strict |
+| `--baseline-policy CHOICE` | Existing-project baseline handling: `auto`, `run`, `skip`, `provided`, or `none`. Use `skip`/`none` for expensive baselines, or `provided` with a metrics file. Choices: `auto`, `run`, `skip`, `provided`, `none`. | Config or auto |
+| `--baseline-metrics-file PATH` | JSON or metric-line file used when `--baseline-policy provided`. | Unset |
+| `--max-files N` | Context file budget for LLM steps. | 8 |
+| `--max-source-chars-per-file N` | Per-file source context budget. | 4000 |
+| `--env-mode CHOICE` | `current` or `external`. Choices: `current`, `external`. | Saved/config policy; current if unset |
+| `--python PATH` | Python executable for external env mode. | Saved/config interpreter; external policy needs one |
+
+Execution stops at review gates. --yes can approve inline CodeTask gates; native start process approvals use different rules. --no-review-inline stops at gates; --interactive asks before primitive steps. Applying edits requires plan approval plus --apply-proposed-edits; larger edits need separate authorization. Offline planning fallback is limited to known complete response-format failures, never transport/budget/deadline/partial-stream failures. Response corrections include the first attempt; transport retries belong to the model connection. Benchmark completion does not prove objective improvement.
+
+Examples:
+
+```bash
+simple-ar code-task execute RUN_DIR --config code-task.toml --dry-run
+simple-ar code-task execute RUN_DIR --config code-task.toml
+```
+
+
+### `simple-ar code-task decide-plan`
+
+Record a human decision on the current patch plan.
+
+```text
+simple-ar code-task decide-plan RUN_DIR --decision CHOICE [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--decision CHOICE` | `approve`, `reject`, or `revise`. Required. Choices: `approve`, `reject`, `revise`. | Required |
+| `--note TEXT` | Optional review note. | Empty |
+| `--reviewer VALUE` | Reviewer label. | user |
+
+Examples:
+
+```bash
+simple-ar code-task decide-plan RUN_DIR --decision approve
+```
+
+
+### `simple-ar code-task probe`
+
+Inspect runtime/environment without installing dependencies or running benchmarks.
+
+```text
+simple-ar code-task probe RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--env-mode CHOICE` | `current` or `external`. Choices: `current`, `external`. | Saved/config policy; current if unset |
+| `--python PATH` | Python executable for external env mode. | Saved/config interpreter; external policy needs one |
+
+Examples:
+
+```bash
+simple-ar code-task probe RUN_DIR
+```
+
+
+### `simple-ar code-task map`
+
+Rebuild the workspace repository map and index.
+
+```text
+simple-ar code-task map RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--no-refresh-index` | Reuse the existing `codebase_index.json`. | Off |
+| `--show-summary` | Print `repo_map_summary.md`. | Off |
+
+Examples:
+
+```bash
+simple-ar code-task map RUN_DIR
+```
+
+
+### `simple-ar code-task locate`
+
+Rank likely editable files and read-only evidence.
+
+```text
+simple-ar code-task locate RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--query TEXT` | Locate query. Defaults to `code_task/task.md`. | Unset |
+| `--top-k N` | Candidate count per group. | 8 |
+| `--refresh-map` | Rebuild index and repo map before ranking. | Off |
+| `--no-read-only` | Omit protected read-only evidence files. | Off |
+| `--show-summary` | Print `locate_results.md`. | Off |
+
+Examples:
+
+```bash
+simple-ar code-task locate RUN_DIR
+```
+
+
+### `simple-ar code-task context`
+
+Build a bounded prompt context pack from located files.
+
+```text
+simple-ar code-task context RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--query TEXT` | Locate query. Defaults to `task.md`. | Unset |
+| `--top-k N` | Locate candidate budget. | 8 |
+| `--max-files N` | Maximum snippets included. | 8 |
+| `--max-source-chars-per-file N` | Per-file snippet budget. | 4000 |
+| `--max-total-chars N` | Total snippet budget. | 20000 |
+| `--refresh-map` | Rebuild map before packing context. | Off |
+| `--show-prompt` | Print `prompt_context.md`. | Off |
+
+Examples:
+
+```bash
+simple-ar code-task context RUN_DIR
+```
+
+
+### `simple-ar code-task work-plan`
+
+Generate a batch-oriented implementation work plan.
+
+```text
+simple-ar code-task work-plan RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--model SELECTOR` | Model override. | Unset |
+| `--no-llm` | Use fallback planning. | Off |
+| `--force` | Regenerate existing work-plan artifacts. | Off |
+| `--allow-planning-fallback` | Allow offline plans after known complete response-format failures only. | Off |
+| `--llm-retry-attempts N` | Completed-response correction bound including the first attempt; transport retries use model settings. | 1 |
+| `--max-files N` | Planning context file budget. | 8 |
+| `--max-source-chars-per-file N` | Per-file source context budget. | 2500 |
+
+Examples:
+
+```bash
+simple-ar code-task work-plan RUN_DIR
+```
+
+
+### `simple-ar code-task batch`
+
+Create an attempt/batch for one work-plan item.
+
+```text
+simple-ar code-task batch RUN_DIR --work-item NAME [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--work-item NAME` | Work-plan item id, such as `W1`. Required. | Required |
+| `--attempt-id NAME` | Optional attempt id, such as `attempt-001`. | Unset |
+| `--force` | Create a new batch even when one already exists. | Off |
+
+Examples:
+
+```bash
+simple-ar code-task batch RUN_DIR --work-item W1
+```
+
+
+### `simple-ar code-task plan`
+
+Generate a patch plan for human review.
+
+```text
+simple-ar code-task plan RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--model SELECTOR` | Model override. | Unset |
+| `--no-llm` | Use fallback plan. | Off |
+| `--force` | Regenerate existing plan. | Off |
+| `--allow-planning-fallback` | Allow offline plans after known complete response-format failures only. | Off |
+| `--llm-retry-attempts N` | Completed-response correction bound including the first attempt; transport retries use model settings. | 1 |
+| `--max-files N` | Context file budget. | 8 |
+| `--max-source-chars-per-file N` | Per-file source context budget. | 2500 |
+
+Examples:
+
+```bash
+simple-ar code-task plan RUN_DIR
+```
+
+
+### `simple-ar code-task propose-edits`
+
+Propose controlled old/new text edits without applying them.
+
+```text
+simple-ar code-task propose-edits RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--model SELECTOR` | Model override. | Unset |
+| `--no-llm` | Write deterministic empty proposal. | Off |
+| `--force` | Regenerate existing proposal. | Off |
+| `--max-files N` | Editable context file budget. | 8 |
+| `--max-source-chars-per-file N` | Per-file source context budget. | 4000 |
+| `--allow-large-edits` | Accept a large but bounded proposal after review. | Off |
+
+Examples:
+
+```bash
+simple-ar code-task propose-edits RUN_DIR
+```
+
+
+### `simple-ar code-task apply-edits`
+
+Apply a reviewed edit proposal inside the allowed workspace scope.
+
+```text
+simple-ar code-task apply-edits RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--edits-file PATH` | Specific proposal file to apply. | Unset |
+| `--allow-unapproved-plan` | Bypass plan approval for local tests/demos. | Off |
+| `--allow-large-edits` | Apply a reviewed proposal that requires large-edit approval. | Off |
+
+Checks paths, scope, unique old text and edit budgets. Repairs are not automatically applied: review and pass their --edits-file. --allow-unapproved-plan bypasses human approval and is intended only for local tests/demos.
+
+Examples:
+
+```bash
+simple-ar code-task apply-edits RUN_DIR --edits-file PROPOSAL_JSON
+```
+
+
+### `simple-ar code-task validate`
+
+Run lightweight static validation; passing is not runtime proof.
+
+```text
+simple-ar code-task validate RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--strict` | Treat higher-risk warnings as errors. | Off |
+| `--max-file-bytes N` | Maximum file size scanned. | 500000 |
+
+Examples:
+
+```bash
+simple-ar code-task validate RUN_DIR
+```
+
+
+### `simple-ar code-task baseline`
+
+Run the saved benchmark before edits.
+
+```text
+simple-ar code-task baseline RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--command VALUE` | Quoted benchmark command string overriding the saved command. | Unset |
+| `--timeout N` | Benchmark timeout. | 60 |
+| `--skip-validation` | Run even when static validation has not passed. | Off |
+| `--env-mode CHOICE` | `current` or `external`. Choices: `current`, `external`. | Saved/config policy; current if unset |
+| `--python PATH` | Python executable for external env mode. | Saved/config interpreter; external policy needs one |
+
+Examples:
+
+```bash
+simple-ar code-task baseline RUN_DIR
+```
+
+
+### `simple-ar code-task run`
+
+Run the saved benchmark after edits and compare available baseline metrics.
+
+```text
+simple-ar code-task run RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--command VALUE` | Quoted benchmark command string overriding the saved command. | Unset |
+| `--timeout N` | Benchmark timeout. | 60 |
+| `--skip-validation` | Run even when static validation has not passed. | Off |
+| `--env-mode CHOICE` | `current` or `external`. Choices: `current`, `external`. | Saved/config policy; current if unset |
+| `--python PATH` | Python executable for external env mode. | Saved/config interpreter; external policy needs one |
+
+Examples:
+
+```bash
+simple-ar code-task run RUN_DIR
+```
+
+
+### `simple-ar code-task analyze-failure`
+
+Summarize the latest validation/benchmark failure deterministically.
+
+```text
+simple-ar code-task analyze-failure RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+
+Examples:
+
+```bash
+simple-ar code-task analyze-failure RUN_DIR
+```
+
+
+### `simple-ar code-task repair`
+
+Propose bounded repair edits; review and apply separately.
+
+```text
+simple-ar code-task repair RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--model SELECTOR` | Model override. | Unset |
+| `--no-llm` | Write deterministic empty repair proposal. | Off |
+| `--max-files N` | Repair context file budget. | 8 |
+| `--max-source-chars-per-file N` | Per-file source context budget. | 4000 |
+
+Writes a proposal only; review before applying with code-task apply-edits --edits-file.
+
+Examples:
+
+```bash
+simple-ar code-task repair RUN_DIR
+```
+
+<a id="tools-and-mcp"></a>
+
+### `simple-ar tools schema`
+
+Export registered read-only tool schemas to stdout or a file.
+
+```text
+simple-ar tools schema [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `--format CHOICE` | Schema export format. Choices: `mcp`, `openai`. | mcp |
+| `--output PATH` | This command's output directory/file. | stdout |
+
+Examples:
+
+```bash
+simple-ar tools schema --format mcp --output schemas.json
+```
+
+
+### `simple-ar tools call`
+
+Call one registered read-only tool with a JSON object and save its trace.
+
+```text
+simple-ar tools call RUN_DIR TOOL_NAME [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `TOOL_NAME` | Registered read-only run tool name. | Required |
+| `--args-json VALUE` | Tool arguments as a JSON object; --args-file avoids shell quoting issues. | {} |
+| `--args-file PATH` | Read argument JSON object from file instead of --args-json. | Unset |
+| `--debug-payloads` | Retain larger payloads in tool traces. | Off |
+
+Arguments must be a JSON object. --args-file takes precedence. Appends RUN_DIR/tools/tool_trace.jsonl.
+
+Examples:
+
+```bash
+simple-ar tools call RUN_DIR TOOL_NAME --args-file arguments.json
+```
+
+
+### `simple-ar tools serve-mcp`
+
+Serve registered read-only run tools over MCP stdio; no shell, write, network or installation capability is granted.
+
+```text
+simple-ar tools serve-mcp RUN_DIR [OPTIONS]
+```
+
+| Parameter | Meaning | Default or conditions |
+| --- | --- | --- |
+| `RUN_DIR` | Existing run/task directory. | Required |
+| `--debug-payloads` | Retain larger payloads in tool traces. | Off |
+
+Examples:
+
+```bash
+simple-ar tools serve-mcp RUN_DIR
+```
+
+Compatibility note: `simple-ar run`, `simple-ar resume`, `simple-ar research-experiment` and `simple-ar research-code-task` are retired and reject execution. Use start for goals or research-session/code-task for explicit contracts; status can inspect supported historical results. Old stage/synthesis-file options are not translated.

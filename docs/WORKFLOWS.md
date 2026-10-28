@@ -21,9 +21,9 @@ A task can investigate sources, change code, run calculations and produce a repo
 Existing results can be reused without rerunning experiments. Grant only the access
 needed by the recipe; commands still need approval and model/API calls may incur charges.
 
-Sections marked V2.10 describe development work on `feat/v2.10-project-research-assistant`;
-they do not imply full acceptance or a release. Use the main-branch [installation](USAGE.md#installation)
-and check [evidence and limits](showcase/README.md#scope-and-current-limitations) for each case.
+This page describes the current branch. Keep documentation and installation versions aligned.
+These are example requests, not claims that every goal has passed end-to-end acceptance.
+See the existing cases' [evidence and limits](showcase/README.md#scope-and-current-limitations).
 Review [effective settings](USAGE.md#configure-once-and-continue-from-the-result):
 preferences guide deliverables; permissions and budgets govern access and resources.
 
@@ -70,44 +70,12 @@ uv run simple-ar start "Create a Python CLI that summarizes selected metrics fro
 do not assume your original project was modified.
 Proposed commands still require individual approval. Review their code and side effects before execution.
 
-For development-branch project work, inspect the retained project inventory as well as
-the edits. Current bounds are 12 edited sources, 4,096 retained members, 64 MiB per file
-and 128 MiB total; oversized projects are refused before generation. Unedited non-runtime
-members retain their bytes, including binary/large dependencies, but this does not mean
-they were inspected or that missing dependencies were found. This applies to ordinary,
-copied and registered feedback projects. Approval/execution use the same bound inventory;
-it need not be enumerated as separate public process inputs. It does not copy task history,
-and broader project continuity remains unaccepted.
-
 **Inspect:** source or patches, actual verification logs, outcomes and unresolved issues.
 Model review and static checks do not replace behavioral verification.
 Continue the same session with a failing input or a changed requirement.
 
-### Fixed edit scope and verification
-
-Keep a scoped repair in the ordinary task session when the project, editable paths and
-independent validator are already known:
-
-```bash
-uv run simple-ar start --kind bug_fix --goal "Fix the missing-value crash" --project ./my-project --allow "src/**" --validate "python tests/check.py"
-```
-
-Approve the displayed work and source identity before execution. This contract keeps code
-changes and validation under CodeTask; generic workspace writes/processes cannot bypass it.
-Feedback can continue a verified candidate as a new version, with the same scope, validator
-and remaining budget. Originals and prior candidates stay unchanged. Disclose incomplete
-work rather than delivering an unrelated file as a completed repair.
-
-For explicit baseline, environment or staged approval controls, use standalone CodeTask:
-
-```bash
-uv run simple-ar code-task init --config examples/code_task_medium_review/configs/code_task.toml
-uv run simple-ar code-task execute "RUN" --config examples/code_task_medium_review/configs/code_task.toml
-```
-
-Replace `RUN` with the directory printed by `init`, and follow plan/proposal approval prompts.
-See the [multi-file example](../examples/code_task_medium_review/README.md) and
-[configuration reference](CONFIG_REFERENCE.md) for workspace, environment, baseline and execution settings.
+For a fixed edit scope, validation command and baseline, use the [multi-file example](../examples/code_task_medium_review/README.md)
+and [CodeTask configuration](CONFIG_REFERENCE.md). Ordinary code tasks need not begin with these expert settings.
 
 ## Analysis and data figures
 
@@ -201,11 +169,9 @@ Distinguish local editing from restructuring:
 uv run simple-ar start --resume-task "SESSION" "Keep the first draft. Reorganize it into problem, route comparisons, evidence limitations and recommendations without changing the results."
 ```
 
-### Continue a retained draft (V2.10 development)
-
-When a draft has not passed inspection, ask to finish the latest retained candidate. The writing owner checks its author records and original evidence. An unfinished inspection is completed; a complete negative inspection feeds correction directly, followed by verification, without redrafting an older version.
-
-Work candidates and adopted manuscripts are saved separately. Fixing one problem does not waive the remaining required findings or authorize publication. Earlier drafts, candidates, inspections and usage records remain intact. Older drafts without the necessary production records do not acquire this continuation authority.
+If a manuscript is incomplete, inspect its task status and retained files before requesting specific changes.
+A candidate is not a final delivery: check that this revision is reflected in both the prose and figures.
+Feedback uses the original session's materials, permissions and remaining allowance.
 
 ### Export ACM LaTeX and PDF
 
@@ -224,64 +190,19 @@ See the [CLI reference](CLI_REFERENCE.md) for files and dependencies.
 
 ### Supplied templates
 
-On the V2.10 development branch, native tasks can use a trusted **Pandoc LaTeX template** instead of the built-in ACM layout:
+If you have a trusted Pandoc LaTeX template, provide it with the manuscript, references and figures:
 
 ```bash
-uv run simple-ar start "Use this report and supplied trusted template. Preserve the Markdown and references, export an editable TeX project and PDF, and render every page for inspection. Explain any unchecked submission requirements." --source ./paper --allow-execution
+uv run simple-ar start "Use this report and trusted template. Preserve the prose, references and figures; export an editable TeX project and PDF. Explain unchecked submission requirements." --source ./paper --allow-execution
 ```
 
-Keep the report and a focused template bundle in the supplied directory, not your
-credentials or unrelated files. The template needs `$body$` and the standard
-`$for(header-includes)$$header-includes$$endfor$` hook in its preamble.
-The renderer consumes a prepared trusted template. Autonomous discovery and full conference compliance
-require verification; successful compilation does not establish submission compliance.
+See [report-export](CLI_REFERENCE.md#simple-ar-report-export) for template format, companion files and dependencies.
+Autonomous template discovery and complete submission compliance remain unverified.
+For template preparation, provide the official entry point, year and submission stage, not just a conference name.
 
-For a new task requiring template preparation, provide an explicit
-official entry point, year and submission stage. The task may use research and code capabilities to retrieve rules and adapt an example into a Pandoc wrapper, subject to network and execution permissions. Treat this as a request requiring verification, not an accepted end-to-end workflow:
-
-```bash
-uv run simple-ar start "Use https://iclr.cc/Conferences/2025/CallForPapers and its links to prepare the supplied manuscript in the 2025 initial anonymous submission layout. Preserve the prose, references, figures, tables and numbers. Retain template/rule sources and adaptation notes; deliver editable sources, PDF and every page preview. Disclose unmet rules without changing scientific content to force compliance. Do not rerun experiments or install an environment." --source ./paper --allow-network --allow-execution
-```
-
-For template preparation, ask the assistant to:
-
-1. Verify the official year/stage and retain the rules and template as materials.
-2. Use an existing Pandoc template directly, or adapt native conference TeX into a wrapper.
-   Adaptation handles variables, packages and layout; you need not select internal tools
-   or edit task JSON. Authorized files can be copied using their observed full hashes.
-3. Retain failures and ask for missing rules/templates if retrieval fails. Do not guess
-   another year or silently substitute ACM.
-
-Research, code and file tools perform this work; the renderer does not discover or download
-templates. Autonomous completion remains unverified. Authored Abstract/Summary sections
-stay in the body; headings do not populate `$abstract$` metadata automatically.
-
-The standalone `report-export` command defaults to ACM and also supports explicit
-trusted-template options; see [export options](CLI_REFERENCE.md#simple-ar-report-export).
-For a native task, describe the required hierarchy and provide a focused template bundle
-(up to 32 flat companion files/16 MB). Partials, scripts and custom build commands are
-unsupported. Abstract/Summary headings stay in the body rather than automatically
-populating template metadata.
-
-Template bytes, figures and output versions share the existing approval and recovery
-contract. Only use trusted TeX: no shell escape is enabled, but this is not a sandbox.
-Inspect warnings and every page. Fonts, explicit column widths, page limits and
-anonymity still require checking; compilation alone does not establish compliance.
-
-For optional page-count and identifying-string checks, state the exact limits in your
-request. They require PDF compilation and installed Poppler tools. Inspect `export.json`
-and saved diagnostics: failed/unavailable checks retain the project but block optional
-final delivery. These finite checks do not certify anonymity or venue compliance.
-Describe these requirements in the task; raw tool parameters are not needed for ordinary use.
-
-**Inspect:** every PDF page, warnings, figure/caption fit, table wrapping, fonts,
-column widths and the rules for the requested year and stage. Unsupported composite or
-nested images and captions that cannot fit fail with sources retained. Supplied captions
-remain bound to the exported figure; scientific text, numbering, links and citations
-must remain intact. Historical manuscripts retain their saved caption policy.
-
-Model-based visual inspection additionally needs a configured vision connection
-and explicit `--allow-vision`; rendering alone does not grant it.
+**Inspect:** every PDF page, figure, caption, line break and font, plus page limits and anonymity rules.
+Compilation does not establish submission compliance. Use trusted TeX; execution isolation is not a security sandbox.
+Model-based visual inspection also requires a vision route and `--allow-vision`.
 
 ## Finite reproduction
 
@@ -318,20 +239,9 @@ Saved legacy ResearchApplication sessions retain their original command:
 uv run simple-ar research-session --session-root "SESSION" --model env
 ```
 
-### Reuse materials in a new task (V2.10 development)
+To give existing results a new goal and budget, use `--from-session` and `--reuse`; see the [CLI reference](CLI_REFERENCE.md).
+Use `--resume-task` to continue the original task instead.
 
-To give saved outputs a new goal and budget, add `from_session = "../saved-task"` and `reuse = ["artifacts"]` to the existing native `[task]` TOML table. You can also select named groups listed by `simple-ar results`; group names are not filesystem paths. The session path is relative to the configuration. Reuse checks material bytes and does not inherit permissions, budget or execution state. To continue the original task, use `--resume-task` instead.
-
-### Add a trusted local extension (V2.10 development)
-
-Add `extensions = ["../my-skill"]` to the native `[task]` table and start with
-`--task-config PATH`. Use only trusted packages: Python has the host's OS privileges,
-and read-only/plan declarations are not a sandbox. Missing or changed packages block
-continuation. See [setup, descriptor and resume rules](CONFIG_REFERENCE.md#trusted-local-packages),
-the example [descriptor](../examples/local_extension/extension.toml) and
-[Python tool](../examples/local_extension/notes.py).
-
-Keep complete delivery directories rather than copying only a PDF and losing figures, sources
-or reconstruction materials. When paused or failed, inspect the reason first.
-See the [CLI reference](CLI_REFERENCE.md) for approval, retry and allowance rules.
-Do not delete records or repeatedly start new tasks as a substitute for recovery.
+Keep the whole delivery directory so figures, sources and rebuild materials travel with the PDF.
+If a task pauses or fails, inspect the reason and follow its printed continuation command.
+Do not delete records or repeatedly create tasks to recover existing work.
