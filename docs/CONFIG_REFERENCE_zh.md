@@ -124,6 +124,8 @@ code = "daily"
 
 字段与类型严格校验。图像 profile 只接受图像能力并拒绝文本生成设置；文本 profile 拒绝图像生成能力与尺寸／质量。Chat 禁用思考时 effort 须为空或 none。声明必须符合提供方实际支持。
 
+推理档位由提供方解释，同名档位不保证效果相同。例如 [DeepSeek 的参数说明](https://api-docs.deepseek.com/guides/thinking_mode/)将 `medium` 映射为 `high`；希望使用低档时应明确设置 `low`。修改已保存任务的思考设置，应显式更换命名连接。
+
 | 选择器／使用方 | 解析方式 |
 | --- | --- |
 | env | 目录 text → default；无目录时旧环境连接 |

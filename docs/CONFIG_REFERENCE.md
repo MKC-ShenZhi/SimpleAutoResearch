@@ -124,6 +124,8 @@ Fields below belong to `[profiles.NAME]`. **Operational** settings can be retune
 
 Fields/types are strict. Image profiles accept image capabilities and reject text-generation settings; text profiles reject image-generation capabilities and size/quality. Chat disabled thinking requires empty effort or `none`. Provider support must match declared settings.
 
+Effort names are interpreted by each provider. For example, [DeepSeek maps `medium` to `high`](https://api-docs.deepseek.com/guides/thinking_mode/); request `low` explicitly for its low tier. Changing thinking settings on a saved task requires an explicit named-connection switch.
+
 | Selector / consumer | Resolution |
 | --- | --- |
 | `env` | Catalog text route → default; legacy environment if no catalog |

@@ -15,6 +15,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Fixed
 
 - Resource exhaustion in search, execution and other operations now pauses shared-loop work instead of buying further investigation of the same blocker. Existing artifacts, failures and accounting remain available for revised requests or explicitly authorized continuation.
+- Saved requests that failed preflight can resume after configuration is restored, without submitting duplicate feedback. Completed clarification turns still wait for a caller response.
 
 ## 2026-10-28 — V2.10 development (unreleased)
 

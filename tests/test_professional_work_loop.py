@@ -526,6 +526,42 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     self._submit(_action('analyze_table', **table))
                     self._ok('analyze_table')
 
+    def test_saved_request_resumes_after_preflight_is_restored_without_duplicate_feedback(self):
+        for answered in (False, True):
+            with self.subTest(existing_reply=answered):
+                self.root=self.directory/str(answered)
+                self._create(goal='Write a short Markdown note from the supplied observations.')
+                feedback=''
+                if answered:
+                    self.decisions.append(_action('ask_user',question='Which observations should the note cover?'))
+                    self._run()
+                    calls=self.send.call_count
+                    self.assertEqual(self.app.session.manifest.status,'paused')
+                    self._reload()
+                    self._run()
+                    self.assertEqual(self.send.call_count,calls)  # No new request: still wait for the caller.
+                    feedback='Use the already supplied observations and state their scope.'
+                calls=self.send.call_count
+                with patch.object(self.app,'_client',side_effect=ValueError('Restore the configured connection')):
+                    self._run(feedback=feedback)
+                self.assertEqual(self.send.call_count,calls)
+                self.assertIsNone(self.app.state['pending'])
+                entries=self.app.ledger.to_dict()['entries']
+                requests=list(self.app.state['requests'])
+                prior_turns=len(self.app.state['turns'])
+                self._reload()
+                self.decisions.extend([
+                    _action('write_file',path='note.md',content='# Supplied observations\n\nOnly the supplied samples are covered.\n'),
+                    _action('deliver_result',summary='Prepared the requested note.',artifacts=['note.md']),
+                ])
+                self._run()
+                self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
+                self.assertEqual(self.app.state['requests'],requests)
+                self.assertTrue(all(turn['request_count']==len(requests) for turn in self.app.state['turns'][prior_turns:]))
+                self.assertEqual(self.app.ledger.to_dict()['entries'][:len(entries)],entries)
+                self.assertTrue((self.root/'workspace/note.md').is_file())
+                self.assertFalse(self.transport_errors)
+
     def test_chinese_markdown_feedback_delivers_without_a_report_or_publication_contract(self):
         self.app = ToolApplication.create(self.root,
             '把已有观察整理成简短的中文 Markdown 说明，保留适用范围即可。',

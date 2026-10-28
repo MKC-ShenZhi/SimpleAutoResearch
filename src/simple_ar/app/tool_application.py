@@ -5006,21 +5006,25 @@ class ToolApplication:
                     pending = self.state['pending']
                     if pending is None and self.session.manifest.status_reason != 'Caller requested boundary stop':
                         turns = self.state['turns']
-                        correctable_text = (self.operations is not None and self._unacted_reply_count()==1
-                            and not self.ledger.unknown_dimensions(current_allowance_only=True)
+                        closed_work = (not self.ledger.unknown_dimensions(current_allowance_only=True)
                             and not any(entry.status == 'reserved' for entry in self.ledger.entries))
-                        if not correctable_text and (not turns or turns[-1].get('origin') != 'professional'
+                        correctable_text = self.operations is not None and self._unacted_reply_count()==1 and closed_work
+                        # A saved request can fail preflight before any native
+                        # turn starts. After conditions are restored, continue
+                        # that request rather than requiring duplicate feedback.
+                        unstarted_request = (self.operations is not None and closed_work
+                            and (not turns or turns[-1].get('request_count',1) < len(self.state['requests'])))
+                        if not (correctable_text or unstarted_request) and (not turns or turns[-1].get('origin') != 'professional'
                                 or turns[-1].get('request_count', 1) != len(self.state['requests'])):
                             return self.result_snapshot()
-                        retained = self.session.store.read_json(turns[-1]['reply'])
-                        # Explicit resume may re-derive the next operation from
-                        # a completed professional receipt after a handoff failed.
-                        # It never replays that operation. Recorded owner stops
-                        # require owner-proven handback or resource continuation.
-                        completed_outcome = (turns[-1]['tools'] and not turns[-1]['remaining']
-                            and not retained.get('owner_stop'))
-                        if not correctable_text and not completed_outcome and not self._professional_stop_can_resume(retained):
-                            return self.result_snapshot()
+                        if not (correctable_text or unstarted_request):
+                            retained = self.session.store.read_json(turns[-1]['reply'])
+                            # Historical professional stops still require their
+                            # owner's handback; recovery never replays the work.
+                            completed_outcome = (turns[-1]['tools'] and not turns[-1]['remaining']
+                                and not retained.get('owner_stop'))
+                            if not completed_outcome and not self._professional_stop_can_resume(retained):
+                                return self.result_snapshot()
                     attempts = self.session.list_attempts()
                     if pending is None or not any(a.attempt_id == pending['attempt'] and a.status == 'running' for a in attempts):
                         self.session.continue_with_revision('Resume pending work without resetting its budget')
