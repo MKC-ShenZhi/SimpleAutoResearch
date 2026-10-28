@@ -52,6 +52,79 @@ def expand_history_view(view):
 
 
 class WorkingContextTests(unittest.TestCase):
+    def test_current_work_keeps_notes_originals_and_recent_reads_without_backfill(self):
+        def read(turn, path, text, **extra):
+            return observation(turn, text, path=path, role='historical_observation', **extra)
+
+        current = read(3, 'outputs/explanation.txt', 'The editable current explanation.')
+        basis = read(1, 'inputs/conditions.txt', 'Original experimental conditions.')
+        unrelated = read(0, 'inputs/archive.txt', 'Old material is still retrievable. ' * 120)
+        authored = read(4, 'outputs/new.txt', 'Writing bytes is not reading evidence.')
+        authored['role'] = 'write_context'
+        stale = read(2, 'inputs/changed.txt', 'Superseded input.', sha256='old')
+        recent = read(1, 'inputs/intermediate.txt', 'Newly observed intermediate result.',
+                      record='records/recent-read.json')
+        notes = [{'text': 'Working judgment, not a certificate.',
+                  'records': [basis['record'], stale['record'], 'records/missing-note-source.json']}]
+        blocks = [block(0, unrelated['text'] * 20), block(1, 'Newly observed intermediate result.'),
+                  block(2, 'Latest genuine execution failure, not a new instruction.')]
+        operations = [{'turn': 0, 'request_count': 1, 'reply': 'records/old.json',
+                       'observation': {'tool': 'read_file', 'record': unrelated['record'], 'status': 'ok'}}]
+        kwargs = dict(material_policy='current', active_from_turn=1,
+            observations=[unrelated, basis, authored, stale, current, recent],
+            turn_blocks=blocks, work_notes=notes, current_artifacts=[current['path'], authored['path']],
+            version_resolver=lambda path: 'recorded-digest', operation_history=operations,
+            context_token_target=14000)
+        before = deepcopy(kwargs)
+        messages, metadata = select(**kwargs)
+        view = json.loads(messages[1]['content'])['working_view']
+        text = json.dumps(messages)
+        self.assertEqual(view['notes'], notes)
+        self.assertIn(current['text'], text)
+        self.assertIn(basis['text'], text)
+        self.assertIn('Newly observed intermediate result.', text)
+        self.assertIn('Latest genuine execution failure', text)
+        self.assertNotIn(unrelated['text'], text)
+        self.assertNotIn(authored['text'], text)
+        self.assertNotIn(stale['text'], text)
+        self.assertLess(metadata['estimated_input_tokens'], 14000)
+        self.assertEqual(view['operation_overview']['omitted_entries'], 1)
+        statuses = {row['source']['record']: row['status'] for row in metadata['omitted_records']}
+        self.assertEqual(statuses[unrelated['record']], 'unreferenced')
+        self.assertEqual(statuses[authored['record']], 'unavailable')
+        self.assertEqual(statuses[stale['record']], 'stale')
+        references = json.loads(messages[1]['content'])['material_supply']['references']
+        self.assertEqual({row['record']: row['status'] for row in references},
+            {basis['record']:'working_view', stale['record']:'stale',
+             'records/missing-note-source.json':'missing'})
+        self.assertEqual(kwargs, before)
+        # A source replacement cannot be hidden by retained notes or a current
+        # artifact label. A different caller can still explicitly select old
+        # recorded originals without making every old receipt mandatory.
+        changed, _ = select(**{**kwargs, 'version_resolver': lambda path: 'replacement'})
+        self.assertNotIn(current['text'], json.dumps(changed))
+        self.assertNotIn(basis['text'], json.dumps(changed))
+        selected, _ = select(**{**kwargs, 'selected_records': [unrelated['record']],
+                               'context_token_target': 22000})
+        self.assertIn(unrelated['text'], json.dumps(selected))
+        prior = read(0, 'inputs/earlier.txt', 'Earlier original survives when notes cannot be supplied.')
+        fallback, _ = select(material_policy='current', active_from_turn=1,
+            turn_blocks=[block(0, 'Earlier reasoning. ' * 1000), block(1, 'Latest result.')],
+            observations=[prior], work_notes=[{'text':'Oversized understanding. ' * 1000,'records':[]}],
+            version_resolver=lambda path:'recorded-digest', context_token_target=4000)
+        fallback_view = json.loads(fallback[1]['content'])['working_view']
+        self.assertEqual(fallback_view['notes'], [])
+        self.assertEqual(fallback_view['history']['active_material_start_turn'], 0)
+        self.assertIn(prior['text'], json.dumps(fallback))
+        partial, _ = select(material_policy='current', active_from_turn=1,
+            turn_blocks=[block(0, 'Earlier reasoning. ' * 1000), block(1, 'Latest result.')],
+            observations=[prior], work_notes=[{'text':'Small current judgment.','records':[]},
+                {'text':'Oversized understanding. ' * 1000,'records':[]}],
+            version_resolver=lambda path:'recorded-digest', context_token_target=4000)
+        self.assertEqual(len(json.loads(partial[1]['content'])['working_view']['notes']), 1)
+        self.assertEqual(json.loads(partial[1]['content'])['working_view']['history']['active_material_start_turn'], 0)
+        self.assertIn(prior['text'], json.dumps(partial))
+
     def test_scoped_originals_precede_optional_navigation_and_report_real_omissions(self):
         first = observation(0, 'Original observed measurement and its scope.')
         unused = observation(1, 'An unrelated, unreferenced observation.')

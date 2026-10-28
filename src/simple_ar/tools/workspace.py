@@ -862,6 +862,33 @@ class WorkspaceToolGateway:
                 'last_operation': last_operation,
                 'next_action': next_action or 'Resume this saved task after addressing the stop condition; completed work and accounting are retained.'}
 
+    def working_artifact_paths(self, result: dict) -> set[str]:
+        """Current work roles from owner receipts, not every historical output.
+
+        Resolve only declared identities; this neither discovers files, reads
+        their bytes nor certifies current versions. The context owner separately
+        validates any original text it presents for these paths.
+        """
+        delivered, produced = result['last_delivery'], result['latest_produced']
+        manuscript = ((delivered or {}).get('report') or {}).get('manuscript')
+        producer = (produced or {}).get('record')
+        records = {producer} if producer else set()
+        if delivered:
+            if not manuscript:
+                records.add(delivered['record'])
+            elif producer == delivered['record']:
+                records.discard(producer)
+        paths = {value for row in result['identities']
+            if row['provenance']['record'] in records
+            and row.get('presence') == 'present' and row['version_binding'] == 'recorded'
+            for value in (row['locator'], row['absolute_path'])}
+        if manuscript:
+            try:
+                paths.add(str(self.resolve(manuscript)))
+            except (OSError, ValueError):
+                pass
+        return paths
+
     def _version_hashes(self, locators: Iterable[str]) -> dict[str, str]:
         """Bound only declared files, with finite streamed I/O."""
         hashes, total = {}, 0
