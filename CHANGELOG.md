@@ -10,7 +10,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
-- New tasks retain source-linked working notes before older records leave context, and give valid notes priority in subsequent input. Summarization uses the same budget; existing tasks keep their saved rules. Engineering checks pass; complete feedback delivery and lower total cost still need real-task acceptance.
+- New tasks retain source-linked working notes before older records leave context. Valid notes and current work material take priority over optional older conversation, keeping drafts and results from being crowded out. Summarization uses the same budget; historical optional-note policies remain unchanged. Complete feedback delivery and lower total cost still need real-task acceptance.
 
 ### Fixed
 

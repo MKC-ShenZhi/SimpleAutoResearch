@@ -82,6 +82,9 @@ def select_working_context(
     does not itself establish that the recorded text is an actual read window.
     ``require_work_notes`` includes all supplied notes in mandatory context
     before optional material admission, independently of original body supply.
+    With usable required notes, retained current/referenced material precedes
+    optional older native work. The latest complete block remains mandatory;
+    cold starts and historical optional-note policies retain their suffix rule.
     """
     if schema_tokens < 0 or context_token_target < 0:
         raise ValueError('Token costs and target must be nonnegative')
@@ -160,10 +163,16 @@ def select_working_context(
             return False
 
     blocks = [[message for message in block if not is_request(message)] for block in blocks]
+    def active(note: Mapping[str, Any]) -> bool:
+        return note.get('current') is not False and note.get('status') in (
+            None, 'current', 'active', 'ok')
+
+    material_first = retained_records and require_work_notes and any(
+        active(note) and isinstance(note.get('text'), str) and note['text'].strip() for note in notes)
     latest = next((i for i in reversed(range(len(blocks))) if blocks[i]), None)
     recent = [latest] if latest is not None else []
     native = [message for i in recent for message in blocks[i]]
-    if latest is not None:
+    if latest is not None and not material_first:
         for i in reversed(range(min(summarized_through_turn,latest),latest)):
             if not blocks[i]:
                 continue
@@ -176,10 +185,6 @@ def select_working_context(
     def locator(row: Mapping[str, Any]) -> dict[str, Any]:
         return {key: deepcopy(value) for key, value in row.items()
                 if key not in {'text'}}
-
-    def active(note: Mapping[str, Any]) -> bool:
-        return note.get('current') is not False and note.get('status') in (
-            None, 'current', 'active', 'ok')
 
     explicit_references = set(selected_records)
     references = set(explicit_references)
@@ -198,21 +203,23 @@ def select_working_context(
     keys: list[str] = []
     native_texts: set[str] = set()
 
-    def collect_text(value: Any) -> None:
+    def collect_text(value: Any, texts: set[str] | None = None) -> None:
+        if texts is None:
+            texts = native_texts
         if isinstance(value, str):
-            native_texts.add(value)
+            texts.add(value)
             if value.lstrip().startswith(('{', '[')):
                 try:
-                    collect_text(json.loads(value))
+                    collect_text(json.loads(value), texts)
                 except ValueError:
                     pass
         elif isinstance(value, Mapping):
-            native_texts.add(dump(value))
+            texts.add(dump(value))
             for item in value.values():
-                collect_text(item)
+                collect_text(item, texts)
         elif isinstance(value, (list, tuple)):
             for item in value:
-                collect_text(item)
+                collect_text(item, texts)
 
     for row in rows:
         text = row.get('text')
@@ -292,22 +299,28 @@ def select_working_context(
             if row.get('record') in reported_references:
                 reference_indices.setdefault(row['record'], []).append(i)
 
+    def observation_text(row: Mapping[str, Any]) -> str:
+        text = row['text']
+        if row.get('kind') == 'operation_result':
+            try:
+                return dump(json.loads(text))
+            except ValueError:
+                pass
+        return text
+
     def mark_native() -> None:
         native_texts.clear()
         collect_text([message for i in recent for message in blocks[i]])
         for row, state in zip(rows, states):
             if state['status'] in {'invalid','summarized'}:
                 continue
-            text = row['text']
-            if row.get('kind') == 'operation_result':
-                try:
-                    text = dump(json.loads(text))
-                except ValueError:
-                    pass
+            text = observation_text(row)
             if row.get('turn') in recent and text in native_texts:
                 state['status'] = 'native'
             elif state['version_status'] == 'stale':
                 state['status'] = 'stale'
+            elif state['status'] == 'working_view':
+                continue  # Optional history cannot displace an admitted body.
             elif scoped_records and row.get('record') not in references:
                 state['status'] = 'unreferenced'
             elif (scoped_records or retained_records) and state['version_status'] not in {'matching', 'historical'}:
@@ -486,9 +499,9 @@ def select_working_context(
     else:
         ordered = ([i for i, row in enumerate(rows) if row.get('record') in references]
                    if owner_records else sorted(range(len(rows)), key=priority, reverse=True))
-    preferred = {i for i in ordered if rows[i].get('record') in references
-                 or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts
-                 or rows[i].get('kind') == 'operation_result'}
+    current_material = {i for i in ordered if rows[i].get('record') in references
+                        or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts}
+    preferred = current_material | {i for i in ordered if rows[i].get('kind') == 'operation_result'}
     # A summary that replaces historical presentation is mandatory context.
     # Optional note admission cannot hide both its history and the notes.
     def admit_notes() -> None:
@@ -501,12 +514,40 @@ def select_working_context(
 
     if not require_work_notes and not retained_records and not owner_records and not summarized_through_turn:
         admit_notes()
-    for i in ordered:
-        if retained_records or i in preferred:
-            admit(i)
-    for i in ordered:
-        if not retained_records and i not in preferred:
-            admit(i)
+    if material_first:
+        for i in ordered:
+            if i in current_material:
+                admit(i)
+        # Keep a contiguous, complete suffix only when it fits beside current
+        # work. Repeating a body already supplied from its receipt wastes that
+        # room; its original operation remains in the navigation/archive.
+        for i in reversed(range(latest or 0)):
+            if not blocks[i]:
+                continue
+            texts: set[str] = set()
+            collect_text(blocks[i], texts)
+            if (any(keys[j] in represented and observation_text(row) in texts
+                    for j, row in enumerate(rows) if isinstance(row.get('text'), str))
+                    or estimate_tokens(dump([m for n in [i, *recent] for m in blocks[n]]))
+                        > context_token_target // 2):
+                break
+            recent.insert(0, i)
+            mark_native()
+            if project()[1] > context_token_target:
+                recent.pop(0)
+                mark_native()
+                break
+            represented.update(keys[j] for j, state in enumerate(states) if state['status'] == 'native')
+        for i in ordered:
+            if i not in current_material:
+                admit(i)
+    else:
+        for i in ordered:
+            if retained_records or i in preferred:
+                admit(i)
+        for i in ordered:
+            if not retained_records and i not in preferred:
+                admit(i)
     if retained_records:
         # As pending statuses become final, their bookkeeping can shrink; a
         # later duplicate may also represent a previously oversized window.

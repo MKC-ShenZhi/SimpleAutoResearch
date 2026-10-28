@@ -448,6 +448,115 @@ class WorkingContextTests(unittest.TestCase):
 
 
 class RetainedWorkingContextTests(unittest.TestCase):
+    def test_required_current_material_precedes_optional_native_under_capacity(self):
+        current = observation(0, 'Current file body. ' * 230,
+            role='historical_observation', path='outputs/current.txt')
+        referenced = observation(0, 'Referenced source. ' * 130,
+            role='historical_observation', record='records/reference.json')
+        notes = [{'text': 'Keep the recorded uncertainty and scope',
+                  'records': [referenced['record']], 'status': 'active'}]
+        blocks = [[], block(1, 'Optional previous work. ' * 300), block(2, 'Latest feedback')]
+        arguments = dict(material_policy='retained', require_work_notes=True,
+            observations=[current, referenced], turn_blocks=blocks, work_notes=notes,
+            current_artifacts=[current['path']], version_resolver=lambda _: 'recorded-digest',
+            schema_tokens=6000, context_token_target=18000)
+        before = deepcopy(arguments)
+        messages, budget = select(**arguments)
+        context = json.loads(messages[1]['content'])
+        self.assertEqual(context['working_view']['notes'], notes)
+        self.assertEqual({entry['observation']['record'] for entry in
+                          context['working_view']['observations']},
+                         {current['record'], referenced['record']})
+        for row in (current, referenced):
+            self.assertEqual(json.dumps(messages).count(row['text']), 1)
+        self.assertEqual([m for m in messages if m['role'] in {'assistant', 'tool'}], blocks[-1])
+        self.assertEqual(context['permissions'], {'write': ['outputs/']})
+        self.assertEqual(messages[0], {'role': 'system', 'content': 'Respect supplied permissions'})
+        self.assertEqual([m['content'] for m in messages[2:] if m['role'] == 'user'],
+                         ['Compare the source measurements', 'Keep the error bars'])
+        self.assertGreaterEqual(budget['estimated_input_tokens'], 6000 + len(json.dumps(messages)))
+        self.assertLessEqual(budget['estimated_input_tokens'], 18000)
+        self.assertEqual(arguments, before)
+
+    def test_required_material_leaves_room_for_native_chronology_without_duplicate_bodies(self):
+        current = observation(0, 'Current original body', role='historical_observation')
+        recent = observation(1, 'Recently observed original', role='historical_observation',
+            path='inputs/recent.txt')
+        blocks = [block(0, 'Oversized archived work. ' * 2000),
+                  block(1, recent['text']), block(2, 'Latest complete result')]
+        requests = ['Initial request', 'Revise the result', 'Preserve uncertainty']
+        messages, budget = select(material_policy='retained', require_work_notes=True,
+            turn_blocks=blocks, observations=[current, recent], user_requests=requests,
+            block_request_counts=[1, 1, 2], selected_records=[current['record']],
+            work_notes=[{'text': 'Use the supplied originals', 'records': []}],
+            version_resolver=lambda _: 'recorded-digest',
+            schema_tokens=2000, context_token_target=16000)
+        self.assertEqual(messages[2:], [
+            {'role': 'user', 'content': requests[0]}, *blocks[1],
+            {'role': 'user', 'content': requests[1]}, *blocks[2],
+            {'role': 'user', 'content': requests[2]}])
+        self.assertEqual(budget['selected_turns'], [1, 2])
+        for row in (current, recent):
+            self.assertEqual(json.dumps(messages).count(row['text']), 1)
+        self.assertGreaterEqual(budget['estimated_input_tokens'], 2000 + len(json.dumps(messages)))
+        self.assertLessEqual(budget['estimated_input_tokens'], 16000)
+
+    def test_admitted_failure_receipt_matches_compact_native_without_losing_supply_metadata(self):
+        result = {'status': 'error', 'data': {'returncode': 1,
+                  'stderr': 'Recorded execution failure', 'outputs': []}}
+        failure = {'kind': 'operation_result', 'record': 'records/failure.json', 'turn': 0,
+            'path': 'outputs/result.csv', 'sha256': 'recorded-output-version',
+            'text': json.dumps(result, indent=2)}
+        old = block(0, '')
+        old[1]['content'] = json.dumps(result, separators=(',', ':'))
+        before = deepcopy((failure, old))
+        messages, budget = select(material_policy='retained', require_work_notes=True,
+            observations=[failure], turn_blocks=[old, block(1, 'Latest feedback')],
+            selected_records=[failure['record']],
+            work_notes=[{'text': 'The recorded execution failed', 'records': [failure['record']]}],
+            version_resolver=lambda _: 'new-output-version',
+            schema_tokens=2000, context_token_target=16000)
+        context = json.loads(messages[1]['content'])
+        self.assertEqual(context['working_view']['observations'],
+                         [{'observation': failure, 'version_status': 'historical'}])
+        self.assertEqual(json.dumps(messages).count(result['data']['stderr']), 1)
+        self.assertEqual(len(budget['selected_records']), 1)
+        supplied = budget['selected_records'][0]
+        self.assertEqual(supplied['status'], 'working_view')
+        self.assertEqual(supplied['version_status'], 'historical')
+        self.assertEqual(supplied['source']['record'], failure['record'])
+        self.assertEqual(supplied['source']['sha256'], failure['sha256'])
+        self.assertEqual(context['material_supply']['references'], [{
+            'record': failure['record'], 'status': 'working_view',
+            'version_status': 'historical', 'source': supplied['source']}])
+        self.assertFalse(budget['omitted_records'])
+        self.assertEqual((failure, old), before)
+        self.assertLessEqual(budget['estimated_input_tokens'], 16000)
+
+    def test_required_notes_without_usable_snapshot_keep_legacy_suffix_and_reject_stale_files(self):
+        current = observation(0, 'Current file body. ' * 390, role='historical_observation')
+        stale = observation(0, 'Retired file original', role='historical_observation',
+            record='records/stale.json', path='inputs/retired.txt', sha256='old-digest')
+        blocks = [[], block(1, 'Optional previous work. ' * 300), block(2, 'Latest feedback')]
+        arguments = dict(material_policy='retained', observations=[current, stale],
+            turn_blocks=blocks, current_artifacts=[current['path'], stale['path']],
+            version_resolver=lambda _: 'recorded-digest',
+            schema_tokens=6000, context_token_target=18000)
+        for notes in ([], [{'text': 'Invalidated judgment', 'current': False}],
+                      [{'text': 'Expired judgment', 'status': 'expired'}]):
+            with self.subTest(notes=notes):
+                messages, budget = select(**arguments, work_notes=notes, require_work_notes=True)
+                _, legacy = select(**arguments, work_notes=notes, require_work_notes=False)
+                self.assertEqual(budget['selected_turns'], legacy['selected_turns'])
+                self.assertEqual(budget['selected_turns'], [1, 2])
+                self.assertEqual([m for m in messages if m['role'] in {'assistant', 'tool'}],
+                                 [m for turn in blocks[1:] for m in turn])
+                self.assertNotIn(current['text'], json.dumps(messages))
+                self.assertNotIn(stale['text'], json.dumps(messages))
+                omitted = {row['source']['record']: row for row in budget['omitted_records']}
+                self.assertEqual(omitted[stale['record']]['status'], 'stale')
+                self.assertLessEqual(budget['estimated_input_tokens'], 18000)
+
     def test_recorded_work_survives_eviction_with_versions_and_one_budget(self):
         source = 'Original measurement and observed conditions. ' * 45
         recent_text = 'Recently read original text'
