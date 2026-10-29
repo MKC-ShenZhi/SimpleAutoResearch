@@ -660,9 +660,10 @@ class InspectionToolGateway:
         decision = _DeliveryResponse.model_validate(value)
         observed = {row['subject']:row for row in [*saved['targets'], *saved['evidence']]
             if row.get('readable') and row.get('sha256') and row.get('windows')}
-        if len(set(decision.evidence)) != len(decision.evidence) or any(
-                key not in observed for key in decision.evidence):
-            raise ValueError('Package evidence must identify actual readable observations')
+        invalid = [key for key in decision.evidence if key not in observed]
+        if len(set(decision.evidence)) != len(decision.evidence) or invalid:
+            raise ValueError('Package evidence must identify unique actual readable observations: '
+                + json.dumps({'invalid': invalid, 'eligible': list(observed)}, ensure_ascii=False))
         if decision.conclusion == 'complete' and saved['delivery_context']['artifacts'] and not decision.evidence:
             raise ValueError('A whole-work conclusion needs actual observed support, not inventory alone')
         artifacts = saved['delivery_context']['artifacts']
@@ -1621,9 +1622,12 @@ class InspectionToolGateway:
                     raise ValueError('Inspection source usage is unsettled; retain completed observations without further requests')
             # A malformed opinion gets one corrective response, independently
             # of legitimate source rounds. Persist every rejection before stopping.
-            if rejected_final and (invalid_finals >= 2 or terminal_only):
+            # Closing forbids further investigation, not the existing single
+            # correction of a fully received opinion. The same prepare/admission
+            # path still checks remaining requests/tokens; no read quota is renewed.
+            if rejected_final and (invalid_finals >= 2 or ledger.remaining('llm_requests') == 0):
                 raise ValueError('Inspection final response invalid; '
-                    + ('one corrective response exhausted' if invalid_finals >= 2 else 'final-only capacity reached')
+                    + ('one corrective response exhausted' if invalid_finals >= 2 else 'no request capacity for correction')
                     + '; retain source reads and incomplete scope: ' + batch_error)
             self._check_versions([*saved['targets'],*saved['evidence']],identity)
             number += 1

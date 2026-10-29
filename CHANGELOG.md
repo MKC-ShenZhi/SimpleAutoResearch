@@ -17,7 +17,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Fixed
 
 - A task stop now prevents new requests inside review, summaries and model batches. In-flight calls settle normally, while completed work, checkpoints and accounting remain intact.
-- Unfinished checks retain their actual failure cause instead of misreporting a local input-capacity failure after settled calls as unknown provider state. Failures cannot pass or replay automatically.
+- Unfinished checks retain their actual cause instead of misreporting a local input-capacity failure after settled calls as unknown provider state. A fully returned opinion with invalid references or format can receive one correction within the original allowance after investigation closes. Failures cannot pass or replay automatically.
 
 Complete feedback delivery and lower total cost still require real-task acceptance.
 

@@ -1913,6 +1913,56 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(proof['binding']['artifacts'], {})
         self.assertEqual(proof['result']['metadata']['delivery_assessment']['verdict'], 'passed')
 
+    def test_closing_inspection_corrects_one_invalid_opinion_without_new_source_reads(self):
+        self._create()
+        self._write('说明.md', '三个观察值的均值为2.0。\n')
+        owner = self.app.operations.inspection
+        prepare = owner._prepare_conversation_round
+        def close_sources(*args, **kwargs):
+            # Exhausted decoded-read allowance after normal input priming.
+            args[-1][0] = 0
+            return prepare(*args, **kwargs)
+        count = 0
+        def review(view):
+            nonlocal count
+            count += 1
+            offered = self.inspection_requests[-1]['tools']
+            self.assertEqual([row['function']['name'] for row in offered], ['record_inspection'])
+            return {'conclusion':'complete', 'findings':[], 'limitations':[],
+                'evidence':['unobserved-source'] if count == 1 else
+                    [row['subject'] for row in view['evidence'] if row['text_windows']]}
+        self.review = review
+        claim = {'summary':'说明已有观察值。', 'artifacts':['说明.md']}
+        with patch.object(owner, '_prepare_conversation_round', side_effect=close_sources):
+            self._submit(_action('deliver_result', **claim))
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertEqual(count, 2)
+        proof = self._last('deliver_result')['metadata']['delivery_review']
+        first = self.app.session.store.read_json(owner._path(proof['identity'], 'sources-0'))
+        self.assertIn('unobserved-source', first['response']['tool_calls'][0]['function']['arguments'])
+        self.assertEqual(first['results'][0]['result']['status'], 'blocked')
+        self.assertIn('eligible', first['results'][0]['result']['error'])
+        self.assertTrue(all(item['tool']=='record_inspection' for item in first['results']))
+        self.assertEqual(proof['result']['metadata']['delivery_assessment']['verdict'], 'passed')
+        prior_delivery = (self.root/'delivery.json').read_bytes()
+        self._submit(_action('write_file', path='说明.md', content='这三个观察不能证明总体结论。\n',
+            expected_sha256=_digest(self.root/'workspace/说明.md')), feedback='补充总体推断的限制。')
+        self.review = lambda view: {'conclusion':'complete', 'findings':[], 'limitations':[],
+            'evidence':['unobserved-source']}
+        calls = len(self.inspection_requests)
+        with patch.object(owner, '_prepare_conversation_round', side_effect=close_sources):
+            self._submit(_action('deliver_result', **claim))
+        self.assertEqual(len(self.inspection_requests)-calls, 2)
+        self.assertNotEqual(self.app.session.manifest.status, 'completed')
+        self.assertEqual((self.root/'delivery.json').read_bytes(), prior_delivery)
+        failed = self._last('deliver_result')['metadata']['delivery_review']
+        self.assertIn('one corrective response exhausted', failed['error'])
+        self.assertFalse(self._process_receipts())
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        self._reload()
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+
     def test_document_owner_uses_original_reads_across_feedback_and_recovers_without_new_calls(self):
         # Frozen work.v2 keeps its real nested document protocol through load;
         # work.v4 creation exercises native professional prose authoring separately.
