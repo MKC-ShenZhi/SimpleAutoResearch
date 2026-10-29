@@ -11,6 +11,9 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
+DEFAULT_CONTEXT_INPUT_TOKENS = 64000
+
+
 class ModelConfigError(ValueError):
     pass
 
@@ -50,7 +53,7 @@ class ModelProfile(BaseModel):
     connect_timeout_sec: float | None = Field(default=None, gt=0, allow_inf_nan=False,
         exclude_if=lambda value: value is None)
     max_output_tokens: int | None = Field(default=None, gt=0)
-    context_input_tokens: int = Field(default=24000, gt=0)
+    context_input_tokens: int = Field(default=DEFAULT_CONTEXT_INPUT_TOKENS, gt=0)
     retry_attempts: int = Field(default=3, ge=1)
     connect_retry_attempts: int = Field(default=1, ge=1)
     native_response_corrections: int = Field(default=0, strict=True, ge=0, le=1,

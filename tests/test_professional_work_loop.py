@@ -26,7 +26,7 @@ from unittest.mock import patch
 from simple_ar.app.tool_application import ToolApplication
 from tests.native_history_fixture import load_native_history
 from simple_ar.core.assessments import ArtifactAssessment
-from simple_ar.integrations.llm import LLMClient, LLMSettings
+from simple_ar.integrations.llm import LLMClient, LLMSettings, estimate_tokens
 from simple_ar.tools.specs import ToolCall, ToolResult
 
 
@@ -1129,10 +1129,13 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual((self.root/'budget_ledger.json').read_bytes(),before)
         self.assertFalse(self.transport_errors)
 
-    def _queue_checkpoint_history(self, *, context_protocol='working.v1', initial_notes=True):
+    def _queue_checkpoint_history(self, *, context_protocol='working.v1', initial_notes=True,
+                                  context_input_tokens=12000, output_tokens=None):
         from dataclasses import replace
         self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
-            context_input_tokens=12000))
+            context_input_tokens=context_input_tokens,
+            max_output_tokens=(output_tokens if output_tokens is not None else
+                               self.services.llm_client.effective_output_limit())))
         self._create(context_protocol=context_protocol)
         if initial_notes:
             self.decisions.append(_action('update_work_plan',notes=[{
@@ -1143,6 +1146,58 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 encoding='utf-8')
             self.decisions.append(_action('read_file',path='measurements/'+name))
         self.decisions.append(_action('ask_user',question='Which interpretation should be emphasized?'))
+
+    def test_large_journal_window_supplies_complete_results_without_buying_summaries(self):
+        self._queue_checkpoint_history(context_protocol='auto', initial_notes=False,
+            context_input_tokens=128000, output_tokens=65536)
+        complete = 'Complete large observed result. ' * 3000
+        (self.inputs/'large-result.txt').write_text(complete, encoding='utf-8')
+        self.decisions.insert(len(self.decisions)-1,
+            _action('read_file', path='measurements/large-result.txt', max_bytes=256000))
+        self._run()
+        self._ok('ask_user')
+        self.assertEqual(self._ok('read_file')['data']['text'], complete)
+        self.assertFalse(self.memory_views)
+        self.assertFalse(any(entry.purpose.startswith('working-memory') for entry in self.app.ledger.entries))
+        messages = self.app._messages()
+        self.assertIn(complete, json.dumps(messages))
+        context = json.loads(messages[1]['content'])
+        self.assertFalse(context['working_context']['compaction_needed'])
+        self.assertLessEqual(context['working_context']['estimated_input_tokens'], 128000)
+        self.assertTrue(all(call.args[1].get('max_tokens') == 65536 for call in self.send.call_args_list))
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        self._reload()
+        self.assertIn(complete, json.dumps(self.app._messages()))
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+
+    def _assert_journal_note_supply(self, memory):
+        client = self.app._client()
+        messages = self.app._messages(client=client)
+        context = json.loads(messages[1]['content'])
+        actual = context['working_view']['notes']
+        expected = [{key:value for key,value in note.items() if key != 'observed_versions'}
+                    for note in memory['notes']]
+        for note in actual:
+            self.assertIn(note, expected)
+            self.assertNotIn('observed_versions', note)
+        self.assertLessEqual(len(actual), len(expected))
+        cost = estimate_tokens(json.dumps(messages, ensure_ascii=False)) + estimate_tokens(
+            json.dumps(self.app.schemas, ensure_ascii=False))
+        remaining = self.app.ledger.remaining('total_tokens')
+        self.assertLessEqual(cost + client.effective_output_limit(), remaining)
+        target = min(client._settings.context_input_tokens, remaining - client.effective_output_limit())
+        working = context['working_context']
+        self.assertEqual(working['context_exceeds_input_target'], working['estimated_input_tokens'] > target)
+        if working['context_exceeds_input_target']:
+            self.assertFalse(actual)  # Required atomic input can overflow; optional notes cannot add to it.
+        records = {record for note in memory['notes'] for record in note.get('records', [])}
+        for record in records:
+            self.assertTrue(self.app.session.store.resolve('attempts/'+record.removeprefix('records/')).is_file())
+        retained = [self.app.session.store.read_json(item['result'])
+                    for turn in self.app.state['turns'] for item in turn['tools']]
+        self.assertTrue(any(row.get('tool_name') == 'read_file' and row.get('status') == 'ok'
+            and row.get('data', {}).get('text') for row in retained))
 
     def test_default_journal_continuity_forms_notes_and_explicit_updates_remain_authoritative(self):
         self._queue_checkpoint_history(context_protocol='auto', initial_notes=False)
@@ -1164,13 +1219,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
         memory = self.app._working_memory()
         self.assertGreater(memory['through_turn'], 0)
         self.assertTrue(memory['notes'])
-        actual = json.loads(self.app._messages()[1]['content'])['working_view']['notes']
-        self.assertEqual([note['text'] for note in actual], [note['text'] for note in memory['notes']])
-        self.assertTrue(all('observed_versions' not in note for note in actual))
+        self._assert_journal_note_supply(memory)
         ledger = self.app.ledger.to_dict()
         self._reload()
         self.assertEqual(self.app._working_memory(), memory)
         self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self._assert_journal_note_supply(memory)
         self.app.supply(supply_id='additional-source', reason='Expose another authorized material alias',
             changes={'sources':{'extra':self.inputs}})
         self.assertEqual(self.app.state['config']['memory_protocol'], 'journal.v1')
@@ -1211,8 +1265,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.send.call_count, calls)
         self.assertEqual(self.app.ledger.to_dict(), ledger)
         self.assertEqual(snapshot.read_bytes(), raw)
-        actual = json.loads(self.app._messages()[1]['content'])['working_view']['notes']
-        self.assertEqual([note['text'] for note in actual], [note['text'] for note in memory['notes']])
+        self._assert_journal_note_supply(memory)
 
     def test_unknown_optional_checkpoint_keeps_its_charge_through_explicit_native_and_caller_recovery(self):
         from simple_ar.integrations.llm import LLMStreamError
@@ -1281,32 +1334,40 @@ class OperationsWorkLoopTests(unittest.TestCase):
             if not request.get('tools'):
                 view, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
                 if 'notes' in view.get('response_schema',{}).get('properties',{}):
-                    self.assertEqual(request.get('max_tokens',request.get('max_completion_tokens')),8192)
+                    cap = (self.services.llm_client.effective_output_limit()
+                           if self.app.state['config'].get('memory_protocol') == 'journal.v1' else 8192)
+                    self.assertEqual(request.get('max_tokens',request.get('max_completion_tokens')), cap)
                     result['choices'][0]['finish_reason'] = 'length'
             return result
         self.send.side_effect = respond
 
     def test_settled_length_checkpoint_keeps_notes_and_main_decision_continues(self):
-        self._queue_checkpoint_history()
-        self._truncate_checkpoints()
-        self._run()
-        self._ok('ask_user')
-        failures = list((self.root/'attempts').glob('*/memory_failure.json'))
-        self.assertTrue(failures)
-        for path in failures:
-            store = self.app.session.store.__class__(path.parent)
-            failure = store.read_json('memory_failure.json')
-            self.assertEqual(failure['finish_reason'],'length')
-            self.assertFalse(store.exists('memory_snapshot.json'))
-            self.assertIn(store.ref('memory_failure.json',kind='working_memory_failure'),
-                store.read_capability_result().artifacts)
-        self.assertIn('Keep the original measurement scope',self.app._working_memory()['notes'][0]['text'])
-        self.assertTrue(all(entry.status == 'settled' for entry in self.app.ledger.entries
-            if entry.purpose == 'working-memory'))
-        before = (self.root/'budget_ledger.json').read_bytes()
-        self._reload()
-        self.assertEqual((self.root/'budget_ledger.json').read_bytes(),before)
-        self.assertIn('Keep the original measurement scope',self.app._working_memory()['notes'][0]['text'])
+        for protocol in ('working.v1', 'auto'):
+            with self.subTest(protocol=protocol):
+                self.root = self.directory/('truncated-'+protocol)
+                self.decisions.clear()
+                self.memory_views.clear()
+                self.send.side_effect = self._provider
+                self._queue_checkpoint_history(context_protocol=protocol)
+                self._truncate_checkpoints()
+                self._run()
+                self._ok('ask_user')
+                failures = list((self.root/'attempts').glob('*/memory_failure.json'))
+                self.assertTrue(failures)
+                for path in failures:
+                    store = self.app.session.store.__class__(path.parent)
+                    failure = store.read_json('memory_failure.json')
+                    self.assertEqual(failure['finish_reason'],'length')
+                    self.assertFalse(store.exists('memory_snapshot.json'))
+                    self.assertIn(store.ref('memory_failure.json',kind='working_memory_failure'),
+                        store.read_capability_result().artifacts)
+                self.assertIn('Keep the original measurement scope',self.app._working_memory()['notes'][0]['text'])
+                self.assertTrue(all(entry.status == 'settled' for entry in self.app.ledger.entries
+                    if entry.purpose == 'working-memory'))
+                before = (self.root/'budget_ledger.json').read_bytes()
+                self._reload()
+                self.assertEqual((self.root/'budget_ledger.json').read_bytes(),before)
+                self.assertIn('Keep the original measurement scope',self.app._working_memory()['notes'][0]['text'])
 
     def _interrupt_checkpoint_commit(self, *, truncated=False):
         from simple_ar.core.session import _persist_attempt_result
@@ -3311,7 +3372,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         saved = owner.store.read_json(owner._path(identity, 'input'))
         checkpoints = [owner.store.read_json(owner._path(identity, f'sources-{number}')).get('checkpoint', {})
             for number in range(len(saved['source_rounds']))]
-        self.assertGreaterEqual(sum(bool(checkpoint) for checkpoint in checkpoints), 2)
+        self.assertTrue(any(checkpoints))
         memory = owner._conversation_memory(saved, owner._conversation_rows(saved))
         self.assertTrue(memory['notes'])
         self.assertTrue(memory['compacted_records'])
@@ -3320,7 +3381,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             for record in memory['compacted_records']))
         summary_inputs = [view for view in self.memory_views
             if any(row['record'].startswith(source_prefix) for row in view['observations'])]
-        self.assertGreaterEqual(len(summary_inputs), 2)
+        self.assertTrue(summary_inputs)
         self.assertEqual(summary_inputs[0]['previous_notes'], [])
         supplied = [row['record'] for view in summary_inputs for row in view['observations']]
         self.assertEqual(len(supplied), len(set(supplied)))

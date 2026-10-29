@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from simple_ar.integrations.llm import LLMResponseError
 
 
-OUTPUT_LIMIT = 8192
+_LEGACY_OUTPUT_LIMIT = 8192
 MEMORY_PURPOSES = {'working-memory', 'working-memory-no-response-format'}
 
 
@@ -177,11 +177,9 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
 
     ``rows`` are exact closed operation observations with journal positions.
     All physical usage remains on the caller's existing budgeted client.
-    A positive ``required_decision_tokens`` protects that full decision cost
-    plus a conservative input increment for newly mandatory notes, and one
-    subsequent request. This is a maximum floor with any outer protection,
-    not additional budget. The increment assumes require_work_notes strips
-    observed_versions after the caller's ordinary project_notes projection.
+    A positive ``required_decision_tokens`` protects that decision and one
+    subsequent request. Journal owners fit optional notes into the measured
+    next input; historical owners retain their mandatory-note input floor.
     Unsettled memory calls skip this optional checkpoint without adopting a
     response or changing their ledger reservations.
     Zero preserves the historical optional-checkpoint budget behavior.
@@ -197,6 +195,14 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
     if not rows:
         return None, ()
     target = client._settings.context_input_tokens
+    journal = 'compacted_records' in previous
+    # A journal shares its owner's actual decoding capacity, including thinking.
+    # The old non-journal protocol keeps its recorded checkpoint behavior.
+    output_limit = client.effective_output_limit() if journal else _LEGACY_OUTPUT_LIMIT
+    if journal and output_limit is None and client._budget_ledger.remaining('total_tokens') is not None:
+        # Optional continuity must not create an unbounded generated response
+        # inside a finite allowance. Do not invent a smaller hidden output cap.
+        return None, ()
     previous_notes = previous.get('notes',[])
     failed_through = previous.get('attempted_through_turn',0)
     if failed_through:
@@ -205,7 +211,7 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
         unseen = [row for row in rows if row['turn'] >= failed_through]
         unseen_volume = sum(estimate_tokens(json.dumps(row['result'],ensure_ascii=False)[:16000])
             for row in unseen)
-        if unseen_volume < target//4:
+        if not unseen or not journal and unseen_volume < target//4:
             return None, ()
     view = {'requests':requests,'previous_notes':[{'id':'p'+str(i),**row}
             for i,row in enumerate(previous_notes)],
@@ -214,7 +220,6 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
             'observations':[], 'response_schema':_Snapshot.model_json_schema(),
             'scope':'Working summary only. Actual records, file versions and checks remain authoritative.'}
     through = previous.get('through_turn',0)
-    journal = 'compacted_records' in previous
     batches = ((row['turn'], [row]) for row in rows) if journal else groupby(rows,key=lambda row:row['turn'])
     for turn, grouped in batches:
         group = list(grouped)
@@ -230,7 +235,9 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
                 if key in row:
                     additions[-1][key] = row[key]
         view['observations'].extend(additions)
-        if estimate_tokens(json.dumps(view,ensure_ascii=False)) > target*0.6:
+        if (estimate_tokens(json.dumps(view,ensure_ascii=False)) +
+                (estimate_tokens(SYSTEM+'\n\nReturn valid JSON only. Do not include markdown or extra text.') if journal else 0)) > (
+                target if journal else target*0.6):
             del view['observations'][-len(additions):]
             if journal:
                 # Keep the receipt intact in the journal. A capacity omission
@@ -240,7 +247,8 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
         through = turn+1
     # The threshold refers to observed history volume, not a scientific stage
     # or fixed task-specific call count. The recent working sequence remains.
-    if not view['observations'] or estimate_tokens(json.dumps(view['observations'],ensure_ascii=False)) < target//4:
+    if not view['observations'] or (not journal and
+            estimate_tokens(json.dumps(view['observations'],ensure_ascii=False)) < target//4):
         return None, ()
     text = json.dumps(view,ensure_ascii=False)
     ledger = client._budget_ledger
@@ -254,9 +262,10 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
             entry.purpose in MEMORY_PURPOSES or entry.logical_call_id.startswith('working-memory-'))
             for entry in ledger.entries):
         raise ValueError('Unsettled provider work must be reconciled before checkpointing')
-    needed = estimate_tokens(SYSTEM)+estimate_tokens(text+'\n\nReturn valid JSON only. Do not include markdown or extra text.')+OUTPUT_LIMIT
+    needed = estimate_tokens(SYSTEM)+estimate_tokens(text+'\n\nReturn valid JSON only. Do not include markdown or extra text.')+(output_limit or 0)
     protection = nullcontext()
-    if required_decision_tokens:
+    increment = 0
+    if required_decision_tokens and not journal:
         supplied = [*view['previous_notes'], *view['observations']]
         records = {record for row in supplied
             for record in row.get('records', [row['record']] if 'record' in row else [])}
@@ -273,6 +282,7 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
             for _ in range(view['response_schema']['properties']['notes']['maxItems'])]
         increment = estimate_tokens(json.dumps(json.dumps({'notes':envelope},ensure_ascii=False),
             ensure_ascii=False))
+    if required_decision_tokens:
         protection = ledger.protect_remaining({'llm_requests':1,
             'total_tokens':required_decision_tokens+increment}, additional=additional_protection)
     with protection:
@@ -284,7 +294,8 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
         input_ref = store.write_json('memory_input.json',view,kind='working_memory_input')
         refs = [input_ref]
         try:
-            response = client.with_output_limit(OUTPUT_LIMIT).ask_json(SYSTEM,text,
+            checkpoint_client = client if journal else client.with_output_limit(_LEGACY_OUTPUT_LIMIT)
+            response = checkpoint_client.ask_json(SYSTEM,text,
                 label='working-memory',budget_call_id=call_id or 'working-memory-'+attempt_id)
             checkpoint_entries(client._budget_ledger,attempt_id,client._budget_session_id,call_id=call_id)
             refs.append(store.write_json('memory_response.json',response,kind='working_memory_response'))
@@ -303,7 +314,8 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
                 'error_type':type(exc).__name__, 'diagnostic':str(exc),
                 'finish_reason':getattr(exc,'finish_reason',None),
                 'raw_response':getattr(exc,'raw_response',''),
-                'scope':'Settled unusable optional checkpoint; previous committed notes remain authoritative.'},
+                'scope':'Settled unusable optional checkpoint; original receipts remain authoritative. '
+                        'Earlier notes may not describe the latest progress.'},
                 kind='working_memory_failure'))
             return None, tuple(refs)
     snapshot = {'schema_version':'working_memory.v1','through_turn':through,

@@ -243,7 +243,7 @@ class _ReadHistory(BaseModel):
     end_turn: int | None = Field(default=None, ge=0,
         description='Pin the returned end_turn when continuing byte windows, so appended turns cannot change this range.')
     offset_bytes: int = Field(default=0, ge=0)
-    max_bytes: int = Field(default=16000, ge=1, le=64000)
+    max_bytes: int = Field(default=16000, ge=1, le=256000)
 
 
 class _WorkPlanStep(BaseModel):
@@ -314,7 +314,7 @@ class _RuntimeClientPort:
         self.client, self.binding = client, binding
         self.model = binding['model']
         self._settings = SimpleNamespace(api_mode='chat',
-            context_input_tokens=getattr(client, 'context_input_tokens', 16000))
+            context_input_tokens=getattr(client, 'context_input_tokens', LLMSettings.context_input_tokens))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.client, name)
@@ -360,8 +360,8 @@ def _runtime_bindings(services: Any | None) -> dict[str, Any]:
         model = getattr(client, 'model', type(client).__qualname__)
         if not isinstance(model, str) or not model.strip():
             raise ValueError('Injected client model identity must be a nonempty string')
-        if not isinstance(client, LLMClient) and (type(getattr(client, 'context_input_tokens', 16000)) is not int
-                or getattr(client, 'context_input_tokens', 16000) < 1):
+        if not isinstance(client, LLMClient) and (type(getattr(client, 'context_input_tokens', LLMSettings.context_input_tokens)) is not int
+                or getattr(client, 'context_input_tokens', LLMSettings.context_input_tokens) < 1):
             raise ValueError('Injected client context_input_tokens must be positive')
         bindings[name] = {'type': type(client).__module__ + '.' + type(client).__qualname__, 'model': model}
         if isinstance(client, LLMClient):
@@ -3334,6 +3334,7 @@ class ToolApplication:
                 observations=working_rows, schema_tokens=schema_cost,context_token_target=target,
                 estimate_tokens=estimate_tokens,work_notes=work_notes,
                 require_work_notes=config.get('memory_protocol') == 'journal.v1',
+                fit_work_notes=config.get('memory_protocol') == 'journal.v1',
                 summarized_through_turn=memory['through_turn'],
                 selected_records=selected_records,current_artifacts=sorted(current_artifacts),version_resolver=version,
                 block_request_counts=[turn.get('request_count',1) for turn in turns],

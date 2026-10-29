@@ -109,7 +109,7 @@ Fields below belong to `[profiles.NAME]`. **Operational** settings can be retune
 | `request_timeout_sec` | Request timeout including finite SDK Chat stream | Positive number `180` seconds | Operational |
 | `connect_timeout_sec` | SDK text TCP/TLS timeout | Optional finite positive number; default connection cap 20 seconds, bounded by request timeout | Operational |
 | `max_output_tokens` | Output cap; provider limits still apply when omitted | Optional positive integer | Operational; explicit call cap can override |
-| `context_input_tokens` | Native input working-set target | Positive integer `24000` | Operational; not provider context size |
+| `context_input_tokens` | Native input working-set target, including tools and history | Positive integer `64000` | Operational; not provider context size |
 | `retry_attempts`, `connect_retry_attempts` | Total attempts / pre-dispatch connection ceiling | Integers ≥1; `3`, `1` | Operational; attempts share budget |
 | `retry_base_delay_sec`, `retry_max_delay_sec` | Retry delays | Positive numbers `1`, `12` seconds | Operational |
 | `native_response_corrections` | One settled native Chat truncation correction | Strict integer `0`/`1`, default `0` | Identity; finite output cap/shared budget required |
@@ -123,6 +123,8 @@ Fields below belong to `[profiles.NAME]`. **Operational** settings can be retune
 | `image_quality` | Image quality | Optional `auto`, `standard`, `hd`, `low`, `medium`, `high` | Identity; image APIs only |
 
 Fields/types are strict. Image profiles accept image capabilities and reject text-generation settings; text profiles reject image-generation capabilities and size/quality. Chat disabled thinking requires empty effort or `none`. Provider support must match declared settings.
+
+Size capacity for the whole task: `context_input_tokens` includes tools and history without requiring the window to be filled; `max_output_tokens` must leave room for thinking and final content. New working summaries inherit the task output setting. With a finite total token allowance, configure a provider-supported output cap; otherwise optional unbounded summaries are skipped and original work records remain available.
 
 Effort names are interpreted by each provider. For example, [DeepSeek maps `medium` to `high`](https://api-docs.deepseek.com/guides/thinking_mode/); request `low` explicitly for its low tier. Changing thinking settings on a saved task requires an explicit named-connection switch.
 

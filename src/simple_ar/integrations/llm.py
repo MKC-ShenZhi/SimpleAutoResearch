@@ -24,7 +24,7 @@ os.environ.setdefault("LITELLM_LOG", "ERROR")
 from dotenv import load_dotenv
 
 from simple_ar.core.budget import BudgetError, BudgetLedger
-from simple_ar.integrations.model_profiles import ModelCatalog, ModelConfigError, load_model_catalog, resolve_proxy_env
+from simple_ar.integrations.model_profiles import DEFAULT_CONTEXT_INPUT_TOKENS, ModelCatalog, ModelConfigError, load_model_catalog, resolve_proxy_env
 
 
 T = TypeVar("T")
@@ -168,7 +168,7 @@ class LLMSettings:
     output_price_per_million: float | None = None
     request_timeout_sec: float | None = None
     max_output_tokens: int | None = None
-    context_input_tokens: int = 24000
+    context_input_tokens: int = DEFAULT_CONTEXT_INPUT_TOKENS
     retry_attempts: int = 3
     connect_retry_attempts: int = 1
     retry_base_delay_sec: float = 1.0

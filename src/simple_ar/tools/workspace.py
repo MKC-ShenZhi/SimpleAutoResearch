@@ -69,7 +69,8 @@ class _List(_Path):
 
 class FileWindow(_Path):
     offset_bytes: int = Field(default=0, ge=0)
-    max_bytes: int = Field(default=16000, ge=1, le=64000)
+    max_bytes: int = Field(default=16000, ge=1, le=256000,
+        description="Requested UTF-8 byte window, up to 256000 bytes. Choose enough for the current work; page larger files and respect the model input capacity.")
     full_digest: bool = Field(default=False, exclude_if=lambda value: value is False,
         description="Request a streamed full-file SHA256 for a file at most 64 MiB, regardless of the returned text-window size. Larger files are rejected. False preserves the normal digest policy: SHA256 only for files at most 256000 bytes.")
     start_line: int | None = Field(default=None, ge=1,

@@ -79,7 +79,8 @@ class ProfessionalConversation:
         value = project(False)
         floor, protect = admission(value)
         closing = force_close or closing_enabled and not protect
-        if checkpoint is not None and not closing:
+        working = value.projection.get('working_context', value.projection)
+        if checkpoint is not None and not closing and working.get('compaction_needed', True):
             # Nested inspection must also leave the caller's existing floor.
             # The compactor adds its decision/note protection inside this floor.
             with self.ledger.protect_remaining(floor if protect else {}, additional=additional):

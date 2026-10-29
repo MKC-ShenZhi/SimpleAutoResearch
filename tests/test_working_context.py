@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import json
 from pathlib import Path
 import tempfile
@@ -448,6 +449,42 @@ class WorkingContextTests(unittest.TestCase):
 
 
 class RetainedWorkingContextTests(unittest.TestCase):
+    def test_journal_native_uses_available_capacity_beyond_half_the_window(self):
+        blocks = [block(0, 'Earlier native work. ' * 500), block(1, 'Latest native work. ' * 500)]
+        messages, budget = select(material_policy='retained', require_work_notes=True,
+            fit_work_notes=True, turn_blocks=blocks, context_token_target=32000)
+        self.assertEqual([m for m in messages if m['role'] in {'assistant', 'tool'}],
+                         blocks[0] + blocks[1])
+        self.assertGreater(budget['recent_native_tokens'], 16000)
+        self.assertLessEqual(budget['estimated_input_tokens'], 32000)
+        self.assertFalse(budget['compaction_needed'])
+
+    def test_journal_current_references_and_results_precede_native_without_a_snapshot(self):
+        current = observation(0, 'Current original. ' * 100, path='outputs/current.txt',
+            role='historical_observation')
+        referenced = observation(0, 'Referenced original. ' * 100, record='records/reference.json',
+            role='historical_observation')
+        result = observation(0, json.dumps({'status':'ok', 'data':{'result':'Successful measurement. '*60}}),
+            kind='operation_result', record='records/success.json')
+        authored = observation(1, 'Authored implementation. '*1500, role='write_context', path='outputs/code.py', record='records/write.json')
+        old = block(1, 'Write completed')
+        old[0]['tool_calls'][0]['function'] = {'name':'write_file', 'arguments':json.dumps({'path':authored['path'], 'content':authored['text']})}
+        rows = [current, referenced, result, authored]
+        messages, budget = select(material_policy='retained', require_work_notes=True,
+            fit_work_notes=True, observations=rows,
+            turn_blocks=[[], old, block(2, 'Latest feedback')],
+            selected_records=[referenced['record']], current_artifacts=[current['path']],
+            version_resolver=lambda _: 'recorded-digest', context_token_target=18000)
+        supplied = json.loads(messages[1]['content'])['working_view']['observations']
+        self.assertEqual({row['observation']['record'] for row in supplied},
+                         {current['record'], referenced['record'], result['record']})
+        self.assertEqual(next(row['version_status'] for row in supplied if
+            row['observation']['record'] == result['record']), 'historical')
+        self.assertEqual({row['status'] for row in budget['omitted_records']}, {'unavailable'})
+        self.assertEqual(budget['selected_turns'], [2])
+        self.assertTrue(budget['compaction_needed'])
+        self.assertLessEqual(budget['estimated_input_tokens'], 18000)
+
     def test_required_current_material_precedes_optional_native_under_capacity(self):
         current = observation(0, 'Current file body. ' * 230,
             role='historical_observation', path='outputs/current.txt')
@@ -987,6 +1024,92 @@ class CheckpointFailureTests(unittest.TestCase):
         return {'choices':[{'message':{'role':'assistant','content':content},'finish_reason':finish}],
             'usage':{'prompt_tokens':100,'completion_tokens':40,'total_tokens':140}}
 
+    def test_journal_inherits_caller_output_cap_and_legacy_keeps_8192(self):
+        for journal, cap in ((True, 1024), (True, 16384), (True, 65536),
+                             (True, None), (False, 65536)):
+            with self.subTest(journal=journal, cap=cap):
+                self.store = ArtifactStore(self.root/f'{journal}-{cap}')
+                # TODO: generic finite uncapped LLM reservations need a real
+                # provider output maximum; this case tests unlimited inheritance.
+                self.ledger = BudgetLedger({'llm_requests':3,
+                    'total_tokens':None if cap is None else 200000})
+                client = LLMClient(replace(self.client._settings, max_output_tokens=None),
+                    budget_ledger=self.ledger, budget_session_id='session', budget_attempt_id='native-turn-test')
+                self.client = client.with_output_limit(cap) if cap is not None else client
+                self.previous = {'through_turn':0, 'notes':[], **({'compacted_records':set()} if journal else {})}
+                rows = ([{'turn':0, 'record':'records/small.json', 'result':{
+                    'tool_name':'read_file', 'status':'ok', 'data':{'text':'Complete short observation'}}}]
+                    if journal else None)
+                with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
+                        '{"notes":[{"text":"Retained scope","observations":["o1"]}]}')) as send:
+                    snapshot, _ = self.compact(rows=rows)
+                self.assertIsNotNone(snapshot)
+                send.assert_called_once()
+                request = send.call_args.args[1]
+                self.assertEqual(request.get('max_tokens'), cap if journal else 8192)
+                self.assertEqual(self.client.effective_output_limit(), cap)
+                self.assertEqual(json.loads(self.store.read_json('memory_input.json')
+                    ['observations'][0]['observation_text'])['status'], 'ok')
+
+    def test_journal_without_output_cap_skips_optional_work_under_finite_budget(self):
+        self.previous['compacted_records'] = set()
+        self.client = LLMClient(replace(self.client._settings, max_output_tokens=None),
+            budget_ledger=self.ledger, budget_session_id='session', budget_attempt_id='native-turn-test')
+        before = self.ledger.to_dict()
+        with patch('simple_ar.integrations.llm._call_openai_sdk') as send:
+            self.assertEqual(self.compact(required_decision_tokens=100), (None, ()))
+        send.assert_not_called()
+        self.assertEqual(self.ledger.to_dict(), before)
+        self.assertFalse(self.store.exists('memory_input.json'))
+
+    def test_journal_complete_batch_uses_actual_target_without_fraction_thresholds(self):
+        from simple_ar.app.work_memory import SYSTEM
+        self.previous = {'through_turn':0, 'notes':[], 'compacted_records':set()}
+        rows = [{'turn':0, 'record':f'records/{i}.json', 'result':{
+            'tool_name':'read_file', 'status':'ok', 'data':{'text':letter*18000}}}
+            for i, letter in enumerate(('a', 'b'))]
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
+                '{"notes":[{"text":"Both complete observations","observations":["o1","o2"]}]}')):
+            snapshot, _ = self.compact(rows=rows)
+        self.assertIsNotNone(snapshot)
+        view = self.store.read_json('memory_input.json')
+        self.assertEqual([json.loads(row['observation_text']) for row in view['observations']],
+                         [row['result'] for row in rows])
+        self.assertTrue(all(row['truncated'] is False for row in view['observations']))
+        measured = estimate_tokens(SYSTEM) + estimate_tokens(json.dumps(view, ensure_ascii=False))
+        self.assertGreater(measured, self.client._settings.context_input_tokens * 0.6)
+        self.assertLessEqual(measured, self.client._settings.context_input_tokens)
+        self.assertEqual(summary_coverage(previous=self.previous, snapshot=snapshot, view=view,
+            operations_for_turn=lambda turn:{row['record']:{} for row in rows}), 1)
+
+    def test_journal_notes_fit_remaining_budget_and_leave_next_request_payable(self):
+        self.ledger = BudgetLedger({'llm_requests':2, 'total_tokens':85000})
+        self.client = LLMClient(replace(self.client._settings,
+            max_output_tokens=65536, context_input_tokens=128000), budget_ledger=self.ledger,
+            budget_session_id='session', budget_attempt_id='native-turn-test')
+        self.previous = {'through_turn':0, 'notes':[], 'compacted_records':set()}
+        rows = [{'turn':0, 'record':'records/success.json', 'result':{
+            'tool_name':'run_process', 'status':'ok', 'data':{'stdout':'Measured successfully'}}}]
+        notes = [{'text':'Retain the successful measurement', 'observations':['o1']},
+                 *[{'text':'\x00'*1500, 'observations':['o1']} for _ in range(15)]]
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
+                json.dumps({'notes':notes}))):
+            snapshot, _ = self.compact(rows=rows, required_decision_tokens=7000)
+        self.assertIsNotNone(snapshot)  # No hypothetical maximum-note envelope.
+        target = min(self.client._settings.context_input_tokens,
+                     self.ledger.remaining('total_tokens') - self.client.effective_output_limit())
+        messages, budget = select(material_policy='retained', require_work_notes=True,
+            fit_work_notes=True, work_notes=snapshot['notes'], context_token_target=target,
+            schema_tokens=estimate_tokens('[]'), estimate_tokens=estimate_tokens)
+        supplied = json.loads(messages[1]['content'])['working_view']['notes']
+        self.assertTrue(supplied)
+        self.assertEqual(supplied[0]['text'], notes[0]['text'])
+        self.assertLess(len(supplied), len(snapshot['notes']))
+        self.assertLessEqual(budget['estimated_input_tokens'], target)
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response('Continue')):
+            self.client.chat_turn(messages, tools=[], label='next-decision')
+        self.assertEqual([entry.status for entry in self.ledger.entries], ['settled', 'settled'])
+
     def test_settled_truncated_malformed_and_invalid_schema_keep_previous_notes(self):
         for content, finish in [('partial notes','length'),('not JSON','stop'),('{"notes":[]}','stop'),
                 ('{"notes":"invalid"}','stop'),
@@ -1149,6 +1272,24 @@ class CheckpointFailureTests(unittest.TestCase):
             self.assertEqual(ordinary.messages, project(False).messages)
         self.assertEqual(self.ledger.remaining('llm_requests'), 2)
 
+    def test_shared_prepare_checkpoints_only_capacity_pressure_and_keeps_legacy_default(self):
+        from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
+        conversation = ProfessionalConversation(self.client)
+        for projection, expected in (({'compaction_needed':False}, 0),
+                ({'working_context':{'compaction_needed':False}}, 0),
+                ({'compaction_needed':True}, 1), ({}, 1)):
+            with self.subTest(projection=projection):
+                project = Mock(side_effect=lambda closing:ConversationInput(
+                    [{'role':'user', 'content':'Retain the observations'}], [], projection))
+                checkpoint = Mock()
+                before = self.ledger.to_dict()
+                value = conversation.prepare(project, checkpoint=checkpoint,
+                    followup=lambda value:{'llm_requests':1, 'total_tokens':10000})
+                self.assertFalse(value.closing)
+                self.assertEqual(checkpoint.call_count, expected)
+                self.assertEqual(project.call_count, 1 + expected)
+                self.assertEqual(self.ledger.to_dict(), before)
+
     def test_explicit_checkpoint_recovery_keeps_bounded_unknown_entries_and_fees(self):
         entry = self.ledger.reserve('checkpoint', {'llm_requests':1,'total_tokens':5000},
             session_id='session', attempt_id='native-turn-test',
@@ -1257,7 +1398,7 @@ class CheckpointFailureTests(unittest.TestCase):
         self.assertFalse(self.store.exists('memory_input.json'))
         self.assertEqual(self.ledger.remaining('total_tokens'),20000)
 
-    def test_required_notes_input_is_protected_before_buying_a_checkpoint(self):
+    def test_legacy_required_notes_input_is_protected_before_buying_a_checkpoint(self):
         self.ledger = BudgetLedger({'llm_requests':2,'total_tokens':20000})
         self.client = self.client.with_budget(self.ledger,session_id='session',attempt_id='native-turn-test')
         # The old decision alone fits; escaped maximum-size future notes do not.
@@ -1288,7 +1429,7 @@ class CheckpointFailureTests(unittest.TestCase):
         self.assertIsNotNone(snapshot)
         self.assertEqual(self.ledger.remaining('total_tokens'), 200000-140)
 
-    def test_note_reservation_includes_long_escaped_supplied_record_locators(self):
+    def test_legacy_note_reservation_includes_long_escaped_supplied_record_locators(self):
         self.ledger = BudgetLedger({'llm_requests':2,'total_tokens':200000})
         # Prior-note locators are support too; repeated backslashes cost more
         # after the JSON context is serialized into the decision messages.
@@ -1390,7 +1531,7 @@ class CheckpointFailureTests(unittest.TestCase):
         return app
 
     def test_journal_partial_turn_batches_derive_frontier_without_rebuying_or_claiming_coverage(self):
-        results = [{'tool_name':'read_file', 'status':status, 'data':{'text':text*20000}}
+        results = [{'tool_name':'read_file', 'status':status, 'data':{'text':text*26000}}
             for status, text in (('ok', 'a'), ('error', 'b'))]
         # Each receipt fits, but their complete native turn exceeds the window.
         app = self._journal_app(results)
@@ -1451,10 +1592,6 @@ class CheckpointFailureTests(unittest.TestCase):
             self.assertEqual(self.compact(rows=rows), (None, ()))
             send.assert_not_called()
         self.previous['compacted_records'] = set()
-        with patch('simple_ar.integrations.llm._call_openai_sdk') as send:
-            self.assertEqual(self.compact(rows=[rows[0], {**rows[1], 'result':{
-                'tool_name':'read_file', 'data':{'text':'small'}}}]), (None, ()))
-            send.assert_not_called()
         with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
                 '{"notes":[{"text":"Later complete work","observations":["o1"]}]}')):
             snapshot, refs = self.compact(rows=rows)
@@ -1476,6 +1613,16 @@ class CheckpointFailureTests(unittest.TestCase):
         memory = app._working_memory()
         self.assertEqual(memory['compacted_records'], set())
         self.assertEqual(memory['through_turn'], 0)
+        # A settled unusable summary cannot hide the successful original result.
+        result = observation(0, json.dumps(rows[0]['result']), kind='operation_result', record=rows[0]['record'])
+        messages, budget = select(material_policy='retained', require_work_notes=True, fit_work_notes=True,
+            work_notes=memory['notes'], summarized_through_turn=memory['through_turn'], observations=[result],
+            turn_blocks=[[], block(1, 'Continue from the successful receipt')],
+            context_token_target=12000, estimate_tokens=estimate_tokens)
+        supplied, = json.loads(messages[1]['content'])['working_view']['observations']
+        self.assertEqual(json.loads(supplied['observation']['text']), rows[0]['result'])
+        self.assertEqual(supplied['version_status'], 'historical')
+        self.assertFalse(budget['compaction_needed'])
         before = self.ledger.to_dict()
         # Historical empty snapshots validate but cannot acknowledge receipts either.
         failure = self.store.read_json('memory_failure.json')

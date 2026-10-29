@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.budget import completed_llm_usage_is_accounted
-from simple_ar.integrations.llm import estimate_tokens
+from simple_ar.integrations.llm import LLMSettings, estimate_tokens
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 from simple_ar.tools.workspace import FileWindow, workspace_tool_specs
 
@@ -830,9 +830,13 @@ class InspectionToolGateway:
             except (OSError, ValueError):
                 return None
 
-        target = getattr(getattr(client, '_settings', None), 'context_input_tokens', 24000)
+        target = getattr(getattr(client, '_settings', None), 'context_input_tokens', LLMSettings.context_input_tokens)
         if type(target) is not int or target <= 0:
-            target = 24000
+            target = LLMSettings.context_input_tokens
+        if saved.get('memory_protocol') == 'journal.v1' and client._budget_ledger is not None:
+            remaining = client._budget_ledger.remaining('total_tokens')
+            if remaining is not None:
+                target = min(target, max(0, remaining - (client.effective_output_limit() or 0)))
         base = self._view(saved, request)
         pinned = {(row['path'], row['sha256']): row for role in ('targets', 'evidence')
             for row in base[role] if row.get('text_windows')}
@@ -899,7 +903,7 @@ class InspectionToolGateway:
             context_token_target=target,estimate_tokens=estimate_tokens,
             material_policy='retained' if retained else 'ranked',
             version_resolver=version if retained else None,
-            **({'work_notes':notes, 'require_work_notes':True,
+            **({'work_notes':notes, 'require_work_notes':True, 'fit_work_notes':True,
                 'summarized_through_turn':min(memory['through_turn'], len(blocks)),
                 'current_artifacts':[row['path'] for row in saved['targets']]} if continuity else {}),
             history_access='read_file at the recorded authorized source path and range',

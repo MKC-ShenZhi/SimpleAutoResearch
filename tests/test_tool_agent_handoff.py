@@ -5567,7 +5567,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         for name, default in (('start_turn', 0), ('max_turns', 10),
                               ('offset_bytes', 0), ('max_bytes', 16000)):
             self.assertEqual(fields[name]['default'], default)
-        for name, minimum, maximum in (('max_turns', 1, 32), ('max_bytes', 1, 64000)):
+        for name, minimum, maximum in (('max_turns', 1, 32), ('max_bytes', 1, 256000)):
             self.assertEqual(fields[name]['minimum'], minimum)
             self.assertEqual(fields[name]['maximum'], maximum)
         self.assertEqual(fields['start_turn']['minimum'], 0)
@@ -5626,7 +5626,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 if end == len(original):
                     self.assertEqual(window.data['next_turn'], 24)
         for invalid in ({'start_turn': -1}, {'offset_bytes': -1}, {'max_turns': 0},
-                        {'max_turns': 33}, {'max_bytes': 0}, {'max_bytes': 64001},
+                        {'max_turns': 33}, {'max_bytes': 0}, {'max_bytes': 256001},
                         {'start_turn': '0'}, {'path': 'outside/secret.json'},
                         {'end_turn': -1}, {'start_turn': 25}, {'end_turn': 25},
                         {'start_turn': 7, 'end_turn': 6}, {'max_turns': 1, 'end_turn': 2},

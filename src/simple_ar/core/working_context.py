@@ -43,6 +43,7 @@ def select_working_context(
     material_policy: Literal['ranked', 'referenced', 'scoped', 'retained'] = 'ranked',
     operation_history: Sequence[Mapping[str, Any]] | None = None,
     require_work_notes: bool = False,
+    fit_work_notes: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -85,6 +86,11 @@ def select_working_context(
     With usable required notes, retained current/referenced material precedes
     optional older native work. The latest complete block remains mandatory;
     cold starts and historical optional-note policies retain their suffix rule.
+    ``fit_work_notes`` is the journal working policy: notes receive priority
+    within the same measured input instead of an unbounded mandatory envelope.
+    Current materials and exact operation results remain selectable without a
+    successful note snapshot. Compaction pressure accounts for omitted whole
+    work, including authored arguments and reasoning, not just readable sources.
     """
     if schema_tokens < 0 or context_token_target < 0:
         raise ValueError('Token costs and target must be nonnegative')
@@ -92,6 +98,8 @@ def select_working_context(
         raise ValueError('Unknown working context selection policy')
     scoped_records = material_policy == 'scoped'
     retained_records = material_policy == 'retained'
+    if fit_work_notes and not (retained_records and require_work_notes):
+        raise ValueError('Fitted notes require the retained journal working policy')
     owner_records = material_policy in {'referenced', 'scoped'}
     whole_records = owner_records or retained_records
     context = deepcopy(dict(base_context))
@@ -163,12 +171,13 @@ def select_working_context(
             return False
 
     blocks = [[message for message in block if not is_request(message)] for block in blocks]
+    block_tokens = [estimate_tokens(dump(block)) if block else 0 for block in blocks] if fit_work_notes else []
     def active(note: Mapping[str, Any]) -> bool:
         return note.get('current') is not False and note.get('status') in (
             None, 'current', 'active', 'ok')
 
-    material_first = retained_records and require_work_notes and any(
-        active(note) and isinstance(note.get('text'), str) and note['text'].strip() for note in notes)
+    material_first = retained_records and (fit_work_notes or require_work_notes and any(
+        active(note) and isinstance(note.get('text'), str) and note['text'].strip() for note in notes))
     latest = next((i for i in reversed(range(len(blocks))) if blocks[i]), None)
     recent = [latest] if latest is not None else []
     native = [message for i in recent for message in blocks[i]]
@@ -177,7 +186,7 @@ def select_working_context(
             if not blocks[i]:
                 continue
             candidate = blocks[i] + native
-            if estimate_tokens(dump(candidate)) > context_token_target // 2:
+            if estimate_tokens(dump(candidate)) > (context_token_target if fit_work_notes else context_token_target // 2):
                 break
             recent.insert(0, i)
             native = candidate
@@ -264,7 +273,8 @@ def select_working_context(
                  'Only version_status=matching has a supplied matching digest. '
                  'Operation results are historical raw receipts, never current file facts. '
                  'Historical text is not revalidated when no digest is available.',
-        'observations': [], 'notes': deepcopy(notes) if require_work_notes or owner_records or summarized_through_turn else [],
+        'observations': [], 'notes': deepcopy(notes) if not fit_work_notes and (
+            require_work_notes or owner_records or summarized_through_turn) else [],
         'history': {},
     }
     if retained_records:
@@ -388,7 +398,10 @@ def select_working_context(
         while True:
             context['working_context'] = {'latest_atomic_turn':latest,
                 'recent_start_turn':view['history']['recent_start_turn'],
-                'estimated_input_tokens':cost,'context_exceeds_input_target':cost>context_token_target}
+                'estimated_input_tokens':cost,'context_exceeds_input_target':cost>context_token_target,
+                **({'compaction_needed':cost + sum(tokens for i, tokens in enumerate(block_tokens)
+                    if i not in recent) > context_token_target and any(
+                        block for i, block in enumerate(blocks) if i not in recent)} if fit_work_notes else {})}
             if 'resources' in context:
                 context['resources'].update(approximate_next_input_tokens=cost,
                     context_exceeds_input_target=cost>context_token_target)
@@ -416,7 +429,8 @@ def select_working_context(
     material_ceiling = (context_token_target if whole_records else
                         min(context_token_target, required_cost + context_token_target // 3))
     note_states = [{'index': i, 'records': deepcopy(note.get('records', [])),
-                    'status': 'working_view' if require_work_notes or owner_records or summarized_through_turn else 'capacity',
+                    'status': 'working_view' if not fit_work_notes and (
+                        require_work_notes or owner_records or summarized_through_turn) else 'capacity',
                     'estimated_tokens': estimate_tokens(dump(note))}
                    for i, note in enumerate(notes)]
     # Explicit refs/current artifacts, recent operations, then lexical sources.
@@ -512,11 +526,15 @@ def select_working_context(
             else:
                 note_states[i]['status'] = 'working_view'
 
+    if fit_work_notes:
+        # Notes are useful judgments, not an unbounded mandatory payload. Actual
+        # receipts stay independently selectable when an optional summary fails.
+        admit_notes()
     if not require_work_notes and not retained_records and not owner_records and not summarized_through_turn:
         admit_notes()
     if material_first:
         for i in ordered:
-            if i in current_material:
+            if i in preferred:
                 admit(i)
         # Keep a contiguous, complete suffix only when it fits beside current
         # work. Repeating a body already supplied from its receipt wastes that
@@ -528,7 +546,7 @@ def select_working_context(
             collect_text(blocks[i], texts)
             if (any(keys[j] in represented and observation_text(row) in texts
                     for j, row in enumerate(rows) if isinstance(row.get('text'), str))
-                    or estimate_tokens(dump([m for n in [i, *recent] for m in blocks[n]]))
+                    or not fit_work_notes and estimate_tokens(dump([m for n in [i, *recent] for m in blocks[n]]))
                         > context_token_target // 2):
                 break
             recent.insert(0, i)
@@ -539,7 +557,7 @@ def select_working_context(
                 break
             represented.update(keys[j] for j, state in enumerate(states) if state['status'] == 'native')
         for i in ordered:
-            if i not in current_material:
+            if i not in preferred:
                 admit(i)
     else:
         for i in ordered:
@@ -556,7 +574,7 @@ def select_working_context(
             if states[i]['status'] == 'capacity':
                 states[i]['status'] = 'not_attempted'
                 admit(i)
-        if not require_work_notes:
+        if not require_work_notes and not fit_work_notes:
             admit_notes()
     if scoped_records or retained_records:
         # Original bodies share this budget and precede optional navigation.
@@ -577,6 +595,7 @@ def select_working_context(
         'omitted_records': omitted, 'notes': note_states,
         'selected_turns': list(recent),
         'recent_start_turn': view['history']['recent_start_turn'],
+        **({'compaction_needed':context['working_context']['compaction_needed']} if fit_work_notes else {}),
         'archive_end_turn': view['history']['archive_end_turn'],
         'recent_native_tokens': estimate_tokens(dump([message for i in recent for message in blocks[i]])),
         'material_input_ceiling': material_ceiling,
