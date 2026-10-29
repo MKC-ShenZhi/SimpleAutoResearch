@@ -429,7 +429,7 @@ class ToolApplication:
         if config.get('memory_protocol') and (config.get('context_protocol') != 'working.v4'
                 or config.get('professional_operations') != 'work.v5'):
             raise ValueError('Journal continuity requires the saved shared native work context')
-        if config.get('delivery_review_protocol') not in {None, 'task.v1', 'task.v2'}:
+        if config.get('delivery_review_protocol') not in {None, 'task.v1', 'task.v2', 'task.v3'}:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
         if config.get('professional_operations') is not None and config['professional_operations'] not in PROFESSIONAL_CONTRACTS:
             raise ValueError('Unsupported saved professional operation contract; no silent migration')
@@ -1744,7 +1744,7 @@ class ToolApplication:
             delivery_files=delivery_files,
             extensions=extensions, creation_declarations=creation_declarations)
         config['inspection_protocol'] = 'subjects.v3'
-        config['delivery_review_protocol'] = 'task.v2'
+        config['delivery_review_protocol'] = 'task.v3'
         from simple_ar.app.operation_tools import CURRENT_PROFESSIONAL_CONTRACT
         config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
         if context_protocol is not None:
@@ -3914,6 +3914,20 @@ class ToolApplication:
                     payload.update(status='blocked', error=str(exc))
                     return payload
             hashes = self.workspace.artifact_hashes(delivery['artifacts'])
+            package_review = (self.operations is not None and self.operations.delivery_review is not None
+                              and self.operations.delivery_review.protocol == 'task.v3')
+            if package_review and request.summary_source is not None:
+                # v3 binds the completion claim itself, including the actual
+                # summary source. Never change that claim after its review.
+                retained = payload.get('metadata', {}).get('delivery_hashes')
+                if retained is not None and hashes != retained:
+                    payload.update(status='blocked', error='Final work outputs changed before summary binding; no delivery or replay')
+                    return payload
+                try:
+                    delivery['summary'] = self.workspace.delivery_summary(delivery, hashes)
+                except (ValueError, OSError) as exc:
+                    payload.update(status='blocked', error=str(exc))
+                    return payload
             if self.operations is not None:
                 try:
                     # Domain consumers verify an actual observation record, not
@@ -3932,8 +3946,7 @@ class ToolApplication:
                     # act on the result through this same ledger.
                     review_floor = (self._completion_floor(self._client(store.root.name), dispatch=True)
                         if start_review and self.operations.delivery_review is not None
-                            and not request.unresolved and request.report is not None
-                            and request.report.status == 'canonical' else {})
+                            and self.operations.delivery_review.requires_review(request) else {})
                     with self.ledger.protect_remaining(review_floor):
                         review = self.operations.review_delivery(delivery, store.root.name,
                             may_start=start_review, current_result=current, current_outputs=outputs)
@@ -3945,7 +3958,9 @@ class ToolApplication:
                         metadata['delivery_review'] = review
                         if not review.get('error'):
                             reviewed = review['result']['metadata']
-                            for key in ('assessments', 'inspection_binding'):
+                            keys = (('inspection_binding',) if package_review
+                                    else ('assessments', 'inspection_binding'))
+                            for key in keys:
                                 if key in reviewed:
                                     metadata[key] = reviewed[key]
                             if review['identity'] == store.root.name:
@@ -3960,7 +3975,7 @@ class ToolApplication:
                     # terminal gate requires the actual current full-scope proof.
                     payload.setdefault('metadata', {})['delivery_review_error'] = str(exc)
             retained = payload['metadata'].get('delivery_hashes')
-            if request.summary_source is not None:
+            if request.summary_source is not None and not package_review:
                 try:
                     if retained is not None and hashes != retained:
                         raise ValueError('Final work outputs changed before summary binding; no delivery or replay')

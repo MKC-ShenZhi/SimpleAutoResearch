@@ -10,6 +10,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
+- New tasks use one delivery owner to review the request, completion claim and actual outputs, including deliveries without report metadata and direct text answers. Local opinions inform that review instead of adding another acceptance gate. Saved tasks keep their original rules.
 - Package review prioritizes current manuscript, code and result text, reusing valid reads and filling unread ranges. Original sources remain available for investigation. Large material follows existing capacity rules; complete reading does not establish correctness.
 
 ### Fixed

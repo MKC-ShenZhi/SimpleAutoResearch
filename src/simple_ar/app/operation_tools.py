@@ -35,7 +35,8 @@ _DIRECT_WORK = (
     "code behavior through actual callers, resolved configuration and defaults. Ask only indispensable "
     "questions about semantics, scope, resources or permission. "
 )
-def _work_principles(owned_delivery: bool = False, automatic_memory: bool = False) -> str:
+def _work_principles(owned_delivery: bool = False, automatic_memory: bool = False, *,
+                     delivery_protocol: str | None = None) -> str:
     return (
     ("Use the supplied working understanding as fallible continuity and reassess outdated judgments. "
      "update_work_plan.notes deliberately replaces that understanding; it is not a prerequisite for real work. "
@@ -44,9 +45,21 @@ def _work_principles(owned_delivery: bool = False, automatic_memory: bool = Fals
     "and open questions with update_work_plan.notes citing actual observation records. Reuse this work "
     "across feedback instead of reinventorying materials. Notes are model judgments; original observations "
     "remain evidence. ")
-    + "Work in complete useful units: investigate enough, implement and run, interpret the "
-    "result, then inspect and deliver; do not repeatedly recheck an unchanged result without a concrete gap. "
-    + ("For a formal report, keep one editable manuscript and submit its canonical delivery when the "
+    + ("Work in complete useful units: investigate enough, implement and run when needed, interpret "
+       "the result and deliver; do not repeatedly recheck an unchanged result without a concrete gap. "
+       if delivery_protocol == 'task.v3' else
+       "Work in complete useful units: investigate enough, implement and run, interpret the "
+       "result, then inspect and deliver; do not repeatedly recheck an unchanged result without a concrete gap. ")
+    + ("Submit the actual completion claim and delivered artifacts when the requested work is ready. "
+       "The delivery owner automatically reviews that claim and the complete bound inventory against "
+       "the original requests before acceptance, using this same ledger, including ordinary code, "
+       "tables and text deliveries without a report claim. Leave shared model capacity for that review. "
+       "Local inspect_artifacts checks are optional investigation aids, not a prerequisite or a substitute; "
+       "do not add a local-then-whole review sequence merely to satisfy completion. Address genuine "
+       "required findings while preserving useful outputs. Disclose unfinished work as unresolved for "
+       "partial delivery; this exit does not start an automatic whole-delivery review or claim completion. "
+       if delivery_protocol == 'task.v3' else
+       "For a formal report, keep one editable manuscript and submit its canonical delivery when the "
        "requested work is ready; export that same version if PDF/TeX is requested. The delivery owner "
        "independently reviews the complete requested work and actual delivery inventory before acceptance, "
        "using this same ledger. Leave shared model capacity for that review. Local inspect_artifacts "
@@ -57,8 +70,12 @@ def _work_principles(owned_delivery: bool = False, automatic_memory: bool = Fals
        "evidence using inspect_artifacts, and export that same version if PDF/TeX is requested. Check the "
        "claims and methods, not only agreement between generated text and generated tables. A narrow "
        "consistency check is not a review of the underlying analysis. ")
-    + "A canonical "
-    "report claim identifies the inspected manuscript and requested formats in the delivery. Fix actual required findings; "
+    + ("For a formal report claim, identify the editable manuscript and requested formats; existing "
+       "report and publication rules still apply. Authorized scripts may produce PDF artifacts; "
+       "a PDF suffix alone does not make an artifact a formal report. "
+       if delivery_protocol == 'task.v3' else
+       "A canonical report claim identifies the inspected manuscript and requested formats in the delivery. ")
+    + "Fix actual required findings; "
     "a process exit code or files existing is not a scientific or visual certificate. Use image inspection "
     "when available and relevant; never claim visual inspection from text alone. Preserve limitations. "
     "Advisory suggestions do not create new task obligations. Once requested artifacts are usable and "
@@ -130,7 +147,7 @@ class OperationTools:
             adaptive=self.inspection.adaptive),
             self.inspection)
         self.delivery_review = None
-        if config.get('delivery_review_protocol') in {'task.v1', 'task.v2'}:
+        if config.get('delivery_review_protocol') in {'task.v1', 'task.v2', 'task.v3'}:
             from simple_ar.tools.delivery_review import DeliveryReview
             self.delivery_review = DeliveryReview(workspace=self.workspace, inspector=self.inspection,
                 user_requests=user_requests, observations=observations,
@@ -164,7 +181,8 @@ class OperationTools:
             if professional and not exact and preparation is None else None)
         self.system = (_SOURCE_COORDINATION
             if source_owner or not exact and preparation in {'prepared.v2','prepared.v3'} else _DIRECT_WORK) + _work_principles(
-                self.delivery_review is not None, config.get('memory_protocol') == 'journal.v1')
+                self.delivery_review is not None, config.get('memory_protocol') == 'journal.v1',
+                delivery_protocol=self.delivery_review.protocol if self.delivery_review is not None else None)
         if exact or (preparation is not None or source_owner) and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
             self.implementation = ImplementationToolGateway(root,self.workspace,ledger,config['model'],session_id,
@@ -285,13 +303,14 @@ class OperationTools:
             subjects = []
             targets_reviewed = feedback.pop('reviewed_subjects')
             inventory = feedback.pop('reviewed_inventory', {})
+            package = (feedback.get('delivery_context') or {}).get('schema_version') == 'delivery_review.v3'
             for locator, digest in {**inventory, **targets_reviewed}.items():
                 try:
                     subject = self.workspace.resolve(locator)
                 except ValueError:
                     continue  # Old locators do not grant new access.
                 copy = next((path for path, value in selected.items() if value == digest), None)
-                if ((subject, digest) in concluded or not (copy is not None or any(subject == root
+                if (not package and (subject, digest) in concluded or not (copy is not None or any(subject == root
                         or root.is_dir() and subject.is_relative_to(root) for root in roots))):
                     continue
                 current_path = copy or subject
@@ -307,7 +326,11 @@ class OperationTools:
                 if (any(conclusive(row) and locator in row['subjects'] for row in assessments)
                         or inventory and assessments and all(conclusive(row) for row in assessments)):
                     concluded.add((subject, digest))
-            if subjects:
+            # A local file opinion cannot retire a whole-claim opinion. Direct
+            # answers and claim-level defects have no file scope at all, yet
+            # remain relevant guidance for the next whole-work judgment.
+            claim_findings = (feedback['result'].get('metadata') or {}).get('delivery_assessment', {}).get('findings', [])
+            if subjects or package and (not inventory or not roots or any(not row['subjects'] for row in claim_findings)):
                 result.append({**feedback, 'kind': 'inspection_feedback', 'subjects': subjects,
                     'record': 'records/' + observed['record'].removeprefix('attempts/')})
         return result
@@ -411,11 +434,15 @@ class OperationTools:
         except ValueError as exc:
             return [str(exc)]
         issues.extend(report_issues)
-        scoped_review = self.delivery_review is not None and bool(required)
+        scoped_review = (self.delivery_review is not None
+                         and self.delivery_review.requires_review(request))
+        package_review = scoped_review and self.delivery_review.protocol == 'task.v3'
         # Admission need not already have the review it is about to perform.
-        # After the operation, local opinions still constrain actual findings,
-        # but only the bound whole-delivery review fulfills the report check.
-        if include_inspection and not (scoped_review and proposed is not None):
+        # The whole-work owner reconsiders retained local opinions against this
+        # exact claim and inventory; a second local gate would force duplicate
+        # reviews or preserve a rejected old opinion forever. Historical file
+        # contracts keep their gate. A package pass is never a local file pass.
+        if include_inspection and not package_review and not (scoped_review and proposed is not None):
             issues.extend(assessment_issues(self.workspace,observations,resolved['artifacts'],
                 require_pass=[] if scoped_review else required))
         if include_inspection and scoped_review and proposed is None:
