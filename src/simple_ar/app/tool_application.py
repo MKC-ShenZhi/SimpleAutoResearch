@@ -3291,19 +3291,43 @@ class ToolApplication:
                     'scope': 'Prior delivery and recorded production are not current acceptance. '
                         'Recorded hashes describe prior bindings. See working_view for matching/stale/unknown read versions.'}
                 manuscript = ((delivered or {}).get('report') or {}).get('manuscript')
+                manuscript_path = None
                 if manuscript:
                     try:
                         path = str(self.workspace.resolve(manuscript))
-                        context['retained_work']['last_delivery']['manuscript_identity'] = next(
+                        primary = next(
                             ({key: row[key] for key in ('locator', 'recorded_sha256', 'current_version', 'presence')}
                              for row in reversed(retained['identities']) if row.get('absolute_path') == path
                              and row['provenance']['record'] == delivered['record']), None)
+                        context['retained_work']['last_delivery']['manuscript_identity'] = primary
+                        if primary and primary['presence'] == 'present' and primary['recorded_sha256']:
+                            manuscript_path = path
                     except (OSError, ValueError):
                         pass
-                # Prioritize authorized identities under every observed spelling.
+                # Keep the complete delivered inventory discoverable as names.
+                # On feedback to a delivery with a declared primary manuscript,
+                # the primary and new work are the working material; old supporting
+                # files remain available by their original record and on demand.
+                # Without a primary owner, retain the historical selection policy.
+                revision = (delivered and manuscript_path is not None
+                    and isinstance(delivered.get('request_count'), int)
+                    and delivered['request_count'] < len(self.state['requests']))
+                if revision:
+                    delivery_rows = [row for row in retained['identities']
+                        if row.get('provenance', {}).get('record') == delivered['record']
+                        and row['provenance'].get('kind') == 'delivery_binding']
+                    context['retained_work']['last_delivery']['artifacts'] = list(dict.fromkeys(
+                        row['locator'] for row in delivery_rows))
+                    unavailable = {row['locator']: row['presence'] for row in delivery_rows
+                        if row.get('presence') != 'present'}
+                    if unavailable:
+                        context['retained_work']['last_delivery']['unavailable'] = unavailable
                 # Resolution grants no new mount and does not read output bytes.
                 for row in retained['identities']:
                     if row.get('presence') == 'present' and row['version_binding'] == 'recorded':
+                        if (revision and row.get('absolute_path') != manuscript_path
+                                and row.get('provenance', {}).get('request_count') != len(self.state['requests'])):
+                            continue
                         current_artifacts.update((row['locator'], row['absolute_path']))
                 spellings = {value for row in working_rows
                     for value in (row.get('path'), row.get('absolute_path')) if isinstance(value, str)}
@@ -3340,6 +3364,18 @@ class ToolApplication:
                     operation_history = scope['operation_history']
                     if scope['diagnostic']:
                         context['professional_work']['material_diagnostic'] = scope['diagnostic']
+            # Caller turns are not replayed as native assistant/tool messages.
+            # Keep their explicitly selected windows eligible throughout this
+            # request, not just until the next read or edit. The shared selector
+            # still checks versions and fits these observations to capacity.
+            selected_records = list(dict.fromkeys([*selected_records, *(
+                row['record'] for row in working_rows
+                if isinstance(row.get('turn'), int) and 0 <= row['turn'] < len(turns)
+                and turns[row['turn']].get('origin') == 'caller'
+                and not turns[row['turn']].get('remaining')
+                and turns[row['turn']].get('request_count', 1) == len(self.state['requests'])
+                and row.get('tool') == 'read_file' and row.get('role') == 'historical_observation'
+                and row.get('record'))]))
             messages, selection = select_working_context(user_requests=self.state['requests'],
                 system_text=prefix[0]['content'],base_context=context,
                 turn_blocks=[block if position>=boundary else [] for position,block in enumerate(blocks)],
@@ -4403,6 +4439,11 @@ class ToolApplication:
             hashes = (payload.get('metadata') or {}).get('delivery_hashes')
             if hashes is None or self.workspace.artifact_hashes(data['artifacts']) != hashes:
                 raise ValueError('Delivery version is unbound or changed; inspect retained results before continuing')
+            from simple_ar.tools.delivery_versions import DeliveryVersions
+            DeliveryVersions(self.session.store.root).retain(observed['result'], delivery, hashes,
+                turn.get('request_count', 1))
+            if self.workspace.artifact_hashes(data['artifacts']) != hashes:
+                raise ValueError('Delivery changed during byte retention; retained version available, no delivery commit')
             self.session.store.write_json('delivery.json', data)
             self.session.complete('Delivery manifest saved; scientific quality requires independent checking')
             if data['unresolved']:
@@ -4971,6 +5012,23 @@ class ToolApplication:
         """Read saved results for users; never execute, certify or change state."""
         result = self.session.status_snapshot()
         result['retained_work'] = self._retained_work()
+        result['delivery_version_scope'] = ('Only captured terminal deliveries have restorable bytes; '
+            'missing historical versions are not reconstructed from current files.')
+        from simple_ar.tools.delivery_versions import DeliveryVersions
+        try:
+            result['delivery_versions'] = [{
+                'observation': v['observation'], 'request_count': v['request_count'],
+                'summary': v['delivery'].get('summary'), 'binding': v['binding'],
+                'status': v['status'], 'reason': v.get('reason'),
+                'receipt': (v['observation'].rsplit('/', 1)[0] + '/delivery-version/receipt.json'
+                    if v['status'] == 'retained' else None),
+                'files': {locator: {'source': 'records/' + row['blob'].removeprefix('attempts/'),
+                    'source_sha256': row['sha256'], 'size_bytes': row['size_bytes']}
+                    for locator, row in v['files'].items()}} for v in
+                DeliveryVersions(self.session.store.root).versions()]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            result['delivery_versions'] = []
+            result['delivery_versions_error'] = str(exc)
         return result
 
     def run(self, *, feedback: str = "", approved_execution: str = "",

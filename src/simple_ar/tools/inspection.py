@@ -1264,7 +1264,12 @@ class InspectionToolGateway:
                 finals = sum(name=='record_inspection' for name,_ in parsed)
                 if finals and len(parsed)!=1:
                     raise ValueError('Return record_inspection alone, after source results have been observed')
-                if len(parsed)>8:
+                # Adaptive work already bounds the material presented to the
+                # model and the total decoded reads. Rejecting an otherwise
+                # valid batch solely because it has more than eight calls
+                # makes the model request the same sources again. Keep the
+                # historical fixed-round contract for non-adaptive sessions.
+                if not self.adaptive and len(parsed)>8:
                     raise ValueError('Inspection allows at most eight source calls in one response')
                 if finals:
                     value = parsed[0][1]

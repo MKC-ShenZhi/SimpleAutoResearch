@@ -114,7 +114,7 @@ class DeliveryRequest(BaseModel):
     summary_source: FileWindow | None = Field(default=None, exclude_if=lambda value: value is None,
         description='Optional exact UTF-8 window of an actual delivered text file. After final work succeeds, the delivery owner replaces summary with this window and checks its existing delivery byte binding. No semantic representativeness or scientific correctness is certified. Omit to retain the free summary contract.')
     artifacts: list[str] = Field(default_factory=list,
-        description="Existing workspace outputs (workspace-relative or explicitly mounted paths) or retained files in this task's evidence mount. Evidence remains read-only and is referenced, not copied or certified. Directories expand to a snapshot of at most 200 accessible files; private paths, virtual environments, Python bytecode caches and symlinks are excluded by the existing inventory rules. Oversized inventories must be narrowed explicitly; this is not an archive or correctness certificate.")
+        description="Existing workspace outputs (workspace-relative or explicitly mounted paths) or retained files in this task's evidence mount. Evidence remains read-only and is not certified. Directories expand to at most 200 accessible files; private paths, environments, bytecode caches and symlinks are excluded by existing inventory rules. New formal deliveries retain exact selected file bytes at the original terminal attempt. Storage failure prevents commit. Old deliveries without retained bytes are not reconstructed. This is not a whole-workspace archive or correctness certificate.")
     unresolved: list[str] = Field(default_factory=list,
         description='Requested work still unfinished or a required defect still unresolved; nonempty makes delivery partial. Put inherent evidence limits in limitations instead.')
     limitations: list[str] = Field(default_factory=list,exclude_if=lambda value:not value,
@@ -411,7 +411,13 @@ class RetainedDelivery:
     def admit(self, path: Path) -> Path:
         if self.authorize is not None:
             self.authorize(path)
-        if any(_private_name(part) for part in path.parts):
+        if '..' in path.parts:
+            raise ValueError('Use an authorized path without traversal')
+        # A granted task root can itself live below .codex (managed worktrees).
+        # Its ancestors are not task contents. External sources retain the
+        # original full-path private-name policy and admission callback.
+        parts = path.relative_to(self.root).parts if path.is_relative_to(self.root) else path.parts
+        if any(_private_name(part) for part in parts):
             raise ValueError('Private/runtime paths are not exposed to retained material reads')
         return path
 

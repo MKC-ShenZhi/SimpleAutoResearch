@@ -1676,6 +1676,39 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self._versions(self.inputs), original_inputs)
         self.assertFalse(self._process_receipts())
 
+        # A new request keeps the declared manuscript and the delivery inventory,
+        # without treating every supporting file as an automatically required
+        # original body. Explicit reads and current-request outputs still work.
+        self._submit(_action('read_file', path='report.md'),
+            feedback='Revise the report using the existing work and preserve the supporting table.')
+        from simple_ar.core.working_context import select_working_context
+        with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select:
+            self.app._messages()
+        active = set(select.call_args.kwargs['current_artifacts'])
+        self.assertIn('workspace/report.md', active)
+        self.assertNotIn('workspace/table.csv', active)
+        self.assertIn('workspace/table.csv', self.app.result_snapshot()['retained_work']['artifacts'])
+        report = self.root/'workspace/report.md'
+        original = report.read_bytes()
+        try:
+            report.unlink()
+            with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select:
+                self.app._messages()
+            self.assertIn('workspace/table.csv', select.call_args.kwargs['current_artifacts'])
+        finally:
+            report.write_bytes(original)
+        self._submit(_action('read_file', path='measurements/conditions.txt'))
+        self._submit(_action('read_file', path='table.csv'))
+        messages = self.app._messages()
+        self.assertTrue(any('mean\\n2.0' in str(message.get('content', '')) for message in messages))
+        self._submit(_action('write_file', path='revision-note.md', content='Current work.'))
+        with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select:
+            self.app._messages()
+        self.assertIn('workspace/revision-note.md', select.call_args.kwargs['current_artifacts'])
+        messages = self.app._messages()
+        self.assertTrue(any('mean\\n2.0' in str(message.get('content', '')) for message in messages))
+        self.assertTrue(any('Three supplied observations' in str(message.get('content', '')) for message in messages))
+
     def test_document_owner_uses_original_reads_across_feedback_and_recovers_without_new_calls(self):
         # Frozen work.v2 keeps its real nested document protocol through load;
         # work.v4 creation exercises native professional prose authoring separately.
@@ -2073,6 +2106,30 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.send.call_count,calls)
         self.assertEqual(self.app.ledger.to_dict(),ledger)
         self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'),records)
+
+    def test_adaptive_inspection_accepts_a_batch_larger_than_eight_reads(self):
+        self._create()
+        self._write('report.md', 'Check the supplied observations.\n')
+        sources = {f'source-{number}.txt': f'Observation {number}.\n' for number in range(12)}
+        for name, text in sources.items():
+            (self.root/'workspace'/name).write_text(text, encoding='utf-8')
+
+        def review(view):
+            if len(self.inspection_requests) == 1:
+                return [_action('read_file', path=name) for name in sources]
+            replies = self._inspection_history()
+            self.assertEqual(len(replies), len(sources))
+            self.assertTrue(all(row['status'] == 'ok' for row in replies), replies)
+            observed = {Path(row['data']['path']).name: ''.join(
+                window['text'] for window in row['data']['text_windows']) for row in replies}
+            self.assertEqual(observed, sources)
+            return {'decisions':[{'subject':'target-1', 'conclusion':'complete',
+                'findings':[], 'evidence':[], 'limitations':[]}]}
+
+        self.review = review
+        result = self._inspect(['report.md'], [])
+        self.assertEqual(result['status'], 'ok', result)
+        self.assertEqual(len(self.inspection_requests), 2)
 
     def test_retained_inspection_yields_optional_context_to_target_priming_and_new_reads(self):
         from dataclasses import replace
@@ -3203,7 +3260,6 @@ class OperationsWorkLoopTests(unittest.TestCase):
             'final_then_source': [final, source],
             'multiple_final': [final, final],
             'invalid_shape': [{'tool_name':'read_file', 'arguments':['measurements/conditions.txt']}],
-            'too_many_sources': [source]*9,
             # Raw native calls bypass the fixture's convenience conclusion.
             'missing_conclusion': [_action('record_inspection', decisions=[{
                 'subject':'target-1','findings':[],'evidence':[],'limitations':[]}])],

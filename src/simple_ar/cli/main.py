@@ -1421,6 +1421,9 @@ def _print_research_session_status(run_dir: Path) -> None:
         f"(current={snapshot.get('current_attempt') or 'none'}, "
         f"attempts={snapshot['attempt_count']})"
     )
+    if controller.manifest.transition_recipe == 'native-tools-v1':
+        for line in _delivery_version_lines(controller.store.root):
+            print_line(line)
 
     # Historical sessions recorded next-step decisions. Display those facts
     # without executing the retired workflow or rewriting its manifest.
@@ -2436,6 +2439,36 @@ def _stage_status(item: dict[str, object]) -> str:
     return "done" if item.get("completed") else "pending"
 
 
+def _delivery_version_lines(root: Path) -> list[str]:
+    """Discover retained bytes from original attempts, without changing state."""
+    from simple_ar.tools.delivery_versions import DeliveryVersions
+
+    if not (root / 'session_manifest.json').is_file():
+        return []
+    try:
+        versions = DeliveryVersions(root).versions()
+    except (OSError, ValueError, KeyError, TypeError):
+        return ['Retained byte versions unavailable / 保留字节版本不可用；请检查原始交付回执。']
+    retained = sum(version['status'] == 'retained' for version in versions)
+    lines = [f'Retained byte versions / 已保留字节版本: {retained}']
+    if not retained and (root / 'delivery.json').is_file():
+        lines.append('Historical delivery bytes unavailable / 历史交付缺少可还原字节；不会从当前文件补建。')
+    for version in versions:
+        if version['status'] != 'retained':
+            lines.append(f"- request={version['request_count']}; "
+                f"unavailable / 历史字节不可还原; observation={version['observation']}")
+            continue
+        receipt = version['observation'].rsplit('/', 1)[0] + '/delivery-version/receipt.json'
+        lines.append(f"- request={version['request_count']}; files={len(version['files'])}; "
+            f"binding={version['binding']}; receipt={receipt}")
+    if retained:
+        lines.append('Select receipt.files[original].blob (session-relative exact bytes) and sha256; '
+            'copy to a NEW destination. / 按回执选择原文件对应的字节副本与摘要，复制到新目标。')
+        lines.append('Retained bytes do not establish current completion or scientific acceptance. / '
+            '保留字节不代表当前请求完成或科研验收。')
+    return lines
+
+
 def _render_native_result(app: Any, status: dict[str, Any]) -> None:
     """Read the existing owners; never commit, reconcile or certify a result."""
     from simple_ar.core.console import make_console
@@ -2523,6 +2556,7 @@ def _render_native_result(app: Any, status: dict[str, Any]) -> None:
     else:
         lines.append("No saved delivery record / 无已保存交付记录")
 
+    lines.extend(_delivery_version_lines(root))
     budget = app.ledger.snapshot()
     entries = app.ledger.entries
     table = Table("Resource", "Cumulative accounting / 累计账目", "Remaining / 剩余", expand=True)
