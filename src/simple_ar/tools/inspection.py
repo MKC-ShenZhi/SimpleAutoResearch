@@ -814,7 +814,8 @@ class InspectionToolGateway:
                           offered: list, client: Any, *, finish: dict | None = None,
                           validate_capacity: bool = True) -> tuple[list, dict]:
         """Reuse the common pure projector; original read/response records stay intact."""
-        from simple_ar.core.working_context import select_working_context
+        from simple_ar.core.working_context import (
+            current_material_paths, processed_journal_turns, select_working_context)
 
         policy = saved.get('inspection_context_policy')
         if 'inspection_context_policy' in saved and policy != 'retained.v1':
@@ -868,7 +869,7 @@ class InspectionToolGateway:
         # decoded ranges and receipts remain the authority for adoption.
         memory, notes = None, []
         if continuity:
-            memory, observations = self._conversation_material(saved)
+            memory, observations, journal_rows = self._conversation_material(saved)
             for note in memory['notes']:
                 current = all(version(path) == digest for path, digest in note['observed_versions'].items())
                 notes.append({**note, 'current':current})
@@ -905,7 +906,11 @@ class InspectionToolGateway:
             version_resolver=version if retained else None,
             **({'work_notes':notes, 'require_work_notes':True, 'fit_work_notes':True,
                 'summarized_through_turn':min(memory['through_turn'], len(blocks)),
-                'current_artifacts':[row['path'] for row in saved['targets']]} if continuity else {}),
+                'current_artifacts':sorted(current_material_paths(
+                    request_count=len(saved.get('user_requests', [request.goal])),
+                    selected_paths=[row['path'] for row in saved['targets']])),
+                'processed_turns':processed_journal_turns(journal_rows, memory['compacted_records'])
+                } if continuity else {}),
             history_access='read_file at the recorded authorized source path and range',
             trailing_messages=[finish] if finish is not None else [])
         if validate_capacity and metadata['estimated_input_tokens'] > target:
@@ -1004,7 +1009,7 @@ class InspectionToolGateway:
                 failure=store.read_json('memory_failure.json') if store.exists('memory_failure.json') else None)
         return memory
 
-    def _conversation_material(self, saved: dict) -> tuple[dict, list]:
+    def _conversation_material(self, saved: dict) -> tuple[dict, list, list]:
         """Adapt original owner-bound read windows, never another role's notes."""
         rows = self._conversation_rows(saved)
         memory = self._conversation_memory(saved, rows)
@@ -1029,7 +1034,7 @@ class InspectionToolGateway:
                     'role':'historical_observation', 'turn':source['turn'] if source else None,
                     'offset_bytes':window['offset_bytes'], 'next_offset_bytes':window['review_next_offset_bytes'],
                     'size_bytes':window['size_bytes'], 'text':text})
-        return memory, observations
+        return memory, observations, rows
 
     def _prepare_conversation_round(self, saved, request, messages, tools, terminal, finish,
                                     client, number, remaining):
@@ -1047,8 +1052,9 @@ class InspectionToolGateway:
         def checkpoint(value, decision_tokens):
             rows = self._conversation_rows(saved)
             memory = self._conversation_memory(saved, rows)
-            cutoff = value.projection['recent_start_turn']
-            pending = [row for row in rows if row['turn'] < cutoff
+            selected = value.projection.get('compaction_turns')
+            pending = [row for row in rows if (row['turn'] in selected if selected is not None
+                else row['turn'] < value.projection['recent_start_turn'])
                 and row['record'] not in memory['compacted_records']]
             store = ArtifactStore(self.root/f"tools/inspection/{saved['identity']}/sources-{number}")
             try:

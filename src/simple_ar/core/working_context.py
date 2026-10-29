@@ -25,6 +25,37 @@ def history_view(turns: list[dict[str, Any]]) -> Any:
         json.dumps(turns, ensure_ascii=False)) else turns
 
 
+def current_material_paths(*, identities: Sequence[Mapping[str, Any]] = (),
+                           request_count: int, selected_paths: Sequence[str] = ()) -> set[str]:
+    """Qualify current production and owner-selected material, without reading bytes.
+
+    A delivery inventory is discovery, not relevance. Owners resolve selections
+    under their existing permissions; the selector still checks read versions.
+    """
+    paths = set(selected_paths)
+    for row in identities:
+        if (row.get('presence') == 'present' and row.get('version_binding') == 'recorded'
+                and row.get('provenance', {}).get('request_count') == request_count):
+            paths.update(value for value in (row.get('locator'), row.get('absolute_path'))
+                         if isinstance(value, str) and value)
+    return paths
+
+
+def processed_journal_turns(rows: Sequence[Mapping[str, Any]],
+                            compacted_records: Sequence[str] | set[str]) -> list[int]:
+    """Closed turns whose every original receipt entered an adopted checkpoint.
+
+    Owners supply their validated closed journal, including reply-only turns.
+    This is presentation coverage, never completion, evidence or note validity.
+    No through-turn watermark can stand in for an absent receipt.
+    """
+    records: dict[int, set[str]] = {}
+    for row in rows:
+        records.setdefault(row['turn'], set()).add(row['record'])
+    covered = set(compacted_records)
+    return sorted(turn for turn, originals in records.items() if originals <= covered)
+
+
 def select_working_context(
     *, user_requests: Sequence[str], system_text: str,
     base_context: Mapping[str, Any],
@@ -541,11 +572,16 @@ def select_working_context(
         admit_notes()
     if material_first:
         if journal_selection:
-            # A note's source locator is navigation, not a standing demand to
-            # resend its full original. Current objects and explicit references
-            # still use the same version-checked original-body admission.
-            ordered = [i for i in ordered if rows[i].get('record') in explicit_references
-                or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts]
+            # Only adopted receipt coverage with usable supplied notes can
+            # retire a historical body. Empty coverage, new reads and sources
+            # outside this journal retain ordinary whole-window admission.
+            # Explicit/current originals override retirement, not version checks.
+            if any(active(note) for note in view['notes']):
+                ordered = [i for i in ordered if rows[i].get('turn') not in processed
+                    or rows[i].get('record') in explicit_references
+                    or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts]
+            # Retained originals precede optional native history; otherwise an
+            # evicted read can lose its only body to unrelated native blocks.
             preferred = set(ordered)
         for i in ordered:
             if i in preferred:

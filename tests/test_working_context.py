@@ -9,7 +9,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, PropertyMock, patch
 
-from simple_ar.core.working_context import history_view, select_working_context
+from simple_ar.core.working_context import (
+    current_material_paths, history_view, processed_journal_turns, select_working_context)
 from simple_ar.app.work_memory import compact_work, checkpoint_artifacts, checkpoint_entries, summary_coverage
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.core.budget import BudgetLedger
@@ -449,14 +450,65 @@ class WorkingContextTests(unittest.TestCase):
 
 
 class RetainedWorkingContextTests(unittest.TestCase):
+    def test_journal_coverage_retires_only_processed_originals_and_keeps_needed_bodies(self):
+        covered = observation(0, 'Covered original bytes.', path='covered.csv', role='historical_observation')
+        fresh = observation(1, 'New original bytes.', path='fresh.csv', role='historical_observation')
+        external = observation(None, 'Original outside this journal.', path='external.csv',
+            record='records/external.json', role='historical_observation')
+        arguments = dict(material_policy='retained', require_work_notes=True, fit_work_notes=True,
+            observations=[covered, fresh, external],
+            turn_blocks=[block(0, covered['text']), block(1, fresh['text']), block(2, 'Current target')],
+            work_notes=[{'text':'Earlier interpretation, not original evidence.',
+                'records':[covered['record']], 'current':True}],
+            version_resolver=lambda _:'recorded-digest', context_token_target=40000)
+        for processed in ([], [0]):
+            with self.subTest(processed=processed):
+                messages, metadata = select(**arguments, processed_turns=processed)
+                supplied = json.dumps(messages)
+                self.assertEqual(covered['text'] in supplied, not bool(processed))
+                self.assertIn(fresh['text'], supplied)
+                self.assertIn(external['text'], supplied)
+                self.assertFalse(metadata['compaction_needed'])
+                for selection in ({'selected_records':[covered['record']]},
+                                  {'current_artifacts':[covered['path']]}):
+                    required, _ = select(**arguments, processed_turns=processed, **selection)
+                    self.assertIn(covered['text'], json.dumps(required))
+        self.assertEqual(processed_journal_turns([
+            {'turn':0, 'record':covered['record']}, {'turn':1, 'record':fresh['record']}],
+            {covered['record']}), [0])
+
+    def test_current_material_qualification_keeps_inventory_separate_from_selected_reads(self):
+        def identity(path, count, presence='present'):
+            return {'locator':path, 'absolute_path':'/'+path, 'presence':presence,
+                'version_binding':'recorded', 'provenance':{'request_count':count}}
+        rows = [identity('old.csv', 1), identity('new.py', 2), identity('missing.md', 2, 'missing')]
+        before = deepcopy(rows)
+        paths = current_material_paths(identities=rows, request_count=2, selected_paths=['/primary.md'])
+        self.assertEqual(paths, {'new.py', '/new.py', '/primary.md'})
+        self.assertEqual(rows, before)
+        # Qualification grants neither new reads nor version validity. A
+        # current output's old read window must still fail the shared resolver.
+        row = observation(0, 'Old output bytes', path='new.py', role='historical_observation')
+        for digest, expected in [('changed', 'stale'), (None, 'unknown')]:
+            messages, selection = select(material_policy='retained', fit_work_notes=True,
+                require_work_notes=True, processed_turns=[], current_artifacts=paths,
+                observations=[row], version_resolver=lambda _, value=digest:value)
+            self.assertNotIn(row['text'], json.dumps(messages))
+            self.assertEqual(selection['omitted_records'][0]['version_status'], expected)
+
     def test_processed_prefix_is_navigation_not_a_demand_to_refill_the_window(self):
         text = 'Original historical source. '*300
         row = observation(0, text, role='historical_observation')
         notes = [{'text':'Earlier work remains a model judgment; consult its original.',
             'records':[row['record']], 'current':True}]
+        journal = [{'turn':0, 'record':row['record']}, {'turn':0, 'record':'records/other.json'},
+            {'turn':1, 'record':'records/current.json'}]
+        self.assertEqual(processed_journal_turns(journal, {row['record']}), [])
+        processed = processed_journal_turns(journal, {row['record'], 'records/other.json'})
+        self.assertEqual(processed, [0])
         arguments = dict(material_policy='retained', require_work_notes=True, fit_work_notes=True,
             turn_blocks=[block(0, text), block(1, 'Current operation')], observations=[row],
-            work_notes=notes, processed_turns=[0], version_resolver=lambda _:row['sha256'],
+            work_notes=notes, processed_turns=processed, version_resolver=lambda _:row['sha256'],
             context_token_target=40000)
         messages, selection = select(**arguments)
         self.assertNotIn(text, json.dumps(messages))

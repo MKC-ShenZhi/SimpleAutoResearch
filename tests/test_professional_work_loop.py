@@ -595,7 +595,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(retained['last_delivery']['unresolved'], delivery['unresolved'])
         self.assertEqual(retained['last_delivery']['limitations'], delivery['limitations'])
         self.assertEqual(retained['latest_produced']['request_count'], 2)
-        self.assertIn('workspace/说明.md', select.call_args.kwargs['current_artifacts'])
+        self.assertNotIn('workspace/说明.md', select.call_args.kwargs['current_artifacts'])
+        self.assertIn('workspace/checks/observation.json', select.call_args.kwargs['current_artifacts'])
+        self.assertIn('workspace/说明.md', retained['last_delivery']['artifacts'])
         snapshot = self.app.result_snapshot()['retained_work']
         self.assertEqual(set(snapshot['artifacts']), {'workspace/说明.md', 'workspace/checks/observation.json'})
         self.assertEqual(snapshot['acceptance'], 'not_inferred')
@@ -695,7 +697,13 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(snapshot['latest_produced'], produced)
         self.assertEqual(json.loads(messages[1]['content'])['retained_work']['latest_produced']['versions'],
                          {'workspace/bound.bin': hashlib.sha256(b'produced').hexdigest()})
-        self.assertIn('duplicate/original.dat', select.call_args.kwargs['current_artifacts'])
+        self.assertNotIn('duplicate/original.dat', select.call_args.kwargs['current_artifacts'])
+        self.assertIn('workspace/bound.bin', select.call_args.kwargs['current_artifacts'])
+        # Explicit caller windows remain eligible by receipt, independently of
+        # whether the path is current production or a historical delivered file.
+        selected = select.call_args.kwargs['selected_records']
+        self.assertTrue({'records/'+item['result'].removeprefix('attempts/')
+            for item in self.app.state['turns'][-1]['tools']}.issubset(selected))
         self.assertNotIn('measurements/conditions.txt', select.call_args.kwargs['current_artifacts'])
         self.assertNotIn('workspace/checks/observation.json', select.call_args.kwargs['current_artifacts'])
         self.assertEqual(before, self._versions(self.root))
@@ -1694,7 +1702,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
             report.unlink()
             with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select:
                 self.app._messages()
-            self.assertIn('workspace/table.csv', select.call_args.kwargs['current_artifacts'])
+            self.assertNotIn('workspace/table.csv', select.call_args.kwargs['current_artifacts'])
+            self.assertIn('workspace/table.csv', self.app.result_snapshot()['retained_work']['artifacts'])
         finally:
             report.write_bytes(original)
         self._submit(_action('read_file', path='measurements/conditions.txt'))
@@ -2455,7 +2464,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.ledger.to_dict(), ledger)
         self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), records)
 
-    def test_inspection_reuses_retired_evidence_in_the_common_working_view(self):
+    def test_inspection_rereads_retired_original_on_demand_before_judgment(self):
         from dataclasses import replace
 
         self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
@@ -2465,32 +2474,43 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._write('basis.txt', 'Observed sample values are 1, 2, 3; their mean is 2.0.\n')
         for index in range(2):
             self._write(f'context-{index}.txt', f'Other authorized context {index}.\n'+'Unrelated. '*1600)
+        pending_reads = [
+            _action('read_file', path='basis.txt', offset_bytes=0, max_bytes=1024),
+            *[_action('read_file', path=f'context-{index}.txt', max_bytes=16000) for index in range(2)]]
+        reread_requested = False
 
         def review(view):
-            number = len(self.inspection_views)
+            nonlocal reread_requested
             terminal = next(tool['function']['parameters']
                 for tool in self.inspection_requests[-1]['tools']
                 if tool['function']['name']=='record_inspection')
             evidence = terminal['properties']['decisions']['items']['anyOf'][0]['properties']['evidence']
-            if number == 1:
+            if not view['evidence']:
                 self.assertEqual(evidence['maxItems'], 0)
                 self.assertNotIn('enum', evidence['items'])
             else:
                 self.assertEqual(evidence['items']['enum'],
-                    [f'evidence-{index}' for index in range(1,number)])
-            if number == 1:
-                return [_action('read_file', path='basis.txt', max_bytes=1024)]
-            if number < 4:
-                return [_action('read_file', path=f'context-{number-2}.txt', max_bytes=16000)]
+                    [row['subject'] for row in view['evidence']])
+            if pending_reads:
+                return [pending_reads.pop(0)]
             self.assertGreater(view['working_view']['history']['archive_end_turn'], 0)
             self.assertTrue(all(row['version_status']=='matching'
                 and row['observation']['role']=='historical_observation'
                 for row in view['working_view']['observations']))
-            supplied = [row['observation'] for row in view['working_view']['observations']]
-            basis, = [row for row in supplied if row['subject']=='evidence-1']
-            self.assertEqual(basis['text'], 'Observed sample values are 1, 2, 3; their mean is 2.0.\n')
+            # The fixture reader merges only actual working-view/native read
+            # bodies with matching path and digest into these visible windows.
+            # Neither retired ranges nor checkpoint notes supply original text.
+            basis, = [row for row in view['evidence'] if row['subject']=='evidence-1']
+            if not basis['text_windows']:
+                self.assertFalse(reread_requested, 'One reread must restore the original; do not loop')
+                reread_requested = True
+                return [_action('read_file', path='basis.txt', offset_bytes=0, max_bytes=1024)]
+            window, = basis['text_windows']
+            self.assertEqual(window['text'], 'Observed sample values are 1, 2, 3; their mean is 2.0.\n')
             self.assertEqual(basis['sha256'], _digest(self.root/'workspace/basis.txt'))
-            self.assertEqual(basis['next_offset_bytes'],len(basis['text'].encode()))
+            self.assertEqual(window['offset_bytes'], 0)
+            self.assertEqual(window['next_offset_bytes'],len(window['text'].encode()))
+            self.assertEqual(window['size_bytes'],len(window['text'].encode()))
             return {'decisions':[{'subject':'target-1','evidence':['evidence-1'],
                 'findings':[],'limitations':[]}]}
 
@@ -2503,6 +2523,15 @@ class OperationsWorkLoopTests(unittest.TestCase):
         for request in self.inspection_requests:
             self.assertLessEqual(request['messages'][1]['content'].count('working_view'),1)
         identity = Path(result['data']['record']).parts[1]
+        self.assertTrue(reread_requested)
+        saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+        reads = [row for number in range(len(saved['source_rounds']))
+            for row in self.app.session.store.read_json(
+                f'tools/inspection/{identity}/sources-{number}.json')['results']
+            if row['tool']=='read_file' and row['arguments'].get('path')=='basis.txt']
+        self.assertEqual(len(reads), 2)  # Initial observation plus one necessary reread.
+        self.assertTrue(all(row['result']['status']=='ok'
+            and row['arguments']['offset_bytes']==0 and row['arguments']['max_bytes']==1024 for row in reads))
         retained = self._versions(self.root/f'tools/inspection/{identity}')
         calls, ledger = self.send.call_count, self.app.ledger.to_dict()
         self._reload()
@@ -3439,6 +3468,30 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertTrue(all(note['observed_versions'] for note in memory['notes']))
         self.assertTrue(all(record.startswith(source_prefix)
             for record in memory['compacted_records']))
+        # Reproject this inspector's actual closed source journal. Adopted
+        # receipt coverage, rather than its watermark or the author's notes,
+        # determines which rounds may retire from repeated native presentation.
+        from simple_ar.core.working_context import select_working_context
+        from simple_ar.tools.inspection import InspectionRequest
+        rows = owner._conversation_rows(saved)
+        history = self.inspection_requests[0]['messages'][:2]
+        for number in sorted({row['turn'] for row in rows}):
+            trace = owner.store.read_json(owner._path(identity, f'sources-{number}'))
+            history.append(trace['response'])
+            history.extend({'role':'tool', 'tool_call_id':row['call_id'],
+                'content':json.dumps(row['result'])} for row in trace['results'])
+        request = InspectionRequest.model_validate(saved['arguments'])
+        for covered in (memory['compacted_records'], set()):
+            with self.subTest(covered=bool(covered)), patch.object(owner, '_conversation_memory',
+                    return_value={**memory, 'compacted_records':covered}), patch(
+                    'simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select:
+                owner._working_messages(saved, request, history, [], self.services.llm_client,
+                    validate_capacity=False)
+            expected = sorted(number for number in {row['turn'] for row in rows}
+                if {row['record'] for row in rows if row['turn'] == number} <= covered)
+            self.assertEqual(select.call_args.kwargs['processed_turns'], expected)
+            self.assertEqual(select.call_args.kwargs['current_artifacts'],
+                sorted(row['path'] for row in saved['targets']))
         summary_inputs = [view for view in self.memory_views
             if any(row['record'].startswith(source_prefix) for row in view['observations'])]
         self.assertTrue(summary_inputs)

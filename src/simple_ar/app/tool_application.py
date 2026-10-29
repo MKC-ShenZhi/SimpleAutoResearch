@@ -3264,7 +3264,8 @@ class ToolApplication:
                   {'role': 'user', 'content': ''}]
         schema_cost = estimate_tokens(json.dumps(self.schemas if schemas is None else schemas, ensure_ascii=False))
         if working_mode:
-            from simple_ar.core.working_context import select_working_context
+            from simple_ar.core.working_context import (
+                current_material_paths, processed_journal_turns, select_working_context)
             current_artifacts = set()
             if config.get('professional_operations') == 'work.v5' and config['context_protocol'] == 'working.v4':
                 retained = self._retained_work(observations=owner_observations)
@@ -3305,11 +3306,9 @@ class ToolApplication:
                     except (OSError, ValueError):
                         pass
                 # Keep the complete delivered inventory discoverable as names.
-                # On feedback to a delivery with a declared primary manuscript,
-                # the primary and new work are the working material; old supporting
-                # files remain available by their original record and on demand.
-                # Without a primary owner, retain the historical selection policy.
-                revision = (delivered and manuscript_path is not None
+                # Prior delivery names remain discoverable independently of
+                # whether its owner declared a usable primary manuscript.
+                revision = (delivered
                     and isinstance(delivered.get('request_count'), int)
                     and delivered['request_count'] < len(self.state['requests']))
                 if revision:
@@ -3323,12 +3322,9 @@ class ToolApplication:
                     if unavailable:
                         context['retained_work']['last_delivery']['unavailable'] = unavailable
                 # Resolution grants no new mount and does not read output bytes.
-                for row in retained['identities']:
-                    if row.get('presence') == 'present' and row['version_binding'] == 'recorded':
-                        if (revision and row.get('absolute_path') != manuscript_path
-                                and row.get('provenance', {}).get('request_count') != len(self.state['requests'])):
-                            continue
-                        current_artifacts.update((row['locator'], row['absolute_path']))
+                current_artifacts = current_material_paths(identities=retained['identities'],
+                    request_count=len(self.state['requests']),
+                    selected_paths=[primary['locator'], manuscript_path] if manuscript_path is not None else [])
                 spellings = {value for row in working_rows
                     for value in (row.get('path'), row.get('absolute_path')) if isinstance(value, str)}
                 for value in spellings - current_artifacts:
@@ -3391,10 +3387,11 @@ class ToolApplication:
                     'scoped' if config['context_protocol'] == 'working.v4' else
                     'referenced' if config['context_protocol'] in _REFERENCED_CONTEXT_PROTOCOLS else 'ranked'),
                 operation_history=operation_history,
-                **({'processed_turns':[number for number, turn in enumerate(turns)
-                    if (records := ({'records/'+item['result'].removeprefix('attempts/') for item in turn['tools']}
-                        or {'records/'+turn['reply'].removeprefix('attempts/')}))
-                    and records.issubset(memory.get('compacted_records', ()))]} if journal else {}))
+                **({'processed_turns':processed_journal_turns([
+                    {'turn':number, 'record':'records/'+path.removeprefix('attempts/')}
+                    for number, turn in enumerate(turns) if not turn.get('remaining')
+                    for path in ([item['result'] for item in turn['tools']] or [turn['reply']])],
+                    memory.get('compacted_records', set()))} if journal else {}))
             if working_selection is not None:
                 working_selection.update(selection)
             cost = estimate_tokens(json.dumps(messages,ensure_ascii=False))+schema_cost
