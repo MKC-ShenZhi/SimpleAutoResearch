@@ -146,9 +146,14 @@ class PortableExportIntegrationTests(unittest.TestCase):
                 # manuscript and every first-build auxiliary are unavailable.
                 moved = root / 'relocated'
                 moved.mkdir()
-                for filename in ('main.tex', 'body.tex', 'references.bib', 'template.latex', 'source.md'):
-                    shutil.copyfile(output / filename, moved / filename)
-                shutil.copytree(output / 'figures', moved / 'figures')
+                for filename in result['public_artifacts']:
+                    if filename == 'main.pdf':
+                        continue  # Require a clean build, not the first PDF.
+                    target = moved / filename
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(output / filename, target)
+                self.assertFalse((moved / 'publication_view.json').exists())
+                self.assertFalse((moved / 'main.aux').exists())
                 source.rename(root / 'withheld-input')
                 rebuilt = _compile(moved, True)
                 self.assertTrue(rebuilt['compiled'], rebuilt)
@@ -515,10 +520,14 @@ class PortableExportIntegrationTests(unittest.TestCase):
                     moved.mkdir()
                     # Copy only delivered editable inputs: no .aux/.bbl/PDF or wrapper
                     # repairs can make this ordinary rebuild appear to work.
-                    for name in ('main.tex', 'body.tex', 'references.bib', 'source.md', 'README.txt'):
-                        shutil.copyfile(exported / name, moved / name)
-                    for name in ('figures', 'code'):
-                        shutil.copytree(exported / name, moved / name)
+                    for name in manifest['public_artifacts']:
+                        if name == 'main.pdf':
+                            continue
+                        target = moved / name
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(exported / name, target)
+                    self.assertFalse((moved / 'publication_view.json').exists())
+                    self.assertFalse((moved / 'main.aux').exists())
                     original.rename(root / "input-unavailable")
                     latex = ['pdflatex', '-no-shell-escape', '-halt-on-error',
                              '-interaction=nonstopmode', 'main.tex']

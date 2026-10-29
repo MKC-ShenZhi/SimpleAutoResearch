@@ -13,6 +13,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - New tasks use one delivery owner to review the request, completion claim and actual outputs, including deliveries without report metadata and direct text answers. Local opinions inform that review instead of adding another acceptance gate. Saved tasks keep their original rules.
 - Package review prioritizes current manuscript, code and result text, reusing valid reads and filling unread ranges. Original sources remain available for investigation. Large material follows existing capacity rules; complete reading does not establish correctness.
 - Follow-up work receives exact review findings and affected-version status, with full source bindings and usage retained in the original records instead of crowding out source text with repeated metadata.
+- Publication exports deliver the editable sources, templates, figure assets and requested PDF by default. Internal document trees, build logs and previews remain available for diagnosis without automatically entering delivery review. Whole-project byte bindings and historical recovery rules remain intact.
 
 ### Fixed
 

@@ -252,6 +252,9 @@ class ReportExportTests(unittest.TestCase):
                 self.assertEqual((exported / 'template.latex').read_bytes(), template.read_bytes())
                 self.assertEqual((exported / 'local.bst').read_bytes(), companion.read_bytes())
                 self.assertIn('workspace/publications/template/local.bst', result.artifacts)
+                self.assertIn('workspace/publications/template/template.latex', result.artifacts)
+                self.assertNotIn('workspace/publications/template/publication_view.json', result.artifacts)
+                self.assertIn('workspace/publications/template/publication_view.json', result.data['artifact_sha256'])
                 self.assertEqual(result.data['manifest']['format'], 'pandoc-latex-template')
                 self.assertEqual(result.data['manifest']['compliance']['anonymity'], 'unverified')
                 header = standalone[0]['meta']['header-includes']
@@ -654,7 +657,9 @@ class ReportExportTests(unittest.TestCase):
                 return "converted text"
             with patch("simple_ar.report.export.shutil.which", return_value="pandoc"), patch(
                     "simple_ar.report.export._run", side_effect=convert):
-                export_acm_report(source, root / "acm")
+                exported = export_acm_report(source, root / "acm")
+            self.assertIn('code/block-1.txt', exported['public_artifacts'])
+            self.assertNotIn('publication_view.json', exported['public_artifacts'])
             para = converted[0]["blocks"][-2]["c"]
             self.assertEqual(para[0], {"t": "RawInline", "c": ["latex",
                 r"\seqsplit{train/validation/calibration/test}"]})
@@ -884,7 +889,11 @@ class ReportExportTests(unittest.TestCase):
                 self.assertTrue(workspace.resolve(published.artifacts[0]).is_file())
                 project_files = workspace.resolve_delivery(DeliveryRequest(
                     summary='Project files', artifacts=[published.data['project']]))['artifacts']
-                self.assertEqual(published.artifacts, project_files)
+                self.assertEqual(set(published.artifacts), {f'workspace/publications/export/{path}' for path in (
+                    'main.tex', 'body.tex', 'references.bib', 'source.md', 'template.latex',
+                    'README.txt', 'export.json', 'figures/figure-1.png')})
+                self.assertNotIn('workspace/publications/export/publication_view.json', published.artifacts)
+                self.assertIn('workspace/publications/export/publication_view.json', project_files)
                 self.assertIn('workspace/publications/export/figures/figure-1.png', published.artifacts)
                 self.assertIn('workspace/publications/export/README.txt', published.artifacts)
                 self.assertEqual(published.data['artifact_sha256'], workspace.artifact_hashes(project_files))
@@ -971,6 +980,8 @@ class ReportExportTests(unittest.TestCase):
 
                 def compile_project(output, has_citations, *, runner, **forecast):
                     (output / 'main.pdf').write_bytes(b'original compiled PDF')
+                    for name in ('main.log', 'main.aux', 'build.log'):
+                        (output / name).write_text('Internal compiler diagnostic.\n')
                     return {'status': 'compiled', 'compiled': True}
 
                 with patch('simple_ar.report.export._compile', side_effect=compile_project):
@@ -982,12 +993,24 @@ class ReportExportTests(unittest.TestCase):
                 self.assertTrue({f'workspace/publications/bound/{path}' for path in
                     ('main.pdf', 'README.txt', 'figures/figure-1.png', vector)}.issubset(bound.artifacts))
                 self.assertTrue(set(bound.artifacts).issubset(bound.data['delivery']['artifacts']))
+                internal = {f'workspace/publications/bound/{name}' for name in (
+                    'publication_view.json', 'main.log', 'main.aux', 'build.log')}
+                self.assertTrue(internal.issubset(bound.data['artifact_sha256']))
+                self.assertTrue(internal.isdisjoint(bound.data['delivery']['artifacts']))
+                observation = {'tool_name':'export_report', 'status':'ok', 'data':bound.data}
+                for formats, files in ((['tex'], bound.artifacts), (['pdf'], ['workspace/publications/bound/main.pdf'])):
+                    self.assertTrue(gateway.check_requested_delivery([observation], files,
+                        formats=formats, manuscript='workspace/draft.md'))
+                with self.assertRaisesRegex(ValueError, 'complete publication files'):
+                    gateway.check_requested_delivery([observation], [path for path in bound.artifacts
+                        if path != f'workspace/publications/bound/{vector}'],
+                        formats=['tex'], manuscript='workspace/draft.md')
                 after_bound = processes.call_count
                 # Recreate the gateway to exercise durable receipts, not memory.
                 gateway = PublicationToolGateway(native, workspace, ledger)
                 for relative, mutation in [
                         *((path, 'modify') for path in ('main.pdf', 'main.tex', 'body.tex', 'source.md',
-                            'references.bib', 'figures/figure-1.png', vector)),
+                            'references.bib', 'figures/figure-1.png', vector, 'publication_view.json', 'main.log')),
                         ('export.json', 'failed_manifest'), ('figures/figure-1.png', 'delete'),
                         ('added.tex', 'add')]:
                     with self.subTest(file=relative, mutation=mutation):
@@ -1022,8 +1045,9 @@ class ReportExportTests(unittest.TestCase):
                     self.assertEqual(preview.data['preview_images'], [
                         'workspace/publications/preview/previews/page-1.png',
                         'workspace/publications/preview/previews/page-2.png'])
-                    self.assertTrue(set(preview.data['preview_images']).issubset(preview.artifacts))
-                    self.assertTrue(set(preview.data['preview_images']).issubset(preview.data['delivery']['artifacts']))
+                    self.assertTrue(set(preview.data['preview_images']).issubset(preview.data['artifact_sha256']))
+                    self.assertTrue(set(preview.data['preview_images']).isdisjoint(preview.artifacts))
+                    self.assertTrue(set(preview.data['preview_images']).isdisjoint(preview.data['delivery']['artifacts']))
                     self.assertFalse(preview.data['manifest']['quality_checked'])
                     self.assertFalse(preview.data['manifest']['pdf_preview']['visual_reviewed'])
                     gateway = PublicationToolGateway(native, workspace, ledger)
@@ -1061,6 +1085,32 @@ class ReportExportTests(unittest.TestCase):
                             self.assertEqual(gateway.call('export_report', preview_request, identity=identity).data, failed.data)
                             self.assertEqual(processes.call_count, failed_count)
                     preview_failure = ''
+                # An old producer manifest owns the historical whole-project
+                # set. Loading it must neither infer public roles nor rewrite it.
+                def historical_export(*args, **kwargs):
+                    historical = export_acm_report(*args, **kwargs)
+                    historical.pop('public_artifacts')
+                    (args[1]/'export.json').write_text(json.dumps(historical), encoding='utf-8')
+                    return historical
+                with patch('simple_ar.tools.publication.export_acm_report', side_effect=historical_export), patch(
+                        'simple_ar.report.export._compile', side_effect=compile_project):
+                    legacy_bound = gateway.call('export_report', bound_request, identity='legacy-bound')
+                self.assertEqual(legacy_bound.status, 'ok', legacy_bound.error)
+                legacy_files = workspace.resolve_delivery(DeliveryRequest(
+                    summary='Historical project', artifacts=[legacy_bound.data['project']]))['artifacts']
+                self.assertEqual(legacy_bound.artifacts, legacy_files)
+                self.assertIn('workspace/publications/legacy-bound/publication_view.json', legacy_files)
+                legacy_observation = {'tool_name':'export_report', 'status':'ok', 'data':legacy_bound.data}
+                legacy_public = [f'workspace/publications/legacy-bound/{path}' for path in manifest['public_artifacts']]
+                with self.assertRaisesRegex(ValueError, 'complete publication files'):
+                    gateway.check_requested_delivery([legacy_observation], legacy_public,
+                        formats=['tex'], manuscript='workspace/draft.md')
+                original_manifest = (workspace.resolve(legacy_bound.data['project'])/'export.json').read_bytes()
+                legacy_calls = processes.call_count
+                self.assertEqual(PublicationToolGateway(native, workspace, ledger).call(
+                    'export_report', bound_request, identity='legacy-bound').data, legacy_bound.data)
+                self.assertEqual((workspace.resolve(legacy_bound.data['project'])/'export.json').read_bytes(), original_manifest)
+                self.assertEqual(processes.call_count, legacy_calls)
                 after_bound = processes.call_count
                 owner = native / 'tools/publications/bound'
                 (owner / 'result.json').unlink()
@@ -1080,7 +1130,7 @@ class ReportExportTests(unittest.TestCase):
                 # Older terminal manifests have no caption-owner field. Reading
                 # them must neither migrate their bytes nor infer a new policy.
                 manifest = {key: value for key, value in manifest.items()
-                    if key not in {'figure_caption_owner', 'consumed_inputs'}}
+                    if key not in {'figure_caption_owner', 'consumed_inputs', 'public_artifacts'}}
                 historical_bytes = json.dumps(manifest).encode('utf-8')
                 (output / 'export.json').write_bytes(historical_bytes)
                 for historic in (saved, input_only, markdown_only):

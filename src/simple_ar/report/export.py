@@ -480,7 +480,7 @@ def _figure_pagination_preamble() -> str:
 """
 
 
-def _prepare_technical_content(fragments: Any, output: Path) -> None:
+def _prepare_technical_content(fragments: Any, output: Path) -> list[str]:
     """Prepare only the TeX AST; canonical code and display text stay intact."""
     # A technical compound can overflow a table cell below the ordinary
     # 32-character identifier boundary (operators and mixed letter/digit IDs
@@ -494,6 +494,7 @@ def _prepare_technical_content(fragments: Any, output: Path) -> None:
                    for word in _nodes(table.get('c')) if word.get('t') == 'Str'
                    and not word['c'].isalpha() and any(char.isalpha() for char in word['c'])}
     block_index = 0
+    code_files = []
     for node in _nodes(fragments):
         if node.get('t') == 'Table':
             # Pandoc <=2.9/API1.20 uses five Table fields with numeric widths;
@@ -518,6 +519,7 @@ def _prepare_technical_content(fragments: Any, output: Path) -> None:
             # External verbatim input cannot terminate a TeX environment or
             # execute commands. Only exporter-owned filenames enter TeX.
             path.write_text(node["c"][1], encoding="utf-8")
+            code_files.append(path.relative_to(output).as_posix())
             node.update(t="RawBlock", c=["latex",
                 r"\VerbatimInput[breaklines=true,breakanywhere=true,breaksymbolleft={},breaksymbolright={},breakanywheresymbolpre={},breakanywheresymbolpost={}]{" + path.relative_to(output).as_posix() + "}"])
         elif node.get("t") == "Code":
@@ -527,6 +529,7 @@ def _prepare_technical_content(fragments: Any, output: Path) -> None:
             # Long prose tokens also occur as checksums/identifiers. Keep
             # their surrounding font; math and link targets are separate nodes.
             node.update(t="RawInline", c=["latex", r"\seqsplit{" + _tex_literal(node["c"]) + "}"])
+    return code_files
 
 
 def _scientific_unicode_preamble(*fragments: str) -> str:
@@ -706,7 +709,9 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                                "source_report": str(body_path), "status": "exporting",
                                "compiled": False, "quality_checked": False,
                                "figure_caption_owner": caption_owner,
-                               "bound_figure_captions": bound_captions}
+                               "bound_figure_captions": bound_captions,
+                               "public_artifacts": ["main.tex", "body.tex", "references.bib",
+                                                    "source.md", "template.latex", "README.txt", "export.json"]}
     if citation_style is not None:
         manifest['citation_style'] = citation_style
     if render_preview:
@@ -729,6 +734,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                     if bound_digest is not None and bound_digest != digest:
                         raise ReportExportError('Template input changed during copying')
                 (output / target).write_bytes(content)
+                manifest['public_artifacts'].append(target)
                 manifest['template']['inputs'][path.relative_to(root).as_posix()] = digest
             manifest['compliance'] = {'official_requirements': 'unverified', 'anonymity': 'unverified',
                 'page_limits': 'unverified', 'visual_layout': 'unverified',
@@ -781,7 +787,13 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                 for index, (url, path) in enumerate(image_sources.items(), start=1)},
             'logical_document': source_ast,
         }
-        _prepare_technical_content([title_inlines, blocks, abstract], output)
+        # The producer knows which copied/generated assets make the editable
+        # project portable. Diagnostic ASTs, checks, previews and build products
+        # remain on disk and byte-bound; they are not project deliverables.
+        manifest['public_artifacts'].extend(copied_records)
+        for image in publication_view['image_mapping'].values():
+            manifest['public_artifacts'].extend(image['files'])
+        manifest['public_artifacts'].extend(_prepare_technical_content([title_inlines, blocks, abstract], output))
 
         division = template.get('top_level_division') if template_files else None
         body_tex = run([pandoc, "--from=json", "--to=latex", "--natbib", "--no-highlight",
@@ -945,6 +957,9 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             'Only graphics are reduced to the remaining page area; small graphics are not enlarged. '
             'Captions that leave no image area fail with a simple-ar TeX error. '
             'Compound/nested graphics require separate figures; inspect image readability in all-page previews.\n')
+        readme += ('export.json public_artifacts lists the portable editable project and compiled PDF, when available. '
+            'The logical inspection view, build logs, check evidence and preview pages remain in the original '
+            'export for diagnosis; they are not required project inputs. Rebuilding generates new build logs.\n')
         (output / 'README.txt').write_text(readme, encoding='utf-8')
         manifest["status"] = "exported"
         # Forecast the bounded PDF suffix without reserving/charging it. Each
@@ -983,6 +998,10 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         manifest.update(status="failed", error=str(exc))
         raise ReportExportError(f"Export failed; retained files and export.json at {output}: {exc}") from exc
     finally:
+        if manifest['compiled'] and (output / 'main.pdf').is_file():
+            manifest['public_artifacts'].append('main.pdf')
+        manifest['public_artifacts'] = sorted({path for path in manifest['public_artifacts']
+            if path == 'export.json' or (output / path).is_file()})
         (output / "export.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest
 

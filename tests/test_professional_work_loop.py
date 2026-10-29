@@ -2301,7 +2301,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
             return self.app.publication.check_requested_delivery(rows,artifacts,
                 formats=formats,manuscript=manuscript)
 
-        expected = {self.app.workspace.resolve(path) for path in current['data']['artifact_sha256']}
+        expected = {self.app.workspace.resolve(path) for path in current['artifacts']}
+        internal = self.app.workspace.locator(str(current_project/'publication_view.json'))
+        self.assertIn(internal, current['data']['artifact_sha256'])
+        self.assertNotIn(self.app.workspace.resolve(internal), expected)
         for rows in (observations,list(reversed(observations))):
             self.assertEqual(check(rows,delivery['artifacts']),expected)
             # Even when an old project is also delivered, its stale source

@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import Any, Literal, Callable
+from typing import Any, Literal, Callable, Iterable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -246,6 +246,28 @@ def _publication_inputs(source: Path, request: ExportRequest, saved: dict, manif
     return expected
 
 
+def _publication_artifacts(workspace: Any, project: str, manifest: dict,
+                           inventory: Iterable[str]) -> list[str]:
+    """Consume producer-declared project files; retain old whole-directory contracts."""
+    inventory = list(inventory)
+    if 'public_artifacts' not in manifest:
+        return inventory
+    files = manifest['public_artifacts']
+    if (not isinstance(files, list) or any(not isinstance(path, str) or not path
+            or '\\' in path or Path(path).is_absolute() or '..' in Path(path).parts
+            or Path(path).as_posix() != path for path in files)
+            or len(set(files)) != len(files)):
+        raise ValueError('Invalid publication project artifact set')
+    artifacts = [f'{project}/{path}' for path in files]
+    if any(path not in inventory for path in artifacts):
+        raise ValueError('Publication project artifact is missing from its retained inventory')
+    root = workspace.resolve(project)
+    # Existing terminal bindings can also own the original canonical manuscript.
+    # It is outside the generated project, and remains part of that delivery.
+    artifacts.extend(path for path in inventory if not workspace.resolve(path).is_relative_to(root))
+    return artifacts
+
+
 class PublicationToolGateway:
     @property
     def context_tools(self) -> set[str]:
@@ -445,14 +467,15 @@ class PublicationToolGateway:
                     for key, digest in inputs.items() if digest is not None)
                 if 'pdf' in formats and data['manifest'].get('compiled') is not True:
                     continue
+                public = _publication_artifacts(self.workspace, data['project'], data['manifest'], hashes)
                 if 'tex' in formats:
-                    required.update(self.workspace.resolve(path) for path in hashes)
+                    required.update(self.workspace.resolve(path) for path in public)
                 if required.issubset(delivered) and all(path.is_file() for path in required):
-                    return {self.workspace.resolve(path) for path in hashes}
+                    return {self.workspace.resolve(path) for path in public}
                 missing = sorted(str(path.relative_to(self.workspace.workspace)) for path in required-delivered)
                 if missing:
                     failures.append('Requested report formats need the complete publication files: '
-                        + ', '.join(missing) + '. Deliver the publication project directory for an editable TeX project.')
+                        + ', '.join(missing) + '. Deliver the exporter artifact set for an editable TeX project.')
             except (ValueError,OSError,KeyError,TypeError,RuntimeError) as exc:
                 # Rejected candidates remain history, not a veto over another
                 # genuinely current publication delivered for the same source.
@@ -694,8 +717,8 @@ class PublicationToolGateway:
                             'output_integrity': 'historical_unbound',
                             'scope': 'Historical rendering receipt only; current project bytes and compilation are unverified.'})
                 # Workspace owns bounded directory expansion and file digests.
-                # Include figures, editable variants, source attachments, build
-                # records and instructions, rather than a second filename list.
+                # Integrity still covers every project byte, including internal
+                # views, logs and previews; it is not the public delivery set.
                 artifacts = self.workspace.resolve_delivery(DeliveryRequest(
                     summary='Editable publication project', artifacts=[prefix]))['artifacts']
                 # A terminal publication owns its actual editable source too.
@@ -719,8 +742,19 @@ class PublicationToolGateway:
                             for row in receipt.get('results', {}).values() if 'evidence_sha256' in row})
                         if any(digest is not None and hashes.get(path) != digest for path, digest in observed.items()):
                             raise ValueError('Publication PDF/check evidence changed after observation; retain files and process receipts, no delivery or replay')
+                # Classify only after the original complete byte binding has
+                # passed. Missing public files and unexpected internal files
+                # must take the same integrity path on recovery.
+                artifacts = _publication_artifacts(self.workspace, prefix, manifest, hashes)
+                if saved is None:
                     owner.write_json('result.json', {'artifact_sha256': hashes,
                         **({'report_identity': report_identity} if report_identity is not None else {})})
+            elif 'public_artifacts' in manifest:
+                # A failed, never-bound export has no successful hash receipt
+                # to verify or invent; expose only its actually retained project.
+                inventory = self.workspace.resolve_delivery(DeliveryRequest(
+                    summary='Retained failed publication project', artifacts=[prefix]))['artifacts']
+                artifacts = _publication_artifacts(self.workspace, prefix, manifest, inventory)
             preview_images = [f"{prefix}/{path}" for path in manifest.get('pdf_preview', {}).get('pages', [])]
             delivery = None
             if completed and request.delivery is not None:
