@@ -19,7 +19,8 @@ from simple_ar.core.budget import BudgetLedger
 from simple_ar.core.working_context import history_view
 from simple_ar.core.capabilities import ArtifactRef, ArtifactStore, AttemptManifest, CapabilityContext, CapabilityRegistry, CapabilityResult
 from simple_ar.core.session import BudgetState, SessionController
-from simple_ar.integrations.llm import LLMClient, LLMError, LLMSettings, estimate_tokens
+from simple_ar.integrations.llm import (
+    LLMCallStopped, LLMClient, LLMError, LLMSettings, check_llm_call_stop, estimate_tokens, llm_call_stop_scope)
 from simple_ar.integrations.model_profiles import catalog_path, model_connections_compatible
 from simple_ar.tools.gateway import CommonToolGateway
 from simple_ar.tools.openai_schema import compact_json_schema, export_openai_tool_schemas
@@ -342,6 +343,7 @@ class _RuntimeClientPort:
         return _RuntimeClientPort(method(limit), self.binding)
 
     def chat_turn(self, messages: list, *, tools: list, label: str, budget_call_id: str) -> dict:
+        check_llm_call_stop()
         native = getattr(self.client, 'chat_turn', None)
         if callable(native):
             return native(messages, tools=tools, label=label, budget_call_id=budget_call_id)
@@ -354,6 +356,19 @@ class _RuntimeClientPort:
         if not isinstance(reply, dict) or reply.get('role', 'assistant') != 'assistant':
             raise ValueError('Injected JSON client must return an assistant tool-call message')
         return {'role': 'assistant', 'content': reply.get('content'), 'tool_calls': reply.get('tool_calls', [])}
+
+    def tool_turn(self, *args: Any, **kwargs: Any) -> dict:
+        check_llm_call_stop()
+        turn = getattr(self.client, 'tool_turn', None) or self.chat_turn
+        return turn(*args, **kwargs)
+
+    def ask_json(self, *args: Any, **kwargs: Any) -> dict:
+        check_llm_call_stop()
+        return self.client.ask_json(*args, **kwargs)
+
+    def ask(self, *args: Any, **kwargs: Any) -> str:
+        check_llm_call_stop()
+        return self.client.ask(*args, **kwargs)
 
 
 def _runtime_bindings(services: Any | None) -> dict[str, Any]:
@@ -414,7 +429,7 @@ class ToolApplication:
         if config.get('memory_protocol') and (config.get('context_protocol') != 'working.v4'
                 or config.get('professional_operations') != 'work.v5'):
             raise ValueError('Journal continuity requires the saved shared native work context')
-        if config.get('delivery_review_protocol') not in {None, 'task.v1'}:
+        if config.get('delivery_review_protocol') not in {None, 'task.v1', 'task.v2'}:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
         if config.get('professional_operations') is not None and config['professional_operations'] not in PROFESSIONAL_CONTRACTS:
             raise ValueError('Unsupported saved professional operation contract; no silent migration')
@@ -1729,7 +1744,7 @@ class ToolApplication:
             delivery_files=delivery_files,
             extensions=extensions, creation_declarations=creation_declarations)
         config['inspection_protocol'] = 'subjects.v3'
-        config['delivery_review_protocol'] = 'task.v1'
+        config['delivery_review_protocol'] = 'task.v2'
         from simple_ar.app.operation_tools import CURRENT_PROFESSIONAL_CONTRACT
         config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
         if context_protocol is not None:
@@ -4575,8 +4590,17 @@ class ToolApplication:
                         kind='native_result' if capability == 'native_turn' else 'native_observation'))))
             self.session.reconcile_attempt(identity)
         else:
-            result = self.session.execute_attempt(capability, attempt_id=identity,
-                **({"call": pending["call"]} if capability == "native_tool" else {}))
+            try:
+                result = self.session.execute_attempt(capability, attempt_id=identity,
+                    **({"call": pending["call"]} if capability == "native_tool" else {}))
+            except LLMCallStopped:
+                # This stack has unwound after an observed caller stop; unlike
+                # a lost process, it is known not to dispatch further work.
+                # Close the attempt through the existing interruption owner so
+                # settled checkpoints remain usable, without replaying tools.
+                self.session.recover_interrupted(identity,
+                    reason='Caller stopped before the next model dispatch; recorded effects retained')
+                raise
             if result.status != "completed":
                 detail = "; ".join(result.diagnostics) or "No diagnostics recorded"
                 raise RuntimeError(f"Operation failed; inspect saved diagnostics: {detail}")
@@ -5186,7 +5210,14 @@ class ToolApplication:
                     attempts = self.session.list_attempts()
                     if pending is None or not any(a.attempt_id == pending['attempt'] and a.status == 'running' for a in attempts):
                         self.session.continue_with_revision('Resume pending work without resetting its budget')
-                self._run(approved_execution, approve, progress, should_stop)
+                with llm_call_stop_scope(should_stop):
+                    self._run(approved_execution, approve, progress, should_stop)
+            except LLMCallStopped:
+                # Preserve any budget block recorded by the attempt owner.
+                if self.session.manifest.status != 'blocked':
+                    self.session.manifest.status = 'paused'
+                    self.session.manifest.status_reason = 'Caller requested boundary stop'
+                self._save()
             except (Exception, KeyboardInterrupt) as exc:
                 if self.session.manifest.status != "blocked":
                     self.session.manifest.status = "paused"

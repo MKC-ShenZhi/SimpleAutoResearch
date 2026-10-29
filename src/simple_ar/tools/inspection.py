@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.budget import completed_llm_usage_is_accounted
-from simple_ar.integrations.llm import LLMSettings, estimate_tokens
+from simple_ar.integrations.llm import LLMCallStopped, LLMSettings, estimate_tokens
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 from simple_ar.tools.workspace import FileWindow, workspace_tool_specs
 
@@ -908,7 +908,9 @@ class InspectionToolGateway:
                 'summarized_through_turn':min(memory['through_turn'], len(blocks)),
                 'current_artifacts':sorted(current_material_paths(
                     request_count=len(saved.get('user_requests', [request.goal])),
-                    selected_paths=[row['path'] for row in saved['targets']])),
+                    selected_paths=[row['path'] for row in saved['targets']]
+                        + (list(saved['delivery_context']['artifacts']) if
+                            saved.get('delivery_context', {}).get('schema_version') == 'delivery_review.v2' else []))),
                 'processed_turns':processed_journal_turns(journal_rows, memory['compacted_records'])
                 } if continuity else {}),
             history_access='read_file at the recorded authorized source path and range',
@@ -1128,7 +1130,9 @@ class InspectionToolGateway:
             count = size - cursor
             # One normal read at most. A conservative byte bound avoids spending
             # the shared read allowance probing files unlikely to fit the view.
-            if not 0 < count <= min(64000, remaining[0], headroom):
+            bound = (256000 if saved.get('delivery_context', {}).get('schema_version') == 'delivery_review.v2'
+                else 64000)
+            if not 0 < count <= min(bound, remaining[0], headroom):
                 continue
             tail = self._observe(FileWindow(path=row['path'], offset_bytes=cursor, max_bytes=count),
                 row['subject'], identity, remaining)
@@ -1146,6 +1150,70 @@ class InspectionToolGateway:
                 saved['targets'][index] = merged
         self.store.write_json(self._path(identity, 'input'), saved)
 
+    def _prime_delivery(self, saved: dict, identity: str, remaining: list[int]) -> None:
+        """Read a bounded current delivery as one work unit, not repeated model-selected pages.
+
+        The owner already bound these files. Originals still use the common
+        reader, selector and decoded-read allowance; binary/large bundles keep
+        ordinary investigation. A read or a matching hash grants no verdict.
+        Historical delivery scopes and local inspections do not enter this path.
+        """
+        delivery = saved.get('delivery_context', {})
+        if not self.adaptive or delivery.get('schema_version') != 'delivery_review.v2':
+            return
+        targets = {row['path'] for row in saved['targets']}
+        pending = []
+        for path, digest in delivery['artifacts'].items():
+            if path in targets or Path(path).suffix.lower() in _BINARY:
+                continue
+            owners = [row for row in saved['evidence']
+                if row.get('readable') and row.get('path') == path and row.get('sha256') == digest]
+            if owners and self._complete_target(owners[0], owners):
+                continue
+            size = self.workspace.resolve(path).stat().st_size
+            if size > 256000:
+                return  # No forced truncation or larger read quota for this bundle.
+            gaps, cursor = [], 0
+            windows = sorted((window['offset_bytes'], window['review_next_offset_bytes'])
+                for owner in owners for window in owner['windows'] if window['size_bytes'] == size)
+            for start, end in windows:
+                if not 0 <= start <= end <= size:
+                    continue
+                if start > cursor:
+                    gaps.append((cursor, start))
+                cursor = max(cursor, end)
+            if cursor < size or not size and not owners:
+                gaps.append((cursor, size))
+            pending.append((path, digest, gaps, owners))
+        if sum(end-start for _, _, gaps, _ in pending for start, end in gaps) > remaining[0]:
+            return
+        number = max((int(row['subject'].split('-')[1]) for row in saved['evidence']), default=0)
+        for path, digest, gaps, owners in pending:
+            if not owners:
+                number += 1
+            subject = owners[0]['subject'] if owners else f'evidence-{number}'
+            for start, end in gaps:
+                observed = self._observe(FileWindow(path=path, offset_bytes=start, max_bytes=max(1, end-start)),
+                    subject, identity, remaining)
+                if observed.get('sha256') and observed['sha256'] != digest:
+                    raise ValueError('Delivery input changed before review; no stale inspection')
+                if not observed.get('readable'):
+                    break  # Keep earlier actual windows; never complete an unread gap.
+                if owners:
+                    owners[0]['windows'].extend(observed['windows'])
+                    owners[0]['windows'].sort(key=lambda window:window['offset_bytes'])
+                else:
+                    saved['evidence'].append(observed)
+                    owners = [observed]
+                owner = owners[0]
+                owner['complete'] = self._complete_target(owner, owners)
+                if owner['complete']:
+                    owner.pop('limitation', None)
+                self.store.write_json(self._path(identity, 'input'), saved)
+        saved['initial_subjects'] = [row['subject'] for row in [*saved['targets'], *saved['evidence']]]
+        self._mark_evidence(saved)
+        self.store.write_json(self._path(identity, 'input'), saved)
+
     def _inspect(self, saved: dict[str, Any], request: InspectionRequest, identity: str,
                  remaining: list[int], client: Any) -> dict:
         """One read-only native conversation; the existing owner binds its final opinion."""
@@ -1159,6 +1227,7 @@ class InspectionToolGateway:
             'description':'Finish this inspection with findings and scope limitations. '
                 'Return this alone after reading evidence; it executes no external operation.',
             'parameters':response_model.model_json_schema()}}
+        self._prime_delivery(saved, identity, remaining)
         self._prime_targets(saved, request, identity, remaining, client, [*tools, terminal])
         messages = [{'role':'system','content':_REVIEW_SYSTEM if self.adaptive else _SUBJECT_SYSTEM if self.protocol else _SYSTEM},
                     {'role':'user','content':json.dumps(self._view(saved,request),ensure_ascii=False)}]
@@ -1409,7 +1478,7 @@ class InspectionToolGateway:
                 saved['memory_protocol'] = 'journal.v1'
             if delivery_context is not None:
                 if (not isinstance(delivery_context, dict)
-                        or delivery_context.get('schema_version') != 'delivery_review.v1'):
+                        or delivery_context.get('schema_version') not in {'delivery_review.v1', 'delivery_review.v2'}):
                     raise ValueError('Delivery inspection requires its owner-bound context')
                 saved['delivery_context'] = deepcopy(delivery_context)
             remaining = [512000]
@@ -1451,10 +1520,14 @@ class InspectionToolGateway:
             if not any(row.get('sha256') for row in saved['targets']):
                 receipt['usage'] = self._usage(identity)
                 return self._finish(saved,receipt,identity,failure='No bound target')
+            stopped = None
             try:
                 client = self.client_factory(identity)
                 response = self._inspect(saved,request,identity,remaining,client)
                 receipt.update(completed=True, response=response)
+            except LLMCallStopped as exc:
+                stopped = exc
+                receipt.update(error=str(exc))
             except Exception as exc:
                 receipt.update(error=str(exc), raw_response=getattr(exc, 'raw_response', ''))
             finally:
@@ -1462,7 +1535,10 @@ class InspectionToolGateway:
                 receipt['usage'] = self._usage(identity)
                 self.store.write_json(self._path(identity, 'response'), receipt)
             if not receipt['completed']:
-                return self._finish(saved, receipt, identity, failure=receipt['error'])
+                result = self._finish(saved, receipt, identity, failure=receipt['error'])
+                if stopped is not None:
+                    raise stopped
+                return result
             try:
                 self._receipt(identity)
             except (ValueError, KeyError) as exc:

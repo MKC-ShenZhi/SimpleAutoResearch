@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -24,6 +25,7 @@ from simple_ar.core.artifacts import read_json, read_jsonl
 from simple_ar.core.budget import BudgetConflictError, BudgetExceededError, BudgetLedger, BudgetUnknownError
 from simple_ar.integrations.llm import (
     LLMClient,
+    LLMCallStopped,
     LLMDeadlineError,
     LLMError,
     LLMImageInputError,
@@ -34,6 +36,7 @@ from simple_ar.integrations.llm import (
     _call_openai_sdk,
     _request_for_api_mode,
     estimate_tokens,
+    llm_call_stop_scope,
     normalize_terminal_json_object,
     parse_json_object,
 )
@@ -44,6 +47,109 @@ class LLMParsingTests(unittest.TestCase):
         catalog = patch('simple_ar.integrations.llm.load_model_catalog', return_value=None)
         catalog.start()
         self.addCleanup(catalog.stop)
+
+    def test_call_stop_scopes_inherit_restore_and_cover_injected_professional_clients(self):
+        from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
+        from simple_ar.app.tool_application import _RuntimeClientPort
+        from simple_ar.result_analysis.service import request_json_with_diagnostics
+        stop = threading.Event()
+        ledger = BudgetLedger({'llm_requests':4, 'total_tokens':10000})
+        injected = SimpleNamespace(_budget_ledger=ledger, chat_turn=Mock())
+        value = ConversationInput([], [], {})
+        conversation = ProfessionalConversation(injected)
+        with llm_call_stop_scope(stop.is_set):
+            with self.assertRaises(LLMCallStopped), llm_call_stop_scope(lambda:True):
+                conversation.call(value, native=True, label='inspection', call_id='inspection')
+            conversation.call(value, native=True, label='main', call_id='main')
+            stop.set()
+            with self.assertRaises(LLMCallStopped), llm_call_stop_scope(lambda:False):
+                conversation.call(value, native=True, label='nested', call_id='nested')
+        conversation.call(value, native=True, label='outside', call_id='outside')
+        self.assertEqual(injected.chat_turn.call_count, 2)
+        self.assertEqual(ledger.entries, ())
+        raw = Mock(return_value='{"checks":[]}')
+        port = _RuntimeClientPort(SimpleNamespace(ask=raw), {'model':'injected'})
+        with llm_call_stop_scope(stop.is_set), self.assertRaises(LLMCallStopped):
+            request_json_with_diagnostics(port, 's', 'u', label='analysis', output_dir=None)
+        raw.assert_not_called()
+        self.assertEqual(request_json_with_diagnostics(port, 's', 'u', label='outside', output_dir=None),
+            {'checks':[]})
+
+    def test_call_stop_reaches_batch_workers_before_dispatch_and_does_not_leak(self):
+        stop = threading.Event()
+        ledger = BudgetLedger({'llm_requests':3, 'total_tokens':10000})
+        client = LLMClient(LLMSettings(api_key='fixture', api_mode='chat', max_output_tokens=100),
+            budget_ledger=ledger)
+        original = client.ask
+        def in_worker(*args, **kwargs):
+            stop.set()  # Parent has submitted; the worker must inherit its scope.
+            return original(*args, **kwargs)
+        response = {'choices':[{'message':{'content':'ok'}}],
+            'usage':{'prompt_tokens':10,'completion_tokens':2,'total_tokens':12}}
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as provider:
+            with patch.object(client, 'ask', side_effect=in_worker), llm_call_stop_scope(stop.is_set):
+                with self.assertRaises(LLMCallStopped):
+                    client.ask_many([LLMRequest(system='s', user='u')], max_workers=1)
+            provider.assert_not_called()
+            self.assertEqual(ledger.entries, ())
+            self.assertEqual(client.ask('s','outside'), 'ok')
+        self.assertEqual(len(ledger.entries), 1)
+        self.assertEqual(ledger.entries[0].status, 'settled')
+
+    def test_call_stop_between_retry_attempts_preserves_dispatched_settlement_or_unknown(self):
+        from simple_ar.integrations.llm import LLMDeadlineError
+        for failure in ('transient', 'unknown'):
+            with self.subTest(failure=failure):
+                stop = threading.Event()
+                ledger = BudgetLedger({'llm_requests':4, 'total_tokens':10000})
+                client = LLMClient(LLMSettings(api_key='fixture', api_mode='chat',
+                    retry_attempts=3, max_output_tokens=100), budget_ledger=ledger)
+                def failed(*args, **kwargs):
+                    stop.set()
+                    if failure == 'unknown':
+                        raise LLMDeadlineError('Controlled dispatched timeout')
+                    error = RuntimeError('503 Service Unavailable')
+                    error.status_code = 503
+                    raise error
+                with patch('simple_ar.integrations.llm._call_openai_sdk', side_effect=failed) as provider, \
+                        patch('simple_ar.integrations.llm.time.sleep'):
+                    with llm_call_stop_scope(stop.is_set), self.assertRaises(LLMCallStopped):
+                        client.ask('s','u')
+                self.assertEqual(provider.call_count, 1)
+                self.assertEqual(len(ledger.entries), 1)
+                entry, = ledger.entries
+                self.assertEqual(entry.status, 'unknown' if failure == 'unknown' else 'settled')
+                self.assertEqual(entry.actual['llm_requests'], 1)
+                self.assertEqual(entry.actual_source, 'reservation_bound' if failure == 'unknown' else 'estimated')
+
+    def test_call_stop_after_dispatch_settles_response_and_releases_unsent_reservation(self):
+        stop = threading.Event()
+        ledger = BudgetLedger({'llm_requests':4, 'total_tokens':10000})
+        client = LLMClient(LLMSettings(api_key='fixture', api_mode='chat', max_output_tokens=100),
+            budget_ledger=ledger)
+        response = {'choices':[{'message':{'content':'ok'}}],
+            'usage':{'prompt_tokens':10,'completion_tokens':2,'total_tokens':12}}
+        def dispatched(*args, **kwargs):
+            stop.set()
+            return response
+        with patch('simple_ar.integrations.llm._call_openai_sdk', side_effect=dispatched) as provider:
+            with llm_call_stop_scope(stop.is_set):
+                self.assertEqual(client.ask('s','already sent'), 'ok')
+            self.assertEqual(provider.call_count, 1)
+            self.assertEqual(ledger.entries[0].status, 'settled')
+            self.assertEqual(ledger.entries[0].actual['total_tokens'], 12)
+            stop.clear()
+            reserve = client._reserve_budget
+            def stop_after_reserve(**kwargs):
+                identity = reserve(**kwargs)
+                stop.set()
+                return identity
+            with patch.object(client, '_reserve_budget', side_effect=stop_after_reserve), \
+                    llm_call_stop_scope(stop.is_set), self.assertRaises(LLMCallStopped):
+                client.ask('s','not sent')
+            self.assertEqual(provider.call_count, 1)
+        self.assertEqual([entry.status for entry in ledger.entries], ['settled','released'])
+        self.assertEqual(ledger.entries[-1].actual, {})
 
     def test_local_vision_payloads_and_provider_or_unknown_usage(self):
         from simple_ar.integrations.model_profiles import ModelCatalog, ModelProfile

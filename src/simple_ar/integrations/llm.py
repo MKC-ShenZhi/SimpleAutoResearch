@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 import asyncio
 import base64
 from io import BytesIO
@@ -49,6 +50,36 @@ _TRANSPORT_PHASES = frozenset({"unobserved"} | {
 
 class LLMError(RuntimeError):
     """Raised when the LLM layer cannot satisfy a request."""
+
+
+class LLMCallStopped(KeyboardInterrupt):
+    """Caller stop observed before dispatch; not a provider failure or usage.
+
+    Bypass ordinary domain/error retries like a controlled interruption. No
+    signal is sent to a running request and no reservation is reconciled here.
+    """
+
+
+_CALL_STOP: ContextVar[Callable[[], bool] | None] = ContextVar('llm_call_stop', default=None)
+
+
+@contextmanager
+def llm_call_stop_scope(should_stop: Callable[[], bool] | None):
+    """Temporarily inherit/combine caller stops; never persist them on clients."""
+    parent = _CALL_STOP.get()
+    predicate = parent if should_stop is None else (
+        lambda: bool((parent is not None and parent()) or should_stop()))
+    token = _CALL_STOP.set(predicate)
+    try:
+        yield
+    finally:
+        _CALL_STOP.reset(token)
+
+
+def check_llm_call_stop() -> None:
+    predicate = _CALL_STOP.get()
+    if predicate is not None and predicate():
+        raise LLMCallStopped('Caller requested stop before model dispatch; no new request sent')
 
 
 class LLMImageInputError(LLMError):
@@ -909,6 +940,7 @@ class LLMClient:
             )
             attempted = 0
             for attempt in range(1, attempts + 1):
+                check_llm_call_stop()
                 try:
                     reservation_id = self._reserve_budget(
                         logical_call_id=logical_call_id,
@@ -923,6 +955,13 @@ class LLMClient:
                         exc.args = (f"{exc}; preceding provider failure after "
                                     f"{provider_attempts} physical attempt(s): "
                                     f"{_provider_failure_summary(last_error)}",)
+                    raise
+                try:
+                    check_llm_call_stop()
+                except LLMCallStopped:
+                    if reservation_id is not None and self._budget_ledger is not None:
+                        self._budget_ledger.release(reservation_id,
+                            reason='Caller stopped before provider dispatch; no usage')
                     raise
                 attempted = attempt
                 provider_attempts += 1
@@ -1225,7 +1264,8 @@ class LLMClient:
                     index, request = next(remaining)
                 except StopIteration:
                     return False
-                future = executor.submit(handler, request)
+                check_llm_call_stop()
+                future = executor.submit(copy_context().run, handler, request)
                 pending[future] = (index, request)
                 return True
 

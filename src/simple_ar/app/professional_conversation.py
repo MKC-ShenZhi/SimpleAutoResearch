@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import json
 from typing import Any, Callable
 
-from simple_ar.integrations.llm import estimate_tokens
+from simple_ar.integrations.llm import check_llm_call_stop, estimate_tokens
 
 
 @dataclass
@@ -113,6 +113,7 @@ class ProfessionalConversation:
 
     def call(self, value: ConversationInput, *, label: str, call_id: str,
              native: bool = False, additional: bool = False) -> dict:
+        check_llm_call_stop()
         with self.ledger.protect_remaining(value.reserve or {}, additional=additional):
             turn = self.client.chat_turn if native else (
                 getattr(self.client, 'tool_turn', None) or self.client.chat_turn)

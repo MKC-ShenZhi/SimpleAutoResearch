@@ -29,10 +29,14 @@ _ERRORS = (ValueError, OSError, KeyError, TypeError, RuntimeError)
 class DeliveryReview:
     def __init__(self, workspace: Any, inspector: Any,
                  user_requests: Callable[[], list[str]], *,
-                 observations: Callable[[], list[dict]] | None = None) -> None:
+                 observations: Callable[[], list[dict]] | None = None,
+                 protocol: str = 'task.v1') -> None:
+        if protocol not in {'task.v1', 'task.v2'}:
+            raise ValueError('Unknown delivery review protocol')
         self.workspace, self.inspector = workspace, inspector
         self.user_requests = user_requests
         self.observations = observations
+        self.protocol = protocol
 
     def _binding(self, delivery: dict, *, current_outputs: tuple[Path, ...] = ()) -> dict | None:
         request = DeliveryRequest.model_validate(delivery)
@@ -49,7 +53,8 @@ class DeliveryReview:
         requests = self.user_requests()
         if not isinstance(requests, list) or any(not isinstance(text, str) for text in requests):
             raise ValueError('Delivery review requires exact original request and feedback strings')
-        return {'schema_version': 'delivery_review.v1', 'requests': list(requests),
+        return {'schema_version': 'delivery_review.v2' if self.protocol == 'task.v2' else 'delivery_review.v1',
+                'requests': list(requests),
                 'manuscript': manuscript, 'formats': sorted(set(request.report.formats)),
                 'authorized_roots': {name: str(path) for name, path in self.workspace.mounts.items()},
                 'artifacts': self.workspace.artifact_hashes(artifacts)}

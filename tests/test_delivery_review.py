@@ -142,6 +142,22 @@ class DeliveryReviewTests(unittest.TestCase):
         self.assertIn('error', rejected)
         self.assertEqual(len(self.inspector.calls), 1)
 
+    def test_complete_input_scope_does_not_upgrade_or_borrow_historical_review(self):
+        legacy=self.review('historical')
+        self.observe(legacy)
+        self.owner=DeliveryReview(self.workspace,self.inspector,lambda:self.requests,
+            observations=lambda:self.observations,protocol='task.v2')
+        self.assertTrue(self.owner.issues(self.observations,self.delivery))
+        proof=self.review('current')
+        self.assertEqual(proof['binding']['schema_version'],'delivery_review.v2')
+        self.assertEqual(len(self.inspector.calls),2)
+        self.assertEqual(self.inspector.store.read_json(self.inspector._path('historical','input'))
+            ['delivery_context'],legacy['binding'])
+        self.observe(proof)
+        self.assertFalse(self.owner.issues(self.observations,self.delivery))
+        self.assertEqual(self.review('cached'),proof)
+        self.assertEqual(len(self.inspector.calls),2)
+
     def test_all_bundle_and_requirement_changes_invalidate_proof(self):
         for change in ('feedback', 'appendix', 'manuscript', 'new-file', 'formats', 'roots'):
             with self.subTest(change=change):

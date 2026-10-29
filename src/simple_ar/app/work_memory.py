@@ -13,7 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from simple_ar.integrations.llm import LLMResponseError
+from simple_ar.integrations.llm import LLMResponseError, check_llm_call_stop
 
 
 _LEGACY_OUTPUT_LIMIT = 8192
@@ -295,6 +295,7 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
         refs = [input_ref]
         try:
             checkpoint_client = client if journal else client.with_output_limit(_LEGACY_OUTPUT_LIMIT)
+            check_llm_call_stop()
             response = checkpoint_client.ask_json(SYSTEM,text,
                 label='working-memory',budget_call_id=call_id or 'working-memory-'+attempt_id)
             checkpoint_entries(client._budget_ledger,attempt_id,client._budget_session_id,call_id=call_id)

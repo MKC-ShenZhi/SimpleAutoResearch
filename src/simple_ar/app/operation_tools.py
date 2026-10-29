@@ -130,10 +130,11 @@ class OperationTools:
             adaptive=self.inspection.adaptive),
             self.inspection)
         self.delivery_review = None
-        if config.get('delivery_review_protocol') == 'task.v1':
+        if config.get('delivery_review_protocol') in {'task.v1', 'task.v2'}:
             from simple_ar.tools.delivery_review import DeliveryReview
             self.delivery_review = DeliveryReview(workspace=self.workspace, inspector=self.inspection,
-                user_requests=user_requests, observations=observations)
+                user_requests=user_requests, observations=observations,
+                protocol=config['delivery_review_protocol'])
         self.registry.register_package(analysis_tool_specs(),
             AnalysisToolGateway(root,self.workspace,contract=config.get('table_analysis')),
             request_visible=config.get('table_analysis') is not None)
@@ -163,7 +164,7 @@ class OperationTools:
             if professional and not exact and preparation is None else None)
         self.system = (_SOURCE_COORDINATION
             if source_owner or not exact and preparation in {'prepared.v2','prepared.v3'} else _DIRECT_WORK) + _work_principles(
-                config.get('delivery_review_protocol') == 'task.v1', config.get('memory_protocol') == 'journal.v1')
+                self.delivery_review is not None, config.get('memory_protocol') == 'journal.v1')
         if exact or (preparation is not None or source_owner) and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
             self.implementation = ImplementationToolGateway(root,self.workspace,ledger,config['model'],session_id,

@@ -6,6 +6,18 @@ User-visible changes in reverse chronological order. Development entries are unr
 engineering checks and real task acceptance are reported separately.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-10-30 — V2.10 development (unreleased)
+
+### Improved
+
+- Package review prioritizes current manuscript, code and result text, reusing valid reads and filling unread ranges. Original sources remain available for investigation. Large material follows existing capacity rules; complete reading does not establish correctness.
+
+### Fixed
+
+- A task stop now prevents new requests inside review, summaries and model batches. In-flight calls settle normally, while completed work, checkpoints and accounting remain intact.
+
+Complete feedback delivery and lower total cost still require real-task acceptance.
+
 ## 2026-10-29 — V2.10 development (unreleased)
 
 ### Improved

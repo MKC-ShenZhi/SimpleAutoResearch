@@ -19,6 +19,7 @@ import shlex
 import shutil
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -1107,6 +1108,98 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._run()
         self.assertEqual(self._process_receipts(), second_receipts)
 
+    def test_call_stop_after_parent_boundary_prevents_first_dispatch_without_charge_or_replay(self):
+        self._create()
+        self.app.session.manifest.budget.max_no_progress = 1
+        self.app.session.save()
+        config = deepcopy(self.app.state['config'])
+        stop = threading.Event()
+        def progress(line):
+            if line.startswith('Observe and choose action'):
+                stop.set()  # The outer loop's boundary check has already passed.
+        result = self.app.run(progress=progress, should_stop=stop.is_set)
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(self.app.session.manifest.status_reason, 'Session budget exhausted.')
+        self.send.assert_not_called()
+        self.assertEqual(self.app.ledger.entries, ())
+        self.assertEqual(self.app.state['config'], config)
+        self.assertEqual(self.app.state['pending']['kind'], 'model')
+        self._reload()
+        self._run(should_stop=lambda:False)
+        self.send.assert_not_called()  # No automatic replay of an interrupted attempt.
+        self.assertEqual(self.app.ledger.entries, ())
+
+    def test_call_stop_between_inspection_requests_retains_actual_reads_and_settled_usage(self):
+        self._create()
+        self._write('note.md', 'Only the supplied observations are described.')
+        originals = self._versions(self.inputs)
+        stop = threading.Event()
+        def review(view):
+            stop.set()  # The first request is already dispatched and must settle.
+            return [_action('read_file', path='measurements/conditions.txt')]
+        self.review = review
+        self._submit(_action('inspect_artifacts', goal='Check the supplied observation scope.',
+            targets=['note.md'], evidence=[]), should_stop=stop.is_set)
+        self.assertEqual(len(self.inspection_requests), 1)
+        self.assertEqual(self.app.session.manifest.status, 'paused')
+        self.assertEqual(self.app.session.manifest.status_reason, 'Caller requested boundary stop')
+        pending = self.app.state['pending']
+        owner = self.app.operations.inspection
+        saved = owner.store.read_json(owner._path(pending['attempt'], 'input'))
+        self.assertTrue(any(row['path']==str(self.inputs/'conditions.txt') and row['windows']
+            for row in saved['evidence']))
+        result = owner.store.read_json(owner._path(pending['attempt'], 'result'))
+        self.assertTrue(all(row['verdict']=='incomplete' for row in result['metadata']['assessments']))
+        paid = [entry for entry in self.app.ledger.entries if entry.actual.get('llm_requests')]
+        self.assertEqual(len(paid), 1)
+        self.assertEqual(paid[0].status, 'settled')
+        self.assertFalse(self.app.ledger.unknown_dimensions())
+        self.assertEqual(self._versions(self.inputs), originals)
+        self.assertFalse(self.app.session.store.exists('delivery.json'))
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        self._reload()
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        # Explicit continuation may choose new work after reconciling this
+        # read-only failure, but never reruns the stopped inspection.
+        self.decisions.append(_action('ask_user', question='Which unresolved interpretation should be checked next?'))
+        self._run(should_stop=lambda:False)
+        self.assertEqual(len(self.inspection_requests), 1)
+        self.assertEqual(self.app.ledger.to_dict()['entries'][:len(ledger['entries'])], ledger['entries'])
+        self.assertNotEqual(self.app.session.manifest.status, 'completed')
+        self.assertFalse(self.app.session.store.exists('delivery.json'))
+        self.assertEqual(owner.store.read_json(owner._path(pending['attempt'], 'result')), result)
+
+    def test_call_stop_after_checkpoint_settlement_preserves_notes_without_dispatching_main(self):
+        self._queue_checkpoint_history(context_protocol='auto', initial_notes=False, context_input_tokens=24000)
+        stop = threading.Event()
+        provider = self.send.side_effect
+        def respond(mode, request, **kwargs):
+            response = provider(mode, request, **kwargs)
+            if not request.get('tools') and self.memory_views:
+                stop.set()
+            return response
+        self.send.side_effect = respond
+        self._run(should_stop=stop.is_set)
+        self.assertEqual(self.app.session.manifest.status_reason, 'Caller requested boundary stop')
+        self.assertEqual(len(self.memory_views), 1)
+        pending = self.app.state['pending']
+        self.assertEqual(pending['kind'], 'model')
+        store = self.app.session.store.__class__(self.root/'attempts'/pending['attempt'])
+        self.assertTrue(store.exists('memory_snapshot.json'))
+        self.assertFalse(store.exists('native_result.json'))
+        entries = [entry for entry in self.app.ledger.entries if entry.attempt_id==pending['attempt']]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].purpose, 'working-memory')
+        self.assertEqual(entries[0].status, 'settled')
+        memory = self.app._working_memory()
+        self.assertTrue(memory['notes'])
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        self._reload()
+        self.assertEqual(self.app._working_memory(), memory)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self.send.call_count, calls)
+
     def test_budgeted_work_checkpoint_commits_with_original_turn_and_recovers_without_replay(self):
         from dataclasses import replace
         self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
@@ -1607,6 +1700,83 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertFalse(self.app._work_context(['measurements'])['working_notes'][0]['current'])
         self._submit(_action('update_work_plan', notes=[]))
         self.assertEqual(self.app._working_memory()['notes'],[])
+
+    def test_whole_delivery_reads_current_text_once_and_keeps_source_investigation(self):
+        self._create()
+        texts = {'report.md':'# Observations\n\n'+'The sample mean is 2.0.\n'*3600,
+            'results.json':json.dumps({'details':'recorded '*180, 'result_marker':'current derived value'}),
+            'calculation.py':'# editable source\n'*60+'result = sum([1, 2, 3]) / 3\n'}
+        for path, text in texts.items():
+            self._write(path, text)
+        self.assertGreater(len(texts['report.md'].encode()), 64000)
+        selected_start, selected_count = 64, 128
+        self._submit(_action('read_file',path='results.json',offset_bytes=selected_start,
+            max_bytes=selected_count,full_digest=True))
+        full_views = []
+        def inspect(view):
+            wire = json.dumps(self.inspection_requests[-1]['messages'])
+            if 'proposed_delivery' not in view:
+                self.assertNotIn('current derived value', wire)
+                return self._review_complete_targets(view)
+            full_views.append(view)
+            for path, text in texts.items():
+                rows = [row for row in [*view['targets'], *view['evidence']]
+                    if row['path']==str(self.root/'workspace'/path)]
+                self.assertTrue(rows, path)
+                self.assertTrue(any(text==''.join(w['text'] for w in sorted(
+                    row['text_windows'], key=lambda window:window['offset_bytes']))
+                    for row in rows), path)
+            if len(full_views)==1:
+                return [_action('read_file',path='measurements/conditions.txt',max_bytes=8000)]
+            return self._review_complete_targets(view)
+        self.review = inspect
+        self._inspect(['report.md'], [])
+        self._ok('inspect_artifacts')
+        with patch.object(self.app.workspace, 'call', wraps=self.app.workspace.call) as reader:
+            self._submit(_action('deliver_result',**self._delivery('report.md','results.json','calculation.py')))
+        size = len(texts['results.json'].encode())
+        selected_end = selected_start + selected_count
+        reads = [(call.args[1].get('offset_bytes',0), call.args[1].get('max_bytes',16000))
+            for call in reader.call_args_list if call.args[0]=='read_file'
+            and self.app.workspace.resolve(call.args[1]['path'])==self.root/'workspace/results.json']
+        self.assertIn((0,selected_start), reads)
+        self.assertIn((selected_end,size-selected_end), reads)
+        self.assertNotIn((0,size), reads)
+        for start, count in reads:
+            if start < selected_end and start+count > selected_start:
+                # Revalidating the original receipt is allowed; priming must
+                # not reread that already observed body as part of a whole file.
+                self.assertEqual((start,count), (selected_start,selected_count))
+        self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
+        self.assertEqual(len(full_views),2)
+        proof=self._last('deliver_result')['metadata']['delivery_review']
+        self.assertEqual(proof['binding']['schema_version'],'delivery_review.v2')
+        self.assertIn('read_file',{s['function']['name'] for s in self.inspection_requests[-1]['tools']})
+        self.assertIn('Three supplied observations',json.dumps(self.inspection_requests[-1]['messages']))
+        before=self.send.call_count
+        self._reload()
+        self._run()
+        self.assertEqual(self.send.call_count,before)
+
+    def test_large_delivery_keeps_bounded_investigation_without_pretending_whole_reading(self):
+        self._create()
+        self._write('report.md','# Work note\n\nFurther source interpretation is needed.\n')
+        (self.root/'workspace/large.txt').write_text('reading scope\n'+'z'*256000, encoding='utf-8')
+        def inspect(view):
+            self.assertIn('read_file',{s['function']['name'] for s in self.inspection_requests[-1]['tools']})
+            if len(self.inspection_requests)==1:
+                self.assertFalse(any(row['path']==str(self.root/'workspace/large.txt')
+                    for row in view['evidence']))
+                return [_action('read_file',path='large.txt',offset_bytes=100,max_bytes=16000)]
+            self.assertEqual(self._inspection_history()[0]['status'],'ok')
+            return {'decisions':[{'subject':view['targets'][0]['subject'],'conclusion':'incomplete',
+                'findings':[],'evidence':[],'limitations':['The necessary interpretation is unfinished.']}]}
+        self.review=inspect
+        self._submit(_action('deliver_result',**self._delivery('report.md','large.txt')))
+        self._not_delivered()
+        result=self._last('deliver_result')['metadata']['delivery_review']['result']
+        self.assertEqual(result['metadata']['assessments'][0]['verdict'],'incomplete')
+        self.assertEqual(len(self.inspection_requests),2)
 
     def test_report_delivery_owns_full_review_instead_of_promoting_a_local_consistency_pass(self):
         self._create()
@@ -2648,6 +2818,11 @@ class OperationsWorkLoopTests(unittest.TestCase):
 
     def test_delivery_review_with_empty_evidence_reuses_journal_sources_and_reads_current_target(self):
         self._create()
+        # A saved v1 contract retains its original input scope; new tasks use
+        # the whole-delivery material scope covered by the v2 test above.
+        self.app.state['config']['delivery_review_protocol'] = 'task.v1'
+        self.app.operations.delivery_review.protocol = 'task.v1'
+        self.app._save()
         old_body = 'The sample mean is 2.0 across three supplied observations.\n'
         current_body = old_body + 'These observations do not support population inference.\n'
         self._write('report.md', old_body)
