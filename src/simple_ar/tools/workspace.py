@@ -1,6 +1,7 @@
 """Explicitly mounted workspace tools; authorization, not a filesystem sandbox."""
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import io
 import fnmatch
@@ -885,6 +886,33 @@ class WorkspaceToolGateway:
                     digest.update(raw)
             hashes[locator] = digest.hexdigest()
         return hashes
+
+    def approval_binding(self, call: dict[str, Any]) -> dict[str, Any]:
+        """Bind the effective operation without granting execution or retaining mutable caller data."""
+        # Pin the effective command/environment and directly mentioned text files.
+        arguments = validate_workspace_arguments("run_process",
+            json.loads(call["function"]["arguments"])).model_dump()
+        observed = {}
+        cwd = self.resolve(arguments.get("cwd", "workspace"), write=True)
+        argv = self.process_argv(arguments.get("argv", []),
+            resolve_mounts=not arguments.get('literal_argv', False))
+        for value in argv:
+            # argv includes literals and source text (e.g. python -c), not
+            # exclusively filenames. The whole command is pinned below;
+            # only existing, directly referenced files add content digests.
+            try:
+                candidate = (cwd / value).resolve()
+                if candidate.is_file() and candidate.stat().st_size <= 256000:
+                    with candidate.open("rb") as handle:
+                        observed[value] = hashlib.file_digest(handle, "sha256").hexdigest()
+            except (OSError, ValueError):
+                continue
+        payload = {"call": deepcopy(call), "files": observed,
+            "argv": argv, "environment": self.process_environment()}
+        artifacts = self.process_artifact_binding(arguments)
+        if artifacts is not None:
+            payload['artifacts'] = artifacts
+        return payload
 
     def process_artifact_binding(self, arguments: dict[str, Any], *, identity: str | None = None) -> dict[str, Any] | None:
         """Read-only approval hook. Absent declarations preserve historical tokens.

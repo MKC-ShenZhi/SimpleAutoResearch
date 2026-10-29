@@ -4647,30 +4647,8 @@ class ToolApplication:
             source = self.workspace.resolve(request.markdown, write=True)
             return hashlib.sha256(json.dumps({"call": call,
                 "inputs": self.publication.input_binding(source, request)}, sort_keys=True).encode()).hexdigest()
-        # Pin the effective command/environment and directly mentioned text files.
-        arguments = validate_workspace_arguments("run_process",
-            json.loads(call["function"]["arguments"])).model_dump()
-        observed = {}
-        cwd = self.workspace.resolve(arguments.get("cwd", "workspace"), write=True)
-        argv = self.workspace.process_argv(arguments.get("argv", []),
-            resolve_mounts=not arguments.get('literal_argv', False))
-        for value in argv:
-            # argv includes literals and source text (e.g. python -c), not
-            # exclusively filenames. The whole command is pinned below;
-            # only existing, directly referenced files add content digests.
-            try:
-                candidate = (cwd / value).resolve()
-                if candidate.is_file() and candidate.stat().st_size <= 256000:
-                    with candidate.open("rb") as handle:
-                        observed[value] = hashlib.file_digest(handle, "sha256").hexdigest()
-            except (OSError, ValueError):
-                continue
-        payload = {"call": call, "files": observed,
-            "argv": argv, "environment": self.workspace.process_environment()}
-        artifacts = self.workspace.process_artifact_binding(arguments)
-        if artifacts is not None:
-            payload['artifacts'] = artifacts
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        return hashlib.sha256(json.dumps(self.workspace.approval_binding(call),
+            sort_keys=True).encode()).hexdigest()
 
     def _authorize(self, sources: tuple[Path, ...], *, execution: bool, network: bool, vision: bool) -> str:
         """Explicit caller grants within the existing task, never inferred intent."""
