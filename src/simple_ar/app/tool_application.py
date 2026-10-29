@@ -52,6 +52,7 @@ _DEFERRED_WORKSPACE_TOOLS = {'write_file', 'edit_file', 'run_process'}
 # Terminal shape and closing suitability belong to frozen tool contracts.
 _COMPLETION_POLICIES = {'protected_decision.v1', 'closing_decision.v2'}
 _OPERATION_COMPLETION = 'available_operations.v1'
+_OPERATION_EXIT = 'available_operations.v2'
 _REPORT_PROTOCOL = 'canonical_report.v1'
 _OWNERS = 'owners.v1'
 _SHARED_OWNERS = 'owners.v2'
@@ -79,6 +80,14 @@ _CLOSING_DECISION = (
     'or ask an indispensable scope/resource question. A plan, ordinary file write or prose '
     'alone cannot close this request. Do not claim an unexecuted check or old delivery is current. '
     'A non-closing batch will be retained without executing its proposed operations.'
+)
+_OPERATION_EXIT_DECISION = (
+    'The remaining resources can support this exit decision but not a protected follow-up decision. '
+    'Ordinary supplied operations remain available. Choose executable final work as needed, '
+    'with exactly one explicit delivery or indispensable question last in the action batch. '
+    'Only actual results can satisfy delivery checks. Disclose unfinished work as unresolved '
+    'and deliver existing usable artifacts when full completion is not affordable. '
+    'A batch without that terminal action will be retained without execution.'
 )
 
 
@@ -822,6 +831,8 @@ class ToolApplication:
         Selection is not permission or acceptance. Existing domain validation,
         approval and delivery checks still own every returned action.
         """
+        if self.state['config'].get('completion_policy') == _OPERATION_EXIT:
+            return self.schemas
         # Restrict the active contracts rather than loading deferred specialists:
         # expanding an on-demand catalog here can evict original input windows.
         schemas = [row for row in self.schemas
@@ -1420,13 +1431,13 @@ class ToolApplication:
         if control_protocol not in {None, 'operations.v1'}:
             raise ValueError('Unsupported operation control protocol')
         if completion_policy is None:
-            completion_policy = _OPERATION_COMPLETION if control_protocol is not None else 'closing_decision.v2'
+            completion_policy = _OPERATION_EXIT if control_protocol is not None else 'closing_decision.v2'
         frozen_extensions = freeze_extensions(extensions or [])
         if report_protocol not in {None, _REPORT_PROTOCOL}:
             raise ValueError('Unsupported report protocol')
         if type(tool_contracts) is not str or tool_contracts not in _TOOL_CONTRACT_MODES:
             raise ValueError('Tool contracts must be full, on_demand or outcomes')
-        if completion_policy not in _COMPLETION_POLICIES | {_OPERATION_COMPLETION}:
+        if completion_policy not in _COMPLETION_POLICIES | {_OPERATION_COMPLETION, _OPERATION_EXIT}:
             raise ValueError('Unsupported completion policy')
         if delivery_files is not None:
             from simple_ar.tools.workspace import validate_delivery_patterns
@@ -2248,7 +2259,9 @@ class ToolApplication:
 
     def _system_text(self, *, closing: bool = False) -> str:
         if self.operations is not None:
-            return self.operations.system_text() + ('\n\n'+_CLOSING_DECISION if closing else '')
+            exit_text = (_OPERATION_EXIT_DECISION
+                if self.state['config'].get('completion_policy') == _OPERATION_EXIT else _CLOSING_DECISION)
+            return self.operations.system_text() + ('\n\n'+exit_text if closing else '')
         # Do not append delegation advice to the old do-everything solver role:
         # professional owners now hold the complete investigation-to-result unit.
         mode = self.state['config'].get('professional_work')
@@ -2271,7 +2284,7 @@ class ToolApplication:
 
     def _completion_floor(self, client: Any, messages: list | None = None, *,
                           dispatch: bool = False) -> dict[str, int]:
-        policies = _COMPLETION_POLICIES | ({_OPERATION_COMPLETION} if dispatch else set())
+        policies = _COMPLETION_POLICIES | {_OPERATION_EXIT} | ({_OPERATION_COMPLETION} if dispatch else set())
         if client is None or self.state['config'].get('completion_policy') not in policies:
             return {}
         if messages is None and self.state['turns']:
@@ -3606,6 +3619,8 @@ class ToolApplication:
     def _professional_model_input(self, context: Any, client: Any) -> tuple:
         from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
         conversation = ProfessionalConversation(client)
+        operation_exit = self.state['config'].get('completion_policy') == _OPERATION_EXIT
+        journal = self.state['config'].get('memory_protocol') == 'journal.v1'
         working_memory, memory_refs = None, ()
         selection = {}
 
@@ -3618,33 +3633,48 @@ class ToolApplication:
 
         def checkpoint(value, decision_tokens):
             nonlocal working_memory, memory_refs
-            omitted = selection.get('compaction_turns')
+            omitted = selection.get('compaction_turns') if journal else None
             cutoff = (max(omitted, default=-1)+1 if omitted is not None else
                 value.projection.get('working_context', {}).get('recent_start_turn', 0))
-            memory_refs = self._compact_work(context, client, cutoff,
-                decision_tokens=decision_tokens, additional_protection=True, selected_turns=omitted)
+            # Non-journal working.v1 keeps its original turn-atomic checkpoint
+            # and decision floor; the exit policy must not disable continuity.
+            with conversation.ledger.protect_remaining({} if journal else {
+                    'llm_requests':1, 'total_tokens':decision_tokens}):
+                memory_refs = self._compact_work(context, client, cutoff,
+                    decision_tokens=decision_tokens, additional_protection=True, selected_turns=omitted)
             if memory_refs:
                 memory_refs = self._memory_artifacts(context.store, context.attempt.attempt_id)
                 if context.store.exists('memory_snapshot.json'):
-                    working_memory = ProfessionalConversation.adopt(previous=self._working_memory(),
-                        snapshot=context.store.read_json('memory_snapshot.json'),
-                        view=context.store.read_json('memory_input.json'), operations_for_turn=self._memory_operations)
+                    snapshot = context.store.read_json('memory_snapshot.json')
+                    previous, view = self._working_memory(), context.store.read_json('memory_input.json')
+                    if journal:
+                        working_memory = ProfessionalConversation.adopt(previous=previous,
+                            snapshot=snapshot, view=view, operations_for_turn=self._memory_operations)
+                    else:
+                        from simple_ar.app.work_memory import summary_coverage
+                        working_memory = {'notes':snapshot['notes'], 'through_turn':summary_coverage(
+                            previous=previous, snapshot=snapshot, view=view,
+                            operations_for_turn=self._memory_operations)}
                     working_memory['notes'] = self.operations.project_notes(working_memory['notes'])
 
         value = conversation.prepare(project,
-            followup=lambda value:self._completion_floor(client, value.messages),
-            checkpoint=None if (self.state.get('pending') or {}).get('skip_memory_checkpoint') else checkpoint,
-            closing_enabled=self.state['config'].get('completion_policy') == 'closing_decision.v2',
+            followup=lambda value:({'llm_requests':1, 'total_tokens':conversation.tokens(value)}
+                if operation_exit else self._completion_floor(client, value.messages)),
+            checkpoint=None if ((self.state.get('pending') or {}).get('skip_memory_checkpoint')
+                or not journal and self.state['config'].get('context_protocol') != 'working.v1') else checkpoint,
+            closing_enabled=operation_exit or self.state['config'].get('completion_policy') == 'closing_decision.v2',
+            exit_first=operation_exit,
             continue_allowed=self._request_capacity() > 1 and (
                 self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts > 2))
         floor = ({'llm_requests':1, 'total_tokens':conversation.tokens(value)}
-            if value.closing else self._completion_floor(client, value.messages))
+            if value.closing else value.reserve if operation_exit else self._completion_floor(client, value.messages))
         return conversation, value, memory_refs, floor
 
     def _model(self, *, context: Any) -> CapabilityResult:
         client = self._client(context.attempt.attempt_id)
         conversation = None
-        if self.state['config'].get('memory_protocol') == 'journal.v1':
+        if (self.state['config'].get('memory_protocol') == 'journal.v1'
+                or self.state['config'].get('completion_policy') == _OPERATION_EXIT):
             conversation, value, memory_refs, floor = self._professional_model_input(context, client)
             messages, schemas, closing = value.messages, value.tools, value.closing
         else:
@@ -3663,7 +3693,9 @@ class ToolApplication:
                 if self.state['config'].get('professional_inputs') == 'owner.v3' else {}),
             **({'context_protocol': self.state['config']['context_protocol']}
                 if self.state['config'].get('context_protocol') in _CONVERSATION_CONTEXT_PROTOCOLS else {}),
-            **({'closing_action_contract': 'single_terminal.v1'} if closing else {}),
+            **({'closing_action_contract': ('terminal_batch.v1'
+                if self.state['config'].get('completion_policy') == _OPERATION_EXIT else 'single_terminal.v1')}
+                if closing else {}),
             'input_projection': {
                 'resources': projection['resources'],
                 **({'professional_outcomes': projection['professional_outcomes']}
@@ -5165,7 +5197,7 @@ class ToolApplication:
     def _run(self, approved_execution: str, approve: Any, progress: Callable[[str], None],
              should_stop: Callable[[], bool] | None = None) -> None:
         caller_takeover = self._caller_takeover()
-        reserve_completion = (self.state['config'].get('completion_policy') in _COMPLETION_POLICIES
+        reserve_completion = (self.state['config'].get('completion_policy') in _COMPLETION_POLICIES | {_OPERATION_EXIT}
             and self.state['config']['model'] is not None and not caller_takeover)
         while True:
             if self._commit_terminal(progress):

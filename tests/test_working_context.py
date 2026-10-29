@@ -1433,6 +1433,65 @@ class CheckpointFailureTests(unittest.TestCase):
                 self.assertEqual(project.call_count, 1 + expected)
                 self.assertEqual(self.ledger.to_dict(), before)
 
+    def test_shared_exit_first_measures_exit_before_unaffordable_ordinary_projection(self):
+        from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
+        conversation = ProfessionalConversation(self.client)
+        tools = [{'type':'function', 'function':{'name':'write_file'}}]
+        exit_input = ConversationInput([{'role':'user', 'content':'Finish known work; disclose unfinished work.'}],
+            tools, {'compaction_needed':False})
+        cost = conversation.tokens(exit_input)
+        followup = lambda value:{'llm_requests':1, 'total_tokens':conversation.tokens(value)}
+        for remaining, closing, calls in ((2*cost-1, True, [True]), (3*cost, False, [True,False])):
+            with self.subTest(remaining=remaining):
+                self.ledger.limits['total_tokens'] = remaining
+                projected = []
+                def project(final):
+                    projected.append(final)
+                    if not final and closing:
+                        self.fail('Ordinary projection would reject before the affordable exit could be offered')
+                    return deepcopy(exit_input)
+                checkpoint = Mock()
+                before = self.ledger.to_dict()
+                value = conversation.prepare(project, followup=followup, checkpoint=checkpoint, exit_first=True)
+                self.assertEqual(projected, calls)
+                self.assertEqual(value.closing, closing)
+                self.assertEqual(value.tools, tools)
+                self.assertEqual(value.reserve, {} if closing else {'llm_requests':1,'total_tokens':cost})
+                self.assertEqual(self.client.effective_output_limit(), 8192)
+                checkpoint.assert_not_called()
+                self.assertEqual(self.ledger.to_dict(), before)
+
+    def test_shared_exit_first_unknown_capacity_never_projects_or_sends(self):
+        from simple_ar.app.professional_conversation import ProfessionalConversation
+        self.ledger.reserve('unsettled', {'llm_requests':1, 'total_tokens':1000},
+            session_id='session', attempt_id='native-turn-test', purpose='native-turn')
+        self.ledger.mark_unknown('unsettled', reason='No usage receipt')
+        project, followup = Mock(), Mock()
+        before = self.ledger.to_dict()
+        with self.assertRaisesRegex(ValueError, 'capacity is unknown'):
+            ProfessionalConversation(self.client).prepare(project, followup=followup, exit_first=True)
+        project.assert_not_called()
+        followup.assert_not_called()
+        self.assertEqual(self.ledger.to_dict(), before)
+
+    def test_saved_terminal_batch_shape_survives_current_policy_changes(self):
+        app = ToolApplication.__new__(ToolApplication)
+        calls = [{'terminal':False}, {'terminal':True}]
+        app.state = {'config':{'completion_policy':'available_operations.v2'},
+            'turns':[{'remaining':calls, 'reply':'attempts/native-turn-test/native_result.json'}]}
+        app.session = SimpleNamespace(manifest=SimpleNamespace(
+            budget=SimpleNamespace(max_attempts=10, attempts=1)),
+            store=SimpleNamespace(exists=lambda _:True, read_json=Mock()))
+        app._terminal_intent = lambda call:call['terminal']
+        for policy, contract, expected in (
+                ('available_operations.v2', 'single_terminal.v1', False),
+                ('closing_decision.v2', 'terminal_batch.v1', True)):
+            with self.subTest(policy=policy, saved_contract=contract):
+                app.state['config']['completion_policy'] = policy
+                app.session.store.read_json.return_value = {'closing_required':True, 'closing_action_contract':contract}
+                self.assertTrue(app._closing_decision())
+                self.assertEqual(app._terminal_batch(), expected)
+
     def test_historical_model_projection_without_compaction_turns_keeps_its_original_cutoff(self):
         app = ToolApplication.__new__(ToolApplication)
         app.state = {'config':{'memory_protocol':'journal.v1'}}

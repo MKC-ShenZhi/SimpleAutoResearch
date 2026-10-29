@@ -57,26 +57,43 @@ class ProfessionalConversation:
                 followup: Callable[[ConversationInput], dict],
                 checkpoint: Callable[[ConversationInput, int], None] | None = None,
                 closing_enabled: bool = True, force_close: bool = False,
-                continue_allowed: bool = True, additional: bool = False) -> ConversationInput:
+                continue_allowed: bool = True, additional: bool = False,
+                exit_first: bool = False) -> ConversationInput:
         """Project, optionally compact closed work, then protect a real exit.
 
         The owner chooses the terminal contract and any non-budget boundary.
         Rebuild after a checkpoint so neither new notes nor final instructions
         are appended outside the measured input. No provider call is retried.
+        ``exit_first`` measures the owner's executable exit before ordinary
+        projection and uses that exact input/output estimate as the follow-up
+        floor. Historical owners keep their original projection order.
         """
         if {'llm_requests', 'total_tokens'}.intersection(self.ledger.unknown_dimensions(
                 unbounded_only=True, current_allowance_only=True)):
             raise ValueError('Professional conversation capacity is unknown; no request sent')
 
+        exit_value = None
+
         def admission(value):
-            floor = followup(value)
+            floor = followup(exit_value if exit_value is not None else value)
             slots, capacity = self.ledger.remaining('llm_requests'), self.ledger.remaining('total_tokens')
             protect = bool(floor and continue_allowed and not force_close
                 and (slots is None or slots >= 1 + floor.get('llm_requests', 0))
                 and (capacity is None or capacity >= self.tokens(value) + floor.get('total_tokens', 0)))
             return floor, protect
 
-        value = project(False)
+        def ordinary_input():
+            nonlocal exit_value
+            if exit_first:
+                # Measure a real exit before ordinary projection/admission can
+                # consume the last opportunity. This does not retry a failed
+                # projection, shrink output limits or reserve provider usage.
+                exit_value = project(True)
+                if force_close or not admission(exit_value)[1]:
+                    return exit_value
+            return project(False)
+
+        value = ordinary_input()
         floor, protect = admission(value)
         closing = force_close or closing_enabled and not protect
         working = value.projection.get('working_context', value.projection)
@@ -85,11 +102,11 @@ class ProfessionalConversation:
             # The compactor adds its decision/note protection inside this floor.
             with self.ledger.protect_remaining(floor if protect else {}, additional=additional):
                 checkpoint(value, self.tokens(value))
-            value = project(False)
+            value = ordinary_input()
             floor, protect = admission(value)
             closing = force_close or closing_enabled and not protect
         if closing:
-            value = project(True)
+            value = exit_value if exit_first else project(True)
         value.closing = closing
         value.reserve = floor if protect and not closing else {}
         return value

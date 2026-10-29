@@ -838,11 +838,13 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.assertTrue(self.decisions, 'Unexpected model work after the supplied decisions')
                 action = self.decisions.popleft()
                 action = action() if callable(action) else action
-                self.assertIn(action['tool_name'], offered)
+                actions = action if isinstance(action, list) else [action]
+                for item in actions:
+                    self.assertIn(item['tool_name'], offered)
                 message = {'role': 'assistant', 'content': None, 'tool_calls': [{
-                    'id': f'decision-{self.send.call_count}', 'type': 'function',
-                    'function': {'name': action['tool_name'],
-                        'arguments': json.dumps(action['arguments'])}}]}
+                    'id': f'decision-{self.send.call_count}' + (f'-{number}' if len(actions)>1 else ''), 'type': 'function',
+                    'function': {'name': item['tool_name'],
+                        'arguments': json.dumps(item['arguments'])}} for number, item in enumerate(actions)]}
                 finish = 'tool_calls'
             else:
                 view, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
@@ -3031,6 +3033,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.session.store.read_json('delivery.json')['unresolved'], partial['unresolved'])
         self.assertEqual(self.send.call_count, 4)
         self.assertEqual(len(self.inspection_requests), 2)
+        final_budget = self.app.session.store.read_json(str(
+            Path(self.app.state['turns'][-1]['reply']).with_name('decision_budget.json')))
+        self.assertTrue(final_budget['closing_required'])
+        self.assertEqual(final_budget['closing_action_contract'], 'terminal_batch.v1')
         self.assertEqual(self.app.ledger.limits, limits)
         entries = [entry.to_dict() for entry in self.app.ledger.entries]
         self.assertEqual(entries[:len(charged)], charged)
@@ -3684,10 +3690,90 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(_action('deliver_result', **self._delivery('notes.md')))
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
 
+    def test_available_operations_exit_batch_survives_approval_and_reload(self):
+        self.app = ToolApplication.create(self.root, 'Write a note, verify it and deliver both files.',
+            model='fixture', services=self.services, sources={}, allow_execution=True,
+            max_turns=1, max_tokens=200000, max_attempts=10, tool_contracts='full')
+        self.assertEqual(self.app.state['config']['completion_policy'], 'available_operations.v2')
+        self.decisions.append([
+            _action('write_file', path='note.md', content='Useful final work.'),
+            _action('run_process', argv=['python', '-c',
+                "from pathlib import Path; Path('checked.txt').write_text(Path('note.md').read_text())"],
+                inputs=['note.md'], outputs=['checked.txt'], timeout_sec=5),
+            _action('deliver_result', summary='The note and its checked copy.', artifacts=['note.md','checked.txt'])])
+        self._run()
+        self.assertEqual(self.send.call_count, 1)
+        self.assertEqual((self.root/'workspace/note.md').read_text(), 'Useful final work.')
+        self.assertFalse((self.root/'workspace/checked.txt').exists())
+        turn = self.app.state['turns'][-1]
+        budget = self.app.session.store.read_json(str(Path(turn['reply']).with_name('decision_budget.json')))
+        self.assertTrue(budget['closing_required'])
+        self.assertEqual(budget['closing_action_contract'], 'terminal_batch.v1')
+        self.assertIn('read_file', budget['input_projection']['tool_names'])
+        self.assertIn('run_process', budget['input_projection']['tool_names'])
+        token = self.app.approval_token(self.app.state['pending']['call'])
+        ledger = self.app.ledger.to_dict()
+        self._reload()
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self.app.approval_token(self.app.state['pending']['call']), token)
+        self._run(approved_execution=token)
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertEqual((self.root/'workspace/checked.txt').read_text(), 'Useful final work.')
+        self.assertEqual(self.send.call_count, 1)
+        self.assertEqual(len(self._process_receipts()), 1)
+        self.assertFalse(self.app.ledger.over_limit())
+        self._reload()
+        self._run()
+        self.assertEqual(self.send.call_count, 1)
+        self.assertEqual(len(self._process_receipts()), 1)
+
+    def test_available_operations_ordinary_decision_keeps_batch_freedom_and_followup_floor(self):
+        self._create(goal='Write two small notes, then finish.', context_protocol='working.v4')
+        self.assertNotIn('memory_protocol', self.app.state['config'])
+        self.decisions.extend([
+            [_action('write_file', path='one.md', content='One.'),
+             _action('write_file', path='two.md', content='Two.')],
+            _action('deliver_result', summary='Both notes.', artifacts=['one.md','two.md'])])
+        self._run()
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        budget = self.app.session.store.read_json(str(Path(self.app.state['turns'][0]['reply']).with_name('decision_budget.json')))
+        self.assertFalse(budget['closing_required'])
+        self.assertNotIn('closing_action_contract', budget)
+        self.assertGreater(budget['estimated_followup_tokens'], self.services.llm_client.effective_output_limit())
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_available_operations_token_boundary_offers_honest_partial_before_capacity_is_lost(self):
+        self._create(goal='Deliver the note and its verification, or disclose unfinished verification.')
+        self._write('note.md', 'Usable note; verification is unfinished.')
+        client = self.app._client()
+        exit_messages = self.app._messages(client=client, closing=True, schemas=self.app.schemas)
+        exit_cost = self.app._decision_tokens(client, exit_messages)
+        # Set the initial fixture allowance from its real projected input and
+        # unchanged output cap: one exit fits, two decisions do not. Requests
+        # remain plentiful, so this exercises token rather than slot exhaustion.
+        self.app.ledger.limits['total_tokens'] = exit_cost + exit_cost//2
+        limits = dict(self.app.ledger.limits)
+        self.decisions.append(_action('deliver_result', summary='Note retained; verification unfinished.',
+            artifacts=['note.md'], unresolved=['Requested verification is unfinished.']))
+        self._run(should_stop=lambda:False)
+        self.assertEqual(self.app.session.manifest.status, 'partial', self.app.result_snapshot())
+        budget = self.app.session.store.read_json(str(
+            Path(self.app.state['turns'][-1]['reply']).with_name('decision_budget.json')))
+        self.assertTrue(budget['closing_required'])
+        self.assertEqual(budget['closing_action_contract'], 'terminal_batch.v1')
+        self.assertEqual(self.app.session.store.read_json('delivery.json')['unresolved'],
+            ['Requested verification is unfinished.'])
+        self.assertEqual(self.app.ledger.limits, limits)
+        self.assertEqual(self.app._client().effective_output_limit(), client.effective_output_limit())
+        self.assertEqual(self.send.call_count, 1)
+        self.assertGreater(self.app.ledger.remaining('llm_requests'), 1)
+        self.assertFalse(self.app.ledger.over_limit())
+
     def test_request_boundary_keeps_real_nonterminal_work_without_forcing_a_delivery(self):
         self.app = ToolApplication.create(self.root,'Prepare a useful note; explain any remaining work.',
             model='fixture',services=self.services,sources={},max_turns=1,max_tokens=100000,
-            max_attempts=10,tool_contracts='full')
+            max_attempts=10,tool_contracts='full',completion_policy='available_operations.v1')
+        self.assertEqual(self.app._completion_floor(self.app._client()), {})
         self.decisions.append(_action('write_file',path='note.md',content='Saved work, not a completed task.'))
         result=self._run()
         self.assertEqual(result['status'],'paused',result)
@@ -3696,6 +3782,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertFalse(self.app.session.store.exists('delivery.json'))
         calls=self.send.call_count
         self._reload()
+        self.assertEqual(self.app.state['config']['completion_policy'], 'available_operations.v1')
         self._run()
         self.assertEqual(self.send.call_count,calls)
 
