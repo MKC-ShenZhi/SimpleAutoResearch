@@ -1827,12 +1827,44 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(first['result']['metadata']['delivery_assessment']['verdict'], 'needs_revision')
         self.assertIn('contradicts', ' '.join(self.app._delivery_feedback()['issues']))
         feedback = self.app._work_context(['workspace/summary.json'])['professional_findings']
-        self.assertTrue(any(row.get('delivery_context')==first['binding']
+        scope = self.app.operations.inspection.delivery_scope_view(first['binding'])
+        self.assertTrue(any(row.get('delivery_context')==scope
             and 'contradicts' in json.dumps(row['result']) for row in feedback))
+        package_feedback = next(row for row in feedback if row.get('delivery_context')==scope)
+        self.assertEqual(len(package_feedback['subjects']), 1)
+        self.assertTrue(package_feedback['subjects'][0]['current_matches_review'])
+        self.assertNotIn('delivery_assessment', package_feedback['result']['metadata'])
+        self.assertEqual(scope['artifact_count'], 2)
+        navigation = package_feedback['result']['data']['source_observations']
+        raw_feedback = json.loads(self.app.workspace.resolve(navigation['record']).read_text())
+        for field in navigation['fields']:
+            value = raw_feedback
+            for key in field.split('.'):
+                value = value[key]
+        self.assertEqual(raw_feedback['metadata']['delivery_review']['binding'], first['binding'])
+        # Model views carry exact findings and proof locators; large retained
+        # inventories must not multiply across binding, opinion and source maps.
+        raw = deepcopy(self._last('deliver_result'))
+        large = raw['metadata']['delivery_review']
+        for number in range(100):
+            path = str(self.root/f'workspace/attachments/retained-original-{number:03d}.csv')
+            large['binding']['artifacts'][path] = 'a'*64
+            large['result']['metadata']['delivery_assessment']['artifacts'][path] = 'a'*64
+            large['result']['metadata']['delivery_assessment']['evidence_sha256'][path] = 'b'*64
+        untouched = deepcopy(raw)
+        presented = self.app._coordination_result(raw, 'records/retained-review/native_result.json')
+        self.assertEqual(raw, untouched)
+        projected = presented['metadata']['delivery_review']
+        self.assertEqual(projected['binding']['artifact_count'], 102)
+        self.assertEqual(projected['result']['metadata']['delivery_opinion']['findings'][0]['message'],
+            first['result']['metadata']['delivery_assessment']['findings'][0]['message'])
+        self.assertLess(len(json.dumps(projected)), len(json.dumps(large))/5)
+        self.assertIn('metadata.delivery_review.binding',
+            projected['result']['data']['source_observations']['fields'])
         # A later narrow pass cannot erase the earlier whole-work defect.
         self._inspect(['summary.json'], ['说明.md'])
         feedback = self.app._work_context(['workspace/summary.json'])['professional_findings']
-        self.assertTrue(any(row.get('delivery_context')==first['binding']
+        self.assertTrue(any(row.get('delivery_context')==scope
             and 'contradicts' in json.dumps(row['result']) for row in feedback))
         failed = self._versions(self.root/'tools/inspection'/first['identity'])
         ledger, calls = self.app.ledger.to_dict(), self.send.call_count
@@ -1842,6 +1874,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         for name, body in [('说明.md','这三个观察值的均值为2.0。\n'), ('summary.json','{"mean":2.0}\n')]:
             self._submit(_action('write_file', path=name, content=body,
                 expected_sha256=_digest(self.root/'workspace'/name)))
+        guidance = self.app.operations.inspection_feedback(['workspace/summary.json'])
+        prior = next(row for row in guidance if row.get('delivery_context')==scope)
+        self.assertFalse(prior['subjects'][0]['current_matches_review'])
+        self.assertIn('contradicts', json.dumps(prior['result']))
         self._submit(_action('deliver_result', **claim))
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         self.assertEqual(len(reviews), 2)
@@ -1866,7 +1902,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertNotEqual(self.app.session.manifest.status, 'completed')
         negative = self._last('deliver_result')['metadata']['delivery_review']
         feedback = self.app.operations.inspection_feedback([])
-        self.assertTrue(any(row.get('delivery_context')==negative['binding']
+        self.assertTrue(any(row.get('delivery_context')==self.app.operations.inspection.delivery_scope_view(negative['binding'])
             and 'overstates' in json.dumps(row['result']) for row in feedback))
         self.review = self._review_complete_targets
         self._submit(_action('deliver_result', summary='这三个观察值不支持总体推断。', artifacts=[]))
@@ -3560,7 +3596,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     # An invalid final has no completed professional opinion.
                     # Recovery must refuse replay, not reinterpret it as a pass.
                     self.assertEqual(cached.status, 'blocked', cached.error)
-                    self.assertIn('No completed inspection response', cached.error)
+                    self.assertIn('No completed inspection opinion', cached.error)
                     self.assertEqual(self.app.session.store.read_json(
                         f'tools/inspection/{identity}/result.json'), expected)
                     self.assertEqual(self.send.call_count, calls)

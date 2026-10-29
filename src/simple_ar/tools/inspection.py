@@ -241,8 +241,37 @@ class InspectionToolGateway:
         return f'tools/inspection/{identity}/{leaf}.json'
 
     @staticmethod
+    def delivery_scope_view(binding: dict) -> dict:
+        """Model navigation, never the version-bound acceptance contract."""
+        return {'projection': 'delivery_scope', 'requests': binding['requests'],
+            'claim': {key: value for key, value in binding['claim'].items() if key != 'artifacts'},
+            'artifact_count': len(binding['artifacts'])}
+
+    @staticmethod
     def coordination_result(result: ToolResult, *, receipt_path: str) -> dict:
         """Return inspection decisions and source locators, not another copy of its reading session."""
+        package = result.metadata.get('delivery_assessment')
+        if 'delivery_opinion' in result.metadata:
+            projected = result.model_dump(mode='json')
+            projected['data']['source_observations']['record'] = receipt_path
+            return projected
+        if package is not None:
+            # The full inventory, source digests and physical usage are checked
+            # by their owners and retained once in the raw receipt. Repeating
+            # those proofs in every model turn crowds out the actual evidence.
+            return {**result.model_dump(mode='json'),
+                'data': {'source_observations': {'record': receipt_path,
+                    'fields': ['data.targets', 'data.evidence', 'metadata.delivery_assessment', 'metadata.usage'],
+                    'scope': 'Original windows, exact version bindings and usage remain in this receipt. '
+                        'This projected opinion is guidance, not source evidence or current acceptance.'}},
+                'metadata': {'delivery_opinion': {
+                    'projection': 'delivery_opinion',
+                    'coverage': package['coverage'], 'verdict': package['verdict'],
+                    'findings': [{'severity': row['severity'], 'message': row['message'],
+                        'artifacts': list(row['subjects'])} for row in package['findings']],
+                    'limitations': package['limitations'],
+                    'artifact_count': len(package['artifacts']),
+                    'evidence_count': len(package['evidence_sha256'])}}}
         data = dict(result.data)
         for role in ('targets','evidence'):
             if role in data:
@@ -252,6 +281,33 @@ class InspectionToolGateway:
             'scope':'Full original read windows remain in this receipt; the inspection opinion is not source evidence. '
                     'Read a particular source or archived window when its actual text is needed.'}
         return {**result.model_dump(mode='json'),'data':data}
+
+    @classmethod
+    def feedback_view(cls, feedback: dict) -> dict:
+        """Supply exact findings and affected-version status, with full proof by reference.
+
+        Also handles retained v3 input without rewriting its historical bytes.
+        Callers still verify the original owner result before supplying feedback.
+        """
+        binding = feedback.get('delivery_context') or {}
+        if binding.get('schema_version') != 'delivery_review.v3':
+            return feedback
+        record = feedback.get('record', '')
+        result = cls.coordination_result(ToolResult.model_validate(feedback['result']), receipt_path=record)
+        if record:
+            source = result['data']['source_observations']
+            source['fields'] = ['metadata.delivery_review.result.' + field for field in source['fields']]
+            source['fields'].append('metadata.delivery_review.binding')
+        opinion = result['metadata'].get('delivery_opinion', {})
+        affected = {path for row in opinion.get('findings', []) for path in row['artifacts']}
+        subjects = feedback.get('subjects', [])
+        return {**feedback, 'delivery_context': cls.delivery_scope_view(binding), 'result': result,
+            'subjects': [row for row in subjects if row['path'] in affected],
+            'reviewed_version_status': {'matching': sum(row['current_matches_review'] for row in subjects),
+                'changed_or_unavailable': sum(not row['current_matches_review'] for row in subjects)},
+            'scope': feedback.get('scope', '') + ' Full scope, versions and source observations remain '
+                'in the recorded receipt. Only affected subject versions are repeated here; '
+                'an empty artifact list on a finding means a whole-claim concern.'}
 
     def has_started(self, identity: str) -> bool:
         return self.store.exists(self._path(identity, 'input'))
@@ -278,11 +334,17 @@ class InspectionToolGateway:
 
     def _receipt(self, identity: str) -> dict[str, Any]:
         saved = self.store.read_json(self._path(identity, 'response'))
-        if saved.get('identity') != identity or saved.get('completed') is not True:
-            raise ValueError('No completed inspection response; provider state is unknown. No replay')
+        if saved.get('identity') != identity:
+            raise ValueError('Inspection response identity mismatch; no replay')
         if saved.get('input_sha256') != self._digest(self._path(identity, 'input')):
             raise ValueError('Retained inspection input bytes changed; no replay')
         usage = self._usage(identity)
+        if saved.get('completed') is not True:
+            pending = (saved.get('usage') != usage or
+                any(row['status'] in {'reserved', 'unknown'} for row in usage))
+            state = 'provider usage is pending or unknown' if pending else 'recorded usage has no pending or unknown entries'
+            raise ValueError('No completed inspection opinion: ' + saved.get('error', 'no final response')
+                + '; ' + state + '. No replay')
         if (saved.get('usage') != usage or not any(row['status'] == 'settled'
                     and row.get('logical_call_id') == f'inspect-artifacts-{identity}'
                     and row.get('actual', {}).get('llm_requests', 0) > 0
@@ -867,7 +929,7 @@ class InspectionToolGateway:
                 'This owner requests the complete proposed-delivery review; its fixed goal '
                 'does not narrow this to agreement among generated files.')
             view['proposed_delivery'] = {
-                **({'claim':delivery['claim']} if self._delivery_scope(saved) else
+                **({'claim':{key:value for key,value in delivery['claim'].items() if key != 'artifacts'}} if self._delivery_scope(saved) else
                     {'manuscript':delivery['manuscript'], 'formats':delivery['formats']}),
                 'artifacts': list(delivery['artifacts']),
                 'scope': 'Owner-bound actual delivery inventory, not proof of correctness. '
@@ -876,7 +938,8 @@ class InspectionToolGateway:
                     'with one another do not establish correctness. Locate and read original '
                     'evidence as needed; disclose unsupported conclusions or unfinished checks.'}
             if self._delivery_scope(saved):
-                view['prior_work_opinions'] = saved.get('prior_work_opinions', [])
+                view['prior_work_opinions'] = [self.feedback_view(row)
+                    for row in saved.get('prior_work_opinions', [])]
         for role in ('targets','evidence'):
             view[role] = [{'subject':row['subject'], 'path':row.get('path'), 'complete':row['complete'],
                 'limitation':row.get('limitation',''),

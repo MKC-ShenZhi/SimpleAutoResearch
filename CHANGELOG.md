@@ -12,10 +12,12 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 - New tasks use one delivery owner to review the request, completion claim and actual outputs, including deliveries without report metadata and direct text answers. Local opinions inform that review instead of adding another acceptance gate. Saved tasks keep their original rules.
 - Package review prioritizes current manuscript, code and result text, reusing valid reads and filling unread ranges. Original sources remain available for investigation. Large material follows existing capacity rules; complete reading does not establish correctness.
+- Follow-up work receives exact review findings and affected-version status, with full source bindings and usage retained in the original records instead of crowding out source text with repeated metadata.
 
 ### Fixed
 
 - A task stop now prevents new requests inside review, summaries and model batches. In-flight calls settle normally, while completed work, checkpoints and accounting remain intact.
+- Unfinished checks retain their actual failure cause instead of misreporting a local input-capacity failure after settled calls as unknown provider state. Failures cannot pass or replay automatically.
 
 Complete feedback delivery and lower total cost still require real-task acceptance.
 

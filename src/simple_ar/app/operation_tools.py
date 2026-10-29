@@ -329,10 +329,10 @@ class OperationTools:
             # A local file opinion cannot retire a whole-claim opinion. Direct
             # answers and claim-level defects have no file scope at all, yet
             # remain relevant guidance for the next whole-work judgment.
-            claim_findings = (feedback['result'].get('metadata') or {}).get('delivery_assessment', {}).get('findings', [])
-            if subjects or package and (not inventory or not roots or any(not row['subjects'] for row in claim_findings)):
-                result.append({**feedback, 'kind': 'inspection_feedback', 'subjects': subjects,
-                    'record': 'records/' + observed['record'].removeprefix('attempts/')})
+            claim_findings = (feedback['result'].get('metadata') or {}).get('delivery_opinion', {}).get('findings', [])
+            if subjects or package and (not inventory or not roots or any(not row['artifacts'] for row in claim_findings)):
+                result.append(self.inspection.feedback_view({**feedback, 'kind': 'inspection_feedback', 'subjects': subjects,
+                    'record': 'records/' + observed['record'].removeprefix('attempts/')}))
         return result
 
     def presentation(self, selected: set[str], mode: str):
@@ -500,6 +500,9 @@ class OperationTools:
         review = presented['metadata']['delivery_review']
         review['result'] = self.inspection.coordination_result(
             ToolResult.model_validate(review['result']), receipt_path=record)
-        review['result']['data']['source_observations']['fields'] = [
-            'metadata.delivery_review.result.data.targets', 'metadata.delivery_review.result.data.evidence']
+        source = review['result']['data']['source_observations']
+        source['fields'] = ['metadata.delivery_review.result.' + field for field in source['fields']]
+        if review.get('binding', {}).get('schema_version') == 'delivery_review.v3':
+            review['binding'] = self.inspection.delivery_scope_view(review['binding'])
+            source['fields'].append('metadata.delivery_review.binding')
         return presented

@@ -156,8 +156,13 @@ class DeliveryReview:
             [binding['manuscript']], require_pass=[binding['manuscript']])
 
     def _verified(self, identity: str, binding: dict, claimed: dict | None = None) -> ToolResult:
-        # Never trust an outer pass, including a pass copied from a real local review.
-        result = self.inspector._cached(identity)
+        # A retained failure is diagnostic only: no final opinion is needed to
+        # report it. Every possible acceptance still goes through _cached's
+        # completed response, usage, integrity and version verification.
+        path = self.inspector._path(identity, 'result')
+        retained = (ToolResult.model_validate(self.inspector.store.read_json(path))
+                    if self.inspector.store.exists(path) else None)
+        result = retained if retained is not None and not retained.ok else self.inspector._cached(identity)
         saved = self.inspector.store.read_json(self.inspector._path(identity, 'input'))
         if (saved.get('identity') != identity or saved.get('delivery_context') != binding
                 or saved.get('arguments') != self._arguments(binding)
@@ -165,7 +170,7 @@ class DeliveryReview:
             raise ValueError('Delivery review does not match the retained full delivery context')
         if claimed is not None and (claimed.get('identity') != identity
                 or claimed.get('binding') != binding
-                or claimed.get('error')
+                or (result.ok and claimed.get('error'))
                 or claimed.get('result') != result.model_dump(mode='json')):
             raise ValueError('Delivery review metadata differs from the actual inspection receipt')
         if self.workspace.artifact_hashes(binding['artifacts']) != binding['artifacts']:
@@ -178,6 +183,8 @@ class DeliveryReview:
     def _envelope(binding: dict, identity: str, result: ToolResult, *, error: str = '') -> dict:
         value = {'binding': deepcopy(binding), 'identity': identity,
                  'result': result.model_dump(mode='json')}
+        if not result.ok and not error:
+            error = result.error or result.status
         if error:
             value['error'] = error
         return value
@@ -242,6 +249,10 @@ class DeliveryReview:
                 return None
             result = self.inspector.call('inspect_artifacts', self._arguments(binding), identity,
                                          delivery_context=deepcopy(binding))
+            if not result.ok:
+                # Preserve the actual execution failure before attempting any
+                # acceptance-only final-receipt checks. No retry or replay.
+                return self._envelope(binding, identity, result)
             verified = self._verified(identity, binding)
             if verified.model_dump(mode='json') != result.model_dump(mode='json'):
                 raise ValueError('Returned delivery review differs from its retained result')

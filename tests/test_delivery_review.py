@@ -341,6 +341,51 @@ class DeliveryReviewTests(unittest.TestCase):
         self.review(may_start=False)
         self.assertEqual(len(self.inspector.calls), 1)
 
+    def test_unsuccessful_review_keeps_execution_diagnostic_without_a_final_opinion_or_replay(self):
+        from unittest.mock import patch
+
+        original_call = self.inspector.call
+        cause = 'Inspection working view cannot fit its model input target'
+        self.inspector.verdict = 'needs_revision'
+        for status in ('error', 'blocked'):
+            with self.subTest(status=status):
+                identity = 'failed-' + status
+                def fail(name, arguments, key, *, delivery_context):
+                    result = original_call(name, arguments, key, delivery_context=delivery_context)
+                    result.status, result.error = status, cause
+                    result.metadata['usage'] = [
+                        {'status':'settled', 'actual':{'llm_requests':1, 'total_tokens':140}},
+                        {'status':'settled', 'actual':{'llm_requests':1, 'total_tokens':160}}]
+                    payload = result.model_dump(mode='json')
+                    self.inspector.store.write_json(self.inspector._path(key, 'result'), payload)
+                    self.inspector.expected[key] = deepcopy(payload)
+                    return result
+
+                # A missing final opinion must not make the parent call the
+                # acceptance checker and replace the actual local failure.
+                self.inspector.rejected[identity] = 'No completed inspection response; provider state is unknown. No replay'
+                with patch.object(self.inspector, 'call', side_effect=fail):
+                    proof = self.review(identity)
+                self.assertEqual(proof['error'], cause)
+                self.assertEqual(proof['result'], self.inspector.expected[identity])
+                self.assertEqual(proof['result']['metadata']['delivery_assessment']['verdict'], 'needs_revision')
+                observed = self.observe(proof)
+                calls = len(self.inspector.calls)
+                paths = [self.inspector._path(identity, leaf) for leaf in ('input', 'result')]
+                original = {path:self.inspector.store.resolve(path).read_bytes() for path in paths}
+                ledger = self.workspace.ledger.to_dict()
+                # Recreate the parent as on load. A fresh explicit identity may
+                # be considered separately; recovery never replays this one.
+                self.owner = DeliveryReview(self.workspace, self.inspector, lambda:self.requests,
+                    observations=lambda:self.observations, protocol='task.v3')
+                for may_start in (False, True):
+                    self.assertEqual(self.review(identity, may_start=may_start), proof)
+                self.assertEqual(self.owner.issues([observed], self.delivery), ['Delivery review failed: ' + cause])
+                self.assertNotIn(identity, self.inspector.cached)
+                self.assertEqual(len(self.inspector.calls), calls)
+                self.assertEqual(self.workspace.ledger.to_dict(), ledger)
+                self.assertEqual({path:self.inspector.store.resolve(path).read_bytes() for path in paths}, original)
+
     def test_required_partial_incomplete_and_missing_assessments_cannot_pass(self):
         for verdict, coverage, missing in (
                 ('needs_revision', 'complete', False), ('incomplete', 'complete', False),
