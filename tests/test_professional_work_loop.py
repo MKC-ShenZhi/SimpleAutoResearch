@@ -1200,7 +1200,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
             and row.get('data', {}).get('text') for row in retained))
 
     def test_default_journal_continuity_forms_notes_and_explicit_updates_remain_authoritative(self):
-        self._queue_checkpoint_history(context_protocol='auto', initial_notes=False)
+        # Fit the mandatory prompt before testing eviction of accumulated work.
+        self._queue_checkpoint_history(context_protocol='auto', initial_notes=False, context_input_tokens=24000)
         self.assertEqual(self.app.state['config']['memory_protocol'], 'journal.v1')
         # One closed prose reply must not strand all later observations behind
         # an empty turn. It is working judgment, never original-file support.
@@ -1213,6 +1214,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.send.side_effect = respond
         self._run()
         self.assertTrue(self.memory_views)
+        # Twelve reads should not repeatedly rewrite notes once per old turn.
+        self.assertLess(len(self.memory_views), 6)
         self.assertTrue(any(row.get('records') == [] and row['tool'] == 'assistant_reply'
             for view in self.memory_views for row in view['observations']))
         self.assertTrue(all('request_count' in row for view in self.memory_views for row in view['observations']))
@@ -1237,7 +1240,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app._working_memory()['notes'], [])
 
     def test_settled_journal_checkpoint_survives_a_failed_native_decision_and_caller_recovery(self):
-        self._queue_checkpoint_history(context_protocol='auto', initial_notes=False)
+        self._queue_checkpoint_history(context_protocol='auto', initial_notes=False, context_input_tokens=24000)
         provider = self.send.side_effect
         interrupted = False
         def respond(mode, request, **kwargs):
@@ -1348,7 +1351,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.decisions.clear()
                 self.memory_views.clear()
                 self.send.side_effect = self._provider
-                self._queue_checkpoint_history(context_protocol=protocol)
+                self._queue_checkpoint_history(context_protocol=protocol,
+                    context_input_tokens=24000 if protocol == 'auto' else 12000)
                 self._truncate_checkpoints()
                 self._run()
                 self._ok('ask_user')

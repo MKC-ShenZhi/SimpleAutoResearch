@@ -1099,7 +1099,7 @@ class ToolApplication:
             return False
 
     def _compact_work(self, context: Any, client: Any, cutoff: int, *, decision_tokens: int = 0,
-                      additional_protection: bool = False) -> tuple:
+                      additional_protection: bool = False, selected_turns: list | None = None) -> tuple:
         """Checkpoint old closed work through the same model attempt and ledger."""
         if self._request_capacity()<2 or not cutoff:
             return ()
@@ -1112,6 +1112,8 @@ class ToolApplication:
             previous['attempted_through_turn'] = failure['attempted_through_turn']
         rows = []
         for number in range(previous['through_turn'],cutoff):
+            if selected_turns is not None and number not in selected_turns:
+                continue
             turn = self.state['turns'][number]
             if turn.get('remaining') or not journal and not turn['tools']:
                 break
@@ -2431,11 +2433,12 @@ class ToolApplication:
 
     def _messages(self, *, client: LLMClient | None = None, closing: bool = False,
                   native_history_start_turn: int | None = None, schemas: list | None = None,
-                  working_memory: dict | None = None) -> list[dict[str, Any]]:
+                  working_memory: dict | None = None, working_selection: dict | None = None) -> list[dict[str, Any]]:
         protocol = self.state['config'].get('context_protocol')
         if protocol in _CONVERSATION_CONTEXT_PROTOCOLS:
             return self._conversation_messages(client=client, closing=closing,
-                native_history_start_turn=native_history_start_turn, schemas=schemas,working_memory=working_memory)
+                native_history_start_turn=native_history_start_turn, schemas=schemas,working_memory=working_memory,
+                working_selection=working_selection)
         if protocol is not None:
             raise ValueError('Unknown saved context protocol; no projection migration')
         config = self.state["config"]
@@ -3017,7 +3020,8 @@ class ToolApplication:
 
     def _conversation_messages(self, *, client: LLMClient | None = None, closing: bool = False,
                                native_history_start_turn: int | None = None,
-                               schemas: list | None = None, working_memory: dict | None = None) -> list[dict[str, Any]]:
+                               schemas: list | None = None, working_memory: dict | None = None,
+                               working_selection: dict | None = None) -> list[dict[str, Any]]:
         """One chronological working set; receipts retain their actual text once.
 
         This is historical conversation, not a revalidated evidence cache. Tool
@@ -3240,6 +3244,8 @@ class ToolApplication:
                 block = (request_messages if declared else []) + [{'role': 'user', 'content': json.dumps({
                     'professional_work': reply['content'],
                     'operations': [{'tool': calls[item['id']]['function']['name'],
+                        **({'arguments':self._recorded_arguments(calls[item['id']])}
+                           if config.get('memory_protocol') == 'journal.v1' else {}),
                         'result': presented_results[item['id']]}
                         for item in turn['tools']]}, ensure_ascii=False)}]
             blocks.append(block if complete else [])
@@ -3317,11 +3323,17 @@ class ToolApplication:
                     return self.workspace.artifact_hashes([path])[path]
                 except (ValueError,OSError):
                     return None
+            journal = config.get('memory_protocol') == 'journal.v1'
             memory = self._working_memory() if working_memory is None else working_memory
             work_notes = memory['notes']
             selected_records = list((plan or {}).get('evidence_records', []))
             if self.operations is not None and self.operations.work is not None:
-                scope = self.operations.work.input_view(rows=working_rows, operation_history=operation_history,
+                # Recent work already has its atomic journal presentation.
+                # Do not turn every post-boundary read into a permanent full
+                # source reference. The work owner still resolves its actual
+                # selected locations and explicit evidence references.
+                scope = self.operations.work.input_view(rows=[] if journal else working_rows,
+                    operation_history=operation_history,
                     boundary=boundary, references=selected_records, notes=work_notes)
                 if scope is not None:
                     selected_records, work_notes = scope['references'], scope['notes']
@@ -3342,7 +3354,13 @@ class ToolApplication:
                     and config['context_protocol'] == 'working.v4' else
                     'scoped' if config['context_protocol'] == 'working.v4' else
                     'referenced' if config['context_protocol'] in _REFERENCED_CONTEXT_PROTOCOLS else 'ranked'),
-                operation_history=operation_history)
+                operation_history=operation_history,
+                **({'processed_turns':[number for number, turn in enumerate(turns)
+                    if (records := ({'records/'+item['result'].removeprefix('attempts/') for item in turn['tools']}
+                        or {'records/'+turn['reply'].removeprefix('attempts/')}))
+                    and records.issubset(memory.get('compacted_records', ()))]} if journal else {}))
+            if working_selection is not None:
+                working_selection.update(selection)
             cost = estimate_tokens(json.dumps(messages,ensure_ascii=False))+schema_cost
             if remaining is not None and cost+output>remaining:
                 raise ValueError('Current working view exceeds the remaining token allowance; no request sent')
@@ -3556,18 +3574,22 @@ class ToolApplication:
         from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
         conversation = ProfessionalConversation(client)
         working_memory, memory_refs = None, ()
+        selection = {}
 
         def project(closing):
             schemas = self._closing_schemas() if closing else self.schemas
+            selection.clear()
             messages = self._messages(client=client, working_memory=working_memory,
-                closing=closing, schemas=schemas)
+                closing=closing, schemas=schemas, working_selection=selection)
             return ConversationInput(messages, schemas, json.loads(messages[1]['content']))
 
         def checkpoint(value, decision_tokens):
             nonlocal working_memory, memory_refs
-            cutoff = value.projection.get('working_context', {}).get('recent_start_turn', 0)
+            omitted = selection.get('compaction_turns')
+            cutoff = (max(omitted, default=-1)+1 if omitted is not None else
+                value.projection.get('working_context', {}).get('recent_start_turn', 0))
             memory_refs = self._compact_work(context, client, cutoff,
-                decision_tokens=decision_tokens, additional_protection=True)
+                decision_tokens=decision_tokens, additional_protection=True, selected_turns=omitted)
             if memory_refs:
                 memory_refs = self._memory_artifacts(context.store, context.attempt.attempt_id)
                 if context.store.exists('memory_snapshot.json'):

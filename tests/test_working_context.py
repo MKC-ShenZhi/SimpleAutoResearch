@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 from simple_ar.core.working_context import history_view, select_working_context
 from simple_ar.app.work_memory import compact_work, checkpoint_artifacts, checkpoint_entries, summary_coverage
@@ -449,6 +449,97 @@ class WorkingContextTests(unittest.TestCase):
 
 
 class RetainedWorkingContextTests(unittest.TestCase):
+    def test_processed_prefix_is_navigation_not_a_demand_to_refill_the_window(self):
+        text = 'Original historical source. '*300
+        row = observation(0, text, role='historical_observation')
+        notes = [{'text':'Earlier work remains a model judgment; consult its original.',
+            'records':[row['record']], 'current':True}]
+        arguments = dict(material_policy='retained', require_work_notes=True, fit_work_notes=True,
+            turn_blocks=[block(0, text), block(1, 'Current operation')], observations=[row],
+            work_notes=notes, processed_turns=[0], version_resolver=lambda _:row['sha256'],
+            context_token_target=40000)
+        messages, selection = select(**arguments)
+        self.assertNotIn(text, json.dumps(messages))
+        self.assertEqual(selection['selected_turns'], [1])
+        self.assertEqual(selection['compaction_turns'], [])
+        self.assertFalse(selection['compaction_needed'])
+        self.assertLess(selection['estimated_input_tokens'], 10000)
+        self.assertEqual(selection['omitted_records'][0]['status'], 'not_requested')
+        # Explicit current work can still reuse originals; notes never certify them.
+        explicit, selected = select(**arguments, selected_records=[row['record']])
+        self.assertIn(text, json.dumps(explicit))
+        self.assertEqual(selected['selected_records'][0]['version_status'], 'matching')
+        stale, selected = select(**{**arguments, 'version_resolver':lambda _:'changed'},
+            selected_records=[row['record']])
+        self.assertNotIn(text, json.dumps(stale))
+        self.assertEqual(selected['omitted_records'][0]['version_status'], 'stale')
+        for supplied in ([], [{**notes[0], 'current':False}], [{**notes[0], 'text':'Oversized note. '*10000}]):
+            fallback, _ = select(**{**arguments, 'work_notes':supplied})
+            self.assertIn(text, json.dumps(fallback))
+
+    def test_selected_body_is_replaced_by_its_complete_native_operation_before_measuring(self):
+        result = {'tool_name':'execute', 'status':'error', 'error':'Original diagnostic. '*100}
+        row = observation(0, json.dumps(result), kind='operation_result')
+        old = block(0, 'unused')
+        old[0]['tool_calls'][0]['function'] = {'name':'execute', 'arguments':'{"argv":["worker"]}'}
+        old[1]['content'] = json.dumps(result)
+        messages, selection = select(material_policy='retained', require_work_notes=True, fit_work_notes=True,
+            processed_turns=[], observations=[row], selected_records=[row['record']],
+            turn_blocks=[old, block(1, 'Continue')], context_token_target=20000)
+        self.assertEqual(selection['selected_turns'], [0, 1])
+        self.assertEqual(json.loads(messages[1]['content'])['working_view']['observations'], [])
+        self.assertEqual([m for m in messages if m['role'] in {'assistant','tool'}], old + block(1, 'Continue'))
+        self.assertFalse(selection['compaction_needed'])
+
+    def test_visible_result_cannot_hide_capacity_omitted_authored_arguments(self):
+        result = {'tool_name':'write_file', 'status':'error', 'error':'Write was rejected'}
+        row = observation(0, json.dumps(result), kind='operation_result')
+        old = block(0, 'unused')
+        old[0]['tool_calls'][0]['function'] = {'name':'write_file',
+            'arguments':json.dumps({'path':'code.py', 'content':'Authored implementation. '*4000})}
+        old[1]['content'] = json.dumps(result)
+        messages, selection = select(material_policy='retained', require_work_notes=True, fit_work_notes=True,
+            processed_turns=[], observations=[row], selected_records=[row['record']],
+            turn_blocks=[old, block(1, 'Continue')], context_token_target=12000)
+        self.assertIn('Write was rejected', json.dumps(messages))
+        self.assertEqual(selection['compaction_turns'], [0])
+        self.assertTrue(selection['compaction_needed'])
+        self.assertEqual(selection['selected_turns'], [1])
+
+    def test_partial_processed_history_and_required_overflow_do_not_claim_compaction_value(self):
+        notes = [{'text':'Navigable prior work', 'records':[], 'current':True}]
+        blocks = [block(0, 'Unprocessed failure'), block(1, 'Processed receipt'), block(2, 'Current work')]
+        messages, selection = select(material_policy='retained', require_work_notes=True, fit_work_notes=True,
+            processed_turns=[1], work_notes=notes, turn_blocks=blocks, context_token_target=20000)
+        self.assertEqual(selection['selected_turns'], [0,1,2])
+        self.assertIn('Unprocessed failure', json.dumps(messages))
+        _, selection = select(material_policy='retained', require_work_notes=True, fit_work_notes=True,
+            processed_turns=[], turn_blocks=[blocks[0], block(1, 'Required latest. '*4000)], context_token_target=3000)
+        self.assertTrue(selection['context_exceeds_input_target'])
+        self.assertFalse(selection['compaction_needed'])
+
+    def test_processed_but_uncited_failure_remains_discoverable_in_compact_history(self):
+        texts = ['Original source body. '*300, 'Full failed execution output. '*300]
+        operations = [{'turn':i, 'turn_complete':True, 'request_count':1, 'call_id':str(i),
+            'reply':f'records/{i}/reply.json', 'observation':{'tool':'execute',
+                'record':f'records/{i}/result.json', 'arguments':{'argv':['worker',str(i)]},
+                'status':'error' if i else 'ok', 'error':'Recorded execution failure' if i else '',
+                'observed':{'returncode':1 if i else 0}}} for i in range(2)]
+        arguments = dict(material_policy='retained', require_work_notes=True, fit_work_notes=True,
+            processed_turns=[0,1], turn_blocks=[block(0,texts[0]), block(1,texts[1]), block(2,'Current work')],
+            work_notes=[{'text':'A judgment about only the first record',
+                'records':['records/0/result.json'], 'current':True}], context_token_target=40000)
+        without, bare = select(**arguments)
+        messages, selection = select(**arguments, operation_history=operations)
+        overview = json.loads(messages[1]['content'])['working_view']['operation_overview']
+        entries = [entry for group in expand_history_view(overview['entries']) for entry in group['observations']]
+        self.assertEqual({entry['record'] for entry in entries}, {row['observation']['record'] for row in operations})
+        self.assertIn('Recorded execution failure', json.dumps(entries))
+        self.assertEqual(overview['omitted_entries'], 0)
+        self.assertEqual(selection['selected_turns'], [2])
+        self.assertTrue(all(text not in json.dumps(messages) for text in texts))
+        self.assertLess(selection['estimated_input_tokens'] - bare['estimated_input_tokens'], sum(map(len,texts)))
+
     def test_journal_native_uses_available_capacity_beyond_half_the_window(self):
         blocks = [block(0, 'Earlier native work. ' * 500), block(1, 'Latest native work. ' * 500)]
         messages, budget = select(material_policy='retained', require_work_notes=True,
@@ -1290,6 +1381,25 @@ class CheckpointFailureTests(unittest.TestCase):
                 self.assertEqual(project.call_count, 1 + expected)
                 self.assertEqual(self.ledger.to_dict(), before)
 
+    def test_historical_model_projection_without_compaction_turns_keeps_its_original_cutoff(self):
+        app = ToolApplication.__new__(ToolApplication)
+        app.state = {'config':{'memory_protocol':'journal.v1'}}
+        self.enterContext(patch.object(ToolApplication, 'schemas', new_callable=PropertyMock, return_value=[]))
+        app.session = SimpleNamespace(manifest=SimpleNamespace(
+            budget=SimpleNamespace(max_attempts=100, attempts=0)))
+        app._request_capacity = lambda:10
+        app._completion_floor = lambda client, messages:{'llm_requests':1, 'total_tokens':1000}
+        app._messages = Mock(return_value=[{'role':'system','content':'Respect the original contract'},
+            {'role':'user','content':json.dumps({'working_context':{'recent_start_turn':2}})}])
+        app._compact_work = Mock(return_value=())
+        context = SimpleNamespace(store=self.store, attempt=SimpleNamespace(attempt_id='native-turn-test'))
+        before = self.ledger.to_dict()
+        conversation, value, refs, _ = app._professional_model_input(context, self.client)
+        app._compact_work.assert_called_once_with(context, self.client, 2,
+            decision_tokens=conversation.tokens(value), additional_protection=True, selected_turns=None)
+        self.assertEqual(refs, ())
+        self.assertEqual(self.ledger.to_dict(), before)
+
     def test_explicit_checkpoint_recovery_keeps_bounded_unknown_entries_and_fees(self):
         entry = self.ledger.reserve('checkpoint', {'llm_requests':1,'total_tokens':5000},
             session_id='session', attempt_id='native-turn-test',
@@ -1538,7 +1648,7 @@ class CheckpointFailureTests(unittest.TestCase):
         context = SimpleNamespace(store=self.store, attempt=SimpleNamespace(attempt_id='native-turn-test'))
         response = self.response('{"notes":[{"text":"Retained work","observations":["o1"]}]}')
         with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as send:
-            app._compact_work(context, self.client, 1)
+            app._compact_work(context, self.client, 1, selected_turns=[0])
             first = self.store.read_json('memory_input.json')
             self.assertEqual([row['record'] for row in first['observations']], ['records/reads/result-0.json'])
             self.assertEqual(json.loads(first['observations'][0]['observation_text']), results[0])
@@ -1560,6 +1670,32 @@ class CheckpointFailureTests(unittest.TestCase):
             self.assertEqual(memory['compacted_records'], {'records/reads/result-0.json', 'records/reads/result-1.json'})
             self.assertEqual(app._compact_work(next_context, next_client, 1), ())
             self.assertEqual(send.call_count, 2)
+
+    def test_selected_closed_work_keeps_authored_arguments_failures_and_historical_recovery_contract(self):
+        result = {'tool_name':'write_file', 'status':'error', 'error':'Original write rejected'}
+        app = self._journal_app([result])
+        reply = app.session.store.read_json('attempts/reads/reply.json')
+        arguments = {'path':'candidate.py', 'content':'Original authored payload'}
+        reply['tool_calls'][0]['function']['arguments'] = json.dumps(arguments)
+        app.session.store.write_json('attempts/reads/reply.json', reply)
+        context = SimpleNamespace(store=self.store, attempt=SimpleNamespace(attempt_id='native-turn-test'))
+        response = self.response('{"notes":[{"text":"The write failed; inspect its original arguments","observations":["o1"]}]}')
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as send:
+            self.assertEqual(app._compact_work(context, self.client, 1, selected_turns=[]), ())
+            send.assert_not_called()
+            self.assertTrue(app._compact_work(context, self.client, 1, selected_turns=[0]))
+            supplied, = self.store.read_json('memory_input.json')['observations']
+            self.assertEqual(supplied['arguments'], arguments)
+            self.assertEqual(json.loads(supplied['observation_text']), result)
+            self.assertFalse(supplied['truncated'])
+            before = self.ledger.to_dict()
+            # Loading old owner presentations must not require today's format.
+            app._coordination_result = Mock(side_effect=AssertionError('Historical input must not be reprojected'))
+            memory = app._working_memory()
+            self.assertTrue(memory['notes'])
+            self.assertEqual(app._working_memory(), memory)
+            self.assertEqual(self.ledger.to_dict(), before)
+            self.assertEqual(send.call_count, 1)
 
     def test_journal_explicit_notes_replacement_resets_derived_frontier(self):
         app = self._journal_app([{'tool_name':'read_file', 'status':'ok', 'data':{'text':'x'*20000}}])

@@ -10,7 +10,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
-- The default input working set is now 64k and remains configurable. Working summaries inherit task output capacity instead of imposing a separate small cap on thinking. Current material, actual results and notes share one measured input budget; history is compacted under input pressure. Original records and charges remain intact. Complete feedback delivery and lower total cost still need real-task acceptance.
+- The default input working set is now 64k and remains configurable. Working summaries inherit task output capacity. Recent operations and current materials take priority; older work is compacted in batches under actual pressure and remains available from its records, reducing repeated text and summaries. Original records and charges remain intact. Complete feedback delivery and lower total cost still need real-task acceptance.
 - Independent checks can retain working notes from their own read records, sharing context and call-budget management with ordinary tasks. Author notes do not become independent evidence, and saved historical checks retain their original rules.
 
 ### Fixed
