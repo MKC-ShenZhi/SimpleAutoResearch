@@ -9,11 +9,13 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from simple_ar.app.operation_tools import delivery_requires_review, prepare_delivery_review
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.core.capabilities import ArtifactStore
-from simple_ar.tools.delivery_review import DeliveryReview
+from simple_ar.tools.delivery_review import DeliveryReview, recorded_delivery_review
 from simple_ar.tools.specs import ToolResult
 from simple_ar.tools.workspace import DeliveryRequest, WorkspaceToolGateway
 
@@ -93,6 +95,43 @@ class ControlledInspector:
 
 
 class DeliveryReviewTests(unittest.TestCase):
+    def test_recorded_opinion_exposes_limitations_only_for_the_bound_delivery(self):
+        root = self.root
+        path = str(root / 'workspace' / 'report.md')
+        digest = 'a' * 64
+        delivery = {'summary': 'Summary', 'artifacts': ['workspace/report.md'], 'unresolved': []}
+        item = {'id': 'call', 'result': 'attempts/native-tool-1/native_result.json',
+            'review_result': 'attempts/native-action-1/native_result.json'}
+        state = {'pending': None, 'requests': ['Summarize'], 'config': {},
+            'turns': [{'reply': 'reply.json', 'tools': [item], 'remaining': [], 'request_count': 1}]}
+        manifest = {'status': 'completed'}
+        binding = {'schema_version': 'delivery_review.v3', 'artifacts': {path: digest},
+            'claim': {'summary': 'Summary', 'artifacts': [path], 'unresolved': []},
+            'requests': ['Summarize']}
+        pending = ToolResult(tool_name='inspect_artifacts', data={'inspection_pending': 'native-tool-1'}).model_dump(mode='json')
+        parent = {'tool_name': 'deliver_result', 'status': 'ok', 'data': delivery,
+            'metadata': {'delivery_hashes': {'workspace/report.md': digest},
+                'delivery_review': {'identity': 'native-tool-1', 'binding': binding, 'result': pending}}}
+        records = {'reply.json': {'tool_calls': [{'id': 'call', 'function': {'name': 'deliver_result'}}]},
+            item['result']: parent, 'delivery.json': delivery, 'session_manifest.json': manifest,
+            'actions.json': state}
+        reader = SimpleNamespace(root=root, state=state, manifest=manifest,
+            record=records.__getitem__, resolve=lambda locator: root / locator)
+        assessment = {'schema_version': 'delivery_assessment.v1', 'artifacts': {path: digest},
+            'coverage': 'complete', 'verdict': 'passed', 'findings': [], 'evidence_sha256': {},
+            'limitations': ['The source data was unavailable.']}
+        receipt = ToolResult(tool_name='inspect_artifacts', metadata={'delivery_assessment': assessment}).model_dump(mode='json')
+        with patch('simple_ar.tools.materials.accepted_review_journal',
+                return_value={'record': item['review_result'], 'receipt': receipt}):
+            opinion = recorded_delivery_review(reader)
+            self.assertEqual(opinion['limitations'], assessment['limitations'])
+            self.assertIn('not proof', opinion['scope'])
+            receipt['metadata']['delivery_assessment']['artifacts'][path] = 'b' * 64
+            with self.assertRaisesRegex(ValueError, 'scope differs'):
+                recorded_delivery_review(reader)
+            state['requests'].append('A later request')
+            self.assertIsNone(recorded_delivery_review(reader))
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

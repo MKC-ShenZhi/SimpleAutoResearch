@@ -8,7 +8,7 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from simple_ar.core.assessments import assessment_issues
-from simple_ar.tools.specs import ToolResult
+from simple_ar.tools.specs import ToolResult, tool_completion
 
 
 _GOAL = (
@@ -73,6 +73,73 @@ class _DeliveryAssessment(BaseModel):
         if required and self.verdict != 'needs_revision':
             raise ValueError('Required delivery findings need revision')
         return self
+
+
+def recorded_delivery_review(reader: Any) -> dict | None:
+    """Present the accepted terminal review as a recorded opinion, without replay.
+
+    ``reader`` owns the task's accessible paths. This does not establish that
+    evidence or live files remain current, or that the opinion is correct.
+    """
+    state, manifest = reader.state, reader.manifest
+    if (manifest.get('status') not in {'completed', 'partial'} or state.get('pending')
+            or not state.get('turns')):
+        return None
+    turn = state['turns'][-1]
+    if (turn.get('remaining') or not turn.get('tools')
+            or turn.get('request_count', 1) != len(state.get('requests', []))):
+        return None
+    item = turn['tools'][-1]
+    if not item.get('review_result'):
+        return None
+    calls = reader.record(turn['reply']).get('tool_calls') or []
+    if not calls or calls[-1].get('id') != item.get('id'):
+        raise ValueError('Delivery review has no matching terminal call')
+    completion = tool_completion(calls[-1]['function']['name'], state['config'].get('tool_completions'))
+    if completion is None or completion.kind != 'delivery':
+        raise ValueError('Review is not attached to a delivery')
+    parent = reader.record(item['result'])
+    data, metadata = parent.get('data') or {}, parent.get('metadata') or {}
+    delivered = data.get(completion.field) if completion.field else data
+    from simple_ar.tools.workspace import DeliveryRequest
+    if (parent.get('status') != 'ok' or parent.get('tool_name') != calls[-1]['function']['name']
+            or not isinstance(delivered, dict)
+            or DeliveryRequest.model_validate(delivered) != DeliveryRequest.model_validate(reader.record('delivery.json'))):
+        raise ValueError('Review differs from the recorded terminal delivery')
+    envelope = metadata.get('delivery_review') or {}
+    binding = envelope.get('binding') or {}
+    if binding.get('schema_version') != 'delivery_review.v3':
+        return None  # Older review formats retain their own presentation.
+    if (envelope.get('identity') != Path(item['result']).parent.name
+            or not DeliveryReview._pending_envelope(envelope)):
+        raise ValueError('Review does not belong to the terminal delivery')
+    from simple_ar.core.capabilities import ArtifactStore
+    from simple_ar.tools.materials import accepted_review_journal
+    journal = accepted_review_journal(reader, ArtifactStore(reader.root), item, parent)
+    result = ToolResult.model_validate(journal['receipt'])
+    assessment = _DeliveryAssessment.model_validate(result.metadata.get('delivery_assessment'))
+    pinned = metadata.get('delivery_hashes')
+    if (not result.ok or result.tool_name != 'inspect_artifacts' or not isinstance(pinned, dict)
+            or {str(reader.resolve(path)): digest for path, digest in pinned.items()} != binding.get('artifacts')
+            or assessment.artifacts != binding['artifacts']):
+        raise ValueError('Review scope differs from the recorded delivery')
+    claim = DeliveryRequest.model_validate(delivered).model_dump(mode='json', exclude_none=True)
+    claim['artifacts'] = sorted(binding['artifacts'])
+    if claim.get('report', {}).get('manuscript'):
+        claim['report']['manuscript'] = str(reader.resolve(claim['report']['manuscript']))
+    if claim.get('report', {}).get('formats'):
+        claim['report']['formats'] = sorted(set(claim['report']['formats']))
+    if claim.get('summary_source') is not None:
+        claim['summary_source']['path'] = str(reader.resolve(claim['summary_source']['path']))
+    if claim != binding.get('claim') or state['requests'] != binding.get('requests'):
+        raise ValueError('Review claim differs from the recorded delivery request')
+    if reader.record('session_manifest.json') != manifest or reader.record('actions.json') != state:
+        raise ValueError('Task changed while reading the delivery review')
+    return {'coverage': assessment.coverage, 'verdict': assessment.verdict,
+        'limitations': assessment.limitations,
+        'findings': [{'severity': row.severity, 'message': row.message} for row in assessment.findings],
+        'record': journal['record'],
+        'scope': 'Recorded model opinion at delivery time; not proof of current sources or scientific correctness.'}
 
 
 class DeliveryReview:

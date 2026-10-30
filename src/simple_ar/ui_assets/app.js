@@ -299,6 +299,16 @@ async function refresh() {
     if (delivery.unresolved?.length) {
       for (const diagnostic of delivery.unresolved) paragraph($('delivery'), diagnostic, 'receipt');
     } else paragraph($('delivery'), '原交付记录未列出未解决事项。', 'hint');
+    if (delivery.limitations?.length) {
+      paragraph($('delivery'), '交付记录中的适用范围与局限：', 'hint');
+      for (const limitation of delivery.limitations) paragraph($('delivery'), limitation, 'receipt');
+    }
+    if (delivery.review) {
+      paragraph($('delivery'), '独立模型检查的记录意见（不证明科研正确性）：', 'hint');
+      for (const finding of delivery.review.findings || []) paragraph($('delivery'), finding.message, 'receipt');
+      for (const limitation of delivery.review.limitations || []) paragraph($('delivery'), limitation, 'receipt');
+    }
+    if (delivery.review_notice) paragraph($('delivery'), delivery.review_notice, 'hint');
     if (delivery.unavailable_file_count) paragraph($('delivery'),
       '部分已核对的交付文件受 HTTP 访问策略限制，不在此提供预览；这不代表交付已过期。请在任务原目录查看。', 'hint');
     for (const row of delivery.files) {

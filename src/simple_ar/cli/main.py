@@ -2537,6 +2537,8 @@ def _render_native_result(app: Any, status: dict[str, Any]) -> None:
             artifacts = delivery["artifacts"]
             if not isinstance(artifacts, list):
                 raise ValueError("Invalid saved artifact list")
+            for limitation in delivery.get('limitations', []):
+                lines.append(f"Delivery limitation / 交付局限: {limitation}")
             for locator in artifacts[:4]:
                 try:
                     path = app.workspace.resolve(locator)
@@ -2548,6 +2550,18 @@ def _render_native_result(app: Any, status: dict[str, Any]) -> None:
                 lines.append(f"Other recorded locations: {len(artifacts) - 4}; see delivery.json")
         except (OSError, ValueError, KeyError, TypeError):
             lines.append("Saved delivery record unreadable; no delivery inferred")
+        if status['status'] in {'completed', 'partial'}:
+            try:
+                from simple_ar.tools.delivery_review import recorded_delivery_review
+                from simple_ar.tools.workspace import RetainedDelivery
+                review = recorded_delivery_review(RetainedDelivery(root))
+                if review:
+                    lines.append('Recorded independent model opinion / 独立模型检查记录；不证明科研正确性:')
+                    lines.extend(f"- {row['message']}" for row in review['findings'])
+                    lines.extend(f"- {limit}" for limit in review['limitations'])
+                    lines.append(f"Opinion record / 意见记录: {review['record']}")
+            except (OSError, ValueError, KeyError, TypeError):
+                lines.append('Independent opinion unavailable / 检查意见记录不可核对')
     else:
         lines.append("No saved delivery record / 无已保存交付记录")
 

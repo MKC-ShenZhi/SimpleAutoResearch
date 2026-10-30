@@ -325,7 +325,8 @@ class Workspace:
             state = self.record(root, 'actions.json')
             saved = self.record(root, 'delivery.json') if (root / 'delivery.json').exists() else {}
             result = dict(label='历史交付 / 未验证为当前请求成果', current=False,
-                          summary=saved.get('summary'), unresolved=saved.get('unresolved', []), files=[])
+                          summary=saved.get('summary'), unresolved=saved.get('unresolved', []),
+                          limitations=saved.get('limitations', []), files=[])
             worker = self.workers.get(name)
             if (worker and worker[0].is_alive() or state.get('pending')
                     or manifest['status'] not in {'completed', 'partial'} or not state['turns']
@@ -340,7 +341,8 @@ class Workspace:
                     if path.is_relative_to(root):
                         return bounded(path, root)
                     return self.read(path)
-                groups = RetainedDelivery(root, authorize=admit).reusable_materials()
+                reader = RetainedDelivery(root, authorize=admit)
+                groups = reader.reusable_materials()
                 files, unavailable = [], set()
                 for group, paths in groups.items():
                     for path in paths:
@@ -362,6 +364,11 @@ class Workspace:
                     return result
                 result.update(current=True, label='当前可复用交付（原 owner 核查；不认证科研质量）',
                               files=files, unavailable_file_count=len(unavailable))
+                from simple_ar.tools.delivery_review import recorded_delivery_review
+                try:
+                    result['review'] = recorded_delivery_review(reader)
+                except (OSError, ValueError, KeyError, TypeError):
+                    result['review_notice'] = '检查意见记录不可核对；不推断检查结果。'
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 result['diagnostic'] = public_text(str(exc))
             return result

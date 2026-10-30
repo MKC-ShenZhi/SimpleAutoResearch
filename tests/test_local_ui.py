@@ -42,7 +42,8 @@ class LocalWorkspaceTests(unittest.TestCase):
                 call('write_file', {'path': 'workspace/report.txt', 'content': 'Visible output'}),
                 call('write_file', {'path': 'workspace/execution.log', 'content': 'Retained process evidence'}),
                 call('deliver_result', {'summary': 'Saved outputs', 'artifacts': [
-                    'workspace/report.txt', 'workspace/execution.log'], 'unresolved': []}),
+                    'workspace/report.txt', 'workspace/execution.log'], 'unresolved': [],
+                    'limitations': ['Only these local observations were available.']}),
             ], progress=lambda _: None)
             # Historical dependencies are outside UI grants and can disappear.
             unused.unlink()
@@ -53,6 +54,7 @@ class LocalWorkspaceTests(unittest.TestCase):
             records = {p: p.read_bytes() for p in root.rglob('*.json')}
             visible = workspace.delivery('retained')
             self.assertTrue(visible['current'])
+            self.assertEqual(visible['limitations'], ['Only these local observations were available.'])
             descriptor.unlink()
             with patch.object(ToolApplication, 'load', side_effect=AssertionError('No executable assembly')):
                 self.assertTrue(workspace.delivery('retained')['current'])
