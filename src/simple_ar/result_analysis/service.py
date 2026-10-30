@@ -91,7 +91,6 @@ def run_result_analysis(
         result = normalize_llm_result(raw_response, ctx, metric_summary, fallback=result)
 
     result.raw_llm_response = raw_response
-    result.audit = audit_result(result, metric_summary)
     result.status, result.status_reasons = derive_analysis_status(ctx, metric_summary)
     if output_dir is not None:
         write_analysis_artifacts(output_dir, ctx, result)
@@ -220,17 +219,16 @@ def deterministic_result(context: AnalysisContext, metric_summary: dict[str, Any
         limitations=deterministic_limitations(metric_summary),
         notes=["deterministic result-analysis fallback"],
     )
-    readme = deterministic_markdown(context, metric_summary, claims, rubric_coverage, audit)
-    return AnalysisResult(
-        readme_markdown=readme,
+    result = AnalysisResult(
+        readme_markdown="",
         claims=claims,
-        claims_payload=claims_payload(context, metric_summary, claims, rubric_coverage),
         metric_summary=metric_summary,
         rubric_coverage=rubric_coverage,
         audit=audit,
         recommendation=deterministic_recommendation(context),
         decision_context=dict(context.metadata),
     )
+    return _finalize_result(result, context, metric_summary)
 
 
 def deterministic_recommendation(context: AnalysisContext) -> AnalysisRecommendation:
@@ -696,17 +694,16 @@ def normalize_llm_result(
         missing_required_metrics=list(metric_summary.get("missing_required_metrics") or []),
         weak_metric_signals=list(metric_summary.get("weak_metric_signals") or []),
         unsupported_claims=normalize_string_list(audit_data.get("unsupported_claims")),
+        downgraded_claims=list(fallback.audit.downgraded_claims) if claims is fallback.claims else [],
         limitations=normalize_string_list(audit_data.get("limitations")),
         notes=normalize_string_list(audit_data.get("notes")),
     )
     recommendation = parse_recommendation(
         response.get("recommendation"), fallback=fallback.recommendation,
     )
-    readme = render_analyzed_markdown(response.get("summary"), context, metric_summary, claims, rubric_coverage, audit)
-    return AnalysisResult(
-        readme_markdown=readme.strip() + "\n",
+    result = AnalysisResult(
+        readme_markdown="",
         claims=claims,
-        claims_payload=claims_payload(context, metric_summary, claims, rubric_coverage),
         metric_summary=metric_summary,
         rubric_coverage=rubric_coverage,
         audit=audit,
@@ -714,6 +711,26 @@ def normalize_llm_result(
         goal_assessment=parse_goal_assessment(response.get("goal_assessment"), context, metric_summary),
         decision_context=dict(context.metadata),
     )
+    return _finalize_result(result, context, metric_summary, summary=response.get("summary"))
+
+
+def _finalize_result(
+    result: AnalysisResult, context: AnalysisContext, metric_summary: dict[str, Any], *, summary: Any = None,
+) -> AnalysisResult:
+    """Audit once before deriving any published representation of the claims."""
+    result.audit = audit_result(result, metric_summary)
+    result.claims_payload = claims_payload(context, metric_summary, result.claims, result.rubric_coverage)
+    if result.audit.downgraded_claims and isinstance(summary, dict):
+        # Free-form results may repeat a verdict just downgraded by the audit;
+        # the original response remains available, but is not a safe conclusion.
+        summary = {**summary, "results": "Some proposed claims lack traceable support; "
+            "see the audited claim verdicts below."}
+        result.audit.limitations.append("The model's results narrative was not adopted because some claims "
+            "lacked supporting references; the original response is retained.")
+    result.readme_markdown = render_analyzed_markdown(
+        summary, context, metric_summary, result.claims, result.rubric_coverage, result.audit,
+    ).strip() + "\n"
+    return result
 
 
 def parse_goal_assessment(

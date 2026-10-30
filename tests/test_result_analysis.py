@@ -447,6 +447,8 @@ class ResultAnalysisTests(unittest.TestCase):
         self.assertTrue(any("do not determine" in item for item in claim.limitations))
 
     def test_llm_supported_claim_without_evidence_is_downgraded(self) -> None:
+        import json
+
         context = AnalysisContext(
             task_id="T2",
             expected_metrics=[{"name": "rmse", "direction": "minimize"}],
@@ -454,7 +456,7 @@ class ResultAnalysisTests(unittest.TestCase):
         )
         client = FakeAnalysisClient(
             {
-                "readme_markdown": "# Result\nLooks good.",
+                "summary": {"method": "Measured", "results": "The experiment is successful."},
                 "claims": [
                     {
                         "claim_id": "c1",
@@ -467,10 +469,42 @@ class ResultAnalysisTests(unittest.TestCase):
             }
         )
 
-        result = run_result_analysis(context, client=client, use_llm=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            result = run_result_analysis(context, client=client, use_llm=True, output_dir=out)
+            self.assertEqual(result.claims[0].verdict, "not_evaluated")
+            self.assertIn("c1", result.audit.downgraded_claims)
+            saved = json.loads((out / "claims.json").read_text(encoding="utf-8"))
+            for claims in (result.claims_payload, saved):
+                self.assertEqual(claims["claims"][0]["verdict"], "not_evaluated")
+                self.assertEqual(claims["hypothesis_verdicts"][0]["verdict"], "not_evaluated")
+            report = (out / "analysis_report.md").read_text(encoding="utf-8")
+            self.assertEqual(report, result.readme_markdown)
+            self.assertIn("**not_evaluated** `c1`", report)
+            self.assertNotIn("**supported** `c1`", report)
+            self.assertNotIn("\nThe experiment is successful.\n", report)
+            self.assertEqual(json.loads((out / "analysis_response.json").read_text(encoding="utf-8")), client.payload)
 
+        # The deterministic path uses the same audited claims, without changing
+        # the supplied original result or attributing a natural-language verdict.
+        supplied = {"claims": [{"claim_id": "c2", "claim": "Another claim", "verdict": "supported"}]}
+        result = run_result_analysis(context.model_copy(update={"project_results": supplied}))
         self.assertEqual(result.claims[0].verdict, "not_evaluated")
-        self.assertIn("c1", result.audit.downgraded_claims)
+        self.assertEqual(result.claims_payload["claims"][0]["verdict"], "not_evaluated")
+        self.assertIn("**not_evaluated** `c2`", result.readme_markdown)
+        self.assertEqual(supplied["claims"][0]["verdict"], "supported")
+        response = {"claims": [], "summary": {"results": "Another claim is supported."}}
+        fallback = run_result_analysis(context.model_copy(update={"project_results": supplied}),
+            client=FakeAnalysisClient(response), use_llm=True)
+        self.assertIn("c2", fallback.audit.downgraded_claims)
+        self.assertNotIn("\nAnother claim is supported.\n", fallback.readme_markdown)
+
+        grounded = {"claims": [{"claim_id": "c3", "claim": "Observed rmse", "verdict": "supported",
+                                "metric_refs": ["rmse"]}],
+                    "summary": {"results": "The recorded rmse is 0.42."}}
+        result = run_result_analysis(context, client=FakeAnalysisClient(grounded), use_llm=True)
+        self.assertEqual(result.claims[0].verdict, "supported")
+        self.assertIn("The recorded rmse is 0.42.", result.readme_markdown)
 
     def test_writes_analysis_artifacts(self) -> None:
         context = AnalysisContext(

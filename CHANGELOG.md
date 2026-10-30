@@ -18,6 +18,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 - Preserve the model budget when a structured task uses an injected model client.
 - Preserve observed paired differences without inferring whether a natural-language hypothesis is true solely from metric preference and mean direction.
+- Audit result claims before generating the report and data files, keeping their verdicts consistent when supporting evidence is missing.
 
 Complete feedback delivery, independent review quality and total cost still require real-task acceptance on one version.
 
