@@ -173,6 +173,10 @@ If a manuscript is incomplete, inspect its task status and retained files before
 A candidate is not a final delivery: check that this revision is reflected in both the prose and figures.
 Feedback uses the original session's materials, permissions and remaining allowance.
 
+For a written explanation, Markdown can be the final deliverable. If you need a PDF,
+you can request a plain single-column article and an editable LaTeX project in the task.
+This layout requires Pandoc, BibTeX and a LaTeX engine; Chinese compilation needs XeLaTeX, CTeX and Fandol fonts.
+
 ### Export ACM LaTeX and PDF
 
 The exporter accepts an assembled report directory containing `report_body.md` and

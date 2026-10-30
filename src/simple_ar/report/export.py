@@ -532,13 +532,8 @@ def _prepare_technical_content(fragments: Any, output: Path) -> list[str]:
     return code_files
 
 
-def _scientific_unicode_preamble(*fragments: str) -> str:
-    """Declare scientific glyphs for pdfLaTeX without rewriting source prose.
-
-    Pandoc preserves bare Greek letters and many mathematical symbols. Their
-    fixed TeX equivalents work in prose, math and escaped code alike; this is
-    not a general multilingual font system or permission to inject a preamble.
-    """
+def _scientific_unicode_symbols() -> dict[str, str]:
+    """One fixed glyph map shared by engine admission and the pdfLaTeX preamble."""
     greek = dict(zip("αβγδεζηθικλμνξοπρστυφχψω", (
         "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi o pi rho sigma tau upsilon phi chi psi omega"
     ).split(), strict=True))
@@ -556,9 +551,74 @@ def _scientific_unicode_preamble(*fragments: str) -> str:
     for chars, operator in (("₊₋₌₍₎", "_"), ("⁺⁻⁼⁽⁾", "^")):
         symbols.update({char: "{}" + operator + "{" + sign + "}"
                         for char, sign in zip(chars, "+-=()", strict=True)})
+    return symbols
+
+
+def _scientific_unicode_preamble(*fragments: str) -> str:
+    """Declare scientific glyphs for pdfLaTeX without rewriting source prose.
+
+    Pandoc preserves bare Greek letters and many mathematical symbols. Their
+    fixed TeX equivalents work in prose, math and escaped code alike; this is
+    not a general multilingual font system or permission to inject a preamble.
+    """
+    symbols = _scientific_unicode_symbols()
     present = set("".join(fragments)) & symbols.keys()
     return "".join(f"\\DeclareUnicodeCharacter{{{ord(char):04X}}}{{\\ensuremath{{{symbols[char]}}}}}\n"
                    for char in sorted(present))
+
+
+ARTICLE_RENDERING_VERSION = 'article-rendering.v1'
+
+
+def article_rendering_plan(*fragments: str, version: str = ARTICLE_RENDERING_VERSION) -> dict:
+    """Content-only, versioned admission; installed tools never select the engine.
+
+    Western Windows-1252 text and the existing scientific glyph map use pdfLaTeX.
+    Other characters require XeLaTeX. This is not a font-coverage assertion: the
+    actual compile must reject missing glyphs, including unsupported scripts.
+    """
+    if version != ARTICLE_RENDERING_VERSION:
+        raise ReportExportError('Unsupported article rendering version; retain the saved publication')
+    symbols = _scientific_unicode_symbols()
+    unsupported = set()
+    for char in set(''.join(fragments)) - symbols.keys():
+        try:
+            char.encode('cp1252')
+        except UnicodeEncodeError:
+            unsupported.add(ord(char))
+    return {'schema_version': version, 'engine': 'xelatex' if unsupported else 'pdflatex',
+        'unicode_character_count': len(unsupported),
+        'unicode_samples': [f'U+{code:04X}' for code in sorted(unsupported)[:16]]}
+
+
+def _article_template(engine: str) -> str:
+    """Bundled presentation only; the shared converter owns content and processes."""
+    fonts = (r"\usepackage[T1]{fontenc}\usepackage[utf8]{inputenc}\usepackage{textcomp}" if engine == 'pdflatex'
+        else r"\usepackage[UTF8,scheme=plain,fontset=fandol]{ctex}")
+    return (r"""% General article; no venue or author metadata is inferred.
+\documentclass[11pt,a4paper]{article}
+""" + fonts + r"""
+\tracinglostchars=3
+\usepackage[margin=25mm]{geometry}
+\usepackage{amsmath,amssymb,xcolor}
+\usepackage[numbers,square,comma]{natbib}
+\usepackage[unicode,hidelinks]{hyperref}
+$for(header-includes)$
+$header-includes$
+$endfor$
+\pdfstringdefDisableCommands{\def\seqsplit#1{#1}}
+\title{$title$}
+\author{}
+\date{}
+\begin{document}
+\maketitle
+$body$
+$if(bibliography)$
+\bibliographystyle{$biblio-style$}
+\bibliography{references}
+$endif$
+\end{document}
+""")
 
 
 def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None = None,
@@ -567,6 +627,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                       resolve_image: Callable[[Path], Path] | None = None,
                       caption_owner: Literal['manifest', 'markdown'] = 'manifest',
                       template: dict[str, Any] | None = None,
+                      layout: Literal['article', 'acm'] | None = None,
+                      article_rendering: dict[str, Any] | None = None,
                       citation_style: Literal['numeric', 'template'] | None = None,
                       checks: dict[str, Any] | None = None,
                       preflight: Callable[[dict[str, int]], None] | None = None) -> dict[str, Any]:
@@ -578,15 +640,28 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     workspace publication explicitly selects Markdown ownership.
     Only an explicit image resolver can extend image authority; validate_asset
     verifies bytes and never relaxes the default report-directory boundary.
-    Templates retain their separate manuscript-directory trust contract.
+    Templates retain their separate manuscript-directory trust contract. Explicit
+    article selects pdfLaTeX or XeLaTeX by versioned content rules; omitted layout retains historical ACM.
+    Built-in layouts and user templates are mutually exclusive.
     Omitted citation_style retains historical rendering and manifest shape;
     'template' explicitly preserves layout defaults, 'numeric' selects bracketed
     natbib display and a numeric default bibliography style. Records/keys stay intact.
     """
     root, output = report_dir.resolve(), output_dir.resolve()
+    if layout not in {None, 'article', 'acm'}:
+        raise ReportExportError('layout must be article or acm')
+    if layout is not None and template is not None:
+        raise ReportExportError('Choose a built-in layout or a supplied template, not both')
     if citation_style is not None and citation_style not in {'numeric', 'template'}:
         raise ReportExportError('citation_style must be numeric or template')
     template_files = publication_template_inputs(root, template) if template is not None else {}
+    article = layout == 'article'
+    engine = template.get('engine', 'pdflatex') if template_files else 'pdflatex'
+    if article_rendering is not None and not article:
+        raise ReportExportError('article_rendering requires layout=article')
+    if article_rendering is not None and article_rendering != {'schema_version': ARTICLE_RENDERING_VERSION}:
+        raise ReportExportError('Unsupported article rendering policy; retain the saved publication')
+    numeric_citations = citation_style == 'numeric' or article and citation_style is None
     if caption_owner not in {'manifest', 'markdown'}:
         raise ReportExportError('Unknown figure caption owner')
     if render_preview and not compile_pdf:
@@ -653,11 +728,11 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     if not title_inlines:
         title_inlines = [{"t": "Str", "c": "Research report"}]
     abstract: list[dict] = []
-    # Only the built-in layout owns the historical abstract projection. A
-    # supplied template may omit or conditionally suppress $abstract$; moving
+    # Only the historical ACM layout owns abstract projection. A general
+    # article keeps authored sections; a supplied template may omit or conditionally suppress $abstract$; moving
     # authored sections into its metadata would silently lose content. Keep
     # its complete body rather than guessing document roles from headings.
-    for index, block in enumerate(blocks if not template_files else []):
+    for index, block in enumerate(blocks if not template_files and not article else []):
         if block.get("t") == "Header" and _plain_inlines(block["c"][2]).lower() in {
             "abstract", "abstract / executive summary", "summary", "executive summary",
         }:
@@ -680,6 +755,20 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     if bibliography_path.exists() and not bibliography_path.resolve().is_relative_to(root):
         raise ReportExportError("Bibliography escapes the report directory")
     bibliography = bibliography_path.read_text(encoding="utf-8") if bibliography_path.is_file() else ""
+    if article:
+        policy = {'schema_version': ARTICLE_RENDERING_VERSION}
+        # Consume the existing, authorized Pandoc AST after caption binding.
+        # Ignore locator strings, discarded YAML and non-rendered attributes;
+        # include literal code/math which the technical preamble later rewrites.
+        visible_text = []
+        for node in _nodes([title_inlines, blocks, abstract]):
+            if node.get('t') == 'Str':
+                visible_text.append(node['c'])
+            elif node.get('t') in {'Code', 'CodeBlock', 'Math'}:
+                visible_text.append(node['c'][-1])
+        plan = article_rendering_plan(*visible_text, bibliography, version=policy['schema_version'])
+        article_rendering = plan
+        engine = plan['engine']
     keys = set(re.findall(r"@\w+\s*\{\s*([^,\s]+)\s*,", bibliography))
     if citations - keys:
         raise ReportExportError("Unresolved bibliography keys: " + ", ".join(sorted(citations - keys)))
@@ -712,6 +801,11 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                                "bound_figure_captions": bound_captions,
                                "public_artifacts": ["main.tex", "body.tex", "references.bib",
                                                     "source.md", "template.latex", "README.txt", "export.json"]}
+    if layout is not None:
+        manifest['layout'] = layout
+    if article:
+        manifest['format'] = 'article'
+        manifest['article_rendering'] = article_rendering
     if citation_style is not None:
         manifest['citation_style'] = citation_style
     if render_preview:
@@ -806,7 +900,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                         cwd=output, text=json.dumps(source_ast))
         (output / "source.md").write_text(markdown, encoding="utf-8")
         publication_view['source_markdown_sha256'] = hashlib.sha256((output / 'source.md').read_bytes()).hexdigest()
-        main = (
+        main = _article_template(engine) if article else (
             "% acmart manuscript demonstration; no conference submission metadata is inferred.\n"
             "\\documentclass[manuscript,screen,nonacm]{acmart}\n"
             "\\usepackage{longtable,booktabs,array,calc}\n"
@@ -852,9 +946,9 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             "\\robustify\\seqsplit\n"
             "\\providecommand{\\tightlist}{\\setlength{\\itemsep}{0pt}\\setlength{\\parskip}{0pt}}\n"
             "\\providecommand{\\passthrough}[1]{#1}\n"
-            "\\setlength{\\emergencystretch}{1em}\n") if template_files else ''
+            "\\setlength{\\emergencystretch}{1em}\n") if template_files or article else ''
         preamble += _figure_pagination_preamble()
-        if citation_style == 'numeric' and citations:
+        if numeric_citations and citations:
             # Templates/classes may already load natbib (even before this
             # header hook). Configure after preamble setup but before the aux
             # file is read: AtBeginDocument is too late for author-year templates
@@ -869,7 +963,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                 "}{\\PackageError{simple-ar}{citation_style=numeric requires natbib}%\n"
                 "  {Load natbib in the trusted publication template.}}}\n"
                 "\\makeatother\n")
-        if not template_files or template.get('engine', 'pdflatex') == 'pdflatex':
+        if engine == 'pdflatex':
             # Metadata is rendered by the final standalone writer. Include its
             # actual Unicode (also an explicit title absent from source.md),
             # without dispatching separate fragment conversions to discover it.
@@ -887,15 +981,16 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             # plainurl supplies numeric labels while retaining URL/DOI fields;
             # plain would lose reader-facing locators. Do not rewrite records.
             # A template with its own literal bibliography style still owns it.
-            default_bst = ('plainurl' if citation_style == 'numeric' else 'plainnat') if template_files else 'ACM-Reference-Format'
+            default_bst = ('plainurl' if numeric_citations else 'plainnat') if template_files else (
+                'plainurl' if article else 'ACM-Reference-Format')
             metadata['biblio-style'] = {'t': 'MetaString', 'c': default_bst}
         main = run([pandoc, '--from=json', '--to=latex', '--natbib', '--no-highlight', '--wrap=none',
             '--standalone', '--template=template.latex'], cwd=output,
             text=json.dumps({**ast, 'meta': metadata,
                 'blocks': [{'t': 'RawBlock', 'c': ['latex', r'\input{body.tex}']}]}))
         (output / "main.tex").write_text(main, encoding="utf-8")
-        publication_view['presentation'] = {'citation_style': citation_style,
-            'engine': template.get('engine', 'pdflatex') if template_files else 'pdflatex',
+        publication_view['presentation'] = {'citation_style': 'numeric' if numeric_citations else citation_style,
+            'engine': engine,
             'inputs': {key: hashlib.sha256((output/key).read_bytes()).hexdigest() for key in
                 dict.fromkeys(['main.tex', 'body.tex', 'references.bib', 'template.latex', *template_files])}}
         view_path = output / 'publication_view.json'
@@ -943,16 +1038,38 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                 'Missing authors/dates remain missing. External evidence paths are listed in export.json, not copied.\n'
                 f"Rebuild here: {template.get('engine', 'pdflatex')} -no-shell-escape -halt-on-error main.tex; "
                 'bibtex main (if cited); repeat the TeX command twice.\n')
+        if article:
+            readme = (
+                'Editable general article, single-column A4 with 25 mm margins. No venue format is claimed.\n'
+                'Keep main.tex/body.tex/template.latex/references.bib, code/ and figures/ together.\n'
+                'source.md retains the authored title, sections, exact citations and portable image paths.\n'
+                'Dependencies: Pandoc; selected TeX engine, geometry, natbib, hyperref, '
+                'amsmath/amssymb, longtable/booktabs/array/calc, fvextra/seqsplit/etoolbox; '
+                'BibTeX and plainurl (TeX urlbst package) for cited references; librsvg for SVG conversion.\n'
+                'No automatic installation, font download or custom build script. '
+                'Engine selection uses the existing Pandoc visible text (including code/math/captions) and bibliography, '
+                'not Markdown locators or discarded YAML, and never an installed-tool fallback. Windows-1252 text and the fixed '
+                'scientific Unicode map use pdfLaTeX; other characters select XeLaTeX with CTeX/Fandol. '
+                'pdfLaTeX uses fontenc/inputenc/textcomp. Unsupported scripts/fonts require a trusted supplied template.\n'
+                f"Selected engine: {engine}; policy: {ARTICLE_RENDERING_VERSION}. See export.json article_rendering.\n"
+                'Missing dependencies or glyphs fail publication; no substitution, source edits or engine retry.\n'
+                'Citations are numeric by default; bibliography records and missing metadata are not rewritten.\n'
+                f'Rebuild here: {engine} -no-shell-escape -halt-on-error main.tex; '
+                'bibtex main (if cited); repeat the selected TeX command twice.\n'
+                'The shared renderer restricts file access and records logs; TeX is not a security sandbox.\n'
+                'No scientific, visual, anonymity or page-limit compliance is certified. '
+                'Inspect the PDF and any requested previews independently.\n')
         if citation_style is not None:
             readme += ('Explicit citation_style: ' + citation_style + '.\n'
                 + ('Natbib citations use bracketed numbers, including narrative and suppress-author citations. '
                    'The template must load natbib. '
                    + ('Default biblio-style is plainurl (TeX urlbst package, retaining URL/DOI); an explicit template style remains authoritative. '
-                      if template_files else 'Built-in ACM retains ACM-Reference-Format. ')
+                      if template_files else 'Built-in article uses plainurl. ' if article else 'Built-in ACM retains ACM-Reference-Format. ')
                    +
                    'Class, body, bibliography records and exact citation keys are preserved; no author/year fields are inferred.\n'
                    if citation_style == 'numeric' else
-                   'Template citation defaults are preserved (built-in ACM remains acmnumeric).\n'))
+                   ('Template citation defaults are preserved (built-in article remains numeric).\n' if article else
+                    'Template citation defaults are preserved (built-in ACM remains acmnumeric).\n')))
         readme += ('Figure pagination measures captions once using the selected template at its native font size. '
             'Only graphics are reduced to the remaining page area; small graphics are not enlarged. '
             'Captions that leave no image area fail with a simple-ar TeX error. '
@@ -977,7 +1094,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         if compile_pdf:
             manifest.update(_compile(output, bool(citations), runner=runner,
                 **({'preflight': preflight, 'following_processes': pdf_needs} if preflight is not None else {}),
-                **({'engine': template.get('engine', 'pdflatex')} if template_files else {})))
+                **({'engine': engine} if template_files or article else {}),
+                **({'fail_on_missing_glyphs': True} if article else {})))
         if manifest['compiled'] and preflight is not None and pdf_needs['process_invocations']:
             preflight(pdf_needs)
         pdf_info = {}  # Same-export observations only; never upgrade history.
@@ -986,7 +1104,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                 _check_publication_pdf(output, manifest['checks'], runner=run, pdf_info=pdf_info)
             if manifest['checks']['status'] != 'passed':
                 manifest['status'] = 'checks_failed'
-                manifest['error'] = 'Declared publication checks did not pass; inspect checks.results. Editable project retained; no automatic revision or recompilation.'
+                manifest['error'] = ((manifest.get('compile_note', '') + ' ') if article and not manifest['compiled'] else '') + 'Declared publication checks did not pass; inspect checks.results. Editable project retained; no automatic revision or recompilation.'
         if render_preview:
             if not manifest['compiled']:
                 raise ReportExportError(manifest.get('compile_note') or "PDF compilation did not produce a PDF; requested preview unavailable")
@@ -1144,13 +1262,28 @@ def _render_pdf_preview(output: Path, *, runner: Callable, pdf_info: dict | None
             'pages': [path.relative_to(output).as_posix() for path in expected]}
 
 
+def _missing_tex_glyphs(output: Path, text: str) -> list[str]:
+    log = output / 'main.log'
+    if log.is_file():
+        text += '\n' + log.read_text(encoding='utf-8', errors='replace')
+    return list(dict.fromkeys(re.findall(r'Missing character:[^\n]*', text)))
+
+
 def _compile(output: Path, has_citations: bool, *, runner: Callable | None = None,
              engine: str = 'pdflatex', preflight: Callable[[dict[str, int]], None] | None = None,
-             following_processes: dict[str, int] | None = None) -> dict[str, Any]:
+             following_processes: dict[str, int] | None = None,
+             fail_on_missing_glyphs: bool = False) -> dict[str, Any]:
     if engine not in {'pdflatex', 'xelatex'}:
         raise ReportExportError('Unsupported TeX engine')
     latex, bibtex = shutil.which(engine), shutil.which("bibtex")
     if not latex or (has_citations and not bibtex):
+        if fail_on_missing_glyphs:
+            missing = [name for name, available in ((engine, latex), ('bibtex', bibtex if has_citations else True))
+                if not available]
+            return {'status': 'compile_failed', 'compiled': False,
+                'compile_note': 'Missing article dependencies: ' + ', '.join(missing)
+                    + ('; Unicode content selected XeLaTeX, requiring CTeX and Fandol fonts.' if engine == 'xelatex' else '.')
+                    + ' Editable project retained; no engine fallback or automatic installation.'}
         return {"status": "exported", "compiled": False, "compile_note": "TeX unavailable; editable source retained."}
     env = {**os.environ, "openin_any": "p", "openout_any": "p", "shell_escape": "f"}
     command = [latex, "-no-shell-escape", "-halt-on-error", "-interaction=nonstopmode", "main.tex"]
@@ -1164,12 +1297,25 @@ def _compile(output: Path, has_citations: bool, *, runner: Callable | None = Non
                 'process_wall_seconds': max(90,(following_processes or {}).get('process_wall_seconds',0))})
         for argv in commands:
             logs.append((runner or _run)(argv, cwd=output, timeout=90, env=env))
+            if fail_on_missing_glyphs:
+                missing = _missing_tex_glyphs(output, logs[-1])
+                if missing:
+                    raise ReportExportError('Article font lacks required glyphs: ' + '; '.join(dict.fromkeys(missing))
+                        + '. Retain the original content and choose a trusted template with suitable fonts; no fallback.')
     except ReportExportResourceError as exc:
         logs.append(str(exc))
         raise
     except (OSError, subprocess.SubprocessError, ReportExportError) as exc:
         logs.append(str(exc))
-        return {"status": "compile_failed", "compiled": False, "compile_note": str(exc)}
+        note = str(exc)
+        if fail_on_missing_glyphs:
+            missing = _missing_tex_glyphs(output, note)
+            if missing:
+                note = 'Required glyphs are missing: ' + '; '.join(missing)
+            note = (f'Article {engine} compilation failed; '
+                + ('required Unicode support is CTeX with Fandol fonts. ' if engine == 'xelatex' else '')
+                + 'No engine fallback or content substitution. ' + note)
+        return {"status": "compile_failed", "compiled": False, "compile_note": note}
     finally:
         (output / "build.log").write_text("\n".join(logs), encoding="utf-8")
     compiled = (output / "main.pdf").is_file()

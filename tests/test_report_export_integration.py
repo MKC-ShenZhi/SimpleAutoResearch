@@ -566,5 +566,116 @@ class PortableExportIntegrationTests(unittest.TestCase):
                     self.assertEqual(manifest["external_source_references"], ["../measurements.json"])
 
 
+@unittest.skipUnless(os.environ.get('SAR_TEST_EXPORT_INTEGRATION') == '1' and
+    all(shutil.which(name) for name in ('pandoc', 'rsvg-convert', 'pdflatex', 'bibtex',
+        'pdfinfo', 'pdftotext', 'pdftoppm')),
+    'Opt-in article integration requires Pandoc, librsvg, pdfLaTeX, BibTeX/urlbst and Poppler')
+class GeneralArticleIntegrationTests(unittest.TestCase):
+    def test_public_english_article_compiles_with_pdftex_and_moves_with_sources(self):
+        self._assert_portable_article(unicode_text=False)
+
+    @unittest.skipUnless(shutil.which('xelatex'), 'Optional Chinese case requires XeLaTeX/CTeX/Fandol')
+    def test_public_bilingual_article_compiles_with_xetex_and_moves_with_sources(self):
+        self._assert_portable_article(unicode_text=True)
+
+    def _assert_portable_article(self, *, unicode_text):
+        from types import SimpleNamespace
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.tools.publication import PublicationToolGateway, PUBLICATION_ASSET_PROTOCOL
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            native = root / 'task'
+            native.mkdir()
+            ledger = BudgetLedger({'process_invocations': 16, 'process_wall_seconds': 1000},
+                storage_path=native / 'budget.json')
+            workspace = WorkspaceToolGateway(native, {}, ledger)
+            source = workspace.resolve('draft.md')
+            engine = 'xelatex' if unicode_text else 'pdflatex'
+            title = '普通报告 / Readable report' if unicode_text else 'Readable report'
+            observation = '中文说明与可编辑图表。' if unicode_text else 'Western text: résumé — cost €; scientific symbols α ≤ β.'
+            body = ('---\nignored: 中文\n---\n' + f'# {title}\n\n## Summary\n\n{observation} '
+                'Narrative citation @p1; evidence [@p1].\n\n'
+                r'Formula: $\alpha \leq \beta$ and $E=mc^2$.' + '\n\n'
+                '## Results\n\n| Measure | Value |\n|:--|--:|\n| Score | 3 |\n\n'
+                '![Chart caption with evidence [@p1].](图.svg)\n' + TECHNICAL_BODY)
+            source.write_text(body, encoding='utf-8')
+            bibliography = '@misc{p1, title={Reader evidence}, url={https://example.org/evidence}}\n'
+            source.with_name('references.bib').write_text(bibliography, encoding='utf-8')
+            source.with_name('图.svg').write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="80">'
+                '<rect width="160" height="80" fill="white"/><path d="M10 60L60 20L140 40" '
+                'stroke="black" fill="none"/></svg>', encoding='utf-8')
+            originals = {path: path.read_bytes() for path in source.parent.iterdir() if path.is_file()}
+            gateway = PublicationToolGateway(native, workspace, ledger, owned_execution=True,
+                asset_protocol=PUBLICATION_ASSET_PROTOCOL)
+            arguments = {'markdown': 'draft.md', 'layout': 'article', 'compile_pdf': True,
+                'render_preview': True, 'checks': {'max_pages': 12},
+                'delivery': {'summary': 'Readable PDF and editable project', 'artifacts': []}}
+            context = SimpleNamespace(attempt=SimpleNamespace(attempt_id='article'))
+            binding = gateway.approval_binding(arguments, identity='article')
+            self.assertIn('schema_version', binding['article_rendering'])
+            self.assertNotIn('engine', binding['article_rendering'])  # Selection uses the authorized Pandoc pass.
+            denied = gateway.execute_tool('export_report', context, {**arguments, 'layout': 'acm'},
+                approval={'binding': binding})
+            self.assertEqual(denied.status, 'blocked')
+            self.assertEqual(ledger.entries, ())
+            result = gateway.execute_tool('export_report', context, arguments, approval={'binding': binding})
+            self.assertTrue(result.ok, result.error)
+            manifest = result.data['manifest']
+            self.assertTrue(manifest['compiled'], manifest)
+            self.assertEqual(manifest['article_rendering']['schema_version'], binding['article_rendering']['schema_version'])
+            self.assertEqual(manifest['article_rendering']['engine'], engine)
+            self.assertEqual(manifest['checks']['status'], 'passed')
+            self.assertTrue(manifest['pdf_preview']['rendered'])
+            self.assertIn('delivery', result.data)
+            self.assertFalse(any('Missing character:' in warning or 'undefined citation' in warning.lower()
+                for warning in manifest['compile_warnings']), manifest)
+            project = workspace.resolve(result.data['project'])
+            self.assertEqual((project / 'references.bib').read_bytes(), bibliography.encode('utf-8'))
+            self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+            self.assertEqual((project / 'code/block-1.txt').read_bytes(), LITERAL_CODE.encode('utf-8'))
+            receipts = [json.loads(path.read_text(encoding='utf-8'))
+                for path in (native / 'tools/processes').glob('*/invocation.json')]
+            # The original runner owns every physical invocation and settlement.
+            self.assertEqual(len(receipts), len(ledger.entries))
+            self.assertTrue(all(entry.status == 'settled' and entry.purpose == 'local_process'
+                for entry in ledger.entries))
+            charged = ledger.to_dict()
+            self.assertEqual(PublicationToolGateway(native, workspace, ledger, owned_execution=True,
+                asset_protocol=PUBLICATION_ASSET_PROTOCOL).call('export_report', arguments, identity='article').data,
+                result.data)
+            self.assertEqual(ledger.to_dict(), charged)
+            moved = root / 'portable'
+            moved.mkdir()
+            for relative in manifest['public_artifacts']:
+                target = moved / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(project / relative, target)
+            workspace.workspace.rename(root / 'authoring-unavailable')
+            rebuilt = _compile(moved, True, engine=engine, fail_on_missing_glyphs=True)
+            self.assertTrue(rebuilt['compiled'], rebuilt)
+            text = subprocess.check_output(['pdftotext', '-layout', str(moved / 'main.pdf'), '-'], text=True)
+            compact = ''.join(text.split())
+            self.assertIn(''.join(title.split()), compact)
+            self.assertIn('中文说明与可编辑图表' if unicode_text else 'Westerntext:résumé', compact)
+            self.assertIn('Summary', text)
+            self.assertIn('Narrativecitation[1]', compact)
+            self.assertNotIn('[?]', compact)
+            self.assertNotIn('p1', compact)
+            self.assertTrue((moved / 'figures/figure-1.svg').is_file())
+            self.assertIn(f'Selected engine: {engine}', (moved / 'README.txt').read_text(encoding='utf-8'))
+            if not unicode_text:
+                self.assertNotIn('ctex', (moved / 'main.tex').read_text(encoding='utf-8'))
+            qa_root = os.environ.get('SAR_TEST_EXPORT_QA_DIR')
+            if qa_root:
+                Path(qa_root).mkdir(parents=True, exist_ok=True)
+                retained = Path(tempfile.mkdtemp(prefix='article-', dir=qa_root))
+                shutil.copytree(root / 'authoring-unavailable' / project.relative_to(workspace.workspace), retained / 'export')
+                shutil.copytree(moved, retained / 'rebuilt')
+                print('Article PDF/preview evidence:', retained, flush=True)
+
+
 if __name__ == "__main__":
     unittest.main()

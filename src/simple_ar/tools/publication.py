@@ -14,7 +14,7 @@ from simple_ar.core.budget import BudgetError
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.process import ProcessSpec, run_process
 from simple_ar.report.export import (ReportExportError, ReportExportResourceError, export_acm_report,
-    _asset_path, publication_template_inputs, report_image_targets, validate_publication_checks)
+    _asset_path, ARTICLE_RENDERING_VERSION, publication_template_inputs, report_image_targets, validate_publication_checks)
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 from simple_ar.tools.workspace import DeliveryRequest, _private_name, resolve_mounted_path
 
@@ -70,20 +70,26 @@ class PublicationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     markdown: str = Field(description="Workspace Markdown file. Local image paths are relative to it; modern tasks authorize referenced images through existing workspace/source grants. references.bib and trusted templates retain manuscript-directory scope.")
     title: str = Field(default="", max_length=500)
-    compile_pdf: bool = True
+    compile_pdf: bool = Field(default=True,
+        description='Compile the explicitly requested publication to PDF. Set false for an editable TeX project only. Ordinary Markdown/figure delivery does not require this export tool; the historical default within an export request is unchanged.')
+    layout: Literal['article', 'acm'] | None = Field(default=None,
+        exclude_if=lambda value: value is None,
+        description='Built-in layout: article is a single-column report; acm is the ACM manuscript. Article selects pdfLaTeX or XeLaTeX with CTeX/Fandol from the content. Choose layout or a trusted template; omit both for historical ACM. This does not request export or certify quality.')
     citation_style: Literal['numeric', 'template'] | None = Field(default=None,
         exclude_if=lambda value: value is None,
         description='Optional publication presentation choice. Select numeric for readable bracketed numbers, including narrative citations and authorless sources; supplied templates must load natbib and the default bibliography style becomes plainurl (TeX urlbst package, retaining URL/DOI; a literal template style still owns its choice). Select template to explicitly honor template citation defaults (built-in ACM stays numeric). May be chosen from the ordinary publication goal; no hashes or source metadata edits needed. Omit/null preserves historical rendering, request bindings and manifest shape. Exact citekeys, BibTeX records and template class/body remain unchanged.')
     checks: PublicationChecks | None = Field(default=None, exclude_if=lambda value: value is None,
         description='Optional finite rules explicitly supplied by the user. Requires compile_pdf=true and installed Poppler tools. Missing tools, bounded-output failure or rule failure retain diagnostics and prevent final delivery. No automatic edits or recompile; absence of literals never certifies anonymity.')
     template: PublicationTemplate | None = Field(default=None,
-        description='Explicit user-provided trusted template bundle. Omit for the historical ACM manuscript layout. Compilation does not establish anonymous/page/official compliance.')
+        description='Explicit user-provided trusted template bundle, mutually exclusive with layout. Omit both for the historical ACM manuscript layout. Compilation does not establish anonymous/page/official compliance.')
     render_preview: bool = Field(default=False, exclude_if=lambda value: value is False,
         description="Explicitly render every compiled PDF page with Poppler: at most 12 pages, 120 DPI scaled to a maximum 1600 pixels per dimension. Requires compile_pdf=true. Returns PNG locators for optional inspect_images; rendering is not visual review. Incomplete previews prevent delivery. False preserves historical request bindings.")
     delivery: DeliveryRequest | None = Field(default=None,
         description="Optional explicit final delivery after successful export/compilation. Exported files are added automatically; artifacts selects other already-existing outputs or retained task evidence. Disclose unresolved work. This does not certify scientific or visual quality. Request this operation alone when delivering.")
     @model_validator(mode="after")
     def validate_preview(self) -> PublicationRequest:
+        if self.layout is not None and self.template is not None:
+            raise ValueError('Choose a built-in layout or a supplied template, not both')
         if self.render_preview and not self.compile_pdf:
             raise ValueError("render_preview requires compile_pdf=true")
         if self.checks is not None and not self.compile_pdf:
@@ -107,15 +113,17 @@ def publication_tool_specs(*, preparation: bool = True) -> list[CommonToolSpec]:
     return [CommonToolSpec(name="export_report", domain="publication", permission_level="execution",
         completion={'field': 'delivery', 'closing': True},
         risk_level="medium", input_schema=(ExportRequest if preparation else PublicationRequest).model_json_schema(),
-        description="Convert canonical workspace Markdown, bibliography and local figures into an editable TeX project using an explicit trusted Pandoc LaTeX template bundle, or ACM by default. Template bytes and companions share existing approval/recovery bindings. No official template discovery, scripts or shell escape; trusted TeX is not sandboxed. Optional finite user-declared checks use Poppler through the same process ledger: all-page count and exact literals in UTF-8 extracted text, separately reported. Literal absence never certifies anonymity; images, metadata and indirect identity are uncovered. Rendering is not scientific, visual or official compliance review. Optional delivery requires every requested check and preview to pass; failure retains the project without revision or recompilation.")]
+        description="Export workspace Markdown, bibliography and figures as an editable TeX project. Choose the built-in article or ACM layout, or a trusted Pandoc template; omitting both preserves ACM. Use for requested publication, not ordinary Markdown delivery. Compilation and optional page checks or previews require their dependencies and approval; templates are not sandboxed. No shell escape or official template discovery. Rendering and literal checks do not certify scientific, visual or venue compliance. Failed checks retain the project.")]
 
 
 def export_input_binding(source: Path, request: ExportRequest, *, output_root: Path | None = None,
                          include_images: bool = True, image_paths: list[str] | None = None,
-                         image_binding_version: int = 1, workspace: Any = None) -> dict[str, Any]:
+                         image_binding_version: int = 1, workspace: Any = None,
+                         saved: dict | None = None) -> dict[str, Any]:
     """Pin authoring inputs once for approval and export recovery, without secrets."""
     root = source.parent.resolve()
     inputs = {}
+    fields = request.model_dump(exclude_none=True)
     for path in (source, root / 'references.bib', root / 'figures/figures_manifest.json'):
         if path.exists() and not path.resolve().is_relative_to(root):
             raise ValueError('Export input escapes the manuscript directory')
@@ -124,6 +132,14 @@ def export_input_binding(source: Path, request: ExportRequest, *, output_root: P
         if path.is_file():
             with path.open('rb') as file:
                 inputs[key] = hashlib.file_digest(file, 'sha256').hexdigest()
+    if request.layout == 'article' and (saved is None or 'article_rendering' in saved):
+        # Pin policy and original input bytes before any execution. The already
+        # authorized Pandoc pass, not another parser, owns visible-text selection.
+        # Unversioned article receipts retain their historical binding.
+        policy = saved['article_rendering'] if saved is not None else {'schema_version': ARTICLE_RENDERING_VERSION}
+        if policy != {'schema_version': ARTICLE_RENDERING_VERSION}:
+            raise ValueError('Unsupported article rendering policy; retain the saved publication')
+        fields['article_rendering'] = policy
     if request.template is not None:
         for path in publication_template_inputs(root, request.template.model_dump()).values():
             authorized = resolve_mounted_path({'workspace': root}, str(path))
@@ -132,7 +148,7 @@ def export_input_binding(source: Path, request: ExportRequest, *, output_root: P
             with authorized.open('rb') as file:
                 inputs[authorized.relative_to(root).as_posix()] = hashlib.file_digest(file, 'sha256').hexdigest()
     if not include_images:
-        return {**request.model_dump(exclude_none=True), 'inputs': inputs}
+        return {**fields, 'inputs': inputs}
     if image_binding_version not in {1, 2}:
         raise ValueError('Unsupported publication image binding version; preserve the receipt')
     if image_binding_version == 2:
@@ -166,7 +182,7 @@ def export_input_binding(source: Path, request: ExportRequest, *, output_root: P
                 raise ValueError('Publication image inputs exceed 256 MB')
             with path.open('rb') as file:
                 inputs[_input_key(root, path)] = hashlib.file_digest(file, 'sha256').hexdigest()
-        return {**request.model_dump(exclude_none=True), 'inputs': inputs, 'image_binding_version': 2}
+        return {**fields, 'inputs': inputs, 'image_binding_version': 2}
     if image_paths is not None:
         # Recovery checks the renderer's retained dependencies. New approvals
         # still inventory potential images; existing publications do not depend
@@ -186,7 +202,7 @@ def export_input_binding(source: Path, request: ExportRequest, *, output_root: P
                 raise ValueError('Publication image inputs exceed 256 MB')
             with path.open('rb') as file:
                 inputs[key] = hashlib.file_digest(file, 'sha256').hexdigest()
-        return {**request.model_dump(exclude_none=True), 'inputs':inputs, 'image_binding_version':1}
+        return {**fields, 'inputs':inputs, 'image_binding_version':1}
     # Approval must cover actual figure bytes, including standalone Markdown
     # images without a generated manifest. Bind the authorized local image
     # inventory rather than introducing a second Markdown/Pandoc parser here.
@@ -221,7 +237,7 @@ def export_input_binding(source: Path, request: ExportRequest, *, output_root: P
                     raise ValueError('Publication image inventory exceeds 256 MB; use a focused manuscript directory')
                 with path.open('rb') as file:
                     inputs[key] = hashlib.file_digest(file, 'sha256').hexdigest()
-    return {**request.model_dump(exclude_none=True), 'inputs': inputs, 'image_binding_version': 1}
+    return {**fields, 'inputs': inputs, 'image_binding_version': 1}
 
 
 def _publication_inputs(source: Path, request: ExportRequest, saved: dict, manifest: dict,
@@ -234,7 +250,7 @@ def _publication_inputs(source: Path, request: ExportRequest, saved: dict, manif
     """
     expected = manifest.get('consumed_inputs', saved['inputs'])
     if 'consumed_inputs' in manifest:
-        base = export_input_binding(source, request, output_root=output_root, include_images=False)['inputs']
+        base = export_input_binding(source, request, output_root=output_root, include_images=False, saved=saved)['inputs']
         if (not isinstance(expected, dict) or not base.keys() <= expected.keys()
                 or any(key not in saved['inputs'] or saved['inputs'][key] != value
                        for key, value in expected.items())):
@@ -297,7 +313,7 @@ class PublicationToolGateway:
             2 if self.asset_protocol == PUBLICATION_ASSET_PROTOCOL else 1)
         return export_input_binding(source, request, output_root=self.workspace.workspace / 'publications',
             include_images=include_images, image_paths=image_paths,
-            image_binding_version=version, workspace=self.workspace)
+            image_binding_version=version, workspace=self.workspace, saved=saved)
 
     def _source_identity(self, request: ExportRequest) -> dict | None:
         if request.candidate_result:
@@ -346,7 +362,7 @@ class PublicationToolGateway:
         owner = ArtifactStore(self.root/'tools/publications'/relative.parts[0])
         saved, result = owner.read_json('request.json'), owner.read_json('result.json')
         request = {key: value for key, value in saved.items()
-            if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity'}}
+            if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity', 'article_rendering'}}
         manifest = ArtifactStore(self.workspace.resolve(data['project'])).read_json('export.json')
         binding = self.approval_binding(request, identity=relative.parts[0],
             saved=saved,
@@ -458,7 +474,7 @@ class PublicationToolGateway:
                         or ArtifactStore(project).read_json('export.json') != data['manifest']):
                     raise ValueError('Publication project or owner evidence changed')
                 request = ExportRequest.model_validate({key: value for key, value in saved.items()
-                    if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity'}})
+                    if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity', 'article_rendering'}})
                 current = self.input_binding(self.workspace.resolve(saved['markdown']), request, saved=saved,
                     image_paths=list(data['manifest']['consumed_inputs']) if 'consumed_inputs' in data['manifest'] else None)
                 inputs = _publication_inputs(self.workspace.resolve(saved['markdown']), request,
@@ -662,6 +678,8 @@ class PublicationToolGateway:
                         **({'resolve_image': resolve_image}
                            if binding.get('image_binding_version') == 2 else {}),
                         caption_owner=(report_identity or {}).get('figure_caption_owner', 'markdown'),
+                        **({'layout': request.layout} if request.layout is not None else {}),
+                        **({'article_rendering': binding['article_rendering']} if 'article_rendering' in binding else {}),
                         **({'citation_style': request.citation_style} if request.citation_style is not None else {}),
                         **({'checks': request.checks.model_dump(exclude_none=True)} if request.checks is not None else {}),
                         **({'template': request.template.model_dump()} if request.template is not None else {}))

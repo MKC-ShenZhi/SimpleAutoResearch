@@ -191,9 +191,19 @@ class ReportExportTests(unittest.TestCase):
                 'template': arguments['template']}
             self.assertEqual(approved, {**historical_request, 'inputs': approved['inputs'], 'image_binding_version': 1})
             self.assertNotIn('citation_style', request.model_dump())
+            self.assertNotIn('layout', request.model_dump())
+            self.assertEqual(ExportRequest.model_validate({**arguments, 'layout': None}).model_dump(),
+                request.model_dump())
             self.assertEqual(ExportRequest.model_validate({**arguments, 'citation_style': None}).model_dump(),
                 request.model_dump())
             schema = ExportRequest.model_json_schema()
+            from simple_ar.tools.publication import publication_tool_specs
+            public = publication_tool_specs(preparation=False)[0].input_schema
+            self.assertIn({'enum': ['article', 'acm'], 'type': 'string'}, public['properties']['layout']['anyOf'])
+            self.assertNotIn('candidate_result', public['properties'])
+            for layout in ('article', 'acm'):
+                with self.assertRaisesRegex(ValueError, 'built-in layout or a supplied template'):
+                    ExportRequest.model_validate({**arguments, 'layout': layout})
             self.assertIn({'enum': ['numeric', 'template'], 'type': 'string'},
                 schema['properties']['citation_style']['anyOf'])
             # Exercise the actual native approval consumer, using the old
@@ -399,6 +409,13 @@ class ReportExportTests(unittest.TestCase):
                 ExportRequest(markdown='workspace/draft.md', citation_style=style)
         with self.assertRaisesRegex(ReportExportError, 'citation_style must be'):
             export_acm_report(Path('unused'), Path('unused-output'), citation_style='author-year')
+        for layout in ('unknown', '', True):
+            with self.subTest(layout=layout), self.assertRaises(ValueError):
+                ExportRequest(markdown='workspace/draft.md', layout=layout)
+        with self.assertRaisesRegex(ReportExportError, 'layout must be'):
+            export_acm_report(Path('unused'), Path('unused-output'), layout='unknown')
+        with self.assertRaisesRegex(ReportExportError, 'built-in layout or a supplied template'):
+            export_acm_report(Path('unused'), Path('unused-output'), layout='article', template={'path': 'unused.latex'})
 
         for checks in ({}, {'max_pages': 0}, {'max_pages': True}, {'max_pages': 1.5},
                 {'forbidden_identifiers': []}, {'forbidden_identifiers': [' ']},
@@ -758,6 +775,101 @@ class ReportExportTests(unittest.TestCase):
                 self.assertNotIn('abstract', converted[-1]['meta'])
                 self.assertEqual(json.loads((root / 'export/source.md').read_text()), document['blocks'])
 
+    def test_article_engine_admission_binds_all_text_without_environment_fallback(self):
+        from simple_ar.report.export import article_rendering_plan
+        from simple_ar.tools.publication import ExportRequest, export_input_binding
+
+        for text, engine in (('Readable English report', 'pdflatex'), ('Résumé — coût €; α ≤ β²', 'pdflatex'),
+                ('中文报告', 'xelatex'), ('हिन्दी', 'xelatex')):
+            with self.subTest(text=text):
+                self.assertEqual(article_rendering_plan(text)['engine'], engine)
+        with tempfile.TemporaryDirectory() as tmp:
+            source = self._source(Path(tmp))
+            manuscript = source / 'report_body.md'
+            bibliography = source / 'references.bib'
+            figures = source / 'figures/figures_manifest.json'
+            figures.parent.mkdir(exist_ok=True)
+            request = ExportRequest(markdown='report_body.md', layout='article', compile_pdf=False)
+            with patch('simple_ar.report.export.shutil.which', side_effect=AssertionError('Content-only selection')):
+                original = export_input_binding(manuscript, request, include_images=False)
+                for field in ('body', 'title', 'bibliography', 'caption'):
+                    with self.subTest(field=field):
+                        before = {path: path.read_bytes() for path in (manuscript, bibliography)}
+                        selected = request.model_copy(update={'title': '中文'}) if field == 'title' else request
+                        if field == 'body':
+                            manuscript.write_text('中文', encoding='utf-8')
+                        elif field == 'bibliography':
+                            bibliography.write_text('@misc{p1,title={中文}}', encoding='utf-8')
+                        elif field == 'caption':
+                            figures.write_text(json.dumps({'figures': [{'caption': '中文'}]}, ensure_ascii=True), encoding='utf-8')
+                        binding = export_input_binding(manuscript, selected, include_images=False)
+                        self.assertEqual(binding['article_rendering'], original['article_rendering'])
+                        self.assertNotEqual(binding, original)
+                        self.assertEqual(export_input_binding(manuscript, selected, saved=binding,
+                            include_images=False), binding)
+                        for path, content in before.items():
+                            path.write_bytes(content)
+                        if figures.exists():
+                            figures.unlink()
+                legacy = {key: value for key, value in original.items() if key != 'article_rendering'}
+                self.assertEqual(export_input_binding(manuscript, request, saved=legacy,
+                    include_images=False), legacy)  # No new policy on an unversioned receipt.
+                unknown = {**original, 'article_rendering': {'schema_version': 'future'}}
+                with self.assertRaisesRegex(ValueError, 'Unsupported article rendering policy'):
+                    export_input_binding(manuscript, request, saved=unknown, include_images=False)
+
+    def test_article_compile_dependency_diagnostics_keep_original_tex_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            def missing_font(argv, **kwargs):
+                (output / 'main.log').write_text('! Package fontspec Error: The font "FandolSong-Regular" cannot be found.')
+                raise ReportExportError('! Package fontspec Error: The font "FandolSong-Regular" cannot be found.')
+            with patch('simple_ar.report.export.shutil.which', side_effect=lambda name: name):
+                result = _compile(output, False, engine='xelatex', runner=missing_font, fail_on_missing_glyphs=True)
+            self.assertFalse(result['compiled'])
+            self.assertIn('FandolSong-Regular', result['compile_note'])
+            self.assertIn('No engine fallback', result['compile_note'])
+            self.assertTrue((output / 'build.log').is_file())
+
+    def test_article_preserves_authored_sections_and_uses_bundled_numeric_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self._source(root)
+            document = _ast()
+            converted = []
+            def convert(argv, **kwargs):
+                if '--to=json' in argv:
+                    return json.dumps(document)
+                current = json.loads(kwargs['text'])
+                converted.append(current)
+                return (_standalone_fixture(current, kwargs['cwd']) if '--standalone' in argv
+                    else json.dumps(current['blocks']))
+            before = {path.name: path.read_bytes() for path in source.iterdir() if path.is_file()}
+            with patch('simple_ar.report.export.shutil.which', return_value='pandoc'), \
+                    patch('simple_ar.report.export._run', side_effect=convert):
+                result = export_acm_report(source, root / 'article', layout='article')
+            output = root / 'article'
+            self.assertEqual((result['format'], result['layout']), ('article', 'article'))
+            self.assertFalse(result['compiled'])
+            main = (output / 'main.tex').read_text(encoding='utf-8')
+            self.assertIn(r'\documentclass[11pt,a4paper]{article}', main)
+            self.assertIn(r'\usepackage[T1]{fontenc}', main)
+            self.assertNotIn('ctex', main)
+            self.assertIn(r'\bibliographystyle{plainurl}', main)
+            self.assertIn(r'\let\citet\citep\let\citeyearpar\citep', main)
+            self.assertNotIn('acmart', main)
+            self.assertNotIn('abstract', converted[-1]['meta'])
+            self.assertEqual([node['c'][2] for node in _nodes(converted[0]['blocks']) if node.get('t') == 'Header'],
+                [block['c'][2] for block in document['blocks'][1:] if block['t'] == 'Header'])
+            self.assertEqual(json.loads((output / 'source.md').read_text()), document['blocks'])
+            self.assertEqual((output / 'references.bib').read_bytes(), (source / 'references.bib').read_bytes())
+            view = json.loads((output / 'publication_view.json').read_text(encoding='utf-8'))
+            self.assertEqual(view['presentation']['engine'], 'pdflatex')
+            self.assertEqual(result['article_rendering']['engine'], 'pdflatex')
+            self.assertEqual(view['presentation']['citation_style'], 'numeric')
+            self.assertTrue({'template.latex', 'main.tex', 'body.tex', 'source.md', 'references.bib'} <= set(result['public_artifacts']))
+            self.assertEqual({path.name: path.read_bytes() for path in source.iterdir() if path.is_file()}, before)
+
     def test_export_preserves_canonical_sources_and_separates_abstract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -781,6 +893,7 @@ class ReportExportTests(unittest.TestCase):
             self.assertNotIn('compliance', result)
             self.assertNotIn('checks', result)
             self.assertNotIn('citation_style', result)
+            self.assertNotIn('layout', result)
             self.assertTrue(all(document["meta"] == {} for document in calls[:-1]))
             # Body LaTeX, portable Markdown, standalone LaTeX: title/abstract
             # metadata must not spend two additional process invocations.
@@ -813,6 +926,10 @@ class ReportExportTests(unittest.TestCase):
             self.assertTrue((root / "acm/export.json").is_file())
             with patch('simple_ar.report.export.shutil.which', return_value='pandoc'), \
                     patch('simple_ar.report.export._run', side_effect=convert):
+                selected = export_acm_report(source, root / 'explicit-acm', layout='acm')
+                self.assertEqual(selected['layout'], 'acm')
+                self.assertEqual(selected['format'], result['format'])
+                self.assertEqual((root / 'explicit-acm/main.tex').read_bytes(), (root / 'acm/main.tex').read_bytes())
                 for style in ('template', 'numeric'):
                     explicit = root / ('acm-' + style)
                     receipt = export_acm_report(source, explicit, citation_style=style)
@@ -1281,8 +1398,9 @@ class ReportExportTests(unittest.TestCase):
         # Keep the real core reservation/settlement path; replace only physical
         # execution. Four Pandoc calls, four TeX/BibTeX calls and three Poppler
         # calls must fit exactly, regardless of the number of preview pages.
-        for mode in ('fits', 'slots', 'wall', 'floor', 'unknown_after_compile'):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+        for layout, mode in [(None, mode) for mode in ('fits', 'slots', 'wall', 'floor', 'unknown_after_compile')] + [
+                ('article', 'fits'), ('article', 'slots'), ('article', 'missing_xelatex'), ('article', 'glyphs')]:
+            with self.subTest(layout=layout, mode=mode), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 ledger = BudgetLedger({'process_invocations': 10 if mode == 'slots' else 11,
                     'process_wall_seconds': 80 if mode == 'wall' else 1000},
@@ -1290,9 +1408,14 @@ class ReportExportTests(unittest.TestCase):
                 workspace = WorkspaceToolGateway(root, {}, ledger)
                 source = workspace.resolve('draft.md')
                 source.write_text('# Evidence\n\nBody [@p1].', encoding='utf-8')
+                if mode == 'missing_xelatex':
+                    source.write_text('# 中文\n\nBody [@p1].', encoding='utf-8')
                 source.with_name('references.bib').write_text('@misc{p1,title={Evidence}}', encoding='utf-8')
                 request = {'markdown': 'draft.md', 'compile_pdf': True, 'render_preview': True,
                     'checks': {'max_pages': 12, 'forbidden_identifiers': ['PRIVATE']}}
+                if layout is not None:
+                    request['layout'] = layout
+                    request['delivery'] = {'summary': 'Article and editable sources', 'artifacts': []}
                 latex_calls = 0
                 unresolved = None
 
@@ -1300,9 +1423,13 @@ class ReportExportTests(unittest.TestCase):
                     nonlocal latex_calls, unresolved
                     spec.output_dir.mkdir(parents=True, exist_ok=True)
                     executable = spec.argv[0]
-                    if executable == 'pdflatex':
+                    if executable in {'pdflatex', 'xelatex'}:
+                        self.assertEqual(executable, 'pdflatex')
+                        self.assertIn('-no-shell-escape', spec.argv)
                         latex_calls += 1
                         (spec.cwd / 'main.pdf').write_bytes(b'%PDF-fixed-compiled-version')
+                        if mode == 'glyphs':
+                            (spec.cwd / 'main.log').write_text('Missing character: There is no X in font fixture!\n')
                         if mode == 'unknown_after_compile' and latex_calls == 3:
                             ledger.reserve('unresolved', {'process_wall_seconds': 1})
                             ledger.mark_unknown('unresolved', reason='Interrupted unrelated process')
@@ -1316,7 +1443,10 @@ class ReportExportTests(unittest.TestCase):
                             Image.new('RGB', (8, 12)).save(f'{spec.argv[-1]}-{page:02d}.png')
                         text = ''
                     else:
-                        text = json.dumps(_ast()) if '--to=json' in spec.argv else 'rendered source'
+                        document = _ast()
+                        if mode == 'missing_xelatex':
+                            document['blocks'][0]['c'][2] = [{'t': 'Str', 'c': '中文'}]
+                        text = json.dumps(document) if '--to=json' in spec.argv else 'rendered source'
                     (spec.output_dir / 'stdout.log').write_text(text, encoding='utf-8')
                     record = {'status': 'finished', 'invocation_id': spec.invocation_id,
                         'duration_sec': 1, 'streams': {'stdout': {'log_bytes_discarded': 0}}}
@@ -1324,18 +1454,23 @@ class ReportExportTests(unittest.TestCase):
                     return SimpleNamespace(returncode=0, stop_reason=None, record=record)
 
                 scope = ledger.protect_remaining({'process_invocations': 1}) if mode == 'floor' else nullcontext()
-                with scope, patch('simple_ar.report.export.shutil.which', side_effect=lambda name: name), \
+                with scope, patch('simple_ar.report.export.shutil.which',
+                        side_effect=lambda name: None if mode == 'missing_xelatex' and name == 'xelatex' else name), \
                         patch('simple_ar.core.process._run_process', side_effect=execute) as physical:
                     gateway = PublicationToolGateway(root, workspace, ledger)
                     result = gateway.call('export_report', request, identity='bounded')
                     self.assertEqual(result.ok, mode == 'fits', result.error)
-                    expected_calls = 11 if mode == 'fits' else 8 if mode == 'unknown_after_compile' else 4
+                    expected_calls = 11 if mode == 'fits' else 8 if mode == 'unknown_after_compile' else 5 if mode == 'glyphs' else 4
                     self.assertEqual(physical.call_count, expected_calls)
                     manifest = result.data['manifest']
                     self.assertEqual(manifest['compiled'], mode in {'fits', 'unknown_after_compile'})
                     project = workspace.resolve(result.data['project'])
                     self.assertTrue((project / 'main.tex').is_file())
-                    if mode != 'fits':
+                    if mode in {'missing_xelatex', 'glyphs'}:
+                        self.assertNotIn('delivery', result.data)
+                        self.assertIn('xelatex' if mode == 'missing_xelatex' else 'Required glyphs are missing', manifest['compile_note'])
+                        self.assertFalse(manifest['compiled'])
+                    elif mode != 'fits':
                         self.assertEqual(result.data['failure_kind'], 'resource_exhausted')
                         self.assertFalse(manifest['pdf_preview']['rendered'])
                         self.assertNotIn('delivery', result.data)
@@ -1354,6 +1489,13 @@ class ReportExportTests(unittest.TestCase):
                     restored = PublicationToolGateway(root, workspace, BudgetLedger.load(root / 'budget.json'))
                     self.assertEqual(restored.call('export_report', request, identity='bounded').data, result.data)
                     self.assertEqual(physical.call_count, expected_calls)
+                    if layout == 'article':
+                        self.assertEqual(manifest['article_rendering']['engine'], 'xelatex' if mode == 'missing_xelatex' else 'pdflatex')
+                        with patch('simple_ar.report.export.shutil.which', side_effect=AssertionError('No backend reselection/replay')):
+                            self.assertEqual(restored.call('export_report', request, identity='bounded').data, result.data)
+                        self.assertIn('inputs changed', restored.call('export_report',
+                            {**request, 'layout': 'acm'}, identity='bounded').error)
+                        self.assertEqual(physical.call_count, expected_calls)
                     self.assertEqual({path: path.read_bytes() for path in frozen}, frozen)
 
     def test_finite_checks_keep_independent_observations_when_text_is_unavailable(self):

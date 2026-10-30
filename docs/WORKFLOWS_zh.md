@@ -158,6 +158,9 @@ uv run simple-ar start --resume-task "SESSION" "保留初稿，将结构改为�
 稿件未完成时，先查看任务状态及保留文件，再提出具体修改要求。候选稿不等于正式交付；
 应核对本轮改动是否同时反映到正文和图表。反馈沿用原会话的材料、权限和剩余额度。
 
+只需说明时可以交付 Markdown；需要 PDF 时，可在任务中要求普通单栏文章版式，
+同时保留可编辑的 LaTeX 工程。该版式需要 Pandoc、BibTeX 和 LaTeX 引擎；中文编译需 XeLaTeX、CTeX 与 Fandol 字体。
+
 ### 导出 ACM LaTeX 与 PDF
 
 导出器接收已装配的报告目录，其中有 `report_body.md` 和 `references.bib`；
