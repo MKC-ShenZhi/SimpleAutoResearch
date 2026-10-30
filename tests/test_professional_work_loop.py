@@ -2139,10 +2139,15 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._create()
         texts = {'report.md':'# Observations\n\n'+'The sample mean is 2.0.\n'*3600,
             'results.json':json.dumps({'details':'recorded '*180, 'result_marker':'current derived value'}),
-            'calculation.py':'# editable source\n'*60+'result = sum([1, 2, 3]) / 3\n'}
+            'calculation.py':'# editable source\n'*60+'result = sum([1, 2, 3]) / 3\n',
+            'appendix.txt':'所提供观察值的均值为2.0。\n'*8000}
         for path, text in texts.items():
-            self._write(path, text)
+            if path == 'appendix.txt':
+                (self.root/'workspace'/path).write_text(text, encoding='utf-8')
+            else:
+                self._write(path, text)
         self.assertGreater(len(texts['report.md'].encode()), 64000)
+        self.assertGreater(len(texts['appendix.txt'].encode()), 256000)
         selected_start, selected_count = 64, 128
         self._submit(_action('read_file',path='results.json',offset_bytes=selected_start,
             max_bytes=selected_count,full_digest=True))
@@ -2167,7 +2172,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._inspect(['report.md'], [])
         self._ok('inspect_artifacts')
         with patch.object(self.app.workspace, 'call', wraps=self.app.workspace.call) as reader:
-            self._submit(_action('deliver_result',**self._delivery('report.md','results.json','calculation.py')))
+            self._submit(_action('deliver_result',**self._delivery('report.md','results.json','calculation.py','appendix.txt')))
         size = len(texts['results.json'].encode())
         selected_end = selected_start + selected_count
         reads = [(call.args[1].get('offset_bytes',0), call.args[1].get('max_bytes',16000))
@@ -2194,23 +2199,47 @@ class OperationsWorkLoopTests(unittest.TestCase):
 
     def test_large_delivery_keeps_bounded_investigation_without_pretending_whole_reading(self):
         self._create()
-        self._write('report.md','# Work note\n\nFurther source interpretation is needed.\n')
-        (self.root/'workspace/large.txt').write_text('reading scope\n'+'z'*256000, encoding='utf-8')
+        texts = {'report.md':'# Work note\n\nFurther source interpretation is needed.\n',
+            'support.txt':'授权原始记录。\n'*900,
+            'other.txt':'Additional usable original.\n'*20}
+        for path, text in texts.items():
+            self._write(path, text)
+        large = 'reading scope\n'+'z'*600000
+        (self.root/'workspace/large.txt').write_text(large, encoding='utf-8')
+        self._write('figure.png', 'Image identity is not text evidence.\n')
+        (self.root/'workspace/opaque.dat').write_bytes(b'\x00'*100)
         def inspect(view):
             self.assertIn('read_file',{s['function']['name'] for s in self.inspection_requests[-1]['tools']})
             if len(self.inspection_requests)==1:
-                self.assertFalse(any(row['path']==str(self.root/'workspace/large.txt')
+                for path, text in texts.items():
+                    row, = [row for row in view['evidence'] if row['path']==str(self.root/'workspace'/path)]
+                    self.assertTrue(row['complete'])
+                    self.assertEqual(''.join(w['text'] for w in sorted(row['text_windows'],
+                        key=lambda w:w['offset_bytes'])), text)
+                row, = [row for row in view['evidence'] if row['path']==str(self.root/'workspace/large.txt')]
+                self.assertFalse(row['complete'])
+                self.assertTrue(row['text_windows'])
+                self.assertFalse(any(row['path']==str(self.root/'workspace/figure.png')
                     for row in view['evidence']))
-                return [_action('read_file',path='large.txt',offset_bytes=100,max_bytes=16000)]
+                opaque, = [row for row in view['evidence'] if row['path']==str(self.root/'workspace/opaque.dat')]
+                self.assertFalse(opaque['complete'])
+                self.assertFalse(opaque['text_windows'])
+                return [_action('read_file',path='large.txt',offset_bytes=len(large)-32,max_bytes=32)]
             self.assertEqual(self._inspection_history()[0]['status'],'ok')
             return {'conclusion':'incomplete','findings':[],'evidence':[],
                 'limitations':['The necessary interpretation is unfinished.']}
         self.review=inspect
-        self._submit(_action('deliver_result',**self._delivery('report.md','large.txt')))
+        # The large member precedes useful small members and the combined size
+        # exceeds the entire decoded-read allowance. Neither is a bundle veto.
+        self._submit(_action('deliver_result',**self._delivery(
+            'large.txt','report.md','support.txt','other.txt','figure.png','opaque.dat')))
         self._not_delivered()
         result=self._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']
         self.assertEqual(result['metadata']['delivery_assessment']['verdict'],'incomplete')
         self.assertEqual(len(self.inspection_requests),2)
+        windows = [window for row in result['data']['evidence'] for window in row['windows']]
+        self.assertLessEqual(sum(window['next_offset_bytes']-window['offset_bytes'] for window in windows), 512000)
+        self.assertTrue(any(not row['readable'] and row['windows'] for row in result['data']['evidence']))
 
     def test_completion_claim_owns_full_review_without_a_surrogate_report(self):
         self._create()
@@ -2287,6 +2316,58 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertIn('a,1', json.dumps(values['data.evidence']))
         self.assertEqual(producer_path.read_bytes(), producer_bytes)
         self.assertEqual(self.app.state['turns'][-1]['tools'][-1], producer_item)
+        # The producer still has its pending envelope; raw reads live only in
+        # the separately accepted opinion. Locate them through the real provider.
+        from simple_ar.tools.materials import journal_material_references, validate_material_observation
+        envelope = json.loads(producer_bytes)['metadata']['delivery_review']['result']
+        self.assertEqual(envelope['data'], {'inspection_pending': first['identity']})
+        material_record = 'records/'+review_record.removeprefix('attempts/')
+        references = [row for row in self.app._material_observations(['measurements'])
+            if row.get('record') == material_record]
+        self.assertTrue(references)
+        source = next(row for row in references
+            if self.app.workspace.resolve(row['request']['path']) == self.inputs/'observations.csv')
+        admitted = validate_material_observation(self.app.workspace, source, identity='review-result-reuse')
+        self.assertEqual(admitted['data']['text'], (self.inputs/'observations.csv').read_text())
+        self.assertNotIn('findings', admitted)
+        inspector = self.app.operations.inspection
+        inspector._reused_source_dependencies(source, admitted['data']['absolute_path'])
+        action_path = review_path.parent/'action.json'
+        original_action = action_path.read_bytes()
+        try:
+            action = json.loads(original_action)
+            action['result_sha256'] = '0'*64
+            action_path.write_text(json.dumps(action), encoding='utf-8')
+            with self.assertRaises(ValueError):
+                inspector._reused_source_dependencies(source, admitted['data']['absolute_path'])
+        finally:
+            action_path.write_bytes(original_action)
+        original_source = (self.inputs/'observations.csv').read_bytes()
+        try:
+            (self.inputs/'observations.csv').write_bytes(b'sample,value\na,8\n')
+            with self.assertRaises(ValueError):
+                validate_material_observation(self.app.workspace, source, identity='changed-review-source')
+        finally:
+            (self.inputs/'observations.csv').write_bytes(original_source)
+        with patch.dict(self.app.workspace.mounts, {name: root for name, root in
+                self.app.workspace.mounts.items() if name != 'measurements'}, clear=True):
+            with self.assertRaises(ValueError):
+                validate_material_observation(self.app.workspace, source, identity='revoked-review-source')
+        isolated = deepcopy(self.app.state['turns'][-1])
+        earlier_opinion = next(item['result'] for turn in self.app.state['turns']
+            for item in turn['tools'] if self.app.session.store.read_json(item['result'])['tool_name']=='inspect_artifacts')
+        forged = self.root/'workspace/unregistered-opinion.json'
+        forged.write_bytes(review_bytes)
+        try:
+            for unrelated in (earlier_opinion, str(forged)):
+                with self.subTest(unrelated_opinion=unrelated):
+                    isolated['tools'][-1]['review_result'] = unrelated
+                    self.assertEqual(journal_material_references(self.app.workspace, self.app.session.store,
+                        [isolated], ['workspace', 'measurements']), [])
+        finally:
+            forged.unlink()
+        self.assertEqual(producer_path.read_bytes(), producer_bytes)
+        self.assertEqual(review_path.read_bytes(), review_bytes)
         # Model views carry exact findings and proof locators; large retained
         # inventories must not multiply across binding, opinion and source maps.
         raw = deepcopy(self._last('deliver_result', reviewed=True))
@@ -2332,7 +2413,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         prior = next(row for row in guidance if row.get('delivery_context')==scope)
         self.assertFalse(prior['subjects'][0]['current_matches_review'])
         self.assertIn('contradicts', json.dumps(prior['result']))
+        inspections = len(self.inspection_requests)
         self._submit(_action('deliver_result', **claim))
+        self.assertEqual(len(self.inspection_requests)-inspections, 1,
+            'The new opinion should receive unchanged raw support without another source request')
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         self.assertEqual(len(reviews), 2)
         self.assertEqual(self._versions(self.inputs), originals)
@@ -2351,10 +2435,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.ledger.to_dict(), ledger)
 
         # A later request can ask for a direct answer instead of another file.
+        calls = len(self.inspection_requests)
         self.review = lambda view: {'conclusion':'complete','evidence':[], 'limitations':[],
             'findings':[{'severity':'required','message':'The claim overstates the supplied evidence.', 'artifacts':[]}]}
         self._submit(_action('deliver_result', summary='这些观察足以支持总体推断。', artifacts=[]),
             feedback='这次只用一句中文回答这些观察能否支持总体推断，不需要新文件。')
+        self.assertGreater(len(self.inspection_requests), calls, 'Changed claims require a fresh independent opinion')
         self.assertNotEqual(self.app.session.manifest.status, 'completed')
         negative = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
         feedback = self.app.operations.inspection_feedback([])
@@ -2368,6 +2454,23 @@ class OperationsWorkLoopTests(unittest.TestCase):
         proof = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
         self.assertEqual(proof['binding']['artifacts'], {})
         self.assertEqual(proof['result']['metadata']['delivery_assessment']['verdict'], 'passed')
+
+        # A direct answer can omit evidence IDs, but cannot adopt a judgment
+        # after a source actually supplied to the reviewer changed mid-call.
+        source_path = self.inputs/'observations.csv'
+        original = source_path.read_bytes()
+        def source_changes_after_offer(view):
+            self.assertTrue(any(row['observation'].get('path') == str(source_path)
+                for row in view['working_view']['observations']))
+            source_path.write_bytes(b'sample,value\na,100\n')
+            return {'conclusion':'complete','evidence':[], 'limitations':[], 'findings':[]}
+        self.review = source_changes_after_offer
+        try:
+            self._submit(_action('deliver_result', summary='这些观察仍是原始数值。', artifacts=[]),
+                feedback='直接说明刚才的数据是否保持原样。')
+            self.assertNotEqual(self.app.session.manifest.status, 'completed')
+        finally:
+            source_path.write_bytes(original)
 
     def test_closing_inspection_corrects_one_invalid_opinion_without_new_source_reads(self):
         self._create()
@@ -2403,7 +2506,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         prior_delivery = (self.root/'delivery.json').read_bytes()
         self._submit(_action('write_file', path='说明.md', content='这三个观察不能证明总体结论。\n',
             expected_sha256=_digest(self.root/'workspace/说明.md')), feedback='补充总体推断的限制。')
-        self.review = lambda view: {'conclusion':'complete', 'findings':[], 'limitations':[],
+        candidate_message = 'The supplied claim requires further independent investigation.'
+        self.review = lambda view: {'conclusion':'complete',
+            'findings':[{'severity':'required', 'message':candidate_message, 'artifacts':[]}], 'limitations':[],
             'evidence':['unobserved-source']}
         calls = len(self.inspection_requests)
         with patch.object(owner, '_prepare_conversation_round', side_effect=close_sources):
@@ -2413,6 +2518,24 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual((self.root/'delivery.json').read_bytes(), prior_delivery)
         failed = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
         self.assertIn('one corrective response exhausted', failed['error'])
+        rejected = failed['result']['data']['rejected_opinion']
+        self.assertEqual(rejected['candidate_excerpt'],
+            [{'scope':'proposed_delivery', 'candidate_messages':[candidate_message]}])
+        trace = self.app.session.store.read_json(rejected['record'])
+        raw = json.loads(trace['response']['tool_calls'][0]['function']['arguments'])
+        self.assertEqual(raw['findings'][0]['message'], candidate_message)
+        self.assertEqual(raw['evidence'], ['unobserved-source'])
+        self.assertEqual(failed['result']['metadata']['delivery_assessment']['verdict'], 'incomplete')
+        self.assertFalse(failed['result']['metadata']['delivery_assessment']['findings'])
+        self.assertTrue(any(row['readable'] and row['windows'] for row in failed['result']['data']['evidence']))
+        item = self.app.state['turns'][-1]['tools'][-1]
+        producer = self.app.session.store.read_json(item['result'])
+        presented = self.app._coordination_result(producer, 'records/'+item['result'].removeprefix('attempts/'),
+            review_record=item.get('review_result'))
+        projected = presented['metadata']['delivery_review']['result']
+        self.assertEqual(projected['data']['rejected_opinion'], rejected)
+        self.assertEqual(projected['metadata']['delivery_opinion']['verdict'], 'incomplete')
+        self.assertIn('Unadopted', projected['data']['rejected_opinion']['scope'])
         self.assertFalse(self._process_receipts())
         calls, ledger = self.send.call_count, self.app.ledger.to_dict()
         self._reload()
@@ -2550,7 +2673,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(plain_delivery)
         self._not_delivered()
         findings = []
-        self._inspect([{'path': 'analysis.md', 'max_bytes': 8}], ['evidence-notes.txt'])
+        # This branch tests a genuinely partial review: if a retained full read
+        # is available, the shared inspector may instead reassess the full text.
+        with patch.object(self.app.operations.inspection, 'material_observations', return_value=[]):
+            self._inspect([{'path': 'analysis.md', 'max_bytes': 8}], ['evidence-notes.txt'])
         self.assertEqual(self._assessment()['verdict'], 'incomplete')
         self._submit(plain_delivery)
         self._not_delivered()
@@ -3005,6 +3131,50 @@ class OperationsWorkLoopTests(unittest.TestCase):
             owner._working_messages({**historical, 'inspection_context_policy':'future.v99'},
                 request, [], offered, self.services.llm_client)
 
+    def test_interrupted_inspection_priming_resumes_missing_ranges_without_renewing_read_allowance(self):
+        self._create()
+        text = 'Original authorized text.\n'*4000
+        self._write('original.txt', text)
+        reader = self.app.workspace.call
+        def interrupt(name, arguments, **kwargs):
+            if name == 'read_file' and arguments.get('offset_bytes', 0) >= 16000:
+                raise KeyboardInterrupt('Controlled interruption between persisted source windows')
+            return reader(name, arguments, **kwargs)
+        with patch.object(self.app.workspace, 'call', side_effect=interrupt):
+            self._submit(_action('inspect_artifacts', goal='Check the complete original text',
+                targets=['original.txt'], evidence=[]))
+        self.assertEqual(self.app.session.manifest.status, 'paused')
+        self.assertIn('KeyboardInterrupt', self.app.session.manifest.status_reason)
+        self.assertFalse(self.inspection_requests)
+        scope = self.app.state['pending']['inspection']
+        path = f'tools/inspection/{scope}/input.json'
+        saved = self.app.session.store.read_json(path)
+        windows = saved['targets'][0]['windows']
+        consumed = sum(w['next_offset_bytes']-w['offset_bytes'] for w in windows)
+        self.assertGreater(consumed, 512)
+        self.assertEqual(saved['initial_read_remaining'], 512000-consumed)
+        self.assertFalse(saved.get('source_rounds'))
+        cursor = max(w['review_next_offset_bytes'] for w in windows)
+        # An older shared inspection saved primed windows before updating its
+        # initial allowance. Loading that checkpoint must not renew read bytes.
+        first = windows[0]
+        saved['initial_read_remaining'] = 512000-(first['next_offset_bytes']-first['offset_bytes'])
+        self.app.session.store.write_json(path, saved)
+        ledger = self.app.ledger.to_dict()
+        self._reload()
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        with patch.object(self.app.workspace, 'call', wraps=self.app.workspace.call) as reads:
+            self._run()
+        resumed = [call.args[1].get('offset_bytes', 0) for call in reads.call_args_list
+            if call.args[0] == 'read_file' and call.args[1].get('max_bytes', 0) > 1]
+        self.assertTrue(resumed)
+        self.assertGreaterEqual(min(resumed), cursor)
+        self.assertEqual(self._ok('inspect_artifacts')['status'], 'ok')
+        saved = self.app.session.store.read_json(path)
+        consumed = sum(w['next_offset_bytes']-w['offset_bytes'] for w in saved['targets'][0]['windows'])
+        self.assertEqual(consumed, len(text.encode('utf-8')))
+        self.assertEqual(saved['initial_read_remaining'], 512000-consumed)
+
     def test_progressive_inspection_large_target_under_tight_capacity_still_allows_paging(self):
         from dataclasses import replace
 
@@ -3445,8 +3615,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def test_empty_evidence_reuse_respects_current_access_versions_and_whole_window_capacity(self):
         from dataclasses import replace
 
-        # Isolate seed's 96000-character whole-window allowance from the
-        # separate model-view token budget. This fixture has no paid transport.
+        # Both whole windows fit the actual read and model budgets. Reuse must
+        # not be cut off by the older 96000-character optional-seed limit.
         self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
             context_input_tokens=500000))
         self._create()
@@ -3458,8 +3628,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(_action('write_file', path='stale.txt', content='Current unread replacement.\n',
             expected_sha256=_digest(self.root/'workspace/stale.txt')))
         self._ok('write_file')
-        # Two original windows exceed the common optional 96000-character
-        # allowance together. Retain whole receipts; never invent a clipped read.
+        # Two original windows exceed the old optional-seed limit together.
+        # Retain whole receipts; never invent a clipped read.
         bodies = ['First retained source. '+('a '*31000), 'Second retained source. '+('b '*31000)]
         for index, body in enumerate(bodies):
             self._write(f'large-{index}.txt', body)
@@ -3485,8 +3655,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
                               'Current unread replacement.\n'):
                 self.assertNotIn(forbidden, texts)
             admitted = [text for text in texts if text in bodies]
-            self.assertEqual(len(admitted), 1, 'Only one whole original window fits optional capacity')
-            self.assertLessEqual(sum(len(row['text']) for row in sources), 96000)
+            self.assertCountEqual(admitted, bodies)
+            self.assertLessEqual(sum(len(row['text'].encode('utf-8')) for row in sources), 512000)
             self.assertTrue(all(row['text'] in bodies for row in sources))
             return {'decisions': [{'subject': 'target-1', 'conclusion': 'incomplete',
                 'evidence': list(dict.fromkeys(row['subject'] for row in sources)), 'findings': [],
@@ -3505,8 +3675,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
         seeded = [window['text'] for row in saved['evidence'] for window in row['windows']
             if window.get('source_reference')]
-        self.assertEqual(len(seeded), 1, 'Seed itself admits only one whole original window')
-        self.assertIn(seeded[0], bodies)
+        self.assertCountEqual(seeded, bodies)
         self.assertEqual([entry.to_dict() for entry in self.app.ledger.entries][:len(entries)], entries)
         for path, raw in retained.items():
             self.assertEqual(path.read_bytes(), raw)
@@ -3538,6 +3707,79 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 omitted = [row for row in projection['omitted_records'] if row['source'].get('path')==str(source)]
                 self.assertTrue(omitted)
                 self.assertTrue(all(row['version_status']=='unknown' for row in omitted))
+
+    def test_many_retained_reads_leave_room_for_current_target_and_new_investigation(self):
+        from dataclasses import replace
+
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=500000))
+        self._create()
+        target = 'Current user material.\n' + 'x ' * 60000
+        self._write('target.txt', target)
+        for index in range(8):
+            name = f'prior-{index}.txt'
+            self._write(name, f'Prior observation {index}.\n' + 'a ' * 31000)
+            self._submit(_action('read_file', path=name, max_bytes=64000, full_digest=True))
+            self._ok('read_file')
+
+        seen = []
+        def review(view):
+            seen.append(view)
+            if len(seen) == 1:
+                self.assertTrue(view['targets'][0]['complete'])
+                self.assertEqual(''.join(row['text'] for row in sorted(
+                    view['targets'][0]['text_windows'], key=lambda row: row['offset_bytes'])), target)
+                return [_action('read_file', path='measurements/conditions.txt', max_bytes=4000)]
+            self.assertEqual(self._inspection_history()[-1]['status'], 'ok')
+            return {'decisions': [{'subject': 'target-1', 'conclusion': 'incomplete',
+                'findings': [], 'evidence': [], 'limitations': ['Further interpretation remains.']}]}
+
+        self.review = review
+        result = self._inspect(['target.txt'], [])
+        self.assertEqual(result['status'], 'ok', result)
+        self.assertEqual(len(seen), 2)
+        identity = Path(result['data']['record']).parts[1]
+        saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+        self.assertEqual(saved['source_priming_policy'], 'priority.v1')
+        self.assertTrue(any(window.get('source_reference') for row in saved['evidence'] for window in row['windows']))
+
+    def test_delivery_reuses_large_set_before_reserving_missing_ranges(self):
+        from simple_ar.tools.workspace import FileWindow
+
+        self._create()
+        artifacts = {}
+        for index in range(32):
+            path = self.root/'workspace'/f'part-{index:02d}.txt'
+            path.write_text(f'{index:02d}' + 'x'*15999, encoding='utf-8')
+            self._read(path.name)
+            artifacts[str(path)] = _digest(path)
+        saved = {'execution_protocol':'shared.v1', 'source_priming_policy':'priority.v1',
+            'targets':[], 'evidence':[], 'delivery_context':{
+                'schema_version':'delivery_review.v3', 'artifacts':artifacts}}
+        remaining = [512000]
+        self.app.operations.inspection._reuse_observations(saved, remaining)
+        retained = [window for row in saved['evidence'] for window in row['windows']
+            if window.get('source_reference')]
+        self.assertGreaterEqual(len(retained), 30)
+        self.assertGreaterEqual(remaining[0], FileWindow.model_fields['max_bytes'].default)
+
+    def test_saved_shared_inspection_keeps_legacy_bundle_priming(self):
+        from simple_ar.tools.inspection import _DeliveryInspectionRequest
+
+        self._create()
+        path = self.root/'workspace/large.txt'
+        path.write_text('x'*300000, encoding='utf-8')
+        saved = {'execution_protocol':'shared.v1', 'targets':[], 'evidence':[],
+            'delivery_context':{'schema_version':'delivery_review.v3', 'artifacts':{str(path):_digest(path)}}}
+        old = deepcopy(saved)
+        remaining = [512000]
+        owner = self.app.operations.inspection
+        with patch.object(owner, '_prime_originals', wraps=owner._prime_originals) as current:
+            owner._prime_delivery(saved, _DeliveryInspectionRequest(goal='Check old delivery', targets=[], evidence=[]),
+                'legacy-priming', remaining, self.services.llm_client, [])
+        current.assert_not_called()
+        self.assertEqual(saved, old)
+        self.assertEqual(remaining, [512000])
 
     def test_inspector_locates_missing_sources_within_one_version_bound_operation(self):
         self._create(report=True)
@@ -5206,8 +5448,16 @@ class OperationsWorkLoopTests(unittest.TestCase):
             "from pathlib import Path; Path('value.txt').write_text(Path('input.txt').read_text())"],
             inputs=['input.txt'], outputs=['value.txt']), approve=lambda *_: True)
         self._ok('run_process')
+        self._read('value.txt')
+        reference = next(row for row in self.app._material_observations(['workspace/value.txt'])
+            if self.app.workspace.resolve(row['request']['path']) == self.root/'workspace/value.txt')
+        inspector = self.app.operations.inspection
+        inspector._reused_source_dependencies(reference, 'workspace/value.txt')
         self._submit(_action('write_file', path='input.txt', content='changed\n',
             expected_sha256=_digest(self.root/'workspace/input.txt')))
+        self.assertEqual((self.root/'workspace/value.txt').read_text(), 'first\n')
+        with self.assertRaisesRegex(ValueError, 'producer inputs/outputs changed'):
+            inspector._reused_source_dependencies(reference, 'workspace/value.txt')
         calls = self.send.call_count
         self._submit(_action('write_file', path='report.md', content='# Current report\n',
             delivery=self._delivery('report.md', 'value.txt')))

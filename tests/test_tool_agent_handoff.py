@@ -1311,6 +1311,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             provider=lambda _: unicode_refs, roots=[str(unicode_file)], context={'inventory': 'x' * 180000})
         self.assertEqual(unicode_seed['observations'], [])
         self.assertEqual(unicode_seed['coverage']['not_admitted'][0]['reason'], 'serialized_context_capacity')
+        # The shared reader's allowance is in bytes, not Unicode characters.
+        inventory = material_inventories(app.workspace, [str(unicode_file)], identity='unicode-byte-seed')
+        for allowance, expected in ((63000, 1), (62999, 0)):
+            measured = material_observation_seed(workspace=app.workspace, inventories=inventory,
+                provider=lambda _: unicode_refs, roots=[str(unicode_file)], context={}, remaining_bytes=allowance)
+            self.assertEqual(len(measured['observations']), expected)
+            if not expected:
+                self.assertEqual(measured['coverage']['not_admitted'][0]['reason'], 'observation_capacity')
 
     def test_common_gateway_dispatches_read_only_and_blocks_execution(self) -> None:
         run_dir, _ = self._tool_materials()
@@ -11203,6 +11211,37 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'reviewed inputs changed'):
                 app._work_context([str(image)])
         self.assertEqual(fake.ask_json.call_count, 2)
+
+    def test_retained_review_respects_recorded_input_version(self) -> None:
+        from PIL import Image
+        from simple_ar.tools.professional_outcomes import journal_input_dependencies
+
+        inputs, fake, app, visual = self._visual_fixture(historical=True)
+        fake.connection_binding.return_value = {'profile': 'fixture-vision'}
+        fake.effective_output_limit.return_value = 16000
+        fake.ask_json.return_value = {'findings': []}
+        image = inputs / 'evidence.png'
+        Image.new('RGB', (16, 16), 'white').save(image)
+        with patch('simple_ar.tools.visual.LLMClient.from_env', return_value=fake):
+            result = visual.call('inspect_images', {'images': ['source0/evidence.png'],
+                'goal': 'Inspect'}, identity='retained-visual')
+        self.assertEqual(result.status, 'ok', result.error)
+        payload = result.model_dump(mode='json')
+        pending = {'attempt': 'retained-visual', 'kind': 'opinion',
+            'origin': {'scope': 'fixture', 'position': 'retained-visual', 'kind': 'opinion'},
+            'result_sha256': hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()}
+        record = app._attempt('native_action', pending, perform=lambda _: payload)
+        app.state['turns'].append({'tools': [{'result': record}]})
+        app._save()
+        feedback = result.data['feedback']
+        original = image.read_bytes()
+        self.assertEqual(journal_input_dependencies(app.session.store.root, app.workspace, feedback),
+                         {str(image.resolve()): hashlib.sha256(original).hexdigest()})
+        Image.new('RGB', (16, 16), 'black').save(image)
+        with self.assertRaisesRegex(ValueError, 'input version changed'):
+            journal_input_dependencies(app.session.store.root, app.workspace, feedback)
+        image.write_bytes(original)
+        self.assertTrue(journal_input_dependencies(app.session.store.root, app.workspace, feedback))
 
     def test_visual_review_replays_confirmed_results_and_retains_failures(self) -> None:
         inputs, fake, resumed, visual = self._visual_fixture()

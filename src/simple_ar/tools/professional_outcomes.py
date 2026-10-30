@@ -89,6 +89,89 @@ def accepted_native_result(root: Path, session_id: str, observed: dict,
     return store, hashlib.sha256(raw).hexdigest()
 
 
+def accepted_scoped_opinion(root: Path, workspace: Any, session_id: str, locator: str,
+                            scope: str, *, expected: dict | None = None) -> tuple[Path, dict, str]:
+    """Prove an opinion belongs to one parent action without adopting its judgment."""
+    path = native_result_path(root, workspace, locator)
+    result = ArtifactStore(path.parent).read_json('native_result.json')
+    if expected is not None and result != expected:
+        raise ValueError('Opinion differs from the accepted native observation')
+    store, digest = accepted_native_result(root, session_id, result, path.parent.name)
+    action = store.read_json('action.json')
+    if (store.read_attempt_manifest().capability != 'native_action'
+            or not isinstance(action, dict) or action.get('kind') != 'opinion'
+            or not isinstance(action.get('origin'), dict) or action['origin'].get('scope') != scope):
+        raise ValueError('Opinion is not the accepted action for this scope')
+    return path, result, digest
+
+
+def journal_input_dependencies(root: Path, workspace: Any, locator: str, *,
+                               cache: dict | None = None) -> dict[str, str]:
+    """Check declared input versions in existing same-task operation receipts.
+
+    The index is temporary and contains no new facts or task state. Results
+    lacking an input binding stay unknown; a file read never certifies them.
+    Process outputs remain the workspace owner's responsibility.
+    """
+    store = ArtifactStore(root)
+    cache = {} if cache is None else cache
+    index = cache.get('journal_input_owners')
+    if index is None:
+        index = {}
+        for turn in store.read_json('actions.json').get('turns', []):
+            for item in turn.get('tools', []):
+                try:
+                    result = store.read_json(item['result'])
+                    inputs = (result.get('data') or {}).get('input_sha256')
+                    if result.get('status') != 'ok' or not isinstance(inputs, dict):
+                        continue
+                    for artifact in result.get('artifacts', []):
+                        try:
+                            index[str(workspace.resolve(artifact))] = item['result']
+                        except (ValueError, OSError):
+                            continue  # Unrelated inaccessible artifacts do not displace current ones.
+                except (ValueError, TypeError, KeyError, OSError, RuntimeError):
+                    continue
+        cache['journal_input_owners'] = index
+
+    session_id = store.read_json('session_manifest.json')['session_id']
+    dependencies, active, completed = {}, set(), set()
+
+    def visit(name: str) -> None:
+        path = str(workspace.resolve(name))
+        if path in active:
+            raise ValueError('Recorded material dependencies form a cycle')
+        if path in completed:
+            return
+        record = index.get(path)
+        if record is None:
+            return  # No recorded producer is not a proof of no dependencies.
+        result = store.read_json(record)
+        accepted_native_result(root, session_id, result, Path(record).parent.name)
+        inputs = (result.get('data') or {}).get('input_sha256')
+        if result.get('status') != 'ok' or not isinstance(inputs, dict):
+            raise ValueError('Recorded material producer no longer has its input binding')
+        if workspace.artifact_hashes(inputs) != inputs:
+            raise ValueError('Recorded material producer input version changed')
+        active.add(path)
+        try:
+            workspace.check_artifact_producers(inputs, cache=cache)
+            for name, digest in inputs.items():
+                if not isinstance(digest, str) or len(digest) != 64:
+                    raise ValueError('Recorded material producer has an invalid input version')
+                canonical = str(workspace.resolve(name))
+                if canonical in dependencies and dependencies[canonical] != digest:
+                    raise ValueError('Recorded material producers have conflicting input versions')
+                dependencies[canonical] = digest
+                visit(name)
+        finally:
+            active.remove(path)
+        completed.add(path)
+
+    visit(locator)
+    return dependencies
+
+
 def stop_decision(owner: Any, observed: dict, attempt_id: str, reason: str, detail: str) -> dict:
     """Describe an accepted outcome without changing its historical stop semantics."""
     _, digest = accepted_native_result(owner.root, owner.session_id, observed, attempt_id)

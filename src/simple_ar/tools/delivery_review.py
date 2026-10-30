@@ -239,21 +239,14 @@ class DeliveryReview:
         try:
             result = self._envelope_result(envelope, envelope['binding'], record=projected.get('record'))
             if result is not None and review_record is not None:
-                from simple_ar.tools.professional_outcomes import accepted_native_result, native_result_path
+                from simple_ar.tools.professional_outcomes import accepted_scoped_opinion
 
                 if not isinstance(review_record, str) or not review_record:
                     raise ValueError('Review record must identify an accepted opinion')
                 root = self.inspector.store.root
-                path = native_result_path(root, self.workspace, review_record)
                 session_id = self.inspector.store.read_json('session_manifest.json')['session_id']
-                action_store, _ = accepted_native_result(root, session_id,
-                    result.model_dump(mode='json'), path.parent.name)
-                action = action_store.read_json('action.json')
-                if (action_store.read_attempt_manifest().capability != 'native_action'
-                        or not isinstance(action, dict) or action.get('kind') != 'opinion'
-                        or not isinstance(action.get('origin'), dict)
-                        or action['origin'].get('scope') != envelope['identity']):
-                    raise ValueError('Review record is not the accepted opinion for this inspection')
+                accepted_scoped_opinion(root, self.workspace, session_id, review_record,
+                    envelope['identity'], expected=result.model_dump(mode='json'))
         except _ERRORS:
             return projected
         if result is not None:

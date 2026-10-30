@@ -260,7 +260,7 @@ def validate_material_observation(workspace: Any, reference: dict, *, identity: 
         row = read_material_window(workspace, request.model_dump(exclude_unset=True),
             identity=identity, cache=cache, on_observation=on_observation)
         proof = _content_target(workspace, request, row['data'], source)
-        if proof != reuse['target'] or reference.get('data') != row['data']:
+        if proof != reuse['target'] or ('data' in reference and reference['data'] != row['data']):
             raise ValueError('Reused target version or window changed')
         return {**row, 'content_reuse': reuse}
     request = FileWindow.model_validate(reference['request']).model_copy(update={'full_digest': True})
@@ -362,6 +362,24 @@ def journal_material_references(workspace: Any, store: Any, turns: list[dict],
     """
     roots = [workspace.resolve_material_root(path) for path in targets]
     retained = []
+    def collect(receipt: dict, request: dict, record: str, digest: str) -> None:
+        for row in journal_read_windows(receipt, request):
+            try:
+                path = workspace.resolve(row['request']['path'])
+                data = row.get('data') or {}
+                in_scope = any(path == root or root.is_dir() and path.is_relative_to(root) for root in roots)
+                if (not (include_cross_path or in_scope)
+                        or not isinstance(data.get('sha256'), str) or len(data['sha256']) != 64
+                        or type(data.get('next_offset_bytes')) is not int
+                        or type(data.get('size_bytes')) is not int):
+                    continue
+                retained.append((not in_scope, {'request': row['request'],
+                    **({'input_index': row['input_index']} if 'input_index' in row else {}),
+                    'record': 'records/' + record.removeprefix('attempts/'),
+                    'receipt_sha256': digest}))
+            except (ValueError, TypeError, KeyError, OSError, RuntimeError):
+                continue
+
     for turn in reversed(turns):
         calls = {call['id']: call for call in store.read_json(turn['reply']).get('tool_calls', [])}
         for item in reversed(turn['tools']):
@@ -372,21 +390,25 @@ def journal_material_references(workspace: Any, store: Any, turns: list[dict],
                 receipt = json.loads(raw)
                 if receipt.get('tool_name') != call['name']:
                     continue
-                for row in journal_read_windows(receipt, request):
-                    path = workspace.resolve(row['request']['path'])
-                    data = row.get('data') or {}
-                    in_scope = any(path == root or root.is_dir() and path.is_relative_to(root) for root in roots)
-                    if (not (include_cross_path or in_scope)
-                            or not isinstance(data.get('sha256'), str) or len(data['sha256']) != 64
-                            or type(data.get('next_offset_bytes')) is not int
-                            or type(data.get('size_bytes')) is not int):
-                        continue
-                    retained.append((not in_scope, {'request': row['request'],
-                        **({'input_index': row['input_index']} if 'input_index' in row else {}),
-                        'record': 'records/' + item['result'].removeprefix('attempts/'),
-                        'receipt_sha256': hashlib.sha256(raw).hexdigest()}))
             except (ValueError, TypeError, KeyError, OSError, RuntimeError):
                 continue
+            collect(receipt, request, item['result'], hashlib.sha256(raw).hexdigest())
+            if item.get('review_result'):
+                # Shared actions keep their own accepted observation rather than
+                # copying it into the producer's pending envelope. Read that
+                # registered receipt through the same byte/version owner as any
+                # other journal observation; its opinion is not transferred.
+                try:
+                    from simple_ar.tools.professional_outcomes import accepted_native_result, accepted_scoped_opinion
+
+                    session_id = store.read_json('session_manifest.json')['session_id']
+                    accepted_native_result(store.root, session_id, receipt, Path(item['result']).parent.name)
+                    path, review, digest = accepted_scoped_opinion(store.root, workspace, session_id,
+                        item['review_result'], Path(item['result']).parent.name)
+                    record = 'attempts/' + path.relative_to((store.root / 'attempts').resolve()).as_posix()
+                    collect(review, {}, record, digest)
+                except (ValueError, TypeError, KeyError, OSError, RuntimeError):
+                    continue
     # Current roots lead the bounded reuse search; unrelated recent reads must
     # not displace their original receipts. Preserve recency within each group.
     return [reference for _, reference in sorted(retained, key=lambda item: item[0])]
@@ -449,6 +471,7 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict] | None 
                               roots: list[str], context: dict,
                               excluded_paths: set[str] | None = None,
                               remaining_capacity: int | None = None,
+                              remaining_bytes: int | None = None,
                               initial_observations: list[dict] | None = None,
                               on_observation: Callable[[dict], None] | None = None) -> dict | None:
     """Freeze bounded, validated parent reads in the existing selection input.
@@ -456,16 +479,23 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict] | None 
     References come from the parent journal, never model-transcribed text or
     digests. Rechecking bytes is deterministic validation, not a new tool/model
     investigation. Cross-path reuse proves bytes, never roles or authority.
-    remaining_capacity bounds optional whole-window admission after required
-    context; omission preserves the historical 96000-character behavior.
+    remaining_capacity bounds optional whole windows in characters. Consumers
+    with a physical decoded-read allowance can instead supply remaining_bytes;
+    omission preserves the historical 96000-character behavior. The caller's
+    model-context selector independently decides what fits in tokens.
     on_observation retains successful actual reads even when reuse validation
     or presentation admission subsequently refuses them.
     """
     if provider is None:
         return None
-    limit = 96000 if remaining_capacity is None else remaining_capacity
-    if type(limit) is not int or not 0 <= limit <= 96000:
+    if remaining_bytes is not None and remaining_capacity is not None:
+        raise ValueError('Choose one material observation capacity unit')
+    limit = remaining_bytes if remaining_bytes is not None else (
+        96000 if remaining_capacity is None else remaining_capacity)
+    if (type(limit) is not int or limit < 0
+            or remaining_bytes is None and limit > 96000):
         raise ValueError('Invalid remaining material observation capacity')
+    serialized_limit = 4 * 1024 * 1024 if remaining_bytes is not None else 232000
     references = provider(roots)
     if not references:
         return None
@@ -490,11 +520,11 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict] | None 
         path, start, end, digest = observed_window_key(workspace,
             FileWindow.model_validate(row['request']), row['data'])
         seen.add((path, digest, start, end))
-    characters, cache = 0, {}
+    used, cache = 0, {}
     excluded = excluded_paths or set()
 
     def admit(row: dict, request: FileWindow, coverage: dict) -> None:
-        nonlocal characters
+        nonlocal used
         data = row['data']
         if not data['text']:
             raise ValueError('empty_material_window')
@@ -505,15 +535,16 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict] | None 
             raise ValueError('same_path_version_and_measured_window_already_supplied')
         if data['size_bytes'] != visible[path]:
             raise ValueError('current_size_changed')
-        if characters + len(data['text']) > limit:
+        cost = end - start if remaining_bytes is not None else len(data['text'])
+        if used + cost > limit:
             raise ValueError('observation_capacity')
         if len(json.dumps({**context, 'observations': observations + [row]},
-                ensure_ascii=False).encode('utf-8')) > 232000:
+                ensure_ascii=False).encode('utf-8')) > serialized_limit:
             raise ValueError('serialized_context_capacity')
         observations.append(row)
         admitted.append(coverage)
         seen.add(key)
-        characters += len(data['text'])
+        used += cost
 
     for reference in references:
         coverage = {key: reference[key] for key in ('record', 'receipt_sha256', 'request', 'input_index', 'source_reference') if key in reference}
@@ -522,14 +553,15 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict] | None 
             path = workspace.resolve(request.path)
             if str(path) not in visible or str(path) in excluded:
                 raise ValueError('outside_candidate_inventory_or_source_owner')
-            if remaining_capacity is not None:
+            if remaining_capacity is not None or remaining_bytes is not None:
                 # Refuse optional whole bodies before reading current bytes.
                 # Historical callers retain their original validation order.
                 data = (_journal_receipt(workspace, reference) if 'record' in reference else reference)['data']
                 key_path, start, end, digest = observed_window_key(workspace, request, data)
                 if (key_path, digest, start, end) in seen:
                     raise ValueError('same_path_version_and_measured_window_already_supplied')
-                if characters + len(data['text']) > limit:
+                cost = end - start if remaining_bytes is not None else len(data['text'])
+                if used + cost > limit:
                     raise ValueError('observation_capacity')
             row = validate_material_observation(workspace, reference, identity='material-seed', cache=cache,
                 on_observation=on_observation)
@@ -575,7 +607,9 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict] | None 
                     validation_exhausted = True
                     raise ValueError('content_validation_capacity')
                 candidates_checked += 1
-                if characters + len(source['text']) > limit:
+                cost = (source['next_offset_bytes'] - source['offset_bytes']
+                    if remaining_bytes is not None else len(source['text']))
+                if used + cost > limit:
                     raise ValueError('observation_capacity')
                 # Check permission and inventory size before any target hash.
                 target = workspace.resolve_material_root(locator)

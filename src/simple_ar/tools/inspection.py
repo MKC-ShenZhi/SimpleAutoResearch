@@ -501,10 +501,14 @@ class InspectionToolGateway:
         return versions
 
     def _check_shared_dependencies(self, saved: dict, *, current_inputs: bool,
-                                   selected: list[dict] | None = None) -> dict[str, str]:
+                                   selected: list[dict] | None = None,
+                                   include_delivery: bool = True,
+                                   visited: set[tuple[str, str]] | None = None,
+                                   journal_cache: dict | None = None) -> dict[str, str]:
         if saved.get('execution_protocol') != 'shared.v1':
             return {}
         dependencies: dict[str, str] = {}
+        journal_cache = {} if journal_cache is None else journal_cache
 
         def bind(path: str, digest: str) -> None:
             path = str(self.workspace.resolve(path))
@@ -513,32 +517,50 @@ class InspectionToolGateway:
             dependencies[path] = digest
         selected_paths = ({str(self.workspace.resolve(row['path'])) for row in selected or [] if row.get('path')}
             if current_inputs else set())
-        if current_inputs and selected is not None and self._delivery_scope(saved):
+        if current_inputs and selected is not None and include_delivery and self._delivery_scope(saved):
             selected_paths.update(str(self.workspace.resolve(path)) for path in saved['delivery_context']['artifacts'])
         cache: dict[str, Any] = {}
         if current_inputs and selected_paths:
             diagnostics = self.workspace.root / 'tools' / 'processes'
             material = [path for path in selected_paths if not Path(path).is_relative_to(diagnostics)]
             self.workspace.check_artifact_producers(material, cache=cache)
-        rows = []
+        rows, supplied = [], set()
+
+        def check_owner_receipts(row: dict) -> None:
+            for locator, expected in row.get('owner_receipts', {}).items():
+                owner_path = Path(locator)
+                actual = (hashlib.sha256(owner_path.read_bytes()).hexdigest() if owner_path.is_absolute()
+                    else self._digest(locator))
+                if actual != expected:
+                    raise ValueError('Inspection operation owner receipt changed; no replay')
+
         for number, digest in enumerate(saved.get('source_rounds', [])):
             path = self._path(saved['identity'], f'sources-{number}')
             if self._digest(path) != digest:
                 raise ValueError('Inspection source investigation record changed; no replay')
             trace = self.store.read_json(path)
+            if saved.get('source_priming_policy') == 'priority.v1':
+                for message in trace.get('offer', {}).get('messages', []):
+                    if message.get('role') != 'user':
+                        continue
+                    try:
+                        view = json.loads(message['content']).get('working_view', {})
+                        for entry in view.get('observations', []):
+                            item = entry['observation']
+                            supplied.add((item['path'], item['sha256'], item['offset_bytes'],
+                                          item['next_offset_bytes']))
+                    except (ValueError, TypeError, KeyError, AttributeError):
+                        continue
             closed = [trace[key] for key in ('model_receipt', 'checkpoint_receipt') if key in trace]
             closed.extend(row['receipt'] for row in trace.get('results', []) if 'receipt' in row)
-            for receipt in closed:
-                self._receipt_result(receipt)
+            if include_delivery:
+                for receipt in closed:
+                    self._receipt_result(receipt)
             for row in trace.get('results', []):
                 rows.append(row)
-                for locator, expected in row.get('owner_receipts', {}).items():
-                    owner_path = Path(locator)
-                    actual = (hashlib.sha256(owner_path.read_bytes()).hexdigest() if owner_path.is_absolute()
-                        else self._digest(locator))
-                    if actual != expected:
-                        raise ValueError('Inspection operation owner receipt changed; no replay')
-        if not current_inputs or not selected_paths:
+                if include_delivery:
+                    check_owner_receipts(row)
+        if not current_inputs:
             return dependencies
         included_visual = set()
         while True:
@@ -552,13 +574,22 @@ class InspectionToolGateway:
                         for locator in producers[path][2]['inputs'])
             added = False
             for index, row in enumerate(rows):
-                owner_result = self._receipt_result(row['receipt']) if 'receipt' in row else {}
-                images = owner_result.get('data', {}).get('input_sha256')
-                if (index in included_visual or row.get('tool') != 'inspect_images' or not isinstance(images, dict)
-                        or owner_result.get('status') != 'ok'
-                        or not any(str(self.workspace.resolve(locator)) in reached
-                            for locator in owner_result.get('artifacts', []))):
+                recorded = row.get('result') or {}
+                def is_reached(locator: str) -> bool:
+                    try:
+                        return str(self.workspace.resolve(locator)) in reached
+                    except (ValueError, OSError):
+                        return False  # An unrelated inaccessible output is not this source's dependency.
+                if (index in included_visual or row.get('tool') != 'inspect_images'
+                        or recorded.get('status') != 'ok'
+                        or not any(is_reached(locator) for locator in recorded.get('artifacts', []))):
                     continue
+                if not include_delivery:
+                    check_owner_receipts(row)
+                owner_result = self._receipt_result(row['receipt']) if 'receipt' in row else recorded
+                images = owner_result.get('data', {}).get('input_sha256')
+                if owner_result.get('status') != 'ok' or not isinstance(images, dict):
+                    raise ValueError('Selected visual observation lacks its original input binding')
                 if self.workspace.artifact_hashes(images) != images:
                     raise ValueError('Selected visual observation has changed image inputs')
                 for locator, digest in images.items():
@@ -581,9 +612,95 @@ class InspectionToolGateway:
             chosen = (receipt.get('attempt') in owner_ids
                 or any(Path(path).parent == process_directory for path in selected_paths))
             if row.get('tool') == 'run_process' and receipt and chosen:
+                if not include_delivery:
+                    check_owner_receipts(row)
                 for locator, digest in self._check_bound_process_inputs(receipt, row['arguments']).items():
                     bind(locator, digest)
+        source_rows = list(selected or [])
+        if include_delivery and saved.get('source_priming_policy') == 'priority.v1':
+            source_rows.extend(row for row in [*saved['targets'], *saved['evidence']] if row not in source_rows)
+        for row in source_rows:
+            for window in row.get('windows', []):
+                reference = window.get('source_reference')
+                exposed = (row.get('path'), row.get('sha256'), window.get('offset_bytes'),
+                    window.get('review_next_offset_bytes')) in supplied
+                if reference and (row in (selected or []) or exposed) and (
+                        saved.get('source_priming_policy') == 'priority.v1' or not include_delivery):
+                    for locator, digest in self._reused_source_dependencies(
+                            reference, row['path'], visited=visited, journal_cache=journal_cache).items():
+                        bind(locator, digest)
         return dependencies
+
+    def _reused_source_dependencies(self, reference: dict, path: str, *,
+                                    visited: set[tuple[str, str]] | None = None,
+                                    validated: dict | None = None,
+                                    journal_cache: dict | None = None) -> dict[str, str]:
+        """Check known upstream owners of one retained read, without adopting its opinion."""
+        from simple_ar.tools.materials import validate_material_observation
+        from simple_ar.tools.professional_outcomes import journal_input_dependencies
+
+        seen = visited if visited is not None else set()
+        key = (json.dumps(reference, sort_keys=True, ensure_ascii=False), str(self.workspace.resolve(path)))
+        if key in seen:
+            raise ValueError('Retained inspection sources contain a dependency cycle')
+        seen.add(key)
+        try:
+            observed = validated or validate_material_observation(self.workspace, reference, identity='inspection-source')
+            if str(self.workspace.resolve(observed['request']['path'])) != key[1]:
+                raise ValueError('Retained source names a different current file')
+            self.workspace.check_artifact_producers([path])
+            dependencies = journal_input_dependencies(self.root, self.workspace, path, cache=journal_cache)
+
+            def merge(other: dict[str, str]) -> dict[str, str]:
+                for locator, digest in other.items():
+                    if locator in dependencies and dependencies[locator] != digest:
+                        raise ValueError('Retained sources have conflicting input versions')
+                    dependencies[locator] = digest
+                return dependencies
+
+            source = reference.get('content_reuse', {}).get('source')
+            if source:
+                return merge(self._reused_source_dependencies(source, source['request']['path'],
+                    visited=seen, journal_cache=journal_cache))
+            if 'record' not in reference:
+                return dependencies
+            receipt = json.loads(self.workspace.resolve(reference['record']).read_bytes())
+            previous = receipt
+            if receipt.get('tool_name') != 'inspect_artifacts':
+                previous = (receipt.get('metadata') or {}).get('delivery_review', {}).get('result', {})
+            binding = (previous.get('metadata') or {}).get('inspection_binding')
+            artifact = (previous.get('data') or {}).get('record')
+            if previous.get('tool_name') != 'inspect_artifacts' or not isinstance(binding, dict) or not artifact:
+                return dependencies  # The byte read is known; no upstream inspection contract was recorded.
+            parts = Path(artifact).parts
+            if len(parts) != 4 or parts[0] != 'attempts' or parts[2] != 'inspection':
+                raise ValueError('Retained inspection source has an invalid owner')
+            scope = parts[1]
+            input_path = self._path(scope, 'input')
+            if self._digest(input_path) != binding.get('input_sha256'):
+                raise ValueError('Retained inspection input changed')
+            prior = self.store.read_json(input_path)
+            if (prior.get('identity') != scope or prior.get('targets') != previous['data'].get('targets')
+                    or prior.get('evidence') != previous['data'].get('evidence')):
+                raise ValueError('Retained reads differ from their inspection input')
+            receipt_path = self.workspace.resolve(reference['record'])
+            if receipt.get('tool_name') == 'inspect_artifacts':
+                from simple_ar.tools.professional_outcomes import accepted_native_result, accepted_scoped_opinion
+                session_id = self.store.read_json('session_manifest.json')['session_id']
+                attempt = ArtifactStore(receipt_path.parent).read_attempt_manifest()
+                if attempt.capability == 'native_action':
+                    accepted_scoped_opinion(self.root, self.workspace, session_id,
+                        reference['record'], scope, expected=receipt)
+                else:
+                    accepted_native_result(self.root, session_id, receipt, receipt_path.parent.name)
+            matches = [row for row in [*prior['targets'], *prior['evidence']]
+                if row.get('path') == key[1] and row.get('sha256') == observed['data'].get('sha256')]
+            if not matches:
+                raise ValueError('Retained read is absent from its inspection input')
+            return merge(self._check_shared_dependencies(prior, current_inputs=True, selected=matches,
+                include_delivery=False, visited=seen, journal_cache=journal_cache))
+        finally:
+            seen.remove(key)
 
     def _shared_final_bindings(self, saved: dict, response: dict) -> dict[str, dict[str, str]]:
         observed = {row['subject']:row for row in [*saved['targets'], *saved['evidence']]}
@@ -659,7 +776,9 @@ class InspectionToolGateway:
                 'data': {'source_observations': {'record': receipt_path,
                     'fields': ['data.targets', 'data.evidence', 'metadata.delivery_assessment', 'metadata.usage'],
                     'scope': 'Original windows, exact version bindings and usage remain in this receipt. '
-                        'This projected opinion is guidance, not source evidence or current acceptance.'}},
+                        'This projected opinion is guidance, not source evidence or current acceptance.'},
+                    **({'rejected_opinion': deepcopy(result.data['rejected_opinion'])}
+                       if 'rejected_opinion' in result.data else {})},
                 'metadata': {'delivery_opinion': {
                     'projection': 'delivery_opinion',
                     'coverage': package['coverage'], 'verdict': package['verdict'],
@@ -940,59 +1059,102 @@ class InspectionToolGateway:
         """Supply prior raw reads through the common byte owner, never prior verdicts."""
         from simple_ar.tools.materials import material_observation_seed
 
-        # Targets still require this review's actual reading. Reuse supporting
-        # source windows as optional material, never inherit a prior target pass.
-        subjects = [row for row in saved['evidence']
+        current = saved.get('source_priming_policy') == 'priority.v1'
+        subjects = [row for row in ([*saved['targets'], *saved['evidence']] if current else saved['evidence'])
             if row.get('readable') and row.get('sha256')]
-        paths = list(dict.fromkeys(row['path'] for row in subjects))
+        paths = list(dict.fromkeys(row['path'] for row in saved['evidence']
+            if row.get('readable') and row.get('sha256')))
         if remaining[0] <= 0:
             return
-        inventories = ([{'candidate_files': {row['path']: row['windows'][0]['size_bytes']
-                        for row in subjects}}] if paths else None)
-        seed = material_observation_seed(workspace=self.workspace,
-            inventories=inventories, provider=self.material_observations,
-            roots=paths or [str(root) for root in self.workspace.mounts.values()],
-            excluded_paths={row['path'] for row in saved['targets'] if row.get('path')},
-            context={}, remaining_capacity=min(96000, remaining[0]))
-        for observed in (seed or {}).get('observations', []):
-            data, request = observed['data'], observed['request']
-            path = data.get('absolute_path') or data.get('path') or request['path']
-            text = data['text']
-            if (not text.strip() or '\ufffd' in text or Path(path).suffix.lower() in _BINARY
-                    or any(ord(char) < 32 and char not in '\n\r\t\f' for char in text)):
-                continue
-            start = data.get('offset_bytes', request.get('offset_bytes', 0))
-            end = data['next_offset_bytes']
-            owners = [row for row in subjects if row['path'] == path and row['sha256'] == data['sha256']]
-            if end-start > remaining[0]:
-                continue
-            if not owners:
-                # The shared byte owner validated this historical source and
-                # its current version. Preserve that reference, not a fresh
-                # model claim or an inherited inspection verdict.
-                number = max((int(row['subject'].split('-')[1])
-                              for row in saved['evidence']), default=0) + 1
-                row = {'subject': f"evidence-{number}",
-                    'request': request, 'path': path, 'sha256': data['sha256'],
-                    'readable': True, 'complete': False, 'windows': []}
-                saved['evidence'].append(row)
-                subjects.append(row)
-                owners = [row]
-            admitted = False
-            for row in owners:
-                if any(w['offset_bytes'] <= start and end <= w['review_next_offset_bytes']
-                       for w in row['windows']):
+        targets = {row['path'] for row in saved['targets'] if row.get('path')}
+        journal_cache: dict[str, Any] = {}
+
+        def supply(seed: dict | None) -> None:
+            for observed in (seed or {}).get('observations', []):
+                data, request = observed['data'], observed['request']
+                path = data.get('absolute_path') or data.get('path') or request['path']
+                if current:
+                    try:
+                        self._reused_source_dependencies(observed, path, validated=observed,
+                            journal_cache=journal_cache)
+                    except (ValueError, TypeError, KeyError, OSError, RuntimeError):
+                        continue  # Unproved history remains in its original receipt.
+                text = data['text']
+                if (not text.strip() or '\ufffd' in text or Path(path).suffix.lower() in _BINARY
+                        or any(ord(char) < 32 and char not in '\n\r\t\f' for char in text)):
                     continue
-                row['windows'].append({**data, 'offset_bytes': start, 'review_text': text,
-                    'review_next_offset_bytes': end, 'read_request': request,
-                    'source_reference': {key: value for key, value in observed.items() if key != 'data'}})
-                admitted = True
-            if admitted:
-                remaining[0] -= end-start
-        for row in subjects:
-            row['complete'] = self._complete_target(row, subjects)
-            if row['complete']:
-                row.pop('limitation', None)
+                start = data.get('offset_bytes', request.get('offset_bytes', 0))
+                end = data['next_offset_bytes']
+                owners = [row for row in subjects if row['path'] == path and row['sha256'] == data['sha256']]
+                if end-start > remaining[0]:
+                    continue
+                if not owners:
+                    number = max((int(row['subject'].split('-')[1])
+                                  for row in saved['evidence']), default=0) + 1
+                    row = {'subject': f"evidence-{number}",
+                        'request': request, 'path': path, 'sha256': data['sha256'],
+                        'readable': True, 'complete': False, 'windows': []}
+                    saved['evidence'].append(row)
+                    subjects.append(row)
+                    owners = [row]
+                admitted = False
+                for row in owners:
+                    if any(w['offset_bytes'] <= start and end <= w['review_next_offset_bytes']
+                           for w in row['windows']):
+                        continue
+                    row['windows'].append({**data, 'offset_bytes': start, 'review_text': text,
+                        'review_next_offset_bytes': end, 'read_request': request,
+                        'source_reference': {key: value for key, value in observed.items() if key != 'data'}})
+                    admitted = True
+                if admitted:
+                    remaining[0] -= end-start
+            for row in subjects:
+                row['complete'] = self._complete_target(row, subjects)
+                if row['complete']:
+                    row.pop('limitation', None)
+
+        if not current:
+            inventories = ([{'candidate_files': {row['path']: row['windows'][0]['size_bytes']
+                            for row in subjects}}] if paths else None)
+            supply(material_observation_seed(workspace=self.workspace, inventories=inventories,
+                provider=self.material_observations, roots=paths or [str(root) for root in self.workspace.mounts.values()],
+                excluded_paths=targets, context={}, remaining_capacity=min(96000, remaining[0])))
+            return
+
+        # Reuse actual current target/delivery windows first. Only then reserve
+        # the missing current ranges before offering unrelated historical reads.
+        # The original read is not an inherited opinion or a new permission.
+        default_window = FileWindow.model_fields['max_bytes'].default
+        primary = set(targets)
+        if self._delivery_scope(saved):
+            primary.update(str(self.workspace.resolve(path)) for path in saved['delivery_context']['artifacts'])
+        candidates = {}
+        for locator in primary:
+            try:
+                path = self.workspace.resolve(locator)
+                if path.is_file() and path.suffix.lower() not in _BINARY:
+                    candidates[str(path)] = path.stat().st_size
+            except (ValueError, OSError):
+                continue
+        if candidates and remaining[0] > default_window:
+            supply(material_observation_seed(workspace=self.workspace,
+                inventories=[{'candidate_files': candidates}], provider=self.material_observations,
+                roots=list(candidates), excluded_paths=set(), context={},
+                remaining_bytes=remaining[0] - default_window))
+        reserved = default_window
+        for path, size in candidates.items():
+            owners = [row for row in subjects if row['path'] == path and row.get('readable')]
+            missing = sum(end-start for start, end in self._missing_original_ranges(size, owners))
+            reserved += missing if path in targets else min(missing, default_window)
+        capacity = max(0, remaining[0] - reserved)
+        if capacity:
+            inventories = ([{'candidate_files': {row['path']: row['windows'][0]['size_bytes']
+                            for row in saved['evidence'] if row.get('readable') and row.get('sha256')}}]
+                           if paths else None)
+            supply(material_observation_seed(workspace=self.workspace, inventories=inventories,
+                provider=self.material_observations,
+                roots=paths or [str(root) for root in self.workspace.mounts.values()],
+                excluded_paths=set(candidates), context={}, remaining_bytes=capacity))
 
     def _complete_target(self, target: dict, rows: list[dict]) -> bool:
         """Actual decoded ranges, not a model declaration or a matching copy."""
@@ -1284,13 +1446,14 @@ class InspectionToolGateway:
                 last = next((row for row in trace.get('results', []) if row.get('call_id') == call_id), {})
                 rejected = last.get('result', {})
                 arguments = last.get('arguments', {})
-                rows = arguments.get('decisions', []) if isinstance(arguments, dict) else []
+                rows = ([arguments] if package else arguments.get('decisions', [])) if isinstance(arguments, dict) else []
                 candidates = []
                 for row in rows[:4] if isinstance(rows, list) else []:
                     if not isinstance(row, dict):
                         continue
                     findings = row.get('findings', [])
-                    candidates.append({'subject': str(row.get('subject', '<omitted>'))[:120],
+                    candidates.append({**({'scope': 'proposed_delivery'} if package else
+                        {'subject': str(row.get('subject', '<omitted>'))[:120]}),
                         'candidate_messages': [str(item.get('message', ''))[:320]
                             for item in (findings[:3] if isinstance(findings, list) else [])
                             if isinstance(item, dict)]})
@@ -1348,7 +1511,16 @@ class InspectionToolGateway:
         else:
             raise ValueError('Inspection response has no retained completion state')
         expected = self._finish(saved, deepcopy(receipt), identity, failure=failure, persist=False)
-        if retained != expected.model_dump(mode='json'):
+        expected_result = expected.model_dump(mode='json')
+        if self._delivery_scope(saved) and expected_result['data'].get('rejected_opinion'):
+            # Earlier package diagnostics retained the full trace but rendered
+            # no excerpt. Accept that exact historical projection on load;
+            # never rewrite it or turn its rejected findings into an assessment.
+            historical = deepcopy(expected_result)
+            historical['data']['rejected_opinion']['candidate_excerpt'] = []
+            if retained == historical:
+                expected_result = historical
+        if retained != expected_result:
             raise ValueError('Inspection retained result differs from its response; no overwrite')
         if (self.store.require(result_path).read_bytes() != result_bytes
                 or self.store.require(response_path).read_bytes() != response_bytes
@@ -1896,13 +2068,19 @@ class InspectionToolGateway:
 
     def _prime_targets(self, saved: dict, request: InspectionRequest, identity: str,
                        remaining: list[int], client: Any, offered: list) -> None:
-        """Supply required small inputs once, without asking the reviewer to page them.
+        """Supply whole-file requests without asking the reviewer to select pages.
 
         Only a whole-file request may expand. The ordinary projector admits the
         actual decoded bytes; reading them neither concludes nor passes a review.
         A cached inspection never enters this fresh-work path.
         """
         if not self.progressive:
+            return
+        if saved.get('source_priming_policy') == 'priority.v1':
+            originals = [(row['path'], row['sha256'], [row])
+                for value, row in zip(request.targets, saved['targets'])
+                if isinstance(value, str) and row.get('readable') and not row.get('complete')]
+            self._prime_originals(saved, request, identity, remaining, client, offered, originals)
             return
         for index, value in enumerate(request.targets):
             row = saved['targets'][index]
@@ -1917,8 +2095,7 @@ class InspectionToolGateway:
             window = row['windows'][-1]
             size, cursor = window['size_bytes'], window['review_next_offset_bytes']
             count = size - cursor
-            # One normal read at most. A conservative byte bound avoids spending
-            # the shared read allowance probing files unlikely to fit the view.
+            # Historical owners retain their original one-read allocation.
             bound = (256000 if saved.get('delivery_context', {}).get('schema_version') == 'delivery_review.v2'
                 else 64000)
             if not 0 < count <= min(bound, remaining[0], headroom):
@@ -1939,19 +2116,72 @@ class InspectionToolGateway:
                 saved['targets'][index] = merged
         self.store.write_json(self._path(identity, 'input'), saved)
 
-    def _prime_delivery(self, saved: dict, identity: str, remaining: list[int]) -> None:
-        """Read a bounded current delivery as one work unit, not repeated model-selected pages.
+    @staticmethod
+    def _missing_original_ranges(size: int, owners: list[dict]) -> list[tuple[int, int]]:
+        windows = sorted((window['offset_bytes'], window['review_next_offset_bytes'])
+            for owner in owners for window in owner['windows'] if window['size_bytes'] == size)
+        gaps, cursor = [], 0
+        for start, end in windows:
+            if not 0 <= start <= end <= size:
+                continue
+            if start > cursor:
+                gaps.append((cursor, start))
+            cursor = max(cursor, end)
+        if cursor < size or not size and not owners:
+            gaps.append((cursor, size))
+        return gaps
 
-        The owner already bound these files. Originals still use the common
-        reader, selector and decoded-read allowance; binary/large bundles keep
-        ordinary investigation. A read or a matching hash grants no verdict.
-        Historical delivery scopes and local inspections do not enter this path.
-        """
+    def _prime_delivery(self, saved: dict, request: InspectionRequest, identity: str,
+                        remaining: list[int], client: Any, offered: list) -> None:
+        """Supply authorized originals without an all-or-nothing bundle gate."""
         delivery = saved.get('delivery_context', {})
         if not self.adaptive or delivery.get('schema_version') not in {'delivery_review.v2','delivery_review.v3'}:
             return
         targets = {row['path'] for row in saved['targets']}
-        pending = []
+        if saved.get('source_priming_policy') != 'priority.v1':
+            # Historical inspections keep their saved all-or-nothing contract.
+            pending = []
+            for path, digest in delivery['artifacts'].items():
+                if path in targets or Path(path).suffix.lower() in _BINARY:
+                    continue
+                owners = [row for row in saved['evidence']
+                    if row.get('readable') and row.get('path') == path and row.get('sha256') == digest]
+                if owners and self._complete_target(owners[0], owners):
+                    continue
+                size = self.workspace.resolve(path).stat().st_size
+                if size > 256000:
+                    return
+                pending.append((path, digest, self._missing_original_ranges(size, owners), owners))
+            if sum(end-start for _, _, gaps, _ in pending for start, end in gaps) > remaining[0]:
+                return
+            number = max((int(row['subject'].split('-')[1]) for row in saved['evidence']), default=0)
+            for path, digest, gaps, owners in pending:
+                if not owners:
+                    number += 1
+                subject = owners[0]['subject'] if owners else f'evidence-{number}'
+                for start, end in gaps:
+                    observed = self._observe(FileWindow(path=path, offset_bytes=start, max_bytes=max(1, end-start)),
+                        subject, identity, remaining)
+                    if observed.get('sha256') and observed['sha256'] != digest:
+                        raise ValueError('Delivery input changed before review; no stale inspection')
+                    if not observed.get('readable'):
+                        break
+                    if owners:
+                        owners[0]['windows'].extend(observed['windows'])
+                        owners[0]['windows'].sort(key=lambda window: window['offset_bytes'])
+                    else:
+                        saved['evidence'].append(observed)
+                        owners = [observed]
+                    owner = owners[0]
+                    owner['complete'] = self._complete_target(owner, owners)
+                    if owner['complete']:
+                        owner.pop('limitation', None)
+                    self.store.write_json(self._path(identity, 'input'), saved)
+            saved['initial_subjects'] = [row['subject'] for row in [*saved['targets'], *saved['evidence']]]
+            self._mark_evidence(saved)
+            self.store.write_json(self._path(identity, 'input'), saved)
+            return
+        originals = []
         for path, digest in delivery['artifacts'].items():
             if path in targets or Path(path).suffix.lower() in _BINARY:
                 continue
@@ -1959,35 +2189,80 @@ class InspectionToolGateway:
                 if row.get('readable') and row.get('path') == path and row.get('sha256') == digest]
             if owners and self._complete_target(owners[0], owners):
                 continue
+            originals.append((path, digest, owners))
+        self._prime_originals(saved, request, identity, remaining, client, offered, originals)
+
+    def _prime_originals(self, saved: dict, request: InspectionRequest, identity: str,
+                         remaining: list[int], client: Any, offered: list, originals: list) -> None:
+        """Page missing byte ranges, then let the public selector admit real text.
+
+        Small originals get a first opportunity before larger ones; subsequent
+        pages alternate among materials. A capacity miss stops that material,
+        not the bundle, and its actual read remains in input.json for recovery.
+        Neither file identity nor a previous opinion supplies a text window.
+        """
+        def save_observations():
+            if saved.get('execution_protocol') == 'shared.v1':
+                # This existing field is the allowance before sources-0. Keep
+                # it beside each primed read so interruption cannot renew quota.
+                saved['initial_read_remaining'] = remaining[0]
+            self.store.write_json(self._path(identity, 'input'), saved)
+
+        pending = []
+        for path, digest, owners in originals:
             size = self.workspace.resolve(path).stat().st_size
-            if size > 256000:
-                return  # No forced truncation or larger read quota for this bundle.
-            gaps, cursor = [], 0
-            windows = sorted((window['offset_bytes'], window['review_next_offset_bytes'])
-                for owner in owners for window in owner['windows'] if window['size_bytes'] == size)
-            for start, end in windows:
-                if not 0 <= start <= end <= size:
-                    continue
-                if start > cursor:
-                    gaps.append((cursor, start))
-                cursor = max(cursor, end)
-            if cursor < size or not size and not owners:
-                gaps.append((cursor, size))
-            pending.append((path, digest, gaps, owners))
-        if sum(end-start for _, _, gaps, _ in pending for start, end in gaps) > remaining[0]:
-            return
+            gaps = self._missing_original_ranges(size, owners)
+            if gaps:
+                pending.append((path, digest, gaps, owners))
+        pending.sort(key=lambda item: sum(end-start for start, end in item[2]))
         number = max((int(row['subject'].split('-')[1]) for row in saved['evidence']), default=0)
-        for path, digest, gaps, owners in pending:
-            if not owners:
-                number += 1
-            subject = owners[0]['subject'] if owners else f'evidence-{number}'
-            for start, end in gaps:
-                observed = self._observe(FileWindow(path=path, offset_bytes=start, max_bytes=max(1, end-start)),
+        # Leave one ordinary source window for the inspector to investigate;
+        # saved legacy tasks retain their original priming behaviour.
+        reserve = (FileWindow.model_fields['max_bytes'].default
+            if saved.get('source_priming_policy') == 'priority.v1' else 0)
+        while pending and remaining[0] > reserve:
+            _, projection = self._working_messages(saved, request, [], offered, client,
+                validate_capacity=False)
+            if projection['required_input_tokens'] >= projection['input_token_target']:
+                break  # Source reads cannot repair required-input overflow.
+            observed_batch = []
+            for path, digest, gaps, owners in pending:
+                if remaining[0] <= reserve:
+                    break
+                if not owners:
+                    number += 1
+                subject = owners[0]['subject'] if owners else f'evidence-{number}'
+                start, end = gaps[0]
+                # Read a useful first window. For an observed source its actual
+                # token/byte ratio guides the next window; the shared selector
+                # still decides whether the original text fits.
+                sample = next((window['review_text'] for owner in owners
+                    for window in reversed(owner['windows']) if window.get('review_text', '').strip()), '')
+                page_bytes = 16000 if not sample else 64000
+                if sample:
+                    framing = estimate_tokens(json.dumps({'path': path, 'sha256': digest,
+                        'offset_bytes': start, 'next_offset_bytes': end, 'text': ''}, ensure_ascii=False))
+                    # Required targets may displace optional historical sources;
+                    # the common selector owns that priority and the final fit.
+                    cost = ('required_input_tokens' if any(row['subject'] == subject
+                        for row in saved['targets']) else 'estimated_input_tokens')
+                    tokens = projection['input_token_target'] - projection[cost] - framing
+                    if tokens <= 0:
+                        continue
+                    page_bytes = min(page_bytes, max(1,
+                        tokens * len(sample.encode('utf-8')) // max(1, estimate_tokens(sample))))
+                observed = self._observe(FileWindow(path=path, offset_bytes=start,
+                    max_bytes=max(1, min(page_bytes, end-start, remaining[0] - reserve))),
                     subject, identity, remaining)
-                if observed.get('sha256') and observed['sha256'] != digest:
-                    raise ValueError('Delivery input changed before review; no stale inspection')
-                if not observed.get('readable'):
-                    break  # Keep earlier actual windows; never complete an unread gap.
+                # Persist failures and changed-version observations too. They
+                # are audit records, never admissible replacement source text.
+                if not observed.get('readable') or observed.get('sha256') != digest:
+                    number += 1
+                    saved['evidence'].append({**observed, 'subject': f'evidence-{number}'})
+                    save_observations()
+                    if observed.get('sha256') and observed['sha256'] != digest:
+                        raise ValueError('Inspection input changed before review; no stale inspection')
+                    continue
                 if owners:
                     owners[0]['windows'].extend(observed['windows'])
                     owners[0]['windows'].sort(key=lambda window:window['offset_bytes'])
@@ -1998,10 +2273,38 @@ class InspectionToolGateway:
                 owner['complete'] = self._complete_target(owner, owners)
                 if owner['complete']:
                     owner.pop('limitation', None)
-                self.store.write_json(self._path(identity, 'input'), saved)
-        saved['initial_subjects'] = [row['subject'] for row in [*saved['targets'], *saved['evidence']]]
+                save_observations()
+                observed_batch.append((path, digest, gaps, owners, observed))
+            if not observed_batch:
+                break
+            # Evaluate the whole round once instead of rebuilding the complete
+            # context and rechecking every file after each decoded window.
+            messages, projection = self._working_messages(saved, request, [], offered, client,
+                validate_capacity=False)
+            visible = json.loads(messages[1]['content']).get('working_view', {}).get('observations', [])
+            following = []
+            for path, digest, gaps, owners, observed in observed_batch:
+                start, end = gaps[0]
+                windows = observed['windows']
+                supplied = all(any(entry['observation'].get('path') == path
+                    and entry['observation'].get('sha256') == digest
+                    and entry['observation'].get('offset_bytes') == window['offset_bytes']
+                    and entry['observation'].get('next_offset_bytes') == window['review_next_offset_bytes']
+                    and entry['observation'].get('text') == window['review_text'] for entry in visible)
+                    for window in windows)
+                cursor = windows[-1]['review_next_offset_bytes']
+                if (not supplied or projection['estimated_input_tokens'] > projection['input_token_target']
+                        or cursor <= start):
+                    continue
+                if cursor < end:
+                    gaps[0] = (cursor, end)
+                else:
+                    gaps.pop(0)
+                if gaps:
+                    following.append((path, digest, gaps, owners))
+            pending = following
         self._mark_evidence(saved)
-        self.store.write_json(self._path(identity, 'input'), saved)
+        save_observations()
 
     def _admit_response(self, saved: dict, calls: list, offered: list, response_model: Any,
                         read_names: set[str], *, shared: bool) -> tuple[list, str, dict | None, list]:
@@ -2101,8 +2404,11 @@ class InspectionToolGateway:
                 'Return this alone after reading evidence; it executes no external operation.',
             'parameters':response_model.model_json_schema()}}
         if not shared or not saved.get('source_rounds'):
-            self._prime_delivery(saved, identity, remaining)
-            self._prime_targets(saved, request, identity, remaining, client, [*tools, terminal])
+            if saved.get('source_priming_policy') == 'priority.v1':
+                self._prime_targets(saved, request, identity, remaining, client, [*tools, terminal])
+            self._prime_delivery(saved, request, identity, remaining, client, [*tools, terminal])
+            if saved.get('source_priming_policy') != 'priority.v1':
+                self._prime_targets(saved, request, identity, remaining, client, [*tools, terminal])
             if shared:
                 trace = self._path(identity, 'sources-0')
                 self.store.write_json(trace, {'primed':True, 'remaining':remaining[0],
@@ -2512,6 +2818,7 @@ class InspectionToolGateway:
                 if self.operation_specs is None or self.operation_call is None:
                     raise ValueError('Shared inspection requires the actual operation specs and operation gateway')
                 saved['execution_protocol'] = 'shared.v1'
+                saved['source_priming_policy'] = 'priority.v1'
             if self.protocol:
                 saved['protocol'] = self.protocol
             if self.adaptive:
@@ -2622,6 +2929,24 @@ class InspectionToolGateway:
         package = self._delivery_scope(saved)
         request = (_DeliveryInspectionRequest if package else InspectionRequest).model_validate(saved['arguments'])
         remaining = [saved['initial_read_remaining']]
+        if not saved.get('source_rounds'):
+            # Older shared inspections could persist primed windows without
+            # lowering the initial allowance. Recover from actual retained
+            # reads, never grant that decoded capacity a second time.
+            consumed, references = 0, set()
+            for row in [*saved['targets'], *saved['evidence']]:
+                for window in row.get('windows', []):
+                    start, end = window.get('offset_bytes'), window.get('next_offset_bytes')
+                    if type(start) is not int or type(end) is not int or not 0 <= start <= end:
+                        raise ValueError('Retained inspection window has invalid byte coverage')
+                    reference = window.get('source_reference')
+                    if reference:
+                        key = json.dumps(reference, sort_keys=True, ensure_ascii=False)
+                        if key in references:
+                            continue
+                        references.add(key)
+                    consumed += end - start
+            remaining[0] = min(remaining[0], max(0, 512000 - consumed))
 
         def invoke(kind, position, call, perform):
             try:
