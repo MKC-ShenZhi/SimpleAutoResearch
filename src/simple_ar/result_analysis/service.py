@@ -391,7 +391,7 @@ def hypothesis_placeholder_claims(context: AnalysisContext, metric_summary: dict
         verdict = "not_evaluated"
         limitations = ["No grounded verdict was found in the run artifacts."]
         if paired_summaries:
-            verdict, evidence, limitations = _evaluate_paired_hypothesis(
+            evidence, limitations = _paired_hypothesis_evidence(
                 metric_refs, evidence, paired_summaries, metric_summary
             )
         claims.append(
@@ -420,23 +420,24 @@ def _paired_summary_rows(project_results: Mapping[str, Any]) -> list[dict[str, A
     return []
 
 
-def _evaluate_paired_hypothesis(
+def _paired_hypothesis_evidence(
     metric_refs: list[str],
     evidence: list[dict[str, Any]],
     summaries: list[dict[str, Any]],
     metric_summary: Mapping[str, Any],
-) -> tuple[str, list[dict[str, Any]], list[str]]:
-    """Evaluate declared metric directions from paired summaries.
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Describe paired changes without inferring what a hypothesis asserts.
 
-    This is a directional, descriptive verdict. It never treats an unknown
-    direction, an ambiguous metric, or a zero change as support.
+    A metric's preferred direction is not the hypothesis's predicted direction,
+    conditions, or strength of evidence. Keep the measured changes available
+    to a later evaluation rather than assigning a hypothesis verdict from them.
     """
     directions = {
         str(row.get("name")): str(row.get("direction") or "unknown")
         for row in metric_summary.get("metrics", []) or []
         if isinstance(row, Mapping) and row.get("name")
     }
-    evaluated: list[bool] = []
+    found = False
     unavailable: list[str] = []
     added_evidence = list(evidence)
     for reference in metric_refs:
@@ -458,12 +459,12 @@ def _evaluate_paired_hypothesis(
                 or isinstance(delta, bool)
                 or not isinstance(delta, (int, float))
                 or not math.isfinite(float(delta))
-                or not row.get("n")):
+                or type(row.get("n")) is not int or row["n"] < 1):
             unavailable.append(reference)
             continue
         delta_value = float(delta)
         favorable = (delta_value > 0) if direction == "higher" else (delta_value < 0)
-        evaluated.append(favorable)
+        found = True
         added_evidence.append({
             "source": f"paired_summary:{metric}",
             "metric": metric,
@@ -475,33 +476,21 @@ def _evaluate_paired_hypothesis(
             "favorable": favorable,
         })
 
-    if not evaluated:
-        return (
-            "not_evaluated",
-            added_evidence,
-            ["No unique paired measurement with a known direction was available for the declared metrics."],
-        )
+    if not found:
+        return added_evidence, [
+            "No unique paired measurement with a known direction was available for the declared metrics."
+        ]
     limitations = [
-        "Directional comparison is descriptive; no significance test or population uncertainty was established."
+        "Directional comparison is descriptive; no significance test or population uncertainty was established.",
+        "Metric preferences and observed paired means do not determine whether the stated hypothesis "
+        "or its conditions are supported; evaluate the claim separately.",
     ]
     if unavailable:
         limitations.append(
             "Some declared metrics were unavailable, ambiguous, or had no usable direction: "
             + ", ".join(unavailable) + "."
         )
-        # An unavailable metric does not turn an observed refutation into
-        # support. Only return partial support when at least one measured
-        # metric actually favors the claim.
-        if not any(evaluated):
-            return "unsupported", added_evidence, limitations
-        limitations.append("Metric directions alone cannot determine support for the stated hypothesis when evidence is incomplete.")
-        return "not_evaluated", added_evidence, limitations
-    if all(evaluated):
-        return "supported", added_evidence, limitations
-    if any(evaluated):
-        limitations.append("Mixed metric directions require evaluation against the stated hypothesis; an ancillary improvement is not partial support by itself.")
-        return "not_evaluated", added_evidence, limitations
-    return "unsupported", added_evidence, limitations
+    return added_evidence, limitations
 
 
 def deterministic_markdown(

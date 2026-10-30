@@ -184,6 +184,15 @@ class AnalysisCapabilityTests(unittest.TestCase):
             self.assertIsNone(summaries[1]["delta_sample_std"])
             self.assertTrue(any("no significance" in text for text in evidence["limitations"]))
             self.assertEqual(evidence["implementation_ref"], implementation_ref.to_dict())
+            one_group = store.write_json('one-group.json', {
+                'pairs': pairs[:2], 'implementation_ref': implementation_ref.to_dict()}, kind='experiment_set')
+            analyze_experiment_capability(context=CapabilityContext(store, AttemptManifest('hypothesis'),
+                inputs=(one_group, *inputs, implementation_ref)), result_ref=one_group,
+                analysis_context={'hypotheses': [{'id': 'h', 'statement': 'Accuracy decreases.',
+                    'metric_refs': ['accuracy']}], 'expected_metrics': [{'name': 'accuracy', 'direction': 'higher'}]})
+            claim = store.read_json('analysis.json')['analysis']['claims'][0]
+            self.assertEqual(claim['verdict'], 'not_evaluated')
+            self.assertAlmostEqual(claim['evidence'][0]['delta'], 0.2)
             candidate_only = store.write_json('candidate-only.json', {'pairs': [
                 {**pair, 'baseline': None} for pair in pairs], 'baseline_policy': 'skip'}, kind='experiment_set')
             analyze_experiment_capability(context=CapabilityContext(store, AttemptManifest('candidate-only'),

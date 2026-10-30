@@ -350,7 +350,7 @@ class ResultAnalysisTests(unittest.TestCase):
         self.assertIn("f1", result.audit.missing_required_metrics)
         self.assertIn("all comparable metrics are zero", result.audit.weak_metric_signals)
 
-    def test_paired_hypothesis_uses_directional_summary_evidence(self) -> None:
+    def test_paired_summary_does_not_infer_a_hypothesis_verdict(self) -> None:
         context = AnalysisContext(
             task_id="paired",
             hypotheses=[{
@@ -373,15 +373,26 @@ class ResultAnalysisTests(unittest.TestCase):
             },
         )
 
-        result = run_result_analysis(context)
+        for statement in ("The candidate lowers forgetting.", "The candidate increases forgetting."):
+            with self.subTest(statement=statement):
+                hypothesis = {**context.hypotheses[0], "statement": statement}
+                result = run_result_analysis(context.model_copy(update={"hypotheses": [hypothesis]}))
+                claim = result.claims[0]
+                self.assertEqual(claim.verdict, "not_evaluated")
+                evidence = next(item for item in claim.evidence if item.get("source") == "paired_summary:forgetting")
+                self.assertEqual(evidence["delta"], -0.1)
+                self.assertTrue(evidence["favorable"])
+                self.assertIn("no significance test", claim.limitations[0])
+                self.assertTrue(any("do not determine" in item for item in claim.limitations))
+        for count in (0, -1, True, 3.0, "3"):
+            with self.subTest(invalid_pair_count=count):
+                summary = {**context.project_results["paired_summary"][0], "n": count}
+                results = {**context.project_results, "paired_summary": [summary]}
+                claim = run_result_analysis(context.model_copy(update={"project_results": results})).claims[0]
+                self.assertEqual(claim.verdict, "not_evaluated")
+                self.assertNotIn("paired_summary:forgetting", {item.get("source") for item in claim.evidence})
 
-        self.assertEqual(result.claims[0].verdict, "supported")
-        self.assertIn("paired_summary:forgetting", {
-            item.get("source") for item in result.claims[0].evidence
-        })
-        self.assertIn("no significance test", result.claims[0].limitations[0])
-
-    def test_missing_metric_does_not_turn_only_refuted_evidence_into_partial_support(self) -> None:
+    def test_missing_metric_keeps_paired_hypothesis_unevaluated(self) -> None:
         context = AnalysisContext(
             task_id="paired-incomplete",
             hypotheses=[{
@@ -408,7 +419,7 @@ class ResultAnalysisTests(unittest.TestCase):
 
         result = run_result_analysis(context)
 
-        self.assertEqual(result.claims[0].verdict, "unsupported")
+        self.assertEqual(result.claims[0].verdict, "not_evaluated")
         self.assertTrue(any("unavailable" in item for item in result.claims[0].limitations))
 
     def test_secondary_improvement_does_not_imply_partial_hypothesis_support(self) -> None:
@@ -433,7 +444,7 @@ class ResultAnalysisTests(unittest.TestCase):
         claim = result.claims[0]
         self.assertEqual(claim.verdict, "not_evaluated")
         self.assertEqual(len(claim.evidence), 3)
-        self.assertTrue(any("Mixed metric directions" in item for item in claim.limitations))
+        self.assertTrue(any("do not determine" in item for item in claim.limitations))
 
     def test_llm_supported_claim_without_evidence_is_downgraded(self) -> None:
         context = AnalysisContext(
