@@ -17,7 +17,6 @@ from typing import Any
 from simple_ar.core import ArtifactRef, ArtifactStore, SessionManifest
 from simple_ar.research.workflow_contracts import ResearchBrief
 
-from .research_application import ResearchApplicationServices
 from .research_intake import create_research_task
 
 
@@ -96,7 +95,7 @@ def import_legacy_session(
     *,
     requested_outputs: Iterable[str] | None = None,
     artifact_names: Iterable[str] = (),
-    services: ResearchApplicationServices | None = None,
+    services: Any | None = None,
     max_artifact_bytes: int = _DEFAULT_MAX_ARTIFACT_BYTES,
 ) -> SessionMigrationResult:
     """Create a new application session from a read-only v1 session.

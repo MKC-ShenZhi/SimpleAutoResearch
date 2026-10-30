@@ -469,33 +469,23 @@ def migrate_structured_creation(args: argparse.Namespace, *, request: str, outpu
                                 report_config: dict, writing_method: str | None,
                                 data_analysis: dict | None, review_model: str | None = None) -> None:
     """Project domain contracts into one task; modules own their local work."""
-    from simple_ar.app.research_application import ResearchApplicationServices
-    from simple_ar.app.research_intake import create_research_task
+    from simple_ar.app.research_intake import create_structured_research_task
     from simple_ar.research.workflow_contracts import ResearchBrief
     model = args.model if data_analysis is None or 'report' in outputs else None
-    # CLI defaults remain CLI defaults. The common intake owns normalization,
-    # source aliases, report/table contracts and admission for all consumers.
-    config = dict(research_use_fulltext=False, research_allow_pdf_download=False,
-        research_keep_raw_pdf=False, research_max_pdf_mb=20, research_max_pdf_pages=100,
-        research_read_max_shortlist=args.max_results, research_max_iterations=0,
-        research_max_fulltext_documents=min(research_config.get('research_max_documents', args.max_results), args.max_results),
-        research_materials_only=data_analysis is not None or args.task_kind == 'writing')
+    config = dict(research_materials_only=data_analysis is not None or args.task_kind == 'writing')
     config.update(research_config)
     config.update(research_task_kind=args.task_kind, report=report_config,
         report_writing_method=writing_method, data_analysis=data_analysis,
-        max_output_tokens=getattr(args, 'max_output_tokens', None) if model else None,
-        research_execution_boundary={'timeout_sec': args.timeout_sec if args.timeout_sec is not None else 300})
+        max_output_tokens=getattr(args, 'max_output_tokens', None) if model else None)
     if review_model:
         config['feasibility_review_model'] = review_model
-    budgets = {**limits, **{name: getattr(args, name, None)
-        for name in ('process_invocations', 'process_wall_seconds')}}
-    services = ResearchApplicationServices(max_results=args.max_results, max_chunks=args.max_chunks,
-        idea_limit=args.idea_limit, cache_dir=Path(args.cache_dir).resolve() if args.cache_dir else None,
-        input_base_dir=Path.cwd(), config=config, budget_limits=budgets,
-        max_attempts=max(30, (limits.get('llm_requests') if limits.get('llm_requests') is not None else 30 if model else 0) * 10),
-        max_no_progress=6)
-    app = create_research_task(ResearchBrief(request_text=request, objective=args.topic,
-        requested_outputs=outputs, asset_requests=sources), root=root, services=services, model=model)
+    app = create_structured_research_task(ResearchBrief(request_text=request, objective=args.topic,
+        requested_outputs=outputs, asset_requests=sources), root=root, model=model,
+        config=config, budget_limits={**limits, **{name: getattr(args, name, None)
+            for name in ('process_invocations', 'process_wall_seconds')}},
+        input_base_dir=Path.cwd(), timeout_sec=args.timeout_sec,
+        max_results=args.max_results, max_chunks=args.max_chunks, idea_limit=args.idea_limit,
+        cache_dir=Path(args.cache_dir).resolve() if args.cache_dir else None)
     _run_created_research(app, request=request, root=root, outputs=outputs,
         question=args.topic, data_analysis=data_analysis)
 
@@ -590,32 +580,21 @@ def _create_declared_execution(args: argparse.Namespace, *, execution: dict, req
                                writing_method: str | None, research_work: bool,
                                confirm_protocol: bool = False):
     """CLI defaults and domain inputs only; intake owns all creation contracts."""
-    from simple_ar.app.research_application import ResearchApplicationServices
-    from simple_ar.app.research_intake import create_research_task
+    from simple_ar.app.research_intake import create_structured_research_task
     from simple_ar.research.workflow_contracts import ResearchBrief
     config = {**(research_config or {}), 'execution': execution,
-        'interaction': getattr(args, 'interaction', None) or (research_config or {}).get('interaction') or 'checkpoints',
         'require_design': (research_config or {}).get('require_design', research_work and 'experiments' in outputs),
         'execution_confirmation': confirm_protocol,
         'report': report_config or {}, 'report_writing_method': writing_method,
         'max_output_tokens': getattr(args, 'max_output_tokens', None) if args.model else None}
-    if research_work:
-        config.update(queries=list(args.queries or ()),
-            providers=list(args.providers or ('openalex', 'semantic_scholar', 'arxiv')))
-    budgets = {**limits}
-    for name, default in (('llm_requests', 30), ('total_tokens', 600000)):
-        if budgets.get(name) is None:
-            budgets[name] = default if args.model else 0
-        elif not args.model:
-            budgets[name] = 0
-    services = ResearchApplicationServices(config=config, budget_limits=budgets,
+    return create_structured_research_task(ResearchBrief(request_text=request, objective=args.topic,
+        requested_outputs=outputs, asset_requests=sources), root=root, model=args.model or None,
+        research_work=research_work, queries=args.queries, providers=args.providers,
+        interaction=getattr(args, 'interaction', None),
+        config=config, budget_limits=limits,
         input_base_dir=Path(args.config).resolve().parent if getattr(args, 'config', None) else Path.cwd(),
         max_results=args.max_results, max_chunks=args.max_chunks, idea_limit=args.idea_limit,
-        cache_dir=Path(args.cache_dir).resolve() if args.cache_dir else None,
-        max_attempts=max(20, budgets['llm_requests'] * 10 + 16), max_no_progress=6)
-    return create_research_task(ResearchBrief(request_text=request, objective=args.topic,
-        requested_outputs=outputs, asset_requests=sources), root=root, services=services,
-        model=args.model or None)
+        cache_dir=Path(args.cache_dir).resolve() if args.cache_dir else None)
 
 
 def _print_execution_confirmation(app, root: Path) -> None:

@@ -641,7 +641,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     self.assertEqual(defaults['max_turns'], args.max_turns)
                     self.assertEqual(defaults['max_tokens'], args.max_tokens)
                     self.assertEqual(defaults['allow_execution'], args.allow_execution)
-                    _, _, owner_limits, _ = ToolApplication._configuration(workspace.tasks,
+                    _, _, owner_limits, _ = ToolApplication.preview_creation(workspace.tasks,
                         'Configuration preview', model=None, sources={},
                         max_turns=args.max_turns, max_tokens=args.max_tokens)
                     for field in ('process_invocations', 'process_wall_seconds'):
@@ -735,9 +735,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     migrate_new_start(cli)
                     cli.model = 'profile:a'  # Same named route selection; no provider invocation.
                     options = native_creation_options(cli)
-                    projected = {k: v for k, v in options.items()
-                        if k not in {'professional_inputs', 'context_protocol'}}
-                    expected, _, expected_limits, _ = ToolApplication._configuration(workspace.tasks, cli.request, **projected)
+                    expected, _, expected_limits, _ = ToolApplication.preview_creation(workspace.tasks, cli.request, **options)
                     self.assertEqual(config_preview['goal'], cli.request)
                     self.assertEqual(config_preview['creation_declarations'], expected['creation_declarations'])
                     self.assertEqual(config_preview['limits'], expected_limits)

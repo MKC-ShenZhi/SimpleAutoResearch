@@ -1706,6 +1706,44 @@ class ToolApplication:
         return config, reused_inputs, limits, attempt_limit
 
     @classmethod
+    def preview_creation(cls, root: Path, goal: str, **options: Any) -> tuple[dict[str, Any], list, dict[str, Any], int]:
+        """Resolve the same creation contract as create(), without writing a session.
+
+        The returned configuration and resources are a preview, not permission
+        or a persistent task. Creation resolves them again before admission.
+        """
+        professional_inputs = options.pop('professional_inputs', False)
+        investigate_results = options.pop('investigate_results', True)
+        context_protocol = options.pop('context_protocol', 'auto')
+        control_protocol = options.setdefault('control_protocol', 'operations.v1')
+        if control_protocol != 'operations.v1':
+            raise ValueError('New tasks require control_protocol="operations.v1"; use load() for a saved historical task')
+        if type(professional_inputs) is not bool or type(investigate_results) is not bool:
+            raise ValueError('professional_inputs and investigate_results must be boolean')
+        if professional_inputs or not investigate_results or options.get('report_protocol') is not None:
+            raise ValueError('Professional controller options are load-only; new tasks use source operations, inspect_artifacts and export_report')
+        automatic_memory = context_protocol == 'auto'
+        if automatic_memory:
+            context_protocol = 'working.v4'
+        if context_protocol not in _CONTEXT_PROTOCOLS:
+            raise ValueError('Unsupported context protocol')
+        if options.get('creation_declarations') is not None and context_protocol not in _CONVERSATION_CONTEXT_PROTOCOLS:
+            raise ValueError('Declared inputs require a journal-backed conversation context')
+        config, reused, limits, attempts = cls._configuration(root, goal, **options)
+        config['inspection_protocol'] = 'subjects.v3'
+        config['inspection_execution_protocol'] = 'shared.v1'
+        if config['model'] is not None:
+            config['delivery_review_protocol'] = 'task.v3'
+        from simple_ar.app.operation_tools import CURRENT_PROFESSIONAL_CONTRACT
+        config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
+        if context_protocol is not None:
+            config['context_protocol'] = context_protocol
+        if automatic_memory:
+            config['memory_protocol'] = 'journal.v1'
+            config['context_checkpoint_policy'] = 'economic.v1'
+        return config, reused, limits, attempts
+
+    @classmethod
     def create(cls, root: Path, goal: str, *, model: str | None, sources: dict[str, Path],
                allow_execution: bool = False, allow_network: bool = False, allow_vision: bool = False, max_turns: int = 30,
                max_tokens: int = 600000, max_images: int = 0,
@@ -1727,26 +1765,14 @@ class ToolApplication:
                investigate_results: bool = True,
                control_protocol: Literal['operations.v1'] = 'operations.v1',
                creation_declarations: dict[str, Any] | None = None,
+               verify_creation: Callable[[tuple[dict[str, Any], list, dict[str, Any], int]], None] | None = None,
                context_protocol: Literal['auto', 'conversation.v1', 'working.v1', 'working.v2', 'working.v3', 'working.v4'] | None = 'auto') -> ToolApplication:
         """Create work on the operation-composed loop.
 
         Historical professional controllers are load-only. Loading and supply
         retain their saved contracts, approvals and ledger without migration.
         """
-        if control_protocol != 'operations.v1':
-            raise ValueError('New tasks require control_protocol="operations.v1"; use load() for a saved historical task')
-        if type(professional_inputs) is not bool or type(investigate_results) is not bool:
-            raise ValueError('professional_inputs and investigate_results must be boolean')
-        if professional_inputs or not investigate_results or report_protocol is not None:
-            raise ValueError('Professional controller options are load-only; new tasks use source operations, inspect_artifacts and export_report')
-        automatic_memory = context_protocol == 'auto'
-        if automatic_memory:
-            context_protocol = 'working.v4'
-        if context_protocol not in _CONTEXT_PROTOCOLS:
-            raise ValueError('Unsupported context protocol')
-        if creation_declarations is not None and context_protocol not in _CONVERSATION_CONTEXT_PROTOCOLS:
-            raise ValueError('Declared inputs require a journal-backed conversation context')
-        config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
+        prepared = cls.preview_creation(root, goal, model=model, sources=sources,
             allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
             max_turns=max_turns, max_tokens=max_tokens, max_images=max_images, project_python=project_python,
             code_task=code_task, process_limits=process_limits, report_requirement=report_requirement, report_protocol=report_protocol,
@@ -1755,21 +1781,12 @@ class ToolApplication:
             services=services, snapshot_sources=snapshot_sources, max_snapshot_bytes=max_snapshot_bytes,
             tool_contracts=tool_contracts, completion_policy=completion_policy, control_protocol=control_protocol,
             delivery_files=delivery_files,
-            extensions=extensions, creation_declarations=creation_declarations)
-        config['inspection_protocol'] = 'subjects.v3'
-        config['inspection_execution_protocol'] = 'shared.v1'
-        # Caller-driven tasks without a model cannot start an independent model
-        # review. Keep their actual delivery and any explicit checks usable;
-        # saved tasks retain whichever review contract they were created with.
-        if config['model'] is not None:
-            config['delivery_review_protocol'] = 'task.v3'
-        from simple_ar.app.operation_tools import CURRENT_PROFESSIONAL_CONTRACT
-        config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
-        if context_protocol is not None:
-            config['context_protocol'] = context_protocol
-        if automatic_memory:
-            config['memory_protocol'] = 'journal.v1'
-            config['context_checkpoint_policy'] = 'economic.v1'
+            extensions=extensions, creation_declarations=creation_declarations,
+            professional_inputs=professional_inputs, investigate_results=investigate_results,
+            context_protocol=context_protocol)
+        if verify_creation is not None:
+            verify_creation(deepcopy(prepared))
+        config, reused, limits, attempts = prepared
         session = SessionController.create(root, session_id=root.name, topic=goal,
             registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6))
         session.manifest.transition_recipe = cls.RECIPE
@@ -3925,7 +3942,7 @@ class ToolApplication:
                     # owner's actual preflight diagnosis so the next decision
                     # can repair the contract rather than repeat an opaque gate.
                     try:
-                        self._owner_execution_binding(call)
+                        self.execution_binding(call)
                     except (ValueError, TypeError, KeyError, OSError) as exc:
                         result = ToolResult(tool_name=call['function']['name'], status='error',
                             error=f'Execution proposal is invalid: {exc}; no execution occurred',
@@ -4765,7 +4782,8 @@ class ToolApplication:
         pending = self.state.get('pending') or {}
         return pending.get('action') or pending
 
-    def _owner_execution_binding(self, call: dict[str, Any]) -> dict[str, Any]:
+    def execution_binding(self, call: dict[str, Any]) -> dict[str, Any]:
+        """Describe the actual inputs bound to a pending execution approval."""
         name = call['function']['name']
         owner = self.gateway.session_owner(name)
         binding = owner.approval_binding(json.loads(call['function']['arguments']),
@@ -4784,7 +4802,7 @@ class ToolApplication:
     def approval_token(self, call: dict[str, Any]) -> str:
         if self.gateway.session_owner(call['function']['name']) is not None:
             return hashlib.sha256(json.dumps({'call': call,
-                'inputs': self._owner_execution_binding(call)},
+                'inputs': self.execution_binding(call)},
                 sort_keys=True).encode()).hexdigest()
         if call["function"]["name"] == "export_report":
             request = ExportRequest.model_validate(json.loads(call["function"]["arguments"]))
@@ -5411,7 +5429,7 @@ class ToolApplication:
                     raise ValueError('Execution inputs changed during approval; approve the current identity')
                 approval = {'token': token}
                 if self.gateway.session_owner(name) is not None:
-                    approval['binding'] = self._owner_execution_binding(call)
+                    approval['binding'] = self.execution_binding(call)
                 elif name == 'run_process':
                     approval['binding'] = self.workspace.approval_binding(call)
                 pending['execution_approval'] = approval

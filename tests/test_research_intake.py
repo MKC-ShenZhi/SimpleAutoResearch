@@ -13,6 +13,7 @@ from simple_ar.app.research_application import ResearchApplicationServices
 from simple_ar.app.research_intake import (
     ResearchInputError,
     create_research_task,
+    create_structured_research_task,
     normalize_assets,
     parse_research_input,
     validate_brief,
@@ -63,6 +64,95 @@ def _reply(name, arguments):
 
 
 class ResearchIntakeTests(unittest.TestCase):
+    def test_structured_creation_recognizes_named_and_injected_models(self):
+        import sys
+        from types import SimpleNamespace
+
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            catalog = base / 'models.toml'
+            catalog.write_text('version = 1\n[routes]\ndefault = "acceptance"\n'
+                '[profiles.acceptance]\napi = "openai_chat"\n'
+                'base_url = "https://acceptance.invalid/v1"\nmodel = "fixture-model"\n'
+                'api_key_env = "ACCEPTANCE_MODEL_KEY"\ncapabilities = ["text"]\n', encoding='utf-8')
+            execution = {'command': [sys.executable, '-c', "print('score: 3')"],
+                'cwd': str(base), 'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
+            brief = ResearchBrief(request_text='Measure the provided conditions.',
+                requested_outputs=('experiments',))
+            for name, model, runtime, expected in (
+                    ('injected', None, SimpleNamespace(llm_client=_JSONClient()), 4),
+                    ('named', 'profile:acceptance', None, 4),
+                    ('no-model', None, None, 0)):
+                with self.subTest(name=name), patch.dict(os.environ, {
+                        'SIMPLE_AR_MODELS_CONFIG': str(catalog), 'ACCEPTANCE_MODEL_KEY': 'fixture-key'}):
+                    app = create_structured_research_task(brief, root=base / name,
+                        config={'execution': execution, 'research_materials_only': True},
+                        budget_limits={'llm_requests': 4, 'total_tokens': 100000},
+                        model=model, max_results=10, services=runtime)
+                    self.assertEqual(app.ledger.remaining('llm_requests'), expected)
+                    self.assertEqual(app.state['config']['model'],
+                        'runtime' if name == 'injected' else model)
+                    self.assertEqual(app.session.manifest.budget.max_attempts,
+                        max(20, expected * 10 + 16))
+                    self.assertFalse(app.ledger.entries)
+            collection = create_structured_research_task(
+                ResearchBrief(request_text='Read these conditions.', requested_outputs=('assessment',)),
+                root=base / 'collection', config={'research_materials_only': True},
+                budget_limits={}, model=None, max_results=10,
+                services=SimpleNamespace(llm_client=_JSONClient()))
+            self.assertEqual(collection.ledger.remaining('llm_requests'), 30)
+            self.assertEqual(collection.session.manifest.budget.max_attempts, 300)
+
+    def test_direct_creation_keeps_runtime_bindings_and_legacy_creation_equivalent(self):
+        from types import SimpleNamespace
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            note = base / 'note.md'
+            note.write_text('Supplied evidence only.', encoding='utf-8')
+            brief = ResearchBrief(request_text='Assess supplied evidence.', requested_outputs=('assessment',),
+                asset_requests=({'locator': 'note.md', 'role': 'material'},))
+            client, reviewer = _JSONClient(), _JSONClient()
+            registry = SearchProviderRegistry()
+            runtime = SimpleNamespace(llm_client=client, feasibility_llm_client=reviewer, search_registry=registry)
+            options = dict(config={'research_materials_only': True}, input_base_dir=base,
+                budget_limits={'llm_requests': 4, 'total_tokens': 100000, 'process_invocations': 0,
+                    'process_wall_seconds': 0, 'source_operations': 0},
+                max_attempts=7, max_no_progress=5, cache_dir=base / 'cache')
+            original = copy.deepcopy(options)
+            legacy = ResearchApplicationServices(llm_client=client, feasibility_llm_client=reviewer,
+                search_registry=registry, **options)
+            with patch.object(LLMClient, 'from_env', side_effect=AssertionError('No environment fallback')):
+                old = create_research_task(brief, root=base / 'old-call', services=legacy)
+                new = create_research_task(brief, root=base / 'direct-call', services=runtime, **options)
+            for field in ('model', 'research_policy', 'sources', 'allow_network', 'allow_execution'):
+                self.assertEqual(new.state['config'][field], old.state['config'][field], field)
+            self.assertIs(new.services, runtime)
+            self.assertIs(new.sources.registry, registry)
+            self.assertEqual(new.session.manifest.budget.max_attempts, 7)
+            self.assertEqual(new.session.manifest.budget.max_no_progress, 5)
+            self.assertEqual(new.ledger.remaining('process_invocations'), 0)
+            self.assertEqual(new.ledger.remaining('source_operations'), 0)
+            self.assertEqual(new.state['config']['research_policy']['providers'], [])
+            self.assertEqual(new.session.list_attempts(), ())
+            self.assertEqual(client.calls, [])
+            self.assertEqual(reviewer.calls, [])
+            self.assertEqual(options, original)
+
+    def test_direct_creation_rejects_unowned_controls_before_mutation(self):
+        brief = ResearchBrief(request_text='Retain explicit ownership.')
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / 'absent'
+            for options, error in (
+                    ({'config': {'unknown_creation_control': True}}, 'explicit execution/revision owner'),
+                    ({'budget_limits': {'unknown_resource': 1}}, 'Unsupported creation resource'),
+                    ({'model': 'named', 'budget_limits': {'llm_requests': 0}}, 'finite positive'),
+                    ({'max_attempts': True}, 'positive integer'),
+                    ({'max_no_progress': 0}, 'positive'),
+                    ({'services': ResearchApplicationServices(), 'config': {}}, 'direct creation settings')):
+                with self.subTest(options=options), self.assertRaisesRegex(ValueError, error):
+                    create_research_task(brief, root=root, **options)
+            self.assertFalse(root.exists())
+
     def test_ordinary_outcomes_directly_edits_and_delivers_chinese_markdown(self):
         request = '仅依据所给材料整理 Markdown 摘要，不生成 PDF。'
         content = '# 材料摘要\n单次观察不能证明稳定性。\n'
@@ -207,7 +297,9 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(experiments.ledger.remaining('process_invocations'), 16)
             legacy = create_session(brief, root=root / 'legacy', services=replace(services, llm_client=None))
             self.assertEqual(legacy.services.max_attempts, 16)
-            restored = load_session(root / 'legacy', services=ResearchApplicationServices(max_attempts=999))
+            with patch('simple_ar.app.research_intake.create_research_task',
+                    side_effect=AssertionError('Restore must not create a successor')):
+                restored = load_session(root / 'legacy', services=ResearchApplicationServices(max_attempts=999))
             self.assertEqual(restored.services.max_attempts, 16)
             self.assertEqual(restored.controller.manifest.budget.max_attempts, 16)
             for invalid in (0, -1, True, 1.5, '16'):

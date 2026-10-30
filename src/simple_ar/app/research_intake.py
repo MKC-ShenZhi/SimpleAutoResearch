@@ -22,29 +22,106 @@ class ResearchInputError(ValueError):
         super().__init__(message)
 
 
-def create_research_task(brief: ResearchBrief, *, root: str | Path, services: Any | None = None,
-                         model: str | None = None,
-                         allow_vision: bool = False,
-                         snapshot_sources: bool = False,
-                         max_snapshot_bytes: int = 16 * 1024 * 1024):
-    """Create a common task from public research inputs without running it.
+def _legacy_creation_options(services: Any) -> dict:
+    """Read old public creation settings only at the compatibility boundary.
 
-    This is an input projection, not another planner or lifecycle. Runtime
-    clients/providers stay in memory; the native owner retains their identities,
-    user obligations, selected evidence and the one resource ledger.
-    Image inspection requires explicit allow_vision=True; the native owner
-    validates its named vision route and charges the same model budget.
+    The object itself still carries runtime clients/registry to the native owner.
+    Saved-task loading never enters this boundary.
     """
-    if type(allow_vision) is not bool:
-        raise ValueError('allow_vision must be a bool')
+    return {name: getattr(services, name) for name in (
+        'config', 'budget_limits', 'input_base_dir', 'max_results', 'max_chunks',
+        'idea_limit', 'cache_dir', 'extraction_dir', 'max_attempts', 'max_no_progress')}
 
-    from simple_ar.app.research_application import ResearchApplicationServices
+
+_DEFAULT_RESEARCH_PROVIDERS = ('openalex', 'semantic_scholar', 'arxiv')
+
+
+def _creation_model_limits(limits: Mapping, *, model_enabled: bool) -> dict:
+    return {name: limits[name] if limits.get(name) is not None else default if model_enabled else 0
+        for name, default in (('llm_requests', 30), ('total_tokens', 600000))}
+
+
+def create_structured_research_task(brief: ResearchBrief, *, root: str | Path,
+                                    config: Mapping, budget_limits: Mapping,
+                                    model: str | None, max_results: int,
+                                    timeout_sec: int | None = None, research_work: bool = False,
+                                    queries: Iterable[str] | None = None,
+                                    providers: Iterable[str] | None = None,
+                                    interaction: str | None = None, **creation_options):
+    """Preserve structured-entry admission defaults without legacy service boxes.
+
+    Source collection and declared execution had distinct resource contracts.
+    Resolve them here before the common creation compiler; this adds no runtime
+    or saved state. Callers retain their original input and cache path bases.
+    """
+    values, limits = dict(config), dict(budget_limits)
+    runtime = creation_options.get('services')
+    model_enabled = bool(model) or getattr(runtime, 'llm_client', None) is not None
+    if values.get('execution') is None:
+        defaults = dict(research_use_fulltext=False, research_allow_pdf_download=False,
+            research_keep_raw_pdf=False, research_max_pdf_mb=20, research_max_pdf_pages=100,
+            research_read_max_shortlist=max_results, research_max_iterations=0,
+            research_max_fulltext_documents=min(values.get('research_max_documents', max_results), max_results))
+        values = {**defaults, **values}
+        values['research_execution_boundary'] = {'timeout_sec': timeout_sec if timeout_sec is not None else 300}
+        attempts = max(30, _creation_model_limits(limits, model_enabled=model_enabled)['llm_requests'] * 10)
+    else:
+        values['interaction'] = interaction or values.get('interaction') or 'checkpoints'
+        if research_work:
+            values.update(queries=list(queries or ()), providers=list(providers or _DEFAULT_RESEARCH_PROVIDERS))
+        # Declared caller-directed execution never authorizes a model by budget alone.
+        limits.update(_creation_model_limits(limits if model_enabled else {}, model_enabled=model_enabled))
+        attempts = max(20, limits['llm_requests'] * 10 + 16)
+    return create_research_task(brief, root=root, model=model, config=values, budget_limits=limits,
+        max_results=max_results, max_attempts=attempts, max_no_progress=6, **creation_options)
+
+
+def create_research_task(brief: ResearchBrief, *, root: str | Path, services: Any | None = None,
+                         model: str | None = None, allow_vision: bool = False,
+                         snapshot_sources: bool = False,
+                         max_snapshot_bytes: int = 16 * 1024 * 1024,
+                         **creation_options):
+    """Create without running; intake owns configuration and domain admission.
+
+    Creation keywords are config, budget_limits, input_base_dir, max_results,
+    max_chunks, idea_limit, cache_dir, max_attempts and max_no_progress.
+    Services supply runtime bindings only. Historical ResearchApplicationServices
+    settings remain supported, but cannot be mixed with direct creation keywords.
+    Image inspection requires explicit allow_vision and the native vision route.
+    """
+    if services is not None and hasattr(services, 'config'):
+        if creation_options:
+            raise ValueError('Choose direct creation settings or legacy services settings, not both')
+        creation_options = _legacy_creation_options(services)
+    return _create_research_task(brief, root=root, services=services, model=model,
+        allow_vision=allow_vision, snapshot_sources=snapshot_sources,
+        max_snapshot_bytes=max_snapshot_bytes, **creation_options)
+
+
+def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: Any | None,
+                          model: str | None, allow_vision: bool, snapshot_sources: bool,
+                          max_snapshot_bytes: int, config: Mapping | None = None,
+                          budget_limits: Mapping | None = None, input_base_dir: str | Path | None = None,
+                          max_results: int = 10, max_chunks: int | None = 300, idea_limit: int = 3,
+                          cache_dir: str | Path | None = None, extraction_dir: str | Path | None = None,
+                          max_attempts: int | None = None,
+                          max_no_progress: int = 3):
     from simple_ar.app.tool_application import ToolApplication
     from simple_ar.tools.sources import SourcePolicy
     from simple_ar.tools.writing import freeze_report_requirement
 
-    settings = services or ResearchApplicationServices()
-    config = dict(settings.config)
+    if type(allow_vision) is not bool:
+        raise ValueError('allow_vision must be a bool')
+    if max_attempts is not None and (type(max_attempts) is not int or max_attempts < 1):
+        raise ValueError('max_attempts must be a positive integer')
+    if max_results < 1 or idea_limit < 1:
+        raise ValueError('Research application numeric settings must be positive.')
+    if max_chunks is not None and max_chunks < 1:
+        raise ValueError('max_chunks must be positive when provided.')
+    if max_no_progress < 1:
+        raise ValueError('Research application budgets must be positive.')
+    config = dict(config or {})
+    limits = dict(budget_limits or {})
     aliases = {'research_sources': 'providers', 'research_use_fulltext': 'require_fulltext',
         'research_selected_idea_id': 'selected_idea_id', 'feasibility_review_model': 'feasibility_connection'}
     policy_values, unhandled = {}, []
@@ -56,11 +133,12 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
             policy_values[target] = value
         elif name not in auxiliary:
             unhandled.append(name)
-    if unhandled or settings.extraction_dir is not None:
+    if unhandled or extraction_dir is not None:
         raise ValueError('These legacy creation controls need their explicit execution/revision owner: '
-            + ', '.join(sorted([*unhandled, *(['extraction_dir'] if settings.extraction_dir is not None else [])])))
+            + ', '.join(sorted([*unhandled, *(['extraction_dir'] if extraction_dir is not None else [])])))
     source = Path(brief.source_path) if brief.source_path else None
-    base = settings.input_base_dir or (source.parent if source and source.suffix else source) or Path.cwd()
+    base = Path(input_base_dir) if input_base_dir is not None else (
+        (source.parent if source and source.suffix else source) or Path.cwd())
     assets = normalize_assets(brief, input_base_dir=base)
     diagnostics = validate_brief(brief, assets)
     if any(item.severity == 'error' for item in diagnostics):
@@ -73,8 +151,9 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
         mounts[alias] = Path(asset.locator)
         if asset.role not in {'dataset', 'code'} and mounts[alias].is_file():
             materials.append(alias)
-    providers = (list(settings.search_registry.names()) if settings.search_registry is not None
-        else ['openalex', 'semantic_scholar', 'arxiv'])
+    registry = getattr(services, 'search_registry', None)
+    providers = (list(registry.names()) if registry is not None
+        else list(_DEFAULT_RESEARCH_PROVIDERS))
     local_only = (config.get('research_materials_only') is True
         or policy_values.get('allow_network') is False
         or bool(materials) and config.get('research_materials_only') is not False
@@ -109,10 +188,10 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
             and asset.role not in {'dataset', 'code'} and path.is_file() for asset in assets)]
     if confirm_execution and (projection is None or projection['execution_contract'] is None):
         raise ValueError('execution_confirmation requires a fixed scientific measurement contract')
-    policy = SourcePolicy.model_validate({'max_results': settings.max_results,
-        'max_documents': settings.max_results, 'max_chunks': settings.max_chunks,
-        'idea_limit': settings.idea_limit, 'max_fulltext_documents': min(settings.max_results, 1),
-        'cache_dir': str(settings.cache_dir.resolve()) if settings.cache_dir else None,
+    policy = SourcePolicy.model_validate({'max_results': max_results,
+        'max_documents': max_results, 'max_chunks': max_chunks,
+        'idea_limit': idea_limit, 'max_fulltext_documents': min(max_results, 1),
+        'cache_dir': str(Path(cache_dir).resolve()) if cache_dir else None,
         'providers': providers, **policy_values,
         'materials': policy_values.get('materials', materials), 'allow_network': not local_only,
         'require_design': bool(confirm_execution or design_required),
@@ -130,7 +209,7 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
             alias = f'source{index}'
             mounts[alias] = path
         table = {'path': alias, 'spec': {name: value for name, value in table.items() if name != 'file'}}
-    client = settings.llm_client
+    client = getattr(services, 'llm_client', None)
     if model is not None and client is not None:
         raise ValueError('Choose a named model or an injected client, not both')
     selected_model = model if model else 'runtime' if client is not None else None
@@ -148,7 +227,6 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
         policy = policy.model_copy(update={'execution_boundary': boundary,
             'execution_schema': execution.get('result_schema', {}),
             'source_workspace': project_alias or policy.source_workspace})
-    limits = settings.budget_limits
     if selected_model is not None and any(type(limits[name]) is not int or limits[name] < 1
             for name in ('llm_requests', 'total_tokens') if limits.get(name) is not None):
         raise ValueError('Model-assisted creation requires finite positive llm_requests/total_tokens')
@@ -156,9 +234,10 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
         'llm_requests', 'total_tokens', 'process_invocations', 'process_wall_seconds', 'source_operations'}}
     if unsupported_limits:
         raise ValueError('Unsupported creation resource controls: ' + ', '.join(sorted(unsupported_limits)))
+    model_limits = _creation_model_limits(limits, model_enabled=selected_model is not None)
     source_count = max(1, len(policy.queries)) * len(policy.providers)
     # Preserve the old bounded process allowance independently of native attempts.
-    execution_runs = (settings.max_attempts if settings.max_attempts is not None else 16) if 'experiments' in outputs else 0
+    execution_runs = (max_attempts if max_attempts is not None else 16) if 'experiments' in outputs else 0
     network_runs = source_count if policy.allow_network and (projection is None or research_work) else 0
     process_defaults = (projection['process_limits'] if projection is not None else {
         'process_invocations': execution_runs,
@@ -173,17 +252,15 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
             ('process_wall_seconds', process_defaults['process_wall_seconds'], network_runs * 120))}
     root = Path(root).expanduser().resolve()
     # Caller-directed work has no model-turn budget from which to size attempts.
-    attempt_limit = settings.max_attempts
+    attempt_limit = max_attempts
     if selected_model is None and attempt_limit is None:
         attempt_limit = 16
     app = ToolApplication.create(root, (brief.objective or brief.request_text)
         + '\nOriginal user request and declared constraints:\n' + json.dumps(brief.to_dict(), ensure_ascii=False),
         model=selected_model, sources=mounts, allow_vision=allow_vision,
         allow_execution='experiments' in outputs or projection is not None,
-        allow_network=policy.allow_network if projection is None or research_work else False, max_turns=(limits.get('llm_requests')
-            if limits.get('llm_requests') is not None else 30 if selected_model is not None else 0),
-        max_tokens=(limits.get('total_tokens') if limits.get('total_tokens') is not None
-            else 600000 if selected_model is not None else 0),
+        allow_network=policy.allow_network if projection is None or research_work else False,
+        max_turns=model_limits['llm_requests'], max_tokens=model_limits['total_tokens'],
         max_attempts=attempt_limit, report_requirement=report, control_protocol='operations.v1',
         max_output_tokens=config.get('max_output_tokens'), table_analysis=table,
         research_policy=policy.model_dump(mode='json') if projection is None or research_work or confirm_execution else None,
@@ -192,9 +269,9 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
         process_limits=process_limits,
         source_operations=limits.get('source_operations') if limits.get('source_operations') is not None
             else source_count * (1 + policy.max_iterations) + policy.max_documents * 3,
-        services=settings, snapshot_sources=snapshot_sources, max_snapshot_bytes=max_snapshot_bytes)
+        services=services, snapshot_sources=snapshot_sources, max_snapshot_bytes=max_snapshot_bytes)
     with app.session.mutation_scope():
-        app.session.manifest.budget.max_no_progress = settings.max_no_progress
+        app.session.manifest.budget.max_no_progress = max_no_progress
         app.session.manifest.state_refs['brief'] = app.session.store.write_json('inputs/research_brief.json',
             brief.to_dict(), kind='research_input', schema=brief.schema_version, producer='research_intake')
         app.session.manifest.state_refs['assets'] = app.session.store.write_json('inputs/research_assets.json',
@@ -923,6 +1000,7 @@ _KNOWN_SUFFIXES = {
 __all__ = [
     "ResearchInputError",
     "create_research_task",
+    "create_structured_research_task",
     "project_execution_creation",
     "UnsupportedExecutionCreation",
     "normalize_assets",

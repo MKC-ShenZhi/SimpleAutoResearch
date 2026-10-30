@@ -541,7 +541,7 @@ class StartTests(unittest.TestCase):
         token = hashlib.sha256(json.dumps({'call': proposal, 'inputs': binding},
             sort_keys=True).encode()).hexdigest()
         lines = []
-        app._owner_execution_binding.return_value = binding
+        app.execution_binding.return_value = binding
 
         def confirm(_):
             command = next(line for line in lines if line.startswith('Prepared command: '))
@@ -562,9 +562,9 @@ class StartTests(unittest.TestCase):
                 patch('builtins.input', side_effect=confirm) as prompt:
             main(['start', '--resume-task', 'saved-task'])
             prompt.assert_called_once()
-            app._owner_execution_binding.assert_called_once_with(proposal)
+            app.execution_binding.assert_called_once_with(proposal)
             lines.clear()
-            app._owner_execution_binding.return_value = {**binding, 'argv': ['changed-command']}
+            app.execution_binding.return_value = {**binding, 'argv': ['changed-command']}
             prompt.reset_mock()
             with self.assertRaisesRegex(SystemExit, 'changed since approval'):
                 main(['start', '--resume-task', 'saved-task'])
@@ -723,6 +723,16 @@ class StartTests(unittest.TestCase):
                 app = ToolApplication.load(root)
                 self.assertEqual(app.session.manifest.status, 'paused')
                 self.assertTrue(app.sources.policy.require_design)
+                # Parser-provided iterations=1 overrides collection entry's fallback=0.
+                self.assertEqual(app.sources.policy.max_iterations, 1)
+                self.assertEqual(app.session.manifest.budget.max_no_progress, 6)
+                expected_attempts = 30 if root.parent.name == 'no-command' else 20
+                self.assertEqual(app.session.manifest.budget.max_attempts, expected_attempts)
+                if root.parent.name == 'no-command':
+                    policy = app.sources.policy
+                    self.assertEqual((policy.max_pdf_mb, policy.max_pdf_pages), (20, 100))
+                    self.assertEqual(policy.read_max_shortlist, policy.max_results)
+                    self.assertEqual(policy.max_fulltext_documents, min(policy.max_documents, policy.max_results))
                 self.assertIsNone(app.state['config']['model'])
                 self.assertIsNone(app.state['config'].get('execution_contract'))
                 self.assertFalse(app.ledger.entries)
@@ -782,6 +792,10 @@ class StartTests(unittest.TestCase):
             session, = (root / 'out').iterdir()
             app = ToolApplication.load(session)
             self.assertEqual(app.session.manifest.transition_recipe, ToolApplication.RECIPE)
+            self.assertEqual(app.session.manifest.budget.max_no_progress, 6)
+            self.assertEqual(app.session.manifest.budget.max_attempts, 20)
+            self.assertEqual(app.ledger.remaining('llm_requests'), 0)
+            self.assertEqual(app.ledger.remaining('total_tokens'), 0)
             proposal = app.sources.pending_decision()
             self.assertEqual(proposal['proposal_kind'], 'caller_execution_protocol')
             # Protocol confirmation precedes any attempt or process approval.
@@ -879,6 +893,67 @@ class StartTests(unittest.TestCase):
             return app
         create.side_effect = capture
         return app
+
+    def test_structured_collection_preserves_original_settings_resources_and_cwd(self):
+        from copy import deepcopy
+        from simple_ar.app.research_application import ResearchApplicationServices
+        from simple_ar.app.research_intake import create_research_task
+        from simple_ar.cli.start import migrate_structured_creation
+        from simple_ar.research.workflow_contracts import ResearchBrief
+        with tempfile.TemporaryDirectory() as directory, contextlib.chdir(directory), \
+                patch('simple_ar.integrations.llm.LLMClient.from_env',
+                    side_effect=AssertionError('No model authorized')), \
+                patch('simple_ar.cli.start._run_created_research') as run:
+            base = Path(directory).resolve()
+            config_dir = base / 'config'
+            config_dir.mkdir()
+            (base / 'paper.md').write_text('Original cwd material.', encoding='utf-8')
+            (config_dir / 'paper.md').write_text('Different configuration-directory material.', encoding='utf-8')
+            args = build_parser().parse_args(['research-session', '--topic', 'Keep original inputs',
+                '--max-results', '7', '--cache-dir', 'cache'])
+            args.config = config_dir / 'research.toml'
+            sources = ({'locator': 'paper.md', 'role': 'paper'},)
+            for name, extra, processes, model_limits in (
+                    ('defaults', {}, (None, None), {}),
+                    ('zero', {'research_max_documents': 9, 'research_max_fulltext_documents': 2,
+                        'research_max_pdf_mb': 9, 'research_max_pdf_pages': 31,
+                        'research_read_max_shortlist': 4, 'research_max_iterations': 3},
+                        (0, 0), {'llm_requests': 4, 'total_tokens': 50000}),
+                    ('positive', {'research_max_documents': 9}, (2, 10), {})):
+                with self.subTest(name=name):
+                    args.process_invocations, args.process_wall_seconds = processes
+                    research = {'research_max_documents': 5, **extra}
+                    limits = {'process_invocations': 99, 'process_wall_seconds': 999, **model_limits}
+                    original = deepcopy((vars(args), research, limits, sources))
+                    migrate_structured_creation(args, request=args.topic, outputs=('experiments',),
+                        sources=sources, limits=limits, root=base / name, research_config=research,
+                        report_config={}, writing_method=None, data_analysis=None)
+                    actual = run.call_args.args[0]
+                    # Frozen pre-migration input contract; no production default helper in the oracle.
+                    old_config = dict(research_use_fulltext=False, research_allow_pdf_download=False,
+                        research_keep_raw_pdf=False, research_max_pdf_mb=20, research_max_pdf_pages=100,
+                        research_read_max_shortlist=7, research_max_iterations=0,
+                        research_max_fulltext_documents=min(research['research_max_documents'], 7),
+                        research_materials_only=False)
+                    old_config.update(research)
+                    old_config.update(research_task_kind=args.task_kind, report={}, report_writing_method=None,
+                        data_analysis=None, max_output_tokens=None, research_execution_boundary={'timeout_sec': 300})
+                    old = create_research_task(ResearchBrief(request_text=args.topic, objective=args.topic,
+                        requested_outputs=('experiments',), asset_requests=sources), root=base / (name + '-old'),
+                        services=ResearchApplicationServices(config=old_config,
+                            budget_limits={**limits, 'process_invocations': processes[0],
+                                'process_wall_seconds': processes[1]}, input_base_dir=base,
+                            cache_dir=base / 'cache', max_results=7, max_chunks=args.max_chunks,
+                            idea_limit=args.idea_limit, max_attempts=40 if name == 'zero' else 30,
+                            max_no_progress=6))
+                    self.assertEqual(actual.state['config'], old.state['config'])
+                    self.assertEqual(actual.ledger.to_dict(), old.ledger.to_dict())
+                    self.assertEqual(actual.session.manifest.budget.to_dict(), old.session.manifest.budget.to_dict())
+                    self.assertEqual(actual.state['config']['sources'], {'source0': str(base / 'paper.md')})
+                    self.assertEqual(actual.sources.policy.cache_dir, str(base / 'cache'))
+                    self.assertIsNone(actual.services)
+                    self.assertEqual(actual.session.list_attempts(), ())
+                    self.assertEqual((vars(args), research, limits, sources), original)
 
     def test_document_urls_preserve_literal_input_and_require_confirmed_chat_acquisition(self):
         url = 'https://example.test/paper'
@@ -2579,6 +2654,7 @@ class StartTests(unittest.TestCase):
                     self.assertEqual(cli['code_task']['validation_command'], ['python', 'check.py'])
                     self.assertEqual(cli['execution_contract']['conditions'][0]['source'], 'implementation')
                     self.assertEqual(cli['process_limits'], {'process_invocations': 0, 'process_wall_seconds': 0})
+                    self.assertEqual(cli['max_attempts'], 56)
                     self.assertFalse(cli['allow_network'])
                     self.assertTrue(cli['allow_execution'])
                     self.assertTrue(cli['research_policy']['require_design'])

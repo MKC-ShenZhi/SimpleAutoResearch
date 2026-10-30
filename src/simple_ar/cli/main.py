@@ -410,11 +410,6 @@ def _experiment_result_schema(args: argparse.Namespace) -> dict[str, object]:
 def _print_research_session(args: argparse.Namespace) -> None:
     """Run the canonical bounded research-to-report application."""
 
-    from simple_ar.app.research_application import (
-        ResearchApplicationError,
-        ResearchApplicationServices,
-    )
-    from simple_ar.app.research_intake import ResearchInputError
     from simple_ar.app.session_roots import new_research_session_root
     from simple_ar.research.workflow_contracts import ResearchBrief
 
@@ -729,7 +724,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
                 report_config=report_config, writing_method=writing_method, research_config=config)
             return
         else:
-            from simple_ar.app.research_application import load_session
+            from simple_ar.app.research_application import ResearchApplicationServices, load_session
             from dataclasses import replace
             display = ResearchConsole()
             validation_runs = 1 + execute_options.repair_rounds if task_kind == "bug_fix" and code_task_spec is not None else 1
@@ -808,7 +803,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
             if view.status in {"completed", "paused", "blocked", "failed"}:
                 break
         app.export_session()
-    except (ResearchApplicationError, ResearchInputError, OSError, RuntimeError, TypeError, ValueError) as exc:
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
     print_line(f"Research session: {view.session_root}")
     print_line(f"Status: {view.status}")
@@ -2779,7 +2774,7 @@ def _run_native_start(args: argparse.Namespace) -> None:
             if call['function']['name'] == 'execute_implementation':
                 import hashlib
                 import json
-                binding = app._owner_execution_binding(call)
+                binding = app.execution_binding(call)
                 identity = hashlib.sha256(json.dumps({'call': call, 'inputs': binding},
                     sort_keys=True).encode()).hexdigest()
                 if identity != token:

@@ -232,7 +232,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         app.run(actions=[{'tool_name': 'execute_implementation', 'arguments': {
             'prepared_result': prepared['data']['prepared_result']}}], progress=lambda _: None)
         call = app.state['pending']['call']
-        binding = app._owner_execution_binding(call)
+        binding = app.execution_binding(call)
         self.assertGreater(len(binding['source_sha256']), 64)
         self.assertGreater(sum(Path(path).stat().st_size for path in binding['source_sha256']), 64 * 1024 * 1024)
         token = app.approval_token(call)
@@ -1884,7 +1884,7 @@ class ImplementationDecisionTests(unittest.TestCase):
                 self.assertEqual(source['argv_semantics'], 'candidate_relative.v2')
                 app.run(actions=[{'tool_name': 'execute_implementation', 'arguments': {
                     'prepared_result': result['data']['prepared_result']}}], progress=lambda _: None)
-                binding = app._owner_execution_binding(app.state['pending']['call'])
+                binding = app.execution_binding(app.state['pending']['call'])
                 self.assertEqual(binding['argv_semantics'], 'candidate_relative.v2')
                 self.assertEqual(binding['argv'][1], path)
                 self.assertEqual(Path(binding['cwd']), Path(result['data']['project_dir']))
@@ -1954,7 +1954,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         self.assertFalse(restored.workspace.has_started(identity))
         # The current dispatcher must recompute the old exact binding/token;
         # no approval or owner method is mocked for this compatibility check.
-        self.assertEqual(restored._owner_execution_binding(restored.state['pending']['call']), legacy)
+        self.assertEqual(restored.execution_binding(restored.state['pending']['call']), legacy)
         self.assertEqual(restored.approval_token(restored.state['pending']['call']), approval['token'])
         with patch.object(restored.workspace, 'call', wraps=restored.workspace.call) as calls:
             restored.run(approved_execution=approval['token'], progress=lambda _: None,

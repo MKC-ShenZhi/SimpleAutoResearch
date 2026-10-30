@@ -9920,9 +9920,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertTrue(missing_path.is_file())
                     missing_path.unlink()
                     diagnostic = Path(missing).name
-                binding = (patch.object(app, '_owner_execution_binding',
+                binding = (patch.object(app, 'execution_binding',
                     side_effect=ValueError('Candidate has no execution plan')) if missing == 'invalid_plan'
-                    else patch.object(app, '_owner_execution_binding', wraps=app._owner_execution_binding))
+                    else patch.object(app, 'execution_binding', wraps=app.execution_binding))
                 if missing == 'invalid_plan':
                     diagnostic = 'Candidate has no execution plan'
                 ledger = app.ledger.to_dict()

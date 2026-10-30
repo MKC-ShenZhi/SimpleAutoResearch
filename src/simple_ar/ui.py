@@ -140,15 +140,10 @@ class Workspace:
     def creation_defaults(self) -> dict:
         args = native_arguments()
         options = native_creation_options(args)
-        # These options select creation-time state owners in create(), not
-        # resource configuration. The preview must not create a task merely
-        # to consume them, or forward them to the narrower configuration API.
-        for key in ('professional_inputs', 'context_protocol'):
-            options.pop(key, None)
         # The native configuration owner resolves automatic process limits.
         # No model or material is authorized for this read-only projection.
         options.update(model=None, sources={})
-        _, _, limits, _ = ToolApplication._configuration(self.tasks, 'Configuration preview', **options)
+        _, _, limits, _ = ToolApplication.preview_creation(self.tasks, 'Configuration preview', **options)
         return {key: options[key] for key in ('max_turns', 'max_tokens', 'max_images',
                     'allow_execution', 'allow_network', 'allow_vision')} | {
             key: limits[key] for key in ('process_invocations', 'process_wall_seconds')}
@@ -265,8 +260,7 @@ class Workspace:
 
     def creation_configuration(self, root: Path, goal: str, options: dict) -> tuple:
         descriptors = self.extension_grants(options['extensions'])
-        projected = {k: v for k, v in options.items() if k not in {'professional_inputs', 'context_protocol'}}
-        result = ToolApplication._configuration(root, goal, **projected)
+        result = ToolApplication.preview_creation(root, goal, **options)
         for extension in result[0].get('extensions', []):
             if descriptors.get(extension['path']) != extension['descriptor_sha256']:
                 raise ValueError('Extension descriptor changed during inspection')
@@ -547,24 +541,26 @@ class Workspace:
                     raise ValueError('Confirm displayed access and hard caps')
                 args, _ = self.creation_inputs(data)
                 root = self.task('task-' + secrets.token_hex(8))
-                workspace = self
+                options = native_creation_options(args)
+                descriptors = self.extension_grants(options['extensions'])
 
-                class ConfirmedCreation(ToolApplication):
-                    @classmethod
-                    def _configuration(cls, root, goal, **kwargs):
-                        # Gate the actual owner's final projection BEFORE any
-                        # session/ledger writes. No retained UI config or task.
-                        current, digest = workspace.creation_inputs(data)
-                        if goal != current.request:
-                            raise ValueError('Task request changed during creation')
-                        options = native_creation_options(current)
-                        result = workspace.creation_configuration(root, current.request, options)
-                        identity, _ = workspace.creation_identity(current, digest, options, result)
-                        if not hmac.compare_digest(str(data.get('preview_id', '')), identity):
-                            raise ValueError('Effective configuration changed; preview and confirm again')
-                        return result
+                def verify(result):
+                    # Check the owner's actual projection and fresh grants
+                    # before it creates the session or its ledger.
+                    current, digest = self.creation_inputs(data)
+                    current_options = native_creation_options(current)
+                    if current.request != args.request or current_options != options:
+                        raise ValueError('Task configuration changed during creation')
+                    current_descriptors = self.extension_grants(current_options['extensions'])
+                    for extension in result[0].get('extensions', []):
+                        if (descriptors.get(extension['path']) != extension['descriptor_sha256']
+                                or current_descriptors.get(extension['path']) != extension['descriptor_sha256']):
+                            raise ValueError('Extension descriptor changed during inspection')
+                    identity, _ = self.creation_identity(current, digest, current_options, result)
+                    if not hmac.compare_digest(str(data.get('preview_id', '')), identity):
+                        raise ValueError('Effective configuration changed; preview and confirm again')
 
-                ConfirmedCreation.create(root, args.request, **native_creation_options(args))
+                ToolApplication.create(root, args.request, verify_creation=verify, **options)
                 return {'task': root.name}
             root = self.task(name)
             # Launch grants also constrain execution of retained tasks. An old
