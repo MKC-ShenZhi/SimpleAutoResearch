@@ -979,9 +979,10 @@ def audit_result(result: AnalysisResult, metric_summary: dict[str, Any],
                 for key in ("source", "ref", "evidence_id", "metric_ref", "artifact", "path"):
                     if isinstance(evidence.get(key), str):
                         refs.add(evidence[key])
-                quote = evidence.get("quote")
-                if isinstance(quote, str) and quote.strip() and quote in context.existing_writeup:
-                    has_quote = True
+                for key in ("quote", "text"):
+                    quote = evidence.get(key)
+                    if isinstance(quote, str) and quote.strip() and quote in context.existing_writeup:
+                        has_quote = True
             missing = sorted(ref for ref in refs if ref and ref not in available)
             if missing:
                 claim.limitations.append("References not found in the supplied analysis inputs: " + ", ".join(missing))

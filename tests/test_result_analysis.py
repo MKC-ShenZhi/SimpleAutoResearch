@@ -524,6 +524,10 @@ class ResultAnalysisTests(unittest.TestCase):
         result = run_result_analysis(context.model_copy(update={"existing_writeup": "The supplied text."}),
             client=FakeAnalysisClient(cited), use_llm=True)
         self.assertEqual(result.claims[0].verdict, "supported")
+        cited["claims"][0]["evidence"] = ["The supplied text."]
+        result = run_result_analysis(context.model_copy(update={"existing_writeup": "The supplied text."}),
+            client=FakeAnalysisClient(cited), use_llm=True)
+        self.assertEqual(result.claims[0].verdict, "supported")
         invalid = {"claims": [{"claim_id": "c6", "claim": "Observed value", "verdict": "supported",
                                 "metric_refs": ["score"]}]}
         result = run_result_analysis(AnalysisContext(metrics={"score": float("nan")}),
