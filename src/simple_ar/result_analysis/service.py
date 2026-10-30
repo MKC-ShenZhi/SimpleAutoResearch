@@ -165,8 +165,8 @@ def _goal_assessment_error(
     if not isinstance(assessment, Mapping):
         return ""
     refs = normalize_string_list(assessment.get("evidence_refs"))
-    known = _known_goal_evidence(context, metric_summary)
-    invalid = [ref for ref in refs if ref not in known]
+    known = _available_result_refs(context, metric_summary)
+    invalid = [ref for ref in refs if not _is_observed_goal_reference(ref, known, context)]
     if not invalid and (refs or assessment.get("status") == "inconclusive"):
         return ""
     # A missing or malformed reference must not turn an inconclusive outcome
@@ -175,11 +175,12 @@ def _goal_assessment_error(
     # Lead with the compact facts the model can actually cite. Detailed
     # per-condition IDs can be numerous and would otherwise crowd out every
     # declared metric from a lexically sorted sample.
-    examples = list(sorted(set(context.metrics) | set(context.artifacts.values())))[:16]
-    examples.extend([ref for ref in sorted(known) if ref not in examples][:8])
+    examples = sorted(set(context.metrics) & known)[:16]
+    examples.extend(ref for ref in sorted(known) if ref not in examples[:16])
+    examples = examples[:24]
     return (
         "Goal assessment evidence_refs must resolve to observed metric names, "
-        "result-table evidence_id values, or supplied artifact paths. "
+        "result-table evidence_id values, or exact passages from the supplied writeup. "
         f"Invalid refs: {invalid!r}. Available examples: {examples!r}. "
         "Preserve the measured verdict and recommendation; if no relevant "
         "evidence exists, use status=inconclusive instead of inventing a ref."
@@ -581,7 +582,8 @@ def build_prompt(
         "Only set requested_delivery=paper when the user explicitly asks for a paper even with negative results; "
         "a generic report request or conditional paper request means auto. Assess the user's original goal, "
         "not merely whether execution passed. Cite evidence_id values from result_tables, "
-        "provided metric names or artifact paths. Reproduction does not require beating a baseline. "
+        "provided metric names, or exact passages from the supplied writeup. A file path by itself "
+        "does not establish that its contents were observed. Reproduction does not require beating a baseline. "
         "For improvement, check the primary objective and constraints, not any favorable metric. "
         "Use inconclusive when the success criteria or necessary evidence are missing.\n\n"
         "Rules:\n"
@@ -740,7 +742,7 @@ def parse_goal_assessment(
     """Keep missing/ungrounded goal judgments uncertain, not silently successful."""
     if not isinstance(value, Mapping):
         return GoalAssessment()
-    known = _known_goal_evidence(context, metric_summary)
+    known = _available_result_refs(context, metric_summary)
     refs = normalize_string_list(value.get("evidence_refs"))
     status = str(value.get("status") or "inconclusive")
     task_type = str(value.get("task_type") or "unknown")
@@ -749,22 +751,38 @@ def parse_goal_assessment(
         status = "inconclusive"
     if task_type not in {"improvement", "reproduction", "evaluation", "unknown"}:
         task_type = "unknown"
-    if not reason or not refs or any(ref not in known for ref in refs):
+    if not reason or not refs or any(not _is_observed_goal_reference(ref, known, context) for ref in refs):
         status = "inconclusive"
         reason = (reason + " " if reason else "") + "Goal judgment lacks resolvable evidence references."
     delivery = str(value.get("requested_delivery") or "auto")
     if delivery not in {"auto", "paper", "analysis_report"}:
         delivery = "auto"
     return GoalAssessment(task_type=task_type, requested_delivery=delivery, status=status, reason=reason,
-                          evidence_refs=[ref for ref in refs if ref in known])
+                          evidence_refs=[ref for ref in refs if _is_observed_goal_reference(ref, known, context)])
 
 
-def _known_goal_evidence(context: AnalysisContext, metric_summary: Mapping[str, Any]) -> set[str]:
-    known = set(context.metrics) | set(context.artifacts.values())
+def _is_observed_goal_reference(ref: str, known: set[str], context: AnalysisContext) -> bool:
+    return ref in known or bool(ref not in context.artifacts.values() and ref.strip()
+        and ref in context.existing_writeup)
+
+
+def _available_result_refs(context: AnalysisContext, metric_summary: Mapping[str, Any]) -> set[str]:
+    """Return references backed by actual finite values, not file names or placeholders."""
+    def finite(value: Any) -> bool:
+        try:
+            return is_number(value) and math.isfinite(value)
+        except (OverflowError, ValueError):
+            return False
+
+    known = {str(name) for name, value in context.metrics.items() if finite(value)}
+    known.update(str(row["name"]) for row in metric_summary.get("metrics", [])
+        if isinstance(row, Mapping) and row.get("name") and finite(row.get("value")))
+    tables = metric_summary.get("result_tables") or {}
+    rows = extract_result_table_rows(context.project_results) if context.project_results else []
+    rows.extend(tables.get("all_metric_rows", []))
     known.update(
         str(row["evidence_id"])
-        for row in (metric_summary.get("result_tables") or {}).get("all_metric_rows", [])
-        if isinstance(row, Mapping) and row.get("evidence_id")
+        for row in rows if isinstance(row, Mapping) and row.get("evidence_id") and finite(row.get("mean"))
     )
     return known
 
@@ -959,16 +977,7 @@ def audit_result(result: AnalysisResult, metric_summary: dict[str, Any],
     audit.weak_metric_signals = sorted(
         set(audit.weak_metric_signals) | set(metric_summary.get("weak_metric_signals") or [])
     )
-    available = {
-        str(row["name"]) for row in metric_summary.get("metrics", [])
-        if isinstance(row, dict) and row.get("name") and is_number(row.get("value"))
-        and math.isfinite(float(row["value"]))
-    }
-    tables = metric_summary.get("result_tables") or {}
-    rows = extract_result_table_rows(context.project_results) if context.project_results else tables.get("all_metric_rows", [])
-    available.update(str(row["evidence_id"]) for row in rows
-        if isinstance(row, dict) and row.get("evidence_id") and is_number(row.get("mean"))
-        and math.isfinite(float(row["mean"])))
+    available = _available_result_refs(context, metric_summary)
     downgraded: list[str] = []
     unsupported: list[str] = []
     for claim in result.claims:

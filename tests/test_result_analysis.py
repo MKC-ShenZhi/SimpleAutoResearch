@@ -46,9 +46,15 @@ class ResultAnalysisTests(unittest.TestCase):
 
     def test_goal_judgment_is_separate_and_requires_resolvable_evidence(self):
         from simple_ar.result_analysis.service import parse_goal_assessment
-        context = AnalysisContext(metrics={"accuracy": 0.7})
-        tables = {"result_tables": {"all_metric_rows": [{"evidence_id": "accuracy:test:candidate"}]}}
+        context = AnalysisContext(metrics={"accuracy": 0.7, "unavailable": float("nan")},
+            artifacts={"results": "results.json"}, existing_writeup="The measured accuracy is 0.7.")
+        tables = {"result_tables": {"all_metric_rows": [
+            {"evidence_id": "accuracy:test:candidate", "mean": 0.7},
+            {"evidence_id": "empty:test:candidate", "mean": None}]}}
         for refs, expected in ((["accuracy"], "met"), (["accuracy:test:candidate"], "met"),
+                               (["The measured accuracy is 0.7."], "met"),
+                               (["results.json"], "inconclusive"), (["unavailable"], "inconclusive"),
+                               (["empty:test:candidate"], "inconclusive"),
                                (["invented"], "inconclusive"), ([], "inconclusive")):
             with self.subTest(refs=refs):
                 result = parse_goal_assessment({"task_type": "reproduction", "status": "met",
