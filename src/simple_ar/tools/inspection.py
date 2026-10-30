@@ -1,4 +1,4 @@
-"""One version-bound inspection; no editing, execution or adoption authority."""
+"""Version-bound inspection over original evidence and owner-dispatched operations."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -15,6 +15,17 @@ from simple_ar.core.budget import completed_llm_usage_is_accounted
 from simple_ar.integrations.llm import LLMCallStopped, LLMSettings, estimate_tokens
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 from simple_ar.tools.workspace import FileWindow, workspace_tool_specs
+
+
+class _InspectionDispatchRaised(BaseException):
+    """Let the outer driver, not the opinion owner, handle dispatcher stops."""
+
+    def __init__(self, original: BaseException) -> None:
+        self.original = original
+
+
+_SHARED_OPERATIONS = frozenset({'read_file', 'list_directory', 'search_files',
+    'write_file', 'edit_file', 'copy_file', 'copy_project', 'run_process', 'inspect_images'})
 
 
 class InspectionRequest(BaseModel):
@@ -91,8 +102,11 @@ class _ReviewResponse(BaseModel):
     decisions: list[_ReviewDecision]
 
 
-def inspection_tool_specs(*, progressive: bool = False, adaptive: bool = False) -> list[CommonToolSpec]:
-    return [CommonToolSpec(name='inspect_artifacts', domain='inspection',
+def inspection_tool_specs(*, progressive: bool = False, adaptive: bool = False,
+                          execution_protocol: str | None = None) -> list[CommonToolSpec]:
+    if execution_protocol not in (None, 'shared.v1'):
+        raise ValueError('Unknown inspection execution protocol')
+    specs = [CommonToolSpec(name='inspect_artifacts', domain='inspection',
         permission_level='read_only', risk_level='low',
         input_schema=InspectionRequest.model_json_schema(),
         artifact_outputs=['artifact_assessment.v1'],
@@ -117,6 +131,15 @@ def inspection_tool_specs(*, progressive: bool = False, adaptive: bool = False) 
             'file; FileWindow requests exactly that range. Total returned text is bounded at '
             '512000 bytes. Partial/binary targets cannot pass. No edits, execution, delivery, '
             'visual inspection or scientific certification. Same identity never requests again.'))]
+    if execution_protocol == 'shared.v1':
+        shared = ('The independent inspector may use offered operations, with helper writes scoped to its '
+            'inspection work directory and ordinary process approval and vision routing. Tool observations '
+            'do not certify scientific correctness. The same identity resumes its recorded work.')
+        specs[0].description = specs[0].description.replace(
+            'No edits, execution, delivery, visual or scientific certification; same identity never requests again.', shared)
+        specs[0].description = specs[0].description.replace(
+            'No edits, execution, delivery, visual inspection or scientific certification. Same identity never requests again.', shared)
+    return specs
 
 
 _SYSTEM_INTRO = (
@@ -208,9 +231,14 @@ class InspectionToolGateway:
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
                  user_requests: Callable[[], list[str]] | None = None,
                  feedback_provider: Callable[[list[str]], list[dict]] | None = None,
-                 protocol: str | None = None) -> None:
+                 protocol: str | None = None,
+                 execution_protocol: str | None = None,
+                 operation_specs: Callable[[], list[CommonToolSpec]] | None = None,
+                 operation_call: Callable[[str, dict[str, Any], str], ToolResult] | None = None) -> None:
         if protocol not in (None, 'subjects.v1', 'subjects.v2', 'subjects.v3'):
             raise ValueError('Unknown inspection protocol')
+        if execution_protocol not in (None, 'shared.v1'):
+            raise ValueError('Unknown inspection execution protocol')
         self.root, self.workspace = Path(root), workspace
         self.store, self.client_factory = ArtifactStore(root), client_factory
         self.prior_assessments = prior_assessments
@@ -218,6 +246,9 @@ class InspectionToolGateway:
         self.user_requests = user_requests
         self.feedback_provider = feedback_provider
         self.protocol = protocol
+        self.execution_protocol = execution_protocol
+        self.operation_specs = operation_specs
+        self.operation_call = operation_call
 
     @property
     def progressive(self) -> bool:
@@ -232,6 +263,26 @@ class InspectionToolGateway:
         return saved.get('delivery_context', {}).get('schema_version') == 'delivery_review.v3'
 
     def _system(self, saved: dict) -> str:
+        if saved.get('execution_protocol') == 'shared.v1':
+            contract = (_DELIVERY_SYSTEM if self._delivery_scope(saved) else
+                _REVIEW_SYSTEM if self.adaptive else _SUBJECT_SYSTEM if self.protocol else _SYSTEM)
+            # Keep the original response/evidence contracts while offering actual
+            # inspection operations under the caller's ordinary authority.
+            for text in ('never execute code or edit files.',
+                    'No visual or scientific certification is possible.',
+                    'Do not invent evidence, execute code, impose a report or PDF, ',
+                    'or claim direct visual inspection from text.'):
+                contract = contract.replace(text, '')
+            contract = contract.replace('through the offered read-only tools;', 'through the offered tools.')
+            return (contract + ' You may use only operations offered in this decision. '
+                'Original targets and sources are immutable. Create or change helper files only under '
+                f"workspace/inspection-work/{saved['identity']}/. "
+                'Process execution requires the ordinary explicit approval and is not sandboxed; '
+                'declare actual input files and outputs when applicable. Visual observations require '
+                'inspect_images. To bind a visual observation, read its recorded feedback or review '
+                'and select that observed evidence ID in the final decision. Select the actual computed '
+                'output or diagnostic observation when relying on it. Tool results do not certify '
+                'scientific correctness.')
         return (_DELIVERY_SYSTEM if self._delivery_scope(saved) else _REVIEW_SYSTEM
             if self.adaptive else _SUBJECT_SYSTEM if self.protocol else _SYSTEM)
 
@@ -239,6 +290,351 @@ class InspectionToolGateway:
         if not isinstance(identity, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
             raise ValueError('Invalid inspection invocation identity')
         return f'tools/inspection/{identity}/{leaf}.json'
+
+    @staticmethod
+    def _position(number: int, role: str, call_id: str = '') -> str:
+        return f'sources-{number}/{role}' + (f'/{call_id}' if call_id else '')
+
+    def _closed_receipt(self, saved: dict, wrapper: dict) -> dict:
+        """Retain facts returned by the common owner, never an execution proposal."""
+        if (not isinstance(wrapper, dict) or not isinstance(wrapper.get('result'), dict)
+                or not isinstance(wrapper.get('attempt'), str)
+                or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', wrapper['attempt'])
+                or not isinstance(wrapper.get('record'), str) or not wrapper['record']):
+            raise ValueError('Inspection dispatcher returned a malformed closed receipt')
+        if self.store.read_json(wrapper['record']) != wrapper['result']:
+            raise ValueError('Inspection dispatcher result differs from its common owner receipt')
+        action_path = f"attempts/{wrapper['attempt']}/action.json"
+        action = self.store.read_json(action_path)
+        if (action.get('attempt') != wrapper['attempt']
+                or (action.get('execution_approval') or {}).get('binding') != wrapper.get('execution_binding')):
+            raise ValueError('Inspection dispatcher binding differs from its accepted common action')
+        reference = {'attempt':wrapper['attempt'], 'record':wrapper['record'],
+            'record_sha256':self._digest(wrapper['record']), 'action_sha256':self._digest(action_path)}
+        invocations = saved.setdefault('source_invocations', [])
+        if reference not in invocations:
+            invocations.append(reference)
+        return reference
+
+    def _receipt_result(self, receipt: dict) -> dict:
+        if (self._digest(receipt['record']) != receipt['record_sha256']
+                or self._digest(f"attempts/{receipt['attempt']}/action.json") != receipt['action_sha256']):
+            raise ValueError('Inspection common owner receipt changed; no replay')
+        result = self.store.read_json(receipt['record'])
+        if not isinstance(result, dict):
+            raise ValueError('Inspection common owner receipt has no result object')
+        return result
+
+    def _accepted_execution_binding(self, receipt: dict) -> dict:
+        action_path = f"attempts/{receipt['attempt']}/action.json"
+        if self._digest(action_path) != receipt['action_sha256']:
+            raise ValueError('Inspection accepted common action changed; no replay')
+        action = self.store.read_json(action_path)
+        binding = (action.get('execution_approval') or {}).get('binding')
+        if binding is None:
+            return {}
+        if not isinstance(binding, dict):
+            raise ValueError('Inspection common owner returned an invalid execution binding')
+        return binding
+
+    def _shared_tools(self, identity: str) -> list[dict]:
+        from simple_ar.tools.openai_schema import compact_json_schema
+        if self.operation_specs is None or self.operation_call is None:
+            raise ValueError('Shared inspection requires the actual operation specs and operation gateway')
+        specs = list(self.operation_specs())
+        if any(not isinstance(spec, CommonToolSpec) for spec in specs):
+            raise ValueError('Shared inspection operation specs must be CommonToolSpecs')
+        names = [spec.name for spec in specs]
+        if len(set(names)) != len(names) or any(name not in _SHARED_OPERATIONS for name in names):
+            raise ValueError('Shared inspection received duplicate or unsupported operation specs')
+        result = []
+        for spec in specs:
+            schema = deepcopy(spec.parameters_schema())
+            properties = schema.get('properties', {})
+            if spec.name in {'write_file', 'run_process'}:
+                properties.pop('delivery', None)
+            if spec.name == 'run_process':
+                properties.pop('input_snapshot', None)
+                schema['required'] = list(dict.fromkeys([*schema.get('required', []), 'cwd']))
+            if spec.name in {'write_file', 'edit_file', 'copy_file', 'copy_project'} and 'path' in properties:
+                properties['path']['description'] = (
+                    f'Destination inside workspace/inspection-work/{identity}/; original files remain unchanged.')
+            if spec.name == 'run_process' and 'cwd' in properties:
+                properties['cwd']['description'] = (
+                    f'Working directory inside workspace/inspection-work/{identity}/. '
+                    'Declared outputs must also be inside that directory. Ordinary approval applies; no sandbox is implied.')
+            result.append({'type':'function', 'function':{'name':spec.name,
+                'description':spec.description, 'parameters':compact_json_schema(schema)}})
+        return result
+
+    def _shared_destination(self, identity: str, value: str, saved: dict) -> Path:
+        base = self.workspace.workspace.resolve() / 'inspection-work' / identity
+        # Do not let a pre-existing link change the meaning of the owner scope.
+        for path in (base.parent, base):
+            if path.is_symlink() or path.is_junction():
+                raise ValueError('Inspection work directory cannot be a link')
+        target = self.workspace.resolve(value, write=True)
+        if target == base or not target.is_relative_to(base):
+            raise ValueError('Inspection helper destination must be inside its own work directory')
+        originals = [Path(row['path']).resolve() for row in saved['targets'] if row.get('path')]
+        originals.extend(Path(row['path']).resolve() for row in saved['evidence']
+            if row.get('path') and self._shared_original(saved, row))
+        originals.extend(self.workspace.resolve(path) for path in
+            saved.get('delivery_context', {}).get('artifacts', {}))
+        if any(path == target or path.is_relative_to(target) for path in originals):
+            raise ValueError('Inspection cannot change a target or source')
+        return target
+
+    def _shared_original(self, saved: dict, row: dict) -> bool:
+        path = Path(row['path']).resolve()
+        work = self.workspace.workspace.resolve() / 'inspection-work' / saved['identity']
+        return str(path) in saved.get('immutable_paths', []) or not path.is_relative_to(work)
+
+    def _check_inspection_versions(self, saved: dict, identity: str, *, selected: list[dict] | None = None) -> None:
+        if saved.get('execution_protocol') != 'shared.v1':
+            self._check_versions([*saved['targets'], *saved['evidence']], identity)
+            return
+        selected_ids = {row['subject'] for row in selected or []}
+        rows = [*saved['targets'], *(row for row in saved['evidence'] if row.get('path')
+            and (self._shared_original(saved, row) or row['subject'] in selected_ids))]
+        self._check_versions(rows, identity)
+
+    def _selected_inspection_rows(self, saved: dict, response: dict) -> list[dict]:
+        if self._delivery_scope(saved):
+            selected = set(response.get('evidence', []))
+        elif self.protocol:
+            selected = {source for decision in response.get('decisions', [])
+                for source in decision.get('evidence', [])}
+        else:
+            selected = {row['subject'] for row in saved['evidence'] if row.get('independent')}
+        return [*saved['targets'], *(row for row in saved['evidence'] if row['subject'] in selected)]
+
+    def _shared_preflight(self, saved: dict, call: dict, arguments: dict) -> None:
+        name = call['function']['name']
+        identity = saved['identity']
+        if name in {'write_file', 'edit_file', 'copy_file', 'copy_project'}:
+            self._shared_destination(identity, arguments['path'], saved)
+        if name == 'run_process':
+            # A cwd may be the work root itself; output files may not.
+            work = self.workspace.workspace.resolve() / 'inspection-work' / identity
+            cwd = self.workspace.resolve(arguments['cwd'], write=True)
+            if cwd == work:
+                for path in (work.parent, work):
+                    if path.is_symlink() or path.is_junction():
+                        raise ValueError('Inspection work directory cannot be a link')
+            else:
+                self._shared_destination(identity, arguments['cwd'], saved)
+            for output in arguments.get('outputs', []):
+                self._shared_destination(identity, output, saved)
+            if 'delivery' in arguments or 'input_snapshot' in arguments:
+                raise ValueError('Inspection processes cannot deliver or acquire another execution owner')
+
+    def _shared_owner_receipts(self, name: str, result: ToolResult, receipt: dict,
+                               arguments: dict) -> dict:
+        receipts = {}
+        attempt = receipt['attempt']
+        accepted = self._accepted_execution_binding(receipt)
+        if name == 'run_process' and result.data.get('receipt'):
+            path = result.data['receipt']
+            record = self.store.read_json(path)
+            if (Path(path) != Path('tools') / 'processes' / attempt / 'invocation.json'
+                    or record.get('invocation_id') != attempt
+                    or record.get('argv') != accepted.get('argv')
+                    or record.get('cwd') != str(self.workspace.resolve(arguments['cwd'], write=True).resolve())):
+                raise ValueError('Process receipt differs from its actual operation identity')
+            actual = (record.get('input_binding') or {}).get('workspace_artifacts')
+            expected = accepted.get('artifacts')
+            if actual != expected:
+                raise ValueError('Process receipt differs from its owner-bound inputs')
+            receipts[path] = self._digest(path)
+        if name == 'inspect_images' and result.ok:
+            images_binding = result.data.get('input_sha256')
+            if not isinstance(images_binding, dict) or set(images_binding) != set(arguments['images']):
+                raise ValueError('Visual receipt lacks its actual image input binding')
+            if not result.artifacts:
+                raise ValueError('Visual owner receipt is unavailable')
+            for locator in result.artifacts:
+                path = self.workspace.resolve(locator)
+                if not path.is_file():
+                    raise ValueError('Visual owner receipt is unavailable')
+                receipts[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+            directory = self.workspace.resolve(result.artifacts[0]).parent
+            if directory != self.workspace.resolve(f'workspace/visual-reviews/{attempt}'):
+                raise ValueError('Visual receipt differs from its actual operation identity')
+            visual_store = ArtifactStore(directory)
+            visual_request = visual_store.read_json('request.json')
+            snapshots = visual_request['images']
+            images = arguments['images']
+            expected = [f'source-{index}{self.workspace.resolve(locator).suffix.lower()}'
+                for index, locator in enumerate(images)]
+            if snapshots != expected or visual_request.get('goal') != arguments['goal']:
+                raise ValueError('Visual owner recorded a different image set')
+            for snapshot, locator in zip(snapshots, images):
+                path = visual_store.resolve(snapshot)
+                actual = hashlib.sha256(path.read_bytes()).hexdigest()
+                if actual != images_binding[locator]:
+                    raise ValueError('Visual owner snapshot differs from its input')
+                receipts[str(path)] = actual
+            for leaf in ('request.json', 'response.json'):
+                path = visual_store.require(leaf)
+                receipts[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return receipts
+
+    def _check_bound_process_inputs(self, receipt: dict, arguments: dict) -> dict[str, str]:
+        """Validate relevant accepted input facts without deriving an approval."""
+        accepted = self._accepted_execution_binding(receipt)
+        artifacts = accepted.get('artifacts')
+        if artifacts is not None:
+            self.workspace._check_process_inputs(artifacts, identity=receipt['attempt'])
+        cwd = self.workspace.resolve(arguments['cwd'], write=True)
+        versions = {}
+        for value, digest in accepted.get('files', {}).items():
+            try:
+                path = str(self.workspace.resolve(str((cwd / value).resolve())))
+            except ValueError:
+                continue  # External runtime pins remain the common owner's facts.
+            versions[path] = digest
+        if self.workspace.artifact_hashes(versions) != versions:
+            raise ValueError('Selected inspection process has changed input files')
+        if artifacts is not None:
+            versions.update({str(self.workspace.resolve(path)):digest for path, digest in artifacts['inputs'].items()})
+        return versions
+
+    def _check_shared_dependencies(self, saved: dict, *, current_inputs: bool,
+                                   selected: list[dict] | None = None) -> dict[str, str]:
+        if saved.get('execution_protocol') != 'shared.v1':
+            return {}
+        dependencies: dict[str, str] = {}
+
+        def bind(path: str, digest: str) -> None:
+            path = str(self.workspace.resolve(path))
+            if path in dependencies and dependencies[path] != digest:
+                raise ValueError('Selected inspection evidence has conflicting input versions')
+            dependencies[path] = digest
+        selected_paths = ({str(self.workspace.resolve(row['path'])) for row in selected or [] if row.get('path')}
+            if current_inputs else set())
+        if current_inputs and selected is not None and self._delivery_scope(saved):
+            selected_paths.update(str(self.workspace.resolve(path)) for path in saved['delivery_context']['artifacts'])
+        cache: dict[str, Any] = {}
+        if current_inputs and selected_paths:
+            diagnostics = self.workspace.root / 'tools' / 'processes'
+            material = [path for path in selected_paths if not Path(path).is_relative_to(diagnostics)]
+            self.workspace.check_artifact_producers(material, cache=cache)
+        rows = []
+        for number, digest in enumerate(saved.get('source_rounds', [])):
+            path = self._path(saved['identity'], f'sources-{number}')
+            if self._digest(path) != digest:
+                raise ValueError('Inspection source investigation record changed; no replay')
+            trace = self.store.read_json(path)
+            closed = [trace[key] for key in ('model_receipt', 'checkpoint_receipt') if key in trace]
+            closed.extend(row['receipt'] for row in trace.get('results', []) if 'receipt' in row)
+            for receipt in closed:
+                self._receipt_result(receipt)
+            for row in trace.get('results', []):
+                rows.append(row)
+                for locator, expected in row.get('owner_receipts', {}).items():
+                    owner_path = Path(locator)
+                    actual = (hashlib.sha256(owner_path.read_bytes()).hexdigest() if owner_path.is_absolute()
+                        else self._digest(locator))
+                    if actual != expected:
+                        raise ValueError('Inspection operation owner receipt changed; no replay')
+        if not current_inputs or not selected_paths:
+            return dependencies
+        included_visual = set()
+        while True:
+            # Reuse the producer owner's visited closure, including its leaf
+            # inputs: a feedback file need not itself have a process producer.
+            producers = cache.get('producers', {})
+            reached = selected_paths | {str(path) for path in cache.get('checked', set())}
+            for path in cache.get('checked', set()):
+                if path in producers and producers[path][2] is not None:
+                    reached.update(str(self.workspace.resolve(locator))
+                        for locator in producers[path][2]['inputs'])
+            added = False
+            for index, row in enumerate(rows):
+                owner_result = self._receipt_result(row['receipt']) if 'receipt' in row else {}
+                images = owner_result.get('data', {}).get('input_sha256')
+                if (index in included_visual or row.get('tool') != 'inspect_images' or not isinstance(images, dict)
+                        or owner_result.get('status') != 'ok'
+                        or not any(str(self.workspace.resolve(locator)) in reached
+                            for locator in owner_result.get('artifacts', []))):
+                    continue
+                if self.workspace.artifact_hashes(images) != images:
+                    raise ValueError('Selected visual observation has changed image inputs')
+                for locator, digest in images.items():
+                    bind(locator, digest)
+                self.workspace.check_artifact_producers(images, cache=cache)
+                included_visual.add(index)
+                added = True
+            if not added:
+                break
+        producers = cache.get('producers', {})
+        owner_ids = {producers[path][1]['invocation_id'] for path in cache.get('checked', set())
+            if path in producers and producers[path][1] is not None}
+        for path in cache.get('checked', set()):
+            if path in producers and producers[path][2] is not None:
+                for locator, digest in producers[path][2]['inputs'].items():
+                    bind(locator, digest)
+        for row in rows:
+            receipt = row.get('receipt', {})
+            process_directory = self.workspace.root / 'tools' / 'processes' / receipt.get('attempt', '')
+            chosen = (receipt.get('attempt') in owner_ids
+                or any(Path(path).parent == process_directory for path in selected_paths))
+            if row.get('tool') == 'run_process' and receipt and chosen:
+                for locator, digest in self._check_bound_process_inputs(receipt, row['arguments']).items():
+                    bind(locator, digest)
+        return dependencies
+
+    def _shared_final_bindings(self, saved: dict, response: dict) -> dict[str, dict[str, str]]:
+        observed = {row['subject']:row for row in [*saved['targets'], *saved['evidence']]}
+        if self._delivery_scope(saved):
+            selected = [observed[key] for key in response['evidence']]
+            return {'delivery':self._check_shared_dependencies(saved, current_inputs=True, selected=selected)}
+        if self.protocol:
+            return {decision['subject']:self._check_shared_dependencies(saved, current_inputs=True,
+                selected=[observed[decision['subject']], *[observed[key] for key in decision['evidence']]])
+                for decision in response['decisions']}
+        selected = self._selected_inspection_rows(saved, response)
+        return {'group':self._check_shared_dependencies(saved, current_inputs=True, selected=selected)}
+
+    def _stored_shared_bindings(self, saved: dict, response: dict) -> dict[str, dict[str, str]]:
+        if saved.get('execution_protocol') != 'shared.v1':
+            return {}
+        if not saved.get('source_rounds'):
+            raise ValueError('Inspection has no retained final decision')
+        trace = self.store.read_json(self._path(saved['identity'], f"sources-{len(saved['source_rounds'])-1}"))
+        admission = trace.get('admission', {})
+        if admission.get('final') != response or not isinstance(admission.get('dependencies'), dict):
+            raise ValueError('Inspection final evidence bindings are unavailable')
+        return admission['dependencies']
+
+    @staticmethod
+    def _evidence_with_dependencies(evidence: dict[str, str], dependencies: dict[str, str]) -> dict[str, str]:
+        result = dict(evidence)
+        for path, digest in dependencies.items():
+            if path in result and result[path] != digest:
+                raise ValueError('Inspection evidence has conflicting input versions')
+            result[path] = digest
+        return result
+
+    def _recover_shared_journal(self, saved: dict) -> None:
+        """Complete an interrupted journal-to-input digest update, without rerunning a step."""
+        input_path = self._path(saved['identity'], 'input')
+        for number, expected in enumerate(saved.get('source_rounds', [])):
+            trace = self._path(saved['identity'], f'sources-{number}')
+            actual = self._digest(trace)
+            if actual == expected:
+                continue
+            recovery = self.store.read_json(trace).get('recovery', {})
+            if (recovery.get('previous_trace_sha256') != expected
+                    or recovery.get('previous_input_sha256') != self._digest(input_path)):
+                raise ValueError('Inspection source investigation record changed; no replay')
+            state = recovery['observations']
+            saved['targets'], saved['evidence'] = state['targets'], state['evidence']
+            if 'source_invocations' in state:
+                saved['source_invocations'] = state['source_invocations']
+            saved['source_rounds'][number] = actual
+            self.store.write_json(input_path, saved)
 
     @staticmethod
     def delivery_scope_view(binding: dict) -> dict:
@@ -313,10 +709,27 @@ class InspectionToolGateway:
         return self.store.exists(self._path(identity, 'input'))
 
     def _usage(self, identity: str) -> list[dict[str, Any]]:
-        # Native source calls own distinct process identities on the same ledger.
-        # Legacy receipts without this admission list keep their original usage.
+        # Closed references identify evidence; admitted common headers also bind
+        # failed/unknown charges whose dispatch never returned a closed wrapper.
         path = self._path(identity,'input')
-        invocations = self.store.read_json(path).get('source_invocations',[]) if self.store.exists(path) else []
+        saved = self.store.read_json(path) if self.store.exists(path) else {}
+        invocations = saved.get('source_invocations', [])
+        if saved.get('execution_protocol') == 'shared.v1':
+            entries = list(self.workspace.ledger.entries)
+            attempts = {row['attempt'] for row in invocations}
+            candidates = {value for entry in entries for value in (entry.attempt_id, entry.logical_call_id)
+                if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', value)}
+            for candidate in candidates - attempts:
+                header_path = f'attempts/{candidate}/action.json'
+                if self.store.exists(header_path):
+                    header = self.store.read_json(header_path)
+                    if (header.get('attempt') == candidate
+                            and header.get('origin', {}).get('scope') == identity):
+                        attempts.add(candidate)
+            return [entry.to_dict() for entry in entries
+                if entry.attempt_id == identity or entry.attempt_id in attempts
+                or entry.logical_call_id in attempts]
+        # Historical owners retain their original invocation-list accounting.
         return [entry.to_dict() for entry in self.workspace.ledger.entries
                 if entry.attempt_id == identity or entry.logical_call_id in invocations]
 
@@ -376,6 +789,8 @@ class InspectionToolGateway:
             for path, expected in self.store.read_json(trace_path).get('checkpoint', {}).items():
                 if self._digest(path) != expected:
                     raise ValueError('Inspection checkpoint record changed; no replay')
+        self._check_shared_dependencies(saved, current_inputs=current_inputs,
+            selected=self._selected_inspection_rows(saved, receipt['response']) if current_inputs else None)
         if saved.get('memory_protocol') == 'journal.v1':
             self._conversation_memory(saved, self._conversation_rows(saved))
         result = ToolResult.model_validate(self.store.read_json(result_path))
@@ -400,7 +815,8 @@ class InspectionToolGateway:
             if error or result.metadata[key] != expected:
                 raise ValueError('Inspection cached subject decisions differ from the retained response; no replay')
         elif current_inputs:
-            self._check_versions([*saved['targets'], *saved['evidence']], identity)
+            self._check_inspection_versions(saved, identity,
+                selected=self._selected_inspection_rows(saved, receipt['response']))
         return result
 
     def feedback_observation(self, identity: str, claimed: dict, *, expected_arguments: dict | None = None) -> dict:
@@ -449,7 +865,8 @@ class InspectionToolGateway:
             return False
 
     def _observe(self, value: FileWindow | str, subject: str, identity: str,
-                 remaining: list[int], *, read_limit: int | None = None) -> dict[str, Any]:
+                 remaining: list[int], *, read_limit: int | None = None,
+                 operation_call: Callable | None = None) -> dict[str, Any]:
         full = isinstance(value, str)
         window = FileWindow(path=value) if full else value
         if self.progressive:
@@ -465,7 +882,8 @@ class InspectionToolGateway:
                              max_bytes=max(1, min(64000 if full else window.max_bytes, remaining[0])))
             consumed = 0
             while True:
-                result = self.workspace.call('read_file', arguments, identity=identity)
+                result = (operation_call('read_file', arguments, identity) if operation_call is not None
+                    else self.workspace.call('read_file', arguments, identity=identity))
                 if not result.ok:
                     raise ValueError(result.error or 'Unreadable file')
                 data = result.data
@@ -677,13 +1095,21 @@ class InspectionToolGateway:
         """A whole-work opinion, never a representative file's extended pass."""
         delivery = saved['delivery_context']
         observed = {row['subject']:row for row in [*saved['targets'], *saved['evidence']]}
-        error, decision = '', None
+        error, decision, dependencies = '', None, {}
         try:
             if failure:
                 raise ValueError(failure)
             decision = self._delivery_decision(saved, receipt['response'])
+            if saved.get('execution_protocol') == 'shared.v1':
+                bindings = self._stored_shared_bindings(saved, receipt['response'])
+                dependencies = bindings['delivery']
             if check_versions:
-                self._check_versions(list(observed.values()), identity)
+                selected = self._selected_inspection_rows(saved, receipt['response'])
+                self._check_inspection_versions(saved, identity, selected=selected)
+                self._check_shared_dependencies(saved, current_inputs=True, selected=selected)
+                if (saved.get('execution_protocol') == 'shared.v1'
+                        and bindings != self._shared_final_bindings(saved, receipt['response'])):
+                    raise ValueError('Inspection selected producer bindings changed')
                 if self.workspace.artifact_hashes(delivery['artifacts']) != delivery['artifacts']:
                     raise ValueError('Bound delivery changed during whole-work review')
         except (ValueError, OSError, KeyError) as exc:
@@ -697,20 +1123,30 @@ class InspectionToolGateway:
             'verdict':'needs_revision' if any(row['severity']=='required' for row in findings)
                 else 'passed' if complete else 'incomplete',
             'findings':findings,
-            'evidence_sha256':{observed[key]['path']:observed[key]['sha256']
-                for key in decision.evidence} if decision else {},
+            'evidence_sha256':self._evidence_with_dependencies(
+                {observed[key]['path']:observed[key]['sha256'] for key in decision.evidence}, dependencies)
+                if decision else {},
             'limitations':[*decision.limitations] if decision else [error or 'Whole-work investigation incomplete']}, error
 
     def _subject_assessments(self, saved: dict[str, Any], receipt: dict[str, Any],
                              identity: str, failure: str, *, check_versions: bool = True) -> tuple[list[dict], str]:
         observed = {row['subject']: row for row in [*saved['targets'], *saved['evidence']]}
-        error, decisions = '', {}
+        error, decisions, bindings = '', {}, {}
         try:
             if failure:
                 raise ValueError(failure)
             decisions = {row.subject: row for row in self._subject_decisions(saved, receipt['response'])}
+            if saved.get('execution_protocol') == 'shared.v1':
+                bindings = self._stored_shared_bindings(saved, receipt['response'])
+                if set(bindings) != set(decisions):
+                    raise ValueError('Inspection selected producer bindings do not match its subjects')
             if check_versions:
-                self._check_versions(list(observed.values()), identity)
+                selected = self._selected_inspection_rows(saved, receipt['response'])
+                self._check_inspection_versions(saved, identity, selected=selected)
+                self._check_shared_dependencies(saved, current_inputs=True, selected=selected)
+                if (saved.get('execution_protocol') == 'shared.v1'
+                        and bindings != self._shared_final_bindings(saved, receipt['response'])):
+                    raise ValueError('Inspection selected producer bindings changed')
         except (ValueError, OSError, KeyError) as exc:
             error, decisions = str(exc), {}
         assessments = []
@@ -735,10 +1171,15 @@ class InspectionToolGateway:
                 'passed' if complete else 'incomplete')
             assessments.append({'schema_version': 'artifact_assessment.v1',
                 'subjects': {target['path']: target['sha256']},
-                'evidence_sha256': {row['path']: row['sha256'] for row in sources},
+                'evidence_sha256': self._evidence_with_dependencies(
+                    {row['path']: row['sha256'] for row in sources},
+                    bindings.get(target['subject'], {}) if decision else {}),
                 'coverage': 'complete' if complete else 'partial',
                 'verdict': verdict, 'findings': findings,
-                'limitations': [*limitations, 'Text inspection only; no visual or scientific certification']})
+                'limitations': [*limitations,
+                    'Inspection uses retained text and recorded tool observations; results do not certify scientific correctness'
+                    if saved.get('execution_protocol') == 'shared.v1' else
+                    'Text inspection only; no visual or scientific certification']})
         return assessments, error
 
     def _group_assessment(self, saved: dict[str, Any], receipt: dict[str, Any],
@@ -751,11 +1192,14 @@ class InspectionToolGateway:
         if not independent:
             limitations.append('No independently read source evidence; scope is target-text review only')
         complete = bool(targets) and all(row['complete'] and row.get('readable') for row in targets)
-        error, findings = '', []
+        error, findings, dependencies = '', [], {}
         try:
             if failure:
                 raise ValueError(failure)
             response = _Response.model_validate(receipt['response'])
+            if saved.get('execution_protocol') == 'shared.v1':
+                bindings = self._stored_shared_bindings(saved, receipt['response'])
+                dependencies = bindings['group']
             known = {row['subject']: row for row in targets}
             if any(row.subject not in known or not row.message.strip() for row in response.findings):
                 raise ValueError('Inspection finding has an unknown target or empty message')
@@ -768,7 +1212,12 @@ class InspectionToolGateway:
                 findings.append({'subjects': {row['path']: row['sha256']},
                                  'severity': finding.severity, 'message': finding.message})
             limitations.extend(response.limitations)
-            self._check_versions([*targets, *evidence], identity)
+            selected = self._selected_inspection_rows(saved, receipt['response'])
+            self._check_inspection_versions(saved, identity, selected=selected)
+            self._check_shared_dependencies(saved, current_inputs=True, selected=selected)
+            if (saved.get('execution_protocol') == 'shared.v1'
+                    and bindings != self._shared_final_bindings(saved, receipt['response'])):
+                raise ValueError('Inspection selected producer bindings changed')
             verdict = ('needs_revision' if any(row['severity'] == 'required' for row in findings)
                        else 'incomplete' if not complete else 'passed')
         except (ValueError, OSError, KeyError) as exc:
@@ -777,24 +1226,29 @@ class InspectionToolGateway:
             limitations.append(error)
         assessment = {'schema_version': 'artifact_assessment.v1',
             'subjects': {row['path']: row['sha256'] for row in targets if row.get('sha256')},
-            'evidence_sha256': {row['path']: row['sha256'] for row in evidence
-                               if row.get('sha256') and row.get('independent')},
+            'evidence_sha256': self._evidence_with_dependencies(
+                {row['path']: row['sha256'] for row in evidence
+                 if row.get('sha256') and row.get('independent')}, dependencies),
             'coverage': 'complete' if complete else 'partial',
             'verdict': verdict, 'findings': findings,
-            'limitations': [*limitations, 'Text inspection only; no visual or scientific certification']}
+            'limitations': [*limitations,
+                'Inspection uses retained text and recorded tool observations; results do not certify scientific correctness'
+                if saved.get('execution_protocol') == 'shared.v1' else
+                'Text inspection only; no visual or scientific certification']}
         return assessment, error
 
     def _finish(self, saved: dict[str, Any], receipt: dict[str, Any], identity: str,
-                *, failure: str = '') -> ToolResult:
+                *, failure: str = '', persist: bool = True) -> ToolResult:
         targets, evidence = saved['targets'], saved['evidence']
         package = self._delivery_scope(saved)
         if not package and not any(row.get('sha256') for row in targets):
             result = ToolResult(tool_name='inspect_artifacts',status='error',
                 error='No readable target version was bound; correct the target selection before inspection',
                 data={'targets':targets,'evidence':evidence},metadata={'usage':receipt.get('usage',[])})
-            self.store.write_json(self._path(identity,'result'),result.model_dump(mode='json'))
-            receipt['result_sha256'] = self._digest(self._path(identity,'result'))
-            self.store.write_json(self._path(identity,'response'),receipt)
+            if persist:
+                self.store.write_json(self._path(identity,'result'),result.model_dump(mode='json'))
+                receipt['result_sha256'] = self._digest(self._path(identity,'result'))
+                self.store.write_json(self._path(identity,'response'),receipt)
             return result
         if package:
             assessment, error = self._delivery_assessment(saved, receipt, identity, failure)
@@ -808,9 +1262,15 @@ class InspectionToolGateway:
             verdict = assessment['verdict']
         key = 'delivery_assessment' if package else 'assessments' if self.protocol else 'assessment'
         attempt_store = ArtifactStore(self.root / 'attempts' / identity)
-        ref = attempt_store.write_json(f'inspection/{key}.json', assessment,
-            kind='delivery_assessment' if package else 'artifact_assessments' if self.protocol else 'artifact_assessment',
-            schema=None if self.protocol else 'artifact_assessment.v1', producer='inspect_artifacts')
+        ref_options = {
+            'kind':'delivery_assessment' if package else 'artifact_assessments' if self.protocol else 'artifact_assessment',
+            'schema':None if self.protocol else 'artifact_assessment.v1', 'producer':'inspect_artifacts'}
+        if persist:
+            ref = attempt_store.write_json(f'inspection/{key}.json', assessment, **ref_options)
+        else:
+            ref = attempt_store.ref(f'inspection/{key}.json', **ref_options)
+            if attempt_store.read_json(ref) != assessment:
+                raise ValueError('Inspection retained assessment differs from its completed response; no overwrite')
         artifact_path = f'attempts/{identity}/{ref.path}'
         diagnostics = {}
         if self.adaptive and error and saved.get('source_rounds'):
@@ -851,10 +1311,54 @@ class InspectionToolGateway:
                           'response_sha256': self._response_digest(receipt),
                           **({'assessment_path': artifact_path} if self.protocol else {}),
                           'assessment_sha256': self._digest(artifact_path)}})
-        self.store.write_json(self._path(identity, 'result'), result.model_dump(mode='json'))
-        receipt['result_sha256'] = self._digest(self._path(identity, 'result'))
-        self.store.write_json(self._path(identity, 'response'), receipt)
+        if persist:
+            self.store.write_json(self._path(identity, 'result'), result.model_dump(mode='json'))
+            receipt['result_sha256'] = self._digest(self._path(identity, 'result'))
+            self.store.write_json(self._path(identity, 'response'), receipt)
         return result
+
+    def _resume_shared_result(self, saved: dict, identity: str) -> ToolResult:
+        """Close a proven final write gap, or return an intact failed diagnostic."""
+        response_path = self._path(identity, 'response')
+        result_path = self._path(identity, 'result')
+        response_bytes = self.store.require(response_path).read_bytes()
+        receipt = json.loads(response_bytes)
+        if (receipt.get('identity') != identity
+                or receipt.get('input_sha256') != self._digest(self._path(identity, 'input'))):
+            raise ValueError('Inspection retained response differs from its original input; no overwrite')
+        result_bytes = self.store.require(result_path).read_bytes()
+        digest = hashlib.sha256(result_bytes).hexdigest()
+        retained = json.loads(result_bytes)
+        result = ToolResult.model_validate(retained)
+        if 'result_sha256' in receipt and receipt['result_sha256'] != digest:
+            raise ValueError('Inspection result bytes changed; no overwrite')
+        if receipt.get('completed') is True:
+            if result.ok and 'result_sha256' in receipt:
+                return self._cached(identity)
+            self._receipt(identity)
+            # A complete provider response may still yield a closed diagnostic
+            # (for example a changed input). That never enters acceptance or
+            # becomes a reason to replay the already completed investigation.
+            failure = '' if result.ok else result.error
+        elif receipt.get('completed') is False:
+            if result.ok:
+                raise ValueError('An unfinished inspection cannot retain an accepted result')
+            self._check_shared_dependencies(saved, current_inputs=False)
+            failure = receipt.get('error', 'No final response')
+        else:
+            raise ValueError('Inspection response has no retained completion state')
+        expected = self._finish(saved, deepcopy(receipt), identity, failure=failure, persist=False)
+        if retained != expected.model_dump(mode='json'):
+            raise ValueError('Inspection retained result differs from its response; no overwrite')
+        if (self.store.require(result_path).read_bytes() != result_bytes
+                or self.store.require(response_path).read_bytes() != response_bytes
+                or receipt['input_sha256'] != self._digest(self._path(identity, 'input'))):
+            raise ValueError('Inspection retained closure changed during recovery; no overwrite')
+        if not result.ok:
+            return result  # Diagnostic history never enters _cached acceptance.
+        receipt['result_sha256'] = digest
+        self.store.write_json(response_path, receipt)
+        return self._cached(identity)
 
     def _prior(self, targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Present same-version concerns, without adopting their earlier verdict."""
@@ -998,6 +1502,12 @@ class InspectionToolGateway:
             if remaining is not None:
                 target = min(target, max(0, remaining - (client.effective_output_limit() or 0)))
         base = self._view(saved, request)
+        if saved.get('execution_protocol') == 'shared.v1':
+            # A primary target is a current material, not permanently pinned
+            # prompt text. Its complete read/version proof stays in the source
+            # journal; the common selector supplies useful original windows.
+            for row in base['targets']:
+                row['text_windows'] = []
         pinned = {(row['path'], row['sha256']): row for role in ('targets', 'evidence')
             for row in base[role] if row.get('text_windows')}
         blocks, current, read_turns = [], [], {}
@@ -1092,12 +1602,15 @@ class InspectionToolGateway:
             if not trace.get('completed') or not response:
                 continue
             call_id = 'inspect-artifacts-'+saved['identity'] + (f'-sources-{number}' if number else '')
+            model_attempt = (trace['model_receipt']['attempt'] if saved.get('execution_protocol') == 'shared.v1'
+                else saved['identity'])
             usage = [entry.to_dict() for entry in self.workspace.ledger.entries
-                if entry.attempt_id == saved['identity'] and entry.logical_call_id == call_id]
+                if entry.attempt_id == model_attempt and entry.logical_call_id == call_id]
             if not any(entry['status'] == 'settled' for entry in usage) or not self._accounted(usage):
                 continue
             calls, results = response.get('tool_calls') or [], trace['results']
-            if [row['call_id'] for row in results] != [call['id'] for call in calls]:
+            if (trace.get('malformed_calls') or
+                    [row['call_id'] for row in results] != [call['id'] for call in calls]):
                 continue  # A response with unfinished tool work is not closed.
             for index, row in enumerate(results):
                 rows.append({'turn':number, 'record':path+f'#results/{index}',
@@ -1142,12 +1655,19 @@ class InspectionToolGateway:
                     raise ValueError('Inspection checkpoint record changed; no replay')
             store = ArtifactStore(self.root/f"tools/inspection/{saved['identity']}/sources-{number}")
             call_id = f"working-memory-{saved['identity']}-sources-{number}"
-            if len(sessions) != 1:
+            attempt_id = (trace['checkpoint_receipt']['attempt'] if saved.get('execution_protocol') == 'shared.v1'
+                else saved['identity'])
+            checkpoint_sessions = ({entry.session_id for entry in self.workspace.ledger.entries
+                if entry.attempt_id == attempt_id and entry.status == 'settled'
+                and entry.logical_call_id == call_id}
+                if saved.get('execution_protocol') == 'shared.v1' else sessions)
+            if len(checkpoint_sessions) != 1:
                 raise ValueError('Inspection checkpoint has no unique original conversation session')
-            session_id, = sessions
+            session_id, = checkpoint_sessions
             try:
-                checkpoint_entries(self.workspace.ledger, saved['identity'],
-                    session_id, call_id=call_id)
+                checkpoint_entries(self.workspace.ledger, attempt_id,
+                    session_id, call_id=call_id,
+                    completed_retry=saved.get('execution_protocol') == 'shared.v1')
             except ValueError:
                 continue  # Unknown/inflight work is not adopted and its fees remain.
             view = store.read_json('memory_input.json')
@@ -1160,8 +1680,9 @@ class InspectionToolGateway:
                         or row.get('truncated') is not False
                         or json.loads(row['observation_text']) != original['result']):
                     raise ValueError('Inspection checkpoint disagrees with its closed source receipt')
-            refs = checkpoint_artifacts(store=store, ledger=self.workspace.ledger, attempt_id=saved['identity'],
+            refs = checkpoint_artifacts(store=store, ledger=self.workspace.ledger, attempt_id=attempt_id,
                 session_id=session_id, call_id=call_id,
+                completed_retry=saved.get('execution_protocol') == 'shared.v1',
                 bind_notes=lambda notes:self._bind_conversation_notes(notes, rows))
             expected = {store.resolve(ref.path).relative_to(self.store.root).as_posix() for ref in refs}
             if set(recorded) != expected or view['archive_through_turn'] > number:
@@ -1182,9 +1703,11 @@ class InspectionToolGateway:
                 for window in data.get('text_windows', []):
                     sources[(data['subject'], window['offset_bytes'], window['next_offset_bytes'], window['text'])] = row
         observations = []
-        # Primary target text remains required domain input. Supplementary
-        # source text has exactly one owner: the common material selector.
-        for row in saved['evidence']:
+        # Shared targets and evidence use the common material selector. Legacy
+        # owners keep target text in their required domain input.
+        materials = ([*saved['targets'], *saved['evidence']]
+            if saved.get('execution_protocol') == 'shared.v1' else saved['evidence'])
+        for row in materials:
             if not row.get('readable'):
                 continue
             for window in row['windows']:
@@ -1199,17 +1722,109 @@ class InspectionToolGateway:
         return memory, observations, rows
 
     def _prepare_conversation_round(self, saved, request, messages, tools, terminal, finish,
-                                    client, number, remaining):
+                                    client, number, remaining, *, dispatch=None, record=None, save_round=None):
         from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
-        from simple_ar.app.work_memory import compact_work
+        from simple_ar.app.work_memory import checkpoint_artifacts, compact_work
         conversation = ProfessionalConversation(client)
         trace = self._path(saved['identity'], f'sources-{number}')
+        last_floor = {}
 
         def project(closing):
             offered = [terminal] if closing else [*tools, terminal]
             projected, metadata = self._working_messages(saved, request, messages, offered, client,
                 finish=finish if closing else None)
             return ConversationInput(projected, offered, metadata)
+
+        def followup(value):
+            nonlocal last_floor
+            last_floor = {'llm_requests':1, 'total_tokens':conversation.tokens(project(True))}
+            return last_floor
+
+        def shared_checkpoint(checkpoint_input, *, restore_floor):
+            rows = self._conversation_rows(saved)
+            originals = {row['record']:row for row in rows}
+            if any(key not in originals for key in checkpoint_input['records']):
+                raise ValueError('Inspection checkpoint source receipt changed; no replay')
+            pending = [originals[key] for key in checkpoint_input['records']]
+            memory = self._conversation_memory(saved, rows)
+            store = ArtifactStore(self.root/f"tools/inspection/{saved['identity']}/sources-{number}")
+            call_id = f"working-memory-{saved['identity']}-sources-{number}"
+
+            def perform(actual_id):
+                checkpoint_client = self.client_factory(actual_id)
+                snapshot, refs = compact_work(store=store, client=checkpoint_client,
+                    requests=saved.get('user_requests', [request.goal]), previous=memory, rows=pending,
+                    bind_notes=lambda notes:self._bind_conversation_notes(notes, rows),
+                    estimate_tokens=estimate_tokens, attempt_id=actual_id, call_id=call_id,
+                    required_decision_tokens=checkpoint_input['decision_tokens'], additional_protection=True,
+                    completed_retry=True)
+                return {'snapshot':snapshot, 'artifacts':[ref.to_dict() for ref in refs]}
+
+            def recover(actual_id):
+                # Reconstitute only a paid, fully closed checkpoint. A lost
+                # ordinary model reply has no such owner proof or recovery hook.
+                if (not store.exists('memory_input.json')
+                        or not (store.exists('memory_snapshot.json') or store.exists('memory_failure.json'))):
+                    raise ValueError('Inspection checkpoint has no complete owner receipt; no replay')
+                sessions = {entry.session_id for entry in self.workspace.ledger.entries
+                    if entry.attempt_id == actual_id and entry.logical_call_id == call_id
+                    and entry.status == 'settled'}
+                if len(sessions) != 1:
+                    raise ValueError('Inspection checkpoint has no unique settled owner session')
+                session_id, = sessions
+                refs = checkpoint_artifacts(store=store, ledger=self.workspace.ledger,
+                    attempt_id=actual_id, session_id=session_id, call_id=call_id,
+                    completed_retry=True,
+                    bind_notes=lambda notes:self._bind_conversation_notes(notes, rows))
+                view = store.read_json('memory_input.json')
+                if (view['requests'] != saved.get('user_requests', [request.goal])
+                        or view['previous_notes'] != [{'id':'p'+str(index), **note}
+                            for index, note in enumerate(memory.get('notes', []))]
+                        or view['archive_through_turn'] != max(row['turn'] for row in pending)+1):
+                    raise ValueError('Inspection checkpoint differs from its retained preparation')
+                positions = {row['record']:index for index, row in enumerate(pending)}
+                supplied = view['observations']
+                order = [positions.get(row['record'], -1) for row in supplied]
+                if (not order or any(index < 0 for index in order)
+                        or order != sorted(set(order))):
+                    raise ValueError('Inspection checkpoint observations differ from the retained plan')
+                for item in supplied:
+                    original = originals[item['record']]
+                    if (item['turn'] != original['turn'] or item.get('arguments', {}) != original['arguments']
+                            or item.get('truncated') is not False
+                            or json.loads(item['observation_text']) != original['result']):
+                        raise ValueError('Inspection checkpoint changed its original source receipt')
+                snapshot = store.read_json('memory_snapshot.json') if store.exists('memory_snapshot.json') else None
+                return {'snapshot':snapshot, 'artifacts':[ref.to_dict() for ref in refs]}
+
+            perform.recover = recover
+
+            if 'checkpoint_receipt' in record:
+                receipt = record['checkpoint_receipt']
+            else:
+                position = self._position(number, 'checkpoint')
+                if restore_floor:
+                    with self.workspace.ledger.protect_remaining(checkpoint_input['floor'], additional=True):
+                        wrapper = dispatch('model', position, None, perform)
+                else:
+                    wrapper = dispatch('model', position, None, perform)
+                receipt = self._closed_receipt(saved, wrapper)
+                record['checkpoint_receipt'] = receipt
+            try:
+                result = self._receipt_result(receipt)
+                if result.get('status') in {'blocked', 'error'}:
+                    raise ValueError(result.get('error') or 'Inspection checkpoint produced no response')
+                if 'snapshot' not in result or not isinstance(result.get('artifacts'), list):
+                    raise ValueError('Inspection checkpoint dispatcher returned a malformed receipt')
+                paths = [ref['path'] for ref in result['artifacts']]
+                if (len(set(paths)) != len(paths) or any(path not in
+                        {'memory_input.json', 'memory_response.json', 'memory_snapshot.json', 'memory_failure.json'}
+                        for path in paths)):
+                    raise ValueError('Inspection checkpoint receipt names unexpected artifacts')
+                record['checkpoint'] = {store.resolve(path).relative_to(self.store.root).as_posix():
+                    hashlib.sha256(store.require(path).read_bytes()).hexdigest() for path in paths}
+            finally:
+                save_round()
 
         def checkpoint(value, decision_tokens):
             rows = self._conversation_rows(saved)
@@ -1218,6 +1833,15 @@ class InspectionToolGateway:
             pending = [row for row in rows if (row['turn'] in selected if selected is not None
                 else row['turn'] < value.projection['recent_start_turn'])
                 and row['record'] not in memory['compacted_records']]
+            if dispatch is not None:
+                if not pending:
+                    return
+                checkpoint_input = {'records':[row['record'] for row in pending],
+                    'decision_tokens':decision_tokens, 'floor':deepcopy(last_floor)}
+                record['checkpoint_input'] = checkpoint_input
+                save_round()
+                shared_checkpoint(checkpoint_input, restore_floor=False)
+                return
             store = ArtifactStore(self.root/f"tools/inspection/{saved['identity']}/sources-{number}")
             try:
                 compact_work(store=store, client=client, requests=saved.get('user_requests', [request.goal]),
@@ -1229,18 +1853,23 @@ class InspectionToolGateway:
                 # Bind all paid work, even when the following model turn fails.
                 # These are checkpoint artifacts in the original round journal,
                 # not an adopted-note cache or a second progress watermark.
-                record = self.store.read_json(trace)
-                record['checkpoint'] = {path.relative_to(self.store.root).as_posix():
+                legacy_record = self.store.read_json(trace)
+                legacy_record['checkpoint'] = {path.relative_to(self.store.root).as_posix():
                     hashlib.sha256(path.read_bytes()).hexdigest()
                     for name in ('memory_input.json', 'memory_response.json', 'memory_snapshot.json', 'memory_failure.json')
                     if (path := store.resolve(name)).exists()}
-                self.store.write_json(trace, record)
+                self.store.write_json(trace, legacy_record)
                 saved['source_rounds'][number] = self._digest(trace)
                 self.store.write_json(self._path(saved['identity'], 'input'), saved)
 
-        value = conversation.prepare(project, checkpoint=checkpoint,
-            followup=lambda value:{'llm_requests':1, 'total_tokens':conversation.tokens(project(True))},
-            force_close=remaining[0] <= 0, additional=True)
+        checkpoint_input = record.get('checkpoint_input') if dispatch is not None else None
+        if checkpoint_input is not None:
+            shared_checkpoint(checkpoint_input, restore_floor=True)
+        value = conversation.prepare(project,
+            checkpoint=None if checkpoint_input is not None else checkpoint,
+            followup=followup,
+            force_close=remaining[0] <= 0, additional=True,
+            exit_first=saved.get('execution_protocol') == 'shared.v1')
         return conversation, value
 
     def _legacy_inspection_input(self, saved, request, messages, tools, terminal, client, finish, number, remaining):
@@ -1374,12 +2003,94 @@ class InspectionToolGateway:
         self._mark_evidence(saved)
         self.store.write_json(self._path(identity, 'input'), saved)
 
+    def _admit_response(self, saved: dict, calls: list, offered: list, response_model: Any,
+                        read_names: set[str], *, shared: bool) -> tuple[list, str, dict | None, list]:
+        """Validate one native batch against the actual offer and final owner contract."""
+        parsed, final, owner_bindings = [], None, []
+        try:
+            schemas = ({item['function']['name']:item['function']['parameters'] for item in offered}
+                if shared else {})
+            for call in calls:
+                function = call['function']
+                arguments = json.loads(function['arguments'])
+                allowed = set(schemas) if shared else read_names | {'record_inspection'}
+                if (call.get('type') != 'function' or not isinstance(arguments, dict)
+                        or function['name'] not in allowed):
+                    raise ValueError('Inspection requested an unoffered tool or non-object arguments')
+                name = function['name']
+                if shared and name != 'record_inspection':
+                    from jsonschema import Draft202012Validator
+                    errors = list(Draft202012Validator(schemas[name]).iter_errors(arguments))
+                    if errors:
+                        raise ValueError('Inspection operation arguments do not match the offered schema: '
+                            + errors[0].message)
+                parsed.append((name, arguments))
+            finals = sum(name == 'record_inspection' for name, _ in parsed)
+            if finals and len(parsed) != 1:
+                raise ValueError('Return record_inspection alone, after source results have been observed')
+            if not self.adaptive and len(parsed) > 8:
+                raise ValueError('Inspection allows at most eight source calls in one response')
+            if finals:
+                value = parsed[0][1]
+                if not self._delivery_scope(saved) and self.protocol and isinstance(value.get('decisions'), list):
+                    rows = value['decisions']
+                    missing = [index for index, row in enumerate(rows) if isinstance(row, dict) and 'subject' not in row]
+                    explicit = [row['subject'] for row in rows if isinstance(row, dict) and 'subject' in row]
+                    targets = {row['subject'] for row in saved['targets']}
+                    if (len(missing) == 1 and len(rows) == len(targets) and len(explicit) == len(rows)-1
+                            and all(isinstance(key, str) and key in targets for key in explicit)
+                            and len(set(explicit)) == len(explicit) and len(targets-set(explicit)) == 1):
+                        subject = next(iter(targets-set(explicit)))
+                        value = deepcopy(value)
+                        value['decisions'][missing[0]]['subject'] = subject
+                        owner_bindings.append({'decision_index': missing[0], 'subject': subject})
+                final = response_model.model_validate(value).model_dump(mode='json')
+                if self._delivery_scope(saved):
+                    self._delivery_decision(saved, final)
+                elif self.protocol:
+                    self._subject_decisions(saved, final)
+                if shared:
+                    selected_rows = self._selected_inspection_rows(saved, final)
+                    self._check_inspection_versions(saved, saved['identity'], selected=selected_rows)
+                    self._check_shared_dependencies(saved, current_inputs=True, selected=selected_rows)
+            return parsed, '', final, owner_bindings
+        except (ValueError, KeyError, TypeError, OSError) as exc:
+            if not shared and isinstance(exc, OSError):
+                raise
+            return parsed, str(exc), None, []
+
+    def _shared_read(self, saved: dict, request: InspectionRequest, arguments: dict,
+                     attempt: str, remaining: int, read_limit: int | None) -> dict:
+        """Return the complete owner observation in the child attempt receipt."""
+        local = deepcopy(saved)
+        allowance = [remaining]
+        number = (max((int(item['subject'].split('-')[1]) for item in local['evidence']), default=0)
+            if self.progressive else len(local['evidence'])) + 1
+        row = self._observe(FileWindow.model_validate(arguments), f'evidence-{number}',
+            attempt, allowance, read_limit=read_limit, operation_call=self.operation_call)
+        owner = self._target_observation(local, row)
+        if owner is None:
+            local['evidence'].append(row)
+        self._mark_evidence(local)
+        role = 'targets' if owner else 'evidence'
+        observed = {**row, 'subject':owner['subject']} if owner else row
+        visible = self._view({**local, 'targets':[], 'evidence':[], role:[observed]}, request,
+            source_result=True)[role][0]
+        result = ToolResult(tool_name='read_file', status='ok' if row.get('readable') else 'error',
+            data=visible, error='' if row.get('readable') else row.get('limitation', 'Read failed'),
+            metadata={'inspection_source':{'observation':row, 'remaining_before':remaining,
+                'remaining_after':allowance[0]}})
+        return result.model_dump(mode='json')
+
     def _inspect(self, saved: dict[str, Any], request: InspectionRequest, identity: str,
-                 remaining: list[int], client: Any) -> dict:
-        """One read-only native conversation; the existing owner binds its final opinion."""
+                 remaining: list[int], client: Any, *, dispatch: Callable | None = None) -> dict:
+        """One native conversation; the existing owner binds its final opinion."""
         input_path = self._path(identity,'input')
+        shared = saved.get('execution_protocol') == 'shared.v1'
+        if shared and dispatch is None:
+            raise ValueError('Shared inspection needs the outer dispatcher')
         read_names = {'read_file','list_directory','search_files'}
-        tools = [{'type':'function','function':{'name':spec.name,
+        tools = self._shared_tools(identity) if shared else [{'type':'function','function':{'name':spec.name,
             'description':spec.description,'parameters':spec.parameters_schema()}}
             for spec in workspace_tool_specs() if spec.name in read_names]
         package = self._delivery_scope(saved)
@@ -1389,8 +2100,17 @@ class InspectionToolGateway:
             'description':'Finish this inspection with findings and scope limitations. '
                 'Return this alone after reading evidence; it executes no external operation.',
             'parameters':response_model.model_json_schema()}}
-        self._prime_delivery(saved, identity, remaining)
-        self._prime_targets(saved, request, identity, remaining, client, [*tools, terminal])
+        if not shared or not saved.get('source_rounds'):
+            self._prime_delivery(saved, identity, remaining)
+            self._prime_targets(saved, request, identity, remaining, client, [*tools, terminal])
+            if shared:
+                trace = self._path(identity, 'sources-0')
+                self.store.write_json(trace, {'primed':True, 'remaining':remaining[0],
+                    'results':[], 'completed':False})
+                saved['source_rounds'] = [self._digest(trace)]
+                self.store.write_json(input_path, saved)
+        elif not self.store.read_json(self._path(identity, 'sources-0')).get('primed'):
+            raise ValueError('Inspection source priming is incomplete; no replay')
         messages = [{'role':'system','content':self._system(saved)},
                     {'role':'user','content':json.dumps(self._view(saved,request),ensure_ascii=False)}]
         turn = getattr(client,'tool_turn',None) or client.chat_turn
@@ -1453,7 +2173,79 @@ class InspectionToolGateway:
                 raise ValueError('Inspection capacity is unknown; retain records without further requests')
             trace = self._path(identity,f'sources-{number}')
             conversation = None
-            if saved.get('memory_protocol') == 'journal.v1':
+            if shared:
+                from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
+
+                if number < len(saved['source_rounds']):
+                    if self._digest(trace) != saved['source_rounds'][number]:
+                        raise ValueError('Inspection source investigation record changed; no replay')
+                    record = self.store.read_json(trace)
+                elif number == len(saved['source_rounds']):
+                    record = {'results':[], 'completed':False, 'remaining':remaining[0]}
+                    self.store.write_json(trace, record)
+                    saved['source_rounds'].append(self._digest(trace))
+                    self.store.write_json(input_path, saved)
+                else:
+                    raise ValueError('Inspection source rounds are not contiguous')
+                remaining[0] = record['remaining']
+
+                def save_round():
+                    record['recovery'] = {
+                        'previous_trace_sha256':saved['source_rounds'][number],
+                        'previous_input_sha256':self._digest(input_path),
+                        'observations':{key:deepcopy(saved[key]) for key in
+                            ('targets', 'evidence', 'source_invocations') if key in saved}}
+                    self.store.write_json(trace, record)
+                    saved['source_rounds'][number] = self._digest(trace)
+                    self.store.write_json(input_path, saved)
+
+                if 'offer' in record:
+                    offer = record['offer']
+                    call_messages, offered = offer['messages'], offer['tools']
+                    projection, terminal_only = offer['projection'], offer['closing']
+                    final_tokens = offer.get('final_tokens', 0)
+                    if saved.get('memory_protocol') == 'journal.v1':
+                        conversation = ProfessionalConversation(client)
+                        value = ConversationInput(call_messages, offered, projection,
+                            closing=terminal_only, reserve=offer['reserve'])
+                    working_input = record.get('working_input', {})
+                else:
+                    if saved.get('memory_protocol') == 'journal.v1':
+                        conversation, value = self._prepare_conversation_round(saved, request, messages,
+                            tools, terminal, finish, client, number, remaining,
+                            dispatch=dispatch, record=record, save_round=save_round)
+                        call_messages, offered, projection, terminal_only = value.messages, value.tools, value.projection, value.closing
+                        final_tokens = 0
+                        reserve = value.reserve or {}
+                    else:
+                        call_messages, offered, projection, terminal_only, final_tokens = self._legacy_inspection_input(
+                            saved, request, messages, tools, terminal, client, finish, number, remaining)
+                        reserve = {} if terminal_only else {'llm_requests':1, 'total_tokens':final_tokens}
+                    working_input = {'messages':call_messages, 'projection':projection} if self.progressive else {}
+                    record.update(offer={'messages':call_messages, 'tools':offered,
+                        'projection':projection, 'closing':terminal_only, 'reserve':reserve,
+                        'final_tokens':final_tokens}, working_input=working_input)
+                    save_round()
+                if 'response' in record:
+                    response = record['response']
+                else:
+                    def model_call(actual_id):
+                        actual_client = self.client_factory(actual_id)
+                        if conversation:
+                            return ProfessionalConversation(actual_client).call(
+                                value, label=label, call_id=label, additional=True)
+                        actual_turn = getattr(actual_client, 'tool_turn', None) or actual_client.chat_turn
+                        with ledger.protect_remaining(offer_reserve, additional=True):
+                            return actual_turn(call_messages, tools=offered, label=label, budget_call_id=label)
+
+                    offer_reserve = record['offer']['reserve']
+                    wrapper = dispatch('model', self._position(number, 'model'), None, model_call)
+                    record['model_receipt'] = self._closed_receipt(saved, wrapper)
+                    response = wrapper['result']
+                    record.update(response=response, completed=True)
+                    save_round()
+                results = record['results']
+            elif saved.get('memory_protocol') == 'journal.v1':
                 self.store.write_json(trace, {'results':[], 'completed':False})
                 saved.setdefault('source_rounds', []).append(self._digest(trace))
                 self.store.write_json(input_path, saved)
@@ -1463,106 +2255,93 @@ class InspectionToolGateway:
             else:
                 call_messages, offered, projection, terminal_only, final_tokens = self._legacy_inspection_input(
                     saved, request, messages, tools, terminal, client, finish, number, remaining)
-            checkpoint_record = self.store.read_json(trace).get('checkpoint', {}) if conversation else {}
-            working_input = {'messages':call_messages,
-                'projection':projection} if self.progressive else {}
-            if self.progressive:
-                self.store.write_json(trace,{'working_input':working_input,'results':[],
-                    'usage':self._usage(identity),'completed':False,
-                    **({'checkpoint':checkpoint_record} if conversation else {})})
+            if not shared:
+                checkpoint_record = self.store.read_json(trace).get('checkpoint', {}) if conversation else {}
+                working_input = {'messages':call_messages,
+                    'projection':projection} if self.progressive else {}
+                if self.progressive:
+                    self.store.write_json(trace,{'working_input':working_input,'results':[],
+                        'usage':self._usage(identity),'completed':False,
+                        **({'checkpoint':checkpoint_record} if conversation else {})})
+                    if conversation:
+                        saved['source_rounds'][number] = self._digest(trace)
+                    else:
+                        saved.setdefault('source_rounds',[]).append(self._digest(trace))
+                    self.store.write_json(input_path,saved)
                 if conversation:
-                    saved['source_rounds'][number] = self._digest(trace)
+                    response = conversation.call(value, label=label, call_id=label, additional=True)
+                else:
+                    with ledger.protect_remaining({} if terminal_only else
+                            {'llm_requests':1,'total_tokens':final_tokens},additional=True):
+                        response = turn(call_messages,tools=offered, label=label,budget_call_id=label)
+                results = []
+                self.store.write_json(trace,{'response':response,'usage':self._usage(identity),'results':results,
+                    **({'checkpoint':checkpoint_record} if conversation else {}),
+                    **({'working_input':working_input,'completed':True} if self.progressive else {})})
+                if self.progressive:
+                    saved['source_rounds'][-1] = self._digest(trace)
                 else:
                     saved.setdefault('source_rounds',[]).append(self._digest(trace))
                 self.store.write_json(input_path,saved)
-            if conversation:
-                response = conversation.call(value, label=label, call_id=label, additional=True)
-            else:
-                with ledger.protect_remaining({} if terminal_only else
-                        {'llm_requests':1,'total_tokens':final_tokens},additional=True):
-                    response = turn(call_messages,tools=offered, label=label,budget_call_id=label)
-            results = []
-            self.store.write_json(trace,{'response':response,'usage':self._usage(identity),'results':results,
-                **({'checkpoint':checkpoint_record} if conversation else {}),
-                **({'working_input':working_input,'completed':True} if self.progressive else {})})
-            if self.progressive:
-                saved['source_rounds'][-1] = self._digest(trace)
-            else:
-                saved.setdefault('source_rounds',[]).append(self._digest(trace))
-            self.store.write_json(input_path,saved)
+            if shared and response.get('status') in {'blocked', 'error'}:
+                raise ValueError(response.get('error') or 'Inspection model produced no response')
             usage = self._usage(identity)
-            if (not self._accounted(usage)
+            if not shared and (not self._accounted(usage)
                     or not any(row['status']=='settled' and row.get('logical_call_id')==label
                         for row in usage)):
                 raise ValueError('Inspection source request usage is unsettled; retain records without further requests')
             # Preserve provider reasoning and call IDs in their original chronology.
-            # This is investigation inside the admitted inspection, with no writes or
-            # independent task state. Only the final structured opinion is adopted.
             calls = response.get('tool_calls') or []
-            ids = [call.get('id') for call in calls if isinstance(call,dict)]
-            if (len(ids)!=len(calls) or any(not isinstance(key,str) or not key for key in ids)
+            malformed_type = shared and not isinstance(calls, list)
+            ids = [] if malformed_type else [call.get('id') for call in calls if isinstance(call,dict)]
+            if (malformed_type or len(ids)!=len(calls) or any(not isinstance(key,str) or not key for key in ids)
                     or len(set(ids))!=len(ids)):
-                raise ValueError('Inspection returned malformed native call identities; no execution')
+                error = 'Inspection returned malformed native call identities; no execution'
+                if not shared:
+                    raise ValueError(error)
+                record['malformed_calls'] = error
+                save_round()
+                messages.append({'role':'user', 'content':error + '. Submit a corrected response.'})
+                if terminal_only:
+                    invalid_finals += 1
+                    if (number + 1 == len(saved['source_rounds'])
+                            and (invalid_finals >= 2 or ledger.remaining('llm_requests') == 0)):
+                        raise ValueError(error + '; corrective response exhausted')
+                number += 1
+                continue
             messages.append(response)
-            batch_error, parsed = '', []
-            try:
-                for call in calls:
-                    function = call['function']
-                    arguments = json.loads(function['arguments'])
-                    if (call.get('type')!='function' or not isinstance(arguments,dict)
-                            or function['name'] not in read_names|{'record_inspection'}):
-                        raise ValueError('Inspection requested an unoffered tool or non-object arguments')
-                    parsed.append((function['name'],arguments))
-                finals = sum(name=='record_inspection' for name,_ in parsed)
-                if finals and len(parsed)!=1:
-                    raise ValueError('Return record_inspection alone, after source results have been observed')
-                # Adaptive work already bounds the material presented to the
-                # model and the total decoded reads. Rejecting an otherwise
-                # valid batch solely because it has more than eight calls
-                # makes the model request the same sources again. Keep the
-                # historical fixed-round contract for non-adaptive sessions.
-                if not self.adaptive and len(parsed)>8:
-                    raise ValueError('Inspection allows at most eight source calls in one response')
-                if finals:
-                    value = parsed[0][1]
-                    owner_bindings = []
-                    if not package and self.protocol and isinstance(value.get('decisions'), list):
-                        rows = value['decisions']
-                        missing = [index for index, row in enumerate(rows)
-                            if isinstance(row, dict) and 'subject' not in row]
-                        explicit = [row['subject'] for row in rows
-                            if isinstance(row, dict) and 'subject' in row]
-                        targets = {row['subject'] for row in saved['targets']}
-                        # Only a genuinely absent identity can be supplied by the
-                        # owner, and only in this fresh native admission path.
-                        if (len(missing) == 1 and len(rows) == len(targets)
-                                and len(explicit) == len(rows)-1
-                                and all(isinstance(key, str) and key in targets for key in explicit)
-                                and len(set(explicit)) == len(explicit)
-                                and len(targets-set(explicit)) == 1):
-                            subject = next(iter(targets-set(explicit)))
-                            value = deepcopy(value)
-                            value['decisions'][missing[0]]['subject'] = subject
-                            owner_bindings.append({'decision_index': missing[0], 'subject': subject})
-                    value = response_model.model_validate(value).model_dump(mode='json')
-                    if package:
-                        self._delivery_decision(saved, value)
-                    elif self.protocol:
-                        self._subject_decisions(saved, value)
+            if shared and 'admission' in record:
+                admission = record['admission']
+                parsed, batch_error, final, owner_bindings = (admission['parsed'], admission['error'],
+                    admission['final'], admission['owner_bindings'])
+            else:
+                parsed, batch_error, final, owner_bindings = self._admit_response(
+                    saved, calls, offered, response_model, read_names, shared=shared)
+                if shared:
+                    dependencies = None
+                    if final is not None:
+                        try:
+                            dependencies = self._shared_final_bindings(saved, final)
+                        except (ValueError, KeyError, TypeError, OSError) as exc:
+                            batch_error, final, owner_bindings = str(exc), None, []
+                    record['admission'] = {'parsed':parsed, 'error':batch_error,
+                        'final':final, 'owner_bindings':owner_bindings,
+                        **({'dependencies':dependencies} if final is not None else {})}
                     if owner_bindings:
-                        # Keep the provider response above unmodified; retain
-                        # the admitted mapping beside it, bound through the input.
-                        record = self.store.read_json(trace)
                         record['owner_bindings'] = owner_bindings
-                        self.store.write_json(trace, record)
-                        saved['source_rounds'][-1] = self._digest(trace)
-                        self.store.write_json(input_path, saved)
-                    return value
-            except (ValueError,KeyError,TypeError) as exc:
-                batch_error = str(exc)
-            rejected_final = (self.adaptive and bool(batch_error)
+                    save_round()
+            if final is not None:
+                if owner_bindings and not shared:
+                    record = self.store.read_json(trace)
+                    record['owner_bindings'] = owner_bindings
+                    self.store.write_json(trace, record)
+                    saved['source_rounds'][-1] = self._digest(trace)
+                    self.store.write_json(input_path, saved)
+                return final
+            rejected_final = ((self.adaptive and bool(batch_error)
                 and any(isinstance(call.get('function'), dict)
                     and call['function'].get('name') == 'record_inspection' for call in calls))
+                or shared and terminal_only and (bool(batch_error) or not calls))
             if rejected_final:
                 invalid_finals += 1
             if terminal_only and not rejected_final:
@@ -1572,7 +2351,9 @@ class InspectionToolGateway:
                 messages.append({'role':'user','content':
                     'Use the offered read tools for needed sources, or record_inspection for the final result.'})
             read_limit = None
-            if self.progressive and not rejected_final:
+            if shared and 'read_limit' in record:
+                read_limit = record['read_limit']
+            elif self.progressive and not rejected_final:
                 _, base_projection = self._working_messages(saved,request,messages[:2],[*tools,terminal],client)
                 # Reused optional originals can be evicted for a useful unseen
                 # window; the next actual request still has to fit its target.
@@ -1580,8 +2361,73 @@ class InspectionToolGateway:
                     and saved.get('inspection_context_policy') == 'retained.v1' else 'estimated_input_tokens')
                 available = max(0,base_projection['input_token_target']-base_projection[cost])
                 read_limit = max(256,min(64000,available*4//(2*max(1,len(calls)))))
+            if shared and 'read_limit' not in record:
+                record['read_limit'] = read_limit
+                save_round()
             for index,call in enumerate(calls):
                 name,arguments = parsed[index] if index<len(parsed) else ('',{})
+                if shared and index < len(results):
+                    previous = results[index]
+                    if previous['call_id'] != call['id']:
+                        raise ValueError('Inspection source receipt order changed; no replay')
+                    messages.append({'role':'tool', 'tool_call_id':call['id'],
+                        'content':json.dumps(previous['result'], ensure_ascii=False)})
+                    continue
+                if shared:
+                    receipt, owner_receipts = None, {}
+                    try:
+                        if batch_error:
+                            raise ValueError(batch_error)
+                        self._shared_preflight(saved, call, arguments)
+
+                        def operation(actual_id):
+                            try:
+                                self._shared_preflight(saved, call, arguments)
+                                if name == 'read_file':
+                                    return self._shared_read(saved, request, arguments, actual_id, remaining[0], read_limit)
+                                if name == 'run_process':
+                                    self.workspace.resolve(arguments['cwd'], write=True).mkdir(parents=True, exist_ok=True)
+                                result = self.operation_call(name, arguments, actual_id)
+                                if not isinstance(result, ToolResult):
+                                    raise ValueError('Inspection operation gateway returned a malformed result')
+                                return result.model_dump(mode='json')
+                            except (ValueError, KeyError, TypeError, OSError) as exc:
+                                return ToolResult(tool_name=name, status='blocked', error=str(exc)).model_dump(mode='json')
+
+                        wrapper = dispatch('tool', self._position(number, f'tool-{index}', call['id']), call, operation)
+                        receipt = self._closed_receipt(saved, wrapper)
+                        result = ToolResult.model_validate(self._receipt_result(receipt))
+                        if result.tool_name != name:
+                            raise ValueError('Inspection operation receipt names a different tool')
+                        source = result.metadata.get('inspection_source') if name == 'read_file' else None
+                        if source is not None:
+                            if source['remaining_before'] != remaining[0] or not 0 <= source['remaining_after'] <= remaining[0]:
+                                raise ValueError('Inspection source receipt changed its read allowance')
+                            row = source['observation']
+                            owner = self._target_observation(saved, row)
+                            if owner is None:
+                                saved['evidence'].append(row)
+                            remaining[0] = source['remaining_after']
+                            result = result.model_copy(update={'metadata':{
+                                key:value for key,value in result.metadata.items() if key != 'inspection_source'}})
+                        elif name == 'read_file' and result.ok:
+                            raise ValueError('Inspection read receipt lacks its original observation')
+                        owner_receipts = self._shared_owner_receipts(name, result, receipt, arguments)
+                    except (ValueError, KeyError, TypeError, OSError) as exc:
+                        result = ToolResult(tool_name=name or 'unoffered', status='blocked', error=str(exc))
+                    row = {'tool':name, 'arguments':arguments, 'call_id':call['id'],
+                        'result':result.model_dump(mode='json'), 'owner_receipts':owner_receipts}
+                    if receipt is not None:
+                        row['receipt'] = receipt
+                    results.append(row)
+                    record['remaining'] = remaining[0]
+                    self._mark_evidence(saved)
+                    save_round()
+                    messages.append({'role':'tool', 'tool_call_id':call['id'],
+                        'content':json.dumps(row['result'], ensure_ascii=False)})
+                    if name == 'run_process' and receipt is not None:
+                        self._check_inspection_versions(saved, identity)
+                    continue
                 try:
                     if batch_error:
                         raise ValueError(batch_error)
@@ -1625,11 +2471,12 @@ class InspectionToolGateway:
             # Closing forbids further investigation, not the existing single
             # correction of a fully received opinion. The same prepare/admission
             # path still checks remaining requests/tokens; no read quota is renewed.
-            if rejected_final and (invalid_finals >= 2 or ledger.remaining('llm_requests') == 0):
+            if (rejected_final and (not shared or number + 1 == len(saved['source_rounds']))
+                    and (invalid_finals >= 2 or ledger.remaining('llm_requests') == 0)):
                 raise ValueError('Inspection final response invalid; '
                     + ('one corrective response exhausted' if invalid_finals >= 2 else 'no request capacity for correction')
                     + '; retain source reads and incomplete scope: ' + batch_error)
-            self._check_versions([*saved['targets'],*saved['evidence']],identity)
+            self._check_inspection_versions(saved, identity)
             number += 1
 
     def call(self, name: str, arguments: dict[str, Any], identity: str, *,
@@ -1652,11 +2499,19 @@ class InspectionToolGateway:
                         or saved.get('protocol') != self.protocol
                         or saved.get('delivery_context') != delivery_context):
                     raise ValueError('Inspection identity is bound to different arguments; no replay')
+                if saved.get('execution_protocol') == 'shared.v1':
+                    if not self.store.exists(self._path(identity, 'result')):
+                        return ToolResult(tool_name=name, data={'inspection_pending':identity})
+                    return self._resume_shared_result(saved, identity)
                 return self._cached(identity)
             # Observe targets before admitting professional work. Read-only file
             # observations have their own owner; an unavailable text input is
             # not a model opinion about the artifact or a required correction.
             saved = {'identity': identity, 'arguments': binding, 'targets': [], 'evidence': []}
+            if self.execution_protocol == 'shared.v1':
+                if self.operation_specs is None or self.operation_call is None:
+                    raise ValueError('Shared inspection requires the actual operation specs and operation gateway')
+                saved['execution_protocol'] = 'shared.v1'
             if self.protocol:
                 saved['protocol'] = self.protocol
             if self.adaptive:
@@ -1696,7 +2551,8 @@ class InspectionToolGateway:
                     raise ValueError('Whole-work inspection needs the actual request and artifact versions')
                 saved['prior_work_opinions'] = (self.feedback_provider(sorted(delivery_context['artifacts']))
                     if self.feedback_provider else [])
-            self.store.write_json(input_path, saved)
+            if saved.get('execution_protocol') != 'shared.v1':
+                self.store.write_json(input_path, saved)
             saved['evidence'] = [self._observe(value, f'evidence-{i + 1}', identity, remaining)
                                  for i, value in enumerate(request.evidence)]
             if self.progressive:
@@ -1707,7 +2563,13 @@ class InspectionToolGateway:
                 saved['initial_subjects'] = [row['subject'] for row in [*saved['targets'],*saved['evidence']]]
             self._mark_evidence(saved)
             saved['prior_required'] = self._prior(saved['targets'])
+            if saved.get('execution_protocol') == 'shared.v1':
+                saved['initial_read_remaining'] = remaining[0]
+                saved['immutable_paths'] = [row['path'] for row in [*saved['targets'], *saved['evidence']]
+                    if row.get('path')]
             self.store.write_json(input_path, saved)
+            if saved.get('execution_protocol') == 'shared.v1':
+                return ToolResult(tool_name=name, data={'inspection_pending':identity})
             receipt = {'identity': identity, 'completed': False,
                        'input_sha256': self._digest(input_path)}
             if not package and not any(row.get('sha256') for row in saved['targets']):
@@ -1739,3 +2601,54 @@ class InspectionToolGateway:
             return self._finish(saved, receipt, identity)
         except Exception as exc:
             return ToolResult(tool_name=name, status='blocked', error=str(exc))
+
+    def advance(self, identity: str,
+                dispatch: Callable[[str, str, dict | None, Callable[[str], dict]], dict]) -> ToolResult:
+        """Resume the journal outside the parent attempt; the caller owns child attempts."""
+        input_path = self._path(identity, 'input')
+        saved = self.store.read_json(input_path)
+        if saved.get('identity') != identity or saved.get('execution_protocol') != 'shared.v1':
+            raise ValueError('Inspection is not bound to the shared execution protocol')
+        if saved.get('protocol') != self.protocol:
+            raise ValueError('Inspection identity is bound to a different protocol; no replay')
+        if self.store.exists(self._path(identity, 'result')):
+            return self._resume_shared_result(saved, identity)
+        if self.store.exists(self._path(identity, 'response')):
+            receipt = self.store.read_json(self._path(identity, 'response'))
+            if receipt.get('completed'):
+                self._receipt(identity)
+                return self._finish(saved, receipt, identity)
+            return self._finish(saved, receipt, identity, failure=receipt.get('error', 'No final response'))
+        package = self._delivery_scope(saved)
+        request = (_DeliveryInspectionRequest if package else InspectionRequest).model_validate(saved['arguments'])
+        remaining = [saved['initial_read_remaining']]
+
+        def invoke(kind, position, call, perform):
+            try:
+                return dispatch(kind, position, call, perform)
+            except BaseException as exc:
+                raise _InspectionDispatchRaised(exc) from exc
+
+        receipt = {'identity':identity, 'completed':False}
+        try:
+            if saved.get('source_rounds'):
+                self._recover_shared_journal(saved)
+                self._check_inspection_versions(saved, identity)
+                self._check_shared_dependencies(saved, current_inputs=True)
+            client = self.client_factory(identity)  # Pure input/capacity planning only.
+            response = self._inspect(saved, request, identity, remaining, client, dispatch=invoke)
+            receipt.update(completed=True, response=response)
+        except _InspectionDispatchRaised as exc:
+            raise exc.original
+        except Exception as exc:
+            receipt.update(error=str(exc), raw_response=getattr(exc, 'raw_response', ''))
+        receipt['input_sha256'] = self._digest(input_path)
+        receipt['usage'] = self._usage(identity)
+        self.store.write_json(self._path(identity, 'response'), receipt)
+        if not receipt['completed']:
+            return self._finish(saved, receipt, identity, failure=receipt['error'])
+        try:
+            self._receipt(identity)
+        except (ValueError, KeyError) as exc:
+            return self._finish(saved, receipt, identity, failure=str(exc))
+        return self._finish(saved, receipt, identity)

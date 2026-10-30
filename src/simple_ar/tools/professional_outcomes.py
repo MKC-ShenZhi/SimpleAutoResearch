@@ -36,16 +36,37 @@ def registered_native_output(root: Path, session_id: str, record: Path, *,
     attempt = store.read_attempt_manifest()
     capability = store.read_capability_result()
     session = ArtifactStore(root).read_json('session_manifest.json')
-    if (attempt.attempt_id != store.root.name or attempt.capability != 'native_tool'
+    if (attempt.attempt_id != store.root.name or attempt.capability not in {'native_tool', 'native_action'}
             or attempt.status != 'completed' or capability.status != 'completed'
             or session['session_id'] != session_id
             or attempt.attempt_id not in session['budget']['recorded_attempts']):
+        if attempt.capability == 'native_action':
+            raise ValueError('Source is not a completed native_action attempt in this task')
         raise ValueError('Source is not a completed native_tool attempt in this task')
+    if attempt.capability == 'native_action':
+        bindings = [ref for ref in attempt.outputs if ref.path == 'action.json']
+        if (len(bindings) != 1 or bindings[0].kind != 'operation_binding'
+                or bindings[0].status != 'available'
+                or [ref for ref in capability.artifacts if ref.path == 'action.json'] != bindings):
+            raise ValueError('Native action lacks its registered action binding')
+        action = store.read_json(bindings[0])
+        if (not isinstance(action, dict) or action.get('attempt') != attempt.attempt_id
+                or action.get('kind') not in ('tool', 'opinion')):
+            raise ValueError('Native action binding is not an accepted tool or opinion')
+        if action['kind'] == 'opinion':
+            result = store.read_json('native_result.json')
+            digest = hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            if action.get('result_sha256') != digest:
+                raise ValueError('Native opinion result differs from its accepted action binding')
     registered = [ref for ref in attempt.outputs if ref.path == relative
         and ref.kind == kind and ref.status == 'available'
         and ref in capability.artifacts]
     if len(registered) != 1:
         raise ValueError('Source is not an actual registered output')
+    if attempt.capability == 'native_action' and (
+            [ref for ref in attempt.outputs if ref.path == relative] != registered
+            or [ref for ref in capability.artifacts if ref.path == relative] != registered):
+        raise ValueError('Native action output registration is ambiguous')
     return registered[0]
 
 

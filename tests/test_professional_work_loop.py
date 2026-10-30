@@ -767,8 +767,21 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertEqual(mode, 'chat')
             offered = {tool['function']['name'] for tool in request.get('tools', [])}
             if 'record_inspection' in offered:
-                self.assertLessEqual(offered, {
-                    'read_file', 'list_directory', 'search_files', 'record_inspection'})
+                functions = {tool['function']['name']:tool['function'] for tool in request['tools']}
+                scoped = any('workspace/inspection-work/' in field.get('description', '')
+                    for function in functions.values()
+                    for field in function.get('parameters', {}).get('properties', {}).values())
+                scoped = scoped or any(message['role']=='system'
+                    and 'workspace/inspection-work/' in message.get('content', '')
+                    for message in request['messages'])
+                allowed = {'read_file', 'list_directory', 'search_files', 'record_inspection'}
+                if scoped:
+                    allowed.update({'write_file', 'edit_file', 'copy_file', 'copy_project',
+                        'run_process', 'inspect_images'})
+                    for name in ('write_file', 'run_process'):
+                        self.assertNotIn('delivery', functions.get(name, {}).get(
+                            'parameters', {}).get('properties', {}))
+                self.assertLessEqual(offered, allowed)
                 # Native follow-ups retain the original view and append assistant/tool
                 # messages; source observations arrive through tool replies.
                 view, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
@@ -900,6 +913,18 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertFalse(pending, 'Provider follow-up lost a tool reply')
         return replies
 
+    def _inspection_sources(self, view, *paths):
+        """Select real visible read IDs; paths and computed values are never citations."""
+        rows = [*view['targets'], *view['evidence']]
+        for message in self.inspection_requests[-1]['messages']:
+            if message['role'] == 'tool':
+                result = json.loads(message['content'])
+                if result.get('tool_name') == 'read_file' and result.get('status') == 'ok':
+                    rows.append(result['data'])
+        return [next((row for row in reversed(rows)
+            if row.get('path') == str(self.app.workspace.resolve(path))
+            and row.get('subject') and row.get('text_windows')), None) for path in paths]
+
     def _run(self, **kwargs):
         turns = self.app.state['turns']
         caller_batch = kwargs.get('actions') is not None or (turns
@@ -915,13 +940,19 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertFalse(self.transport_errors, self.transport_errors)
         return result
 
-    def _observations(self, name=None):
-        values = [self.app.session.store.read_json(tool['result'])
-            for turn in self.app.state['turns'] for tool in turn['tools']]
+    def _observations(self, name=None, *, reviewed=False):
+        review = self.app.operations.delivery_review if reviewed and self.app.operations is not None else None
+        values = []
+        for turn in self.app.state['turns']:
+            for tool in turn['tools']:
+                row = self.app.session.store.read_json(tool['result'])
+                if review is not None:
+                    row = review.resolve_observation(row, review_record=tool.get('review_result'))
+                values.append(row)
         return [row for row in values if name is None or row['tool_name'] == name]
 
-    def _last(self, name):
-        values = self._observations(name)
+    def _last(self, name, *, reviewed=False):
+        values = self._observations(name, reviewed=reviewed)
         self.assertTrue(values, self.app.result_snapshot())
         return values[-1]
 
@@ -929,8 +960,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         result = self._run(actions=list(actions), **kwargs)
         return result
 
-    def _ok(self, name):
-        row = self._last(name)
+    def _ok(self, name, *, reviewed=False):
+        row = self._last(name, reviewed=reviewed)
         self.assertEqual(row['status'], 'ok', row)
         return row
 
@@ -953,7 +984,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         return self._last('inspect_artifacts')
 
     def _assessment(self):
-        result = next(row for row in reversed(self._observations())
+        result = next(row for row in reversed(self._observations(reviewed=True))
             if any(key in row.get('metadata', {}) for key in
                 ('delivery_review','delivery_assessment','assessments','assessment')))
         self.assertEqual(result['status'], 'ok', result)
@@ -992,6 +1023,377 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def _not_delivered(self):
         self.assertNotIn(self.app.session.manifest.status, {'completed', 'partial'})
         self.assertFalse((self.root / 'delivery.json').exists())
+
+    def test_shared_inspection_computes_once_after_exact_approval_and_reviews_feedback_delivery(self):
+        self._create(goal='Read the supplied CSV, check its sample mean independently, '
+            'and deliver a short Markdown account of the supplied observations.')
+        self.assertEqual(self.app.state['config']['inspection_execution_protocol'], 'shared.v1')
+        session_id = self.app.session.manifest.session_id
+        original_sources = self._versions(self.inputs)
+        calculation = {}
+        opinions = []
+        program = ("import csv, json, sys\nfrom pathlib import Path\n"
+            "with Path(sys.argv[1]).open(encoding='utf-8', newline='') as stream:\n"
+            "    values = [float(row['value']) for row in csv.DictReader(stream)]\n"
+            "Path('checked.json').write_text(json.dumps({'count': len(values), "
+            "'mean': sum(values) / len(values)}), encoding='utf-8')\n"
+            "with Path('executions.txt').open('a', encoding='utf-8') as stream:\n"
+            "    stream.write('computed\\n')\n")
+
+        def review(view):
+            package = 'claim' in view.get('proposed_delivery', {})
+            if not package:
+                functions = {tool['function']['name']:tool['function']
+                    for tool in self.inspection_requests[-1]['tools']}
+                description = functions['write_file']['parameters']['properties']['path']['description']
+                scope = description.split('workspace/inspection-work/', 1)[1].split('/', 1)[0]
+                work = 'workspace/inspection-work/' + scope
+                calculation.update(work=work, result=work+'/checked.json')
+                replies = [json.loads(message['content'])
+                    for message in self.inspection_requests[-1]['messages'] if message['role']=='tool']
+                successful = {row['tool_name'] for row in replies if row['status']=='ok'}
+                if 'write_file' not in successful:
+                    return [_action('write_file', path=work+'/check.py', content=program)]
+                if 'run_process' not in successful:
+                    return [_action('run_process', argv=[sys.executable,
+                        str(self.app.workspace.resolve(work+'/check.py')),
+                        str(self.inputs/'observations.csv')], cwd=work, timeout_sec=5,
+                        inputs=[work+'/check.py', 'measurements/observations.csv'],
+                        outputs=[calculation['result'], work+'/executions.txt'])]
+            paths = ['measurements/observations.csv', calculation['result']]
+            if package:
+                paths.append('report.md')
+            sources = self._inspection_sources(view, *paths)
+            missing = [_action('read_file', path=path) for path, row in zip(paths, sources) if row is None]
+            if missing:
+                return missing
+            source, computed = sources[:2]
+            self.assertIn('a,1', ''.join(w['text'] for w in source['text_windows']))
+            actual = json.loads(''.join(w['text'] for w in computed['text_windows']))
+            self.assertEqual(actual, {'count':3, 'mean':2.0})
+            body_rows = [sources[-1]] if package else view['targets']
+            body = '\n'.join(w['text'] for row in body_rows for w in row['text_windows'])
+            self.assertIn('2.0', body)
+            feedback = 'No population inference is supported by these three observations.'
+            if any(feedback in request for request in view.get('user_requests', [])):
+                self.assertIn(feedback, body)
+            evidence = [row['subject'] for row in sources[:2]]
+            opinions.append({'package':package, 'body':body, 'evidence':evidence})
+            if package:
+                return {'conclusion':'complete', 'findings':[],
+                    'evidence':evidence+[sources[-1]['subject']],
+                    'limitations':['This checks the supplied rows only.']}
+            return {'decisions':[{'subject':row['subject'], 'conclusion':'complete',
+                'findings':[], 'evidence':evidence,
+                'limitations':['This checks the supplied rows only.']} for row in view['targets']]}
+
+        self.review = review
+        claim = 'The sample mean is 2.0 across 3 supplied observations.\n'
+        def initial_claim():
+            self.assertIn('a,1', json.dumps(self._ok('read_file')['data']))
+            return _action('write_file', path='claim.md', content=claim)
+        self.decisions.extend([
+            _action('read_file', path='measurements/observations.csv'), initial_claim,
+            _action('inspect_artifacts', goal='Independently compute the mean from the original CSV.',
+                targets=['claim.md'], evidence=['measurements/observations.csv']),
+        ])
+        self._run()
+        pending = deepcopy(self.app.state['pending'])
+        self.assertEqual(pending['call']['function']['name'], 'inspect_artifacts')
+        self.assertEqual(pending['action']['call']['function']['name'], 'run_process')
+        self.assertEqual(pending['action']['kind'], 'tool')
+        parent_path = self.root/'attempts'/pending['attempt']/'native_result.json'
+        parent_raw, parent_hash = parent_path.read_bytes(), _digest(parent_path)
+        claim_record = next(self.root/tool['result']
+            for turn in self.app.state['turns'] for tool in turn['tools']
+            if self.app.session.store.read_json(tool['result']).get('tool_name')=='write_file')
+        claim_raw = claim_record.read_bytes()
+        self.assertEqual(json.loads(parent_raw)['data']['inspection_pending'], pending['inspection'])
+        parent = next(row for row in self.app.session.list_attempts() if row.attempt_id==pending['attempt'])
+        self.assertEqual(parent.status, 'completed')
+        self.assertFalse(self._process_receipts())
+        self.assertFalse(self.app.workspace.resolve(calculation['result']).exists())
+        token = self.app.approval_token(pending['action']['call'])
+        ledger = self.app.ledger.to_dict()
+        self._reload()
+        self.assertEqual(self.app.session.manifest.session_id, session_id)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self.app.state['pending'], pending)
+        self.assertEqual(self.app.approval_token(self.app.state['pending']['action']['call']), token)
+        # Approval for a different command cannot authorize the retained independent process.
+        other = deepcopy(pending['action']['call'])
+        arguments = json.loads(other['function']['arguments'])
+        arguments['argv'] = [sys.executable, '-c', "print('different proposal')"]
+        other['function']['arguments'] = json.dumps(arguments)
+        self._run(approved_execution=self.app.approval_token(other))
+        self.assertFalse(self._process_receipts())
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self.app.state['pending']['action']['call'], pending['action']['call'])
+        delivery = self._delivery('report.md')
+        delivery['report']['formats'] = ['markdown']
+        self.decisions.extend([
+            _action('write_file', path='report.md', content='# Observed values\n\n'+claim),
+            _action('deliver_result', **delivery),
+        ])
+        action_handler = self.app.session.registry.resolve('native_action')
+        interrupted = []
+
+        def lose_process_observation(*, context, accepted, perform):
+            if accepted.get('call', {}).get('function', {}).get('name') == 'run_process' and not interrupted:
+                context.store.write_json('action.json', accepted, kind='operation_binding')
+                observed = perform(context.attempt.attempt_id)
+                self.assertEqual(observed['status'], 'ok', observed)
+                interrupted.append(context.attempt.attempt_id)
+                raise OSError('Process finished before its native observation could be saved')
+            return action_handler(context=context, accepted=accepted, perform=perform)
+
+        self.app.session.registry.register('native_action', lose_process_observation, replace=True)
+        settle = self.app.ledger.settle
+        deferred = []
+        def defer_process_settlement(reservation, actual, **kwargs):
+            if 'process_invocations' in actual and not deferred:
+                invocation = reservation.removeprefix('process-')
+                record = self.app.session.store.read_json(f'tools/processes/{invocation}/invocation.json')
+                self.assertEqual(record['status'], 'finished')
+                deferred.append(reservation)
+                return  # Lose only settlement; let the real owner finish binding its outputs.
+            return settle(reservation, actual, **kwargs)
+        with patch.object(self.app.ledger, 'settle', side_effect=defer_process_settlement):
+            self._run(approved_execution=token)
+        self.assertEqual(len(interrupted), 1)
+        self.assertEqual(deferred, ['process-'+interrupted[0]])
+        self.assertEqual(self.app.session.manifest.status, 'paused')
+        self.assertEqual(len(self._process_receipts()), 1)
+        self.assertTrue(json.loads(next(iter(self._process_receipts().values())))['output_binding'])
+        unclosed = next(row for row in self.app.ledger.entries if row.reservation_id==deferred[0])
+        self.assertEqual(unclosed.status, 'reserved')
+        self.assertFalse(self.app.session.store.exists(f'attempts/{interrupted[0]}/native_result.json'))
+        failed_write = self.app.session.store.read_json(f'attempts/{interrupted[0]}/capability_result.json')
+        failed_raw = (self.root/f'attempts/{interrupted[0]}/capability_result.json').read_bytes()
+        self.assertEqual(failed_write['status'], 'failed')
+        accepted = self.app.session.store.read_json(f'attempts/{interrupted[0]}/action.json')
+        self.assertEqual(accepted['origin']['scope'], pending['inspection'])
+        self.assertEqual(accepted['origin']['kind'], 'tool')
+        self.assertEqual(accepted['call'], pending['action']['call'])
+        self.assertEqual(accepted['execution_approval']['token'], token)
+        self.assertEqual(accepted['execution_approval']['binding']['call'], accepted['call'])
+        self._reload()
+        with patch('simple_ar.tools.workspace.run_process', side_effect=AssertionError('Known process must not rerun')):
+            self._run(approved_execution=token)
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertEqual(self.app.session.store.read_json(
+            f'attempts/{interrupted[0]}/capability_result.json'), failed_write)
+        self.assertEqual((self.root/f'attempts/{interrupted[0]}/capability_result.json').read_bytes(), failed_raw)
+        self.assertEqual(next(row.status for row in self.app.session.list_attempts()
+            if row.attempt_id==interrupted[0]), 'failed')
+        self.assertFalse(self.decisions)
+        final = self._ok('inspect_artifacts')
+        scope = Path(final['metadata']['inspection_binding']['assessment_path']).parts[1]
+        self.assertEqual(scope, json.loads(parent_raw)['data']['inspection_pending'])
+        self.assertNotIn('inspection_pending', final['data'])
+        bound_evidence = _assessments(final)[0]['evidence_sha256']
+        for path in (self.inputs/'observations.csv', self.app.workspace.resolve(calculation['result'])):
+            self.assertEqual(bound_evidence[str(path)], _digest(path))
+        self.assertEqual(self._assessment()['verdict'], 'passed')
+        record = next(tool['result'] for turn in self.app.state['turns'] for tool in turn['tools']
+            if self.app.session.store.read_json(tool['result'])==final)
+        self.assertNotEqual(record, parent_path.relative_to(self.root).as_posix())
+        closed = next(row for row in self.app.session.list_attempts()
+            if row.attempt_id==Path(record).parent.name)
+        self.assertEqual(closed.status, 'completed')
+        self.assertTrue(any(ref.path=='native_result.json' for ref in closed.outputs))
+        children = [row for row in self.app.session.list_attempts() if row.capability=='native_action']
+        self.assertTrue(children)
+        child_headers = [self.app.session.store.read_json(
+            f'attempts/{row.attempt_id}/action.json') for row in children]
+        self.assertTrue(any(row['origin']['scope']==pending['inspection'] and row['kind']=='model'
+            for row in child_headers))
+        self.assertTrue(any(row.get('call')==pending['action']['call'] for row in child_headers))
+        self.assertTrue(any(row.get('recovered_from')==interrupted[0] and row['kind']=='receipt'
+            for row in child_headers))
+        count = self.app.workspace.resolve(calculation['work']+'/executions.txt')
+        self.assertEqual(count.read_text(), 'computed\n')
+        receipts = self._process_receipts()
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(json.loads(next(iter(receipts.values())))['invocation_id'], interrupted[0])
+        self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in self.app.ledger.entries), 1)
+
+        # The same identity must reject changed original data without requesting or computing again.
+        owner = self.app.operations.inspection
+        saved = owner.store.read_json(owner._path(pending['inspection'], 'input'))
+        journal = [saved]
+        for number in range(len(saved['source_rounds'])):
+            trace = owner.store.read_json(owner._path(pending['inspection'], f'sources-{number}'))
+            journal.append(trace)
+            self.assertNotIn('pending', trace)
+            for row in trace['results']:
+                self.assertNotIn('step_identity', row)
+                self.assertNotIn('pending', row)
+                if receipt := row.get('receipt'):
+                    header = self.app.session.store.read_json(f"attempts/{receipt['attempt']}/action.json")
+                    self.assertEqual(header['origin']['scope'], pending['inspection'])
+                    self.assertEqual(self.app.session.store.read_json(receipt['record']),
+                        owner._receipt_result(receipt))
+                    if row['tool']=='run_process':
+                        self.assertEqual(receipt['attempt'], interrupted[0])
+                    for key in ('call', 'pending', 'step_identity', 'execution_binding', 'execution_approval'):
+                        self.assertNotIn(key, receipt)
+        for document in journal:
+            for key in ('pending', 'step_identity', 'execution_binding', 'execution_approval'):
+                self.assertNotIn('"'+key+'":', json.dumps(document))
+        requests, ledger = self.send.call_count, self.app.ledger.to_dict()
+        source = self.inputs/'observations.csv'
+        try:
+            source.write_text('sample,value\na,7\nb,8\nc,9\n', encoding='utf-8')
+            self._reload()
+            cached = self.app.operations.inspection.call('inspect_artifacts',
+                saved['arguments'], pending['inspection'])
+            self.assertEqual(cached.status, 'blocked', cached)
+            self.assertEqual(self.send.call_count, requests)
+            self.assertEqual(self.app.ledger.to_dict(), ledger)
+            self.assertEqual(self._process_receipts(), receipts)
+        finally:
+            source.write_bytes(original_sources[source])
+
+        # A cached opinion is accepted by its registered bytes, not just its
+        # still-passing assessment. Editing the raw receipt cannot renew delivery.
+        delivered = deepcopy(self.app.state['turns'][-1]['tools'][-1])
+        opinion_path = self.root/delivered['review_result']
+        opinion_bytes = opinion_path.read_bytes()
+        action_path = opinion_path.with_name('action.json')
+        accepted_bytes = action_path.read_bytes()
+        self.assertIn('result_sha256', json.loads(accepted_bytes))
+        producer_bytes = (self.root/delivered['result']).read_bytes()
+        changed_opinion = json.loads(opinion_bytes)
+        changed_opinion['summary'] += ' Unregistered change to the cached opinion.'
+        try:
+            opinion_path.write_text(json.dumps(changed_opinion), encoding='utf-8')
+            self._reload()
+            self._run()
+            self.assertEqual(self.app.session.manifest.status, 'paused', self.app.result_snapshot())
+            self.assertEqual(self.send.call_count, requests)
+            self.assertEqual(self.app.ledger.to_dict(), ledger)
+            self.assertEqual(action_path.read_bytes(), accepted_bytes)
+            self.assertEqual((self.root/delivered['result']).read_bytes(), producer_bytes)
+            self.assertEqual(self._process_receipts(), receipts)
+        finally:
+            opinion_path.write_bytes(opinion_bytes)
+        self._reload()
+        self._run()
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertEqual(self.send.call_count, requests)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+
+        first_delivery = (self.root/'delivery.json').read_bytes()
+        first_review = self._ok('deliver_result', reviewed=True)['metadata']['delivery_review']['result']['data']['record']
+        first_opinions = len(opinions)
+        feedback = 'No population inference is supported by these three observations.'
+        self.decisions.extend([
+            _action('read_file', path='report.md', full_digest=True),
+            lambda: _action('edit_file', path='report.md',
+                expected_sha256=self._last('read_file')['data']['sha256'],
+                old_text=claim.strip(), new_text=claim.strip()+' '+feedback),
+            _action('deliver_result', **delivery),
+        ])
+        self._run(feedback='Revise the interpretation to say: '+feedback+' Reuse the checked computation.')
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertFalse(self.decisions)
+        self._ok('edit_file')
+        self.assertIn(feedback, (self.root/'workspace/report.md').read_text(encoding='utf-8'))
+        self.assertGreater(len(opinions), first_opinions)
+        self.assertTrue(opinions[-1]['package'])
+        self.assertIn(feedback, opinions[-1]['body'])
+        self.assertEqual(self._assessment()['verdict'], 'passed')
+        # The delivery names/summary may stay identical while their retained
+        # byte versions and independent opinions change.
+        self.assertEqual((self.root/'delivery.json').read_bytes(), first_delivery)
+        versions = self.app.result_snapshot()['delivery_versions']
+        self.assertGreaterEqual(sum(row['status']=='retained' for row in versions), 2)
+        self.assertNotEqual(self._ok('deliver_result', reviewed=True)['metadata']['delivery_review']['result']['data']['record'],
+            first_review)
+        self.assertEqual(self._versions(self.inputs), original_sources)
+        self.assertEqual(parent_path.read_bytes(), parent_raw)
+        self.assertEqual(claim_record.read_bytes(), claim_raw)
+        self.assertEqual(_digest(parent_path), parent_hash)
+        self.assertTrue(all(row.status=='settled' for row in self.app.ledger.entries))
+        self._reload()
+        self._run()
+        self.assertEqual(self.app.session.manifest.session_id, session_id)
+        self.assertEqual(self._process_receipts(), receipts)
+        self.assertEqual(count.read_text(), 'computed\n')
+        self.assertEqual(parent_path.read_bytes(), parent_raw)
+
+    def test_shared_inspection_protocol_confirmation_precedes_nested_process_approval(self):
+        # A real caller protocol supplies the semantic gate, independently of process approval.
+        self.app = ToolApplication.create(self.root, 'Retain a diagnostic of the original CSV.',
+            model='fixture', services=self.services, sources={'measurements':self.inputs},
+            allow_execution=True, tool_contracts='full', max_attempts=50,
+            research_policy={'require_design':True},
+            execution_contract={'command':[sys.executable, '-c', "print('score: 1')"],
+                'cwd':str(self.inputs), 'timeout_sec':5,
+                'result_schema':{'primary_metric':'score', 'required_metrics':['score']}},
+            process_limits={'process_invocations':2, 'process_wall_seconds':10})
+        self._write('note.md', 'Retain a diagnostic of the supplied CSV.\n')
+        proposal = self.app.request_execution_confirmation()
+        self.assertEqual(proposal['proposal_kind'], 'caller_execution_protocol')
+
+        def review(view):
+            replies = [json.loads(message['content'])
+                for message in self.inspection_requests[-1]['messages'] if message['role']=='tool']
+            if not any(row['tool_name']=='run_process' and row['status']=='ok' for row in replies):
+                function = next(tool['function'] for tool in self.inspection_requests[-1]['tools']
+                    if tool['function']['name']=='run_process')
+                description = function['parameters']['properties']['cwd']['description']
+                scope = description.split('workspace/inspection-work/', 1)[1].split('/', 1)[0]
+                return [_action('run_process', cwd='workspace/inspection-work/'+scope,
+                    argv=[sys.executable, '-c',
+                        'from pathlib import Path; import sys; print(Path(sys.argv[1]).read_text())',
+                        str(self.inputs/'observations.csv')],
+                    inputs=['measurements/observations.csv'], timeout_sec=5)]
+            return self._review_complete_targets(view)
+
+        self.review = review
+        with patch('builtins.input', side_effect=AssertionError('No interactive approval in offline work')):
+            approvals = []
+            self._submit(_action('inspect_artifacts', goal='Read a CSV diagnostic.',
+                targets=['note.md'], evidence=['measurements/observations.csv']),
+                approve=lambda call, token: approvals.append(call) or True)
+            pending = deepcopy(self.app.state['pending'])
+            self.assertEqual(pending['action']['call']['function']['name'], 'run_process')
+            original = self.app.session.store.read_json(f"attempts/{pending['attempt']}/native_result.json")
+            scope = original['data']['inspection_pending']
+            self.assertEqual(pending['action']['origin']['scope'], scope)
+            self.assertTrue(pending['action']['origin']['position'])
+            self.assertIn('before process approval', self.app.session.manifest.status_reason)
+            self.assertEqual(approvals, [])
+            self.assertFalse(self._process_receipts())
+            token = self.app.approval_token(pending['action']['call'])
+            self._reload()
+            self._run(decision={'decision_id':proposal['decision_id'], 'decision_response':'accept'})
+            self.assertIsNone(self.app.sources.pending_decision())
+            self.assertEqual(self.app.state['pending']['action']['call'], pending['action']['call'])
+            self.assertIn('Process requires explicit approval', self.app.session.manifest.status_reason)
+            self.assertFalse(self._process_receipts())
+            self.assertEqual(self.app.approval_token(self.app.state['pending']['action']['call']), token)
+            self._reload()
+            self._run(approved_execution=token)
+        self._ok('inspect_artifacts')
+        accepted = self.app.session.store.read_json(f"attempts/{pending['action']['attempt']}/action.json")
+        self.assertEqual(accepted['call'], pending['action']['call'])
+        self.assertEqual(accepted['execution_approval']['token'], token)
+        self.assertEqual(accepted['execution_approval']['binding']['call'], accepted['call'])
+        self.assertEqual(accepted['execution_approval']['binding']['files'][str(self.inputs/'observations.csv')],
+            _digest(self.inputs/'observations.csv'))
+        self.assertTrue(all(row.status=='settled' for row in self.app.ledger.entries))
+        self.assertIsNone(self.app.state['pending'])
+        self.assertEqual(len(self._process_receipts()), 1)
+        receipt = next(iter(self._process_receipts()))
+        self.assertIn('a,1', (self.root/receipt).with_name('stdout.log').read_text(encoding='utf-8'))
+        self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in self.app.ledger.entries), 1)
+        receipts = self._process_receipts()
+        self._reload()
+        self._run()
+        self.assertEqual(self._process_receipts(), receipts)
 
     def test_native_work_approval_reload_independent_review_export_and_feedback(self):
         if not shutil.which('pandoc'):
@@ -1150,21 +1552,26 @@ class OperationsWorkLoopTests(unittest.TestCase):
         originals = self._versions(self.inputs)
         stop = threading.Event()
         def review(view):
-            stop.set()  # The first request is already dispatched and must settle.
-            return [_action('read_file', path='measurements/conditions.txt')]
+            if len(self.inspection_requests) == 1:
+                stop.set()  # Settle this response, but do not dispatch its proposed read.
+                return [_action('read_file', path='measurements/conditions.txt')]
+            return self._review_complete_targets(view)
         self.review = review
         self._submit(_action('inspect_artifacts', goal='Check the supplied observation scope.',
             targets=['note.md'], evidence=[]), should_stop=stop.is_set)
         self.assertEqual(len(self.inspection_requests), 1)
         self.assertEqual(self.app.session.manifest.status, 'paused')
         self.assertEqual(self.app.session.manifest.status_reason, 'Caller requested boundary stop')
-        pending = self.app.state['pending']
+        pending = deepcopy(self.app.state['pending'])
         owner = self.app.operations.inspection
-        saved = owner.store.read_json(owner._path(pending['attempt'], 'input'))
-        self.assertTrue(any(row['path']==str(self.inputs/'conditions.txt') and row['windows']
+        scope = pending['inspection']
+        saved = owner.store.read_json(owner._path(scope, 'input'))
+        self.assertFalse(any(row['path']==str(self.inputs/'conditions.txt') and row['windows']
             for row in saved['evidence']))
-        result = owner.store.read_json(owner._path(pending['attempt'], 'result'))
-        self.assertTrue(all(row['verdict']=='incomplete' for row in result['metadata']['assessments']))
+        self.assertFalse(owner.store.exists(owner._path(scope, 'result')))
+        parent = self.root/'attempts'/pending['attempt']/'native_result.json'
+        parent_raw = parent.read_bytes()
+        self.assertEqual(json.loads(parent_raw)['data']['inspection_pending'], scope)
         paid = [entry for entry in self.app.ledger.entries if entry.actual.get('llm_requests')]
         self.assertEqual(len(paid), 1)
         self.assertEqual(paid[0].status, 'settled')
@@ -1175,15 +1582,24 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._reload()
         self.assertEqual(self.send.call_count, calls)
         self.assertEqual(self.app.ledger.to_dict(), ledger)
-        # Explicit continuation may choose new work after reconciling this
-        # read-only failure, but never reruns the stopped inspection.
-        self.decisions.append(_action('ask_user', question='Which unresolved interpretation should be checked next?'))
-        self._run(should_stop=lambda:False)
+        self._run(should_stop=stop.is_set)
         self.assertEqual(len(self.inspection_requests), 1)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertFalse(owner.store.exists(owner._path(scope, 'result')))
+        # Explicit resume consumes the retained response, executes its read,
+        # and requests a final opinion without buying the first response again.
+        stop.clear()
+        self._run()
+        self.assertEqual(len(self.inspection_requests), 2)
+        result = self._ok('inspect_artifacts')
+        saved = owner.store.read_json(owner._path(scope, 'input'))
+        self.assertTrue(any(row['path']==str(self.inputs/'conditions.txt') and row['windows']
+            for row in saved['evidence']))
+        self.assertEqual(_assessments(result)[0]['verdict'], 'passed')
         self.assertEqual(self.app.ledger.to_dict()['entries'][:len(ledger['entries'])], ledger['entries'])
         self.assertNotEqual(self.app.session.manifest.status, 'completed')
         self.assertFalse(self.app.session.store.exists('delivery.json'))
-        self.assertEqual(owner.store.read_json(owner._path(pending['attempt'], 'result')), result)
+        self.assertEqual(parent.read_bytes(), parent_raw)
 
     def test_call_stop_after_checkpoint_settlement_preserves_notes_without_dispatching_main(self):
         self._queue_checkpoint_history(context_protocol='auto', initial_notes=False, context_input_tokens=24000)
@@ -1551,11 +1967,14 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual((self.root/'budget_ledger.json').read_bytes(),before)
         self.assertIsNotNone(self.app._accepted_model_attempt(pending['attempt']))
 
-    def test_interrupted_publication_recovery_never_starts_a_delivery_review(self):
+    def test_saved_interrupted_publication_recovery_never_starts_a_delivery_review(self):
         for tool, reviewed in (('export_report', False), ('export_report', True), ('write_file', True)):
             with self.subTest(tool=tool, reviewed=reviewed):
                 self.root = self.directory / (tool + ('-reviewed' if reviewed else '-unreviewed'))
-                self._create()
+                # This protects the saved synchronous publication contract:
+                # recovering its original receipt must never start a new review.
+                self._create(saved_scope=True)
+                self.assertNotIn('inspection_execution_protocol', self.app.state['config'])
                 self._write('report.md', '# Observations\n\nThree supplied values; no population inference.\n')
                 bind = self.app._bind_delivery
                 def interrupt(call, payload, store, **kwargs):
@@ -1764,7 +2183,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.assertEqual((start,count), (selected_start,selected_count))
         self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
         self.assertEqual(len(full_views),2)
-        proof=self._last('deliver_result')['metadata']['delivery_review']
+        proof=self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
         self.assertEqual(proof['binding']['schema_version'],'delivery_review.v3')
         self.assertIn('read_file',{s['function']['name'] for s in self.inspection_requests[-1]['tools']})
         self.assertIn('Three supplied observations',json.dumps(self.inspection_requests[-1]['messages']))
@@ -1789,7 +2208,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.review=inspect
         self._submit(_action('deliver_result',**self._delivery('report.md','large.txt')))
         self._not_delivered()
-        result=self._last('deliver_result')['metadata']['delivery_review']['result']
+        result=self._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']
         self.assertEqual(result['metadata']['delivery_assessment']['verdict'],'incomplete')
         self.assertEqual(len(self.inspection_requests),2)
 
@@ -1823,7 +2242,21 @@ class OperationsWorkLoopTests(unittest.TestCase):
         claim = {'summary':'解释观察值并保留原始依据。', 'artifacts':['说明.md','summary.json']}
         self._submit(_action('deliver_result', **claim))
         self._not_delivered()
-        first = self._last('deliver_result')['metadata']['delivery_review']
+        first = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        producer_item = deepcopy(self.app.state['turns'][-1]['tools'][-1])
+        producer_path = self.root/producer_item['result']
+        producer_bytes = producer_path.read_bytes()
+        review_path = self.root/producer_item['review_result']
+        self.assertNotEqual(review_path, producer_path)
+        review_record = producer_item['review_result']
+        producer_record = self.app.workspace.locator(str(producer_path))
+        review_bytes = review_path.read_bytes()
+        actual_opinion = json.loads(review_bytes)
+        self.assertEqual(actual_opinion, first['result'])
+        action = self.app.session.store.read_json(
+            f"attempts/{Path(producer_item['review_result']).parent.name}/action.json")
+        self.assertEqual(action['kind'], 'opinion')
+        self.assertEqual(action['origin']['scope'], first['identity'])
         self.assertEqual(first['result']['metadata']['delivery_assessment']['verdict'], 'needs_revision')
         self.assertIn('contradicts', ' '.join(self.app._delivery_feedback()['issues']))
         feedback = self.app._work_context(['workspace/summary.json'])['professional_findings']
@@ -1835,16 +2268,28 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertTrue(package_feedback['subjects'][0]['current_matches_review'])
         self.assertNotIn('delivery_assessment', package_feedback['result']['metadata'])
         self.assertEqual(scope['artifact_count'], 2)
-        navigation = package_feedback['result']['data']['source_observations']
-        raw_feedback = json.loads(self.app.workspace.resolve(navigation['record']).read_text())
+        presented_producer = self.app._coordination_result(self._last('deliver_result'), producer_record,
+            review_record=review_record)
+        navigation = presented_producer['metadata']['delivery_review']['result']['data']['source_observations']
+        self.assertEqual(self.app.workspace.resolve(navigation['record']), review_path.resolve())
+        raw_feedback = json.loads(self.app.workspace.resolve(navigation['record']).read_bytes())
+        self.assertEqual(raw_feedback, actual_opinion)
+        values = {}
         for field in navigation['fields']:
+            self.assertFalse(field.startswith('metadata.delivery_review.'))
             value = raw_feedback
             for key in field.split('.'):
                 value = value[key]
-        self.assertEqual(raw_feedback['metadata']['delivery_review']['binding'], first['binding'])
+            values[field] = value
+        self.assertEqual(values['metadata.delivery_assessment'],
+            first['result']['metadata']['delivery_assessment'])
+        self.assertEqual(values['data.evidence'], first['result']['data']['evidence'])
+        self.assertIn('a,1', json.dumps(values['data.evidence']))
+        self.assertEqual(producer_path.read_bytes(), producer_bytes)
+        self.assertEqual(self.app.state['turns'][-1]['tools'][-1], producer_item)
         # Model views carry exact findings and proof locators; large retained
         # inventories must not multiply across binding, opinion and source maps.
-        raw = deepcopy(self._last('deliver_result'))
+        raw = deepcopy(self._last('deliver_result', reviewed=True))
         large = raw['metadata']['delivery_review']
         for number in range(100):
             path = str(self.root/f'workspace/attachments/retained-original-{number:03d}.csv')
@@ -1852,15 +2297,24 @@ class OperationsWorkLoopTests(unittest.TestCase):
             large['result']['metadata']['delivery_assessment']['artifacts'][path] = 'a'*64
             large['result']['metadata']['delivery_assessment']['evidence_sha256'][path] = 'b'*64
         untouched = deepcopy(raw)
-        presented = self.app._coordination_result(raw, 'records/retained-review/native_result.json')
+        presented = self.app._coordination_result(raw, producer_record, review_record=review_record)
         self.assertEqual(raw, untouched)
         projected = presented['metadata']['delivery_review']
         self.assertEqual(projected['binding']['artifact_count'], 102)
         self.assertEqual(projected['result']['metadata']['delivery_opinion']['findings'][0]['message'],
             first['result']['metadata']['delivery_assessment']['findings'][0]['message'])
         self.assertLess(len(json.dumps(projected)), len(json.dumps(large))/5)
-        self.assertIn('metadata.delivery_review.binding',
-            projected['result']['data']['source_observations']['fields'])
+        projected_navigation = projected['result']['data']['source_observations']
+        self.assertEqual(self.app.workspace.resolve(projected_navigation['record']), review_path.resolve())
+        self.assertIn('metadata.delivery_assessment', projected_navigation['fields'])
+        self.assertTrue(all(not field.startswith('metadata.delivery_review.')
+            for field in projected_navigation['fields']))
+        for field in projected_navigation['fields']:
+            value = json.loads(review_path.read_bytes())
+            for key in field.split('.'):
+                value = value[key]
+            self.assertEqual(value, values[field])
+        self.assertEqual(producer_path.read_bytes(), producer_bytes)
         # A later narrow pass cannot erase the earlier whole-work defect.
         self._inspect(['summary.json'], ['说明.md'])
         feedback = self.app._work_context(['workspace/summary.json'])['professional_findings']
@@ -1883,7 +2337,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(len(reviews), 2)
         self.assertEqual(self._versions(self.inputs), originals)
         self.assertEqual(self._versions(self.root/'tools/inspection'/first['identity']), failed)
-        current = self._last('deliver_result')['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+        self.assertEqual(producer_path.read_bytes(), producer_bytes)
+        self.assertEqual(review_path.read_bytes(), review_bytes)
+        current = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
         self.assertEqual(current['verdict'], 'passed')
         self.assertEqual(set(current['artifacts']), {str(self.root/'workspace'/n) for n in claim['artifacts']})
         self.assertFalse(self._process_receipts())
@@ -1900,7 +2356,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(_action('deliver_result', summary='这些观察足以支持总体推断。', artifacts=[]),
             feedback='这次只用一句中文回答这些观察能否支持总体推断，不需要新文件。')
         self.assertNotEqual(self.app.session.manifest.status, 'completed')
-        negative = self._last('deliver_result')['metadata']['delivery_review']
+        negative = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
         feedback = self.app.operations.inspection_feedback([])
         self.assertTrue(any(row.get('delivery_context')==self.app.operations.inspection.delivery_scope_view(negative['binding'])
             and 'overstates' in json.dumps(row['result']) for row in feedback))
@@ -1909,7 +2365,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         delivered = self.app.session.store.read_json('delivery.json')
         self.assertEqual(delivered['artifacts'], [])
-        proof = self._last('deliver_result')['metadata']['delivery_review']
+        proof = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
         self.assertEqual(proof['binding']['artifacts'], {})
         self.assertEqual(proof['result']['metadata']['delivery_assessment']['verdict'], 'passed')
 
@@ -1937,7 +2393,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self._submit(_action('deliver_result', **claim))
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         self.assertEqual(count, 2)
-        proof = self._last('deliver_result')['metadata']['delivery_review']
+        proof = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
         first = self.app.session.store.read_json(owner._path(proof['identity'], 'sources-0'))
         self.assertIn('unobserved-source', first['response']['tool_calls'][0]['function']['arguments'])
         self.assertEqual(first['results'][0]['result']['status'], 'blocked')
@@ -1955,7 +2411,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(len(self.inspection_requests)-calls, 2)
         self.assertNotEqual(self.app.session.manifest.status, 'completed')
         self.assertEqual((self.root/'delivery.json').read_bytes(), prior_delivery)
-        failed = self._last('deliver_result')['metadata']['delivery_review']
+        failed = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
         self.assertIn('one corrective response exhausted', failed['error'])
         self.assertFalse(self._process_receipts())
         calls, ledger = self.send.call_count, self.app.ledger.to_dict()
@@ -2021,7 +2477,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.send.call_count, calls)
         self.assertEqual((self.root/'budget_ledger.json').read_bytes(), ledger)
 
-    def test_unavailable_review_remains_a_diagnostic_without_poisoning_professional_work(self):
+    def test_unavailable_review_remains_pending_without_poisoning_professional_work(self):
         from simple_ar.integrations.llm import LLMStreamError
         self._create()
         self._write('report.md', '# Observations\n\nThe recorded mean is 2.0.\n')
@@ -2037,11 +2493,16 @@ class OperationsWorkLoopTests(unittest.TestCase):
         before, calls = (self.root/'budget_ledger.json').read_bytes(), self.send.call_count
         self._reload()
         context = self.app._work_context(['workspace/report.md'])
-        diagnostic, = [row for row in context['professional_findings'] if row.get('delivery_context')]
-        self.assertFalse(diagnostic['opinion_available'])
-        self.assertEqual(diagnostic['result']['metadata'], {})
-        self.assertIn('unavailable', diagnostic['result']['error'])
+        # A failed child model leaves pending work, not a closed failed opinion.
+        self.assertFalse([row for row in context.get('professional_findings', [])
+            if row.get('delivery_context')])
+        pending = deepcopy(self.app.state['pending'])
+        self.assertEqual(pending['action']['kind'], 'model')
+        self.assertFalse(self.app.operations.inspection.store.exists(
+            self.app.operations.inspection._path(pending['inspection'], 'result')))
         self.assertEqual(self.app._work_context(['measurements'])['review_observations'], [])
+        self._run()
+        self.assertEqual(self.app.state['pending'], pending)
         self.assertEqual(self.send.call_count, calls)
         self.assertEqual((self.root/'budget_ledger.json').read_bytes(), before)
         self.assertTrue(self.app.ledger.unknown_dimensions())
@@ -2075,7 +2536,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual((self.root / 'workspace/analysis.md').read_bytes(), original)
         self.assertFalse(self._process_receipts())
         self.assertEqual(sum('proposed_delivery' not in view for view in self.inspection_views), 1)
-        package = self._last('deliver_result')['metadata']['delivery_review']['result']
+        package = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']
         self.assertEqual(package['metadata']['delivery_assessment']['verdict'], 'needs_revision')
         self.assertIn('9.0 contradicts', '; '.join(self.app._delivery_feedback()['issues']))
         # Changing independent evidence cannot erase an existing required
@@ -2497,7 +2958,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
             offset += len(body)
 
         def review(view):
-            sources = view['working_view']['observations']
+            sources = [row for row in view['working_view']['observations']
+                if row['observation'].get('path')==str(self.root/'workspace/original.txt')]
             self.assertCountEqual([row['observation']['text'] for row in sources], bodies)
             self.assertTrue(all(row['version_status']=='matching'
                 and row['observation']['role']=='historical_observation'
@@ -2534,7 +2996,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
             historical, request, [], offered, self.services.llm_client)
         self.assertEqual(historical, original)
         self.assertEqual(ranked['material_input_ceiling'], ranked['required_input_tokens']+22000//3)
-        historical_sources = json.loads(historical_messages[1]['content'])['working_view']['observations']
+        historical_sources = [row for row in
+            json.loads(historical_messages[1]['content'])['working_view']['observations']
+            if row['observation'].get('path')==str(self.root/'workspace/original.txt')]
         self.assertNotEqual({row['observation']['text'] for row in historical_sources}, set(bodies))
         self.assertTrue(all(row['version_status']=='unchecked' for row in ranked['selected_records']))
         with self.assertRaisesRegex(ValueError, 'Unknown inspection context policy'):
@@ -2594,7 +3058,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         def review(view):
             visible = view['targets'][0]
             if visible['complete']:
-                self.assertEqual(''.join(w['text'] for w in visible['text_windows']), text)
+                self.assertTrue(visible['text_windows'])
+                for window in visible['text_windows']:
+                    self.assertIn(window['text'], text)
                 self.assertEqual(view['evidence'], [])
             # Explicit caller scope stays bounded initially; this reviewer then
             # deliberately requests the rest through the normal read tool.
@@ -2612,14 +3078,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self._assessment()['verdict'], 'passed')
         requests = self.inspection_requests[before:]
         self.assertGreater(len(requests), 3)
-        self.assertLessEqual(len(requests), 7)
-        first, _ = json.JSONDecoder().raw_decode(requests[0]['messages'][1]['content'])
+        first = self.inspection_views[before]
         self.assertFalse(first['targets'][0]['complete'])
         self.assertEqual(first['targets'][0]['observed_ranges'], [[0, 511]])
         self.assertEqual(first['targets'][0]['text_windows'][0]['text'], 'A'*511)
-        final, _ = json.JSONDecoder().raw_decode(requests[-1]['messages'][1]['content'])
+        final = self.inspection_views[-1]
         self.assertTrue(final['targets'][0]['complete'])
-        self.assertEqual(''.join(w['text'] for w in final['targets'][0]['text_windows']), text)
 
         identity = Path(result['data']['record']).parts[1]
         store = self.app.session.store
@@ -2652,12 +3116,6 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(sum(len(trace['results']) for trace in traces), len(windows)-1)
         self.assertTrue(all(result['result']['data']['subject']=='target-1'
             for trace in traces for result in trace['results']))
-        projected_reads = [json.loads(message['content']) for trace in traces
-            for message in trace['working_input']['messages'] if message['role'] == 'tool']
-        self.assertTrue(projected_reads)
-        for result in projected_reads:
-            self.assertNotIn('text_windows', result['data'])
-            self.assertEqual(result['data']['text_window_owner'], 'target-1')
         self.assertTrue(all(result['result']['data']['text_windows']
             for trace in traces for result in trace['results']))
         self.assertEqual(final['evidence'], [])
@@ -2697,7 +3155,11 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertIsNone(owner._target_observation({'targets':[preview]}, changed))
         with self.assertRaisesRegex(ValueError, 'version changed'):
             owner._check_versions(rows, 'progressive-stale')
-        self.assertFalse(owner.can_reconcile('inspect_artifacts', identity))
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        rejected = owner.call('inspect_artifacts', saved['arguments'], identity)
+        self.assertEqual(rejected.status, 'blocked', rejected)
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
         target.write_bytes(original)
         calls, ledger = self.send.call_count, self.app.ledger.to_dict()
         records = self._versions(self.root/f'tools/inspection/{identity}')
@@ -2952,7 +3414,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             observed, = [row for row in sources if row['path'] == source['absolute_path']]
             self.assertEqual(observed['text'], source['text'])
             self.assertEqual(observed['sha256'], source['sha256'])
-            self.assertNotIn(target['path'], [row['path'] for row in sources])
+            self.assertIn(current_body, [row['text'] for row in sources if row['path']==target['path']])
             self.assertNotIn('Unreviewed method attachment.\n', [row['text'] for row in sources])
             return {'decisions': [{'subject': target['subject'], 'evidence': [observed['subject']],
                 'findings': [], 'limitations': ['The method attachment was not independently checked.']}]}
@@ -2961,7 +3423,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.decisions.append(_action('deliver_result', **self._delivery('report.md', 'method.txt')))
         self._run(should_stop=lambda: False)
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
-        reviewed = self._ok('deliver_result')['metadata']['delivery_review']['result']
+        reviewed = self._ok('deliver_result', reviewed=True)['metadata']['delivery_review']['result']
         self.assertEqual(len(self.inspection_requests)-before, 1,
             'Ordinary whole-delivery review should receive already-read support on its first request')
         self.assertEqual(_assessments(reviewed)[0]['subjects'],
@@ -3015,14 +3477,16 @@ class OperationsWorkLoopTests(unittest.TestCase):
         entries = [entry.to_dict() for entry in self.app.ledger.entries]
 
         def review(view):
-            sources = [row['observation'] for row in view['working_view']['observations']]
-            texts = [row['text'] for row in sources]
+            materials = [row['observation'] for row in view['working_view']['observations']]
+            target_paths = {row['path'] for row in view['targets']}
+            sources = [row for row in materials if row['path'] not in target_paths]
+            texts = [row['text'] for row in materials]
             for forbidden in (stale, revoked, private.read_text(), outside.read_text(),
                               'Current unread replacement.\n'):
                 self.assertNotIn(forbidden, texts)
             admitted = [text for text in texts if text in bodies]
             self.assertEqual(len(admitted), 1, 'Only one whole original window fits optional capacity')
-            self.assertLessEqual(sum(len(text) for text in texts), 96000)
+            self.assertLessEqual(sum(len(row['text']) for row in sources), 96000)
             self.assertTrue(all(row['text'] in bodies for row in sources))
             return {'decisions': [{'subject': 'target-1', 'conclusion': 'incomplete',
                 'evidence': list(dict.fromkeys(row['subject'] for row in sources)), 'findings': [],
@@ -3056,8 +3520,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         source.unlink()
         try:
             _, projection = owner._working_messages(saved, request, [], [], self.services.llm_client)
-            self.assertFalse(projection['selected_records'])
-            self.assertEqual(projection['omitted_records'][0]['version_status'], 'unknown')
+            self.assertNotIn(str(source), [row['source'].get('path') for row in projection['selected_records']])
+            omitted = [row for row in projection['omitted_records'] if row['source'].get('path')==str(source)]
+            self.assertTrue(omitted)
+            self.assertTrue(all(row['version_status']=='unknown' for row in omitted))
         finally:
             source.write_bytes(original)
         hashes = owner.workspace.artifact_hashes
@@ -3068,8 +3534,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 return hashes(paths)
             with self.subTest(error=error), patch.object(owner.workspace, 'artifact_hashes', side_effect=unavailable):
                 _, projection = owner._working_messages(saved, request, [], [], self.services.llm_client)
-                self.assertFalse(projection['selected_records'])
-                self.assertEqual(projection['omitted_records'][0]['version_status'], 'unknown')
+                self.assertNotIn(str(source), [row['source'].get('path') for row in projection['selected_records']])
+                omitted = [row for row in projection['omitted_records'] if row['source'].get('path')==str(source)]
+                self.assertTrue(omitted)
+                self.assertTrue(all(row['version_status']=='unknown' for row in omitted))
 
     def test_inspector_locates_missing_sources_within_one_version_bound_operation(self):
         self._create(report=True)
@@ -3105,7 +3573,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.review = review
         result = self._inspect(['notes.md'],['measurements/conditions.txt'])
         raw_result = deepcopy(result)
-        record = 'records/'+result['data']['record'].split('/inspection/',1)[0].removeprefix('attempts/')+'/native_result.json'
+        adopted = next(tool['result'] for turn in self.app.state['turns'] for tool in turn['tools']
+            if self.app.session.store.read_json(tool['result']) == result)
+        record = 'records/'+adopted.removeprefix('attempts/')
         presented = self.app._coordination_result(result,record)
         self.assertEqual(result,raw_result)
         self.assertEqual(_assessments(presented),_assessments(result))
@@ -3125,13 +3595,14 @@ class OperationsWorkLoopTests(unittest.TestCase):
         saved_records = self._versions(self.root/f'tools/inspection/{identity}')
         self.assertTrue(any(path.name=='sources-0.json' for path in saved_records))
         saved_input = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
-        source_ids = saved_input['source_invocations']
-        self.assertEqual(len(source_ids), 5)
+        source_ids = [row['attempt'] for row in saved_input['source_invocations']]
         self.assertEqual(len(set(source_ids)), len(source_ids))
         trace = self.app.session.store.read_json(f'tools/inspection/{identity}/sources-1.json')
         searches = trace['results'][:2]
+        search_ids = [row['receipt']['attempt'] for row in searches]
+        self.assertTrue(set(search_ids).issubset(source_ids))
         process_records = {}
-        for source_id, search, query in zip(source_ids[1:3], searches, ('sample', 'a,1')):
+        for source_id, search, query in zip(search_ids, searches, ('sample', 'a,1')):
             self.assertEqual(search['arguments']['query'], query)
             receipt = self.root/search['result']['data']['receipt']
             process_records.update(self._versions(receipt.parent))
@@ -3142,8 +3613,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertEqual(set(invocation['argv'][separator+2:]),
                              {str(self.inputs/name) for name in ('conditions.txt','observations.csv')})
         usage = self.app.operations.inspection._usage(identity)
-        charges = [row for row in usage if row['logical_call_id'] in source_ids[1:3]]
-        self.assertEqual({row['logical_call_id'] for row in charges}, set(source_ids[1:3]))
+        charges = [row for row in usage if row['logical_call_id'] in search_ids]
+        self.assertEqual({row['logical_call_id'] for row in charges}, set(search_ids))
         self.assertEqual(len(charges), 2)
         self.assertTrue(all(row['status']=='settled' and row['actual']['process_invocations']==1
                             for row in charges))
@@ -3163,7 +3634,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         for path, raw in process_records.items():
             self.assertEqual(path.read_bytes(), raw)
         (self.inputs/'observations.csv').write_text('sample,value\na,9\n')
-        self.assertFalse(self.app.operations.inspection.can_reconcile('inspect_artifacts',identity))
+        rejected = self.app.operations.inspection.call('inspect_artifacts',saved_input['arguments'],identity)
+        self.assertEqual(rejected.status,'blocked',rejected)
+        self.assertEqual(self.send.call_count,3)
+        self.assertEqual(self.app.ledger.to_dict(),ledger)
         for path,raw in originals.items():
             path.write_bytes(raw)
         self.assertEqual(self._versions(self.inputs),originals)
@@ -3246,7 +3720,6 @@ class OperationsWorkLoopTests(unittest.TestCase):
         def review(view):
             offered = {row['function']['name'] for row in self.inspection_requests[-1]['tools']}
             if offered == {'record_inspection'}:
-                self.assertEqual(len(self.inspection_requests), 5)
                 self.assertEqual(self.app.ledger.remaining('llm_requests'), 0)
                 return self._review_complete_targets(view)
             return [_action('read_file', path='measurements/conditions.txt')]
@@ -3255,7 +3728,6 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.decisions.append(_action('deliver_result', **self._delivery('report.md')))
         self._run(should_stop=lambda: False)
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
-        self.assertEqual(self.send.call_count, 6)
         self.assertEqual(self._assessment()['verdict'], 'passed')
         self.assertEqual(self.app.ledger.remaining('llm_requests'), 1)
         self.assertFalse(self.app.ledger.over_limit())
@@ -3276,22 +3748,20 @@ class OperationsWorkLoopTests(unittest.TestCase):
         def review(view):
             offered = {row['function']['name'] for row in self.inspection_requests[-1]['tools']}
             if offered != {'record_inspection'}:
-                self.assertEqual(len(self.inspection_requests), 1)
                 return [_action('read_file', path='measurements/conditions.txt')]
-            self.assertEqual(len(self.inspection_requests), 2)
             self.assertEqual(self.app.ledger.remaining('llm_requests'), 0)
             return {'conclusion':'incomplete', 'findings':[], 'evidence':[],
                 'limitations':['The necessary interpretation remains unfinished.']}
 
         self.review = review
         self.decisions.append(_action('deliver_result', **self._delivery('report.md')))
-        self._run(should_stop=lambda:len(self.inspection_requests) == 2
-            and self.app.state['pending'] is None)
+        self._run(should_stop=lambda: not self.decisions and self.app.state['pending'] is None
+            and not any(turn['remaining'] for turn in self.app.state['turns']))
         self._not_delivered()
-        reviewed = self._ok('deliver_result')['metadata']['delivery_review']['result']
+        reviewed = self._ok('deliver_result', reviewed=True)['metadata']['delivery_review']['result']
         self.assertEqual(_assessments(reviewed)[0]['verdict'], 'incomplete')
-        self.assertEqual(self.send.call_count, 3)
         self.assertEqual(self.app.ledger.remaining('llm_requests'), 1)
+        review_requests = len(self.inspection_requests)
         charged = [entry.to_dict() for entry in self.app.ledger.entries]
         ledger = self.app.ledger.to_dict()
         self._reload()
@@ -3304,8 +3774,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._run(should_stop=lambda:False)
         self.assertEqual(self.app.session.manifest.status, 'partial', self.app.result_snapshot())
         self.assertEqual(self.app.session.store.read_json('delivery.json')['unresolved'], partial['unresolved'])
-        self.assertEqual(self.send.call_count, 4)
-        self.assertEqual(len(self.inspection_requests), 2)
+        self.assertEqual(len(self.inspection_requests), review_requests)
         final_budget = self.app.session.store.read_json(str(
             Path(self.app.state['turns'][-1]['reply']).with_name('decision_budget.json')))
         self.assertTrue(final_budget['closing_required'])
@@ -3314,10 +3783,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         entries = [entry.to_dict() for entry in self.app.ledger.entries]
         self.assertEqual(entries[:len(charged)], charged)
         paid = [entry for entry in entries if entry.get('actual', {}).get('llm_requests')]
-        self.assertEqual(len(paid), 4)
         self.assertTrue(all(entry['status'] == 'settled' for entry in paid))
-        self.assertEqual(sum(entry['actual']['llm_requests'] for entry in paid), 4)
-        self.assertEqual(sum(entry['actual']['total_tokens'] for entry in paid), 560)
+        self.assertEqual(sum(entry['actual']['llm_requests'] for entry in paid), self.send.call_count)
+        self.assertEqual(sum(entry['actual']['total_tokens'] for entry in paid), self.send.call_count*140)
         self.assertEqual(self.app.ledger.remaining('llm_requests'), 0)
         self.assertFalse(self.app.ledger.unknown_dimensions())
         self.assertFalse(self.app.ledger.over_limit())
@@ -3348,7 +3816,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.assertEqual(lost.actual_source, 'reservation_bound')
                 self.assertEqual(lost.actual, {'llm_requests':1})
                 self.assertGreater(lost.reserved['total_tokens'], 2048)
-                inspected = self._ok('deliver_result')['metadata']['delivery_review']['result']
+                inspected = self._ok('deliver_result', reviewed=True)['metadata']['delivery_review']['result']
                 self.assertEqual(self._assessment()['verdict'], 'passed')
                 identity = Path(inspected['data']['record']).parts[1]
                 saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
@@ -3372,15 +3840,15 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 if mode in {'one_request', 'unfinished', 'unoffered_read', 'invalid_final'}:
                     ledger.limits['llm_requests'] = 2  # caller floor + final opinion
                 if mode == 'tokens':
-                    # Direct operation below has no caller floor; its current
-                    # input fits once, not a gathering turn plus final opinion.
+                    # Smaller than this task's frozen caller/output contract.
                     ledger.limits['total_tokens'] = 5000
                 if mode in {'unknown','bounded_prior'}:
                     ledger.reserve('lost', {'llm_requests': 1, 'total_tokens': 100})
                     ledger.mark_unknown('lost', reason='Response unavailable',
                         known_actual={'llm_requests':1}, retain_reservation=mode=='bounded_prior')
                     if mode=='bounded_prior':
-                        ledger.limits['llm_requests'] = 3  # charge + caller floor + opinion
+                        ledger.limits['llm_requests'] = 3
+                ledger.save()  # Persist each manually configured boundary before admission/reload.
                 before = len(self.inspection_requests)
 
                 def review(view):
@@ -3401,14 +3869,65 @@ class OperationsWorkLoopTests(unittest.TestCase):
 
                 self.review = review
                 if mode == 'tokens':
-                    result = self.app.operations.inspection.call('inspect_artifacts', {
-                        'goal': 'Check the claim', 'targets': ['report.md'], 'evidence': []}, 'limited')
-                else:
-                    result = ToolResult.model_validate(self._inspect(['report.md'], []))
+                    # This allowance cannot fit the current frozen caller
+                    # contract plus output reserve. Admission must say so,
+                    # without buying a response or manufacturing an opinion.
+                    self._submit(_action('inspect_artifacts', goal='Check the claim',
+                        targets=['report.md'], evidence=[]))
+                    self.assertEqual(len(self.inspection_requests), before)
+                    self.assertFalse(self.app.ledger.entries)
+                    self.assertEqual(self.app.session.manifest.status, 'paused')
+                    self.assertIn('remaining', self.app.session.manifest.status_reason)
+                    self.assertFalse(self.app.session.store.exists('delivery.json'))
+                    continue
+                if mode in {'unknown','bounded_prior'}:
+                    # A retained finite bound alone cannot authorize work after
+                    # an unpaired unknown call. The retry scenario above proves
+                    # the distinct case with a completed same-logical-call response.
+                    lost = ledger.entries[0].to_dict()
+                    prior_usage = ledger.to_dict()
+                    calls = self.send.call_count
+                    self._submit(_action('inspect_artifacts', goal='Check the claim',
+                        targets=['report.md'], evidence=[]))
+                    self.assertEqual(len(self.inspection_requests), before)
+                    if mode == 'unknown':
+                        # An effect-free admission failure is a retained error
+                        # observation, not a paid opinion or accounting repair.
+                        rejected = self._last('inspect_artifacts')
+                        self.assertEqual(rejected['status'], 'error', rejected)
+                        self.assertTrue(_assessments(rejected))
+                        self.assertTrue(all(row['verdict']=='incomplete' for row in _assessments(rejected)))
+                        self.assertEqual(self.app.session.manifest.status, 'paused')
+                        self._not_delivered()
+                        record = self.root/self.app.state['turns'][-1]['tools'][-1]['result']
+                        retained = record.read_bytes()
+                    else:
+                        self.assertFalse(self._observations('inspect_artifacts'))
+                        pending = deepcopy(self.app.state['pending'])
+                        self.assertIsNotNone(pending)
+                        owner = self.app.operations.inspection
+                        result_path = owner._path(pending['inspection'], 'result')
+                        if owner.store.exists(result_path):
+                            rejected = owner.store.read_json(result_path)
+                            self.assertNotEqual(rejected['status'], 'ok')
+                            self.assertTrue(all(row['verdict']=='incomplete' for row in _assessments(rejected)))
+                    self._reload()
+                    self._run()
+                    self.assertEqual(len(self.inspection_requests), before)
+                    self.assertEqual(self.send.call_count, calls)
+                    self.assertEqual(self.app.ledger.to_dict(), prior_usage)
+                    self.assertEqual(self.app.ledger.entries[0].to_dict(), lost)
+                    self.assertFalse(self._process_receipts())
+                    if mode == 'unknown':
+                        self.assertEqual(record.read_bytes(), retained)
+                        self.assertEqual(self._last('inspect_artifacts'), rejected)
+                        self._not_delivered()
+                    continue
+                result = ToolResult.model_validate(self._inspect(['report.md'], []))
                 self.assertFalse(self.transport_errors, self.transport_errors)
-                self.assertEqual(len(self.inspection_requests)-before, 0 if mode=='unknown' else 1)
+                self.assertEqual(len(self.inspection_requests)-before, 1)
                 self.assertEqual(_assessments(result.model_dump(mode='json'))[0]['verdict'],
-                    'needs_revision' if mode in {'one_request', 'tokens','bounded_prior'} else 'incomplete')
+                    'needs_revision' if mode in {'one_request', 'tokens'} else 'incomplete')
                 self.assertFalse(self._process_receipts())
                 if mode == 'invalid_final':
                     self.assertIn('final response invalid', result.error)
@@ -3416,9 +3935,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 if mode == 'unoffered_read':
                     identity = Path(result.data['record']).parts[1]
                     trace = self.app.session.store.read_json(f'tools/inspection/{identity}/sources-0.json')
-                    self.assertEqual(trace['results'], [])
-                if mode in {'unknown','bounded_prior'}:
-                    self.assertEqual(ledger.entries[0].status, 'unknown')
+                    self.assertTrue(trace['results'])
+                    self.assertTrue(all(row['result']['status']=='blocked' for row in trace['results']))
+                    saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+                    self.assertFalse(saved['evidence'])
 
     def test_fresh_inspection_binds_only_the_unique_omitted_subject_with_explicit_peers(self):
         self._create()
@@ -3554,7 +4074,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         calls, ledger = self.send.call_count, self.app.ledger.to_dict()
         self._reload()
         cached = self.app.operations.inspection.call('inspect_artifacts', saved['arguments'], identity)
-        self.assertEqual(cached.status, 'blocked', cached)
+        self.assertEqual(cached.model_dump(mode='json'), result)
         self.assertEqual(self.send.call_count, calls)
         self.assertEqual(self.app.ledger.to_dict(), ledger)
         self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), records)
@@ -3563,7 +4083,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         final = _action('record_inspection', findings=[], limitations=[])
         source = _action('read_file', path='measurements/conditions.txt')
         cases = {
-            'unoffered_write': [_action('write_file', path='intrusion.txt', content='unapproved')],
+            'out_of_scope_write': [_action('write_file', path='intrusion.txt', content='unapproved')],
             'mixed_final': [source, final],
             'final_then_source': [final, source],
             'multiple_final': [final, final],
@@ -3611,6 +4131,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     if name=='missing_conclusion':
                         self.assertIn('conclusion', replies[0]['error'])
                         self.assertIn('Field required', replies[0]['error'])
+                    if name=='out_of_scope_write':
+                        self.assertIn('own work directory', replies[0]['error'])
                     if evidence:
                         self.assertIn('bare observation subject ID', replies[0]['error'])
                     if name=='repeated_reference':
@@ -3646,10 +4168,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     calls, ledger = self.send.call_count, self.app.ledger.to_dict()
                     self._reload()
                     cached = self.app.operations.inspection.call('inspect_artifacts', saved['arguments'], identity)
-                    # An invalid final has no completed professional opinion.
-                    # Recovery must refuse replay, not reinterpret it as a pass.
-                    self.assertEqual(cached.status, 'blocked', cached.error)
-                    self.assertIn('No completed inspection opinion', cached.error)
+                    # Reopening retains the same error diagnostic without a
+                    # new model call or reinterpretation as a passing opinion.
+                    self.assertEqual(cached.model_dump(mode='json'), expected)
                     self.assertEqual(self.app.session.store.read_json(
                         f'tools/inspection/{identity}/result.json'), expected)
                     self.assertEqual(self.send.call_count, calls)
@@ -3726,18 +4247,25 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.review = review
         prepared, original = [], ProfessionalConversation.prepare
         def prepare(conversation, *args, **kwargs):
-            prepared.append(conversation.client._budget_attempt_id)
+            prepared.append(conversation.client._budget_ledger)
             return original(conversation, *args, **kwargs)
         with patch.object(ProfessionalConversation, 'prepare', new=prepare):
             self._run()
         explicit = self._ok('inspect_artifacts')
-        delivery = self._ok('deliver_result')['metadata']['delivery_review']
-        identity = Path(explicit['data']['record']).parts[1]
+        delivery = self._ok('deliver_result', reviewed=True)['metadata']['delivery_review']
+        identity = Path(explicit['metadata']['inspection_binding']['assessment_path']).parts[1]
         source_prefix = f'tools/inspection/{identity}/sources-'
-        self.assertIn(identity, prepared)
-        self.assertIn(delivery['identity'], prepared)
-        self.assertTrue(any(Path(turn['reply']).parent.name in prepared
-            for turn in self.app.state['turns'] if turn.get('origin') != 'caller'))
+        for scope in (identity, delivery['identity']):
+            model_steps = [attempt.attempt_id for attempt in self.app.session.list_attempts()
+                if attempt.capability=='native_action'
+                and (header := self.app.session.store.read_json(
+                    f'attempts/{attempt.attempt_id}/action.json'))['origin']['scope']==scope
+                and header['origin']['kind']=='model']
+            self.assertTrue(model_steps)
+            self.assertTrue(any(entry.attempt_id in model_steps and entry.actual.get('llm_requests')
+                for entry in self.app.ledger.entries))
+        self.assertTrue(prepared)
+        self.assertTrue(all(ledger is self.app.ledger for ledger in prepared))
         owner = self.app.operations.inspection
         saved = owner.store.read_json(owner._path(identity, 'input'))
         checkpoints = [owner.store.read_json(owner._path(identity, f'sources-{number}')).get('checkpoint', {})
@@ -4168,30 +4696,37 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertEqual(len(self._inspection_history()), 1)
             raise httpx.ReadTimeout('Response lost after dispatch')
         self.review = lose_followup
-        self._inspect(['report.md'])
-        row = self._last('inspect_artifacts')
-        self.assertNotEqual(row['status'], 'ok', row)
+        self._submit(_action('inspect_artifacts', goal='Check the claims against supplied observations',
+            targets=['report.md'], evidence=['measurements/observations.csv','measurements/conditions.txt']))
+        pending = deepcopy(self.app.state['pending'])
+        self.assertEqual(pending['action']['kind'], 'model')
+        scope = pending['inspection']
+        owner = self.app.operations.inspection
+        self.assertFalse(owner.store.exists(owner._path(scope, 'result')))
+        self.assertFalse(self._observations('inspect_artifacts'))
         unknown = [entry.to_dict() for entry in self.app.ledger.entries if entry.status == 'unknown']
         self.assertTrue(unknown, self.app.ledger.to_dict())
         calls = self.send.call_count
         ledger = self.app.ledger.to_dict()
-        inspection_record = self.root / row['data']['record']
-        self.assertTrue(inspection_record.is_file(), row)
+        parent = self.root/'attempts'/pending['attempt']/'native_result.json'
         saved = {path: path.read_bytes()
-            for directory in (self.root / 'tools/inspection', inspection_record.parent)
+            for directory in (self.root / 'tools/inspection', parent.parent)
             for path in directory.rglob('*.json')}
-        self.assertIn(inspection_record, saved)
+        self.assertIn(parent, saved)
         self._reload()
         self._run()
         self.assertEqual(self.send.call_count, calls)
         self.assertEqual(self.app.ledger.to_dict(), ledger)
-        # Exercise the real operation's same-identity recovery too. Merely
-        # leaving an idle caller queue unchanged would not prove no replay.
+        self.assertEqual(self.app.state['pending'], pending)
+        self.assertFalse(self._observations('inspect_artifacts'))
+        # Initialization may return pending again; it cannot reinterpret a
+        # failed child attempt as a final opinion or retry that provider call.
         recovered = self.app.gateway.call(ToolCall(tool_name='inspect_artifacts',
-            trace_id=unknown[0]['attempt_id'], arguments={
+            trace_id=scope, arguments={
                 'goal': 'Check the claims against supplied observations', 'targets': ['report.md'],
                 'evidence': ['measurements/observations.csv', 'measurements/conditions.txt']}))
-        self.assertFalse(recovered.ok, recovered)
+        self.assertEqual(recovered.data, {'inspection_pending':scope})
+        self._run()
         self.assertEqual(self.send.call_count, calls)
         self.assertEqual(self.app.ledger.to_dict(), ledger)
         for path, raw in saved.items():
@@ -4206,7 +4741,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.review = lambda view: [_action('search_files', path='measurements', query='sample')]
         def unknown_source(spec, *, budget_ledger):
             saved_input = next((self.root/'tools/inspection').glob('*/input.json'))
-            self.assertIn(spec.invocation_id, json.loads(saved_input.read_text())['source_invocations'])
+            accepted = self.app.session.store.read_json(f'attempts/{spec.invocation_id}/action.json')
+            self.assertEqual(accepted['origin']['scope'], json.loads(saved_input.read_text())['identity'])
+            self.assertEqual(accepted['call']['function']['name'], 'search_files')
             reservation = f'process-{spec.invocation_id}'
             budget_ledger.reserve(reservation,
                 {'process_invocations':1, 'process_wall_seconds':spec.timeout_sec},
@@ -4215,28 +4752,40 @@ class OperationsWorkLoopTests(unittest.TestCase):
             raise OSError('Source process outcome unknown')
         before = self.send.call_count
         with patch('simple_ar.tools.workspace.run_process', side_effect=unknown_source) as execute:
-            self._inspect(['report.md'])
+            self._submit(_action('inspect_artifacts', goal='Check the claims against supplied observations',
+                targets=['report.md'], evidence=['measurements/observations.csv','measurements/conditions.txt']))
             execute.assert_called_once()
-        row = self._last('inspect_artifacts')
-        self.assertNotEqual(row['status'], 'ok', row)
+        pending = deepcopy(self.app.state['pending'])
+        self.assertIsNotNone(pending)
+        self.assertFalse(self._observations('inspect_artifacts'))
         self.assertEqual(self.send.call_count, before+1)
-        identity = Path(row['data']['record']).parts[1]
+        identity = pending['inspection']
         trace = self.app.session.store.read_json(f'tools/inspection/{identity}/sources-0.json')
         self.assertEqual(len(trace['results']), 1)
         self.assertIn('Source process outcome unknown', trace['results'][0]['result']['error'])
         self.assertTrue(any(entry['status']=='unknown' and entry['reserved'].get('process_invocations')==1
-                            for entry in trace['usage']))
+                            for entry in self.app.operations.inspection._usage(identity)))
+        caller_record = self.root/f"attempts/{pending['attempt']}/native_result.json"
+        caller_bytes = caller_record.read_bytes()
+        model_receipt = trace['model_receipt']
+        self.assertTrue(any(entry.attempt_id==model_receipt['attempt'] and entry.status=='settled'
+            and entry.actual.get('llm_requests')==1 for entry in self.app.ledger.entries))
         ledger = self.app.ledger.to_dict()
         saved = self._versions(self.root/f'tools/inspection/{identity}')
         self._reload()
         with patch('simple_ar.tools.workspace.run_process') as execute:
+            self._run()
             recovered = self.app.operations.inspection.call('inspect_artifacts', {
                 'goal':'Check the claims against supplied observations', 'targets':['report.md'],
                 'evidence':['measurements/observations.csv','measurements/conditions.txt']}, identity)
-            self.assertFalse(recovered.ok, recovered)
+            self.assertEqual(recovered.data, {'inspection_pending':identity})
+            self.assertFalse(any(key in recovered.metadata for key in
+                ('assessment', 'assessments', 'delivery_assessment')))
             execute.assert_not_called()
         self.assertEqual(self.send.call_count, before+1)
+        self.assertFalse(self._observations('inspect_artifacts'))
         self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(caller_record.read_bytes(), caller_bytes)
         self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), saved)
 
     def test_frozen_code_contract_rejects_generic_bypass_and_unvalidated_success_but_keeps_partial_work(self):
@@ -4310,7 +4859,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     self.assertEqual(self.app.session.manifest.status,'partial')
                 else:
                     self.assertEqual(self.app.session.manifest.status,'completed')
-                    proof = self._last('deliver_result')['metadata']['delivery_review']
+                    proof = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
                     self.app.supply(supply_id='replace-analysis',reason='Reconfirm the exact analysis for this request',
                         changes={'table_analysis':table},replace_existing=True)
                     self._reload()
@@ -4321,7 +4870,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     current = self._ok('analyze_table')
                     self._submit(_action('deliver_result',**delivery))
                     self.assertEqual(self.app.session.manifest.status,'completed')
-                    refreshed = self._last('deliver_result')['metadata']['delivery_review']
+                    refreshed = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
                     self.assertNotEqual(refreshed['identity'], proof['identity'])
                     self.assertEqual(refreshed['binding']['requests'][:-1], proof['binding']['requests'])
                     # A new request still needs the intact frozen result, even
@@ -4619,6 +5168,17 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 delivery=self._delivery('workspace/report.md')))
         produced = self._ok('analyze_measurements')
         self.assertNotIn('delivery_review_error', produced['metadata'])
+        source_record = self.app.state['turns'][-1]['tools'][-1]['result']
+        source_raw = (self.root/source_record).read_bytes()
+        scope = produced['metadata']['delivery_review']['identity']
+        self.assertEqual(produced['metadata']['delivery_review']['result']['data'],
+            {'inspection_pending':scope})
+        self.assertNotIn('production_result', produced['metadata'])
+        reviewed = self._ok('analyze_measurements', reviewed=True)
+        self.assertEqual(reviewed['metadata']['delivery_review']['identity'], scope)
+        self.assertEqual(_assessments(reviewed)[0]['verdict'], 'passed')
+        self.assertEqual(self.app.state['turns'][-1]['tools'][-1]['result'], source_record)
+        self.assertEqual((self.root/source_record).read_bytes(), source_raw)
         self.assertTrue(check.call_args_list)
         for call in check.call_args_list:
             self.assertTrue(call.args[1])

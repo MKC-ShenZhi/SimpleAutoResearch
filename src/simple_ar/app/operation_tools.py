@@ -12,7 +12,7 @@ from simple_ar.core.assessments import assessment_issues, current_assessments
 from simple_ar.tools.gateway import CommonToolGateway
 from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.permissions import ToolPermissionPolicy
-from simple_ar.tools.specs import CommonToolSpec, ToolResult
+from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult
 from simple_ar.tools.workspace import WorkspaceToolGateway, workspace_tool_specs, DeliveryRequest
 from simple_ar.tools.sources import SourceToolGateway, source_tool_specs
 from simple_ar.tools.publication import PublicationToolGateway, publication_tool_specs
@@ -144,7 +144,8 @@ class OperationTools:
             prior_assessments=lambda:[row.model_dump() for row in
                 current_assessments(self.workspace,observations())])
         self.registry.register_package(inspection_tool_specs(progressive=self.inspection.progressive,
-            adaptive=self.inspection.adaptive),
+            adaptive=self.inspection.adaptive,
+            execution_protocol=config.get('inspection_execution_protocol')),
             self.inspection)
         self.delivery_review = None
         if config.get('delivery_review_protocol') in {'task.v1', 'task.v2', 'task.v3'}:
@@ -262,6 +263,16 @@ class OperationTools:
                     if spec.domain=='scientific' and spec.permission_level=='execution')
         self.gateway = CommonToolGateway(root,registry=self.registry,policy=ToolPermissionPolicy(
             allowed_permissions=permissions,max_risk_level='high',blocked_tools=blocked))
+        inspection_execution = config.get('inspection_execution_protocol')
+        if inspection_execution not in {None, 'shared.v1'}:
+            raise ValueError('Unsupported saved inspection execution contract')
+        self.inspection.execution_protocol = inspection_execution
+        self.inspection.operation_specs = lambda: [spec for spec in self.registry.list_specs()
+            if (spec.domain == 'workspace' and spec.name in
+                {'read_file', 'list_directory', 'search_files', 'write_file', 'edit_file', 'copy_file', 'run_process'}
+                or spec.name == 'inspect_images') and self.gateway.policy.is_allowed(spec)[0]]
+        self.inspection.operation_call = lambda name, arguments, identity: self.gateway.call(
+            ToolCall(tool_name=name, arguments=arguments, trace_id=identity))
         self.session_id = session_id
         self.ledger = ledger
 
@@ -293,7 +304,9 @@ class OperationTools:
             elif observed.get('tool_name') == 'inspect_artifacts':
                 if not (observed.get('metadata') or {}).get('inspection_binding'):
                     continue
-                identity = Path(observed['record']).parent.name
+                assessment = observed['metadata']['inspection_binding'].get('assessment_path')
+                identity = (Path(assessment).parts[1] if assessment and len(Path(assessment).parts) == 4
+                    and Path(assessment).parts[0] == 'attempts' else Path(observed['record']).parent.name)
                 claimed = {key: value for key, value in observed.items()
                     if key not in {'record', 'arguments', 'current_request', 'contract_current'}}
                 feedback = self.inspection.feedback_observation(identity, claimed,
@@ -490,7 +503,10 @@ class OperationTools:
         return self.delivery_review.review(delivery, identity, may_start=may_start,
             current_outputs=current_outputs)
 
-    def coordination_result(self, result: dict, record: str) -> dict:
+    def coordination_result(self, result: dict, record: str, *, review_record: str | None = None) -> dict:
+        if self.delivery_review is not None:
+            result = self.delivery_review.resolve_observation({**result, 'record': record}, review_record=review_record)
+            result.pop('record', None)
         presented = self.gateway.coordination_result(result, record)
         review = (presented.get('metadata') or {}).get('delivery_review')
         if review is None:
@@ -498,11 +514,16 @@ class OperationTools:
         from copy import deepcopy
         presented = deepcopy(presented)
         review = presented['metadata']['delivery_review']
+        if (review['result'].get('data') or {}).get('inspection_pending'):
+            review_record = None  # A rejected projection cannot point at an unrelated opinion.
         review['result'] = self.inspection.coordination_result(
-            ToolResult.model_validate(review['result']), receipt_path=record)
+            ToolResult.model_validate(review['result']), receipt_path=(
+                'records/'+review_record.removeprefix('attempts/') if review_record else record))
         source = review['result']['data']['source_observations']
-        source['fields'] = ['metadata.delivery_review.result.' + field for field in source['fields']]
+        if review_record is None:
+            source['fields'] = ['metadata.delivery_review.result.' + field for field in source['fields']]
         if review.get('binding', {}).get('schema_version') == 'delivery_review.v3':
             review['binding'] = self.inspection.delivery_scope_view(review['binding'])
-            source['fields'].append('metadata.delivery_review.binding')
+            if review_record is None:
+                source['fields'].append('metadata.delivery_review.binding')
         return presented

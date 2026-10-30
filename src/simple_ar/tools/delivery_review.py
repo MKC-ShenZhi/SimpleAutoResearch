@@ -189,6 +189,78 @@ class DeliveryReview:
             value['error'] = error
         return value
 
+    @staticmethod
+    def _pending_envelope(envelope: Any) -> bool:
+        """Recognize only the original shared-inspection start marker."""
+        if (not isinstance(envelope, dict) or set(envelope) != {'binding', 'identity', 'result'}
+                or not isinstance(envelope['identity'], str) or not isinstance(envelope['binding'], dict)):
+            return False
+        return envelope['result'] == ToolResult(tool_name='inspect_artifacts',
+            data={'inspection_pending': envelope['identity']}).model_dump(mode='json')
+
+    def _pending_input(self, envelope: dict) -> dict:
+        identity, binding = envelope['identity'], envelope['binding']
+        saved = self.inspector.store.read_json(self.inspector._path(identity, 'input'))
+        if (saved.get('execution_protocol') != 'shared.v1' or saved.get('identity') != identity
+                or saved.get('delivery_context') != binding or saved.get('arguments') != self._arguments(binding)
+                or saved.get('user_requests') != binding['requests']):
+            raise ValueError('Pending delivery review differs from its retained inspection scope')
+        return saved
+
+    def _envelope_result(self, envelope: dict, binding: dict, *, record: str | None = None) -> ToolResult | None:
+        """Verify a final claim, or resolve an original pending marker to its owner result."""
+        identity = envelope['identity']
+        if envelope.get('binding') != binding:
+            raise ValueError('Delivery review differs from the requested binding')
+        if not self._pending_envelope(envelope):
+            return self._verified(identity, binding, envelope)
+        if record is not None and (not isinstance(record, str) or Path(record).name != 'native_result.json'
+                or Path(record).parent.name != identity):
+            raise ValueError('Pending delivery review does not belong to its producer observation')
+        self._pending_input(envelope)
+        if not self.inspector.store.exists(self.inspector._path(identity, 'result')):
+            return None
+        return self._verified(identity, binding)
+
+    def resolve_observation(self, observed: dict, *, review_record: str | None = None) -> dict:
+        """Project a closed shared review onto a copy of its original producer observation.
+
+        The caller owns proof of the producer record. When provided, its path
+        also binds a pending review to the producer attempt. A supplied review
+        record must be the accepted opinion action for the same inspection and
+        contain the exact owner result. This method does not register, mutate or
+        certify production. Unfinished or unverifiable reviews retain their marker.
+        """
+        projected = deepcopy(observed)
+        metadata = projected.get('metadata') or {}
+        envelope = metadata.get('delivery_review')
+        if not self._pending_envelope(envelope):
+            return projected
+        try:
+            result = self._envelope_result(envelope, envelope['binding'], record=projected.get('record'))
+            if result is not None and review_record is not None:
+                from simple_ar.tools.professional_outcomes import accepted_native_result, native_result_path
+
+                if not isinstance(review_record, str) or not review_record:
+                    raise ValueError('Review record must identify an accepted opinion')
+                root = self.inspector.store.root
+                path = native_result_path(root, self.workspace, review_record)
+                session_id = self.inspector.store.read_json('session_manifest.json')['session_id']
+                action_store, _ = accepted_native_result(root, session_id,
+                    result.model_dump(mode='json'), path.parent.name)
+                action = action_store.read_json('action.json')
+                if (action_store.read_attempt_manifest().capability != 'native_action'
+                        or not isinstance(action, dict) or action.get('kind') != 'opinion'
+                        or not isinstance(action.get('origin'), dict)
+                        or action['origin'].get('scope') != envelope['identity']):
+                    raise ValueError('Review record is not the accepted opinion for this inspection')
+        except _ERRORS:
+            return projected
+        if result is not None:
+            projected['metadata']['delivery_review'] = self._envelope(envelope['binding'],
+                envelope['identity'], result)
+        return projected
+
     def _retained(self, identity: str) -> ToolResult:
         """Preserve failed work for diagnosis only; this never supplies acceptance."""
         path = self.inspector._path(identity, 'result')
@@ -205,7 +277,16 @@ class DeliveryReview:
         verifies its original input, response, result and accounted usage.
         """
         identity, binding = envelope['identity'], envelope['binding']
-        feedback = self.inspector.feedback_observation(identity, envelope['result'])
+        claimed = envelope['result']
+        if self._pending_envelope(envelope):
+            try:
+                self._pending_input(envelope)
+                path = self.inspector._path(identity, 'result')
+                if self.inspector.store.exists(path):
+                    claimed = self.inspector.store.read_json(path)
+            except _ERRORS:
+                pass  # The inspector returns unavailable guidance for the pending marker.
+        feedback = self.inspector.feedback_observation(identity, claimed)
         original = feedback.get('delivery_context') or {}
         if (original != binding or feedback.get('arguments') != self._arguments(binding)):
             feedback.update(opinion_available=False,
@@ -225,6 +306,12 @@ class DeliveryReview:
         result = None
         try:
             if self.inspector.has_started(identity):
+                if self.inspector.store.read_json(self.inspector._path(identity, 'input')).get(
+                        'execution_protocol') == 'shared.v1' and not self.inspector.store.exists(
+                            self.inspector._path(identity, 'result')):
+                    result = self.inspector.call('inspect_artifacts', self._arguments(binding), identity,
+                        delivery_context=deepcopy(binding))
+                    return self._envelope(binding, identity, result)
                 result = self._verified(identity, binding)
                 return self._envelope(binding, identity, result)
             prior = self.observations
@@ -233,13 +320,13 @@ class DeliveryReview:
                 if not isinstance(candidate, dict) or candidate.get('binding') != binding:
                     continue
                 try:
-                    result = self._verified(candidate['identity'], binding, candidate)
+                    result = self._envelope_result(candidate, binding, record=observed.get('record'))
                 except _ERRORS:
                     # Historical source versions may have changed. This permits a
                     # fresh parent identity, never a replay of the historical one.
                     # Do not fall back to an even older pass of this same bundle.
                     break
-                if not self._result_issues(result, binding):
+                if result is not None and not self._result_issues(result, binding):
                     return self._envelope(binding, candidate['identity'], result)
                 # A fresh explicit delivery may complete unfinished investigation
                 # or reconsider required findings. No old call is replayed and
@@ -249,6 +336,8 @@ class DeliveryReview:
                 return None
             result = self.inspector.call('inspect_artifacts', self._arguments(binding), identity,
                                          delivery_context=deepcopy(binding))
+            if result.ok and result.data.get('inspection_pending') == identity:
+                return self._envelope(binding, identity, result)
             if not result.ok:
                 # Preserve the actual execution failure before attempting any
                 # acceptance-only final-receipt checks. No retry or replay.
@@ -274,7 +363,14 @@ class DeliveryReview:
                 candidate = (observed.get('metadata') or {}).get('delivery_review')
                 if not isinstance(candidate, dict) or candidate.get('binding') != binding:
                     continue
-                result = self._verified(candidate['identity'], binding, candidate)
+                if observed.get('review_record') is not None:
+                    resolved = self.resolve_observation(observed, review_record=observed['review_record'])
+                    candidate = (resolved.get('metadata') or {}).get('delivery_review')
+                    if self._pending_envelope(candidate):
+                        return ['Independent opinion record cannot be verified for this delivery']
+                result = self._envelope_result(candidate, binding, record=observed.get('record'))
+                if result is None:
+                    return ['Current delivery review is still pending']
                 return self._result_issues(result, binding)
             return [('Current delivery lacks a complete independent whole-delivery review'
                      if self.protocol == 'task.v3' else

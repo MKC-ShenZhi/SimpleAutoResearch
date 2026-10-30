@@ -52,7 +52,8 @@ class CheckpointResponseError(ValueError):
 
 
 def checkpoint_entries(ledger: Any, attempt_id: str, session_id: str, *,
-                       allow_bounded_unknown: bool = False, call_id: str | None = None) -> list:
+                       allow_bounded_unknown: bool = False, call_id: str | None = None,
+                       completed_retry: bool = False) -> list:
     """Recognize exact physical calls without changing their accounting.
 
     Default validation requires a settled response and never adopts unknown
@@ -65,6 +66,11 @@ def checkpoint_entries(ledger: Any, attempt_id: str, session_id: str, *,
     entries = [entry for entry in ledger.entries if entry.attempt_id == attempt_id
         and (entry.logical_call_id == logical_id
              or call_id is None and entry.purpose in MEMORY_PURPOSES)]
+    if completed_retry:
+        from simple_ar.core.budget import completed_llm_usage_is_accounted
+        if not completed_llm_usage_is_accounted(entry.to_dict() for entry in entries):
+            raise ValueError('Checkpoint retry has no fully accounted logical response')
+        allow_bounded_unknown = True  # The failed charge stays reserved, not settled or released.
     if not entries or not any(entry.status == 'settled'
             or allow_bounded_unknown and entry.status == 'unknown' for entry in entries):
         raise ValueError('Checkpoint has no settled response; reconcile before continuing')
@@ -102,12 +108,13 @@ def _bound_response(response: dict, view: dict, bind_notes: Any) -> list[dict]:
 
 
 def checkpoint_artifacts(*, store: Any, ledger: Any, attempt_id: str,
-                         session_id: str, bind_notes: Any, call_id: str | None = None) -> tuple:
+                         session_id: str, bind_notes: Any, call_id: str | None = None,
+                         completed_retry: bool = False) -> tuple:
     """Validate durable checkpoint records equally on normal commit and recovery."""
     paths = ('memory_input.json', 'memory_response.json', 'memory_snapshot.json', 'memory_failure.json')
     if not any(store.exists(path) for path in paths):
         return ()
-    checkpoint_entries(ledger, attempt_id, session_id, call_id=call_id)
+    checkpoint_entries(ledger, attempt_id, session_id, call_id=call_id, completed_retry=completed_retry)
     view = store.read_json('memory_input.json')
     digest = hashlib.sha256(json.dumps(view,ensure_ascii=False).encode()).hexdigest()
     supplied_through = max(row['turn'] for row in view['observations'])+1
@@ -172,7 +179,7 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
                  previous: dict, rows: list[dict], bind_notes: Any,
                  estimate_tokens: Any, attempt_id: str,
                  required_decision_tokens: int = 0, call_id: str | None = None,
-                 additional_protection: bool = False) -> tuple[dict | None, tuple]:
+                 additional_protection: bool = False, completed_retry: bool = False) -> tuple[dict | None, tuple]:
     """One bounded checkpoint when unrepresented history warrants compaction.
 
     ``rows`` are exact closed operation observations with journal positions.
@@ -298,7 +305,8 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
             check_llm_call_stop()
             response = checkpoint_client.ask_json(SYSTEM,text,
                 label='working-memory',budget_call_id=call_id or 'working-memory-'+attempt_id)
-            checkpoint_entries(client._budget_ledger,attempt_id,client._budget_session_id,call_id=call_id)
+            checkpoint_entries(client._budget_ledger,attempt_id,client._budget_session_id,call_id=call_id,
+                completed_retry=completed_retry)
             refs.append(store.write_json('memory_response.json',response,kind='working_memory_response'))
             bound = _bound_response(response,view,bind_notes)
             if not bound:
@@ -306,7 +314,8 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
         except (LLMResponseError, ValidationError, CheckpointResponseError) as exc:
             # A complete, accounted response may be unusable. Transport, budget,
             # binding and unknown/inflight failures deliberately escape this path.
-            checkpoint_entries(client._budget_ledger,attempt_id,client._budget_session_id,call_id=call_id)
+            checkpoint_entries(client._budget_ledger,attempt_id,client._budget_session_id,call_id=call_id,
+                completed_retry=completed_retry)
             refs.append(store.write_json('memory_failure.json',{
                 'schema_version':'working_memory_failure.v1',
                 'logical_call_id':call_id or 'working-memory-'+attempt_id,

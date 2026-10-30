@@ -6,6 +6,7 @@ stage selection for the migrated entry, rather than calling ResearchApplication.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import math
@@ -15,7 +16,7 @@ from types import SimpleNamespace
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from simple_ar.core.budget import BudgetLedger
+from simple_ar.core.budget import BudgetLedger, completed_llm_usage_is_accounted
 from simple_ar.core.working_context import history_view
 from simple_ar.core.capabilities import ArtifactRef, ArtifactStore, AttemptManifest, CapabilityContext, CapabilityRegistry, CapabilityResult
 from simple_ar.core.session import BudgetState, SessionController
@@ -64,6 +65,12 @@ _WORKING_CONTEXT_PROTOCOLS = {'working.v1', 'working.v2', 'working.v3', 'working
 _REFERENCED_CONTEXT_PROTOCOLS = {'working.v2', 'working.v3', 'working.v4'}
 _CONVERSATION_CONTEXT_PROTOCOLS = {'conversation.v1', *_WORKING_CONTEXT_PROTOCOLS}
 _CONTEXT_PROTOCOLS = {None, *_CONVERSATION_CONTEXT_PROTOCOLS}
+
+
+class _ActionSuspended(BaseException):
+    """Return control to the caller with the accepted action still pending."""
+
+
 _ADOPTING_OWNER_MODES = {_ADOPTING_OWNERS, _REQUEST_OWNER}
 _SHARED_OWNER_MODES = {_SHARED_OWNERS, *_ADOPTING_OWNER_MODES}
 _OWNER_MODES = {_OWNERS, *_SHARED_OWNER_MODES}
@@ -416,6 +423,7 @@ class ToolApplication:
         self._configure_tools()
         controller.registry.register("native_turn", self._model)
         controller.registry.register("native_tool", self._tool)
+        controller.registry.register("native_action", self._action)
 
     def _configure_operations(self) -> None:
         from simple_ar.app.operation_tools import OperationTools, PROTOCOL, PROFESSIONAL_CONTRACTS
@@ -480,10 +488,9 @@ class ToolApplication:
             for item in turn['tools']:
                 observed = self.session.store.read_json(item['result'])
                 if observed.get('status') == 'ok':
-                    # A journal entry can record useful production and a failed
-                    # independent review in the same native attempt. Projection
-                    # proves the record, not adoption or settled review usage;
-                    # those remain the relevant producer/review owner's gates.
+                    # Prove the original producer before projecting its record.
+                    # A separate review can reject delivery without changing
+                    # production identity or silently settling its charges.
                     accepted_native_result(self.session.store.root,self.session.manifest.session_id,
                         observed,Path(item['result']).parent.name,
                         ledger=None if self.operations is not None and self.operations.professional else self.ledger)
@@ -492,18 +499,20 @@ class ToolApplication:
                 result.append(self._operation_observation(observed, call, item['result'],
                     current_request=turn.get('request_count', 1) == len(self.state['requests']),
                     contract_current=spec is None or spec.domain not in active
-                        or id(turn) in active[spec.domain]))
+                        or id(turn) in active[spec.domain], review_record=item.get('review_result')))
         return result
 
     @staticmethod
     def _operation_observation(payload: dict, call: dict, record: str, *,
-                               current_request: bool = True, contract_current: bool = True) -> dict:
+                               current_request: bool = True, contract_current: bool = True,
+                               review_record: str | None = None) -> dict:
         try:
             arguments = json.loads(call['function']['arguments'])
         except (ValueError, TypeError):
             arguments = {}
         return {**payload, 'record':record, 'arguments':arguments,
-                'current_request':current_request, 'contract_current':contract_current}
+                'current_request':current_request, 'contract_current':contract_current,
+                **({'review_record':review_record} if review_record is not None else {})}
 
     def _configure_tools(self) -> None:
         controller = self.session
@@ -1158,7 +1167,7 @@ class ToolApplication:
                 result = self.session.store.read_json(item['result'])
                 rows.append({'turn':number,'record':record,
                     'arguments':self._recorded_arguments(calls[item['id']]),'result':self._coordination_result(result,record,
-                        delivery_feedback=None if journal else delivery_feedback),
+                        delivery_feedback=None if journal else delivery_feedback, review_record=item.get('review_result')),
                     **({'request_count':turn.get('request_count',1)} if journal else {})})
         from simple_ar.app.work_memory import compact_work
         _, refs = compact_work(store=context.store,client=client,requests=self.state['requests'],
@@ -1744,6 +1753,7 @@ class ToolApplication:
             delivery_files=delivery_files,
             extensions=extensions, creation_declarations=creation_declarations)
         config['inspection_protocol'] = 'subjects.v3'
+        config['inspection_execution_protocol'] = 'shared.v1'
         config['delivery_review_protocol'] = 'task.v3'
         from simple_ar.app.operation_tools import CURRENT_PROFESSIONAL_CONTRACT
         config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
@@ -1977,20 +1987,32 @@ class ToolApplication:
                 and table_alias in row['changes'].get('sources', {})), default=0)
         return [turn for turn in self.state['turns'] if turn.get('request_count', 1) >= start]
 
+    def _check_cancellation(self) -> None:
+        pending = self.state['pending']
+        if pending and pending.get('inspection'):
+            if any(attempt.status == 'running' for attempt in self.session.list_attempts()) or not completed_llm_usage_is_accounted(
+                    row.to_dict() for row in self.ledger.entries):
+                raise ValueError('Reconcile the active inspection operation and accounting before changing its request')
+        elif pending and any(attempt.attempt_id == pending['attempt'] for attempt in self.session.list_attempts()):
+            raise ValueError('Reconcile the started tool before changing its task')
+
     def _cancel_unstarted(self, reason: str) -> None:
         """Close only unstarted tool messages; keep completed observations intact."""
         pending = self.state['pending']
         queued = self.state['turns'] and self.state['turns'][-1]['remaining']
         if (pending and pending['kind'] == 'tool') or (pending is None and queued):
-            if pending and any(attempt.attempt_id == pending['attempt'] for attempt in self.session.list_attempts()):
-                raise ValueError('Reconcile the started tool before changing its task')
+            self._check_cancellation()
             turn = self.state['turns'][-1]
             cancellation = pending['attempt'] if pending else (
                 Path(turn['reply']).stem if turn.get('origin') in {'caller', 'professional'} else Path(turn['reply']).parent.name)
             for index, call in enumerate(turn['remaining']):
                 relative = f'tools/cancelled/{cancellation}-{index}.json'
                 self.session.store.write_json(relative, {'tool_name': call['function']['name'],
-                    'status': 'blocked', 'error': reason, 'data': {'executed': False}})
+                    'status': 'blocked', 'error': reason, 'data': {
+                        'executed': bool(pending and pending.get('inspection') and index == 0),
+                        **({'retained_inspection': pending['inspection'],
+                            'production_record': f"attempts/{pending['attempt']}/native_result.json"}
+                            if pending and pending.get('inspection') and index == 0 else {})}})
                 turn['tools'].append({'id': call['id'], 'result': relative})
             turn['remaining'] = []
             self.state['pending'] = None
@@ -2007,12 +2029,15 @@ class ToolApplication:
                 raise ValueError('Complete the retained caller supply before confirming execution')
             if not self.sources.policy.require_design:
                 raise ValueError('Save research_policy.require_design before declaring a caller protocol confirmation')
-            if any(row.status == 'running' for row in self.session.list_attempts()) or any(
-                    row.status in {'reserved', 'unknown'} for row in self.ledger.entries):
+            if any(row.status == 'running' for row in self.session.list_attempts()) or (
+                    not completed_llm_usage_is_accounted(row.to_dict() for row in self.ledger.entries)
+                    if self.state['config'].get('inspection_execution_protocol') == 'shared.v1' else any(
+                        row.status in {'reserved', 'unknown'} for row in self.ledger.entries)):
                 raise ValueError('Reconcile running or unknown work before proposing a protocol')
             pending = self.state['pending']
-            if pending and (pending['kind'] == 'model' or any(
-                    row.attempt_id == pending['attempt'] for row in self.session.list_attempts())):
+            active = pending.get('action') if pending and pending.get('inspection') else pending
+            if active and (active['kind'] == 'model' or any(
+                    row.attempt_id == active['attempt'] for row in self.session.list_attempts())):
                 raise ValueError('Reconcile the started operation before proposing a protocol')
             decision = self.sources.declare_execution_protocol()
             if self.sources.pending_decision() is not None:
@@ -2261,10 +2286,11 @@ class ToolApplication:
         self._save()
         return True
 
-    def _coordination_result(self, result: dict, record: str, *, delivery_feedback: dict | None = None) -> dict:
+    def _coordination_result(self, result: dict, record: str, *, delivery_feedback: dict | None = None,
+                             review_record: str | None = None) -> dict:
         """Owner-authored presentation; never mutate the canonical observation."""
         if self.operations is not None:
-            presented = workspace_observation_view(self.operations.coordination_result(result,record),record=record)
+            presented = workspace_observation_view(self.operations.coordination_result(result, record, review_record=review_record),record=record)
             if delivery_feedback is not None and delivery_feedback['record']==record:
                 return {**presented,'delivery_check':delivery_feedback}
             return presented
@@ -3192,7 +3218,8 @@ class ToolApplication:
                                                'request_count': current})
                 record = 'records/' + item['result'].removeprefix('attempts/') if item else None
                 presented = self._coordination_result(result, record,
-                    delivery_feedback=delivery_feedback if self.operations is not None else None) if item else result
+                    delivery_feedback=delivery_feedback if self.operations is not None else None,
+                    review_record=item.get('review_result') if item else None) if item else result
                 if item:
                     presented_results[call_id] = presented
                 indexed = self._history_observation(call, result, item['result'] if item else turn['reply'])
@@ -4511,103 +4538,146 @@ class ToolApplication:
             progress(data['summary'])
         return True
 
-    def _attempt(self, capability: str, pending: dict[str, Any]) -> str:
+    def _attempt(self, capability: str, pending: dict[str, Any], *,
+                 perform: Callable[[str], dict] | None = None) -> str:
         identity = pending["attempt"]
         relative = f"attempts/{identity}/native_result.json"
         existing = next((a for a in self.session.list_attempts() if a.attempt_id == identity), None)
         if existing is not None:
             store = ArtifactStore(self.session.store.root / "attempts" / identity)
             recovered = None
-            confirmed = False
-            if store.exists('capability_result.json'):
-                saved = store.read_json('capability_result.json')
-                result = CapabilityResult.from_dict(saved)
-                if result.provenance.get('recovery') == 'explicit_interruption':
-                    confirmed = (capability == existing.capability == 'native_tool'
-                        and pending.get('kind') == 'tool' and result.status == 'failed'
-                        and result.provenance.get('capability') == 'native_tool'
-                        and bool(saved.get('session_interruption_reason')))
-                    if not confirmed:
-                        raise RuntimeError('Saved interruption does not confirm this native tool failure; inspect before recovery')
-                elif (capability == existing.capability == 'native_tool' and existing.status == 'failed'
-                        and pending.get('kind') == 'tool' and result.status == 'failed'
-                        and result.provenance.get('capability') == 'native_tool'
-                        and not result.artifacts
-                        and all(ref.path == 'capability_result.json' for ref in existing.outputs)
-                        and not any(entry.attempt_id == identity and entry.status in {'reserved', 'unknown'}
-                            for entry in self.ledger.entries)):
-                    function = pending.get('call', {}).get('function', {})
-                    confirmed = self.gateway.can_observe_read_failure(
-                        ToolCall(tool_name=function.get('name', ''), trace_id=identity))
-            if not self.session.store.exists(relative):
-                call = pending.get("call", {})
-                if confirmed:
-                    # Core owns the confirmed failure and accounting. Only fill
-                    # the missing native observation; never replay or replace it.
-                    ref = self.workspace.locator(str(store.resolve('capability_result.json')))
-                    store.write_json('native_result.json', ToolResult(
-                        tool_name=call['function']['name'], status='error',
-                        error='; '.join(result.diagnostics) or saved.get('session_interruption_reason') or 'Recorded read-only tool failure',
-                        data={'status': result.status, 'diagnostics': list(result.diagnostics)},
-                        artifacts=[ref], metadata={'capability_result': ref,
-                            'provenance': dict(result.provenance)}).model_dump(mode='json'),
-                        kind='native_observation')
-                elif capability != "native_tool" or not self.gateway.can_reconcile(
-                        ToolCall(tool_name=call["function"]["name"], trace_id=identity)):
-                    raise RuntimeError("Interrupted operation has no durable result; inspect receipts before any replay")
-                else:
-                    recovered = self._tool(context=CapabilityContext(store, existing), call=call, recovering=True)
-            elif (capability == 'native_tool' and self.operations is not None
-                    and self.operations.delivery_review is not None
-                    and (produced := store.read_json('native_result.json')).get('status') == 'ok'
-                    and produced.get('metadata', {}).get('delivery_hashes') is not None
-                    and 'delivery_review' not in produced.get('metadata', {})
-                    and self._terminal_intent(pending['call'])
-                    and self._delivery(pending['call'], produced) is not None):
-                # The existing native observation already proves closed,
-                # byte-bound production. Rebind cached review without calling
-                # the producer again, including non-replayable file writes.
-                bound = self._bind_delivery(pending['call'], produced, store)
-                store.write_json('native_result.json', bound, kind='native_observation')
-                recovered = CapabilityResult(status='completed', artifacts=self._native_artifacts(
-                    store, bound, name=pending['call']['function']['name']))
-            elif (capability == 'native_tool'
-                    and store.read_json('native_result.json').get('metadata', {}).get('admission') == 'offered.v1'
-                    and store.read_json('native_result.json')['metadata'].get('dispatched') is False):
-                # This is an application refusal, not an owner execution to
-                # reconcile. Re-derive it from the frozen offer before adoption.
-                refusal = self._offered_tool_refusal(pending['call'])
-                if refusal is None or store.read_json('native_result.json') != refusal.model_dump(mode='json'):
-                    raise ValueError('Saved admission refusal disagrees with the frozen offered contract')
-            elif (capability == 'native_tool' and self.operations is not None and self.operations.work is not None
-                    and pending.get('call', {}).get('function', {}).get('name') in
-                        {'begin_professional_work', 'finish_professional_work'}
-                    and store.read_json('native_result.json').get('status') == 'ok'):
-                if not store.exists('professional_receipt.json'):
-                    raise ValueError('Professional work receipt is missing; no replay')
-                function = pending['call']['function']
-                retained = self.operations.work.call(function['name'], json.loads(function['arguments']), identity=identity)
-                if retained.model_dump(mode='json') != store.read_json('native_result.json'):
-                    raise ValueError('Professional work differs from its retained candidate or request; no replay')
-            elif not confirmed and (owner := self.gateway.session_owner(
-                    pending.get('call', {}).get('function', {}).get('name', ''))) is not None:
-                observed = owner.execute_tool(pending['call']['function']['name'], CapabilityContext(store, existing),
-                    json.loads(pending['call']['function']['arguments']),
-                    approval=pending.get('execution_approval') or pending.get('implementation_approval'))
-                if store.read_json('native_result.json') != self._bind_delivery(
-                        pending['call'], observed.model_dump(mode='json'), store):
-                    raise ValueError('Saved native observation disagrees with its retained domain result')
+            if existing.capability != capability:
+                raise ValueError('Accepted identity belongs to a different operation')
+            if capability == 'native_action':
+                header = {key: value for key, value in pending.items() if key != 'result'}
+                if not store.exists('action.json') or store.read_json('action.json') != header:
+                    raise ValueError('Retained operation differs from the accepted action; no replay')
+                if pending.get('result_sha256') is not None and store.exists('native_result.json'):
+                    actual = hashlib.sha256(json.dumps(store.read_json('native_result.json'),
+                        sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                    if actual != pending['result_sha256']:
+                        raise ValueError('Retained conclusion differs from its accepted bytes; no replay')
+                self._check_action_inputs(pending)
+                recovery = self._action_recovery(pending, perform)
+                if existing.status == 'failed' and store.exists('capability_result.json'):
+                    if recovery is None:
+                        raise RuntimeError('Failed action lacks a proven result; no replay')
+                    # Preserve the failed attempt and its unknown charges. A new
+                    # receipt records only retrieval from the original owner.
+                    recovered_action = {key: value for key, value in pending.items()
+                                        if key not in {'result', 'execution_approval'}}
+                    recovered_action.update(attempt=identity+'-receipt',
+                                            kind='opinion' if pending['kind']=='opinion' else 'receipt',
+                                            recovered_from=identity)
+                    return self._attempt(capability, recovered_action,
+                        perform=lambda _identity: recovery())
+                if not store.exists('native_result.json'):
+                    if recovery is None:
+                        raise RuntimeError('Interrupted operation has no proven closed receipt; no replay')
+                    recovered = self._action(context=CapabilityContext(store, existing),
+                        accepted=header, perform=lambda _identity: recovery())
+            else:
+                confirmed = False
+                if store.exists('capability_result.json'):
+                    saved = store.read_json('capability_result.json')
+                    result = CapabilityResult.from_dict(saved)
+                    if result.provenance.get('recovery') == 'explicit_interruption':
+                        confirmed = (capability == existing.capability == 'native_tool'
+                            and pending.get('kind') == 'tool' and result.status == 'failed'
+                            and result.provenance.get('capability') == 'native_tool'
+                            and bool(saved.get('session_interruption_reason')))
+                        if not confirmed:
+                            raise RuntimeError('Saved interruption does not confirm this native tool failure; inspect before recovery')
+                    elif (capability == existing.capability == 'native_tool' and existing.status == 'failed'
+                            and pending.get('kind') == 'tool' and result.status == 'failed'
+                            and result.provenance.get('capability') == 'native_tool'
+                            and not result.artifacts
+                            and all(ref.path == 'capability_result.json' for ref in existing.outputs)
+                            and not any(entry.attempt_id == identity and entry.status in {'reserved', 'unknown'}
+                                for entry in self.ledger.entries)):
+                        function = pending.get('call', {}).get('function', {})
+                        confirmed = self.gateway.can_observe_read_failure(
+                            ToolCall(tool_name=function.get('name', ''), trace_id=identity))
+                if not self.session.store.exists(relative):
+                    call = pending.get("call", {})
+                    if confirmed:
+                        # Core owns the confirmed failure and accounting. Only fill
+                        # the missing native observation; never replay or replace it.
+                        ref = self.workspace.locator(str(store.resolve('capability_result.json')))
+                        store.write_json('native_result.json', ToolResult(
+                            tool_name=call['function']['name'], status='error',
+                            error='; '.join(result.diagnostics) or saved.get('session_interruption_reason') or 'Recorded read-only tool failure',
+                            data={'status': result.status, 'diagnostics': list(result.diagnostics)},
+                            artifacts=[ref], metadata={'capability_result': ref,
+                                'provenance': dict(result.provenance)}).model_dump(mode='json'),
+                            kind='native_observation')
+                    elif capability != "native_tool" or not self.gateway.can_reconcile(
+                            ToolCall(tool_name=call["function"]["name"], trace_id=identity)):
+                        raise RuntimeError("Interrupted operation has no durable result; inspect receipts before any replay")
+                    else:
+                        recovered = self._tool(context=CapabilityContext(store, existing), call=call, recovering=True)
+                elif (capability == 'native_tool' and self.operations is not None
+                        and self.operations.delivery_review is not None
+                        and (produced := store.read_json('native_result.json')).get('status') == 'ok'
+                        and produced.get('metadata', {}).get('delivery_hashes') is not None
+                        and 'delivery_review' not in produced.get('metadata', {})
+                        and self._terminal_intent(pending['call'])
+                        and self._delivery(pending['call'], produced) is not None):
+                    # The existing native observation already proves closed,
+                    # byte-bound production. Rebind cached review without calling
+                    # the producer again, including non-replayable file writes.
+                    bound = self._bind_delivery(pending['call'], produced, store)
+                    store.write_json('native_result.json', bound, kind='native_observation')
+                    recovered = CapabilityResult(status='completed', artifacts=self._native_artifacts(
+                        store, bound, name=pending['call']['function']['name']))
+                elif (capability == 'native_tool'
+                        and store.read_json('native_result.json').get('metadata', {}).get('admission') == 'offered.v1'
+                        and store.read_json('native_result.json')['metadata'].get('dispatched') is False):
+                    # This is an application refusal, not an owner execution to
+                    # reconcile. Re-derive it from the frozen offer before adoption.
+                    refusal = self._offered_tool_refusal(pending['call'])
+                    if refusal is None or store.read_json('native_result.json') != refusal.model_dump(mode='json'):
+                        raise ValueError('Saved admission refusal disagrees with the frozen offered contract')
+                elif (capability == 'native_tool' and self.operations is not None and self.operations.work is not None
+                        and pending.get('call', {}).get('function', {}).get('name') in
+                            {'begin_professional_work', 'finish_professional_work'}
+                        and store.read_json('native_result.json').get('status') == 'ok'):
+                    if not store.exists('professional_receipt.json'):
+                        raise ValueError('Professional work receipt is missing; no replay')
+                    function = pending['call']['function']
+                    retained = self.operations.work.call(function['name'], json.loads(function['arguments']), identity=identity)
+                    if retained.model_dump(mode='json') != store.read_json('native_result.json'):
+                        raise ValueError('Professional work differs from its retained candidate or request; no replay')
+                elif not confirmed and (owner := self.gateway.session_owner(
+                        pending.get('call', {}).get('function', {}).get('name', ''))) is not None:
+                    observed = owner.execute_tool(pending['call']['function']['name'], CapabilityContext(store, existing),
+                        json.loads(pending['call']['function']['arguments']),
+                        approval=pending.get('execution_approval') or pending.get('implementation_approval'))
+                    if store.read_json('native_result.json') != self._bind_delivery(
+                            pending['call'], observed.model_dump(mode='json'), store):
+                        raise ValueError('Saved native observation disagrees with its retained domain result')
             if not store.exists("capability_result.json"):
-                store.write_capability_result(recovered or CapabilityResult(status="completed",
-                    artifacts=(*(self._memory_artifacts(store,identity) if capability == 'native_turn' else ()),
-                        *self._native_artifacts(store, store.read_json('native_result.json'),
+                refs = ((store.ref('action.json', kind='operation_binding'),
+                         store.ref('native_result.json', kind='native_observation'))
+                    if capability == 'native_action' else
+                    (*(self._memory_artifacts(store, identity) if capability == 'native_turn' else ()),
+                     *self._native_artifacts(store, store.read_json('native_result.json'),
                         name=pending.get('call', {}).get('function', {}).get('name', ''),
-                        kind='native_result' if capability == 'native_turn' else 'native_observation'))))
+                        kind='native_result' if capability == 'native_turn' else 'native_observation')))
+                store.write_capability_result(recovered or CapabilityResult(status='completed', artifacts=refs))
             self.session.reconcile_attempt(identity)
         else:
             try:
-                result = self.session.execute_attempt(capability, attempt_id=identity,
-                    **({"call": pending["call"]} if capability == "native_tool" else {}))
+                if capability == 'native_action':
+                    if (pending['kind'] in {'model', 'tool'} and not completed_llm_usage_is_accounted(
+                            row.to_dict() for row in self.ledger.entries)):
+                        raise RuntimeError('Unresolved physical accounting prevents new work')
+                    self._check_action_inputs(pending, before_execution=True)
+                    arguments = {'accepted': {key:value for key,value in pending.items() if key != 'result'},
+                                 'perform': perform}
+                else:
+                    arguments = {"call": pending["call"]} if capability == "native_tool" else {}
+                result = self.session.execute_attempt(capability, attempt_id=identity, **arguments)
             except LLMCallStopped:
                 # This stack has unwound after an observed caller stop; unlike
                 # a lost process, it is known not to dispatch further work.
@@ -4621,13 +4691,50 @@ class ToolApplication:
                 raise RuntimeError(f"Operation failed; inspect saved diagnostics: {detail}")
         return relative
 
+    def _check_action_inputs(self, pending: dict, *, before_execution: bool = False) -> None:
+        """One execution owner verifies the effective inputs it approved."""
+        approval = pending.get('execution_approval') or {}
+        binding = approval.get('binding')
+        call = pending.get('call') or {}
+        if not binding or call.get('function', {}).get('name') != 'run_process':
+            return
+        current = self.workspace.approval_binding(call)
+        if before_execution:
+            if current != binding:
+                raise ValueError('Approved operation inputs changed before execution')
+            return
+        # An output named in argv can appear after execution. It cannot change
+        # the pinned command/environment or any originally approved input.
+        if (any(current.get(key) != binding.get(key) for key in ('call', 'argv', 'environment'))
+                or any(current['files'].get(path) != digest for path,digest in binding['files'].items())):
+            raise ValueError('Approved operation inputs changed before receipt recovery')
+        if binding.get('artifacts') is not None:
+            self.workspace._check_process_inputs(binding['artifacts'], identity=pending['attempt'])
+
+    def _action_recovery(self, pending: dict, perform: Callable | None) -> Callable | None:
+        """Recover only an existing owner's closed receipt, never repeat its effect."""
+        if pending['kind'] in {'opinion', 'receipt'}:
+            return lambda: perform(pending['attempt'])
+        if pending['kind'] == 'model':
+            recovery = getattr(perform, 'recover', None)
+            return (lambda: recovery(pending['attempt'])) if recovery is not None else None
+        call = pending.get('call') or {}
+        name = call.get('function', {}).get('name', '')
+        if self.gateway.can_reconcile(ToolCall(tool_name=name, trace_id=pending['attempt'])):
+            return lambda: perform(pending['attempt'])
+        return None
+
+    def _active_action(self) -> dict:
+        pending = self.state.get('pending') or {}
+        return pending.get('action') or pending
+
     def _owner_execution_binding(self, call: dict[str, Any]) -> dict[str, Any]:
         name = call['function']['name']
         owner = self.gateway.session_owner(name)
         binding = owner.approval_binding(json.loads(call['function']['arguments']),
-            identity=self.state['pending']['attempt'],
+            identity=self._active_action()['attempt'],
             **({'for_preparation': True} if name == 'prepare_code_task' else {}))
-        pending = self.state['pending']
+        pending = self._active_action()
         retained = pending.get('execution_approval') or pending.get('implementation_approval')
         if (name == 'execute_implementation' and pending.get('call') == call
                 and retained and 'binding' in retained
@@ -4702,7 +4809,8 @@ class ToolApplication:
         """Prove local operation closure, not provider usage or output validity."""
         from simple_ar.app.work_memory import MEMORY_PURPOSES
         if self.state['config'].get('memory_protocol') == 'journal.v1' and entry.purpose in MEMORY_PURPOSES:
-            return self._retained_checkpoint_charge(entry)
+            if self._retained_checkpoint_charge(entry):
+                return True
         if (entry.status != 'unknown' or entry.session_id != self.session.manifest.session_id
                 or not entry.logical_call_id
                 or set(entry.reserved) != {'llm_requests', 'total_tokens'}
@@ -4720,6 +4828,14 @@ class ToolApplication:
             return (self._accepted_model_attempt(entry.attempt_id) is not None
                 or self._failed_model_attempt({'kind':'model','attempt':entry.attempt_id},
                     current_only=False) is not None)
+        if attempt.capability == 'native_action':
+            store = ArtifactStore(self.session.store.root / 'attempts' / entry.attempt_id)
+            if (attempt.status != 'completed' or not store.exists('capability_result.json')
+                    or not completed_llm_usage_is_accounted(row.to_dict() for row in self.ledger.entries
+                        if row.attempt_id == entry.attempt_id)):
+                return False
+            result = store.read_capability_result()
+            return result.status == 'completed' and all(store.require(ref).exists() for ref in result.artifacts)
         if attempt.capability != 'native_tool':
             return False
         relative = f'attempts/{entry.attempt_id}/native_result.json'
@@ -4759,6 +4875,8 @@ class ToolApplication:
                     continue  # Explicit new authority never settles the old liability.
                 raise ValueError('Reconcile in-flight or unknown operations before authorizing resources')
             attempt = attempts.get(entry.attempt_id)
+            if attempt is not None and attempt.capability == 'native_action' and self._closed_llm_charge(entry):
+                continue
             # An explicit new allowance is not reconciliation or a replay.
             # Closed text calls may retain their finite worst-case charge in
             # the original epoch. Unconfirmed side effects and unbounded
@@ -5111,11 +5229,14 @@ class ToolApplication:
                         or resource_allowances or authorization_id or authorization_reason):
                     raise ValueError('Confirm a design separately from feedback, retries or new access/resources')
                 pending = self.state['pending']
-                if pending and (pending['kind'] == 'model' or any(
-                        attempt.attempt_id == pending['attempt'] for attempt in self.session.list_attempts())):
+                active = pending.get('action') if pending and pending.get('inspection') else pending
+                if active and (active['kind'] == 'model' or any(
+                        attempt.attempt_id == active['attempt'] for attempt in self.session.list_attempts())):
                     raise ValueError('Reconcile the started operation before recording a design decision')
                 if decision.get('decision_guidance') and decision.get('decision_response') != 'revise':
                     raise ValueError('Design guidance requires a revise response, not implicit conditional acceptance')
+                if decision.get('decision_response') in {'reject', 'revise'}:
+                    self._check_cancellation()
                 awaiting = self.sources.pending_decision()
                 response = self.sources.respond_decision(**decision)
                 if response.get('proposal_kind') == 'caller_execution_protocol':
@@ -5201,7 +5322,8 @@ class ToolApplication:
                             if not completed_outcome and not self._professional_stop_can_resume(retained):
                                 return self.result_snapshot()
                     attempts = self.session.list_attempts()
-                    if pending is None or not any(a.attempt_id == pending['attempt'] and a.status == 'running' for a in attempts):
+                    active = pending.get('action') if pending and pending.get('inspection') else pending
+                    if active is None or not any(a.attempt_id == active['attempt'] and a.status == 'running' for a in attempts):
                         self.session.continue_with_revision('Resume pending work without resetting its budget')
                 with llm_call_stop_scope(should_stop):
                     self._run(approved_execution, approve, progress, should_stop)
@@ -5217,6 +5339,139 @@ class ToolApplication:
                 self.session.manifest.status_reason = f"{type(exc).__name__}: {exc}"
                 self._save()
             return self.result_snapshot()
+
+    def _approve_action(self, pending: dict, approved_execution: str, approve: Any,
+                        progress: Callable[[str], None], *, scoped: bool = False) -> bool:
+        """One protocol and exact-approval boundary for accepted process actions."""
+        check_llm_call_stop()
+        call = pending['call']
+        name = call['function']['name']
+        spec = self.gateway.registry.get(name)
+        if (spec is not None and spec.permission_level == 'execution'
+                and (decision := self.sources.pending_decision())
+                and (decision.get('proposal_kind') == 'caller_execution_protocol' or name != 'prepare_code_task')):
+            self.session.pause('Protocol requires an explicit bound user decision before process approval')
+            progress('Pending protocol decision: ' + json.dumps(decision, ensure_ascii=False))
+            return False
+        if (self.state['config']['allow_execution'] and spec is not None
+                and spec.permission_level == 'execution' and self.gateway.policy.is_allowed(spec)[0]
+                and (scoped or not self._offered_tool_error(call) and not self._terminal_error(call))):
+            try:
+                token = self.approval_token(call)
+            except (ValueError, TypeError, KeyError, OSError):
+                token = None  # The ordinary validator returns the invalid proposal, without execution.
+            started = self.gateway.has_started(ToolCall(tool_name=name, trace_id=pending['attempt']))
+            if token is not None and not started and approved_execution != token and not (approve and approve(call, token)):
+                self.session.pause(f'Process requires explicit approval; token={token}')
+                progress(f"Pending command: {call['function']['arguments']}\nApproval token: {token}")
+                if name in {'prepare_code_task', 'implement_code_task'}:
+                    progress('Frozen CodeTask contract: ' + json.dumps(self.implementation.exact.model_dump(), ensure_ascii=False))
+                return False
+            check_llm_call_stop()
+            if token is not None and not started:
+                if token != self.approval_token(call):
+                    raise ValueError('Execution inputs changed during approval; approve the current identity')
+                approval = {'token': token}
+                if self.gateway.session_owner(name) is not None:
+                    approval['binding'] = self._owner_execution_binding(call)
+                elif name == 'run_process':
+                    approval['binding'] = self.workspace.approval_binding(call)
+                pending['execution_approval'] = approval
+                self._save()
+        return True
+
+    def _action(self, *, context: CapabilityContext, accepted: dict,
+                perform: Callable[[str], dict]) -> CapabilityResult:
+        """Run one accepted operation; its origin supplies work, not lifecycle control."""
+        ref = context.store.write_json('action.json', accepted, kind='operation_binding')
+        try:
+            observed = perform(context.attempt.attempt_id)
+        except LLMCallStopped:
+            if any(row.attempt_id == context.attempt.attempt_id for row in self.ledger.entries):
+                raise
+            observed = ToolResult(tool_name='native_action', status='blocked',
+                error='Caller stopped before provider dispatch; no independent opinion was produced',
+                metadata={'stopped_before_dispatch': True}).model_dump(mode='json')
+        if accepted.get('result_sha256') is not None and accepted['result_sha256'] != hashlib.sha256(
+                json.dumps(observed, sort_keys=True, ensure_ascii=False).encode()).hexdigest():
+            raise ValueError('Operation result differs from its accepted conclusion')
+        raw = context.store.write_json('native_result.json', observed, kind='native_observation')
+        return CapabilityResult(status='completed', artifacts=(ref, raw))
+
+    def _inspection_dispatch(self, scope: str, kind: str, position: str, call: dict | None,
+                             perform: Callable[[str], dict], approved_execution: str,
+                             approve: Any, progress: Callable[[str], None]) -> dict:
+        """Translate a professional proposal into the common accepted-action path."""
+        origin = {'scope': scope, 'position': position, 'kind': kind}
+        identity = 'native-action-' + hashlib.sha256(json.dumps(origin,
+            sort_keys=True).encode()).hexdigest()[:40]
+        parent = self.state['pending']
+        action = {'attempt': identity, 'kind': kind, 'origin': origin,
+                  **({'call': deepcopy(call)} if call is not None else {})}
+        if kind == 'opinion':
+            expected = perform(identity)  # Pure, already-completed professional conclusion.
+            action['result_sha256'] = hashlib.sha256(json.dumps(expected,
+                sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        retained = parent.get('action')
+        if retained is not None and retained.get('origin') == origin:
+            if any(retained.get(key) != value for key, value in action.items()):
+                raise ValueError('Accepted operation differs from its retained proposal; no replay')
+            action = retained
+        else:
+            if retained is not None and not retained.get('result'):
+                raise ValueError('An accepted action still needs its actual result; no replacement')
+            parent['action'] = action
+            self._save()
+        if not action.get('result'):
+            if kind == 'tool' and not self._approve_action(action, approved_execution,
+                    approve, progress, scoped=True):
+                raise _ActionSuspended()
+            progress(f'Independent {kind} — {identity}')
+        fresh = not any(row.attempt_id == identity for row in self.session.list_attempts())
+        relative = self._attempt('native_action', action, perform=perform)
+        action['result'] = relative
+        self._save()  # Retained until the professional journal acknowledges this receipt.
+        observed = self.session.store.read_json(relative)
+        if fresh and observed.get('metadata', {}).get('stopped_before_dispatch'):
+            raise LLMCallStopped()
+        return {'result': observed, 'attempt': identity, 'record': relative,
+                'execution_binding': (action.get('execution_approval') or {}).get('binding')}
+
+    def _advance_inspection(self, pending: dict, approved_execution: str,
+                            approve: Any, progress: Callable[[str], None]) -> str | None:
+        scope = pending['inspection']
+        dispatch = lambda kind, position, call, perform: self._inspection_dispatch(
+            scope, kind, position, call, perform, approved_execution, approve, progress)
+        try:
+            direct = pending['call']['function']['name'] == 'inspect_artifacts'
+            floor = ({} if direct and (self._terminal_batch() or self._caller_takeover())
+                else self._completion_floor(self._client(scope), dispatch=True))
+            with self.ledger.protect_remaining(floor):
+                final = self.operations.inspection.advance(scope, dispatch)
+            opinion = dispatch('opinion', 'final-opinion', None,
+                lambda _identity: final.model_dump(mode='json'))
+            if opinion['result'] != final.model_dump(mode='json'):
+                raise ValueError('Accepted opinion differs from its independent owner result')
+            if direct:
+                relative = opinion['record']
+            else:
+                # Two real observations: original production and independent
+                # opinion. Neither changes the other's identity or bytes.
+                pending['review_result'] = opinion['record']
+                relative = f"attempts/{pending['attempt']}/native_result.json"
+            pending.pop('action', None)
+            self._save()
+            return relative
+        except _ActionSuspended:
+            return None
+
+    @staticmethod
+    def _pending_inspection(observed: dict) -> str | None:
+        if observed.get('status') != 'ok':
+            return None
+        direct = (observed.get('data') or {}).get('inspection_pending')
+        review = ((observed.get('metadata') or {}).get('delivery_review') or {}).get('result') or {}
+        return direct or (review.get('data') or {}).get('inspection_pending')
 
     def _run(self, approved_execution: str, approve: Any, progress: Callable[[str], None],
              should_stop: Callable[[], bool] | None = None) -> None:
@@ -5320,45 +5575,23 @@ class ToolApplication:
                 continue
             call = pending["call"]
             name = call["function"]["name"]
-            spec = self.gateway.registry.get(name)
-            if (spec is not None and spec.permission_level == 'execution'
-                    and (decision := self.sources.pending_decision())
-                    and (decision.get('proposal_kind') == 'caller_execution_protocol' or name != 'prepare_code_task')):
-                self.session.pause('Protocol requires an explicit bound user decision before process approval')
-                progress('Pending protocol decision: ' + json.dumps(decision, ensure_ascii=False))
+            if not pending.get('inspection') and not self._approve_action(pending, approved_execution, approve, progress):
                 return
-            if (self.state["config"]["allow_execution"]
-                    and (spec := self.gateway.registry.get(name)) is not None and spec.permission_level == 'execution'
-                    and self.gateway.policy.is_allowed(spec)[0]
-                    and not self._offered_tool_error(call)
-                    and not self._terminal_error(call)):
-                try:
-                    token = self.approval_token(call)
-                except (ValueError, TypeError, KeyError, OSError):
-                    # Invalid proposals must reach the existing tool validator
-                    # as observations, not halt the task before it can correct
-                    # its inputs, including unavailable source receipts. They
-                    # cannot authorize execution.
-                    token = None
-                started = self.gateway.has_started(ToolCall(tool_name=name, trace_id=pending["attempt"]))
-                if token is not None and not started and approved_execution != token and not (approve and approve(call, token)):
-                    self.session.pause(f"Process requires explicit approval; token={token}")
-                    progress(f"Pending command: {call['function']['arguments']}\nApproval token: {token}")
-                    if name in {'prepare_code_task', 'implement_code_task'}:
-                        progress('Frozen CodeTask contract: ' + json.dumps(self.implementation.exact.model_dump(), ensure_ascii=False))
-                    return
-                if token is not None and not started:
-                    if token != self.approval_token(call):
-                        raise ValueError('Execution inputs changed during approval; approve the current identity')
-                    approval = {'token': token}
-                    if self.gateway.session_owner(name) is not None:
-                        approval['binding'] = self._owner_execution_binding(call)
-                    pending['execution_approval'] = approval
-                    self._save()
             progress(f"Tool {name} — {pending['attempt']}")
-            relative = self._attempt("native_tool", pending)
+            if pending.get('inspection'):
+                relative = self._advance_inspection(pending, approved_execution, approve, progress)
+                if relative is None:
+                    return
+            else:
+                relative = self._attempt("native_tool", pending)
+                observed = self.session.store.read_json(relative)
+                if scope := self._pending_inspection(observed):
+                    pending['inspection'] = scope
+                    self._save()
+                    continue
             turn = self.state["turns"][-1]
-            turn["tools"].append({"id": call["id"], "result": relative})
+            turn["tools"].append({"id": call["id"], "result": relative,
+                **({"review_result":pending["review_result"]} if pending.get("review_result") else {})})
             turn["remaining"].pop(0)
             self.state["pending"] = None
             self._save()
