@@ -434,6 +434,10 @@ class ToolApplication:
             raise ValueError('Unsupported saved operation context; no silent migration')
         if config.get('memory_protocol') not in {None, 'journal.v1'}:
             raise ValueError('Unsupported saved working memory; no silent migration')
+        if config.get('context_checkpoint_policy') not in {None, 'economic.v1'}:
+            raise ValueError('Unsupported saved context checkpoint policy')
+        if config.get('context_checkpoint_policy') and config.get('memory_protocol') != 'journal.v1':
+            raise ValueError('Economic checkpointing requires journal continuity')
         if config.get('memory_protocol') and (config.get('context_protocol') != 'working.v4'
                 or config.get('professional_operations') != 'work.v5'):
             raise ValueError('Journal continuity requires the saved shared native work context')
@@ -1761,6 +1765,7 @@ class ToolApplication:
             config['context_protocol'] = context_protocol
         if automatic_memory:
             config['memory_protocol'] = 'journal.v1'
+            config['context_checkpoint_policy'] = 'economic.v1'
         session = SessionController.create(root, session_id=root.name, topic=goal,
             registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6))
         session.manifest.transition_recipe = cls.RECIPE
@@ -1925,6 +1930,7 @@ class ToolApplication:
             # absent unless explicitly supplied, including unrelated supplies.
             for field in ('completion_policy', 'tool_contracts', 'report_protocol', 'tool_completions', 'inspection_protocol',
                           'delivery_review_protocol', 'publication_assets', 'professional_operations', 'memory_protocol',
+                          'context_checkpoint_policy',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
                     if field in old:
@@ -3434,6 +3440,8 @@ class ToolApplication:
                 estimate_tokens=estimate_tokens,work_notes=work_notes,
                 require_work_notes=config.get('memory_protocol') == 'journal.v1',
                 fit_work_notes=config.get('memory_protocol') == 'journal.v1',
+                economical_checkpoint=config.get('context_checkpoint_policy') == 'economic.v1',
+                economical_after_turn=memory.get('attempted_through_turn', 0),
                 summarized_through_turn=memory['through_turn'],
                 selected_records=selected_records,current_artifacts=sorted(current_artifacts),version_resolver=version,
                 block_request_counts=[turn.get('request_count',1) for turn in turns],

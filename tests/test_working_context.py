@@ -602,6 +602,34 @@ class RetainedWorkingContextTests(unittest.TestCase):
         self.assertLessEqual(budget['estimated_input_tokens'], 32000)
         self.assertFalse(budget['compaction_needed'])
 
+        # A larger model window does not justify replaying growing old work
+        # indefinitely. Propose a checkpoint only when repeated history is
+        # more costly than the mandatory current input; retain it verbatim
+        # until a real, usable journal checkpoint is adopted.
+        old = [block(0, 'Earlier observation ' * 700), block(1, 'Another observation ' * 700)]
+        current = block(2, 'Current decision')
+        options = dict(material_policy='retained', require_work_notes=True, fit_work_notes=True,
+            processed_turns=[], turn_blocks=[*old, current], context_token_target=100000)
+        legacy, legacy_budget = select(**options)
+        proposed, budget = select(**options, economical_checkpoint=True)
+        self.assertFalse(legacy_budget['compaction_needed'])
+        self.assertTrue(budget['compaction_needed'])
+        self.assertEqual(budget['compaction_turns'], [0])
+        self.assertEqual([m for m in proposed if m['role'] in {'assistant', 'tool'}], old[0] + old[1] + current)
+        compacted, compacted_budget = select(**{**options, 'processed_turns':[0]},
+            economical_checkpoint=True, work_notes=[{'text':'Earlier work; originals remain in the journal.',
+                'records':[], 'current':True}])
+        self.assertEqual(compacted_budget['selected_turns'], [1, 2])
+        self.assertLess(compacted_budget['estimated_input_tokens'], budget['estimated_input_tokens'])
+        self.assertIn('Current decision', json.dumps(compacted))
+        self.assertEqual(legacy_budget['selected_turns'], [0, 1, 2])
+        _, after_failure = select(**options, economical_checkpoint=True, economical_after_turn=1)
+        self.assertFalse(after_failure['compaction_needed'])
+        future = {**options, 'turn_blocks':[*old, current, block(3, 'Later decision')]}
+        _, after_new_work = select(**future, economical_checkpoint=True, economical_after_turn=1)
+        self.assertTrue(after_new_work['compaction_needed'])
+        self.assertEqual(after_new_work['compaction_turns'], [0, 1])
+
     def test_journal_current_references_and_results_precede_native_without_a_snapshot(self):
         current = observation(0, 'Current original. ' * 100, path='outputs/current.txt',
             role='historical_observation')

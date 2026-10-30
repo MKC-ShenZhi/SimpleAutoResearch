@@ -1681,7 +1681,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.decisions.append(_action('read_file',path='measurements/'+name))
         self.decisions.append(_action('ask_user',question='Which interpretation should be emphasized?'))
 
-    def test_large_journal_window_supplies_complete_results_without_buying_summaries(self):
+    def test_large_journal_keeps_recent_source_when_economical_checkpointing(self):
         self._queue_checkpoint_history(context_protocol='auto', initial_notes=False,
             context_input_tokens=128000, output_tokens=65536)
         complete = 'Complete large observed result. ' * 3000
@@ -1693,10 +1693,17 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self._ok('read_file')['data']['text'], complete)
         self.assertFalse(self.memory_views)
         self.assertFalse(any(entry.purpose.startswith('working-memory') for entry in self.app.ledger.entries))
-        messages = self.app._messages()
+        selection = {}
+        messages = self.app._messages(working_selection=selection)
         self.assertIn(complete, json.dumps(messages))
         context = json.loads(messages[1]['content'])
-        self.assertFalse(context['working_context']['compaction_needed'])
+        # Repeated older work can be marked for a later checkpoint without
+        # buying one now or compacting the large source just read.
+        large_turn = next(index for index, turn in enumerate(self.app.state['turns'])
+            if any(self.app.session.store.read_json(item['result']).get('data', {}).get('absolute_path')
+                   == str(self.inputs/'large-result.txt') for item in turn['tools']))
+        self.assertTrue(context['working_context']['compaction_needed'])
+        self.assertNotIn(large_turn, selection['compaction_turns'])
         self.assertLessEqual(context['working_context']['estimated_input_tokens'], 128000)
         self.assertTrue(all(call.args[1].get('max_tokens') == 65536 for call in self.send.call_args_list))
         calls, ledger = self.send.call_count, self.app.ledger.to_dict()
@@ -1704,6 +1711,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertIn(complete, json.dumps(self.app._messages()))
         self.assertEqual(self.send.call_count, calls)
         self.assertEqual(self.app.ledger.to_dict(), ledger)
+        # On continuation, the shared checkpoint may compact older work, but
+        # the newly read large source still reaches the next real decision.
+        self.decisions.append(_action('ask_user', question='Which result should be emphasized?'))
+        self._run(feedback='Continue using the large observation')
+        self.assertEqual(len(self.memory_views), 1)
+        self.assertIn(complete, json.dumps(self.app._messages()))
 
     def _assert_journal_note_supply(self, memory):
         client = self.app._client()
@@ -1765,6 +1778,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.app.supply(supply_id='additional-source', reason='Expose another authorized material alias',
             changes={'sources':{'extra':self.inputs}})
         self.assertEqual(self.app.state['config']['memory_protocol'], 'journal.v1')
+        self.assertEqual(self.app.state['config']['context_checkpoint_policy'], 'economic.v1')
         self._submit(_action('update_work_plan',steps=[{'step':'Continue from existing observations','status':'pending'}]))
         self.assertEqual(self.app._working_memory()['notes'], memory['notes'])
         self._submit(_action('update_work_plan',notes=[{'text':'Explicitly revised working understanding','records':[]}]))

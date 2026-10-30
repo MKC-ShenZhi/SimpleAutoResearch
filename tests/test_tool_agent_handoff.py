@@ -200,6 +200,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     terms = historical.supply(supply_id='keep-history', reason='Grant access only',
                         changes={'allow_execution': True})
                     restored = ToolApplication.load(historical.session.store.root)
+                    self.assertNotIn('context_checkpoint_policy', restored.state['config'])
                     for retained in (terms['previous_config'], restored.state['config']):
                         if policy is None:
                             self.assertNotIn('completion_policy', retained)

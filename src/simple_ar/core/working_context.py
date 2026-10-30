@@ -76,6 +76,8 @@ def select_working_context(
     require_work_notes: bool = False,
     fit_work_notes: bool = False,
     processed_turns: Sequence[int] | None = None,
+    economical_checkpoint: bool = False,
+    economical_after_turn: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -127,9 +129,15 @@ def select_working_context(
     have already been supplied to a successful checkpoint, not verified or fully
     represented by its notes. With usable supplied notes their closed prefix
     may become navigable history. Explicit/current originals remain selectable.
+    ``economical_checkpoint`` requests optional journal compaction when repeated
+    older work outweighs mandatory input, without shrinking the model window.
+    The saved failure boundary prevents re-buying a failed summary for little
+    new work; originals remain available if no usable checkpoint is adopted.
     """
     if schema_tokens < 0 or context_token_target < 0:
         raise ValueError('Token costs and target must be nonnegative')
+    if type(economical_after_turn) is not int or economical_after_turn < 0:
+        raise ValueError('Invalid economical checkpoint history boundary')
     if material_policy not in ('ranked', 'referenced', 'scoped', 'retained'):
         raise ValueError('Unknown working context selection policy')
     scoped_records = material_policy == 'scoped'
@@ -208,6 +216,7 @@ def select_working_context(
 
     blocks = [[message for message in block if not is_request(message)] for block in blocks]
     capacity_omitted: set[int] = set()
+    economical_history: set[int] = set()
     processed = set(processed_turns or ())
     journal_selection = processed_turns is not None
     if journal_selection and not fit_work_notes:
@@ -439,7 +448,8 @@ def select_working_context(
             context['working_context'] = {'latest_atomic_turn':latest,
                 'recent_start_turn':view['history']['recent_start_turn'],
                 'estimated_input_tokens':cost,'context_exceeds_input_target':cost>context_token_target,
-                **({'compaction_needed':bool(capacity_omitted - processed)} if fit_work_notes else {})}
+                **({'compaction_needed':bool((capacity_omitted | economical_history) - processed)}
+                   if fit_work_notes else {})}
             if 'resources' in context:
                 context['resources'].update(approximate_next_input_tokens=cost,
                     context_exceeds_input_target=cost>context_token_target)
@@ -650,6 +660,21 @@ def select_working_context(
                 state['status'] = 'not_requested'
     if required_cost > context_token_target:
         capacity_omitted.clear()  # Old-history compaction cannot fix required-input overflow.
+    if economical_checkpoint and journal_selection and latest is not None and required_cost <= context_token_target:
+        # Do not cap material to a fraction of the model window. A checkpoint
+        # becomes worthwhile when replayed, unprocessed history outweighs the
+        # actual mandatory input and has already survived more than one turn.
+        # Until a checkpoint succeeds, the original native blocks remain intact.
+        # Keep the immediately preceding action together with the current
+        # action: it may have just supplied a large source for the next step.
+        previous = [i for i in recent if i != latest]
+        repeated = [i for i in previous[:-1] if i not in processed]
+        # After a settled unusable checkpoint, count only newly repeated work:
+        # a tiny new action must not buy the same failed summary each turn.
+        new_work = [i for i in repeated if i >= economical_after_turn]
+        replay_cost = estimate_tokens(dump([message for i in new_work for message in blocks[i]]))
+        if repeated and replay_cost > required_cost:
+            economical_history.update(repeated)
     # Once an unprocessed closed turn actually falls out of the window,
     # checkpoint the other closed unsummarized turns as one bounded batch too.
     # Otherwise each subsequent turn can evict one more block and force a
@@ -657,7 +682,7 @@ def select_working_context(
     # checkpoint owner still limits each batch to its real input budget.
     compaction_turns = ([i for i, block in enumerate(blocks)
         if block and i != latest and i not in processed]
-        if capacity_omitted - processed else [])
+        if capacity_omitted - processed else sorted(economical_history - processed))
     messages, cost = project()
     selected = [state for state in states if state['status'] in {'native', 'working_view'}]
     omitted = [state for state in states if state['status'] not in {'native', 'working_view'}]
