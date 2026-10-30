@@ -456,7 +456,8 @@ class ResultAnalysisTests(unittest.TestCase):
         )
         client = FakeAnalysisClient(
             {
-                "summary": {"method": "Measured", "results": "The experiment is successful."},
+                "summary": {"method": "Measured", "results": "The experiment is successful.",
+                            "limitations": "Only one run was provided."},
                 "claims": [
                     {
                         "claim_id": "c1",
@@ -483,6 +484,8 @@ class ResultAnalysisTests(unittest.TestCase):
             self.assertIn("**not_evaluated** `c1`", report)
             self.assertNotIn("**supported** `c1`", report)
             self.assertNotIn("\nThe experiment is successful.\n", report)
+            self.assertIn("Only one run was provided.", report)
+            self.assertIn("results narrative was not adopted", report)
             self.assertEqual(json.loads((out / "analysis_response.json").read_text(encoding="utf-8")), client.payload)
 
         # The deterministic path uses the same audited claims, without changing
@@ -505,6 +508,42 @@ class ResultAnalysisTests(unittest.TestCase):
         result = run_result_analysis(context, client=FakeAnalysisClient(grounded), use_llm=True)
         self.assertEqual(result.claims[0].verdict, "supported")
         self.assertIn("The recorded rmse is 0.42.", result.readme_markdown)
+        mixed = {"claims": [{"claim_id": "c3", "claim": "Observed rmse", "verdict": "supported",
+                             "metric_refs": ["rmse", "invented:row"]}]}
+        result = run_result_analysis(context, client=FakeAnalysisClient(mixed), use_llm=True)
+        self.assertEqual(result.claims[0].verdict, "supported")
+        self.assertIn("invented:row", " ".join(result.claims[0].limitations))
+        for verdict in ("supported", "unsupported"):
+            ungrounded = {"claims": [{"claim_id": "c4", "claim": "A comparison", "verdict": verdict,
+                                      "evidence": ["An invented source says so."]}]}
+            result = run_result_analysis(context, client=FakeAnalysisClient(ungrounded), use_llm=True)
+            self.assertEqual(result.claims[0].verdict, "not_evaluated")
+            self.assertIn("c4", result.audit.downgraded_claims)
+        cited = {"claims": [{"claim_id": "c5", "claim": "A recorded statement", "verdict": "supported",
+                              "evidence": [{"quote": "The supplied text."}]}]}
+        result = run_result_analysis(context.model_copy(update={"existing_writeup": "The supplied text."}),
+            client=FakeAnalysisClient(cited), use_llm=True)
+        self.assertEqual(result.claims[0].verdict, "supported")
+        invalid = {"claims": [{"claim_id": "c6", "claim": "Observed value", "verdict": "supported",
+                                "metric_refs": ["score"]}]}
+        result = run_result_analysis(AnalysisContext(metrics={"score": float("nan")}),
+            client=FakeAnalysisClient(invalid), use_llm=True)
+        self.assertEqual(result.claims[0].verdict, "not_evaluated")
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "observed.txt").write_text("input", encoding="utf-8")
+            sources = context.model_copy(update={"run_dir": tmp,
+                "artifacts": {"observed": "observed.txt", "missing": "missing.txt"}})
+            for source, expected in (("observed", "supported"), ("missing", "not_evaluated")):
+                response = {"claims": [{"claim_id": "c7", "claim": "Recorded input", "verdict": "supported",
+                                        "evidence": [{"source": source}]}]}
+                result = run_result_analysis(sources, client=FakeAnalysisClient(response), use_llm=True)
+                self.assertEqual(result.claims[0].verdict, expected)
+        rows = [{"dataset": f"d{i}", "condition": "model", "rmse_mean": float(i)} for i in range(250)]
+        long_context = context.model_copy(update={"project_results": {"aggregates": rows}})
+        response = {"claims": [{"claim_id": "c8", "claim": "Recorded row", "verdict": "supported",
+                                "metric_refs": ["rmse:d249:model"]}]}
+        result = run_result_analysis(long_context, client=FakeAnalysisClient(response), use_llm=True)
+        self.assertEqual(result.claims[0].verdict, "supported")
 
     def test_writes_analysis_artifacts(self) -> None:
         context = AnalysisContext(
@@ -584,7 +623,9 @@ class ResultAnalysisTests(unittest.TestCase):
 
         result = run_result_analysis(context, client=client, use_llm=True)
 
-        self.assertEqual(result.claims[0].verdict, "unsupported")
+        # The model's dataset/condition reference does not exist in the input;
+        # an invented reference cannot establish even a negative verdict.
+        self.assertEqual(result.claims[0].verdict, "not_evaluated")
         self.assertEqual(result.claims[0].metric_refs, ["rmse:d1:bagging"])
         self.assertIn("Rubric Coverage", result.readme_markdown)
         self.assertIn("Result Analysis", result.readme_markdown)
@@ -655,6 +696,7 @@ class ResultAnalysisTests(unittest.TestCase):
                     "H1": {
                         "supported": True,
                         "evidence": "Bagging has lower RMSE than boosting.",
+                        "metric_refs": ["rmse:friedman_high_noise:bagging", "rmse:friedman_high_noise:boosting"],
                     }
                 },
             },

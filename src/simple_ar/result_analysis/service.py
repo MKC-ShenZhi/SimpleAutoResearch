@@ -539,7 +539,8 @@ def deterministic_markdown(
                 f"{format_metric_value(row.get('mean'))} | {format_metric_value(row.get('std'))} | "
                 f"{row.get('count', '-')} | `{row.get('evidence_id', '')}` |"
             )
-    lines.extend(["", "## Claims", ""])
+    lines.extend(["", "## Claims", "",
+        "Verdicts reflect supplied or model judgments; a source reference does not independently prove a claim.", ""])
     for claim in claims:
         lines.append(f"- **{claim.verdict}** `{claim.claim_id}`: {claim.claim}")
         if claim.metric_refs:
@@ -718,7 +719,7 @@ def _finalize_result(
     result: AnalysisResult, context: AnalysisContext, metric_summary: dict[str, Any], *, summary: Any = None,
 ) -> AnalysisResult:
     """Audit once before deriving any published representation of the claims."""
-    result.audit = audit_result(result, metric_summary)
+    result.audit = audit_result(result, metric_summary, context)
     result.claims_payload = claims_payload(context, metric_summary, result.claims, result.rubric_coverage)
     if result.audit.downgraded_claims and isinstance(summary, dict):
         # Free-form results may repeat a verdict just downgraded by the audit;
@@ -923,19 +924,22 @@ def render_analyzed_markdown(
                 f"{format_metric_value(row.get('mean'))} | {format_metric_value(row.get('std'))} | "
                 f"{row.get('count', '-')} | `{row.get('evidence_id', '')}` |"
             )
-    lines.extend(["", "## Claim Verdicts", ""])
+    lines.extend(["", "## Claim Verdicts", "",
+        "Verdicts reflect supplied or model judgments; a source reference does not independently prove a claim.", ""])
     for claim in claims:
         lines.append(f"- **{claim.verdict}** `{claim.claim_id}`: {claim.claim}")
         if claim.metric_refs:
             lines.append(f"  Metric refs: {', '.join(claim.metric_refs)}")
         if claim.limitations:
             lines.append(f"  Limitations: {'; '.join(claim.limitations)}")
+    limitations = [str(summary.get("limitations") or "").strip()]
+    limitations.extend(item for item in audit.limitations if item and item not in limitations)
     lines.extend(
         [
             "",
             "## Limitations",
             "",
-            str(summary.get("limitations") or "; ".join(audit.limitations) or "(not provided)").strip(),
+            "; ".join(item for item in limitations if item) or "(not provided)",
             "",
             "## Reproduction Notes",
             "",
@@ -945,7 +949,9 @@ def render_analyzed_markdown(
     return "\n".join(lines)
 
 
-def audit_result(result: AnalysisResult, metric_summary: dict[str, Any]) -> AnalysisAudit:
+def audit_result(result: AnalysisResult, metric_summary: dict[str, Any],
+                 context: AnalysisContext | None = None) -> AnalysisAudit:
+    context = context or AnalysisContext()
     audit = result.audit.model_copy(deep=True)
     audit.missing_required_metrics = sorted(
         set(audit.missing_required_metrics) | set(metric_summary.get("missing_required_metrics") or [])
@@ -953,18 +959,48 @@ def audit_result(result: AnalysisResult, metric_summary: dict[str, Any]) -> Anal
     audit.weak_metric_signals = sorted(
         set(audit.weak_metric_signals) | set(metric_summary.get("weak_metric_signals") or [])
     )
-    available = set(available_metric_names(metric_summary))
+    available = {
+        str(row["name"]) for row in metric_summary.get("metrics", [])
+        if isinstance(row, dict) and row.get("name") and is_number(row.get("value"))
+        and math.isfinite(float(row["value"]))
+    }
+    tables = metric_summary.get("result_tables") or {}
+    rows = extract_result_table_rows(context.project_results) if context.project_results else tables.get("all_metric_rows", [])
+    available.update(str(row["evidence_id"]) for row in rows
+        if isinstance(row, dict) and row.get("evidence_id") and is_number(row.get("mean"))
+        and math.isfinite(float(row["mean"])))
+    for name, locator in context.artifacts.items():
+        try:
+            path = Path(locator)
+            if not path.is_absolute():
+                if not context.run_dir:
+                    continue
+                path = Path(context.run_dir) / path
+            if path.is_file():
+                available.update((str(name), str(locator)))
+        except (OSError, ValueError):
+            continue
     downgraded: list[str] = []
     unsupported: list[str] = []
     for claim in result.claims:
-        if claim.verdict in {"supported", "partially_supported"}:
+        if claim.verdict in {"supported", "partially_supported", "unsupported"}:
             refs = set(claim.metric_refs)
-            has_metric = bool(refs & available)
-            has_evidence = bool(claim.evidence)
-            if not has_metric and not has_evidence:
+            has_quote = False
+            for evidence in claim.evidence:
+                for key in ("source", "ref", "evidence_id", "metric_ref", "artifact", "path"):
+                    if isinstance(evidence.get(key), str):
+                        refs.add(evidence[key])
+                quote = evidence.get("quote")
+                if isinstance(quote, str) and quote.strip() and quote in context.existing_writeup:
+                    has_quote = True
+            missing = sorted(ref for ref in refs if ref and ref not in available)
+            if missing:
+                claim.limitations.append("References not found in the supplied analysis inputs: " + ", ".join(missing))
+            if not (refs & available or has_quote):
                 claim.verdict = "not_evaluated"
                 claim.confidence = "low"
-                claim.limitations.append("Claim was downgraded because no metric reference or evidence was provided.")
+                claim.limitations.append("Claim was downgraded because no reference resolves to a supplied metric, "
+                    "result row, artifact, or exact source passage. Reference presence alone does not prove the claim.")
                 downgraded.append(claim.claim_id)
         if claim.verdict in {"unsupported", "not_evaluated"}:
             unsupported.append(claim.claim_id)
