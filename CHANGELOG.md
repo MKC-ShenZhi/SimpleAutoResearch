@@ -6,6 +6,20 @@ User-visible changes in reverse chronological order. Development entries are unr
 engineering checks and real task acceptance are reported separately.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-10-31 — V2.10 development (unreleased)
+
+### Improved
+
+- Export English or Chinese LaTeX and PDF in an article layout when requested, with editable sources. Tasks without a PDF requirement can still deliver Markdown.
+- CLI and UI share task configuration preview and creation checks. Delivery views show recorded limitations and the independent model's review; the opinion is not proof of scientific correctness.
+- Reuse verified inspection results when presenting delivery feedback, while retaining the original receipts, versions and accounting.
+
+### Fixed
+
+- Preserve the model budget when a structured task uses an injected model client.
+
+Complete feedback delivery, independent review quality and total cost still require real-task acceptance on one version.
+
 ## 2026-10-30 — V2.10 development (unreleased)
 
 ### Improved
