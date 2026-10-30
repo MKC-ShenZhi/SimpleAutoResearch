@@ -775,6 +775,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     and 'workspace/inspection-work/' in message.get('content', '')
                     for message in request['messages'])
                 allowed = {'read_file', 'list_directory', 'search_files', 'record_inspection'}
+                view, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
+                if view.get('history_archive', {}).get('access') == 'read_history':
+                    allowed.add('read_history')
                 if scoped:
                     allowed.update({'write_file', 'edit_file', 'copy_file', 'copy_project',
                         'run_process', 'inspect_images'})
@@ -784,7 +787,6 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.assertLessEqual(offered, allowed)
                 # Native follow-ups retain the original view and append assistant/tool
                 # messages; source observations arrive through tool replies.
-                view, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
                 # Present the controlled reviewer with bodies actually supplied
                 # by the common selector/native replies, never archived bytes.
                 visible = [row['observation'] for row in view.get('working_view', {}).get('observations', [])]
@@ -2272,6 +2274,16 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 return [_action('read_file', path='measurements/observations.csv')]
             self.assertIn('sample,value', wire)
             self.assertIn('summary.json', wire)
+            if not reviews:
+                replies = [json.loads(message['content']) for message in self.inspection_requests[-1]['messages']
+                    if message['role'] == 'tool']
+                if not any(row.get('tool_name') == 'run_process' and row.get('status') == 'ok' for row in replies):
+                    spec = next(row['function'] for row in self.inspection_requests[-1]['tools']
+                        if row['function']['name'] == 'write_file')
+                    scope = spec['parameters']['properties']['path']['description'].split(
+                        'workspace/inspection-work/', 1)[1].split('/', 1)[0]
+                    return [_action('run_process', argv=[sys.executable, '-c', "print('Observed check output')"],
+                        cwd='workspace/inspection-work/'+scope, timeout_sec=5)]
             reviews.append(view)
             evidence = [row['subject'] for row in view['evidence'] if row['text_windows']]
             wrong = any('9.0' in window['text'] for row in view['evidence']
@@ -2283,7 +2295,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._inspect(['说明.md'], ['summary.json'])
         self.assertEqual(self._assessment()['verdict'], 'passed')
         claim = {'summary':'解释观察值并保留原始依据。', 'artifacts':['说明.md','summary.json']}
-        self._submit(_action('deliver_result', **claim))
+        self._submit(_action('deliver_result', **claim), approve=lambda *_: True)
         self._not_delivered()
         first = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
         producer_item = deepcopy(self.app.state['turns'][-1]['tools'][-1])
@@ -2344,6 +2356,21 @@ class OperationsWorkLoopTests(unittest.TestCase):
         admitted = validate_material_observation(self.app.workspace, source, identity='review-result-reuse')
         self.assertEqual(admitted['data']['text'], (self.inputs/'observations.csv').read_text())
         self.assertNotIn('findings', admitted)
+        # The coordinator's ordinary working view must also receive actual
+        # separately accepted reads, not just an opinion and a receipt count.
+        view = json.loads(self.app._messages()[1]['content'])['working_view']
+        reused = [entry for entry in view['observations']
+            if entry['observation'].get('record') == material_record
+            and entry['observation'].get('absolute_path') == str(self.inputs/'observations.csv')]
+        self.assertTrue(reused)
+        self.assertEqual(reused[0]['version_status'], 'matching')
+        self.assertIn('a,1', reused[0]['observation']['text'])
+        actions = [entry['observation'] for entry in view['observations']
+            if entry['observation'].get('tool') == 'run_process']
+        action_view = next(json.loads(row['text']) for row in actions if 'inspection_action' in row['text'])
+        self.assertEqual(action_view['inspection_action']['observed']['returncode'], 0)
+        self.assertIn('Observed check output', action_view['inspection_action']['observed']['stdout'])
+        self.assertIn('does not prove', action_view['scope'])
         inspector = self.app.operations.inspection
         inspector._reused_source_dependencies(source, admitted['data']['absolute_path'])
         action_path = review_path.parent/'action.json'
@@ -2354,6 +2381,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
             action_path.write_text(json.dumps(action), encoding='utf-8')
             with self.assertRaises(ValueError):
                 inspector._reused_source_dependencies(source, admitted['data']['absolute_path'])
+            unverified = json.loads(self.app._messages()[1]['content'])['working_view']['observations']
+            self.assertFalse(any(row['observation'].get('record') == material_record for row in unverified))
         finally:
             action_path.write_bytes(original_action)
         original_source = (self.inputs/'observations.csv').read_bytes()
@@ -2440,7 +2469,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         current = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
         self.assertEqual(current['verdict'], 'passed')
         self.assertEqual(set(current['artifacts']), {str(self.root/'workspace'/n) for n in claim['artifacts']})
-        self.assertFalse(self._process_receipts())
+        self.assertEqual(len(self._process_receipts()), 1)  # The real inspection process is not replayed.
         self.assertFalse(list((self.root/'workspace').rglob('*.pdf')))
         calls, ledger = self.send.call_count, self.app.ledger.to_dict()
         self._reload()
@@ -4547,6 +4576,146 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.ledger.to_dict(), ledger)
         self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), receipts)
 
+    def test_inspector_history_after_checkpoint_and_reload_uses_own_original_receipts(self):
+        from dataclasses import replace
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings, context_input_tokens=12000))
+        self._create()
+        self._write('notes.md', 'Check only the supplied observations.\n')
+        for number in range(4):
+            (self.inputs/f'history-source-{number}.txt').write_text('scope '*4000, encoding='utf-8')
+        first_calls = [_action('read_file', path='measurements/missing-history-source.txt'),
+            _action('read_file', path='measurements/conditions.txt', max_bytes=8),
+            _action('list_directory', path='measurements')]
+        post_owner_error = 'Recorded post-owner validation failure for history coverage'
+        navigation, recovered, finished = bytearray(), {}, set()
+        original = None
+        def history(action=None, offset=0):
+            return [_action('read_history', start_turn=0, end_turn=1, max_turns=1,
+                offset_bytes=offset, max_bytes=4000, **({'action':action} if action is not None else {}))]
+        def review(view):
+            number = len(self.inspection_requests)
+            self.assertIn('read_history', {tool['function']['name'] for tool in self.inspection_requests[-1]['tools']})
+            if number == 1:
+                return first_calls
+            if number <= 5:
+                return [_action('read_file', path=f'measurements/history-source-{number-2}.txt', max_bytes=24000)]
+            replies = [json.loads(message['content']) for message in
+                self.inspection_requests[-1]['messages'] if message['role']=='tool']
+            pages = [row for row in replies if row.get('tool_name')=='read_history']
+            if not pages:
+                self.assertTrue(self.memory_views, 'A real checkpoint must precede retrieval')
+                return history()
+            self.assertEqual(pages[-1]['status'], 'ok', pages[-1])
+            data = pages[-1]['data']
+            if data['projection']=='navigation_index':
+                navigation.extend(data['text'].encode('utf-8'))
+                if data['has_more_bytes']:
+                    return history(offset=len(navigation))
+                actions = json.loads(navigation)[0]['actions']
+                self.assertEqual([row['action'] for row in actions], [0,1,2])
+                self.assertNotEqual(actions[0]['status'], 'ok')
+                return history(action=0)
+            action = data['action']
+            payload = recovered.setdefault(action, bytearray())
+            value = json.loads(original)['results'][action]['result']
+            canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+            self.assertEqual(data['text'].encode('utf-8'), canonical[len(payload):data['next_offset_bytes']])
+            native = owner._receipt_result(data['receipt'])
+            if action < 2:
+                visible = deepcopy(native)
+                source = visible['metadata'].pop('inspection_source')
+                self.assertTrue(0 <= source['remaining_after'] <= source['remaining_before'])
+                self.assertEqual(data['receipt_projection'], 'inspection_source_omitted')
+                self.assertEqual(visible, value)
+            else:
+                self.assertEqual(native['status'], 'ok')
+                self.assertEqual(data['receipt_projection'], 'post_owner_blocked')
+                self.assertEqual(value, ToolResult(tool_name='list_directory', status='blocked',
+                    error=post_owner_error).model_dump(mode='json'))
+            payload.extend(data['text'].encode('utf-8'))
+            if data['has_more_bytes']:
+                return history(action, len(payload))
+            self.assertEqual(json.loads(payload), value)
+            finished.add(action)
+            if action < 2:
+                return history(action+1)
+            partial = json.loads(recovered[1])['data']
+            self.assertFalse(partial['complete'])
+            self.assertEqual(partial['text_windows'][0]['next_offset_bytes'], 8)
+            self.assertIn('missing-history-source.txt', json.dumps(json.loads(recovered[0])))
+            self.assertEqual(json.loads(recovered[2])['tool_name'], 'list_directory')
+            return {'decisions':[{'subject':'target-1', 'conclusion':'incomplete', 'findings':[],
+                'evidence':[], 'limitations':['Historical partial reading remains partial.']}]}
+        self.review = review
+        approve, paused = self.app._approve_action, []
+        def pause_history(pending, *args, **kwargs):
+            if pending['call']['function']['name']=='read_history' and not paused:
+                paused.append(deepcopy(pending))
+                self.app.session.pause('Pause before the accepted historical read for reload coverage')
+                return False
+            return approve(pending, *args, **kwargs)
+        inspection = self.app.operations.inspection
+        bind_owner = inspection._shared_owner_receipts
+        def reject_after_owner(name, result, receipt, arguments):
+            if name == 'list_directory':
+                raise ValueError(post_owner_error)
+            return bind_owner(name, result, receipt, arguments)
+        with patch.object(self.app, '_approve_action', side_effect=pause_history), patch.object(
+                inspection, '_shared_owner_receipts', side_effect=reject_after_owner):
+            self._submit(_action('inspect_artifacts', goal='Check the saved scope', targets=['notes.md'], evidence=[]))
+        self.assertEqual(len(paused), 1)
+        identity, owner = self.app.state['pending']['inspection'], self.app.operations.inspection
+        saved = owner.store.read_json(owner._path(identity, 'input'))
+        self.assertEqual(saved['arguments']['goal'], 'Check the saved scope')
+        pending_round = paused[0]['origin']['position'].split('/')[0]
+        pending_trace = owner.store.read_json(owner._path(identity, pending_round))
+        offer, allowance = deepcopy(pending_trace['offer']), pending_trace['remaining']
+        original_path = self.root/owner._path(identity, 'sources-0')
+        original = original_path.read_bytes()
+        source_receipts = {row['receipt']['record']:owner.store.require(row['receipt']['record']).read_bytes()
+            for row in json.loads(original)['results']}
+        rows = owner._conversation_rows(saved)
+        memory = owner._conversation_memory(saved, rows)
+        self.assertTrue({row['record'] for row in rows if row['turn']==0} <= memory['compacted_records'])
+        self.assertNotIn('missing-history-source.txt', json.dumps(memory['notes']))
+        calls, ledger, sources = self.send.call_count, self.app.ledger.to_dict(), self._versions(self.inputs)
+        self._reload()
+        self.assertEqual((self.send.call_count, self.app.ledger.to_dict()), (calls, ledger))
+        owner = self.app.operations.inspection
+        read_history = owner._read_history
+        def unchanged_ledger(*args, **kwargs):
+            before = self.app.ledger.to_dict()
+            result = read_history(*args, **kwargs)
+            self.assertEqual(self.app.ledger.to_dict(), before)
+            return result
+        with patch.object(owner, '_read_history', side_effect=unchanged_ledger):
+            self._run()
+        self.assertEqual(finished, {0,1,2})
+        self.assertEqual(original_path.read_bytes(), original)
+        self.assertTrue(all(owner.store.require(path).read_bytes() == raw for path,raw in source_receipts.items()))
+        self.assertEqual(self._versions(self.inputs), sources)
+        self.assertEqual(owner.store.read_json(owner._path(identity, pending_round))['offer'], offer)
+        saved = owner.store.read_json(owner._path(identity, 'input'))
+        all_rows = []
+        for number in range(len(saved['source_rounds'])):
+            trace = owner.store.read_json(owner._path(identity, f'sources-{number}'))
+            all_rows.extend(trace['results'])
+            if any(row['tool']=='read_history' for row in trace['results']):
+                self.assertEqual(trace['remaining'], allowance)
+                self.assertTrue(all('receipt' in row for row in trace['results']))
+        for call in first_calls:
+            self.assertEqual(sum(row['tool']==call['tool_name'] and row['arguments']==call['arguments']
+                for row in all_rows), 1, 'Retrieval must not reexecute the original operation')
+        self.assertEqual(self._assessment()['verdict'], 'incomplete')
+        self.assertFalse(self._process_receipts())
+        # The metadata exception must not hide changes to returned data or the
+        # diagnostic shape. Use copies; all retained records stay unchanged.
+        for index, field in ((1, 'data'), (2, 'metadata')):
+            altered = json.loads(original)
+            altered['results'][index]['result'][field]['unrelated_change'] = True
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'result differs'):
+                owner._history_receipt(saved, 0, index, altered)
+
     def test_main_explicit_and_delivery_review_use_one_prepare_and_isolated_receipt_continuity(self):
         from dataclasses import replace
         from simple_ar.app.professional_conversation import ProfessionalConversation
@@ -4565,6 +4734,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         def review(view):
             self.assertNotIn(author, json.dumps(self.inspection_requests[-1]['messages']))
             if 'claim' in view.get('proposed_delivery', {}):
+                self.assertIn('Do not invent evidence or impose a report or PDF.',
+                    self.inspection_requests[-1]['messages'][0]['content'])
                 return self._review_complete_targets(view)
             if 'proposed_delivery' not in view and len(self.inspection_requests) <= 4:
                 return [_action('read_file', path=f'measurements/source-{len(self.inspection_requests)-1}.txt', max_bytes=24000)]
@@ -5336,14 +5507,24 @@ class OperationsWorkLoopTests(unittest.TestCase):
 
     def test_inline_producers_validate_actual_outputs_and_repair_stale_process_edges(self):
         self._create(delivery_files=['final.txt','conditions.txt'])
+        self._write('conditions.txt','Execution and interpretation are distinct.\n')
+        calls = self.send.call_count
         delivery = {'summary':'Actual final output','artifacts':['final.txt']}
         self._submit(_action('write_file',path='final.txt',content='finished\n',delivery=delivery))
-        self._ok('write_file')
+        produced = self._ok('write_file')
+        self.assertIn('missing required workspace outputs', produced['metadata']['delivery_review_error'])
         self._not_delivered()
         self.assertIn('conditions.txt','; '.join(self.app._delivery_feedback()['issues']))
-        self._write('conditions.txt','Execution and interpretation are distinct.\n')
+        # Presence on disk is insufficient for either inline or standalone
+        # acceptance. An explicit partial exit preserves the completed writer.
+        self._submit(_action('deliver_result', **delivery))
+        self.assertNotEqual(self._last('deliver_result')['status'], 'ok')
+        self._submit(_action('deliver_result', **delivery, unresolved=['Conditions are not included.']))
+        self.assertEqual(self.app.session.manifest.status, 'partial')
+        self.assertEqual(self.send.call_count, calls)
+        self.assertFalse((self.root / 'tools/inspection').exists())
         self._submit(_action('deliver_result',summary='Actual final output',
-            artifacts=['final.txt','conditions.txt']))
+            artifacts=['final.txt','conditions.txt']), feedback='Include the retained conditions file.')
         self._ok('deliver_result')
         self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
         self.assertEqual((self.root/'workspace/final.txt').read_text(),'finished\n')

@@ -9,7 +9,6 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from simple_ar.core.assessments import assessment_issues
 from simple_ar.tools.specs import ToolResult
-from simple_ar.tools.workspace import DeliveryRequest
 
 
 _GOAL = (
@@ -77,56 +76,14 @@ class _DeliveryAssessment(BaseModel):
 
 
 class DeliveryReview:
-    def __init__(self, workspace: Any, inspector: Any,
-                 user_requests: Callable[[], list[str]], *,
+    def __init__(self, workspace: Any, inspector: Any, *,
                  observations: Callable[[], list[dict]] | None = None,
                  protocol: str = 'task.v1') -> None:
         if protocol not in {'task.v1', 'task.v2', 'task.v3'}:
             raise ValueError('Unknown delivery review protocol')
         self.workspace, self.inspector = workspace, inspector
-        self.user_requests = user_requests
         self.observations = observations
         self.protocol = protocol
-
-    def requires_review(self, request: DeliveryRequest) -> bool:
-        """Shared admission and capacity obligation; partial remains an exit."""
-        return not request.unresolved and (self.protocol == 'task.v3' or (
-            request.report is not None and request.report.status == 'canonical'
-            and bool(request.report.manuscript)))
-
-    def _binding(self, delivery: dict, *, current_outputs: tuple[Path, ...] = ()) -> dict | None:
-        request = DeliveryRequest.model_validate(delivery)
-        if not self.requires_review(request):
-            return None
-        resolved = self.workspace.resolve_delivery(request, current_outputs=current_outputs)
-        # Absolute authorized locators collapse aliases without replacing original bytes
-        # with an export, a summary, or a reconstructed manuscript.
-        artifacts = sorted({str(self.workspace.resolve(path)) for path in resolved['artifacts']})
-        requests = self.user_requests()
-        if not isinstance(requests, list) or any(not isinstance(text, str) for text in requests):
-            raise ValueError('Delivery review requires exact original request and feedback strings')
-        if self.protocol == 'task.v3':
-            claim = request.model_dump(mode='json', exclude_none=True)
-            claim['artifacts'] = artifacts
-            if request.report is not None:
-                if request.report.manuscript:
-                    claim['report']['manuscript'] = str(self.workspace.resolve(request.report.manuscript))
-                if request.report.formats:
-                    claim['report']['formats'] = sorted(set(request.report.formats))
-            if request.summary_source is not None:
-                claim['summary_source']['path'] = str(self.workspace.resolve(request.summary_source.path))
-            return {'schema_version': 'delivery_review.v3', 'requests': list(requests),
-                    'claim': claim,
-                    'authorized_roots': {name: str(path) for name, path in self.workspace.mounts.items()},
-                    'artifacts': self.workspace.artifact_hashes(artifacts)}
-        manuscript = str(self.workspace.resolve(request.report.manuscript))
-        if manuscript not in artifacts:
-            raise ValueError('Delivery review requires the actual manuscript among delivered artifacts')
-        return {'schema_version': 'delivery_review.v2' if self.protocol == 'task.v2' else 'delivery_review.v1',
-                'requests': list(requests),
-                'manuscript': manuscript, 'formats': sorted(set(request.report.formats)),
-                'authorized_roots': {name: str(path) for name, path in self.workspace.mounts.items()},
-                'artifacts': self.workspace.artifact_hashes(artifacts)}
 
     @staticmethod
     def _arguments(binding: dict) -> dict:
@@ -291,9 +248,8 @@ class DeliveryReview:
         return {**feedback, 'delivery_context': deepcopy(original),
             'reviewed_inventory': dict(original.get('artifacts', {}))}
 
-    def review(self, delivery: dict, identity: str, *, may_start: bool,
-               current_outputs: tuple[Path, ...] = ()) -> dict | None:
-        binding = self._binding(delivery, current_outputs=current_outputs)
+    def review(self, binding: dict | None, identity: str, *, may_start: bool) -> dict | None:
+        """Review a freshly prepared owner scope; it is not an acceptance receipt."""
         if binding is None:
             return None
         result = None
@@ -347,9 +303,8 @@ class DeliveryReview:
                     result = ToolResult(tool_name='inspect_artifacts', status='blocked', error=str(exc))
             return self._envelope(binding, identity, result, error=str(exc))
 
-    def issues(self, observations: list[dict], delivery: dict) -> list[str]:
+    def issues(self, observations: list[dict], binding: dict | None) -> list[str]:
         try:
-            binding = self._binding(delivery)
             if binding is None:
                 return []
             for observed in reversed(observations):

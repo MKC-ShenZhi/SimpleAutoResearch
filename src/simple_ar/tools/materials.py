@@ -353,6 +353,19 @@ def admit_text_window(retained: list[dict], observation: dict, *, pinned: Iterab
         'Whole original observation retained; overlapping decoded text may repeat, no byte slicing.'} if overlap else {})}]
 
 
+def accepted_review_journal(workspace: Any, store: Any, item: dict, receipt: dict) -> dict:
+    """Resolve the separate accepted review without adopting its opinion."""
+    from simple_ar.tools.professional_outcomes import accepted_native_result, accepted_scoped_opinion
+
+    session_id = store.read_json('session_manifest.json')['session_id']
+    parent = Path(item['result']).parent.name
+    accepted_native_result(store.root, session_id, receipt, parent)
+    path, review, digest = accepted_scoped_opinion(
+        store.root, workspace, session_id, item['review_result'], parent)
+    return {'record': 'attempts/' + path.relative_to((store.root / 'attempts').resolve()).as_posix(),
+            'receipt': review, 'sha256': digest}
+
+
 def journal_material_references(workspace: Any, store: Any, turns: list[dict],
                                 targets: list[str], *, include_cross_path: bool = False) -> list[dict]:
     """Locate original reads; optional cross-path lookup grants no target access.
@@ -399,14 +412,8 @@ def journal_material_references(workspace: Any, store: Any, turns: list[dict],
                 # registered receipt through the same byte/version owner as any
                 # other journal observation; its opinion is not transferred.
                 try:
-                    from simple_ar.tools.professional_outcomes import accepted_native_result, accepted_scoped_opinion
-
-                    session_id = store.read_json('session_manifest.json')['session_id']
-                    accepted_native_result(store.root, session_id, receipt, Path(item['result']).parent.name)
-                    path, review, digest = accepted_scoped_opinion(store.root, workspace, session_id,
-                        item['review_result'], Path(item['result']).parent.name)
-                    record = 'attempts/' + path.relative_to((store.root / 'attempts').resolve()).as_posix()
-                    collect(review, {}, record, digest)
+                    review = accepted_review_journal(workspace, store, item, receipt)
+                    collect(review['receipt'], {}, review['record'], review['sha256'])
                 except (ValueError, TypeError, KeyError, OSError, RuntimeError):
                     continue
     # Current roots lead the bounded reuse search; unrelated recent reads must

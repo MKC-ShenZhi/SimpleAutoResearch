@@ -28,6 +28,21 @@ _SHARED_OPERATIONS = frozenset({'read_file', 'list_directory', 'search_files',
     'write_file', 'edit_file', 'copy_file', 'copy_project', 'run_process', 'inspect_images'})
 
 
+class _InspectionHistory(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    start_turn: int = Field(default=0, ge=0,
+        description='Zero-based closed source round in this inspection, not a task turn or attempt.')
+    offset_bytes: int = Field(default=0, ge=0)
+    max_bytes: int = Field(default=16000, ge=1, le=64000)
+    max_turns: int = Field(default=10, ge=1, le=32)
+    end_turn: int | None = Field(default=None, ge=0,
+        description='Pin the index end_turn while continuing byte windows.')
+    action: int | None = Field(default=None, ge=0,
+        description='Omit for a compact index. Select its zero-based action in start_turn for the retained semantic value.')
+    field: Literal['result', 'arguments'] = Field(default='result',
+        description='Retained result or arguments, projected as canonical JSON. Byte offsets address this projection.')
+
+
 class InspectionRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     goal: str = Field(min_length=1)
@@ -268,12 +283,15 @@ class InspectionToolGateway:
                 _REVIEW_SYSTEM if self.adaptive else _SUBJECT_SYSTEM if self.protocol else _SYSTEM)
             # Keep the original response/evidence contracts while offering actual
             # inspection operations under the caller's ordinary authority.
+            contract = contract.replace('Do not invent evidence, execute code, impose a report or PDF, ',
+                'Do not invent evidence or impose a report or PDF. ')
             for text in ('never execute code or edit files.',
                     'No visual or scientific certification is possible.',
-                    'Do not invent evidence, execute code, impose a report or PDF, ',
                     'or claim direct visual inspection from text.'):
                 contract = contract.replace(text, '')
             contract = contract.replace('through the offered read-only tools;', 'through the offered tools.')
+            contract = contract.replace('Use authorized read tools to investigate',
+                'Use authorized tools to investigate')
             return (contract + ' You may use only operations offered in this decision. '
                 'Original targets and sources are immutable. Create or change helper files only under '
                 f"workspace/inspection-work/{saved['identity']}/. "
@@ -281,8 +299,11 @@ class InspectionToolGateway:
                 'declare actual input files and outputs when applicable. Visual observations require '
                 'inspect_images. To bind a visual observation, read its recorded feedback or review '
                 'and select that observed evidence ID in the final decision. Select the actual computed '
-                'output or diagnostic observation when relying on it. Tool results do not certify '
-                'scientific correctness.')
+                'output or diagnostic observation when relying on it. For numerical conclusions material '
+                'to the request, check original data and independently calculate when practical. Rerunning '
+                'the producer establishes reproducibility, not independent correctness; a different script '
+                'alone does not establish independence. Explain necessary checks that could not be made. '
+                'Tool results do not certify scientific correctness.')
         return (_DELIVERY_SYSTEM if self._delivery_scope(saved) else _REVIEW_SYSTEM
             if self.adaptive else _SUBJECT_SYSTEM if self.protocol else _SYSTEM)
 
@@ -1731,9 +1752,20 @@ class InspectionToolGateway:
             base.pop('user_requests', None)
         else:
             base.pop('goal', None)  # Historical input retains its original view.
+        history = self._history_enabled(saved)
+        if history:
+            base['history_archive'] = {'total_turns':len(saved.get('source_rounds', [])), 'access':'read_history',
+                'scope':'Zero-based source rounds of this inspection only. Omit action for a compact turn/action '
+                    'index; pin end_turn while paging it. Select start_turn, action and field=result or arguments '
+                    'to page its retained semantic value directly, without replaying offers. Byte offsets address '
+                    'a canonical JSON projection, not original formatting. Round/receipt/action hashes and JSON '
+                    'pointers identify the immutable originals. Historical output is not current evidence or permission.'}
         base['reading_scope'] = ('Only the supplied decoded windows were observed. Retired source bodies '
-            'remain in the original inspection records; read an authorized original path/range again '
-            'when its text is needed. Full-file hashes are computed by the read owner. Source opinions '
+            'remain in the original inspection records; ' + (
+                'use read_history for original observations, including failures and unread tails. Read an '
+                'authorized source path/range only when new or current bytes are needed. ' if history else
+                'read an authorized original path/range again when its text is needed. ') +
+            'Full-file hashes are computed by the read owner. Source opinions '
             'and self-reported manifests do not replace actual source versions or scientific reasoning.')
         system = self._system(saved)
         messages, metadata = select_working_context(
@@ -1755,35 +1787,211 @@ class InspectionToolGateway:
                                 {'delivery_review.v2','delivery_review.v3'} else []))),
                 'processed_turns':processed_journal_turns(journal_rows, memory['compacted_records'])
                 } if continuity else {}),
-            history_access='read_file at the recorded authorized source path and range',
+            history_access=('read_history' if history else 'read_file at the recorded authorized source path and range'),
             trailing_messages=[finish] if finish is not None else [])
         if validate_capacity and metadata['estimated_input_tokens'] > target:
             raise ValueError('Inspection working view cannot fit its model input target; '
                 'retain observations and narrow the requested inspection scope')
         return messages, metadata
 
+    @staticmethod
+    def _history_enabled(saved: dict) -> bool:
+        policy = saved.get('inspection_history_policy')
+        if policy not in (None, 'receipts.v1'):
+            raise ValueError('Unknown inspection history policy')
+        return policy is not None
+
+    def _closed_source_round(self, saved: dict, number: int) -> dict | None:
+        """The same settled, complete original journal owns compaction and retrieval."""
+        path = self._path(saved['identity'], f'sources-{number}')
+        raw = self.store.resolve(path).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != saved['source_rounds'][number]:
+            raise ValueError('Inspection source investigation record changed; no replay')
+        trace = json.loads(raw)
+        response = trace.get('response')
+        if not trace.get('completed') or not response:
+            return None
+        call_id = 'inspect-artifacts-'+saved['identity'] + (f'-sources-{number}' if number else '')
+        model_attempt = (trace['model_receipt']['attempt'] if saved.get('execution_protocol') == 'shared.v1'
+            else saved['identity'])
+        usage = [entry.to_dict() for entry in self.workspace.ledger.entries
+            if entry.attempt_id == model_attempt and entry.logical_call_id == call_id]
+        if not any(entry['status'] == 'settled' for entry in usage) or not self._accounted(usage):
+            return None
+        calls, results = response.get('tool_calls') or [], trace['results']
+        if (trace.get('malformed_calls') or
+                [row['call_id'] for row in results] != [call['id'] for call in calls]):
+            return None  # A response with unfinished tool work is not closed.
+        return trace
+
+    def _history_round(self, saved: dict, number: int) -> dict:
+        """Read this inspection's decoded, digest-bound closed owner journal."""
+        path = self.root
+        relative = self._path(saved['identity'], f'sources-{number}')
+        for part in ('', *Path(relative).parts):
+            path = path / part
+            if path.is_symlink() or path.is_junction():
+                raise ValueError('Inspection history cannot traverse links')
+        trace = self._closed_source_round(saved, number)
+        if trace is None:
+            raise ValueError('History round has unfinished or unsettled operations')
+        return trace
+
+    def _history_receipt(self, saved: dict, number: int, index: int, trace: dict) -> tuple[dict | None, str]:
+        row = trace['results'][index]
+        receipt = row.get('receipt')
+        if receipt is None:
+            return None, 'round_only'  # Historical/local failures remain bound to their round.
+        attempt = receipt['attempt']
+        if (not isinstance(attempt, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', attempt)
+                or receipt['record'] != f'attempts/{attempt}/native_result.json'):
+            raise ValueError('Inspection history receipt is outside its operation owner')
+        for relative in (receipt['record'], f'attempts/{attempt}/action.json'):
+            path = self.root
+            for part in ('', *Path(relative).parts):
+                path = path / part
+                if path.is_symlink() or path.is_junction():
+                    raise ValueError('Inspection history cannot traverse links')
+        original = self._receipt_result(receipt)
+        action = self.store.read_json(f'attempts/{attempt}/action.json')
+        call = trace['response']['tool_calls'][index]
+        if (action.get('origin') != {'scope':saved['identity'], 'kind':'tool',
+                    'position':self._position(number, f'tool-{index}', call['id'])}
+                or action.get('call') != call):
+            raise ValueError('Inspection history receipt belongs to a different action or scope')
+        recorded, name = row['result'], call['function']['name']
+        if original == recorded:
+            return receipt, 'identical'
+        # _inspect removes only this private source/allowance envelope from a
+        # shared read's visible result. Keep the hashed owner receipt untouched.
+        if (name == 'read_file' and original.get('tool_name') == name and isinstance(original.get('metadata'), dict)
+                and 'inspection_source' in original.get('metadata', {})):
+            projected = deepcopy(original)
+            projected['metadata'].pop('inspection_source')
+            if projected == recorded:
+                return receipt, 'inspection_source_omitted'
+        # A post-owner validation failure records a fresh blocked diagnostic,
+        # not a rewritten owner result. Validate its exact catch-path shape;
+        # the round hash binds the diagnostic, the receipt binds the owner work.
+        error = recorded.get('error')
+        if (isinstance(error, str) and error and recorded == ToolResult(
+                tool_name=name, status='blocked', error=error).model_dump(mode='json')):
+            return receipt, 'post_owner_blocked'
+        raise ValueError('Inspection history result differs from its original operation receipt')
+
+    def investigation_actions(self, identity: str) -> list[dict]:
+        """Expose actual scoped executions, not an opinion that they prove a claim."""
+        self._receipt(identity)
+        saved = self.store.read_json(self._path(identity, 'input'))
+        actions = []
+        for number in range(len(saved.get('source_rounds', []))):
+            trace = self._closed_source_round(saved, number)
+            if trace is None:
+                continue
+            for index, row in enumerate(trace['results']):
+                if row.get('tool') not in {'run_process', 'inspect_images'}:
+                    continue
+                receipt, relation = self._history_receipt(saved, number, index, trace)
+                # A blocked owner projection is a separate diagnosis, not the
+                # successful native process result behind that diagnosis.
+                if receipt is not None and relation == 'identical':
+                    actions.append({'call': trace['response']['tool_calls'][index],
+                        'result': row['result'], 'record': receipt['record']})
+        return actions
+
+    def _read_history(self, saved: dict, arguments: dict, *, before_turn: int,
+                      read_limit: int | None = None) -> ToolResult:
+        """Project navigation or a selected semantic value from validated own receipts."""
+        if not self._history_enabled(saved):
+            raise ValueError('Inspection history was not offered by this saved contract')
+        page = _InspectionHistory.model_validate(arguments)
+        if read_limit is not None and (type(read_limit) is not int or read_limit <= 0):
+            raise ValueError('History read capacity must be a positive integer')
+        total = min(before_turn, len(saved.get('source_rounds', [])))
+        if page.start_turn >= total:
+            raise ValueError('History round is outside the prior closed inspection history')
+        relative = self._path(saved['identity'], f'sources-{page.start_turn}')
+        end_turn = page.start_turn+1
+        binding = {'record':relative, 'sha256':saved['source_rounds'][page.start_turn]}
+        if page.action is None:
+            end_turn = min(total, page.start_turn+page.max_turns) if page.end_turn is None else page.end_turn
+            if not page.start_turn < end_turn <= min(total, page.start_turn+page.max_turns):
+                raise ValueError('Pinned history end is outside this prior bounded range')
+            entries = []
+            for number in range(page.start_turn, end_turn):
+                trace = self._history_round(saved, number)
+                record = self._path(saved['identity'], f'sources-{number}')
+                actions = []
+                for index, row in enumerate(trace['results']):
+                    result = row['result']
+                    arguments = row.get('arguments', {})
+                    actions.append({'action':index, 'call_id':row['call_id'], 'tool':result.get('tool_name'),
+                        'status':result.get('status'), 'error_preview':str(result.get('error', ''))[:256],
+                        'arguments':{key:value for key,value in arguments.items()
+                            if key in {'path','cwd','offset_bytes','max_bytes','query'}
+                            and len(json.dumps(value,ensure_ascii=False)) <= 256} if isinstance(arguments,dict) else {},
+                        'result':record+f'#results/{index}/result',
+                        'original_arguments':record+f'#results/{index}/arguments'})
+                if not trace['results']:
+                    actions.append({'action':0, 'tool':'assistant_reply', 'result':record+'#response'})
+                entries.append({'turn':number, 'record':record, 'sha256':saved['source_rounds'][number], 'actions':actions})
+            value = entries
+            binding = {'projection':'navigation_index', 'scope':'Derived navigation; previews are incomplete '
+                'and do not validate individual operation receipts. Select an action to check its owner and '
+                'read the retained semantic value.'}
+        else:
+            trace = self._history_round(saved, page.start_turn)
+            if trace['results']:
+                if page.action >= len(trace['results']):
+                    raise ValueError('Selected history action is outside this round')
+                row = trace['results'][page.action]
+                receipt, relation = self._history_receipt(saved, page.start_turn, page.action, trace)
+                value = row[page.field]
+                pointer = f'/results/{page.action}/{page.field}'
+            elif page.action == 0 and page.field == 'result':
+                receipt, relation, value, pointer = None, 'round_only', trace['response'], '/response'
+            else:
+                raise ValueError('Selected history action or field is absent')
+            binding.update(projection='retained_value', action=page.action, field=page.field,
+                pointer=pointer, receipt_projection=relation, **({'receipt':receipt} if receipt else {}),
+                scope='Projection of the retained inspection journal value, not original formatting or new authoritative state. '
+                    'inspection_source_omitted removes only the owner source/allowance metadata envelope. '
+                    'post_owner_blocked is the round-bound post-check diagnostic, not the owner result; '
+                    'the receipt retains the original owner output and metadata. '
+                    'Historical output is not current evidence or permission.')
+        raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')
+        if json.loads(raw) != value:
+            raise ValueError('History projection differs from its retained owner value')
+        binding.update(serialization='canonical_json', projection_sha256=hashlib.sha256(raw).hexdigest())
+        size = len(raw)
+        if page.offset_bytes > size:
+            raise ValueError('History byte offset is beyond this value')
+        limit = min(page.max_bytes, read_limit) if read_limit is not None else page.max_bytes
+        window = raw[page.offset_bytes:page.offset_bytes+limit]
+        try:
+            text = window.decode('utf-8')
+        except UnicodeDecodeError as exc:
+            if exc.reason != 'unexpected end of data' or not exc.start:
+                raise ValueError('History byte window must contain complete UTF-8 characters') from None
+            window = window[:exc.start]
+            text = window.decode('utf-8')
+        stop = page.offset_bytes+len(window)
+        return ToolResult(tool_name='read_history', data={'text':text, **binding,
+            'start_turn':page.start_turn, 'end_turn':end_turn, 'size_bytes':size,
+            'total_turns':total, 'offset_bytes':page.offset_bytes, 'next_offset_bytes':stop,
+            'has_more_bytes':stop < size, 'next_turn':page.start_turn if stop < size else end_turn},
+            summary='Own inspection receipt history, not current evidence or permission.')
+
     def _conversation_rows(self, saved: dict) -> list[dict]:
         """Exact closed source results from this role's original round journal."""
         rows = []
-        for number, digest in enumerate(saved.get('source_rounds', [])):
+        for number in range(len(saved.get('source_rounds', []))):
+            trace = self._closed_source_round(saved, number)
+            if trace is None:
+                continue
             path = self._path(saved['identity'], f'sources-{number}')
-            if self._digest(path) != digest:
-                raise ValueError('Inspection source investigation record changed; no replay')
-            trace = self.store.read_json(path)
-            response = trace.get('response')
-            if not trace.get('completed') or not response:
-                continue
-            call_id = 'inspect-artifacts-'+saved['identity'] + (f'-sources-{number}' if number else '')
-            model_attempt = (trace['model_receipt']['attempt'] if saved.get('execution_protocol') == 'shared.v1'
-                else saved['identity'])
-            usage = [entry.to_dict() for entry in self.workspace.ledger.entries
-                if entry.attempt_id == model_attempt and entry.logical_call_id == call_id]
-            if not any(entry['status'] == 'settled' for entry in usage) or not self._accounted(usage):
-                continue
-            calls, results = response.get('tool_calls') or [], trace['results']
-            if (trace.get('malformed_calls') or
-                    [row['call_id'] for row in results] != [call['id'] for call in calls]):
-                continue  # A response with unfinished tool work is not closed.
+            response, results = trace['response'], trace['results']
+            calls = response.get('tool_calls') or []
             for index, row in enumerate(results):
                 rows.append({'turn':number, 'record':path+f'#results/{index}',
                     'arguments':row['arguments'], 'result':row['result']})
@@ -2396,6 +2604,15 @@ class InspectionToolGateway:
         tools = self._shared_tools(identity) if shared else [{'type':'function','function':{'name':spec.name,
             'description':spec.description,'parameters':spec.parameters_schema()}}
             for spec in workspace_tool_specs() if spec.name in read_names]
+        if self._history_enabled(saved):
+            read_names.add('read_history')
+            tools.append({'type':'function', 'function':{'name':'read_history',
+                'description':'Navigate compact own turn/action indexes; omit action and pin end_turn while paging. '
+                    'Select start_turn and action for the retained result, or field=arguments for retained arguments. '
+                    'Continue the same selection at next_offset_bytes. Returned text is a canonical JSON projection '
+                    'with original round/receipt/action hashes and JSON pointer; no offers are replayed. '
+                    'Historical observations grant no current evidence, permission or repeated execution.',
+                'parameters':_InspectionHistory.model_json_schema()}})
         package = self._delivery_scope(saved)
         response_model = (_DeliveryResponse if package else _ReviewResponse if self.adaptive
             else _SubjectResponse if self.protocol else _Response)
@@ -2689,6 +2906,9 @@ class InspectionToolGateway:
                         def operation(actual_id):
                             try:
                                 self._shared_preflight(saved, call, arguments)
+                                if name == 'read_history':
+                                    return self._read_history(saved, arguments, before_turn=number,
+                                        read_limit=read_limit).model_dump(mode='json')
                                 if name == 'read_file':
                                     return self._shared_read(saved, request, arguments, actual_id, remaining[0], read_limit)
                                 if name == 'run_process':
@@ -2741,7 +2961,9 @@ class InspectionToolGateway:
                         json.dumps([identity,number,index,call['id']]).encode()).hexdigest()[:40]
                     saved.setdefault('source_invocations',[]).append(source_identity)
                     self.store.write_json(input_path,saved)
-                    if name=='read_file':
+                    if name=='read_history':
+                        result = self._read_history(saved, arguments, before_turn=number, read_limit=read_limit)
+                    elif name=='read_file':
                         evidence_number = (max((int(item['subject'].split('-')[1])
                             for item in saved['evidence']), default=0) if self.progressive else len(saved['evidence'])) + 1
                         row = self._observe(FileWindow.model_validate(arguments),
@@ -2824,6 +3046,7 @@ class InspectionToolGateway:
             if self.adaptive:
                 saved['inspection_context_policy'] = 'retained.v1'
                 saved['memory_protocol'] = 'journal.v1'
+                saved['inspection_history_policy'] = 'receipts.v1'
             if delivery_context is not None:
                 if (not isinstance(delivery_context, dict)
                         or delivery_context.get('schema_version') not in

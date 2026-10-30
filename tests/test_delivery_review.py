@@ -5,10 +5,12 @@ while completion/usage/integrity rejection is injected at its _cached boundary.
 Workspace resolution, directory expansion, hashing and assessment checks are real.
 """
 from copy import deepcopy
+import json
 from pathlib import Path
 import tempfile
 import unittest
 
+from simple_ar.app.operation_tools import delivery_requires_review, prepare_delivery_review
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.tools.delivery_review import DeliveryReview
@@ -104,7 +106,7 @@ class DeliveryReviewTests(unittest.TestCase):
         self.observations = []
         self.inspector = ControlledInspector(self.root, self.workspace, lambda: self.requests)
         self.owner = DeliveryReview(workspace=self.workspace, inspector=self.inspector,
-            user_requests=lambda: self.requests, observations=lambda: self.observations,
+            observations=lambda: self.observations,
             protocol='task.v3')
         self.delivery = {'summary': '交付说明', 'artifacts': ['workspace/bundle'],
             'report': {'status': 'canonical', 'manuscript': 'workspace/bundle/manuscript.md',
@@ -116,8 +118,19 @@ class DeliveryReviewTests(unittest.TestCase):
         self.observations.append(observed)
         return observed
 
+    def binding(self, delivery, protocol='task.v3', *, current_outputs=()):
+        request = DeliveryRequest.model_validate(delivery)
+        if not delivery_requires_review(request, protocol):
+            return None
+        resolved = self.workspace.resolve_delivery(request, current_outputs=current_outputs)
+        return prepare_delivery_review(self.workspace, request, resolved['artifacts'],
+            lambda: self.requests, protocol=protocol)
+
+    def issues(self, observations, delivery):
+        return self.owner.issues(observations, self.binding(delivery))
+
     def review(self, identity='parent-1', may_start=True):
-        return self.owner.review(self.delivery, identity, may_start=may_start)
+        return self.owner.review(self.binding(self.delivery), identity, may_start=may_start)
 
     def test_completion_claim_and_inventory_are_bound_without_report_or_surrogate_target(self):
         self.delivery.pop('report')
@@ -144,7 +157,7 @@ class DeliveryReviewTests(unittest.TestCase):
         self.assertEqual(binding['claim']['summary'], self.delivery['summary'])
         self.assertIn('delivery_assessment', proof['result']['metadata'])
         self.assertEqual(proof['result']['metadata']['assessments'], [])
-        self.assertEqual(self.owner.issues(self.observations, self.delivery), [])
+        self.assertEqual(self.issues(self.observations, self.delivery), [])
         self.assertEqual(self.review(), proof)
         self.assertEqual(len(self.inspector.calls), 1)
         reused = self.review('parent-2')
@@ -154,14 +167,14 @@ class DeliveryReviewTests(unittest.TestCase):
         self.delivery['artifacts'] = ['bundle/核查代码.py', 'workspace/bundle/appendix.txt',
                                       'bundle/manuscript.md', 'bundle/appendix.txt']
         self.assertEqual(self.review('aliases'), proof)
-        self.assertEqual(self.owner.issues(self.observations, self.delivery), [])
+        self.assertEqual(self.issues(self.observations, self.delivery), [])
         self.assertEqual(len(self.inspector.calls), 1)
         feedback = self.owner.feedback_observation(proof)
         self.assertEqual(feedback['result'], proof['result'])
         self.assertEqual(feedback['reviewed_inventory'], binding['artifacts'])
         self.assertEqual(feedback['reviewed_subjects'], {})
         self.delivery['summary'] = '改变完成主张，应重新绑定'
-        self.assertTrue(self.owner.issues(self.observations, self.delivery))
+        self.assertTrue(self.issues(self.observations, self.delivery))
         # Mutating the callback list cannot mutate a previously returned binding.
         self.requests.append('请解释补充材料的适用范围。')
         self.assertEqual(len(binding['requests']), 1)
@@ -172,17 +185,32 @@ class DeliveryReviewTests(unittest.TestCase):
         summary = self.review('summary-only')
         self.assertEqual(summary['binding']['artifacts'], {})
         self.observe(summary)
-        self.assertTrue(self.owner.issues(self.observations, self.delivery))
+        self.assertTrue(self.issues(self.observations, self.delivery))
         self.assertEqual(summary['result']['metadata']['delivery_assessment']['findings'][0]['subjects'], {})
         self.inspector.verdict = 'passed'
         self.delivery['summary'] = '按原问题修正后的直接回答。'
         self.observe(self.review('corrected-answer'))
-        self.assertEqual(self.owner.issues(self.observations, self.delivery), [])
+        self.assertEqual(self.issues(self.observations, self.delivery), [])
+
+        # Just-produced records may be bound before registration. The resulting
+        # opinion does not itself grant delivery eligibility on a later check.
+        produced = self.workspace.root / 'attempts' / 'producer' / 'output.txt'
+        produced.parent.mkdir(parents=True)
+        produced.write_text('Actual producer output', encoding='utf-8')
+        self.workspace.mounts['records'] = self.workspace.root / 'attempts'
+        candidate = {'summary': 'Produced output', 'artifacts': ['records/producer/output.txt']}
+        with self.assertRaisesRegex(ValueError, 'unregistered attempt records'):
+            self.binding(candidate)
+        bound = self.binding(candidate, current_outputs=(produced,))
+        self.assertEqual(bound['artifacts'], self.workspace.artifact_hashes([str(produced)]))
+        self.owner.review(bound, 'registered-output-review', may_start=True)
+        with self.assertRaisesRegex(ValueError, 'unregistered attempt records'):
+            self.binding(candidate)
 
     def test_local_pass_or_unbound_legacy_review_cannot_prove_delivery(self):
         proof = self.review()
         local = deepcopy(proof['result'])
-        self.assertTrue(self.owner.issues([local], self.delivery))
+        self.assertTrue(self.issues([local], self.delivery))
         # A cached local file pass is still not a package opinion, even when
         # the inspector input happens to contain the entire delivery binding.
         path = self.inspector._path('parent-1', 'result')
@@ -193,7 +221,7 @@ class DeliveryReviewTests(unittest.TestCase):
             'subjects': package['artifacts']}]
         self.inspector.store.write_json(path, forged)
         self.inspector.expected['parent-1'] = deepcopy(forged)
-        self.assertTrue(self.owner.issues([{'metadata': {'delivery_review': {
+        self.assertTrue(self.issues([{'metadata': {'delivery_review': {
             **proof, 'result': forged}}}], self.delivery))
         self.inspector.store.write_json(path, proof['result'])
         self.inspector.expected['parent-1'] = deepcopy(proof['result'])
@@ -202,7 +230,7 @@ class DeliveryReviewTests(unittest.TestCase):
         subset['metadata']['delivery_assessment']['artifacts'].pop(next(iter(package['artifacts'])))
         self.inspector.store.write_json(path, subset)
         self.inspector.expected['parent-1'] = deepcopy(subset)
-        self.assertTrue(self.owner.issues([{'metadata': {'delivery_review': {
+        self.assertTrue(self.issues([{'metadata': {'delivery_review': {
             **proof, 'result': subset}}}], self.delivery))
         self.inspector.store.write_json(path, proof['result'])
         self.inspector.expected['parent-1'] = deepcopy(proof['result'])
@@ -219,7 +247,7 @@ class DeliveryReviewTests(unittest.TestCase):
         saved.pop('delivery_context')
         self.inspector.store.write_json(self.inspector._path('parent-1', 'input'), saved)
         self.observe(proof)
-        self.assertTrue(self.owner.issues(self.observations, self.delivery))
+        self.assertTrue(self.issues(self.observations, self.delivery))
         rejected = self.review(may_start=False)
         self.assertIn('error', rejected)
         self.assertEqual(len(self.inspector.calls), 1)
@@ -228,27 +256,36 @@ class DeliveryReviewTests(unittest.TestCase):
         self.delivery['report']['formats'] = ['tex', 'markdown']
         histories = []
         for protocol in ('task.v1', 'task.v2'):
-            owner = DeliveryReview(self.workspace, self.inspector, lambda: self.requests,
+            owner = DeliveryReview(self.workspace, self.inspector,
                 observations=lambda: self.observations, protocol=protocol)
-            proof = owner.review(self.delivery, protocol, may_start=True)
-            self.assertEqual(proof['binding']['schema_version'], protocol.replace('task', 'delivery_review'))
+            proof = owner.review(self.binding(self.delivery, protocol), protocol, may_start=True)
+            expected = {'schema_version': protocol.replace('task', 'delivery_review'),
+                'requests': list(self.requests),
+                'manuscript': str(self.workspace.workspace / 'bundle' / 'manuscript.md'),
+                'formats': ['markdown', 'tex'],
+                'authorized_roots': {'workspace': str(self.workspace.workspace)},
+                'artifacts': self.workspace.artifact_hashes(sorted([
+                    str(self.workspace.workspace / 'bundle' / 'appendix.txt'),
+                    str(self.workspace.workspace / 'bundle' / 'manuscript.md')]))}
+            # Saved receipt equality includes wire field order and normalization.
+            self.assertEqual(json.dumps(proof['binding']), json.dumps(expected))
             self.assertEqual(self.inspector.calls[-1][1]['targets'], [proof['binding']['manuscript']])
             self.observe(proof)
             histories.append((owner, proof))
-        self.assertTrue(self.owner.issues(self.observations, self.delivery))
+        self.assertTrue(self.issues(self.observations, self.delivery))
         proof = self.review('current')
         self.assertEqual(proof['binding']['schema_version'], 'delivery_review.v3')
         self.assertEqual(len(self.inspector.calls), 3)
         for owner, historical in histories:
-            self.assertEqual(owner.review(self.delivery, historical['identity'], may_start=False), historical)
+            self.assertEqual(owner.review(self.binding(self.delivery, owner.protocol), historical['identity'], may_start=False), historical)
             self.assertEqual(self.inspector.store.read_json(self.inspector._path(historical['identity'], 'input'))
                 ['delivery_context'], historical['binding'])
         self.observe(proof)
-        self.assertFalse(self.owner.issues(self.observations,self.delivery))
+        self.assertFalse(self.issues(self.observations,self.delivery))
         self.delivery['artifacts'] = ['bundle/appendix.txt', 'workspace/bundle/manuscript.md']
         self.delivery['report']['manuscript'] = 'bundle/manuscript.md'
         self.delivery['report']['formats'] = ['markdown', 'tex', 'markdown']
-        self.assertEqual(self.owner.issues(self.observations, self.delivery), [])
+        self.assertEqual(self.issues(self.observations, self.delivery), [])
         self.assertEqual(self.review('cached'),proof)
         self.assertEqual(len(self.inspector.calls),3)
 
@@ -270,7 +307,7 @@ class DeliveryReviewTests(unittest.TestCase):
                 else:
                     filename = 'appendix.txt' if change == 'appendix' else 'manuscript.md'
                     self.workspace.resolve('workspace/bundle/' + filename).write_text('changed', encoding='utf-8')
-                self.assertTrue(self.owner.issues([observed], self.delivery))
+                self.assertTrue(self.issues([observed], self.delivery))
                 fresh = self.review('after-' + change)
                 self.assertNotIn('error', fresh)
                 self.assertNotEqual(fresh['binding'], proof['binding'])
@@ -289,8 +326,17 @@ class DeliveryReviewTests(unittest.TestCase):
                     rejected = self.review(may_start=may_start)
                     self.assertEqual(rejected['error'], reason)
                     self.assertEqual(rejected['result'], proof['result'])
-                    self.assertTrue(self.owner.issues([self.observe(rejected)], self.delivery))
+                    self.assertTrue(self.issues([self.observe(rejected)], self.delivery))
                 self.assertEqual(len(self.inspector.calls), 1)
+
+        # A retained review cannot authorize a path after its mount is withdrawn.
+        mount = self.workspace.mounts.pop('workspace')
+        try:
+            with self.assertRaisesRegex(ValueError, 'authorized mounts'):
+                self.review(may_start=False)
+            self.assertEqual(len(self.inspector.calls), 1)
+        finally:
+            self.workspace.mounts['workspace'] = mount
 
     def test_saved_context_and_outer_result_are_independently_checked(self):
         proof = self.review()
@@ -307,7 +353,7 @@ class DeliveryReviewTests(unittest.TestCase):
                     forged['result']['metadata']['delivery_assessment']['limitations'] = []
                 else:
                     forged[field] = {} if field == 'binding' else 'not-the-parent'
-                self.assertTrue(self.owner.issues([{'metadata': {'delivery_review': forged}}], self.delivery))
+                self.assertTrue(self.issues([{'metadata': {'delivery_review': forged}}], self.delivery))
                 self.inspector.store.write_json(path, original)
 
     def test_started_without_result_and_actual_result_tampering_are_diagnostic(self):
@@ -325,7 +371,7 @@ class DeliveryReviewTests(unittest.TestCase):
         self.inspector.store.write_json(path, tampered)
         rejected = self.review(may_start=False)
         self.assertIn('tampered', rejected['error'])
-        self.assertTrue(self.owner.issues([{'metadata': {'delivery_review': proof}}], self.delivery))
+        self.assertTrue(self.issues([{'metadata': {'delivery_review': proof}}], self.delivery))
         self.assertEqual(len(self.inspector.calls), 1)
 
     def test_fresh_failed_review_preserves_negative_metadata(self):
@@ -337,7 +383,7 @@ class DeliveryReviewTests(unittest.TestCase):
         self.assertEqual(metadata['delivery_assessment']['verdict'], 'needs_revision')
         self.assertIn('inspection_binding', metadata)
         self.assertIn('capability_artifacts', metadata)
-        self.assertTrue(self.owner.issues([{'metadata': {'delivery_review': rejected}}], self.delivery))
+        self.assertTrue(self.issues([{'metadata': {'delivery_review': rejected}}], self.delivery))
         self.review(may_start=False)
         self.assertEqual(len(self.inspector.calls), 1)
 
@@ -376,11 +422,11 @@ class DeliveryReviewTests(unittest.TestCase):
                 ledger = self.workspace.ledger.to_dict()
                 # Recreate the parent as on load. A fresh explicit identity may
                 # be considered separately; recovery never replays this one.
-                self.owner = DeliveryReview(self.workspace, self.inspector, lambda:self.requests,
+                self.owner = DeliveryReview(self.workspace, self.inspector,
                     observations=lambda:self.observations, protocol='task.v3')
                 for may_start in (False, True):
                     self.assertEqual(self.review(identity, may_start=may_start), proof)
-                self.assertEqual(self.owner.issues([observed], self.delivery), ['Delivery review failed: ' + cause])
+                self.assertEqual(self.issues([observed], self.delivery), ['Delivery review failed: ' + cause])
                 self.assertNotIn(identity, self.inspector.cached)
                 self.assertEqual(len(self.inspector.calls), calls)
                 self.assertEqual(self.workspace.ledger.to_dict(), ledger)
@@ -400,7 +446,7 @@ class DeliveryReviewTests(unittest.TestCase):
                 else:
                     self.assertNotIn('error', proof)
                 observed = {'metadata': {'delivery_review': proof}}
-                issues = self.owner.issues([observed], self.delivery)
+                issues = self.issues([observed], self.delivery)
                 self.assertTrue(issues)
                 if verdict == 'needs_revision':
                     self.assertIn('requested explanation is absent', ' '.join(issues))
@@ -412,7 +458,7 @@ class DeliveryReviewTests(unittest.TestCase):
         proof = self.review()
         self.observe(proof)
         source.write_text('changed source', encoding='utf-8')
-        self.assertTrue(self.owner.issues(self.observations, self.delivery))
+        self.assertTrue(self.issues(self.observations, self.delivery))
         self.assertIn('error', self.review())
         self.assertEqual(len(self.inspector.calls), 1)
         self.inspector.sources = self.workspace.artifact_hashes([str(source)])
@@ -434,7 +480,7 @@ class DeliveryReviewTests(unittest.TestCase):
                 self.assertTrue(feedback['opinion_available'])
                 self.assertEqual(feedback['reviewed_inventory'], prior['binding']['artifacts'])
                 self.assertEqual(feedback['result']['metadata']['delivery_assessment']['verdict'], verdict)
-                self.assertTrue(self.owner.issues(self.observations, self.delivery))
+                self.assertTrue(self.issues(self.observations, self.delivery))
                 self.assertIsNone(self.review('next-' + verdict, may_start=False))
                 calls = len(self.inspector.calls)
                 self.inspector.verdict = 'passed'
@@ -442,30 +488,30 @@ class DeliveryReviewTests(unittest.TestCase):
                 self.assertEqual(len(self.inspector.calls), calls + 1)
                 self.assertNotEqual(current['identity'], prior['identity'])
                 self.observe(current)
-                self.assertEqual(self.owner.issues(self.observations, self.delivery), [])
+                self.assertEqual(self.issues(self.observations, self.delivery), [])
 
     def test_partial_skips_review_and_legacy_plain_scope_is_unchanged(self):
         partial = {**self.delivery, 'unresolved': ['unfinished']}
-        self.assertIsNone(self.owner.review(partial, 'partial', may_start=True))
-        self.assertEqual(self.owner.issues([], partial), [])
+        self.assertIsNone(self.owner.review(self.binding(partial), 'partial', may_start=True))
+        self.assertEqual(self.issues([], partial), [])
         self.assertEqual(self.inspector.calls, [])
         self.inspector.verdict = 'needs_revision'
         prior = self.review('known-defect')
         self.observe(prior)
         partial['unresolved'].append('The requested explanation is absent.')
-        self.assertIsNone(self.owner.review(partial, 'partial-after-review', may_start=True))
-        self.assertEqual(self.owner.issues(self.observations, partial), [])
+        self.assertIsNone(self.owner.review(self.binding(partial), 'partial-after-review', may_start=True))
+        self.assertEqual(self.issues(self.observations, partial), [])
         self.assertEqual(partial['unresolved'], ['unfinished', 'The requested explanation is absent.'])
         feedback = self.owner.feedback_observation(prior)
         self.assertEqual(feedback['result']['metadata']['delivery_assessment']['verdict'], 'needs_revision')
         for protocol in ('task.v1', 'task.v2'):
-            owner = DeliveryReview(self.workspace, self.inspector, lambda: self.requests, protocol=protocol)
+            owner = DeliveryReview(self.workspace, self.inspector, protocol=protocol)
             for report, unresolved in ((None, []), (self.delivery['report'], ['unfinished']),
                     ({'status': 'candidate'}, []), ({'status': 'canonical'}, [])):
                 with self.subTest(protocol=protocol, report=report, unresolved=unresolved):
                     delivery = {**self.delivery, 'report': report, 'unresolved': unresolved}
-                    self.assertIsNone(owner.review(delivery, 'unused', may_start=True))
-                    self.assertEqual(owner.issues([], delivery), [])
+                    self.assertIsNone(owner.review(self.binding(delivery, protocol), 'unused', may_start=True))
+                    self.assertEqual(owner.issues([], self.binding(delivery, protocol)), [])
         self.assertEqual(len(self.inspector.calls), 1)
 
 

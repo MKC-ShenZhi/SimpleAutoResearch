@@ -5238,7 +5238,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 _, _, fake, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=2)
                 result = app.workspace.workspace / 'result.txt'
                 result.write_text('original')
-                delivery = {'summary': 'Original', 'artifacts': [str(result)]}
+                # This isolates terminal recovery; no independent reviewer is
+                # configured in the fixture, so the claim must remain partial.
+                delivery = {'summary': 'Original', 'artifacts': [str(result)],
+                            'unresolved': ['Independent review is outside this recovery scenario']}
                 if sourced:
                     delivery['summary_source'] = {'path': str(result)}
                 fake.chat_turn.side_effect = [self._native_message('deliver_result', delivery, 'old-terminal')]
@@ -9768,10 +9771,6 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
         workspace = app.workspace
         mounts = dict(workspace.mounts)
-        (workspace.workspace / 'draft.md').write_text('Retained manuscript', encoding='utf-8')
-        delivery = {'summary': 'Retained draft', 'artifacts': ['workspace/draft.md'],
-            'report': {'status': 'canonical', 'manuscript': 'workspace/draft.md', 'formats': ['markdown']}}
-        binding = app.operations.delivery_review._binding(delivery)
         result = workspace.call('run_process', {'argv': ['python', '-c',
             "import sys; print('checked input'); print('Invalid input schema', file=sys.stderr); sys.exit(2)"]},
             identity='failed-process')
@@ -9816,11 +9815,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(json.loads(receipt.data['text'])['invocation_id'], invocation)
         self.assertEqual(workspace.ledger.to_dict(), ledger)
         self.assertEqual(workspace.mounts, mounts)
-        # No added diagnostic mount may change the historical review binding.
+        # Diagnostic access must not add authority, including after reload.
         restored = ToolApplication.load(workspace.root)
         self.assertEqual(restored.workspace.mounts, mounts)
-        self.assertEqual(restored.operations.delivery_review._binding(delivery), binding)
-        self.assertEqual(binding['authorized_roots'], {name: str(path) for name, path in mounts.items()})
 
     def test_workspace_process_diagnostics_reject_unrelated_files_and_escaped_receipts(self) -> None:
         _, inputs, _, _, app, _ = self._native_fixture()

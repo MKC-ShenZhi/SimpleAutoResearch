@@ -34,7 +34,7 @@ from simple_ar.tools.workspace import (WorkspaceToolGateway, workspace_tool_spec
     DeliveryRequest, FileWindow, validate_workspace_arguments, workspace_observation_view, workspace_history_identity,
     resolve_source_mount)
 from simple_ar.tools.materials import (
-    read_material_window, journal_material_references, journal_read_windows, observe_text_window,
+    read_material_window, journal_material_references, journal_read_windows, accepted_review_journal, observe_text_window,
     current_text_window, admit_text_window, uncovered_text_ranges, observed_window_key,
 )
 from simple_ar.tools.sources import SourcePolicy, SourceToolGateway, source_tool_specs
@@ -1758,7 +1758,11 @@ class ToolApplication:
             extensions=extensions, creation_declarations=creation_declarations)
         config['inspection_protocol'] = 'subjects.v3'
         config['inspection_execution_protocol'] = 'shared.v1'
-        config['delivery_review_protocol'] = 'task.v3'
+        # Caller-driven tasks without a model cannot start an independent model
+        # review. Keep their actual delivery and any explicit checks usable;
+        # saved tasks retain whichever review contract they were created with.
+        if config['model'] is not None:
+            config['delivery_review_protocol'] = 'task.v3'
         from simple_ar.app.operation_tools import CURRENT_PROFESSIONAL_CONTRACT
         config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
         if context_protocol is not None:
@@ -3273,19 +3277,42 @@ class ToolApplication:
                             'version_scope':'Historical operation result, not proof of current output bytes or new permission'})
                     # This projection consumes recorded text only; malformed old
                     # arguments must not break later context or grant read access.
-                    text_rows = [(row['data'], row['field']) for row in read_windows]
+                    text_rows = [(row['data'], row['field'], record, call['function']['name'])
+                        for row in read_windows]
+                    if working_mode and retained_inputs and item.get('review_result'):
+                        try:
+                            review = accepted_review_journal(self.workspace, self.session.store, item, result)
+                            review_record = 'records/' + review['record'].removeprefix('attempts/')
+                            selected = ((review['receipt'].get('metadata') or {}).get('delivery_assessment') or {}).get(
+                                'evidence_sha256', {})
+                            text_rows.extend((row['data'], row['field'], review_record, 'inspect_artifacts')
+                                for row in journal_read_windows(review['receipt'], {})
+                                if selected.get(row['data'].get('absolute_path')) == row['data'].get('sha256')
+                                and row['data'].get('sha256'))
+                            for action in self.operations.inspection.investigation_actions(Path(item['result']).parent.name):
+                                observed = self._history_observation(action['call'], action['result'],
+                                    action['record'], navigation=True)
+                                working_rows.append({'turn': position, 'record': observed['record'],
+                                    'kind': 'operation_result', 'tool': action['call']['function']['name'],
+                                    'text': json.dumps({'inspection_action': observed,
+                                        'scope': 'Recorded inspection operation; execution alone does not prove '
+                                            'independent calculation or scientific correctness.'},
+                                        ensure_ascii=False, separators=(',', ':')),
+                                    'version_scope': 'Historical inspection action, not current evidence or permission'})
+                        except (ValueError, TypeError, KeyError, OSError, RuntimeError):
+                            pass  # A missing or unverified opinion grants no material observation.
                     if not read_windows and not retained_inputs:
-                        text_rows.append((data, 'data.text'))
+                        text_rows.append((data, 'data.text', record, call['function']['name']))
                     if not retained_inputs:
                         for key in ('matches', 'retained_preview'):
-                            text_rows.extend((row, f'data.{key}.{number}.text')
+                            text_rows.extend((row, f'data.{key}.{number}.text', record, call['function']['name'])
                                 for number, row in enumerate(data.get(key) or []) if isinstance(row, dict))
-                    for row, field in text_rows:
+                    for row, field, source_record, source_tool in text_rows:
                         text = row.get('text')
                         if not isinstance(text, str) or not text:
                             continue
-                        supplied.append({'turn': position, 'record': record, 'field': field,
-                            'tool': call['function']['name'], 'role': 'historical_observation',
+                        supplied.append({'turn': position, 'record': source_record, 'field': field,
+                            'tool': source_tool, 'role': 'historical_observation',
                             **({'path': indexed['arguments']['path']}
                                 if 'path' in indexed['arguments'] and field == 'data.text' else {}),
                             **{key: row[key] for key in ('path', 'absolute_path', 'sha256', 'offset_bytes',
@@ -3980,8 +4007,7 @@ class ToolApplication:
                     # success until verified; leave the caller capacity to
                     # act on the result through this same ledger.
                     review_floor = (self._completion_floor(self._client(store.root.name), dispatch=True)
-                        if start_review and self.operations.delivery_review is not None
-                            and self.operations.delivery_review.requires_review(request) else {})
+                        if start_review and self.operations.requires_delivery_review(request) else {})
                     with self.ledger.protect_remaining(review_floor):
                         review = self.operations.review_delivery(delivery, store.root.name,
                             may_start=start_review, current_result=current, current_outputs=outputs)
@@ -4523,7 +4549,9 @@ class ToolApplication:
                     and self.session.store.read_json('delivery.json') == data):
                 return True  # Already committed, including historical unbound deliveries.
             data = self.workspace.resolve_delivery(request)
-            if not request.unresolved:
+            # Operation acceptance already owns completeness for this current
+            # inventory. Historical non-operation tasks retain their old gate.
+            if self.operations is None and not request.unresolved:
                 from simple_ar.tools.workspace import missing_delivery_files
                 missing = missing_delivery_files(self.workspace, data['artifacts'],
                     self.state['config'].get('delivery_files') or [])

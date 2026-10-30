@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -54,6 +55,78 @@ def expand_history_view(view):
 
 
 class WorkingContextTests(unittest.TestCase):
+    def test_inspection_history_projects_selected_owner_values_without_replaying_offers(self):
+        from simple_ar.tools.inspection import InspectionToolGateway
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        store, identity = ArtifactStore(root), 'own-inspection'
+        ledger = BudgetLedger({'llm_requests':3, 'total_tokens':1000})
+        ledger.reserve('round-0', {'llm_requests':1, 'total_tokens':100},
+            attempt_id=identity, logical_call_id='inspect-artifacts-'+identity)
+        ledger.settle('round-0', {'llm_requests':1, 'total_tokens':80})
+        arguments = [{'path':'measurements/missing.txt'}, {'path':'measurements/original.txt', 'max_bytes':8}]
+        results = [
+            {'tool_name':'read_file', 'status':'error', 'error':'原始错误: missing original', 'data':{}},
+            {'tool_name':'read_file', 'status':'ok', 'data':{'text':'原始'*2000,
+                'next_offset_bytes':12000, 'size_bytes':24000, 'has_more':True}}]
+        calls = [{'id':str(i), 'type':'function', 'function':{'name':'read_file',
+            'arguments':json.dumps(args)}} for i,args in enumerate(arguments)]
+        trace = {'offer':{'messages':[{'role':'user', 'content':'Repeated input. '*60000}]},
+            'completed':True, 'response':{'role':'assistant', 'tool_calls':calls},
+            'results':[{'call_id':str(i), 'arguments':args, 'result':result}
+                for i,(args,result) in enumerate(zip(arguments,results))]}
+        relative = f'tools/inspection/{identity}/sources-0.json'
+        store.write_json(relative, trace)
+        original = store.resolve(relative).read_bytes()
+        digest = hashlib.sha256(original).hexdigest()
+        saved = {'identity':identity, 'inspection_history_policy':'receipts.v1', 'source_rounds':[digest]}
+        owner = InspectionToolGateway(root, SimpleNamespace(ledger=ledger),
+            Mock(side_effect=AssertionError('History must not request new work')), protocol='subjects.v3')
+        before = ledger.to_dict()
+        index = owner._read_history(saved, {}, before_turn=1).data
+        entries = json.loads(index['text'])
+        self.assertEqual(index['projection'], 'navigation_index')
+        self.assertLess(len(index['text'].encode('utf-8')), 2000)
+        self.assertNotIn('Repeated input.', index['text'])
+        self.assertEqual(entries[0]['sha256'], digest)
+        self.assertEqual([row['action'] for row in entries[0]['actions']], [0,1])
+        self.assertEqual(entries[0]['actions'][0]['status'], 'error')
+        for action in range(2):
+            for field in ('result', 'arguments'):
+                value = trace['results'][action][field]
+                canonical = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                    separators=(',', ':'), allow_nan=False).encode('utf-8')
+                payload = bytearray()
+                while True:
+                    page = owner._read_history(saved, {'action':action, 'field':field,
+                        'offset_bytes':len(payload), 'max_bytes':4000}, before_turn=1).data
+                    piece = page['text'].encode('utf-8')
+                    self.assertEqual(piece, canonical[len(payload):page['next_offset_bytes']])
+                    self.assertLessEqual(len(piece), 4000)
+                    self.assertEqual(page['projection'], 'retained_value')
+                    self.assertEqual(page['sha256'], digest)
+                    self.assertEqual(page['pointer'], f'/results/{action}/{field}')
+                    self.assertEqual(page['projection_sha256'], hashlib.sha256(canonical).hexdigest())
+                    payload.extend(piece)
+                    if not page['has_more_bytes']:
+                        break
+                self.assertEqual(json.loads(payload), value)
+                self.assertNotIn(b'Repeated input.', payload)
+        self.assertEqual(owner._conversation_rows(saved)[0]['record'], relative+'#results/0')
+        for proposal in ({'path':'../.env'}, {'identity':'another-inspector'}, {'start_turn':1}, {'action':2}):
+            with self.subTest(proposal=proposal), self.assertRaises(ValueError):
+                owner._read_history(saved, proposal, before_turn=1)
+        with self.assertRaisesRegex(ValueError, 'saved contract'):
+            owner._read_history({'identity':identity, 'source_rounds':[digest]}, {}, before_turn=1)
+        self.assertEqual(ledger.to_dict(), before)
+        ledger.reserve('unfinished', {'llm_requests':1, 'total_tokens':100},
+            attempt_id=identity, logical_call_id='inspect-artifacts-'+identity)
+        unsettled = ledger.to_dict()
+        with self.assertRaisesRegex(ValueError, 'unsettled'):
+            owner._read_history(saved, {}, before_turn=1)
+        self.assertEqual(ledger.to_dict(), unsettled)
+        self.assertEqual(store.resolve(relative).read_bytes(), original)
+        owner.client_factory.assert_not_called()
+
     def test_required_notes_are_charged_once_before_retained_originals(self):
         original = observation(0, 'Original measurement ' * 200,
             role='historical_observation')
