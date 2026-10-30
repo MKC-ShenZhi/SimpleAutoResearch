@@ -4669,9 +4669,10 @@ class ToolApplication:
         else:
             try:
                 if capability == 'native_action':
-                    if (pending['kind'] in {'model', 'tool'} and not completed_llm_usage_is_accounted(
-                            row.to_dict() for row in self.ledger.entries)):
-                        raise RuntimeError('Unresolved physical accounting prevents new work')
+                    if pending['kind'] in {'model', 'tool'}:
+                        # Use the same closed-operation proof as explicit model
+                        # continuation; retained liabilities are never settled here.
+                        self._check_authorization_operations(allow_closed_model_charges=True)
                     self._check_action_inputs(pending, before_execution=True)
                     arguments = {'accepted': {key:value for key,value in pending.items() if key != 'result'},
                                  'perform': perform}
@@ -4811,7 +4812,8 @@ class ToolApplication:
         if self.state['config'].get('memory_protocol') == 'journal.v1' and entry.purpose in MEMORY_PURPOSES:
             if self._retained_checkpoint_charge(entry):
                 return True
-        if (entry.status != 'unknown' or entry.session_id != self.session.manifest.session_id
+        if (entry.status != 'unknown' or entry.actual_source != 'reservation_bound'
+                or entry.session_id != self.session.manifest.session_id
                 or not entry.logical_call_id
                 or set(entry.reserved) != {'llm_requests', 'total_tokens'}
                 or entry.reserved['llm_requests'] != 1

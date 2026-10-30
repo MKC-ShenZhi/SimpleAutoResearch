@@ -3828,6 +3828,76 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.assertEqual(self.app.ledger.to_dict(), ledger)
                 self.assertEqual(self.send.call_count-start, 3)
 
+        # Public explicit retry creates a new native decision. Its old failed
+        # decision has no settled same-logical-call successor to excuse its charge.
+        catalog = self.directory/'explicit-retry-models.toml'
+        catalog.write_text('version = 1\n[routes]\ndefault = "offline"\n'
+            '[profiles.offline]\napi = "openai_chat"\nbase_url = "https://offline.example/v1"\n'
+            'model = "fixture"\napi_key_env = "SAR_OFFLINE_TEST_KEY"\ncapabilities = ["text", "code"]\n'
+            'retry_attempts = 1\nconnect_retry_attempts = 1\nmax_output_tokens = 2048\n'
+            'context_input_tokens = 100000\n', encoding='utf-8')
+        with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG':str(catalog), 'SAR_OFFLINE_TEST_KEY':'offline'}):
+            self.root = self.directory/'explicit-native-retry'
+            self.app = ToolApplication.create(self.root, 'Read the supplied CSV and deliver a short Markdown account.',
+                model='profile:offline', sources={'measurements':self.inputs},
+                max_turns=30, max_tokens=900000, max_attempts=100, tool_contracts='full')
+            def terminated_decision(*args, **kwargs):
+                raise LLMStreamError('Controlled one-attempt native response loss')
+            self.send.side_effect = terminated_decision
+            start = self.send.call_count
+            self._run()
+            self.assertEqual(self.send.call_count, start+1)
+            pending = deepcopy(self.app.state['pending'])
+            self.assertEqual(pending['kind'], 'model')
+            lost, = [entry.to_dict() for entry in self.app.ledger.entries if entry.status=='unknown']
+            self.assertEqual(lost['attempt_id'], pending['attempt'])
+            self.assertEqual(lost['actual_source'], 'reservation_bound')
+            self.assertEqual(lost['actual'], {'llm_requests':1})
+            self.assertGreater(lost['reserved']['total_tokens'], 2048)
+            failed = next(row for row in self.app.session.list_attempts() if row.attempt_id==pending['attempt'])
+            self.assertEqual((failed.capability, failed.status), ('native_turn', 'failed'))
+            failed_files = self._versions(self.root/'attempts'/failed.attempt_id)
+            self.app = ToolApplication.load(self.root)
+            self.send.side_effect = self._provider
+            body = '# Supplied observations\n\nThe sample mean is 2.0 across three supplied observations.\n'
+            delivery = self._delivery('report.md')
+            delivery['report']['formats'] = ['markdown']
+            self.decisions.extend([_action('read_file', path='measurements/observations.csv'),
+                _action('write_file', path='report.md', content=body), _action('deliver_result', **delivery)])
+            reviews = len(self.inspection_requests)
+            self._run(retry_model=True,
+                should_stop=lambda: bool((self.app.state['pending'] or {}).get('inspection')))
+            self.assertTrue(self.app.state['pending'].get('inspection'), self.app.result_snapshot())
+            retained = next(entry for entry in self.app.ledger.entries
+                if entry.reservation_id==lost['reservation_id'])
+            calls = self.send.call_count
+            with patch.object(retained, 'actual_source', 'estimated'):
+                with self.assertRaisesRegex(ValueError, 'unknown operations'):
+                    self.app._check_authorization_operations(allow_closed_model_charges=True)
+            self.assertEqual(self.send.call_count, calls)
+            self.assertEqual(retained.to_dict(), lost)
+            self.app.ledger.save()
+            self._run()
+            self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+            self.assertFalse(self.decisions)
+            self._ok('write_file')
+            self.assertEqual((self.root/'workspace/report.md').read_text(encoding='utf-8'), body)
+            self.assertGreater(len(self.inspection_requests), reviews)
+            self.assertEqual(self._assessment()['verdict'], 'passed')
+            entries = [entry.to_dict() for entry in self.app.ledger.entries]
+            self.assertEqual([entry for entry in entries if entry['status']=='unknown'], [lost])
+            self.assertFalse(any(entry['status']=='settled' and entry['logical_call_id']==lost['logical_call_id']
+                for entry in entries))
+            self.assertFalse(self._process_receipts())
+            usage, calls = self.app.ledger.to_dict(), self.send.call_count
+            self.app = ToolApplication.load(self.root)
+            self._run()
+            self.assertEqual(self.send.call_count, calls)
+            self.assertEqual(self.app.ledger.to_dict(), usage)
+            self.assertEqual(self._versions(self.root/'attempts'/failed.attempt_id), failed_files)
+            self.assertEqual(next(row.status for row in self.app.session.list_attempts()
+                if row.attempt_id==failed.attempt_id), 'failed')
+
     def test_inspection_low_capacity_still_requires_a_real_terminal_opinion(self):
         # Request pressure, token pressure, and unknown prior usage all use
         # the same owner; none may synthesize a successful assessment.
