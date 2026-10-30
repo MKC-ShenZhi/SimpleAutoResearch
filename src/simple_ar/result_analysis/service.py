@@ -969,17 +969,6 @@ def audit_result(result: AnalysisResult, metric_summary: dict[str, Any],
     available.update(str(row["evidence_id"]) for row in rows
         if isinstance(row, dict) and row.get("evidence_id") and is_number(row.get("mean"))
         and math.isfinite(float(row["mean"])))
-    for name, locator in context.artifacts.items():
-        try:
-            path = Path(locator)
-            if not path.is_absolute():
-                if not context.run_dir:
-                    continue
-                path = Path(context.run_dir) / path
-            if path.is_file():
-                available.update((str(name), str(locator)))
-        except (OSError, ValueError):
-            continue
     downgraded: list[str] = []
     unsupported: list[str] = []
     for claim in result.claims:
@@ -1000,7 +989,8 @@ def audit_result(result: AnalysisResult, metric_summary: dict[str, Any],
                 claim.verdict = "not_evaluated"
                 claim.confidence = "low"
                 claim.limitations.append("Claim was downgraded because no reference resolves to a supplied metric, "
-                    "result row, artifact, or exact source passage. Reference presence alone does not prove the claim.")
+                    "result row, or exact source passage. A path is not an observation; "
+                    "a reference alone does not prove the claim.")
                 downgraded.append(claim.claim_id)
         if claim.verdict in {"unsupported", "not_evaluated"}:
             unsupported.append(claim.claim_id)

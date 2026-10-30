@@ -533,11 +533,12 @@ class ResultAnalysisTests(unittest.TestCase):
             Path(tmp, "observed.txt").write_text("input", encoding="utf-8")
             sources = context.model_copy(update={"run_dir": tmp,
                 "artifacts": {"observed": "observed.txt", "missing": "missing.txt"}})
-            for source, expected in (("observed", "supported"), ("missing", "not_evaluated")):
+            # A file locator, even if it exists, is not an observed source body.
+            for source in ("observed", "missing"):
                 response = {"claims": [{"claim_id": "c7", "claim": "Recorded input", "verdict": "supported",
                                         "evidence": [{"source": source}]}]}
                 result = run_result_analysis(sources, client=FakeAnalysisClient(response), use_llm=True)
-                self.assertEqual(result.claims[0].verdict, expected)
+                self.assertEqual(result.claims[0].verdict, "not_evaluated")
         rows = [{"dataset": f"d{i}", "condition": "model", "rmse_mean": float(i)} for i in range(250)]
         long_context = context.model_copy(update={"project_results": {"aggregates": rows}})
         response = {"claims": [{"claim_id": "c8", "claim": "Recorded row", "verdict": "supported",
