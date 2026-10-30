@@ -179,8 +179,8 @@ class DeliveryReview:
             return None
         return self._verified(identity, binding)
 
-    def resolve_observation(self, observed: dict, *, review_record: str | None = None) -> dict:
-        """Project a closed shared review onto a copy of its original producer observation.
+    def _resolve_observation(self, observed: dict, *, review_record: str | None = None) -> tuple[dict, ToolResult | None]:
+        """Project a closed shared review and return the opinion already verified for it.
 
         The caller owns proof of the producer record. When provided, its path
         also binds a pending review to the producer attempt. A supplied review
@@ -192,7 +192,7 @@ class DeliveryReview:
         metadata = projected.get('metadata') or {}
         envelope = metadata.get('delivery_review')
         if not self._pending_envelope(envelope):
-            return projected
+            return projected, None
         try:
             result = self._envelope_result(envelope, envelope['binding'], record=projected.get('record'))
             if result is not None and review_record is not None:
@@ -205,11 +205,14 @@ class DeliveryReview:
                 accepted_scoped_opinion(root, self.workspace, session_id, review_record,
                     envelope['identity'], expected=result.model_dump(mode='json'))
         except _ERRORS:
-            return projected
+            return projected, None
         if result is not None:
             projected['metadata']['delivery_review'] = self._envelope(envelope['binding'],
                 envelope['identity'], result)
-        return projected
+        return projected, result
+
+    def resolve_observation(self, observed: dict, *, review_record: str | None = None) -> dict:
+        return self._resolve_observation(observed, review_record=review_record)[0]
 
     def _retained(self, identity: str) -> ToolResult:
         """Preserve failed work for diagnosis only; this never supplies acceptance."""
@@ -311,11 +314,12 @@ class DeliveryReview:
                 candidate = (observed.get('metadata') or {}).get('delivery_review')
                 if not isinstance(candidate, dict) or candidate.get('binding') != binding:
                     continue
-                if observed.get('review_record') is not None:
-                    resolved = self.resolve_observation(observed, review_record=observed['review_record'])
+                if observed.get('review_record') is not None and self._pending_envelope(candidate):
+                    resolved, result = self._resolve_observation(observed, review_record=observed['review_record'])
                     candidate = (resolved.get('metadata') or {}).get('delivery_review')
-                    if self._pending_envelope(candidate):
+                    if result is None or self._pending_envelope(candidate):
                         return ['Independent opinion record cannot be verified for this delivery']
+                    return self._result_issues(result, binding)
                 result = self._envelope_result(candidate, binding, record=observed.get('record'))
                 if result is None:
                     return ['Current delivery review is still pending']

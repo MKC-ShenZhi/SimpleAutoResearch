@@ -2759,6 +2759,14 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self._assessment()['verdict'], 'passed')
         self.assertEqual(self._last('inspect_artifacts'), local)
         self.assertIn('Recheck that the supplied rows', json.dumps(self.inspection_views[-1]['prior_work_opinions']))
+        opinions = self.inspection_views[-1]['prior_work_opinions']
+        prior = next(row for row in opinions if not row.get('delivery_context')
+            and 'Recheck that the supplied rows' in json.dumps(row['result']))
+        self.assertEqual(_assessments(prior['result']), _assessments(local))
+        self.assertNotIn('usage', prior['result']['metadata'])
+        self.assertTrue(all('windows' not in row for role in ('targets', 'evidence')
+            for row in prior['result']['data'][role]))
+        self.assertEqual(self.app.operations.inspection.feedback_view(prior), prior)
         self.assertEqual((self.root / 'workspace/analysis.md').read_bytes(), correct_bytes)
         self._reload()
         self.assertEqual(self._last('inspect_artifacts'), local)
@@ -3887,6 +3895,25 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(presented['data']['source_observations']['record'],record)
         self.assertIn('a,1',json.dumps(result))
         self.assertNotIn('a,1',json.dumps(presented))
+        # Raw historical feedback and ordinary results have one material owner.
+        owner = self.app.operations.inspection
+        feedback = {'record': record, 'result': raw_result, 'opinion_available': True}
+        self.assertEqual(owner.feedback_view(feedback)['result'], presented)
+        self.assertEqual(result, raw_result)
+        self.assertEqual(owner.coordination_result(ToolResult.model_validate(presented), receipt_path=record), presented)
+        self.assertEqual(owner.feedback_view({'record': 'records/other/native_result.json',
+            'result': presented})['result'], presented)
+        self.assertNotIn('usage', presented['metadata'])
+        self.assertEqual(sum(presented['metadata']['usage_status'].values()), len(result['metadata']['usage']))
+        navigation = presented['data']['source_observations']
+        retained = json.loads(self.app.workspace.resolve(navigation['record']).read_bytes())
+        for field in navigation['fields']:
+            value = retained
+            for key in field.split('.'):
+                value = value[key]
+            self.assertEqual(value, result[field.split('.')[0]][field.split('.')[1]])
+        self.assertEqual(owner.coordination_result(ToolResult.model_validate(result), receipt_path=''), result)
+        self.assertEqual(owner.feedback_view({'result': raw_result}), {'result': raw_result})
         assessment = self._assessment()
         self.assertEqual(assessment['verdict'],'passed')
         self.assertEqual(assessment['evidence_sha256'][str(self.inputs/'observations.csv')],
@@ -4443,6 +4470,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
                          {'decisions':decisions})
         self.assertNotIn('rejected_opinion', result['metadata'])
         identity = Path(result['data']['record']).parts[1]
+        feedback = self.app.operations.inspection.feedback_view({
+            'record': f'tools/inspection/{identity}/result.json', 'result': result})
+        self.assertEqual(feedback['result']['status'], 'error')
+        self.assertEqual(feedback['result']['error'], result['error'])
+        self.assertEqual(feedback['result']['data']['rejected_opinion'], diagnostic)
+        self.assertEqual(_assessments(feedback['result']), _assessments(result))
         saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
         records = self._versions(self.root/f'tools/inspection/{identity}')
         calls, ledger = self.send.call_count, self.app.ledger.to_dict()
@@ -4893,6 +4926,41 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(failed['status'], 'error')
         self.assertEqual(failed['metadata']['assessment']['coverage'], 'complete')
         self.assertEqual(failed['metadata']['assessment']['verdict'], 'incomplete')
+        # The group contract and a later failed review both remain usable as
+        # guidance; projection must not infer that either retires the other.
+        for identity, result in (('legacy-negative', negative), ('legacy-failed', failed)):
+            feedback = {'record': gateway._path(identity, 'result'), 'result': result}
+            original = deepcopy(feedback)
+            projected = gateway.feedback_view(feedback)
+            self.assertEqual(feedback, original)
+            self.assertEqual(projected['result']['metadata']['assessment'], result['metadata']['assessment'])
+            self.assertEqual(projected['result']['status'], result['status'])
+            self.assertEqual(projected['result']['error'], result['error'])
+            self.assertEqual(projected['result']['metadata']['usage_diagnostics'],
+                [row for row in result['metadata']['usage'] if row['status'] != 'settled' or row.get('reason')])
+            self.assertEqual(gateway.feedback_view(projected), projected)
+        # Old delivery receipts embed the same real owner result. Their
+        # field paths must resolve inside the producer, not at its root.
+        for version in ('delivery_review.v1', 'delivery_review.v2'):
+            binding = {'schema_version': version}
+            producer = self.directory/f'{identity}-{version}.json'
+            producer.write_text(json.dumps({'metadata': {'delivery_review': {
+                'binding': binding, 'result': result}}}), encoding='utf-8')
+            wrapped = gateway.feedback_view({'record': str(producer),
+                'delivery_context': binding, 'result': result})
+            self.assertEqual(wrapped['result']['metadata'], projected['result']['metadata'])
+            self.assertEqual(gateway.feedback_view(wrapped), wrapped)
+            navigation = wrapped['result']['data']['source_observations']
+            for field in navigation['fields']:
+                value = json.loads(Path(navigation['record']).read_bytes())
+                for key in field.split('.'):
+                    value = value[key]
+                self.assertTrue(field.startswith('metadata.delivery_review.result.'))
+                self.assertEqual(value, result[field.split('.')[-2]][field.split('.')[-1]])
+            self.assertEqual(gateway.feedback_view({**wrapped, 'result': projected['result']})['result'],
+                projected['result'])  # An owner locator overrides the outer producer.
+            self.assertEqual(gateway.coordination_result(ToolResult.model_validate(wrapped['result']),
+                receipt_path=feedback['record']), projected['result'])
         self.assertTrue(assessment_issues(self.app.workspace, [negative, failed], ['notes.md']))
         self.assertTrue(assessment_issues(self.app.workspace, [negative, failed],
             ['notes.md'], require_pass=['notes.md']))

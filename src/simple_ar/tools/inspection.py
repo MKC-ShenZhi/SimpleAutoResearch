@@ -812,20 +812,34 @@ class InspectionToolGateway:
             'artifact_count': len(binding['artifacts'])}
 
     @staticmethod
-    def coordination_result(result: ToolResult, *, receipt_path: str) -> dict:
+    def coordination_result(result: ToolResult, *, receipt_path: str, receipt_prefix: str | None = None) -> dict:
         """Return inspection decisions and source locators, not another copy of its reading session."""
+        projected = result.model_dump(mode='json')
+        if not receipt_path:
+            return projected  # No recoverable origin: keep the complete observation.
+        source = projected['data'].get('source_observations', {})
+        # Navigation is relative to the selected receipt, not to the opinion's
+        # protocol. A legacy producer embeds the result; an owner receipt does not.
+        nested = 'metadata.delivery_review.result.'
+        same_origin = source.get('record') == receipt_path
+        if receipt_prefix is None:
+            receipt_prefix = nested if same_origin and any(
+                field.startswith(nested) for field in source.get('fields', [])) else ''
+        fields = (list(source.get('fields', [])) if same_origin else
+            [receipt_prefix + field.removeprefix(nested) for field in source.get('fields', [])
+                if field != 'metadata.delivery_review.binding'])
         package = result.metadata.get('delivery_assessment')
         if 'delivery_opinion' in result.metadata:
-            projected = result.model_dump(mode='json')
-            projected['data']['source_observations']['record'] = receipt_path
+            projected['data']['source_observations'].update(record=receipt_path, fields=fields)
             return projected
         if package is not None:
             # The full inventory, source digests and physical usage are checked
             # by their owners and retained once in the raw receipt. Repeating
             # those proofs in every model turn crowds out the actual evidence.
-            return {**result.model_dump(mode='json'),
+            return {**projected,
                 'data': {'source_observations': {'record': receipt_path,
-                    'fields': ['data.targets', 'data.evidence', 'metadata.delivery_assessment', 'metadata.usage'],
+                    'fields': [receipt_prefix + field for field in
+                        ('data.targets', 'data.evidence', 'metadata.delivery_assessment', 'metadata.usage')],
                     'scope': 'Original windows, exact version bindings and usage remain in this receipt. '
                         'This projected opinion is guidance, not source evidence or current acceptance.'},
                     **({'rejected_opinion': deepcopy(result.data['rejected_opinion'])}
@@ -838,31 +852,54 @@ class InspectionToolGateway:
                     'limitations': package['limitations'],
                     'artifact_count': len(package['artifacts']),
                     'evidence_count': len(package['evidence_sha256'])}}}
-        data = dict(result.data)
+        data, metadata = projected['data'], projected['metadata']
         for role in ('targets','evidence'):
             if role in data:
                 data[role] = [{key:value for key,value in row.items() if key!='windows'}
                     for row in data[role]]
-        data['source_observations'] = {'record':receipt_path,'fields':['data.targets','data.evidence'],
-            'scope':'Full original read windows remain in this receipt; the inspection opinion is not source evidence. '
-                    'Read a particular source or archived window when its actual text is needed.'}
-        return {**result.model_dump(mode='json'),'data':data}
+                field = receipt_prefix + 'data.' + role
+                if field not in fields:
+                    fields.append(field)
+        if 'usage' in metadata:
+            usage = metadata.pop('usage')
+            metadata['usage_status'] = {status: sum(row['status'] == status for row in usage)
+                for status in dict.fromkeys(row['status'] for row in usage)}
+            metadata['usage_diagnostics'] = [row for row in usage
+                if row['status'] != 'settled' or row.get('reason')]
+            field = receipt_prefix + 'metadata.usage'
+            if field not in fields:
+                fields.append(field)
+        data['source_observations'] = {**source, 'record':receipt_path, 'fields':fields,
+            'scope':'Original windows and accounting remain in this receipt. Assessments and version bindings '
+                'are guidance, not source evidence, current acceptance or proof of settlement. '
+                'Read the original receipt or authorized source windows when their contents are needed.'}
+        return projected
 
     @classmethod
     def feedback_view(cls, feedback: dict) -> dict:
         """Supply exact findings and affected-version status, with full proof by reference.
 
-        Also handles retained v3 input without rewriting its historical bytes.
+        Also handles retained input without rewriting its historical bytes.
         Callers still verify the original owner result before supplying feedback.
         """
         binding = feedback.get('delivery_context') or {}
-        if binding.get('schema_version') != 'delivery_review.v3':
+        source = feedback['result'].get('data', {}).get('source_observations', {})
+        nested = 'metadata.delivery_review.result.'
+        # Prefer the retained material owner's locator. The outer feedback record
+        # may be a producer whose delivery review is nested (or still pending).
+        record = source.get('record') or feedback.get('record', '')
+        if not record:
             return feedback
-        record = feedback.get('record', '')
-        result = cls.coordination_result(ToolResult.model_validate(feedback['result']), receipt_path=record)
-        if record:
+        prefix = None
+        if not source.get('record'):
+            prefix = nested if binding.get('schema_version') in {
+                'delivery_review.v1', 'delivery_review.v2', 'delivery_review.v3'} else ''
+        result = cls.coordination_result(ToolResult.model_validate(feedback['result']),
+            receipt_path=record, receipt_prefix=prefix)
+        if binding.get('schema_version') != 'delivery_review.v3':
+            return {**feedback, 'result': result}
+        if prefix:
             source = result['data']['source_observations']
-            source['fields'] = ['metadata.delivery_review.result.' + field for field in source['fields']]
             source['fields'].append('metadata.delivery_review.binding')
         opinion = result['metadata'].get('delivery_opinion', {})
         affected = {path for row in opinion.get('findings', []) for path in row['artifacts']}
@@ -979,8 +1016,6 @@ class InspectionToolGateway:
             for path, expected in self.store.read_json(trace_path).get('checkpoint', {}).items():
                 if self._digest(path) != expected:
                     raise ValueError('Inspection checkpoint record changed; no replay')
-        self._check_shared_dependencies(saved, current_inputs=current_inputs,
-            selected=self._selected_inspection_rows(saved, receipt['response']) if current_inputs else None)
         if saved.get('memory_protocol') == 'journal.v1':
             self._conversation_memory(saved, self._conversation_rows(saved))
         result = ToolResult.model_validate(self.store.read_json(result_path))
@@ -999,6 +1034,13 @@ class InspectionToolGateway:
         if self.protocol and (binding.get('assessment_path') != artifact
                 or result.data.get('record') != artifact or result.artifacts != [artifact]):
             raise ValueError('Inspection cached assessment path changed; no replay')
+        # Successful shared assessments revalidate the same selected sources
+        # when their authoritative final bindings are reconstructed below.
+        # Other outcomes still need the original journal dependency check.
+        assessed = current_inputs and self.protocol and result.status == 'ok'
+        if not (assessed and saved.get('execution_protocol') == 'shared.v1'):
+            self._check_shared_dependencies(saved, current_inputs=current_inputs,
+                selected=self._selected_inspection_rows(saved, receipt['response']) if current_inputs else None)
         if self.protocol and result.status == 'ok':
             assess = self._delivery_assessment if package else self._subject_assessments
             expected, error = assess(saved, receipt, identity, '', check_versions=current_inputs)
@@ -1339,7 +1381,6 @@ class InspectionToolGateway:
             if check_versions:
                 selected = self._selected_inspection_rows(saved, receipt['response'])
                 self._check_inspection_versions(saved, identity, selected=selected)
-                self._check_shared_dependencies(saved, current_inputs=True, selected=selected)
                 if (saved.get('execution_protocol') == 'shared.v1'
                         and bindings != self._shared_final_bindings(saved, receipt['response'])):
                     raise ValueError('Inspection selected producer bindings changed')
@@ -1376,7 +1417,6 @@ class InspectionToolGateway:
             if check_versions:
                 selected = self._selected_inspection_rows(saved, receipt['response'])
                 self._check_inspection_versions(saved, identity, selected=selected)
-                self._check_shared_dependencies(saved, current_inputs=True, selected=selected)
                 if (saved.get('execution_protocol') == 'shared.v1'
                         and bindings != self._shared_final_bindings(saved, receipt['response'])):
                     raise ValueError('Inspection selected producer bindings changed')
