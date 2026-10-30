@@ -2373,6 +2373,25 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertIn('does not prove', action_view['scope'])
         inspector = self.app.operations.inspection
         inspector._reused_source_dependencies(source, admitted['data']['absolute_path'])
+        # A task opened through a directory alias still reads the same receipt.
+        if os.name != 'nt':
+            from simple_ar.core.capabilities import ArtifactStore
+            alias = self.directory / 'task-alias'
+            alias.symlink_to(self.root, target_is_directory=True)
+            with patch.object(inspector, 'store', ArtifactStore(alias)):
+                inspector._reused_source_dependencies(source, admitted['data']['absolute_path'])
+        # A parent receipt cannot be replaced between byte admission and the
+        # later lookup of its inspection dependencies.
+        def replace_after_admission(*args, **kwargs):
+            result = validate_material_observation(*args, **kwargs)
+            review_path.write_bytes(b'{}')
+            return result
+        try:
+            with patch('simple_ar.tools.materials.validate_material_observation', side_effect=replace_after_admission):
+                with self.assertRaisesRegex(ValueError, 'Parent material receipt changed'):
+                    inspector._reused_source_dependencies(source, admitted['data']['absolute_path'])
+        finally:
+            review_path.write_bytes(review_bytes)
         action_path = review_path.parent/'action.json'
         original_action = action_path.read_bytes()
         try:
@@ -4765,6 +4784,18 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertTrue(all(ledger is self.app.ledger for ledger in prepared))
         owner = self.app.operations.inspection
         saved = owner.store.read_json(owner._path(identity, 'input'))
+        # A cached source round remains version-bound until validation ends.
+        record_path = owner._path(identity, 'sources-0')
+        record_bytes = owner.store.resolve(record_path).read_bytes()
+        bound_records = {}
+        owner._bound_json(record_path, saved['source_rounds'][0], bound_records, 'source changed')
+        owner.store.resolve(record_path).write_bytes(record_bytes + b' ')
+        try:
+            with self.assertRaisesRegex(ValueError, 'source changed'):
+                owner._verify_bound_json(bound_records)
+        finally:
+            owner.store.resolve(record_path).write_bytes(record_bytes)
+        owner._verify_bound_json(bound_records)
         checkpoints = [owner.store.read_json(owner._path(identity, f'sources-{number}')).get('checkpoint', {})
             for number in range(len(saved['source_rounds']))]
         self.assertTrue(any(checkpoints))

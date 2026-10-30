@@ -962,7 +962,8 @@ class WorkspaceToolGateway:
     def check_artifact_producers(self, locators: Iterable[str], *, cache: dict | None = None,
                                  refresh: bool = False,
                                  retained_versions: dict[Path, str] | None = None,
-                                 retained_history: list[dict] | None = None) -> dict | None:
+                                 retained_history: list[dict] | None = None,
+                                 producer_index_cache: dict | None = None) -> dict | None:
         """Reject known stale declared edges; untracked files remain unverified.
 
         Inspect only existing process-owner receipts, never workspace contents.
@@ -977,15 +978,28 @@ class WorkspaceToolGateway:
             return self._check_retained_producers(retained_versions, retained_history or [])
         directory = self.root / 'tools' / 'processes'
         if not directory.is_dir():
+            if producer_index_cache is not None:
+                producer_index_cache.setdefault('producers', {})
+                producer_index_cache.setdefault('observed', set()).update(
+                    resolve_mounted_path(self.mounts, name, discovery=True) for name in locators)
             return
         if cache is None:
             cache = {}
         if refresh:
             cache.clear()
+            if producer_index_cache is not None:
+                producer_index_cache.clear()
         producers = cache.get('producers')
+        if producer_index_cache is not None and 'producers' in producer_index_cache:
+            shared = producer_index_cache['producers']
+            if producers is not None and producers is not shared and producers != shared:
+                raise ValueError('Producer indexes differ during validation')
+            producers = shared
         if producers is None:
             producers = self._artifact_producers(directory)
-            cache['producers'] = producers
+        cache['producers'] = producers
+        if producer_index_cache is not None:
+            producer_index_cache.setdefault('producers', producers)
         visited = cache.setdefault('checked', set())
         visiting = set()
         # Share receipt/input validation within this call, by object identity
@@ -994,6 +1008,8 @@ class WorkspaceToolGateway:
         checked_records = set()
 
         def check(path: Path) -> None:
+            if producer_index_cache is not None:
+                producer_index_cache.setdefault('observed', set()).add(path)
             if path in visited or path in visiting or path not in producers:
                 return
             _, record, binding = producers[path]
@@ -1034,6 +1050,22 @@ class WorkspaceToolGateway:
 
         for locator in locators:
             check(resolve_mounted_path(self.mounts, locator, discovery=True))
+
+    def verify_artifact_producer_index(self, producer_index_cache: dict) -> None:
+        """Reject ownership changes during one read-only dependency validation."""
+        previous = producer_index_cache.get('producers')
+        if previous is None:
+            return
+        directory = self.root / 'tools' / 'processes'
+        current = self._artifact_producers(directory) if directory.is_dir() else {}
+        if any(previous.get(path) != current.get(path)
+               for path in producer_index_cache.get('observed', ())):
+            raise ValueError('Producer ownership changed during validation; inspect current receipts')
+        # The index can stay identical while a consumed input or output changes.
+        # Recheck the observed closure with a fresh walk, including snapshots.
+        self.check_artifact_producers(
+            (str(path) for path in producer_index_cache.get('observed', ())),
+            cache={'producers': current})
 
     def artifact_provenance(self, locators: Iterable[str]) -> dict[str, dict[str, Any]]:
         """Resolve existing process ownership, not inferred file relationships.

@@ -525,7 +525,9 @@ class InspectionToolGateway:
                                    selected: list[dict] | None = None,
                                    include_delivery: bool = True,
                                    visited: set[tuple[str, str]] | None = None,
-                                   journal_cache: dict | None = None) -> dict[str, str]:
+                                   journal_cache: dict | None = None,
+                                   producer_index_cache: dict | None = None,
+                                   validation_records: dict | None = None) -> dict[str, str]:
         if saved.get('execution_protocol') != 'shared.v1':
             return {}
         dependencies: dict[str, str] = {}
@@ -544,7 +546,8 @@ class InspectionToolGateway:
         if current_inputs and selected_paths:
             diagnostics = self.workspace.root / 'tools' / 'processes'
             material = [path for path in selected_paths if not Path(path).is_relative_to(diagnostics)]
-            self.workspace.check_artifact_producers(material, cache=cache)
+            self.workspace.check_artifact_producers(material, cache=cache, **(
+                {'producer_index_cache': producer_index_cache} if producer_index_cache is not None else {}))
         rows, supplied = [], set()
 
         def check_owner_receipts(row: dict) -> None:
@@ -557,21 +560,25 @@ class InspectionToolGateway:
 
         for number, digest in enumerate(saved.get('source_rounds', [])):
             path = self._path(saved['identity'], f'sources-{number}')
-            if self._digest(path) != digest:
-                raise ValueError('Inspection source investigation record changed; no replay')
-            trace = self.store.read_json(path)
+            trace = self._bound_json(path, digest, validation_records,
+                'Inspection source investigation record changed; no replay')
             if saved.get('source_priming_policy') == 'priority.v1':
-                for message in trace.get('offer', {}).get('messages', []):
-                    if message.get('role') != 'user':
-                        continue
-                    try:
-                        view = json.loads(message['content']).get('working_view', {})
-                        for entry in view.get('observations', []):
-                            item = entry['observation']
-                            supplied.add((item['path'], item['sha256'], item['offset_bytes'],
-                                          item['next_offset_bytes']))
-                    except (ValueError, TypeError, KeyError, AttributeError):
-                        continue
+                cached_views = validation_records.setdefault('supplied', {}) if validation_records is not None else {}
+                if path not in cached_views:
+                    windows = set()
+                    for message in trace.get('offer', {}).get('messages', []):
+                        if message.get('role') != 'user':
+                            continue
+                        try:
+                            view = json.loads(message['content']).get('working_view', {})
+                            for entry in view.get('observations', []):
+                                item = entry['observation']
+                                windows.add((item['path'], item['sha256'], item['offset_bytes'],
+                                             item['next_offset_bytes']))
+                        except (ValueError, TypeError, KeyError, AttributeError):
+                            continue
+                    cached_views[path] = windows
+                supplied.update(cached_views[path])
             closed = [trace[key] for key in ('model_receipt', 'checkpoint_receipt') if key in trace]
             closed.extend(row['receipt'] for row in trace.get('results', []) if 'receipt' in row)
             if include_delivery:
@@ -615,7 +622,8 @@ class InspectionToolGateway:
                     raise ValueError('Selected visual observation has changed image inputs')
                 for locator, digest in images.items():
                     bind(locator, digest)
-                self.workspace.check_artifact_producers(images, cache=cache)
+                self.workspace.check_artifact_producers(images, cache=cache, **(
+                    {'producer_index_cache': producer_index_cache} if producer_index_cache is not None else {}))
                 included_visual.add(index)
                 added = True
             if not added:
@@ -648,14 +656,17 @@ class InspectionToolGateway:
                 if reference and (row in (selected or []) or exposed) and (
                         saved.get('source_priming_policy') == 'priority.v1' or not include_delivery):
                     for locator, digest in self._reused_source_dependencies(
-                            reference, row['path'], visited=visited, journal_cache=journal_cache).items():
+                            reference, row['path'], visited=visited, journal_cache=journal_cache,
+                            producer_index_cache=producer_index_cache, validation_records=validation_records).items():
                         bind(locator, digest)
         return dependencies
 
     def _reused_source_dependencies(self, reference: dict, path: str, *,
                                     visited: set[tuple[str, str]] | None = None,
                                     validated: dict | None = None,
-                                    journal_cache: dict | None = None) -> dict[str, str]:
+                                    journal_cache: dict | None = None,
+                                    producer_index_cache: dict | None = None,
+                                    validation_records: dict | None = None) -> dict[str, str]:
         """Check known upstream owners of one retained read, without adopting its opinion."""
         from simple_ar.tools.materials import validate_material_observation
         from simple_ar.tools.professional_outcomes import journal_input_dependencies
@@ -669,8 +680,10 @@ class InspectionToolGateway:
             observed = validated or validate_material_observation(self.workspace, reference, identity='inspection-source')
             if str(self.workspace.resolve(observed['request']['path'])) != key[1]:
                 raise ValueError('Retained source names a different current file')
-            self.workspace.check_artifact_producers([path])
-            dependencies = journal_input_dependencies(self.root, self.workspace, path, cache=journal_cache)
+            self.workspace.check_artifact_producers([path], **(
+                {'producer_index_cache': producer_index_cache} if producer_index_cache is not None else {}))
+            dependencies = journal_input_dependencies(self.root, self.workspace, path, cache=journal_cache, **(
+                {'producer_index_cache': producer_index_cache} if producer_index_cache is not None else {}))
 
             def merge(other: dict[str, str]) -> dict[str, str]:
                 for locator, digest in other.items():
@@ -682,10 +695,14 @@ class InspectionToolGateway:
             source = reference.get('content_reuse', {}).get('source')
             if source:
                 return merge(self._reused_source_dependencies(source, source['request']['path'],
-                    visited=seen, journal_cache=journal_cache))
+                    visited=seen, journal_cache=journal_cache, producer_index_cache=producer_index_cache,
+                    validation_records=validation_records))
             if 'record' not in reference:
                 return dependencies
-            receipt = json.loads(self.workspace.resolve(reference['record']).read_bytes())
+            receipt_path = self.workspace.resolve(reference['record'])
+            receipt_relative = receipt_path.relative_to(self.store.root.resolve()).as_posix()
+            receipt = self._bound_json(receipt_relative, reference['receipt_sha256'], validation_records,
+                'Parent material receipt changed')
             previous = receipt
             if receipt.get('tool_name') != 'inspect_artifacts':
                 previous = (receipt.get('metadata') or {}).get('delivery_review', {}).get('result', {})
@@ -698,13 +715,11 @@ class InspectionToolGateway:
                 raise ValueError('Retained inspection source has an invalid owner')
             scope = parts[1]
             input_path = self._path(scope, 'input')
-            if self._digest(input_path) != binding.get('input_sha256'):
-                raise ValueError('Retained inspection input changed')
-            prior = self.store.read_json(input_path)
+            prior = self._bound_json(input_path, binding.get('input_sha256'), validation_records,
+                'Retained inspection input changed')
             if (prior.get('identity') != scope or prior.get('targets') != previous['data'].get('targets')
                     or prior.get('evidence') != previous['data'].get('evidence')):
                 raise ValueError('Retained reads differ from their inspection input')
-            receipt_path = self.workspace.resolve(reference['record'])
             if receipt.get('tool_name') == 'inspect_artifacts':
                 from simple_ar.tools.professional_outcomes import accepted_native_result, accepted_scoped_opinion
                 session_id = self.store.read_json('session_manifest.json')['session_id']
@@ -719,21 +734,36 @@ class InspectionToolGateway:
             if not matches:
                 raise ValueError('Retained read is absent from its inspection input')
             return merge(self._check_shared_dependencies(prior, current_inputs=True, selected=matches,
-                include_delivery=False, visited=seen, journal_cache=journal_cache))
+                include_delivery=False, visited=seen, journal_cache=journal_cache,
+                producer_index_cache=producer_index_cache, validation_records=validation_records))
         finally:
             seen.remove(key)
 
     def _shared_final_bindings(self, saved: dict, response: dict) -> dict[str, dict[str, str]]:
         observed = {row['subject']:row for row in [*saved['targets'], *saved['evidence']]}
+        producer_index_cache: dict = {}
+        validation_records: dict = {}
+
+        def check(selected: list[dict]) -> dict[str, str]:
+            return self._check_shared_dependencies(saved, current_inputs=True, selected=selected,
+                producer_index_cache=producer_index_cache, validation_records=validation_records)
+
         if self._delivery_scope(saved):
             selected = [observed[key] for key in response['evidence']]
-            return {'delivery':self._check_shared_dependencies(saved, current_inputs=True, selected=selected)}
-        if self.protocol:
-            return {decision['subject']:self._check_shared_dependencies(saved, current_inputs=True,
-                selected=[observed[decision['subject']], *[observed[key] for key in decision['evidence']]])
+            bindings = {'delivery':check(selected)}
+        elif self.protocol:
+            bindings = {decision['subject']:check(
+                [observed[decision['subject']], *[observed[key] for key in decision['evidence']]])
                 for decision in response['decisions']}
-        selected = self._selected_inspection_rows(saved, response)
-        return {'group':self._check_shared_dependencies(saved, current_inputs=True, selected=selected)}
+        else:
+            bindings = {'group':check(self._selected_inspection_rows(saved, response))}
+        if producer_index_cache:
+            self.workspace.verify_artifact_producer_index(producer_index_cache)
+        self._verify_bound_json(validation_records)
+        for dependencies in bindings.values():
+            if self.workspace.artifact_hashes(dependencies) != dependencies:
+                raise ValueError('Inspection dependencies changed during validation')
+        return bindings
 
     def _stored_shared_bindings(self, saved: dict, response: dict) -> dict[str, dict[str, str]]:
         if saved.get('execution_protocol') != 'shared.v1':
@@ -875,6 +905,26 @@ class InspectionToolGateway:
 
     def _digest(self, path: str) -> str:
         return hashlib.sha256(self.store.resolve(path).read_bytes()).hexdigest()
+
+    def _bound_json(self, path: str, digest: str, cache: dict | None, error: str) -> Any:
+        """Read a version-bound record once within a dependency validation."""
+        records = cache.setdefault('records', {}) if cache is not None else {}
+        if path in records:
+            expected, value, _ = records[path]
+            if expected != digest:
+                raise ValueError(error)
+            return value
+        raw = self.store.resolve(path).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise ValueError(error)
+        value = json.loads(raw.decode('utf-8'))
+        records[path] = (digest, value, error)
+        return value
+
+    def _verify_bound_json(self, cache: dict) -> None:
+        for path, (digest, _, error) in cache.get('records', {}).items():
+            if self._digest(path) != digest:
+                raise ValueError(error)
 
     def _accounted(self, usage: list[dict]) -> bool:
         return (completed_llm_usage_is_accounted(usage) if self.progressive else

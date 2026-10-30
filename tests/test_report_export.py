@@ -1832,9 +1832,42 @@ class ProcessArtifactBindingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'changed'):
                 workspace.check_artifact_producers(['figure.png'])
             workspace.resolve('figure.png').write_bytes(b'new image')
+            # A single review may traverse the same producer inventory many
+            # times. Share only its index, never another walk's checked paths.
+            index = {}
+            with patch.object(workspace, '_artifact_producers', wraps=workspace._artifact_producers) as receipts:
+                workspace.check_artifact_producers(['figure.png'], producer_index_cache=index)
+                workspace.check_artifact_producers(['sibling.any'], producer_index_cache=index)
+                self.assertEqual(receipts.call_count, 1)
+                sibling = workspace.resolve('sibling.any')
+                original = sibling.read_bytes()
+                sibling.write_bytes(b'tampered again')
+                try:
+                    with self.assertRaisesRegex(ValueError, 'changed'):
+                        workspace.verify_artifact_producer_index(index)
+                    with self.assertRaisesRegex(ValueError, 'changed'):
+                        workspace.check_artifact_producers(['sibling.any'], producer_index_cache=index)
+                finally:
+                    sibling.write_bytes(original)
+                source = workspace.resolve('source.any')
+                original_source = source.read_bytes()
+                source.write_bytes(b'changed during review')
+                try:
+                    with self.assertRaisesRegex(ValueError, 'changed'):
+                        workspace.verify_artifact_producer_index(index)
+                finally:
+                    source.write_bytes(original_source)
+                workspace.verify_artifact_producer_index(index)
+                self.assertEqual(receipts.call_count, 4)
+            # A new unrelated owner must not invalidate this review.
+            self.assertTrue(self._run(workspace, 'd1', {'argv': ['tool'], 'outputs': ['elsewhere']},
+                {'elsewhere': b'unrelated'}).ok)
+            workspace.verify_artifact_producer_index(index)
             # A later failed owner cannot fall back to an earlier successful
             # co-output receipt, even if the output bytes have not changed.
             self.assertFalse(self._run(workspace, 'e', sibling_args, returncode=1).ok)
+            with self.assertRaisesRegex(ValueError, 'ownership changed'):
+                workspace.verify_artifact_producer_index(index)
             workspace.check_artifact_producers(['middle.any'])
             with self.assertRaisesRegex(ValueError, 'no successful output binding'):
                 workspace.check_artifact_producers(['sibling.any'])

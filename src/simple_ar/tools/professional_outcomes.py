@@ -106,7 +106,8 @@ def accepted_scoped_opinion(root: Path, workspace: Any, session_id: str, locator
 
 
 def journal_input_dependencies(root: Path, workspace: Any, locator: str, *,
-                               cache: dict | None = None) -> dict[str, str]:
+                               cache: dict | None = None,
+                               producer_index_cache: dict | None = None) -> dict[str, str]:
     """Check declared input versions in existing same-task operation receipts.
 
     The index is temporary and contains no new facts or task state. Results
@@ -155,7 +156,8 @@ def journal_input_dependencies(root: Path, workspace: Any, locator: str, *,
             raise ValueError('Recorded material producer input version changed')
         active.add(path)
         try:
-            workspace.check_artifact_producers(inputs, cache=cache)
+            workspace.check_artifact_producers(inputs, cache=cache, **(
+                {'producer_index_cache': producer_index_cache} if producer_index_cache is not None else {}))
             for name, digest in inputs.items():
                 if not isinstance(digest, str) or len(digest) != 64:
                     raise ValueError('Recorded material producer has an invalid input version')
