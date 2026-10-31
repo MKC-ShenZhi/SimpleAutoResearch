@@ -445,6 +445,12 @@ class ToolApplication:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
         if config.get('inspection_coverage_policy') not in {None, 'offered.v1', 'offered.v2'}:
             raise ValueError('Unsupported saved inspection coverage policy; no silent migration')
+        if config.get('inspection_finding_policy') not in {None, 'linked.v1'}:
+            raise ValueError('Unsupported saved inspection finding policy; no silent migration')
+        if (config.get('inspection_finding_policy') == 'linked.v1'
+                and (config.get('inspection_coverage_policy') != 'offered.v2'
+                     or config.get('delivery_review_protocol') != 'task.v3')):
+            raise ValueError('Linked findings require shared inspection and delivery review')
         if (config.get('inspection_coverage_policy') in {'offered.v1', 'offered.v2'}
                 and (config.get('inspection_protocol') != 'subjects.v3'
                      or config.get('inspection_execution_protocol') != 'shared.v1')):
@@ -1741,6 +1747,7 @@ class ToolApplication:
         config['inspection_coverage_policy'] = 'offered.v2'
         if config['model'] is not None:
             config['delivery_review_protocol'] = 'task.v3'
+            config['inspection_finding_policy'] = 'linked.v1'
         from simple_ar.app.operation_tools import CURRENT_PROFESSIONAL_CONTRACT
         config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
         if context_protocol is not None:
@@ -1957,7 +1964,7 @@ class ToolApplication:
             # their original closing obligation. Absent historical fields stay
             # absent unless explicitly supplied, including unrelated supplies.
             for field in ('completion_policy', 'tool_contracts', 'report_protocol', 'tool_completions', 'inspection_protocol',
-                          'inspection_coverage_policy',
+                          'inspection_coverage_policy', 'inspection_finding_policy',
                           'delivery_review_protocol', 'publication_assets', 'professional_operations', 'memory_protocol',
                           'context_checkpoint_policy',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):

@@ -83,13 +83,19 @@ class ControlledInspector:
                 raise ValueError('Inspection target/evidence version changed; no replay')
         return ToolResult.model_validate(result)
 
-    def feedback_observation(self, identity, claimed):
+    def feedback_from_observation(self, observed):
+        from simple_ar.tools.inspection import InspectionToolGateway
+        return InspectionToolGateway.feedback_from_observation(self, observed)
+
+    def feedback_observation(self, identity, claimed, *, expected_arguments=None):
         # Feedback verifies the original receipt, not the applicability of its
         # old file versions to a revision. Acceptance still uses _cached.
         result = self.store.read_json(self._path(identity, 'result'))
         if result != self.expected[identity] or claimed != result:
             raise ValueError('Feedback differs from actual receipt')
         saved = self.store.read_json(self._path(identity, 'input'))
+        if expected_arguments is not None and saved['arguments'] != expected_arguments:
+            raise ValueError('Feedback differs from accepted arguments')
         return {**saved, 'result': result, 'opinion_available': True,
                 'reviewed_subjects': self.workspace.artifact_hashes(saved['arguments']['targets'])}
 
@@ -554,6 +560,305 @@ class DeliveryReviewTests(unittest.TestCase):
         self.assertEqual(len(self.inspector.calls), 1)
 
 
+class FindingsInspector(ControlledInspector):
+    """Receipt-backed offline inspector for the explicitly enabled contract."""
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.reassess = False
+        self.reply_ids = None
+        self.claim_finding = False
+
+    def call(self, name, arguments, identity, *, delivery_context, prior_required=None):
+        result = super().call(name, arguments, identity, delivery_context=delivery_context)
+        saved = self.store.read_json(self._path(identity, 'input'))
+        if prior_required is not None:
+            saved['prior_required'] = deepcopy(prior_required)
+        self.store.write_json(self._path(identity, 'input'), saved)
+        assessment = result.metadata['delivery_assessment']
+        if self.claim_finding:
+            assessment['findings'].append({'severity': 'required',
+                'message': 'The completion claim needs rechecking.', 'subjects': {}})
+            assessment['verdict'] = 'needs_revision'
+        if self.reply_ids is not None or self.reassess:
+            assessment['reassessed_prior'] = (list(self.reply_ids) if self.reply_ids is not None
+                else [row['id'] for row in prior_required or []])
+        payload = result.model_dump(mode='json')
+        self.store.write_json(self._path(identity, 'result'), payload)
+        self.expected[identity] = deepcopy(payload)
+        return result
+
+    def feedback_observation(self, identity, claimed, *, expected_arguments=None):
+        if identity in self.rejected:
+            raise ValueError(self.rejected[identity])
+        # Intact original receipts remain readable after their source changes.
+        result = self.store.read_json(self._path(identity, 'result'))
+        if result != self.expected[identity] or claimed != result:
+            raise ValueError('Feedback differs from actual receipt')
+        saved = self.store.read_json(self._path(identity, 'input'))
+        if expected_arguments is not None and saved['arguments'] != expected_arguments:
+            raise ValueError('Feedback differs from accepted arguments')
+        subjects = {path: digest for row in result['metadata'].get('assessments', [])
+                    for path, digest in row['subjects'].items()}
+        return {**saved, 'result': deepcopy(result), 'opinion_available': True,
+                'reviewed_subjects': subjects}
+
+
+class DeliveryFindingContractTests(unittest.TestCase):
+    binding = DeliveryReviewTests.binding
+    review = DeliveryReviewTests.review
+    issues = DeliveryReviewTests.issues
+
+    def setUp(self):
+        DeliveryReviewTests.setUp(self)
+        self.workspace.mounts['records'] = self.root / 'attempts'
+        self.inspector.store.write_json('session_manifest.json', {'session_id': 'controlled-session'})
+        self.inspector = FindingsInspector(self.root, self.workspace, lambda: self.requests)
+        self.owner = DeliveryReview(self.workspace, self.inspector, protocol='task.v3',
+            observations=lambda: self.observations, track_findings=True)
+
+    def observe(self, proof):
+        observed = {'tool_name': 'deliver_result', 'status': 'ok',
+            'record': f'attempts/{proof["identity"]}/native_result.json',
+            'metadata': {'delivery_review': deepcopy(proof)}}
+        self.inspector.store.write_json(observed['record'],
+            {key: value for key, value in observed.items() if key != 'record'})
+        self.observations.append(observed)
+        return observed
+
+    def local(self, identity='local-1', *, path='bundle/manuscript.md', required=True,
+              reassessed=(), evidence=None, coverage='complete'):
+        subjects = self.workspace.artifact_hashes([path])
+        findings = ([{'severity': 'required', 'message': 'Check the original sample scope.',
+                      'subjects': subjects}] if required else [])
+        assessment = {'schema_version': 'artifact_assessment.v2', 'review_id': identity + ':target-1',
+            'subjects': subjects, 'coverage': coverage, 'verdict': 'needs_revision' if required else 'passed',
+            'findings': findings, 'reassessed_prior': list(reassessed),
+            'evidence_sha256': evidence or {}, 'limitations': []}
+        arguments = {'goal': 'Check this claim', 'targets': [path], 'evidence': []}
+        raw = ToolResult(tool_name='inspect_artifacts', metadata={'assessments': [assessment],
+            'inspection_binding': {'assessment_path': f'attempts/{identity}/inspection/assessments.json'}}
+            ).model_dump(mode='json')
+        self.inspector.store.write_json(self.inspector._path(identity, 'input'), {
+            'identity': identity, 'arguments': arguments, 'user_requests': list(self.requests)})
+        self.inspector.store.write_json(self.inspector._path(identity, 'result'), raw)
+        self.inspector.expected[identity] = deepcopy(raw)
+        self.inspector.store.write_json(f'attempts/{identity}/native_result.json', raw)
+        observed = {**deepcopy(raw), 'record': f'attempts/{identity}/native_result.json',
+                    'arguments': arguments}
+        self.observations.append(observed)
+        return observed
+
+    def concerns(self):
+        return self.owner.pending_concerns(self.binding(self.delivery)['artifacts'])
+
+    def pending_envelope(self, proof, *, record=None):
+        saved = self.inspector.store.read_json(self.inspector._path(proof['identity'], 'input'))
+        saved['execution_protocol'] = 'shared.v1'
+        self.inspector.store.write_json(self.inspector._path(proof['identity'], 'input'), saved)
+        envelope = {**proof, 'result': ToolResult(tool_name='inspect_artifacts',
+            data={'inspection_pending': proof['identity']}).model_dump(mode='json')}
+        observed = self.observe(envelope)
+        if record is not None:
+            observed['review_record'] = record
+            self.inspector.store.write_json(record, proof['result'])
+        return observed
+
+    def test_old_package_pass_then_new_local_required_needs_explicit_new_review(self):
+        original = self.review()
+        self.observe(original)
+        self.local()
+        pending = self.concerns()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]['record'], 'records/local-1/native_result.json')
+        self.assertTrue(self.issues(self.observations, self.delivery))
+        self.assertIsNone(self.review('no-start', may_start=False))
+        fresh = self.review('fresh')
+        self.assertEqual(fresh['identity'], 'fresh')
+        self.assertEqual(self.inspector.store.read_json(
+            self.inspector._path('fresh', 'input'))['prior_required'], pending)
+        self.observe(fresh)  # A historical-style pass cannot silently clear F.
+        self.assertEqual(self.concerns(), pending)
+        self.inspector.reassess = True
+        revised = self.review('reassessed')
+        self.observe(revised)
+        self.assertEqual(self.concerns(), [])
+        self.assertEqual(self.issues(self.observations, self.delivery), [])
+        count = len(self.inspector.calls)
+        self.assertEqual(self.review('reuse'), revised)
+        self.assertEqual(len(self.inspector.calls), count)
+        # Repeated original observations are not later new findings.
+        self.observations.append(deepcopy(self.observations[1]))
+        self.assertEqual(self.concerns(), [])
+
+    def test_changed_target_and_evidence_keep_original_id_and_versions(self):
+        source = self.workspace.workspace / 'source.txt'
+        source.write_text('original evidence', encoding='utf-8')
+        self.local(evidence=self.workspace.artifact_hashes([str(source)]))
+        pending = self.concerns()
+        self.workspace.resolve('bundle/manuscript.md').write_text('Corrected claim', encoding='utf-8')
+        source.write_text('revised evidence', encoding='utf-8')
+        self.assertEqual(self.concerns(), pending)
+        self.inspector.sources = self.workspace.artifact_hashes([str(source)])
+        self.inspector.reassess = True
+        proof = self.review('current-review')
+        self.observe(proof)
+        self.assertEqual(self.concerns(), [])
+        self.assertEqual(self.issues(self.observations, self.delivery), [])
+
+    def test_mixed_package_file_and_claim_findings_have_distinct_stable_ids(self):
+        self.inspector.verdict = 'needs_revision'
+        self.inspector.claim_finding = True
+        proof = self.review()
+        self.observe(proof)
+        pending = self.concerns()
+        self.assertEqual(len(pending), 2)
+        self.assertEqual([row['id'] for row in pending], sorted(row['id'] for row in pending))
+        claim = next(row for row in pending if not row['subjects'])
+        self.assertEqual(claim['record'], 'records/parent-1/native_result.json')
+        self.local('local-pass', required=False, reassessed=[row['id'] for row in pending])
+        self.assertIn(claim, self.concerns())  # File scope cannot retire claim scope.
+        self.inspector.verdict = 'passed'
+        self.inspector.claim_finding = False
+        self.inspector.reassess = True
+        self.observe(self.review('whole-reassessment'))
+        self.assertEqual(self.concerns(), [])
+
+    def test_partial_or_stale_reassessment_cannot_retire_concerns(self):
+        self.local()
+        pending = self.concerns()
+        self.inspector.reassess = True
+        self.inspector.verdict = 'incomplete'
+        self.inspector.coverage = 'partial'
+        self.observe(self.review('partial'))
+        self.assertEqual(self.concerns(), pending)
+        self.inspector.verdict = 'passed'
+        self.inspector.coverage = 'complete'
+        source = self.workspace.workspace / 'source.txt'
+        source.write_text('original', encoding='utf-8')
+        self.inspector.sources = self.workspace.artifact_hashes([str(source)])
+        self.observe(self.review('later-stale'))
+        source.write_text('changed', encoding='utf-8')
+        self.assertEqual(self.concerns(), pending)
+        self.assertTrue(self.issues(self.observations, self.delivery))
+
+    def test_unrelated_history_and_withdrawn_mount_do_not_force_review(self):
+        proof = self.review()
+        self.observe(proof)
+        other = self.root / 'withdrawn'
+        other.mkdir()
+        (other / 'note.txt').write_text('unrelated', encoding='utf-8')
+        self.workspace.mounts['withdrawn'] = other
+        self.local('unrelated', path=str(other / 'note.txt'))
+        self.workspace.mounts.pop('withdrawn')
+        self.observations.append({'tool_name': 'write_file', 'status': 'ok', 'metadata': {}})
+        self.assertEqual(self.concerns(), [])
+        self.assertEqual(self.review('reuse'), proof)
+        self.assertEqual(len(self.inspector.calls), 1)
+
+    def test_partial_package_preserves_completed_individual_rechecks(self):
+        self.local('finding-1')
+        self.local('finding-2')
+        pending = self.concerns()
+        first, second = pending
+        source = self.workspace.workspace / 'source.txt'
+        source.write_text('Actual independently read support', encoding='utf-8')
+        self.inspector.sources = self.workspace.artifact_hashes([str(source)])
+        self.inspector.reply_ids = [first['id']]
+        self.inspector.verdict = 'incomplete'
+        self.inspector.coverage = 'partial'
+        proof = self.review('partial-with-completed-item')
+        self.observe(proof)
+        self.assertEqual(self.concerns(), [second])
+        self.assertTrue(self.issues(self.observations, self.delivery))
+        next_proof = self.review('only-remaining-item')
+        self.assertEqual(self.inspector.store.read_json(self.inspector._path(
+            'only-remaining-item', 'input'))['prior_required'], [second])
+        self.assertIn('not supplied', next_proof['error'])  # Cannot reselect retired F1.
+        source.write_text('Evidence changed', encoding='utf-8')
+        self.assertEqual(self.concerns(), pending)
+
+    def test_multi_subject_pending_scope_excludes_already_reassessed_path(self):
+        self.inspector.verdict = 'needs_revision'
+        original = self.review('multi-subject')
+        self.observe(original)
+        concern = self.concerns()[0]
+        path_a = str(self.workspace.resolve('bundle/manuscript.md'))
+        path_b = str(self.workspace.resolve('bundle/appendix.txt'))
+        self.assertEqual(concern['pending_subjects'], sorted([path_a, path_b]))
+        self.local('recheck-a', required=False, reassessed=[concern['id']])
+        remaining = self.concerns()[0]
+        self.assertEqual(remaining['subjects'], {path_b: concern['subjects'][path_b]})
+        self.assertEqual(original['result']['metadata']['delivery_assessment']['findings'][0]['subjects'],
+                         concern['subjects'])  # Original receipt/identity remains intact.
+        self.assertEqual(remaining['id'], concern['id'])
+        self.assertEqual(remaining['pending_subjects'], [path_b])
+        source = self.workspace.workspace / 'source.txt'
+        source.write_text('Original support for B', encoding='utf-8')
+        self.inspector.sources = self.workspace.artifact_hashes([str(source)])
+        self.inspector.reply_ids = [concern['id']]
+        self.inspector.verdict = 'incomplete'
+        self.inspector.coverage = 'partial'
+        proof = self.review('recheck-b')
+        self.assertEqual(self.inspector.store.read_json(self.inspector._path(
+            'recheck-b', 'input'))['prior_required'], [remaining])
+        self.observe(proof)
+        self.assertEqual(self.concerns(), [])
+        self.assertTrue(self.issues(self.observations, self.delivery))  # Package still incomplete.
+
+    def test_fabricated_reassessment_id_is_not_authorized_by_a_pass(self):
+        self.local()
+        pending = self.concerns()
+        self.inspector.reply_ids = ['f' * 64]
+        proof = self.review('fabricated')
+        self.assertIn('not supplied', proof['error'])
+        self.observe(proof)
+        self.assertTrue(self.issues(self.observations, self.delivery))
+        self.assertTrue(pending)
+
+    def test_unaccepted_pending_reply_never_clears_or_commits(self):
+        self.local()
+        pending = self.concerns()
+        self.inspector.reassess = True
+        proof = self.review('pending-review')
+        observed = self.pending_envelope(proof)
+        self.assertEqual(self.concerns(), pending)
+        self.assertIn('opinion record', '; '.join(self.issues(self.observations, self.delivery)))
+        observed['review_record'] = 'attempts/not-accepted/native_result.json'
+        with patch('simple_ar.tools.professional_outcomes.accepted_scoped_opinion',
+                   side_effect=ValueError('No accepted opinion action')):
+            self.assertEqual(self.concerns(), pending)
+            self.assertTrue(self.issues(self.observations, self.delivery))
+
+    def test_accepted_pending_recovery_and_later_findings_use_one_reducer(self):
+        self.local()
+        self.inspector.reassess = True
+        proof = self.review('shared-review')
+        observed = self.pending_envelope(proof, record='attempts/accepted-opinion/native_result.json')
+        with patch('simple_ar.tools.professional_outcomes.accepted_scoped_opinion') as accepted:
+            self.assertEqual(self.concerns(), [])
+            self.assertEqual(self.issues(self.observations, self.delivery), [])
+            self.assertTrue(accepted.called)
+            self.assertEqual(accepted.call_args.kwargs['expected'], proof['result'])
+            self.local('later-required')
+            self.assertEqual(len(self.concerns()), 1)
+            self.assertTrue(self.issues(self.observations, self.delivery))
+            count = len(self.inspector.calls)
+            self.assertEqual(self.review('shared-review', may_start=False)['identity'], 'shared-review')
+            self.assertEqual(len(self.inspector.calls), count)
+        self.assertEqual(observed['review_record'], 'attempts/accepted-opinion/native_result.json')
+
+    def test_accepted_pending_historical_required_survives_target_revision(self):
+        self.inspector.verdict = 'needs_revision'
+        proof = self.review('historical-shared')
+        self.pending_envelope(proof, record='attempts/accepted-opinion/native_result.json')
+        self.inspector.store.write_json('session_manifest.json', {'session_id': 'controlled-session'})
+        with patch('simple_ar.tools.professional_outcomes.accepted_scoped_opinion'):
+            pending = self.concerns()
+            self.assertEqual(len(pending), 1)
+            self.workspace.resolve('bundle/manuscript.md').write_text('new version', encoding='utf-8')
+            self.assertEqual(self.concerns(), pending)
+
+
 class InspectionOfferCoverageTests(unittest.TestCase):
     """Exercise the ordinary shared inspector with its existing offline provider."""
 
@@ -610,9 +915,11 @@ class InspectionOfferCoverageTests(unittest.TestCase):
         # A task saved before this policy has no marker even if it starts its
         # first inspection after the software is updated.
         self.case.app.state['config'].pop('inspection_coverage_policy')
+        self.case.app.state['config'].pop('inspection_finding_policy')
         self.case.app._save()
         self.case._reload()
         self.assertIsNone(self.case.app.operations.inspection.coverage_policy)
+        self.assertIsNone(self.case.app.operations.inspection.finding_policy)
         self._long_report()
         result = self.case._inspect(['report.md'], [])
         self.assertEqual(result['status'], 'ok', result)
@@ -784,6 +1091,7 @@ class InspectionOfferCoverageTests(unittest.TestCase):
         # A previously saved task keeps its own policy, even when resumed on
         # a newer application. Its recorded opinion is never upgraded.
         self.case.app.state['config']['inspection_coverage_policy'] = 'offered.v1'
+        self.case.app.state['config'].pop('inspection_finding_policy')
         self.case.app._save()
         self.case._reload()
         old = self.case._inspect([target], [])

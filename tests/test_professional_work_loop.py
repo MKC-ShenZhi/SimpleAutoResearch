@@ -2356,6 +2356,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             wrong = any('9.0' in window['text'] for row in view['evidence']
                 if row['path']==str(self.root/'workspace/summary.json') for window in row['text_windows'])
             return {'conclusion':'complete', 'evidence':evidence, 'limitations':[],
+                'reassessed_prior':[row['id'] for row in view.get('prior_required', [])],
                 'findings':[{'severity':'required','message':'The stated mean contradicts the actual source observations.',
                     'artifacts':[str(self.root/'workspace/summary.json')]}] if wrong else []}
         self.review = inspect
@@ -2575,7 +2576,11 @@ class OperationsWorkLoopTests(unittest.TestCase):
         feedback = self.app.operations.inspection_feedback([])
         self.assertTrue(any(row.get('delivery_context')==self.app.operations.inspection.delivery_scope_view(negative['binding'])
             and 'overstates' in json.dumps(row['result']) for row in feedback))
-        self.review = self._review_complete_targets
+        def review_direct_answer(view):
+            response = self._review_complete_targets(view)
+            response['reassessed_prior'] = [row['id'] for row in view.get('prior_required', [])]
+            return response
+        self.review = review_direct_answer
         self._submit(_action('deliver_result', summary='这三个观察值不支持总体推断。', artifacts=[]))
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         delivered = self.app.session.store.read_json('delivery.json')
@@ -2759,21 +2764,84 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual((self.root/'budget_ledger.json').read_bytes(), before)
         self.assertTrue(self.app.ledger.unknown_dimensions())
 
+    def test_new_concern_after_interrupted_delivery_invalidates_reusable_opinion(self):
+        from simple_ar.tools.delivery_versions import DeliveryVersions
+
+        self._create(goal='Explain the supplied observations in one editable note.')
+        self._write('note.md', 'A statement about the supplied observations.\n')
+        source = self.inputs / 'observations.csv'
+        original_source = source.read_bytes()
+        reassess = []
+        def review(view):
+            if 'claim' in view.get('proposed_delivery', {}):
+                observed = self._inspection_sources(view, 'measurements/observations.csv')[0]
+                if observed is None:
+                    return [_action('read_file', path='measurements/observations.csv')]
+                response = {'conclusion':'complete', 'findings':[], 'evidence':[observed['subject']],
+                    'limitations':[]}
+                if self.app.state['config'].get('inspection_finding_policy') == 'linked.v1':
+                    response['reassessed_prior'] = ([row['id'] for row in view['prior_required']]
+                        if reassess else [])
+                return response
+            return {'decisions':[{'subject':'target-1', 'conclusion':'complete', 'evidence':[],
+                'findings':[{'severity':'required', 'message':'The statement needs source support.'}],
+                'limitations':[]}]}
+        self.review = review
+        delivery = _action('deliver_result', summary='The requested explanation.', artifacts=['note.md'])
+        with patch.object(DeliveryVersions, 'retain', side_effect=PermissionError('capture interrupted')):
+            self._submit(delivery)
+        self.assertEqual(self.app.session.manifest.status, 'paused')
+        first = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        self.assertEqual(first['result']['metadata']['delivery_assessment']['verdict'], 'passed')
+        try:
+            # A changed external source makes the retained whole-work opinion
+            # inapplicable without modifying the bound delivery itself.
+            source.write_bytes(original_source + b'changed\n')
+            local = self._inspect(['note.md'], [])
+            self.assertEqual(_assessments(local)[0]['verdict'], 'needs_revision')
+        finally:
+            source.write_bytes(original_source)
+        before = len(self.inspection_requests)
+        self._submit(delivery)
+        self._not_delivered()
+        self.assertGreater(len(self.inspection_requests), before)
+        fresh = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        self.assertNotEqual(fresh['identity'], first['identity'])
+        self.assertEqual(fresh['result']['metadata']['delivery_assessment']['verdict'], 'incomplete')
+        self.assertTrue(self.app.operations.delivery_review.pending_concerns(['note.md']))
+        reassess.append(True)
+        self._submit(delivery)
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertEqual(self.app.operations.delivery_review.pending_concerns(['note.md']), [])
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        self._reload()
+        self._run()
+        self.assertEqual((self.send.call_count, self.app.ledger.to_dict()), (calls, ledger))
+        self.assertEqual(source.read_bytes(), original_source)
+
     def test_required_defect_blocks_delivery_without_editing_then_same_bytes_can_be_reassessed(self):
         self._create()
         self._write('analysis.md', 'The sample mean is 9.0.\n')
         self._write('evidence-notes.txt', 'Only the three supplied observations were checked.\n')
         findings = [{'severity':'required', 'message':'The claim 9.0 contradicts the supplied values 1, 2, 3.'}]
+        partial = []
         def review(view):
             if 'claim' in view.get('proposed_delivery', {}):
                 windows = [window for row in view['evidence']
                     if row['path']==str(self.root/'workspace/analysis.md') for window in row['text_windows']]
                 self.assertTrue(windows)
                 response = self._review_complete_targets(view)
+                prior = view.get('prior_required', [])
+                wrong = any('9.0' in window['text'] for window in windows)
+                response['reassessed_prior'] = [row['id'] for row in prior]
+                if not wrong and len(prior) > 1 and not partial:
+                    partial.append(deepcopy(prior))
+                    response.update(conclusion='incomplete', reassessed_prior=[prior[0]['id']],
+                        limitations=['Some prior concerns still need independent review.'])
                 response['findings'] = ([{'severity':'required',
                     'message':'The claim 9.0 contradicts the supplied values 1, 2, 3.',
                     'artifacts':[str(self.root/'workspace/analysis.md')]}]
-                    if any('9.0' in window['text'] for window in windows) else [])
+                    if wrong else [])
                 return response
             return {'findings':[{'subject':view['targets'][0]['subject'], **row} for row in findings],
                     'limitations':[]}
@@ -2802,11 +2870,11 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(plain_delivery)
         self._not_delivered()
         findings = []
-        # This branch tests a genuinely partial review: if a retained full read
-        # is available, the shared inspector may instead reassess the full text.
+        # A successful narrow review must not retire an earlier whole-file concern.
         with patch.object(self.app.operations.inspection, 'material_observations', return_value=[]):
             self._inspect([{'path': 'analysis.md', 'max_bytes': 8}], ['evidence-notes.txt'])
-        self.assertEqual(self._assessment()['verdict'], 'incomplete')
+        scoped = self._assessment()
+        self.assertEqual((scoped['coverage'], scoped['verdict']), ('scoped', 'passed'))
         self._submit(plain_delivery)
         self._not_delivered()
         self.assertEqual((self.root / 'workspace/analysis.md').read_bytes(), original)
@@ -2822,18 +2890,20 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self._assessment()['verdict'], 'needs_revision')
         local = deepcopy(self._last('inspect_artifacts'))
         self._submit(_action('deliver_result', summary='Observed sample mean checked', artifacts=['analysis.md']))
+        self._not_delivered()
+        self.assertTrue(partial)
+        interim = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']
+        self.assertEqual(interim['metadata']['delivery_assessment']['coverage'], 'partial')
+        remaining = self.app.operations.delivery_review.pending_concerns(['analysis.md'])
+        self.assertNotIn(partial[0][0]['id'], {row['id'] for row in remaining})
+        self.assertTrue(remaining)
+        self._submit(_action('deliver_result', summary='Observed sample mean checked', artifacts=['analysis.md']))
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         self.assertEqual(self._assessment()['verdict'], 'passed')
         self.assertEqual(self._last('inspect_artifacts'), local)
-        self.assertIn('Recheck that the supplied rows', json.dumps(self.inspection_views[-1]['prior_work_opinions']))
-        opinions = self.inspection_views[-1]['prior_work_opinions']
-        prior = next(row for row in opinions if not row.get('delivery_context')
-            and 'Recheck that the supplied rows' in json.dumps(row['result']))
-        self.assertEqual(_assessments(prior['result']), _assessments(local))
-        self.assertNotIn('usage', prior['result']['metadata'])
-        self.assertTrue(all('windows' not in row for role in ('targets', 'evidence')
-            for row in prior['result']['data'][role]))
-        self.assertEqual(self.app.operations.inspection.feedback_view(prior), prior)
+        opinions = partial[0] + self.inspection_views[-1]['prior_required']
+        self.assertTrue(any('Recheck that the supplied rows' in row['message'] and row.get('record')
+            for row in opinions))
         self.assertEqual((self.root / 'workspace/analysis.md').read_bytes(), correct_bytes)
         self._reload()
         self.assertEqual(self._last('inspect_artifacts'), local)
@@ -4933,10 +5003,15 @@ class OperationsWorkLoopTests(unittest.TestCase):
             if any(row['record'].startswith(source_prefix) for row in view['observations'])]
         self.assertTrue(summary_inputs)
         self.assertEqual(summary_inputs[0]['previous_notes'], [])
-        supplied = [row['record'] for view in summary_inputs for row in view['observations']]
-        self.assertEqual(len(supplied), len(set(supplied)))
+        # A later rewrite may omit a previously cited source. It must then be
+        # offered again; a still-cited record need not be repeated.
+        supplied = set()
         for view in summary_inputs:
+            retained = {record for note in view.get('previous_notes', []) for record in note.get('records', [])}
             for row in view['observations']:
+                if row['record'] in supplied:
+                    self.assertNotIn(row['record'], retained)
+                supplied.add(row['record'])
                 self.assertFalse(row['truncated'])
                 self.assertIn('sha256', json.loads(row['observation_text'])['data'])
         calls, ledger = self.send.call_count, self.app.ledger.to_dict()
@@ -4974,13 +5049,157 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.review = lambda _: {'findings':[], 'limitations':[]}
         self._submit(_action('inspect_artifacts', goal='Check only the heading.', targets=['notes.md']))
         self.assertTrue(assessment_issues(self.app.workspace, self._observations(), ['notes.md']))
+        self.assertTrue(assessment_issues(self.app.workspace, self._observations(),
+            ['notes.md'], retain_stale_findings=True))
         self.review = lambda _: {'decisions':[{'subject':'target-1', 'conclusion':'complete',
             'reassessed_prior':True, 'findings':[], 'evidence':[], 'limitations':[]}]}
         self._submit(_action('inspect_artifacts', goal='Reassess the earlier concern.', targets=['notes.md']))
         self.assertFalse(assessment_issues(self.app.workspace, self._observations(), ['notes.md']))
+        self.assertEqual(assessment_issues(self.app.workspace, self._observations(),
+            ['notes.md'], retain_stale_findings=True), [])
         feedback = self.app.operations.inspection_feedback(['notes.md'])
         self.assertEqual(json.dumps(feedback).count('The stated claim is not supported by the observed sample.'), 1)
         self.assertEqual(sum(len(row.get('related_opinion_records', [])) for row in feedback), 1)
+
+    def test_pending_required_projection_keeps_versions_until_explicit_current_reassessment(self):
+        from simple_ar.core.assessments import (
+            assessment_state, current_assessments, finding_id,
+        )
+        self._create()
+        self._write('notes.md', 'A claim needing independent verification.\n')
+        self._write('support.txt', 'Original supporting observations.\n')
+        self.review = lambda _: {'findings':[{'subject':'target-1', 'severity':'required',
+            'message':'Verify the claimed sample against the original source.'}], 'limitations':[]}
+        negative = self._inspect(['notes.md'], ['support.txt'])
+        original = deepcopy(negative)
+        assessment = _assessments(negative)[0]
+        identity = finding_id(assessment, assessment['findings'][0])
+        path = str(self.app.workspace.resolve('notes.md'))
+
+        def pending(rows):
+            values = current_assessments(self.app.workspace, rows, retain_stale_findings=True)
+            passed, concerns = assessment_state([row.model_dump(mode='json') for row in values],
+                resolve=self.app.workspace.resolve, require_explicit_reassessment=True)
+            self.assertFalse(passed & {path for path, findings in concerns.items() if findings})
+            return values, {path: findings for path, findings in concerns.items() if findings}
+
+        initial = self._read('notes.md')
+        self._submit(_action('edit_file', path='notes.md', expected_sha256=initial['sha256'],
+            old_text='A claim needing independent verification.',
+            new_text='A revised claim still needing verification.'))
+        self._ok('edit_file')
+        self.assertEqual(current_assessments(self.app.workspace, [negative]), [])
+        values, concerns = pending([negative, negative])
+        self.assertEqual(len(values), 1)
+        self.assertEqual(set(concerns[path]), {identity})
+        self.assertEqual(values[0].subjects, assessment['subjects'])
+        self.assertEqual(values[0].evidence_sha256, assessment['evidence_sha256'])
+        self.assertEqual(values[0].coverage, 'partial')
+
+        # Exercise real retained inspection results; only the input list of
+        # prior concerns is supplied here, pending the separate caller hookup.
+        owner = self.app.operations.inspection
+        prior = [{'id': identity, 'subjects':['target-1'], 'severity':'required',
+            'message':assessment['findings'][0]['message']}]
+        self.review = lambda _: {'decisions':[{'subject':'target-1', 'conclusion':'complete',
+            'reassessed_prior':False, 'findings':[], 'evidence':['evidence-1'], 'limitations':[]}]}
+        unrelated = self._inspect(['notes.md'], ['support.txt'])
+        self.assertTrue(pending([negative, unrelated])[1][path])
+        self.review = lambda _: {'decisions':[{'subject':'target-1', 'conclusion':'complete',
+            'reassessed_prior':True, 'findings':[], 'evidence':['evidence-1'], 'limitations':[]}]}
+        with patch.object(owner, '_prior', return_value=prior):
+            scoped = self._inspect([{'path':'notes.md', 'max_bytes':8}], ['support.txt'])
+            complete = self._inspect(['notes.md'], ['support.txt'])
+        self.assertEqual(_assessments(scoped)[0]['coverage'], 'scoped')
+        self.assertTrue(pending([negative, scoped])[1][path])
+        self.assertEqual(_assessments(complete)[0]['reassessed_prior'], [identity])
+        rows = [negative, unrelated, scoped, complete, negative, complete]
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        records = self._versions(self.root)
+        self.assertEqual(pending(rows)[1], {})
+        self.assertEqual(negative, original)
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self._versions(self.root), records)
+
+        # A once-valid retirement loses authority when its source or target
+        # changes. Replaying that receipt cannot clear the original concern.
+        support = self.app.workspace.resolve('support.txt')
+        old_support = support.read_bytes()
+        support.write_text('Different supporting observations.\n', encoding='utf-8')
+        self.assertEqual(set(pending(rows)[1][path]), {identity})
+        support.write_bytes(old_support)
+        self.assertEqual(pending(rows)[1], {})
+        target = self.app.workspace.resolve('notes.md')
+        old_target = target.read_bytes()
+        target.write_text('Another revision, without rechecking the concern.\n', encoding='utf-8')
+        self.assertEqual(set(pending(rows)[1][path]), {identity})
+        target.unlink()
+        self.assertEqual(set(pending(rows)[1][path]), {identity})
+        target.write_bytes(old_target)
+        self.assertEqual(pending(rows)[1], {})
+        # Authorization loss fails closed; another path with identical bytes
+        # never retires a concern about this path.
+        self._write('copy.md', old_target.decode())
+        with patch.object(owner, '_prior', return_value=prior):
+            copy_review = self._inspect(['copy.md'], ['support.txt'])
+        self.assertEqual(set(pending([negative, copy_review])[1][path]), {identity})
+        with patch.object(self.app.workspace, 'resolve', side_effect=ValueError('No longer authorized')):
+            self.assertEqual(pending([negative]), ([], {}))
+
+        # The shared reducer also accepts owner-normalized package/file events.
+        # Preserve the full original finding while retiring its paths separately.
+        copy_path = str(self.app.workspace.resolve('copy.md'))
+        finding = {'severity':'required', 'message':'Cross-file consistency needs review.',
+            'subjects':{path:'a' * 64, copy_path:'b' * 64}}
+        event = {'review_id':'owner/multi', 'subjects':dict(finding['subjects']),
+            'coverage':'partial', 'verdict':'needs_revision', 'findings':[finding], 'reassessed_prior':[]}
+        multi_id = finding_id(event, finding)
+        normalized = {**event, 'review_id':'owner/multi#files',
+            'findings':[{**finding, 'finding_id':multi_id}]}
+        review = {'review_id':'owner/recheck-notes', 'subjects':{'workspace/notes.md':'c' * 64},
+            'coverage':'complete', 'verdict':'passed', 'findings':[], 'reassessed_prior':[multi_id]}
+
+        def reduce(events, resolve=None):
+            return assessment_state(events, resolve=resolve or self.app.workspace.resolve,
+                require_explicit_reassessment=True)
+
+        _, concerns = reduce([event, review, event])
+        self.assertFalse(concerns[path])
+        self.assertEqual(concerns[copy_path][multi_id], finding)
+        self.assertEqual(finding_id(event, concerns[copy_path][multi_id]), multi_id)
+        self.assertEqual(set(reduce([normalized, review])[1][copy_path]), {multi_id})
+        second = {**review, 'review_id':'owner/recheck-copy', 'subjects':{copy_path:'d' * 64}}
+        _, concerns = reduce([event, review, second])
+        self.assertFalse(any(concerns.values()))
+        # An invalid later recheck has no clearance authority, and replaying
+        # the same earlier pass cannot restore acceptance after incomplete work.
+        invalid = {**review, 'review_id':'owner/invalid', 'coverage':'partial', 'verdict':'incomplete'}
+        passed, concerns = reduce([event, invalid])
+        self.assertEqual(set(concerns[path]), {multi_id})
+        self.assertNotIn(path, passed)
+        passed, _ = reduce([review, invalid, review])
+        self.assertNotIn(path, passed)
+        claim_finding = {'severity':'required', 'message':'Completion claim unsupported.', 'subjects':{}}
+        claim = {**event, 'review_id':'owner/claim', 'subjects':{}, 'findings':[claim_finding]}
+        claim_id = finding_id(claim, claim_finding)
+        file_only = {**review, 'reassessed_prior':[claim_id]}
+        _, concerns = reduce([claim, file_only])
+        self.assertEqual(set(concerns[None]), {claim_id})
+        claim_review = {**review, 'review_id':'owner/recheck-claim', 'subjects':{},
+            'reassessed_prior':[claim_id]}
+        self.assertFalse(reduce([claim, file_only, claim_review])[1][None])
+        original_resolve = self.app.workspace.resolve
+
+        def restricted(locator):
+            if str(original_resolve(locator)) == copy_path:
+                raise ValueError('Old copy is no longer authorized')
+            return original_resolve(locator)
+
+        _, concerns = reduce([event], restricted)
+        self.assertEqual(set(concerns[path]), {multi_id})
+        self.assertNotIn(copy_path, concerns)
+        self.assertEqual(reduce([event, review], restricted)[1][path], {})
 
     def test_failed_legacy_complete_read_cannot_erase_a_required_opinion(self):
         from simple_ar.core.assessments import assessment_issues
@@ -5039,6 +5258,14 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertTrue(assessment_issues(self.app.workspace, [negative, failed], ['notes.md']))
         self.assertTrue(assessment_issues(self.app.workspace, [negative, failed],
             ['notes.md'], require_pass=['notes.md']))
+        self.review = lambda _: {'findings':[], 'limitations':[]}
+        passed = gateway.call('inspect_artifacts', args, 'legacy-passed').model_dump(mode='json')
+        self.assertEqual(passed['metadata']['assessment']['verdict'], 'passed')
+        # Historical reduction still permits a complete v1 pass to supersede
+        # an earlier defect. The opt-in projection requires an explicit ID.
+        self.assertEqual(assessment_issues(self.app.workspace, [negative, passed], ['notes.md']), [])
+        self.assertTrue(assessment_issues(self.app.workspace, [negative, failed, passed],
+            ['notes.md'], retain_stale_findings=True))
         ledger, calls = self.app.ledger.to_dict(), self.send.call_count
         records = self._versions(self.root/'tools/inspection')
         gateway.call('inspect_artifacts', args, 'legacy-failed')

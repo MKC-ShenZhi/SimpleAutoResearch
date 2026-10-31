@@ -73,6 +73,12 @@ class _DeliveryResponse(BaseModel):
     limitations: list[str]
 
 
+class _DeliveryResponseLinked(_DeliveryResponse):
+    reassessed_prior: list[str] = Field(default_factory=list,
+        description='IDs of supplied prior required concerns actually rechecked against current evidence. '
+            'Omit concerns whose investigation remains incomplete.')
+
+
 class _Finding(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     subject: str
@@ -260,11 +266,13 @@ _BINARY = {'.pdf', '.docx', '.xlsx', '.pptx', '.png', '.jpg', '.jpeg', '.gif',
 class InspectionToolGateway:
     def __init__(self, root: Path, workspace: Any, client_factory: Callable[[str], Any],
                  *, prior_assessments: Callable[[], list[dict]] | None = None,
+                 prior_concerns: Callable[[list[str]], list[dict]] | None = None,
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
                  user_requests: Callable[[], list[str]] | None = None,
                  feedback_provider: Callable[[list[str]], list[dict]] | None = None,
                  protocol: str | None = None,
                  coverage_policy: str | None = None,
+                 finding_policy: str | None = None,
                  execution_protocol: str | None = None,
                  operation_specs: Callable[[], list[CommonToolSpec]] | None = None,
                  operation_call: Callable[[str, dict[str, Any], str], ToolResult] | None = None) -> None:
@@ -274,14 +282,18 @@ class InspectionToolGateway:
             raise ValueError('Unknown inspection execution protocol')
         if coverage_policy not in (None, 'offered.v1', 'offered.v2'):
             raise ValueError('Unknown inspection coverage policy')
+        if finding_policy not in (None, 'linked.v1'):
+            raise ValueError('Unknown inspection finding policy')
         self.root, self.workspace = Path(root), workspace
         self.store, self.client_factory = ArtifactStore(root), client_factory
         self.prior_assessments = prior_assessments
+        self.prior_concerns = prior_concerns
         self.material_observations = material_observations
         self.user_requests = user_requests
         self.feedback_provider = feedback_provider
         self.protocol = protocol
         self.coverage_policy = coverage_policy
+        self.finding_policy = finding_policy
         self.execution_protocol = execution_protocol
         self.operation_specs = operation_specs
         self.operation_call = operation_call
@@ -335,7 +347,10 @@ class InspectionToolGateway:
                 + (' For each target, set reassessed_prior=true only after actually rechecking every '
                    'listed prior required concern against current evidence; a narrower review leaves '
                    'other concerns unresolved.'
-                   if saved.get('coverage_policy') == 'offered.v2' and not self._delivery_scope(saved) else ''))
+                   if saved.get('coverage_policy') == 'offered.v2' and not self._delivery_scope(saved) else '')
+                + (' For the delivery, list only prior concern IDs actually rechecked against current '
+                   'evidence. Leave any unfinished concern out and report the remaining scope.'
+                   if saved.get('finding_policy') == 'linked.v1' and self._delivery_scope(saved) else ''))
         return (_DELIVERY_SYSTEM if self._delivery_scope(saved) else _REVIEW_SYSTEM
             if self.adaptive else _SUBJECT_SYSTEM if self.protocol else _SYSTEM)
 
@@ -920,6 +935,8 @@ class InspectionToolGateway:
                     'coverage': package['coverage'], 'verdict': package['verdict'],
                     'findings': [{'severity': row['severity'], 'message': row['message'],
                         'artifacts': list(row['subjects'])} for row in package['findings']],
+                    **({'reassessed_prior': list(package['reassessed_prior'])}
+                       if 'reassessed_prior' in package else {}),
                     'limitations': package['limitations'],
                     'artifact_count': len(package['artifacts']),
                     'evidence_count': len(package['evidence_sha256'])}}}
@@ -1155,6 +1172,29 @@ class InspectionToolGateway:
                 if row.get('sha256')},
             'scope': 'Retained independent opinion about the bound original versions; '
                 'not current acceptance, a source fact, or permission.'}
+
+    def feedback_from_observation(self, observed: dict) -> dict | None:
+        """Resolve a native inspection once for revision and delivery consumers."""
+        if observed.get('tool_name') != 'inspect_artifacts':
+            return None
+        binding = (observed.get('metadata') or {}).get('inspection_binding')
+        if not binding:
+            return None
+        path = binding.get('assessment_path')
+        parts = Path(path).parts if isinstance(path, str) else ()
+        record = observed.get('record')
+        if len(parts) == 4 and parts[0] == 'attempts':
+            identity = parts[1]
+        elif isinstance(record, str) and record:
+            identity = Path(record).parent.name
+        else:
+            raise ValueError('Inspection feedback has no original owner record')
+        arguments = observed.get('arguments')
+        if not isinstance(arguments, dict):
+            raise ValueError('Inspection feedback has no accepted arguments')
+        claimed = {key: value for key, value in observed.items() if key not in
+            {'record', 'arguments', 'current_request', 'contract_current', 'review_record'}}
+        return self.feedback_observation(identity, claimed, expected_arguments=arguments)
 
     def can_reconcile(self, name: str, identity: str) -> bool:
         if name != 'inspect_artifacts' or not self.has_started(identity):
@@ -1681,7 +1721,13 @@ class InspectionToolGateway:
         return decisions
 
     def _delivery_decision(self, saved: dict, value: dict) -> _DeliveryResponse:
-        decision = _DeliveryResponse.model_validate(value)
+        linked = saved.get('finding_policy') == 'linked.v1'
+        decision = (_DeliveryResponseLinked if linked else _DeliveryResponse).model_validate(value)
+        if linked:
+            allowed = {row['id'] for row in saved['prior_required']}
+            if (len(set(decision.reassessed_prior)) != len(decision.reassessed_prior)
+                    or not set(decision.reassessed_prior) <= allowed):
+                raise ValueError('Reassessed concerns must identify distinct supplied prior findings')
         observed = {row['subject']:row for row in [*saved['targets'], *saved['evidence']]
             if row.get('readable') and row.get('sha256') and row.get('windows')}
         invalid = [key for key in decision.evidence if key not in observed]
@@ -1729,17 +1775,29 @@ class InspectionToolGateway:
             for row in decision.findings] if decision else []
         scopes = ([self._offered_row_scope(observed[key], offered) for key in decision.evidence]
             if decision and self._offered_coverage(saved) else [])
+        linked = saved.get('finding_policy') == 'linked.v1'
+        # A partially completed package can still contain individually rechecked
+        # concerns. Keep those only when the selected evidence was actually
+        # supplied; this is an independent opinion, not a scientific certificate.
+        reassessed = (list(decision.reassessed_prior)
+            if decision and linked and all(covered for covered, _ in scopes)
+                and (decision.evidence or not delivery['artifacts']) else [])
+        pending = ({row['id'] for row in saved['prior_required']} - set(reassessed)
+            if decision and linked else set())
         complete = (decision is not None and decision.conclusion == 'complete'
-            and all(covered for covered, _ in scopes))
+            and all(covered for covered, _ in scopes) and not pending)
         limitations = ([*decision.limitations, *(scope for _, scope in scopes),
             *(['Selected evidence includes read windows not proven supplied to an inspection request']
-                if any(not covered for covered, _ in scopes) else [])]
+                if any(not covered for covered, _ in scopes) else []),
+            *(['Prior required concerns remain to be rechecked: ' + ', '.join(sorted(pending))]
+                if pending else [])]
             if decision else [error or 'Whole-work investigation incomplete'])
         return {'schema_version':'delivery_assessment.v1','artifacts':dict(delivery['artifacts']),
             'coverage':'complete' if complete else 'partial',
             'verdict':'needs_revision' if any(row['severity']=='required' for row in findings)
                 else 'passed' if complete else 'incomplete',
             'findings':findings,
+            **({'reassessed_prior': reassessed} if linked else {}),
             'evidence_sha256':self._evidence_with_dependencies(
                 {observed[key]['path']:observed[key]['sha256'] for key in decision.evidence}, dependencies)
                 if decision else {},
@@ -2015,11 +2073,26 @@ class InspectionToolGateway:
         self.store.write_json(response_path, receipt)
         return self._cached(identity)
 
-    def _prior(self, targets: list[dict[str, Any]], *, current_policy: bool = False) -> list[dict[str, Any]]:
-        """Present same-version concerns, without adopting their earlier verdict."""
+    def _prior(self, targets: list[dict[str, Any]], *, current_policy: bool = False,
+               linked: bool = False) -> list[dict[str, Any]]:
+        """Present applicable prior concerns without adopting their earlier verdict."""
         current = {row['path']: row['sha256'] for row in targets if row.get('sha256')}
         ids = {row['path']: row['subject'] for row in targets if row.get('sha256')}
         result = []
+        if linked:
+            concerns = self.prior_concerns(list(current)) if self.prior_concerns else []
+            for concern in concerns:
+                matched = []
+                for path in concern.get('pending_subjects', concern['subjects']):
+                    try:
+                        subject = ids.get(str(self.workspace.resolve(path)))
+                    except (ValueError, OSError):
+                        continue
+                    if subject is not None and subject not in matched:
+                        matched.append(subject)
+                if matched:
+                    result.append({**concern, 'subjects': matched})
+            return result
         assessments = self.prior_assessments() if self.prior_assessments else []
         if current_policy:
             from simple_ar.core.assessments import assessment_state
@@ -2112,7 +2185,7 @@ class InspectionToolGateway:
                     'supporting source/code/results and interpretations. Generated files agreeing '
                     'with one another do not establish correctness. Locate and read original '
                     'evidence as needed; disclose unsupported conclusions or unfinished checks.'}
-            if self._delivery_scope(saved):
+            if self._delivery_scope(saved) and saved.get('finding_policy') != 'linked.v1':
                 view['prior_work_opinions'] = [self.feedback_view(row)
                     for row in saved.get('prior_work_opinions', [])]
         for role in ('targets','evidence'):
@@ -3109,7 +3182,8 @@ class InspectionToolGateway:
                     'Historical observations grant no current evidence, permission or repeated execution.',
                 'parameters':_InspectionHistory.model_json_schema()}})
         package = self._delivery_scope(saved)
-        response_model = (_DeliveryResponse if package else
+        response_model = ((_DeliveryResponseLinked if saved.get('finding_policy') == 'linked.v1'
+                           else _DeliveryResponse) if package else
             (_ReviewResponseV2 if saved.get('coverage_policy') == 'offered.v2' else _ReviewResponse) if self.adaptive
             else _SubjectResponse if self.protocol else _Response)
         terminal = {'type':'function','function':{'name':'record_inspection',
@@ -3160,6 +3234,13 @@ class InspectionToolGateway:
                     schema['properties']['evidence']['items']['enum'] = sources
                 else:
                     schema['properties']['evidence']['maxItems'] = 0
+                if response_model is _DeliveryResponseLinked:
+                    prior = [row['id'] for row in saved['prior_required']]
+                    schema['properties']['reassessed_prior']['uniqueItems'] = True
+                    if prior:
+                        schema['properties']['reassessed_prior']['items']['enum'] = prior
+                    else:
+                        schema['properties']['reassessed_prior']['maxItems'] = 0
                 terminal['function']['parameters'] = schema
             elif self.adaptive:
                 # Rebuild from cumulative real observations before projection and
@@ -3505,7 +3586,8 @@ class InspectionToolGateway:
             number += 1
 
     def call(self, name: str, arguments: dict[str, Any], identity: str, *,
-             delivery_context: dict[str, Any] | None = None) -> ToolResult:
+             delivery_context: dict[str, Any] | None = None,
+             prior_required: list[dict[str, Any]] | None = None) -> ToolResult:
         try:
             if name != 'inspect_artifacts':
                 raise ValueError('Unknown inspection operation')
@@ -3524,6 +3606,9 @@ class InspectionToolGateway:
                         or saved.get('protocol') != self.protocol
                         or saved.get('delivery_context') != delivery_context):
                     raise ValueError('Inspection identity is bound to different arguments; no replay')
+                if (prior_required is not None and saved.get('finding_policy') == 'linked.v1'
+                        and saved.get('prior_required') != prior_required):
+                    raise ValueError('Inspection identity is bound to different prior concerns; no replay')
                 if saved.get('execution_protocol') == 'shared.v1':
                     if not self.store.exists(self._path(identity, 'result')):
                         return ToolResult(tool_name=name, data={'inspection_pending':identity})
@@ -3535,6 +3620,8 @@ class InspectionToolGateway:
             saved = {'identity': identity, 'arguments': binding, 'targets': [], 'evidence': []}
             if self.coverage_policy is not None:
                 saved['coverage_policy'] = self.coverage_policy
+            if self.finding_policy is not None:
+                saved['finding_policy'] = self.finding_policy
             if self.execution_protocol == 'shared.v1':
                 if self.operation_specs is None or self.operation_call is None:
                     raise ValueError('Shared inspection requires the actual operation specs and operation gateway')
@@ -3578,8 +3665,21 @@ class InspectionToolGateway:
                 if (saved.get('user_requests') != delivery_context['requests']
                         or self.workspace.artifact_hashes(delivery_context['artifacts']) != delivery_context['artifacts']):
                     raise ValueError('Whole-work inspection needs the actual request and artifact versions')
-                saved['prior_work_opinions'] = (self.feedback_provider(sorted(delivery_context['artifacts']))
-                    if self.feedback_provider else [])
+                if self.finding_policy == 'linked.v1':
+                    if (not isinstance(prior_required, list)
+                            or any(not isinstance(row, dict) or not isinstance(row.get('id'), str)
+                                   or not re.fullmatch(r'[0-9a-f]{64}', row['id'])
+                                   or not isinstance(row.get('message'), str)
+                                   or not row['message'].strip() or row.get('severity') != 'required'
+                                   or not isinstance(row.get('subjects'), dict)
+                                   or not isinstance(row.get('pending_subjects', []), list)
+                                   or any(not isinstance(path, str) for path in row.get('pending_subjects', []))
+                                   for row in prior_required)
+                            or len({row['id'] for row in prior_required}) != len(prior_required)):
+                        raise ValueError('Delivery inspection requires its owner-projected prior concerns')
+                else:
+                    saved['prior_work_opinions'] = (self.feedback_provider(sorted(delivery_context['artifacts']))
+                        if self.feedback_provider else [])
             if saved.get('execution_protocol') != 'shared.v1':
                 self.store.write_json(input_path, saved)
             saved['evidence'] = [self._observe(value, f'evidence-{i + 1}', identity, remaining)
@@ -3591,8 +3691,9 @@ class InspectionToolGateway:
                     self._reuse_observations(saved, remaining)
                 saved['initial_subjects'] = [row['subject'] for row in [*saved['targets'],*saved['evidence']]]
             self._mark_evidence(saved)
-            saved['prior_required'] = self._prior(saved['targets'],
-                current_policy=saved.get('coverage_policy') == 'offered.v2')
+            saved['prior_required'] = (deepcopy(prior_required) if package and self.finding_policy == 'linked.v1'
+                else self._prior(saved['targets'], current_policy=saved.get('coverage_policy') == 'offered.v2',
+                    linked=self.finding_policy == 'linked.v1'))
             if saved.get('execution_protocol') == 'shared.v1':
                 saved['initial_read_remaining'] = remaining[0]
                 saved['immutable_paths'] = [row['path'] for row in [*saved['targets'], *saved['evidence']]

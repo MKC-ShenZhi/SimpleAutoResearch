@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from simple_ar.core.assessments import assessment_issues
+from simple_ar.core.assessments import assessment_issues, assessment_state, current_assessments, finding_id
 from simple_ar.tools.specs import ToolResult, tool_completion
 
 
@@ -57,9 +59,15 @@ class _DeliveryAssessment(BaseModel):
     findings: list[_DeliveryFinding]
     evidence_sha256: dict[str, str]
     limitations: list[str]
+    reassessed_prior: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode='after')
     def consistent(self):
+        if self.reassessed_prior is not None and (
+                len(set(self.reassessed_prior)) != len(self.reassessed_prior)
+                or any(len(value) != 64 or any(c not in '0123456789abcdef' for c in value)
+                       for value in self.reassessed_prior)):
+            raise ValueError('Reassessed delivery concerns require distinct retained finding IDs')
         for digest in [*self.artifacts.values(), *self.evidence_sha256.values()]:
             if len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
                 raise ValueError('Delivery assessment requires actual full-file SHA256 versions')
@@ -145,12 +153,250 @@ def recorded_delivery_review(reader: Any) -> dict | None:
 class DeliveryReview:
     def __init__(self, workspace: Any, inspector: Any, *,
                  observations: Callable[[], list[dict]] | None = None,
-                 protocol: str = 'task.v1') -> None:
+                 protocol: str = 'task.v1', track_findings: bool = False) -> None:
         if protocol not in {'task.v1', 'task.v2', 'task.v3'}:
             raise ValueError('Unknown delivery review protocol')
         self.workspace, self.inspector = workspace, inspector
         self.observations = observations
         self.protocol = protocol
+        self.track_findings = track_findings
+
+    def _reassessed_ids(self, identity: str, assessment: _DeliveryAssessment) -> list[str]:
+        """Only the original inspection work order may authorize a reassessment."""
+        ids = assessment.reassessed_prior or []
+        if ids:
+            saved = self.inspector.store.read_json(self.inspector._path(identity, 'input'))
+            offered = {row['id'] for row in saved.get('prior_required', [])}
+            if not set(ids) <= offered:
+                raise ValueError('Delivery reassessment references a concern not supplied at inspection start')
+        return ids
+
+    def _relevant(self, subjects: dict, selected: set[str]) -> bool:
+        for path in subjects:
+            try:
+                if str(self.workspace.resolve(path)) in selected:
+                    return True
+            except (ValueError, OSError):
+                pass  # Unrelated historical paths do not grant access.
+        return False
+
+    def _opinion_record(self, record: Any) -> str | None:
+        """Use an existing authorized native record, never invent a source copy."""
+        if not isinstance(record, str):
+            return None
+        if record.startswith('attempts/'):
+            record = 'records/' + record.removeprefix('attempts/')
+        if not record.startswith('records/') or Path(record).name != 'native_result.json':
+            return None
+        try:
+            if not self.workspace.resolve(record).is_file():
+                return None
+        except (ValueError, OSError):
+            return None
+        return record
+
+    def _accepted_package(self, observed: dict, envelope: dict, raw: dict) -> tuple[bool, bool]:
+        """Acceptance and current applicability are different owner proofs."""
+        if not self._pending_envelope(envelope):
+            try:
+                self._verified(envelope['identity'], envelope['binding'], envelope)
+                return True, True
+            except _ERRORS:
+                # Original feedback was verified before this call. Stale
+                # historical findings remain concerns, never retirement proof.
+                return True, False
+        record = observed.get('review_record')
+        if not isinstance(record, str) or not record:
+            return False, False
+        _, resolved = self._resolve_observation(observed, review_record=record)
+        if resolved is not None:
+            return True, True
+        # _resolve_observation also checks current source bytes. A genuinely
+        # accepted historical opinion may now be stale: prove the accepted
+        # action independently, retaining findings without retirement power.
+        try:
+            from simple_ar.tools.professional_outcomes import accepted_scoped_opinion
+            self._pending_input(envelope)
+            if (Path(observed.get('record', '')).name != 'native_result.json'
+                    or Path(observed['record']).parent.name != envelope['identity']):
+                return False, False
+            root = self.inspector.store.root
+            accepted_scoped_opinion(root, self.workspace,
+                self.inspector.store.read_json('session_manifest.json')['session_id'],
+                record, envelope['identity'], expected=raw)
+            return True, False
+        except _ERRORS:
+            return False, False
+
+    def _reassessment_events(self, identity: str, scope: str, assessment: _DeliveryAssessment,
+                             prior_events: list[dict], *, current: bool) -> list[dict]:
+        """Project completed individual rechecks without completing the package.
+
+        The inspector only emits IDs after validating selected evidence supply.
+        Partial packages additionally need actual bound evidence. Scope comes
+        exclusively from the original, integrity-checked inspection work order.
+        """
+        if not current or not assessment.reassessed_prior or (
+                assessment.coverage != 'complete' and not assessment.evidence_sha256):
+            return []
+        saved = self.inspector.store.read_json(self.inspector._path(identity, 'input'))
+        frozen = {row['id']: row for row in saved.get('prior_required', [])}
+        originals = {finding_id(event, finding): finding for event in prior_events
+                     for finding in event['findings'] if finding['severity'] == 'required'}
+        bound = {str(self.workspace.resolve(path)): digest
+                 for path, digest in assessment.artifacts.items()}
+        events = []
+        for prior_id in assessment.reassessed_prior:
+            row, original = frozen[prior_id], originals.get(prior_id)
+            if (original is None or row.get('message') != original['message']
+                    or row.get('severity') != 'required'):
+                continue
+            paths = row.get('pending_subjects')
+            if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+                continue  # Older work orders have no authenticated item scope.
+            if not original['subjects']:
+                if paths or row.get('subjects') != {}:
+                    continue
+                subjects = {}
+            else:
+                allowed = {}
+                for path, digest in original['subjects'].items():
+                    try:
+                        allowed[str(self.workspace.resolve(path))] = digest
+                    except (ValueError, OSError):
+                        pass  # Revoked siblings are not exposed or reassessed.
+                try:
+                    selected = {str(self.workspace.resolve(path)) for path in paths}
+                    advertised = {str(self.workspace.resolve(path)): digest
+                                  for path, digest in row.get('subjects', {}).items()}
+                except (ValueError, OSError):
+                    continue
+                if (not selected or not selected <= allowed.keys() or not selected <= bound.keys()
+                        or advertised != {path: allowed[path] for path in selected}):
+                    continue
+                subjects = {path: bound[path] for path in sorted(selected)}
+            events.append({'review_id': f'delivery:{identity}:{scope}:reassessed:{prior_id}',
+                'schema_version': 'delivery_assessment.v1', 'subjects': subjects,
+                'coverage': 'complete', 'verdict': 'passed', 'findings': [],
+                'reassessed_prior': [prior_id]})
+        return events
+
+    def _concern_events(self, artifacts: Any, observations: list[dict]) -> list[dict]:
+        """Project verified owner opinions in journal order; never persist state.
+
+        The caller supplies accepted native observations. Feedback verifies the
+        original opinion, separately from its applicability to current bytes.
+        File and claim events deliberately have different identities/scopes.
+        """
+        selected = {str(self.workspace.resolve(path)) for path in artifacts}
+        events = []
+        for observed in observations:
+            metadata = observed.get('metadata') or {}
+            envelope = metadata.get('delivery_review')
+            if isinstance(envelope, dict):
+                binding = envelope['binding']
+                if binding.get('schema_version') != 'delivery_review.v3':
+                    continue
+                identity = envelope['identity']
+                raw = (self.inspector.store.read_json(self.inspector._path(identity, 'result'))
+                       if self._pending_envelope(envelope)
+                       and self.inspector.store.exists(self.inspector._path(identity, 'result'))
+                       else envelope['result'])
+                value = (raw.get('metadata') or {}).get('delivery_assessment')
+                if value is None:
+                    continue  # Pending/failed work has no independent opinion.
+                assessment = _DeliveryAssessment.model_validate(value)
+                if not (self._relevant(assessment.artifacts, selected)
+                        or any(not row.subjects for row in assessment.findings)
+                        or assessment.reassessed_prior):
+                    continue
+                feedback = self.feedback_observation(envelope)
+                if not feedback.get('opinion_available'):
+                    raise ValueError('Retained delivery concern opinion cannot be verified')
+                if assessment.artifacts != binding['artifacts']:
+                    raise ValueError('Delivery concern inventory differs from its original scope')
+                self._reassessed_ids(identity, assessment)
+                accepted, applicable = self._accepted_package(observed, envelope, raw)
+                if not accepted:
+                    continue  # Unregistered independent replies are diagnostic only.
+                # Applicability is established by the existing verified review
+                # path, which already checks all bound outputs and evidence.
+                current = applicable and raw.get('status') == 'ok'
+                scope = hashlib.sha256(json.dumps(binding, sort_keys=True,
+                    ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+                completed = self._reassessment_events(identity, scope, assessment, events, current=current)
+                for kind, subjects in (('files', assessment.artifacts), ('claim', {})):
+                    findings = [row.model_dump(mode='json') for row in assessment.findings
+                                if bool(row.subjects) == (kind == 'files')]
+                    if kind == 'files' and not subjects:
+                        continue
+                    events.append({'review_id': f'delivery:{identity}:{scope}:{kind}',
+                        'schema_version': 'delivery_assessment.v1', 'subjects': subjects,
+                        'coverage': assessment.coverage if current else 'partial',
+                        'verdict': assessment.verdict if current else 'incomplete',
+                        'findings': findings, 'reassessed_prior': [],
+                        'record': self._opinion_record(observed.get('review_record')
+                            if self._pending_envelope(envelope) else observed.get('record'))})
+                events.extend(completed)
+                continue
+            if observed.get('tool_name') != 'inspect_artifacts':
+                continue
+            values = metadata.get('assessments', [metadata.get('assessment')])
+            if not any(isinstance(row, dict) and self._relevant(row.get('subjects', {}), selected)
+                       for row in values):
+                continue
+            feedback = self.inspector.feedback_from_observation(observed)
+            if feedback is None or not feedback.get('opinion_available'):
+                raise ValueError('Retained artifact concern opinion cannot be verified')
+            native = {**feedback['result'], 'record': observed.get('record')}
+            events.extend({**row.model_dump(mode='json'),
+                'record': self._opinion_record(observed.get('record'))}
+                for row in current_assessments(self.workspace, [native], retain_stale_findings=True))
+        return events
+
+    def pending_concerns(self, artifacts: Any, observations: list[dict] | None = None) -> list[dict]:
+        """Return unresolved original concerns, not defects asserted on new bytes."""
+        if not self.track_findings:
+            return []
+        rows = observations if observations is not None else (
+            self.observations() if self.observations is not None else [])
+        selected = {str(self.workspace.resolve(path)) for path in artifacts}
+        events = self._concern_events(artifacts, rows)
+        records = {}
+        for event in events:
+            for finding in event['findings']:
+                if finding['severity'] == 'required' and event.get('record'):
+                    records.setdefault(finding_id(event, finding), event['record'])
+        _, pending = assessment_state(events,
+            resolve=self.workspace.resolve, require_explicit_reassessment=True)
+        concerns = {}
+        for path, findings in pending.items():
+            if path is not None and path not in selected:
+                continue
+            for identity, finding in findings.items():
+                row = concerns.setdefault(identity, {'id': identity, 'message': finding['message'],
+                    'severity': 'required', 'subjects': deepcopy(finding['subjects']),
+                    'pending_subjects': [],
+                    **({'record': records[identity]} if identity in records else {})})
+                if path is not None:
+                    row['pending_subjects'].append(path)
+        for row in concerns.values():
+            row['pending_subjects'].sort()
+            # Identity was computed from the intact original finding above.
+            # Public work orders expose only authorized, still-pending paths.
+            visible = {}
+            for path, digest in row['subjects'].items():
+                try:
+                    if str(self.workspace.resolve(path)) in row['pending_subjects']:
+                        visible[path] = digest
+                except (ValueError, OSError):
+                    pass
+            row['subjects'] = visible
+        return [concerns[identity] for identity in sorted(concerns)]
+
+    def _concern_issues(self, observations: list[dict], binding: dict) -> list[str]:
+        return ['Delivery retains a concern requiring explicit reassessment: ' + row['message']
+                for row in self.pending_concerns(binding['artifacts'], observations)]
 
     @staticmethod
     def _arguments(binding: dict) -> dict:
@@ -200,7 +446,9 @@ class DeliveryReview:
         if self.workspace.artifact_hashes(binding['artifacts']) != binding['artifacts']:
             raise ValueError('Delivery artifacts changed during review')
         if binding['schema_version'] == 'delivery_review.v3' and result.ok:
-            self._package_assessment(result, binding)
+            assessment = self._package_assessment(result, binding)
+            if self.track_findings:
+                self._reassessed_ids(identity, assessment)
         return result
 
     @staticmethod
@@ -334,18 +582,27 @@ class DeliveryReview:
                 result = self._verified(identity, binding)
                 return self._envelope(binding, identity, result)
             prior = self.observations
-            for observed in reversed(prior() if prior is not None else []):
+            observations = prior() if prior is not None else []
+            pending = (self.pending_concerns(binding['artifacts'], observations)
+                       if self.track_findings else [])
+            for observed in reversed(observations):
                 candidate = (observed.get('metadata') or {}).get('delivery_review')
                 if not isinstance(candidate, dict) or candidate.get('binding') != binding:
                     continue
                 try:
-                    result = self._envelope_result(candidate, binding, record=observed.get('record'))
+                    if self.track_findings and self._pending_envelope(candidate):
+                        if not observed.get('review_record'):
+                            break
+                        _, result = self._resolve_observation(observed,
+                            review_record=observed['review_record'])
+                    else:
+                        result = self._envelope_result(candidate, binding, record=observed.get('record'))
                 except _ERRORS:
                     # Historical source versions may have changed. This permits a
                     # fresh parent identity, never a replay of the historical one.
                     # Do not fall back to an even older pass of this same bundle.
                     break
-                if result is not None and not self._result_issues(result, binding):
+                if result is not None and not self._result_issues(result, binding) and not pending:
                     return self._envelope(binding, candidate['identity'], result)
                 # A fresh explicit delivery may complete unfinished investigation
                 # or reconsider required findings. No old call is replayed and
@@ -354,7 +611,8 @@ class DeliveryReview:
             if not may_start:
                 return None
             result = self.inspector.call('inspect_artifacts', self._arguments(binding), identity,
-                                         delivery_context=deepcopy(binding))
+                delivery_context=deepcopy(binding),
+                **({'prior_required': deepcopy(pending)} if self.track_findings else {}))
             if result.ok and result.data.get('inspection_pending') == identity:
                 return self._envelope(binding, identity, result)
             if not result.ok:
@@ -381,16 +639,21 @@ class DeliveryReview:
                 candidate = (observed.get('metadata') or {}).get('delivery_review')
                 if not isinstance(candidate, dict) or candidate.get('binding') != binding:
                     continue
-                if observed.get('review_record') is not None and self._pending_envelope(candidate):
+                if self._pending_envelope(candidate) and (
+                        self.track_findings or observed.get('review_record') is not None):
+                    if self.track_findings and not observed.get('review_record'):
+                        return ['Independent opinion record cannot be verified for this delivery']
                     resolved, result = self._resolve_observation(observed, review_record=observed['review_record'])
                     candidate = (resolved.get('metadata') or {}).get('delivery_review')
                     if result is None or self._pending_envelope(candidate):
                         return ['Independent opinion record cannot be verified for this delivery']
-                    return self._result_issues(result, binding)
+                    return [*self._result_issues(result, binding),
+                            *self._concern_issues(observations, binding)] if self.track_findings else self._result_issues(result, binding)
                 result = self._envelope_result(candidate, binding, record=observed.get('record'))
                 if result is None:
                     return ['Current delivery review is still pending']
-                return self._result_issues(result, binding)
+                return [*self._result_issues(result, binding),
+                        *self._concern_issues(observations, binding)] if self.track_findings else self._result_issues(result, binding)
             return [('Current delivery lacks a complete independent whole-delivery review'
                      if self.protocol == 'task.v3' else
                      'Current canonical delivery lacks a complete independent whole-delivery review')]

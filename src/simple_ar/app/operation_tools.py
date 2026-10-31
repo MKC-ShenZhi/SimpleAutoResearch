@@ -191,9 +191,12 @@ class OperationTools:
             client_factory=lambda identity:client_factory(identity, 'writing'),
             protocol=config.get('inspection_protocol'),
             coverage_policy=config.get('inspection_coverage_policy'),
+            finding_policy=config.get('inspection_finding_policy'),
             material_observations=material_observations,
             user_requests=user_requests,
             feedback_provider=self.inspection_feedback if self.professional else None,
+            prior_concerns=lambda targets: self.delivery_review.pending_concerns(targets)
+                if self.delivery_review is not None else [],
             prior_assessments=lambda:[row.model_dump() for row in
                 current_assessments(self.workspace,observations())])
         self.registry.register_package(inspection_tool_specs(progressive=self.inspection.progressive,
@@ -206,7 +209,8 @@ class OperationTools:
             from simple_ar.tools.delivery_review import DeliveryReview
             self.delivery_review = DeliveryReview(workspace=self.workspace, inspector=self.inspection,
                 observations=observations,
-                protocol=config['delivery_review_protocol'])
+                protocol=config['delivery_review_protocol'],
+                track_findings=config.get('inspection_finding_policy') == 'linked.v1')
         self.registry.register_package(analysis_tool_specs(),
             AnalysisToolGateway(root,self.workspace,contract=config.get('table_analysis')),
             request_visible=config.get('table_analysis') is not None)
@@ -356,15 +360,9 @@ class OperationTools:
             if isinstance(envelope, dict) and self.delivery_review is not None:
                 feedback = self.delivery_review.feedback_observation(envelope)
             elif observed.get('tool_name') == 'inspect_artifacts':
-                if not (observed.get('metadata') or {}).get('inspection_binding'):
+                feedback = self.inspection.feedback_from_observation(observed)
+                if feedback is None:
                     continue
-                assessment = observed['metadata']['inspection_binding'].get('assessment_path')
-                identity = (Path(assessment).parts[1] if assessment and len(Path(assessment).parts) == 4
-                    and Path(assessment).parts[0] == 'attempts' else Path(observed['record']).parent.name)
-                claimed = {key: value for key, value in observed.items()
-                    if key not in {'record', 'arguments', 'current_request', 'contract_current'}}
-                feedback = self.inspection.feedback_observation(identity, claimed,
-                    expected_arguments=observed['arguments'])
             else:
                 continue
             subjects = []
