@@ -5,6 +5,7 @@ lives here. Historical control is selected only by the loader of its saved task.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Callable
 
@@ -347,7 +348,7 @@ class OperationTools:
         roots = [self.workspace.resolve(path) for path in targets]
         selected = {path: self.workspace.artifact_hashes([str(path)])[str(path)]
             for path in roots if path.is_file()}
-        result, concluded = [], set()
+        result, concluded, repeated = [], set(), {}
         for observed in reversed(self.observations()):
             envelope = (observed.get('metadata') or {}).get('delivery_review')
             if isinstance(envelope, dict) and self.delivery_review is not None:
@@ -368,15 +369,31 @@ class OperationTools:
             targets_reviewed = feedback.pop('reviewed_subjects')
             inventory = feedback.pop('reviewed_inventory', {})
             package = (feedback.get('delivery_context') or {}).get('schema_version') == 'delivery_review.v3'
+            metadata = feedback['result'].get('metadata') or {}
+            assessments = metadata.get('assessments', [metadata.get('assessment')])
+            signatures, duplicate_records = [], []
             for locator, digest in {**inventory, **targets_reviewed}.items():
                 try:
                     subject = self.workspace.resolve(locator)
                 except ValueError:
                     continue  # Old locators do not grant new access.
                 copy = next((path for path, value in selected.items() if value == digest), None)
-                if (not package and (subject, digest) in concluded or not (copy is not None or any(subject == root
+                required = any(finding.get('severity') == 'required' and locator in (finding.get('subjects') or {})
+                    for assessment in assessments if isinstance(assessment, dict)
+                    for finding in assessment.get('findings', []) if isinstance(finding, dict))
+                # Keep prior required opinions even after a narrower check, but
+                # do not repeat the identical bound opinion and scope. All
+                # original receipts remain available in the journal.
+                signature = json.dumps([locator, digest, feedback.get('arguments'), assessments],
+                    sort_keys=True, ensure_ascii=False) if required else None
+                if signature in repeated:
+                    duplicate_records.append(signature)
+                    continue
+                if (not package and (subject, digest) in concluded and not required or not (copy is not None or any(subject == root
                         or root.is_dir() and subject.is_relative_to(root) for root in roots))):
                     continue
+                if signature is not None:
+                    signatures.append(signature)
                 current_path = copy or subject
                 current = (self.workspace.artifact_hashes([str(current_path)])[str(current_path)]
                     if current_path.is_file() else None)
@@ -384,8 +401,6 @@ class OperationTools:
                     'selected_path': str(current_path), 'current_sha256': current,
                     'current_matches_review': current == digest,
                     'review_role': 'inspection_target' if locator in targets_reviewed else 'delivery_inventory_member'})
-                metadata = feedback['result'].get('metadata') or {}
-                assessments = metadata.get('assessments', [metadata.get('assessment')])
                 conclusive = lambda row: row and row['coverage'] == 'complete' and row['verdict'] != 'incomplete'
                 if (any(conclusive(row) and locator in row['subjects'] for row in assessments)
                         or inventory and assessments and all(conclusive(row) for row in assessments)):
@@ -394,9 +409,17 @@ class OperationTools:
             # answers and claim-level defects have no file scope at all, yet
             # remain relevant guidance for the next whole-work judgment.
             claim_findings = (feedback['result'].get('metadata') or {}).get('delivery_opinion', {}).get('findings', [])
+            record = 'records/' + observed['record'].removeprefix('attempts/')
+            for signature in duplicate_records:
+                references = repeated[signature].setdefault('related_opinion_records', [])
+                if record not in references:
+                    references.append(record)
             if subjects or package and (not inventory or not roots or any(not row['artifacts'] for row in claim_findings)):
-                result.append(self.inspection.feedback_view({**feedback, 'kind': 'inspection_feedback', 'subjects': subjects,
-                    'record': 'records/' + observed['record'].removeprefix('attempts/')}))
+                view = self.inspection.feedback_view({**feedback, 'kind': 'inspection_feedback',
+                    'subjects': subjects, 'record': record})
+                result.append(view)
+                for signature in signatures:
+                    repeated[signature] = view
         return result
 
     def presentation(self, selected: set[str], mode: str):

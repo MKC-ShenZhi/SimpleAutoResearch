@@ -908,11 +908,19 @@ class WorkspaceToolGateway:
             except (OSError, ValueError):
                 continue
         payload = {"call": deepcopy(call), "files": observed,
-            "argv": argv, "environment": self.process_environment()}
+            "argv": argv, "cwd": str(cwd), "environment": self.process_environment()}
         artifacts = self.process_artifact_binding(arguments)
         if artifacts is not None:
             payload['artifacts'] = artifacts
         return payload
+
+    @staticmethod
+    def approval_digest(binding: dict[str, Any]) -> str:
+        return hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
+
+    def approval_token(self, call: dict[str, Any]) -> str:
+        """Identify the actual command and its bound inputs for approval."""
+        return self.approval_digest(self.approval_binding(call))
 
     def process_artifact_binding(self, arguments: dict[str, Any], *, identity: str | None = None) -> dict[str, Any] | None:
         """Read-only approval hook. Absent declarations preserve historical tokens.

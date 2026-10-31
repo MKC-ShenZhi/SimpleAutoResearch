@@ -20,6 +20,8 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - Preserve observed paired differences without inferring whether a natural-language hypothesis is true solely from metric preference and mean direction.
 - Audit result claims before generating the report and data files, keeping their verdicts consistent when supporting evidence is missing.
 - Require supplied measurements, results, or source text for analysis verdicts and goal judgments; a file path or reference alone does not prove a scientific conclusion.
+- Retain relevant required findings for follow-up work when a later, narrower check passes.
+- Show the actual pending command when an inspection needs execution approval in the UI.
 
 Complete feedback delivery, independent review quality and total cost still require real-task acceptance on one version.
 

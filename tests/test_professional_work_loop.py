@@ -1117,6 +1117,42 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertFalse(self.app.workspace.resolve(calculation['result']).exists())
         token = self.app.approval_token(pending['action']['call'])
         ledger = self.app.ledger.to_dict()
+        from simple_ar.ui import Workspace
+        ui = Workspace(self.directory, [self.inputs], self.directory)
+        approval = ui.snapshot('task')['approval']
+        self.assertEqual(approval['token'], token)
+        self.assertEqual(approval['call'], pending['action']['call'])
+        self.assertEqual(approval['attempt'], pending['action']['attempt'])
+        arguments = json.loads(pending['action']['call']['function']['arguments'])
+        self.assertEqual(approval['execution'], {'argv': arguments['argv'],
+            'cwd': str(self.app.workspace.resolve(calculation['work'], write=True)), 'timeout_sec': 5})
+        first = self.root/'workspace/approval-first'
+        second = self.root/'workspace/approval-second'
+        link = self.root/'workspace/approval-current'
+        first.mkdir()
+        second.mkdir()
+        try:
+            link.symlink_to(first, target_is_directory=True)
+        except OSError:
+            pass  # The host may not allow creating symlinks.
+        else:
+            redirected = deepcopy(pending['action'])
+            proposed = json.loads(redirected['call']['function']['arguments'])
+            proposed.update(argv=['python', '-c', 'pass'], cwd='approval-current', inputs=[], outputs=[])
+            redirected['call']['function']['arguments'] = json.dumps(proposed)
+            binding = self.app.workspace.approval_binding(redirected['call'])
+            redirected['execution_approval'] = {'binding': binding,
+                'token': self.app.workspace.approval_digest(binding)}
+            link.unlink()
+            link.symlink_to(second, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'changed before execution'):
+                self.app._check_action_inputs(redirected, before_execution=True)
+        program_path = self.app.workspace.resolve(calculation['work']+'/check.py')
+        original_program = program_path.read_bytes()
+        program_path.write_bytes(original_program + b'\n# changed after approval\n')
+        self.assertIsNone(ui.snapshot('task')['approval'])
+        program_path.write_bytes(original_program)
+        self.assertEqual(ui.snapshot('task')['approval'], approval)
         self._reload()
         self.assertEqual(self.app.session.manifest.session_id, session_id)
         self.assertEqual(self.app.ledger.to_dict(), ledger)
@@ -4899,13 +4935,17 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.review = lambda view: {'findings':[{'subject':'target-1', 'severity':'required',
             'message':'The stated claim is not supported by the observed sample.'}], 'limitations':[]}
         self._inspect(['notes.md'])
+        self._inspect(['notes.md'])  # Repeated identical opinions keep one presentation, not two.
         self.review = lambda _: unfinished
         self._inspect(['notes.md'])
         self.assertEqual(self._assessment()['verdict'], 'incomplete')
         self.assertTrue(assessment_issues(self.app.workspace, self._observations(), ['notes.md']))
         self.review = lambda _: {'findings':[], 'limitations':[]}
-        self._inspect(['notes.md'])
+        self._submit(_action('inspect_artifacts', goal='Check only the heading.', targets=['notes.md']))
         self.assertFalse(assessment_issues(self.app.workspace, self._observations(), ['notes.md']))
+        feedback = self.app.operations.inspection_feedback(['notes.md'])
+        self.assertEqual(json.dumps(feedback).count('The stated claim is not supported by the observed sample.'), 1)
+        self.assertEqual(sum(len(row.get('related_opinion_records', [])) for row in feedback), 1)
 
     def test_failed_legacy_complete_read_cannot_erase_a_required_opinion(self):
         from simple_ar.core.assessments import assessment_issues
@@ -6008,6 +6048,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
             inputs=['count.py'], outputs=['count.txt']))
         pending = self.app.state['pending']
         self.assertIsNotNone(pending, self.app.result_snapshot())
+        old_binding = self.app.workspace.approval_binding(pending['call'])
+        old_binding.pop('cwd')
+        old_pending = deepcopy(pending)
+        old_pending['execution_approval'] = {'binding': old_binding,
+            'token': self.app.workspace.approval_digest(old_binding)}
+        self.app._check_action_inputs(old_pending, before_execution=True)
         token = self.app.approval_token(pending['call'])
         self.assertFalse(self._process_receipts())
         config = self.app.state['config'].copy()

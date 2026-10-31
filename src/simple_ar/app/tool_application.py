@@ -4753,13 +4753,16 @@ class ToolApplication:
         if not binding or call.get('function', {}).get('name') != 'run_process':
             return
         current = self.workspace.approval_binding(call)
+        if 'cwd' not in binding:
+            # Old approved actions retain the binding that was actually saved.
+            current.pop('cwd', None)
         if before_execution:
             if current != binding:
                 raise ValueError('Approved operation inputs changed before execution')
             return
         # An output named in argv can appear after execution. It cannot change
         # the pinned command/environment or any originally approved input.
-        if (any(current.get(key) != binding.get(key) for key in ('call', 'argv', 'environment'))
+        if (any(current.get(key) != binding.get(key) for key in ('call', 'argv', 'cwd', 'environment'))
                 or any(current['files'].get(path) != digest for path,digest in binding['files'].items())):
             raise ValueError('Approved operation inputs changed before receipt recovery')
         if binding.get('artifacts') is not None:
@@ -4809,8 +4812,7 @@ class ToolApplication:
             source = self.workspace.resolve(request.markdown, write=True)
             return hashlib.sha256(json.dumps({"call": call,
                 "inputs": self.publication.input_binding(source, request)}, sort_keys=True).encode()).hexdigest()
-        return hashlib.sha256(json.dumps(self.workspace.approval_binding(call),
-            sort_keys=True).encode()).hexdigest()
+        return self.workspace.approval_token(call)
 
     def _authorize(self, sources: tuple[Path, ...], *, execution: bool, network: bool, vision: bool) -> str:
         """Explicit caller grants within the existing task, never inferred intent."""
