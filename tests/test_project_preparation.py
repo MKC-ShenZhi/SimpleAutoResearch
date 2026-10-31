@@ -174,7 +174,8 @@ class ProjectPreparationTests(unittest.TestCase):
             (source / 'domain.py').write_text('VALUE = 1\n')
             (root / 'run.py').write_text('if __name__ == "__main__":\n    print("METRIC score=1")\n')
             for builder in (build_codebase_index, build_review_index, source_file_inventory):
-                paths = {row['path'] for row in builder(root)['files']}
+                options = {'access_boundary': root} if builder is build_review_index else {}
+                paths = {row['path'] for row in builder(root, **options)['files']}
                 self.assertIn('environment/domain.py', paths)
                 self.assertIn('run.py', paths)
                 self.assertNotIn('previous-attempt/generated-runtime/third_party.py', paths)
@@ -341,7 +342,7 @@ class ProjectPreparationTests(unittest.TestCase):
                 reads.append(path)
                 return original(path, *args, **kwargs)
             with patch.object(Path, 'read_bytes', observe):
-                index = build_review_index(root)
+                index = build_review_index(root, access_boundary=root)
             self.assertEqual(reads, [root / 'module.py'])
             self.assertIn('def visible(value)', index['files'][0]['public_api'])
 
@@ -426,7 +427,7 @@ class ProjectPreparationTests(unittest.TestCase):
             checkpoint.mkdir()
             (checkpoint / 'copy.ipynb').write_text('old outputs')
             with patch('simple_ar.code_task.review_pipeline.read_code_task_text', wraps=read_code_task_text) as read:
-                index = build_review_index(root)
+                index = build_review_index(root, access_boundary=root)
                 facts = inspect_project_preparation(root, index=index)
             self.assertFalse(any(call.args[0] == notebook for call in read.call_args_list))
             self.assertFalse(any(call.args[0].is_relative_to(root / '.venv')

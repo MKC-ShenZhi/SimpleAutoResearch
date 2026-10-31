@@ -9,6 +9,7 @@ from simple_ar.integrations.llm import LLMClient, LLMError, LLMResponseError
 from simple_ar.reviewing.schema import ReviewFinding, normalize_review_findings, review_report
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.artifacts import write_json
+from simple_ar.code_task.runtime.state import review_workspace_boundary
 from simple_ar.code_task.review_pipeline import (
     build_review_index, build_review_clusters, compact_review_index, snippets_for_cluster,
 )
@@ -34,13 +35,16 @@ def run_project_review(
     cluster_options: dict[str, Any] | None = None,
     snippet_options: dict[str, Any] | None = None,
     save_report: bool = False, before_save: Callable[[Path], None] | None = None,
+    access_boundary: Path | None = None,
 ) -> dict[str, Any]:
     """Own the project-review lifecycle; callers supply domain facts and policy.
 
     Preserve each consumer's paths, scope, source windows and usage ownership.
     The total finding cap does not stop later clusters from being inspected.
     """
-    index = build_review_index(project_dir, result_schema=result_schema, contract=contract)
+    boundary = review_workspace_boundary(project_dir, boundary=access_boundary)
+    index = build_review_index(project_dir, result_schema=result_schema, contract=contract,
+        access_boundary=boundary)
     clusters = build_review_clusters(index, deterministic_findings=deterministic,
                                     **(cluster_options or {}))
     if meta_dir is not None:
@@ -55,7 +59,8 @@ def run_project_review(
     if use_llm:
         compact_index = compact_review_index(index)
         for cluster in clusters:
-            snippets = snippets_for_cluster(project_dir, cluster, **(snippet_options or {}))
+            snippets = snippets_for_cluster(project_dir, cluster,
+                **{**(snippet_options or {}), 'access_boundary': boundary})
             if not snippets:
                 continue
             cluster_id = str(cluster.get('cluster_id') or 'cluster')

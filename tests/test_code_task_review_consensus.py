@@ -32,6 +32,7 @@ class ReviewConsensusTests(unittest.TestCase):
     def test_public_reviews_share_artifacts_empty_clusters_and_caps_without_merging_policy(self):
         from simple_ar.code_task.review import review_code_task_changes
         from simple_ar.code_task.generation.review import review_generated_project
+        from simple_ar.code_task.runtime.state import code_task_workspace_boundary
         clusters = [{'cluster_id': 'empty', 'files': []}] + [
             {'cluster_id': str(i), 'files': ['main.py']} for i in range(5)]
         for phase, per_cluster, total in (('post_apply', 5, 16), ('post_repair', 5, 16),
@@ -55,6 +56,7 @@ class ReviewConsensusTests(unittest.TestCase):
                          patch.object(reviewing, 'run_llm_review', side_effect=capture):
                         if phase == 'generated_project':
                             report = review_generated_project(project_dir=run / 'code_task/workspace',
+                                access_boundary=code_task_workspace_boundary(run),
                                 code_artifacts={}, result_schema={}, resource_plan={},
                                 client=object(), meta_dir=meta, use_llm=enabled)
                         else:

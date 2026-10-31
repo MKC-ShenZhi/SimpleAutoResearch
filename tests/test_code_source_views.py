@@ -201,7 +201,7 @@ class ReviewSourceContextTests(unittest.TestCase):
             (root / 'pkg/unrelated_model.py').write_text('value = 99\n')
             (root / 'large_data.txt').write_text('Unrelated measurements\n' * 100)
             (root / 'README.md').write_text('Unrelated project overview\n')
-            index = build_review_index(root)
+            index = build_review_index(root, access_boundary=root)
             clusters = build_review_clusters(index, relevant_paths=['pkg/helper.py'])
             selected = {path for cluster in clusters for path in cluster['files']}
             self.assertEqual(selected, {'pkg/helper.py', 'pkg/dependency.py', 'pkg/consumer.py'})
@@ -223,7 +223,7 @@ class ReviewSourceContextTests(unittest.TestCase):
             for diff, budget, count in cases:
                 with self.subTest(diff=diff, budget=budget):
                     blocks = snippets_for_cluster(root, {'files': ['helper.py']},
-                        chars_per_file=budget, patch_diff=diff)
+                        chars_per_file=budget, patch_diff=diff, access_boundary=root)
                     self.assert_views(blocks, source, budget)
                     self.assertIn('partial source', blocks[0])
                     if diff:
@@ -245,6 +245,7 @@ class ReviewSourceContextTests(unittest.TestCase):
             (root / 'outside.py').write_text('private = True')
             cluster = {'files': ['main.py', '.env', '../outside.py', str(root / 'outside.py')]}
             blocks = snippets_for_cluster(workspace, cluster, chars_per_file=100,
+                                          access_boundary=workspace,
                                           patch_diff='+++ b/main.py\n@@ -1,1 +1,1 @@\n')
             self.assertEqual(len(blocks), 1)
             self.assert_views(blocks, source, 100)

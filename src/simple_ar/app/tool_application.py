@@ -443,9 +443,9 @@ class ToolApplication:
             raise ValueError('Journal continuity requires the saved shared native work context')
         if config.get('delivery_review_protocol') not in {None, 'task.v1', 'task.v2', 'task.v3'}:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
-        if config.get('inspection_coverage_policy') not in {None, 'offered.v1'}:
+        if config.get('inspection_coverage_policy') not in {None, 'offered.v1', 'offered.v2'}:
             raise ValueError('Unsupported saved inspection coverage policy; no silent migration')
-        if (config.get('inspection_coverage_policy') == 'offered.v1'
+        if (config.get('inspection_coverage_policy') in {'offered.v1', 'offered.v2'}
                 and (config.get('inspection_protocol') != 'subjects.v3'
                      or config.get('inspection_execution_protocol') != 'shared.v1')):
             raise ValueError('Offered inspection coverage requires the shared subject inspection contract')
@@ -1738,7 +1738,7 @@ class ToolApplication:
         config, reused, limits, attempts = cls._configuration(root, goal, **options)
         config['inspection_protocol'] = 'subjects.v3'
         config['inspection_execution_protocol'] = 'shared.v1'
-        config['inspection_coverage_policy'] = 'offered.v1'
+        config['inspection_coverage_policy'] = 'offered.v2'
         if config['model'] is not None:
             config['delivery_review_protocol'] = 'task.v3'
         from simple_ar.app.operation_tools import CURRENT_PROFESSIONAL_CONTRACT

@@ -790,13 +790,15 @@ class SourceToolGateway:
                 if source:
                     from simple_ar.research.preparation import inspect_execution_entry
                     from simple_ar.code_task.review_pipeline import build_review_index
-                    index = build_review_index(source)
-                    if any(str((source / row['path']).resolve()) not in {
-                            str(self.workspace.resolve(path)) for path in inventory['file_hashes']}
-                            for row in index.get('files', [])):
-                        raise ValueError('Project review index includes unmounted source paths')
+                    boundary = self.workspace.material_boundary(str(source))
+                    inventory_paths = {self.workspace.resolve(path) for path in inventory['file_hashes']}
+                    traversal_paths = {parent for path in inventory_paths for parent in path.parents
+                                       if parent.is_relative_to(source)}
+                    index = build_review_index(source, access_boundary=boundary,
+                        path_filter=lambda path: path in inventory_paths or path in traversal_paths)
                     facts = {**inspect_execution_entry({**policy.execution_boundary,
-                        'code_task': {'code_root': str(source)}}), **facts}
+                        'code_task': {'code_root': str(source)}}, access_boundary=boundary,
+                        project_index=index), **facts}
                     artifacts.append(context.store.ref('source_inventory.json', kind='source_inventory'))
                     artifacts.append(context.store.write_json('project_inspection.json', facts, kind='project_inspection'))
                 reviewer = client(reviewer=True)

@@ -12,7 +12,7 @@ from simple_ar.code_task.editing.scope import (
 from simple_ar.code_task.generation.task_contract import load_task_contract
 from simple_ar.code_task.memory import record_review_finding, task_memory_context
 from simple_ar.code_task.analysis.interfaces import find_local_api_mismatches, project_api_contract
-from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest
+from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest, code_task_workspace_boundary, review_workspace_boundary
 from simple_ar.core.artifacts import read_json, read_text
 from simple_ar.reviewing.schema import ReviewFinding
 from simple_ar.integrations.llm import LLMClient
@@ -51,6 +51,7 @@ def review_code_task_changes(
     root = Path(run_dir)
     paths = code_task_paths(root)
     manifest = load_code_task_manifest(root)
+    boundary = review_workspace_boundary(paths.workspace_dir, boundary=code_task_workspace_boundary(root))
     changed_files = _changed_files(manifest, paths)
     interface_mismatches = find_local_api_mismatches(paths.workspace_dir, relevant_paths=changed_files)
     deterministic = _deterministic_findings(root, manifest, changed_files, interface_mismatches=interface_mismatches)
@@ -64,6 +65,7 @@ def review_code_task_changes(
     suffix = "" if phase == "post_apply" else f"_{phase}"
     report = run_project_review(
         project_dir=paths.workspace_dir, result_schema=_result_schema_from_manifest(manifest),
+        access_boundary=boundary,
         contract=_contract_from_run(paths), deterministic=deterministic,
         reviewer="code-task-reviewer", subject=phase, meta_dir=paths.meta_dir,
         artifact_suffix=suffix, cluster_metadata={"phase": phase}, save_report=True,

@@ -5640,7 +5640,7 @@ def _temporary_root():
 
 
 def _generated_review(project: Path, rows: list[dict], **overrides) -> dict:
-    inputs = dict(project_dir=project, code_artifacts={"generated_files": rows},
+    inputs = dict(project_dir=project, access_boundary=project, code_artifacts={"generated_files": rows},
         result_schema={}, resource_plan={"max_files": 10, "max_generated_lines": 200},
         use_llm=False)
     return review_generated_project(**(inputs | overrides))

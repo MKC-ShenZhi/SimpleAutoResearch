@@ -16,7 +16,7 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion
 
 from simple_ar.code_task.orchestration.workflow import initialize_code_task
-from simple_ar.code_task.review_pipeline import build_review_index
+from simple_ar.code_task.review_pipeline import authorized_review_index, build_review_index
 from simple_ar.core.capabilities import CapabilityContext, CapabilityResult
 from simple_ar.experiment.execution.backend import RunRequest
 from simple_ar.experiment.templates import build_experiment_code
@@ -140,6 +140,7 @@ class PreparationRequest:
 def inspect_project_preparation(
     project: Path, *, data_paths: tuple[Path, ...] = (), index: Mapping[str, Any] | None = None,
     read_paths: tuple[str, ...] = (),
+    access_boundary: Path | None = None,
 ) -> dict[str, Any]:
     """Read preparation inputs; neither README commands nor manifests execute.
 
@@ -148,15 +149,27 @@ def inspect_project_preparation(
     """
     from simple_ar.code_task.execution.environment import DEPENDENCY_FILE_NAMES
 
-    root = project.expanduser().resolve()
+    # A raw user path is a new source, not its own authorization proof.
+    # Task-derived projects instead carry their existing mount/workspace grant.
+    from simple_ar.tools.workspace import resolve_source_mount
+    from simple_ar.code_task.runtime.state import review_workspace_boundary
+    root = (resolve_source_mount(project) if access_boundary is None
+            else project.expanduser().absolute())
+    boundary = review_workspace_boundary(root, boundary=access_boundary or root)
     if not root.is_dir():
         raise ValueError(f"Project directory not found: {root}")
-    index = build_review_index(root) if index is None else index
+    index = build_review_index(root, access_boundary=boundary) if index is None else index
+    # Saved inventories are observations, never grants. Project their paths
+    # through the current grant without rewriting the historical artifact.
+    from simple_ar.code_task.analysis.index import code_task_access_filter
+    allowed = code_task_access_filter(root, boundary=boundary)
+    index = authorized_review_index(root, index, access_boundary=boundary)
+    available_paths = {row['path'] for row in index['files']}
     documents = []
     # Generated lock files are intentionally absent from the code-review
     # text index. Their top-level names still belong in preparation inventory.
     for path in root.iterdir():
-        if path.is_file() and path.name.endswith(".lock") and path.name in DEPENDENCY_FILE_NAMES:
+        if allowed(path) and path.is_file() and path.name.endswith(".lock") and path.name in DEPENDENCY_FILE_NAMES:
             documents.append((path.name, "dependency_declaration"))
     for row in index.get("files", []):
         relative = str(row["path"])
@@ -181,8 +194,8 @@ def inspect_project_preparation(
             # Lockfile identities are useful; their large generated contents
             # are not preparation prose. Keep the path available for later use.
             continue
-        if path.is_symlink():
-            notes.append(f"Not followed: {relative} is a symbolic link.")
+        if not allowed(path):
+            notes.append(f"Not read: {relative} no longer passes project access checks.")
             continue
         try:
             with path.open("r", encoding="utf-8") as stream:
@@ -208,11 +221,10 @@ def inspect_project_preparation(
             notes.append("pyproject.toml could not be parsed; its original text is retained.")
     # Entry source explains flags and emitted measurements without importing
     # the project. It shares the established index; notebooks remain unread.
-    available_paths = {str(row["path"]) for row in index.get("files", [])}
     # Preparation can inspect declared lockfiles on request without adding
     # generated contents to the code-review index or initial model context.
     lock_paths = {relative for relative, _ in documents if relative.endswith(".lock")
-                  and not (root / relative).is_symlink()}
+                  and allowed(root / relative)}
     available_paths.update(lock_paths)
     if len(read_paths) > 15 or any(path not in available_paths for path in read_paths):
         raise ValueError("Preparation reads must name indexed project text files (at most 15 extra files); no external or excluded paths.")
@@ -237,7 +249,7 @@ def inspect_project_preparation(
         if any(row["path"] == relative for row in excerpts):
             continue
         path = root / relative
-        if path.is_symlink():
+        if not allowed(path):
             continue
         try:
             with path.open("r", encoding="utf-8") as stream:
@@ -331,7 +343,9 @@ def project_preparation_markdown(facts: Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def inspect_execution_entry(execution: Mapping[str, Any]) -> dict[str, Any]:
+def inspect_execution_entry(execution: Mapping[str, Any], *,
+                            access_boundary: Path | None = None,
+                            project_index: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Inspect the supplied project boundary without creating a workspace.
 
     The result is a compact fact pack for research design. It records existing
@@ -361,10 +375,15 @@ def inspect_execution_entry(execution: Mapping[str, Any]) -> dict[str, Any]:
 
     task = config.get("code_task")
     if isinstance(task, Mapping) and task.get("code_root"):
-        root = Path(str(task["code_root"])).expanduser().resolve()
+        from simple_ar.tools.workspace import resolve_source_mount
+        from simple_ar.code_task.runtime.state import review_workspace_boundary
+        raw = Path(str(task["code_root"]))
+        root = resolve_source_mount(raw) if access_boundary is None else raw.expanduser().absolute()
+        boundary = review_workspace_boundary(root, boundary=access_boundary or root)
         if not root.is_dir():
             raise ValueError("code_task.code_root must be an existing absolute project directory.")
-        index = build_review_index(root, result_schema=config.get("result_schema"))
+        index = (build_review_index(root, result_schema=config.get("result_schema"), access_boundary=boundary)
+                 if project_index is None else authorized_review_index(root, project_index, access_boundary=boundary))
         entrypoints = [str(item) for item in index.get("entrypoints", [])]
         facts["project"] = {
             "root": str(root),
@@ -377,7 +396,7 @@ def inspect_execution_entry(execution: Mapping[str, Any]) -> dict[str, Any]:
             "entrypoint_candidates": entrypoints,
         }
         facts["entrypoint_candidates"] = entrypoints
-        facts["preparation"] = inspect_project_preparation(root, index=index)
+        facts["preparation"] = inspect_project_preparation(root, index=index, access_boundary=boundary)
         for entrypoint in entrypoints:
             prefix = [sys.executable, entrypoint]
             if prefix not in facts["authorized_argv_prefixes"]:

@@ -117,8 +117,20 @@ class _ReviewResponse(BaseModel):
     decisions: list[_ReviewDecision]
 
 
+class _ReviewDecisionV2(_ReviewDecision):
+    reassessed_prior: bool = Field(default=False,
+        description='True only if this review actually re-examined every listed prior required concern '
+            'for this target against current evidence; false leaves them unresolved.')
+
+
+class _ReviewResponseV2(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    decisions: list[_ReviewDecisionV2]
+
+
 def inspection_tool_specs(*, progressive: bool = False, adaptive: bool = False,
-                          execution_protocol: str | None = None) -> list[CommonToolSpec]:
+                          execution_protocol: str | None = None,
+                          coverage_policy: str | None = None) -> list[CommonToolSpec]:
     if execution_protocol not in (None, 'shared.v1'):
         raise ValueError('Unknown inspection execution protocol')
     specs = [CommonToolSpec(name='inspect_artifacts', domain='inspection',
@@ -154,6 +166,11 @@ def inspection_tool_specs(*, progressive: bool = False, adaptive: bool = False,
             'No edits, execution, delivery, visual or scientific certification; same identity never requests again.', shared)
         specs[0].description = specs[0].description.replace(
             'No edits, execution, delivery, visual inspection or scientific certification. Same identity never requests again.', shared)
+    if coverage_policy == 'offered.v2':
+        specs[0].artifact_outputs.append('artifact_assessment.v2')
+        specs[0].description = specs[0].description.replace(
+            'partial targets cannot pass.',
+            'an explicit text window may pass within that window only; it cannot certify the whole file.')
     return specs
 
 
@@ -255,7 +272,7 @@ class InspectionToolGateway:
             raise ValueError('Unknown inspection protocol')
         if execution_protocol not in (None, 'shared.v1'):
             raise ValueError('Unknown inspection execution protocol')
-        if coverage_policy not in (None, 'offered.v1'):
+        if coverage_policy not in (None, 'offered.v1', 'offered.v2'):
             raise ValueError('Unknown inspection coverage policy')
         self.root, self.workspace = Path(root), workspace
         self.store, self.client_factory = ArtifactStore(root), client_factory
@@ -284,9 +301,9 @@ class InspectionToolGateway:
     @staticmethod
     def _offered_coverage(saved: dict) -> bool:
         policy = saved.get('coverage_policy')
-        if policy not in (None, 'offered.v1'):
+        if policy not in (None, 'offered.v1', 'offered.v2'):
             raise ValueError('Unknown saved inspection coverage policy')
-        return policy == 'offered.v1'
+        return policy in {'offered.v1', 'offered.v2'}
 
     def _system(self, saved: dict) -> str:
         if saved.get('execution_protocol') == 'shared.v1':
@@ -314,7 +331,11 @@ class InspectionToolGateway:
                 'to the request, check original data and independently calculate when practical. Rerunning '
                 'the producer establishes reproducibility, not independent correctness; a different script '
                 'alone does not establish independence. Explain necessary checks that could not be made. '
-                'Tool results do not certify scientific correctness.')
+                'Tool results do not certify scientific correctness.'
+                + (' For each target, set reassessed_prior=true only after actually rechecking every '
+                   'listed prior required concern against current evidence; a narrower review leaves '
+                   'other concerns unresolved.'
+                   if saved.get('coverage_policy') == 'offered.v2' and not self._delivery_scope(saved) else ''))
         return (_DELIVERY_SYSTEM if self._delivery_scope(saved) else _REVIEW_SYSTEM
             if self.adaptive else _SUBJECT_SYSTEM if self.protocol else _SYSTEM)
 
@@ -1558,6 +1579,45 @@ class InspectionToolGateway:
         return bool(target.get('readable') and len(sizes) == 1 and self._range_supplied(
             offered.get((target.get('path'), target.get('sha256')), []), 0, next(iter(sizes))))
 
+    @staticmethod
+    def _requested_window(saved: dict, target: dict, index: int) -> dict | None:
+        """Derive an explicit window from the saved request and original read receipt.
+
+        The model's opinion and later source reads cannot expand this scope. A
+        line-limited request needs an uncropped initial read to establish its
+        end; an ordinary byte request has an end fixed by the file size.
+        """
+        if saved.get('coverage_policy') != 'offered.v2':
+            return None
+        values = saved.get('arguments', {}).get('targets', [])
+        if index >= len(values) or not isinstance(values[index], dict):
+            return None
+        windows = target.get('windows', [])
+        if not target.get('readable') or not windows:
+            return None
+        request = FileWindow.model_validate(values[index])
+        first = windows[0]
+        actual = first.get('read_request') or {}
+        size = first.get('size_bytes')
+        start = first.get('offset_bytes')
+        if type(size) is not int or type(start) is not int or not 0 <= start <= size:
+            return None
+        if request.start_line is not None and size and start == size:
+            return None  # A line beyond EOF is not an inspected text window.
+        if request.start_line is None and 'max_lines' not in request.model_fields_set:
+            if start != request.offset_bytes:
+                return None
+            end = min(size, start + request.max_bytes)
+        else:
+            if (actual.get('max_bytes', 0) < request.max_bytes and first.get('has_more')):
+                return None
+            end = first.get('next_offset_bytes')
+            if end != first.get('review_next_offset_bytes'):
+                return None  # The read ended inside a UTF-8 code point.
+        if type(end) is not int or not start <= end <= size:
+            return None
+        return {'start': start, 'end': end, 'size_bytes': size}
+
     def _check_versions(self, rows: list[dict[str, Any]], identity: str) -> None:
         for row in rows:
             if not row.get('sha256'):
@@ -1581,7 +1641,7 @@ class InspectionToolGateway:
             for target in saved['targets']}
 
     def _subject_decisions(self, saved: dict[str, Any], value: dict) -> list[_SubjectDecision]:
-        model = _ReviewResponse if self.adaptive else _SubjectResponse
+        model = (_ReviewResponseV2 if saved.get('coverage_policy') == 'offered.v2' else _ReviewResponse) if self.adaptive else _SubjectResponse
         decisions = model.model_validate(value).decisions
         targets = {row['subject']: row for row in saved['targets']}
         ids = [decision.subject for decision in decisions]
@@ -1711,13 +1771,20 @@ class InspectionToolGateway:
         except (ValueError, OSError, KeyError, TypeError) as exc:
             error, decisions = str(exc), {}
         assessments = []
-        for target in saved['targets']:
+        for index, target in enumerate(saved['targets']):
             if not target.get('sha256'):
                 continue  # Unbound files cannot receive an assessment or a pass.
             decision = decisions.get(target['subject'])
             sources = [observed[key] for key in decision.evidence] if decision else []
             target_complete = (self._offered_target_complete(target, list(observed.values()), offered)
                 if self._offered_coverage(saved) else self._complete_target(target, list(observed.values())))
+            requested = saved.get('arguments', {}).get('targets', [])
+            window_request = (saved.get('coverage_policy') == 'offered.v2' and index < len(requested)
+                and isinstance(requested[index], dict))
+            scope = self._requested_window(saved, target, index) if window_request else None
+            if window_request:
+                target_complete = bool(scope is not None and self._range_supplied(
+                    offered.get((target.get('path'), target.get('sha256')), []), scope['start'], scope['end']))
             scopes = ([self._offered_row_scope(row, offered) for row in sources]
                 if self._offered_coverage(saved) and decision else [])
             limitations = [f"{row['subject']}: {row['limitation']}"
@@ -1731,6 +1798,8 @@ class InspectionToolGateway:
                 if not target_complete or any(not covered for covered, _ in scopes):
                     limitations.append('Requested target or selected evidence has read ranges not proven supplied to an inspection request')
             limitations.extend(decision.limitations if decision else [error])
+            if scope is not None:
+                limitations.append('Opinion covers only the requested text window, not the whole file')
             findings = [{'subjects': {target['path']: target['sha256']},
                 'severity': row.severity, 'message': row.message} for row in decision.findings] if decision else []
             complete = bool(not error and target_complete and all(covered for covered, _ in scopes)
@@ -1738,12 +1807,19 @@ class InspectionToolGateway:
             verdict = ('incomplete' if error else
                 'needs_revision' if any(row['severity'] == 'required' for row in findings) else
                 'passed' if complete else 'incomplete')
-            assessments.append({'schema_version': 'artifact_assessment.v1',
+            current_scope = saved.get('coverage_policy') == 'offered.v2'
+            reassessed = ([item['id'] for item in saved.get('prior_required', [])
+                if target['subject'] in item.get('subjects', []) and item.get('id')]
+                if current_scope and decision and decision.reassessed_prior else [])
+            assessments.append({'schema_version': 'artifact_assessment.v2' if current_scope else 'artifact_assessment.v1',
                 'subjects': {target['path']: target['sha256']},
                 'evidence_sha256': self._evidence_with_dependencies(
                     {row['path']: row['sha256'] for row in sources},
                     bindings.get(target['subject'], {}) if decision else {}),
-                'coverage': 'complete' if complete else 'partial',
+                'coverage': ('scoped' if scope is not None else 'complete') if complete else 'partial',
+                **({'scope': scope} if scope is not None else {}),
+                **({'reassessed_prior': list(dict.fromkeys(reassessed)),
+                    'review_id': identity + ':' + target['subject']} if current_scope else {}),
                 'verdict': verdict, 'findings': findings,
                 'limitations': [*limitations,
                     'Inspection uses retained text and recorded tool observations; results do not certify scientific correctness'
@@ -1939,21 +2015,34 @@ class InspectionToolGateway:
         self.store.write_json(response_path, receipt)
         return self._cached(identity)
 
-    def _prior(self, targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _prior(self, targets: list[dict[str, Any]], *, current_policy: bool = False) -> list[dict[str, Any]]:
         """Present same-version concerns, without adopting their earlier verdict."""
         current = {row['path']: row['sha256'] for row in targets if row.get('sha256')}
         ids = {row['path']: row['subject'] for row in targets if row.get('sha256')}
         result = []
-        for assessment in self.prior_assessments() if self.prior_assessments else []:
+        assessments = self.prior_assessments() if self.prior_assessments else []
+        if current_policy:
+            from simple_ar.core.assessments import assessment_state
+            _, pending = assessment_state(assessments,
+                resolve=self.workspace.resolve if getattr(self, 'workspace', None) else None)
+            grouped = {}
+            for path in current:
+                for identity, finding in pending.get(path, {}).items():
+                    row = grouped.setdefault(identity, {'id': identity, 'subjects': [],
+                        'severity': 'required', 'message': finding['message']})
+                    row['subjects'].append(ids[path])
+            return list(grouped.values())
+        for assessment in assessments:
             assessment = assessment.get('metadata', {}).get('assessment', assessment)
-            if assessment.get('schema_version') != 'artifact_assessment.v1':
+            if assessment.get('schema_version') not in {'artifact_assessment.v1', 'artifact_assessment.v2'}:
                 continue
             for finding in assessment.get('findings', []):
                 subjects = finding.get('subjects', {})
+                matched = [ids[path] for path, digest in subjects.items() if current.get(path) == digest]
                 if (finding.get('severity') == 'required' and subjects
-                        and all(current.get(path) == digest for path, digest in subjects.items())
+                        and len(matched) == len(subjects)
                         and isinstance(finding.get('message'), str) and finding['message'].strip()):
-                    result.append({'subjects': [ids[path] for path in subjects],
+                    result.append({'subjects': matched,
                                    'severity': 'required', 'message': finding['message']})
         return result
 
@@ -1997,7 +2086,9 @@ class InspectionToolGateway:
     def _view(self, saved: dict[str, Any], request: InspectionRequest, *, source_result: bool = False) -> dict[str, Any]:
         view = {'goal':request.goal,
             'prior_required':saved['prior_required'],
-            'prior_scope':'Reassess these concerns against the current full targets and evidence; '
+            'prior_scope':('Reassess these concerns within the explicitly requested target scope and evidence; '
+                if saved.get('coverage_policy') == 'offered.v2' else
+                'Reassess these concerns against the current full targets and evidence; ') +
                           'earlier opinions are not source evidence or adoption decisions.'}
         if 'user_requests' in saved:
             view['user_requests'] = saved['user_requests']
@@ -2036,7 +2127,7 @@ class InspectionToolGateway:
                 for row in saved[role]]
             if self.progressive:
                 all_rows = [*saved['targets'], *saved['evidence']]
-                for original, visible in zip(saved[role], view[role]):
+                for index, (original, visible) in enumerate(zip(saved[role], view[role])):
                     visible['sha256'] = original.get('sha256')
                     visible['version_scope'] = 'Owner-computed current full-file digest, not a scientific opinion'
                     visible['observed_ranges'] = [[w['offset_bytes'], w['review_next_offset_bytes']]
@@ -2045,6 +2136,11 @@ class InspectionToolGateway:
                         visible['complete'] = self._complete_target(original, all_rows)
                         if visible['complete']:
                             visible['limitation'] = ''
+                        scope = self._requested_window(saved, original, index)
+                        if scope is not None:
+                            visible['requested_scope'] = scope
+                            visible['scope_description'] = ('The requested text window only; '
+                                'complete refers to the whole file, not this narrower request.')
                     if not source_result and original['subject'] not in saved.get('initial_subjects', []):
                         visible['text_windows'] = []
         view['authorized_roots'] = {name:str(path) for name,path in self.workspace.mounts.items()}
@@ -3013,7 +3109,8 @@ class InspectionToolGateway:
                     'Historical observations grant no current evidence, permission or repeated execution.',
                 'parameters':_InspectionHistory.model_json_schema()}})
         package = self._delivery_scope(saved)
-        response_model = (_DeliveryResponse if package else _ReviewResponse if self.adaptive
+        response_model = (_DeliveryResponse if package else
+            (_ReviewResponseV2 if saved.get('coverage_policy') == 'offered.v2' else _ReviewResponse) if self.adaptive
             else _SubjectResponse if self.protocol else _Response)
         terminal = {'type':'function','function':{'name':'record_inspection',
             'description':'Finish this inspection with findings and scope limitations. '
@@ -3070,7 +3167,8 @@ class InspectionToolGateway:
                 schema = response_model.model_json_schema()
                 branches = []
                 for subject, references in self._admissible_references(saved).items():
-                    decision = deepcopy(schema['$defs']['_ReviewDecision'])
+                    decision_type = '_ReviewDecisionV2' if response_model is _ReviewResponseV2 else '_ReviewDecision'
+                    decision = deepcopy(schema['$defs'][decision_type])
                     decision['properties']['subject'].update(const=subject,
                         description='Bare target observation subject ID; not a chunk_id or file path.')
                     evidence = decision['properties']['evidence']
@@ -3087,7 +3185,7 @@ class InspectionToolGateway:
                     minItems=len(branches), maxItems=len(branches))
                 # The former item reference has been replaced by inline branches;
                 # their findings still reference the retained _SubjectFinding.
-                del schema['$defs']['_ReviewDecision']
+                del schema['$defs'][decision_type]
                 terminal['function']['parameters'] = schema
             label = f'inspect-artifacts-{identity}' + (f'-sources-{number}' if number else '')
             if saved.get('memory_protocol') != 'journal.v1' and {'llm_requests','total_tokens'}.intersection(ledger.unknown_dimensions(
@@ -3493,7 +3591,8 @@ class InspectionToolGateway:
                     self._reuse_observations(saved, remaining)
                 saved['initial_subjects'] = [row['subject'] for row in [*saved['targets'],*saved['evidence']]]
             self._mark_evidence(saved)
-            saved['prior_required'] = self._prior(saved['targets'])
+            saved['prior_required'] = self._prior(saved['targets'],
+                current_policy=saved.get('coverage_policy') == 'offered.v2')
             if saved.get('execution_protocol') == 'shared.v1':
                 saved['initial_read_remaining'] = remaining[0]
                 saved['immutable_paths'] = [row['path'] for row in [*saved['targets'], *saved['evidence']]

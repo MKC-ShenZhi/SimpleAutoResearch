@@ -17,7 +17,8 @@ from typing import Any, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
-from simple_ar.core.artifacts import read_json, replace_exact_spans
+from simple_ar.core.artifacts import (is_private_path_name as _private_name,
+    read_json, replace_exact_spans)
 from simple_ar.core.budget import BudgetError, BudgetExceededError, BudgetLedger
 from simple_ar.core.process import ProcessSpec, process_observation, run_process, settle_process_record
 from simple_ar.tools.specs import CommonToolSpec, ToolResult, tool_completion
@@ -202,20 +203,13 @@ _TOOLS = {
     "deliver_result": (DeliveryRequest, "Deliver actual workspace artifacts and optional retained task-evidence references; name unresolved work honestly.", "plan"),
     "ask_user": (_Question, "Ask a concentrated question only when needed to proceed; pause with all work preserved.", "plan"),
 }
-_PRIVATE = {".git", ".aws", ".ssh", ".codex", ".agents", "__pycache__", ".venv", "venv"}
-
-
-def _private_name(name: str) -> bool:
-    name = name.lower()
-    return name in _PRIVATE or name.startswith('.env')
-
-
 def resolve_source_mount(value: Path) -> Path:
     """Admit a new read-only source before configuration or model side effects."""
     path = value.expanduser().absolute()
     resolved = path.resolve(strict=True)
     for candidate in (path, resolved):
-        if path.is_symlink() or any(_private_name(part) for part in candidate.parts):
+        if (any(parent.is_symlink() or parent.is_junction() for parent in (path, *path.parents))
+                or any(_private_name(part) for part in candidate.parts)):
             raise ValueError(f'Private/runtime or symlink material is not a task input: {path}')
     if not (resolved.is_file() or resolved.is_dir()):
         raise ValueError(f'Material must be a regular file or directory: {resolved}')
@@ -742,6 +736,12 @@ class WorkspaceToolGateway:
 
     def resolve_material_root(self, value: str) -> Path:
         return resolve_mounted_path(self.mounts, value, discovery=True)
+
+    def material_boundary(self, value: str) -> Path:
+        """Return the existing mount grant after admitting a discovery root."""
+        path = self.resolve_material_root(value)
+        return max((root for root in self.mounts.values() if path.is_relative_to(root)),
+                   key=lambda root: len(root.parts))
 
     def locator(self, value: str) -> str:
         """Expose a short authorized mount spelling, never a new access grant."""
@@ -1380,18 +1380,19 @@ class WorkspaceToolGateway:
                 from simple_ar.core.artifacts import write_json
 
                 target = self.resolve(model.path)
+                boundary = self.material_boundary(str(target))
                 data_paths = tuple(self.resolve(path) for path in model.data_paths)
-                # Apply this gateway's existing private-path policy before
-                # any source is read, not by filtering an already-read index.
+                # CodeTask's example-file visibility cannot expand this
+                # gateway's grant. Delegate to the existing mount resolver.
                 def accessible(path: Path) -> bool:
                     try:
                         self.resolve(str(path))
                     except ValueError:
                         return False
                     return True
-                index = build_review_index(target, excluded_names=frozenset(_PRIVATE),
-                                           path_filter=accessible)
-                facts = inspect_project_preparation(target, data_paths=data_paths, index=index)
+                index = build_review_index(target, access_boundary=boundary, path_filter=accessible)
+                facts = inspect_project_preparation(target, data_paths=data_paths, index=index,
+                                                    access_boundary=boundary)
                 # The attempt owns this derived observation, not the source
                 # acquisition store. It cannot become original paper evidence.
                 record = self.root / "attempts" / identity / "project_inspection.json"

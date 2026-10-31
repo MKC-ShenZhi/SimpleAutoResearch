@@ -31,19 +31,17 @@ class ProfessionalConversation:
               operations_for_turn: Callable, failure: dict | None = None) -> dict:
         """Use only owner-validated, settled checkpoint artifacts.
 
-        Processed receipts are not facts or complete-turn coverage. Projection
-        of note versions is an owner responsibility, separate from this replay.
+        New marked checkpoints require surviving note citations. Unmarked
+        checkpoints replay their historical admission-based contract.
+        Projection of note versions is an owner responsibility, separate from
+        this replay; citations do not verify note semantics.
         """
-        from simple_ar.app.work_memory import summary_coverage
+        from simple_ar.app.work_memory import summary_coverage, summary_records
         if not snapshot or not snapshot.get('notes'):
             return {**previous, **({'attempted_through_turn':failure['attempted_through_turn']}
                                   if failure else {})}
-        compacted = set(previous.get('compacted_records', ()))
-        for row in view['observations']:
-            operations = operations_for_turn(row['turn'])
-            if (row.get('truncated') is False and row['record'] in operations
-                    and row.get('arguments', {}) == operations[row['record']]):
-                compacted.add(row['record'])
+        compacted = summary_records(previous=previous, snapshot=snapshot,
+            view=view, operations_for_turn=operations_for_turn)
         return {'notes':snapshot['notes'], 'compacted_records':compacted,
             'through_turn':summary_coverage(previous=previous, snapshot=snapshot,
                 view=view, operations_for_turn=operations_for_turn)}

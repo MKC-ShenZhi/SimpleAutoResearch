@@ -13,9 +13,29 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
 from simple_ar.code_task.analysis.interfaces import public_api_from_source, render_source_snippets, _module_name, _resolve_import_module
-from simple_ar.code_task.analysis.index import _iter_files, read_code_task_text
+from simple_ar.code_task.analysis.index import _iter_files, code_task_access_filter, read_code_task_text
 from simple_ar.code_task.analysis.source_context import diff_source_anchors, source_context_for_files
 from simple_ar.reviewing.schema import ReviewFinding
+from simple_ar.code_task.runtime.state import review_workspace_boundary
+
+
+def authorized_review_index(project_dir: Path, index: Mapping[str, Any], *,
+                            access_boundary: Path) -> dict[str, Any]:
+    """Project saved path observations through a grant without rewriting them."""
+    boundary = review_workspace_boundary(project_dir, boundary=access_boundary)
+    allowed = code_task_access_filter(project_dir, boundary=boundary)
+
+    def visible(row: Any) -> bool:
+        return (isinstance(row, Mapping) and isinstance(row.get('path'), str)
+                and bool(row['path']) and not Path(row['path']).is_absolute()
+                and allowed(project_dir / row['path']))
+
+    files = [row for row in index.get('files', []) if visible(row)]
+    paths = {row['path'] for row in files}
+    return {**index, 'files': files, 'file_count': len(files),
+            'python_file_count': sum(Path(row['path']).suffix == '.py' for row in files),
+            'entrypoints': [path for path in index.get('entrypoints', []) if isinstance(path, str) and path in paths],
+            'notebooks': [row for row in index.get('notebooks', []) if visible(row)]}
 
 
 def build_review_index(
@@ -25,16 +45,23 @@ def build_review_index(
     contract: Mapping[str, Any] | None = None,
     excluded_names: frozenset[str] = frozenset(),
     path_filter: Callable[[Path], bool] | None = None,
+    access_boundary: Path | None = None,
 ) -> dict[str, Any]:
-    """Build a complete local review index without calling an LLM."""
+    """Index an explicitly authorized root without calling an LLM.
+
+    Runtime callers pass their original workspace boundary, not the nested
+    project root. Source consumers pass a root already admitted by its owner.
+    """
 
     files: list[dict[str, Any]] = []
     notebooks: list[dict[str, Any]] = []
     required_metrics = _required_metrics(result_schema or {})
+    boundary = review_workspace_boundary(project_dir, boundary=access_boundary)
     for path in sorted(_iter_files(project_dir,
-            excluded_names=excluded_names, include_hidden_dirs=True,
+            excluded_names=excluded_names, include_hidden_dirs=True, include_dotenv_examples=True,
             excluded_dir_names=frozenset({'env', 'dist', 'build', '.ipynb_checkpoints'}),
-            excluded_dir_suffixes=('.egg-info', '.dist-info'), path_filter=path_filter)):
+            excluded_dir_suffixes=('.egg-info', '.dist-info'),
+            access_boundary=boundary, path_filter=path_filter)):
         rel = _safe_rel(project_dir, path)
         if not rel:
             continue
@@ -211,10 +238,13 @@ def snippets_for_cluster(
     *,
     chars_per_file: int = 4_000,
     patch_diff: str = "",
+    access_boundary: Path | None = None,
 ) -> list[str]:
+    boundary = review_workspace_boundary(project_dir, boundary=access_boundary)
+    allowed = code_task_access_filter(project_dir, boundary=boundary)
     paths = cluster.get("files")
     rows = source_context_for_files(project_dir,
-        [str(rel) for rel in paths] if isinstance(paths, list) else [],
+        [str(rel) for rel in paths if allowed(project_dir / str(rel))] if isinstance(paths, list) else [],
         max_chars_per_file=chars_per_file, anchors=diff_source_anchors(patch_diff),
         editable_files=[], include_unanchored_tail=True)
     # Keep the existing list-of-blocks interface for generated-project review.

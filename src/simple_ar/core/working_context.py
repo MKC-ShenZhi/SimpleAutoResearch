@@ -8,6 +8,9 @@ import re
 from typing import Any, Literal
 
 
+CITATION_HANDOFF_POLICY = 'citations.v1'
+
+
 def history_view(turns: list[dict[str, Any]]) -> Any:
     # Lossless presentation of receipt-derived indexes, never saved memory.
     columns, rows = [], []
@@ -43,7 +46,7 @@ def current_material_paths(*, identities: Sequence[Mapping[str, Any]] = (),
 
 def processed_journal_turns(rows: Sequence[Mapping[str, Any]],
                             compacted_records: Sequence[str] | set[str]) -> list[int]:
-    """Closed turns whose every original receipt entered an adopted checkpoint.
+    """Closed turns whose every receipt is adopted under its saved policy.
 
     Owners supply their validated closed journal, including reply-only turns.
     This is presentation coverage, never completion, evidence or note validity.
@@ -126,9 +129,11 @@ def select_working_context(
     successful note snapshot. Compaction pressure accounts for omitted whole
     work, including authored arguments and reasoning, not just readable sources.
     ``processed_turns`` is optional journal-owner bookkeeping: these operations
-    have already been supplied to a successful checkpoint, not verified or fully
-    represented by its notes. With usable supplied notes their closed prefix
-    may become navigable history. Explicit/current originals remain selectable.
+    follow the saved checkpoint contract. Notes marked citations.v1 require
+    supporting citations actually supplied in this input to retire history;
+    unmarked historical notes retain their original admission-based policy.
+    Neither policy independently verifies note semantics. Explicit/current
+    originals remain selectable.
     ``economical_checkpoint`` requests optional journal compaction when repeated
     older work outweighs mandatory input, without shrinking the model window.
     The saved failure boundary prevents re-buying a failed summary for little
@@ -588,8 +593,21 @@ def select_working_context(
             # retire a historical body. Empty coverage, new reads and sources
             # outside this journal retain ordinary whole-window admission.
             # Explicit/current originals override retirement, not version checks.
-            if any(active(note) for note in view['notes']):
-                ordered = [i for i in ordered if rows[i].get('turn') not in processed
+            supplied_handoffs = processed if any(active(note) for note in view['notes']) else set()
+            if any(note.get('handoff_policy') == CITATION_HANDOFF_POLICY for note in notes):
+                supplied_citations = {record for note in view['notes'] if active(note)
+                    and note.get('handoff_policy') == CITATION_HANDOFF_POLICY
+                    and isinstance(note.get('text'), str) and note['text'].strip()
+                    for record in note.get('records', [])}
+                turn_records: dict[int, set[str]] = {}
+                for row in [*rows, *[{'turn':operation.get('turn'),
+                        'record':operation['observation'].get('record')} for operation in operations]]:
+                    if isinstance(row.get('turn'), int) and row.get('record'):
+                        turn_records.setdefault(row['turn'], set()).add(row['record'])
+                supplied_handoffs = {turn for turn in processed
+                    if turn_records.get(turn) and turn_records[turn] <= supplied_citations}
+            if supplied_handoffs:
+                ordered = [i for i in ordered if rows[i].get('turn') not in supplied_handoffs
                     or rows[i].get('record') in explicit_references
                     or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts]
             # Retained originals precede optional native history; otherwise an
@@ -604,8 +622,7 @@ def select_working_context(
         for i in reversed(range(latest or 0)):
             if not blocks[i]:
                 continue
-            if (journal_selection and all(n in processed for n in range(i+1) if blocks[n])
-                    and any(active(note) for note in view['notes'])):
+            if (journal_selection and all(n in supplied_handoffs for n in range(i+1) if blocks[n])):
                 break  # Already bought continuity; originals remain retrievable.
             texts: set[str] = set()
             collect_text(blocks[i], texts)

@@ -34,6 +34,10 @@ def implementation_selection_context(goal: str, project: Path | None,
     from simple_ar.code_task.analysis.context import refresh_source_snippets
     from simple_ar.research.preparation import inspect_project_preparation
 
+    # The source owner must admit the root itself before a narrower index can
+    # treat it as a grant; a frozen inventory alone cannot authorize its prefix.
+    if resolve_source(str(project)) != project:
+        raise ValueError('Project root differs from its authorized source')
     visible = {Path(path).relative_to(project).as_posix()
         for path in project_binding['file_hashes']}
     # The mounted inventory owns authorization. Admit only its frozen files
@@ -41,11 +45,13 @@ def implementation_selection_context(goal: str, project: Path | None,
     inventory_paths = {project / path for path in visible}
     traversal_paths = {parent for path in inventory_paths for parent in path.parents
         if parent.is_relative_to(project)}
+    # This project already passed the mounted inventory/source resolver.
     index = build_review_index(project,
-        path_filter=lambda path: path in inventory_paths or path in traversal_paths)
+        path_filter=lambda path: path in inventory_paths or path in traversal_paths,
+        access_boundary=project)
     # Use the same preparation owner as workspace inspect_project,
     # with the already bounded/authorized index, not a second scan.
-    preparation = inspect_project_preparation(project, index=index)
+    preparation = inspect_project_preparation(project, index=index, access_boundary=project)
     owner.write_json('project-inspection.json', preparation)
     context = requested_source_context(project, index, {'query': goal},
         supplied=[], max_files=12, max_chars=2000, max_total_chars=24000)

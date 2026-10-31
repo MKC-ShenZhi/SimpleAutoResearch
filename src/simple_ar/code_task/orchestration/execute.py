@@ -58,6 +58,7 @@ from simple_ar.code_task.memory import (
 )
 from simple_ar.code_task.runtime.state import (
     code_task_paths,
+    code_task_workspace_boundary,
     load_code_task_manifest,
     manifest_section,
     save_code_task_manifest,
@@ -1833,6 +1834,9 @@ def _rerun_greenfield_review(
     max_generated_lines: int,
 ) -> dict[str, Any]:
     manifest = load_code_task_manifest(run_dir)
+    from simple_ar.code_task.runtime.state import review_workspace_boundary
+    boundary = review_workspace_boundary(paths.workspace_dir / 'generated_project',
+        boundary=code_task_workspace_boundary(run_dir))
     code_artifacts = _read_optional_dict(paths.meta_dir / "code_artifacts.json")
     resource_plan = _greenfield_resource_plan(paths, max_files=max_files, max_generated_lines=max_generated_lines)
     if manifest.get('implementation', {}).get('mode') == 'controlled_patch':
@@ -1844,8 +1848,9 @@ def _rerun_greenfield_review(
         code_artifacts = {**code_artifacts, 'generated_files': [
             {'path': row['path'], 'mode': 'controlled_revision',
              'line_count': len((project / row['path']).read_text(encoding='utf-8', errors='replace').splitlines())}
-            for row in build_codebase_index(project)['files']]}
+            for row in build_codebase_index(project, access_boundary=boundary)['files']]}
     review = review_generated_project(
+        access_boundary=boundary,
         project_dir=paths.workspace_dir / "generated_project",
         code_artifacts=code_artifacts,
         result_schema=result_schema_from_manifest(manifest),

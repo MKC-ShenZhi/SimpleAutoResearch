@@ -597,7 +597,7 @@ class InspectionOfferCoverageTests(unittest.TestCase):
         assessment = _assessments(result)[0]
         self.assertEqual((assessment['coverage'], assessment['verdict']), ('partial', 'incomplete'))
         self.assertIn('not proven supplied', ' '.join(assessment['limitations']))
-        self.assertEqual(self.case.app.state['config']['inspection_coverage_policy'], 'offered.v1')
+        self.assertEqual(self.case.app.state['config']['inspection_coverage_policy'], 'offered.v2')
         calls, ledger = self.case.send.call_count, self.case.app.ledger.to_dict()
         self.case._reload()
         cached = self.case.app.operations.inspection.call('inspect_artifacts', saved['arguments'], identity)
@@ -673,11 +673,127 @@ class InspectionOfferCoverageTests(unittest.TestCase):
                 'findings':[], 'evidence':[], 'limitations':[]}]}
         self.case.review = review
         result = self.case._inspect([{'path':'note.md', 'max_bytes':512}], [])
-        self.assertEqual((_assessments(result)[0]['coverage'], _assessments(result)[0]['verdict']),
-            ('complete', 'passed'))
+        assessment = _assessments(result)[0]
+        self.assertEqual((assessment['coverage'], assessment['verdict']), ('scoped', 'passed'))
+        self.assertEqual(assessment['scope'], {'start': 0, 'end': 512, 'size_bytes': len(text.encode())})
         self.case._submit(_action('deliver_result', summary='The requested brief answer.', artifacts=[]))
         answer = self.case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']
         self.assertEqual(answer['metadata']['delivery_assessment']['verdict'], 'passed')
+
+    def test_scoped_pass_does_not_clear_a_whole_file_finding(self):
+        from simple_ar.core.assessments import assessment_issues
+        from tests.test_professional_work_loop import _assessments
+
+        text = 'A report sentence and its supporting condition.\n' * 30
+        (self.case.root / 'workspace' / 'note.md').write_text(text, encoding='utf-8')
+        self.case.review = lambda view: {'decisions':[{'subject':'target-1', 'conclusion':'complete',
+            'findings':[{'severity':'required', 'message':'A conclusion still lacks its source.'}],
+            'evidence':[], 'limitations':[]}]}
+        whole = self.case._inspect(['note.md'], [])
+        self.assertEqual(_assessments(whole)[0]['verdict'], 'needs_revision')
+        self.case.review = lambda view: {'decisions':[{'subject':'target-1', 'conclusion':'complete',
+            'findings':[], 'evidence':[], 'limitations':[]}]}
+        scoped = self.case._inspect([{'path':'note.md', 'offset_bytes':100, 'max_bytes':200}], [])
+        assessment = _assessments(scoped)[0]
+        self.assertEqual((assessment['schema_version'], assessment['coverage'], assessment['verdict']),
+            ('artifact_assessment.v2', 'scoped', 'passed'))
+        self.assertEqual(assessment['scope'], {'start':100, 'end':300, 'size_bytes':len(text.encode())})
+        issues = assessment_issues(self.case.app.workspace, [whole, scoped], ['note.md'],
+            require_pass=['note.md'])
+        self.assertTrue(any('lacks its source' in issue for issue in issues))
+        self.assertTrue(any('lacks a complete independent inspection' in issue for issue in issues))
+        # Reading the whole file for another question also does not, by itself,
+        # establish that the earlier concern was re-examined.
+        later = self.case._inspect(['note.md'], [])
+        self.assertTrue(assessment_issues(self.case.app.workspace, [whole, scoped, later], ['note.md']))
+        self.case.review = lambda view: {'decisions':[{'subject':'target-1', 'conclusion':'complete',
+            'reassessed_prior':True, 'findings':[], 'evidence':[], 'limitations':[]}]}
+        checked = self.case._inspect(['note.md'], [])
+        self.assertFalse(assessment_issues(self.case.app.workspace, [whole, scoped, later, checked], ['note.md']))
+
+    def test_replayed_opinion_cannot_clear_or_reopen_newer_findings(self):
+        from simple_ar.core.assessments import assessment_issues, current_assessments, finding_id
+
+        (self.case.root / 'workspace' / 'note.md').write_text('One version of the work.', encoding='utf-8')
+        subjects = self.case.app.workspace.artifact_hashes(['note.md'])
+        finding = {'severity':'required', 'message':'Check the underlying data.', 'subjects':subjects}
+        def opinion(identity, *, findings=(), reassessed=()):
+            row = {'schema_version':'artifact_assessment.v2', 'review_id':identity,
+                'subjects':subjects, 'coverage':'complete',
+                'verdict':'needs_revision' if findings else 'passed',
+                'findings':list(findings), 'reassessed_prior':list(reassessed),
+                'evidence_sha256':{}, 'limitations':[]}
+            return {'status':'ok', 'metadata':{'assessments':[row]}}
+        earlier = opinion('review-a:target-1')
+        later = opinion('review-b:target-1', findings=[finding])
+        self.assertTrue(assessment_issues(self.case.app.workspace, [later, earlier], ['note.md']))
+        self.assertTrue(assessment_issues(self.case.app.workspace, [earlier, later, earlier], ['note.md']))
+        reviewed_id = finding_id(later['metadata']['assessments'][0], finding)
+        reassessed = opinion('review-c:target-1', reassessed=[reviewed_id])
+        self.assertFalse(assessment_issues(self.case.app.workspace, [later, reassessed, later], ['note.md']))
+        other = {**finding, 'message':'Check the sample scope.'}
+        new_opinion = opinion('review-d:target-1', findings=[other])
+        self.assertTrue(any('sample scope' in item for item in assessment_issues(
+            self.case.app.workspace, [later, new_opinion, reassessed], ['note.md'])))
+
+        def legacy(*, findings=()):
+            return {'status':'ok', 'metadata':{
+                'inspection_binding':{'assessment_path':'attempts/legacy/inspection/assessments.json'},
+                'assessments':[{'schema_version':'artifact_assessment.v1', 'subjects':subjects,
+                    'coverage':'complete', 'verdict':'needs_revision' if findings else 'passed',
+                    'findings':list(findings), 'evidence_sha256':{}, 'limitations':[]}]}}
+        legacy_pass = legacy()
+        self.assertTrue(assessment_issues(self.case.app.workspace, [legacy_pass, later, legacy_pass], ['note.md']))
+        legacy_finding = legacy(findings=[finding])
+        stored = current_assessments(self.case.app.workspace, [legacy_finding])[0].model_dump(mode='json')
+        resolved = opinion('review-e:target-1', reassessed=[finding_id(stored, finding)])
+        self.assertFalse(assessment_issues(self.case.app.workspace, [legacy_finding, resolved, legacy_finding], ['note.md']))
+
+    def test_legacy_multi_subject_finding_remains_visible_for_unreviewed_subject(self):
+        from simple_ar.core.assessments import finding_id
+        from simple_ar.tools.inspection import InspectionToolGateway
+
+        subjects = {'/source/a.txt':'a'*64, '/source/b.txt':'b'*64}
+        finding = {'severity':'required', 'message':'Both sources need checking.', 'subjects':subjects}
+        legacy = {'schema_version':'artifact_assessment.v1', 'review_id':'legacy',
+            'subjects':subjects, 'coverage':'complete', 'verdict':'needs_revision', 'findings':[finding]}
+        reviewed = {'schema_version':'artifact_assessment.v2', 'review_id':'later:target-1',
+            'subjects':{'/source/a.txt':'a'*64}, 'coverage':'complete', 'verdict':'passed',
+            'findings':[], 'reassessed_prior':[finding_id(legacy, finding)]}
+        owner = InspectionToolGateway.__new__(InspectionToolGateway)
+        owner.prior_assessments = lambda:[legacy, reviewed]
+        both = [{'subject':'target-1', 'path':'/source/a.txt', 'sha256':'a'*64},
+                {'subject':'target-2', 'path':'/source/b.txt', 'sha256':'b'*64}]
+        self.assertEqual([row['subjects'] for row in owner._prior(both, current_policy=True)], [['target-2']])
+        self.assertEqual([row['subjects'] for row in owner._prior([both[1]], current_policy=True)], [['target-2']])
+
+    def test_line_window_and_saved_older_coverage_contract(self):
+        from tests.test_professional_work_loop import _assessments
+
+        lines = ['第一行。\n', '第二行。\n', '第三行。\n', '第四行。\n']
+        (self.case.root / 'workspace' / 'note.md').write_text(''.join(lines), encoding='utf-8')
+        self.case.review = lambda view: {'decisions':[{'subject':'target-1', 'conclusion':'complete',
+            'findings':[], 'evidence':[], 'limitations':[]}]}
+        target = {'path':'note.md', 'start_line':2, 'max_lines':2, 'max_bytes':128}
+        result = self.case._inspect([target], [])
+        assessment = _assessments(result)[0]
+        self.assertEqual((assessment['coverage'], assessment['verdict']), ('scoped', 'passed'))
+        self.assertEqual(assessment['scope'], {'start':len(lines[0].encode()),
+            'end':len(''.join(lines[:3]).encode()), 'size_bytes':len(''.join(lines).encode())})
+
+        # A previously saved task keeps its own policy, even when resumed on
+        # a newer application. Its recorded opinion is never upgraded.
+        self.case.app.state['config']['inspection_coverage_policy'] = 'offered.v1'
+        self.case.app._save()
+        self.case._reload()
+        old = self.case._inspect([target], [])
+        self.assertEqual((_assessments(old)[0]['coverage'], _assessments(old)[0]['verdict']),
+            ('partial', 'incomplete'))
+        owner = self.case.app.operations.inspection
+        identity = Path(old['data']['record']).parts[1]
+        saved = owner.store.read_json(owner._path(identity, 'input'))
+        owner.coverage_policy = 'offered.v2'
+        self.assertEqual(owner.call('inspect_artifacts', saved['arguments'], identity).model_dump(mode='json'), old)
 
     def test_empty_source_and_frozen_coverage_contract(self):
         from tests.test_professional_work_loop import _assessments
@@ -691,7 +807,7 @@ class InspectionOfferCoverageTests(unittest.TestCase):
         owner = self.case.app.operations.inspection
         identity = Path(result['data']['record']).parts[1]
         saved = owner.store.read_json(owner._path(identity, 'input'))
-        self.assertEqual(saved['coverage_policy'], 'offered.v1')
+        self.assertEqual(saved['coverage_policy'], 'offered.v2')
         owner.coverage_policy = None  # Changing future defaults must not reinterpret this inspection.
         self.assertEqual(owner.call('inspect_artifacts', saved['arguments'], identity).model_dump(mode='json'), result)
 

@@ -4,8 +4,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from simple_ar.code_task.memory import code_task_memory_paths
-from simple_ar.code_task.analysis.index import _iter_files, read_code_task_text
-from simple_ar.code_task.runtime.state import code_task_paths, workspace_file
+from simple_ar.code_task.analysis.index import _iter_files, code_task_access_filter, read_code_task_text
+from simple_ar.code_task.runtime.state import code_task_paths, code_task_workspace_boundary, workspace_file
 from simple_ar.core.artifacts import read_json, read_jsonl
 from simple_ar.tools.specs import ToolResult
 
@@ -18,6 +18,10 @@ class LocalCodeTaskToolGateway:
     def __init__(self, run_dir: Path) -> None:
         self.run_dir = Path(run_dir)
         self.paths = code_task_paths(self.run_dir)
+
+    def _access_filter(self):
+        return code_task_access_filter(self.paths.workspace_dir,
+            boundary=code_task_workspace_boundary(self.run_dir))
 
     def call(self, name: str, arguments: dict[str, Any] | None = None) -> ToolResult:
         try:
@@ -71,13 +75,14 @@ class LocalCodeTaskToolGateway:
 
     def _list_files(self, arguments: dict[str, Any]) -> list[dict[str, Any]]:
         index = self._index()
+        allowed = self._access_filter()
         role = str(arguments.get("role", "")).strip().lower()
         extensions = _extension_filter(arguments.get("extensions"))
         max_files = _bounded_int(arguments.get("max_files"), default=120, minimum=1, maximum=300)
         rows: list[dict[str, Any]] = []
         for item in _object_list(index.get("files")):
             path = str(item.get("path", ""))
-            if not path:
+            if not path or not allowed(self.paths.workspace_dir / path):
                 continue
             if extensions and Path(path).suffix.lower() not in extensions:
                 continue
@@ -109,7 +114,8 @@ class LocalCodeTaskToolGateway:
         extensions = _extension_filter(arguments.get("extensions")) or self.DEFAULT_SEARCH_EXTENSIONS
         needle = query if case_sensitive else query.lower()
         matches: list[dict[str, Any]] = []
-        for path in sorted(_iter_files(self.paths.workspace_dir, include_hidden_dirs=True, include_dotenv_examples=True)):
+        for path in sorted(_iter_files(self.paths.workspace_dir, include_hidden_dirs=True, include_dotenv_examples=True,
+                access_boundary=code_task_workspace_boundary(self.run_dir))):
             if path.suffix.lower() not in extensions or path.suffix.lower() in {'.pyc', '.pyo'}:
                 continue
             text = read_code_task_text(path, utf8_errors='replace')
@@ -130,6 +136,8 @@ class LocalCodeTaskToolGateway:
         if not rel:
             raise ValueError("Unsafe or missing workspace path.")
         path = workspace_file(self.paths.workspace_dir, rel)
+        if not self._access_filter()(self.paths.workspace_dir / rel):
+            raise ValueError('Private or unauthorized project paths are not exposed to task tools.')
         if path is None or not path.is_file():
             raise FileNotFoundError(f"Code-task workspace file not found: {rel}")
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -155,7 +163,11 @@ class LocalCodeTaskToolGateway:
         max_matches = _bounded_int(arguments.get("max_matches"), default=25, minimum=1, maximum=80)
         needle = query if case_sensitive else query.lower()
         rows: list[dict[str, Any]] = []
+        allowed = self._access_filter()
         for symbol in _object_list(self._repo_map().get("symbols")):
+            path = str(symbol.get('path', ''))
+            if not path or not allowed(self.paths.workspace_dir / path):
+                continue
             kind = str(symbol.get("kind", "")).lower()
             if kind_filter and kind != kind_filter:
                 continue
@@ -189,9 +201,10 @@ class LocalCodeTaskToolGateway:
         max_files = _bounded_int(arguments.get("max_files"), default=20, minimum=1, maximum=80)
         scores: dict[str, dict[str, Any]] = {}
         tokens = _tokens(query)
+        allowed = self._access_filter()
 
         def add(path: str, *, score: float, source: str, summary: str = "") -> None:
-            if not path:
+            if not path or not allowed(self.paths.workspace_dir / path):
                 return
             row = scores.setdefault(path, {"path": path, "score": 0.0, "sources": [], "summary": summary})
             row["score"] = float(row["score"]) + score

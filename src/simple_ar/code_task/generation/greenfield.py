@@ -16,6 +16,8 @@ from simple_ar.code_task.editing.scope import (
 from simple_ar.code_task.execution.summary import write_code_task_summary
 from simple_ar.code_task.runtime.state import (
     code_task_paths,
+    code_task_workspace_boundary,
+    review_workspace_boundary,
     load_code_task_manifest,
     manifest_section,
     save_code_task_manifest,
@@ -240,6 +242,8 @@ def generate_greenfield_code_task(
             generated_files=tuple(str(row["path"]) for row in artifacts.get("generated_files", [])
                                   if isinstance(row, dict) and row.get("path")),
         )
+    boundary = review_workspace_boundary(paths.workspace_dir / 'generated_project',
+        boundary=code_task_workspace_boundary(root))
     paths.meta_dir.mkdir(parents=True, exist_ok=True)
     memory_dir = paths.task_dir / "memory"
     memory_dir.mkdir(parents=True, exist_ok=True)
@@ -473,6 +477,7 @@ def generate_greenfield_code_task(
     _refresh_codebase_artifacts(root, generated_files=generated_files)
     _emit(message_callback, "Reviewing generated greenfield project.")
     review = review_generated_project(
+        access_boundary=boundary,
         project_dir=project_dir,
         code_artifacts=code_artifacts,
         result_schema=result_schema,
@@ -668,7 +673,8 @@ def _domain_profile(task_text: str, *, dependency_advice: dict[str, Any], benchm
 def _refresh_codebase_artifacts(run_dir: Path, *, generated_files: tuple[str, ...]) -> None:
     paths = code_task_paths(run_dir)
     index_path = paths.meta_dir / "codebase_index.json"
-    codebase_index = build_codebase_index(paths.workspace_dir, output_path=index_path)
+    codebase_index = build_codebase_index(paths.workspace_dir, output_path=index_path,
+        access_boundary=code_task_workspace_boundary(run_dir))
     allowed = allowed_patterns_from_manifest(load_code_task_manifest(run_dir))
     protected = protected_patterns_from_manifest(load_code_task_manifest(run_dir))
     repo_map_path = paths.meta_dir / "repo_map.json"

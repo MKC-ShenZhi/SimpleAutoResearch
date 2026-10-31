@@ -13,11 +13,44 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from simple_ar.core.working_context import CITATION_HANDOFF_POLICY
 from simple_ar.integrations.llm import LLMResponseError, check_llm_call_stop
 
 
 _LEGACY_OUTPUT_LIMIT = 8192
 MEMORY_PURPOSES = {'working-memory', 'working-memory-no-response-format'}
+
+
+def summary_records(*, previous: dict, snapshot: dict, view: dict,
+                    operations_for_turn: Any) -> set[str]:
+    """Receipt handoff backed by retained citations, never semantic verification.
+
+    Unmarked checkpoints retain their historical admission-based contract.
+    Under citations.v1 a supplied receipt alone proves nothing. Retain
+    only cited complete receipts, or earlier handoffs whose supporting notes
+    were supplied intact and whose record citations survived the rewrite.
+    Missing citations reopen original selection; no task status is inferred.
+    """
+    citation_handoff = view.get('handoff_policy') == CITATION_HANDOFF_POLICY
+    covered = set(previous.get('compacted_records', ()))
+    if citation_handoff:
+        inherited = set()
+        for note in previous.get('notes', []):
+            if any(all(note.get(key) == supplied.get(key) for key in
+                       ('text', 'records', 'observed_versions', 'handoff_policy'))
+                    for supplied in view['previous_notes']):
+                inherited.update(note.get('records', []))
+        covered &= inherited
+    for row in view['observations']:
+        operations = operations_for_turn(row['turn'])
+        if (row.get('truncated') is False and row['record'] in operations
+                and row.get('arguments', {}) == operations[row['record']]):
+            covered.add(row['record'])
+    if citation_handoff:
+        covered &= {record for note in snapshot.get('notes', [])
+            if isinstance(note.get('text'), str) and note['text'].strip()
+            for record in note.get('records', [])}
+    return covered
 
 
 def summary_coverage(*, previous: dict, snapshot: dict, view: dict, operations_for_turn: Any) -> int:
@@ -28,6 +61,16 @@ def summary_coverage(*, previous: dict, snapshot: dict, view: dict, operations_f
     """
     if not snapshot.get('notes'):
         return 0
+    if 'compacted_records' in previous and view.get('handoff_policy') == CITATION_HANDOFF_POLICY:
+        covered = summary_records(previous=previous, snapshot=snapshot, view=view,
+            operations_for_turn=operations_for_turn)
+        coverage = 0
+        while coverage < snapshot['through_turn']:
+            operations = operations_for_turn(coverage)
+            if not operations or not set(operations) <= covered:
+                break
+            coverage += 1
+        return coverage
     def identity(note):
         return {key:note.get(key) for key in ('text','records','observed_versions')}
     supplied_previous = [identity(note) for note in view['previous_notes']]
@@ -94,6 +137,9 @@ def checkpoint_entries(ledger: Any, attempt_id: str, session_id: str, *,
 
 
 def _bound_response(response: dict, view: dict, bind_notes: Any) -> list[dict]:
+    policy = view.get('handoff_policy')
+    if policy not in (None, CITATION_HANDOFF_POLICY):
+        raise ValueError('Unknown checkpoint handoff policy')
     parsed = _Snapshot.model_validate(response)
     supplied = {row['id']:row.get('records', []) for row in view['previous_notes']}
     supplied.update({row['id']:row.get('records', [row['record']]) for row in view['observations']})
@@ -104,7 +150,10 @@ def _bound_response(response: dict, view: dict, bind_notes: Any) -> list[dict]:
         records = list(dict.fromkeys(locator for key in note.observations
             for locator in supplied[key]))[:16]
         notes.append({'text':note.text, 'records':records})
-    return bind_notes(notes)
+    bound = bind_notes(notes)
+    # Derived after owner binding so existing binders need no new interface.
+    # Recovery rebuilds and compares this marker under the input digest too.
+    return [{**note, 'handoff_policy':policy} for note in bound] if policy else bound
 
 
 def checkpoint_artifacts(*, store: Any, ledger: Any, attempt_id: str,
@@ -191,8 +240,11 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
     response or changing their ledger reservations.
     Zero preserves the historical optional-checkpoint budget behavior.
     ``previous.compacted_records`` opts the journal owner into complete
-    observation batches. It is derived receipt bookkeeping, never model input
-    or proof that an entire native turn was summarized.
+    observation batches. It is citation-backed receipt handoff bookkeeping,
+    never model input, task completion or independent semantic verification.
+    New journal checkpoints record citations.v1 in their input and bound notes;
+    loading an unmarked checkpoint never retrofits that contract. The next
+    successful new checkpoint is the transition, not reopening the session.
     Explicit call_id also binds successful snapshots to that logical call.
     additional_protection stacks the decision/note floor above an owner's
     existing final-opinion and caller floors on the same ledger.
@@ -226,6 +278,14 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
             'archive_scope':'Considered closed history, including capacity-omitted rows; not summarized coverage.',
             'observations':[], 'response_schema':_Snapshot.model_json_schema(),
             'scope':'Working summary only. Actual records, file versions and checks remain authoritative.'}
+    if journal:
+        view['handoff_policy'] = CITATION_HANDOFF_POLICY
+        view['scope'] += (
+            ' Observation citations hand off working continuity: cite an input only when the note '
+            'carries its relevant results, conditions, failures and unresolved work. '
+            'Being supplied is not being covered. Preserve useful previous-note citations when '
+            'rewriting; uncited originals remain eligible for later context. '
+            'Citations are model judgments, not proof of completeness or task completion.')
     through = previous.get('through_turn',0)
     batches = ((row['turn'], [row]) for row in rows) if journal else groupby(rows,key=lambda row:row['turn'])
     for turn, grouped in batches:

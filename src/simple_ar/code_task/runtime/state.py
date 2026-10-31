@@ -60,14 +60,69 @@ def _manifest_project_root(run_dir: Path, task_dir: Path) -> Path:
         return default
     if not isinstance(data, dict):
         return default
-    workspace = data.get("workspace")
+    workspace = data.get("workspace", {})
     if not isinstance(workspace, dict):
         return default
-    value = workspace.get("project_root") or workspace.get("workspace_dir")
+    layout = data.get('layout', {})
+    layout = layout if isinstance(layout, dict) else {}
+    value = (workspace.get("project_root") or workspace.get("workspace_dir")
+             or layout.get('project_root') or layout.get('workspace'))
     if not isinstance(value, str) or not value.strip():
         return default
     path = Path(value)
     return path if path.is_absolute() else run_dir / path
+
+
+def code_task_workspace_boundary(run_dir: Path) -> Path:
+    """Read the original workspace grant, not the possibly nested project root.
+
+    Legacy layout.workspace is the old workspace grant; without either field
+    only the standard workspace is authorized. A project root or source path
+    alone never expands that grant.
+    This read never repairs a manifest or changes historical receipts.
+    """
+    run_dir = Path(run_dir)
+    standard = run_dir / 'code_task' / 'workspace'
+    manifest_path = run_dir / 'manifest.json'
+    manifest = read_json(manifest_path) if manifest_path.exists() else {}
+    if not isinstance(manifest, dict):
+        raise ValueError('Saved project manifest must be an object')
+    workspace = manifest.get('workspace', {})
+    if not isinstance(workspace, dict):
+        raise ValueError('Saved project workspace boundary is invalid')
+    layout = manifest.get('layout', {})
+    layout = layout if isinstance(layout, dict) else {}
+    project = workspace.get('project_root')
+    if project is None and not workspace.get('workspace_dir'):
+        project = layout.get('project_root')
+    if project is not None and (not isinstance(project, str) or not project.strip()):
+        raise ValueError('Saved project root is invalid')
+    value = workspace.get('workspace_dir', layout.get('workspace'))
+    if value is not None and (not isinstance(value, str) or not value.strip()):
+        raise ValueError('Saved project workspace boundary is invalid')
+    boundary = Path(value) if value else standard
+    if value and not boundary.is_absolute():
+        boundary = run_dir / boundary
+    try:
+        project_root = Path(project or value) if project or value else standard
+        if (project or value) and not project_root.is_absolute():
+            project_root = run_dir / project_root
+        project_root.absolute().relative_to(boundary.absolute())
+        project_root.resolve().relative_to(boundary.resolve())
+    except (OSError, ValueError, RuntimeError):
+        raise ValueError('Saved project workspace boundary is unavailable; restore it before reading.') from None
+    return boundary
+
+
+def review_workspace_boundary(project: Path, *, boundary: Path | None = None) -> Path:
+    """Resolve a review's existing grant before any new source observation."""
+    from simple_ar.code_task.analysis.index import code_task_access_filter
+
+    if boundary is None:
+        raise ValueError('Review needs an explicit authorized workspace boundary')
+    if not code_task_access_filter(project, boundary=boundary)(project):
+        raise ValueError('Review project is private or outside its authorized workspace boundary')
+    return Path(boundary)
 
 
 def load_code_task_manifest(run_dir: Path) -> dict[str, Any]:
@@ -91,7 +146,8 @@ def save_code_task_manifest(run_dir: Path, manifest: dict[str, Any]) -> None:
 def implementation_file_hashes(run_dir: Path) -> dict[str, str]:
     """Use the CodeTask source inventory to pin a validated candidate."""
     from simple_ar.code_task.analysis.index import build_codebase_index
-    index = build_codebase_index(code_task_paths(run_dir).workspace_dir)
+    index = build_codebase_index(code_task_paths(run_dir).workspace_dir,
+        access_boundary=code_task_workspace_boundary(run_dir))
     hashes = {row['path']: row['sha256'] for row in index['files']}
     manifest = load_code_task_manifest(run_dir)
     names = manifest.get('code_task', {}).get('native_binding', {}).get('binding', {}).get('contract', {}).get('new_files', [])
@@ -109,6 +165,8 @@ def implementation_file_hashes(run_dir: Path) -> dict[str, str]:
 
 def required_new_file_issues(manifest: dict[str, Any], workspace: Path) -> list[str]:
     """Inspect frozen creation obligations, never create initializer placeholders."""
+    from simple_ar.code_task.analysis.index import code_task_access_filter
+    allowed = code_task_access_filter(workspace, boundary=workspace)
     names = manifest.get('code_task', {}).get('native_binding', {}).get('binding', {}).get('contract', {}).get('new_files', [])
     issues = []
     for name in names:
@@ -118,7 +176,7 @@ def required_new_file_issues(manifest: dict[str, Any], workspace: Path) -> list[
         while current != workspace and current.is_relative_to(workspace):
             components.append(current)
             current = current.parent
-        if (not path.resolve().is_relative_to(workspace.resolve())
+        if (not allowed(path) or not path.resolve().is_relative_to(workspace.resolve())
                 or any(part.is_symlink() or part.is_junction() for part in components)
                 or not path.is_file() or path.stat().st_size == 0):
             issues.append(name)

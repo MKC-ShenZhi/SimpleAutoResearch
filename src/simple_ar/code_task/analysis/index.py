@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal
 
-from simple_ar.core.artifacts import write_json
+from simple_ar.core.artifacts import is_private_path_name, write_json
 from simple_ar.retrieval.index import _looks_like_text, json_summary, kind_for_path
 from simple_ar.code_task.runtime.state import utcnow_iso as _utcnow_iso
 
@@ -39,8 +39,60 @@ IGNORED_FILE_NAMES = {
 
 def is_private_dotenv(name: str) -> bool:
     """Keep example templates searchable while excluding possible credentials."""
-    name = name.casefold()
-    return name.startswith('.env') and not name.endswith('.example')
+    return name.casefold().startswith('.env') and is_private_path_name(name, allow_env_example=True)
+
+
+def code_task_access_filter(root: Path, *, boundary: Path | None = None) -> Callable[[Path], bool]:
+    """Check both the requested and resolved project path before exposing it to a model."""
+    lexical_root = Path(root).absolute()
+    if boundary is None:
+        raise ValueError('An authorized workspace boundary is required before reading project sources')
+    boundary = Path(boundary).absolute()
+    try:
+        resolved_root = lexical_root.resolve()
+        resolved_boundary = boundary.resolve()
+        # A restored boundary is a saved path, not proof that its ancestors
+        # are public. Check both spellings before narrowing to the project.
+        root_parts = (boundary.parts, resolved_boundary.parts,
+            lexical_root.relative_to(boundary).parts,
+            resolved_root.relative_to(resolved_boundary).parts)
+        root_allowed = ('..' not in lexical_root.parts and '..' not in boundary.parts
+            and not any(is_private_path_name(part) for parts in root_parts for part in parts))
+    except (OSError, ValueError, RuntimeError):
+        root_allowed = False
+
+    def allowed(path: Path) -> bool:
+        if not root_allowed:
+            return False
+        path = Path(path).absolute()
+        try:
+            if '..' in path.parts:
+                return False
+            relative = path.relative_to(lexical_root)
+            resolved = path.resolve().relative_to(resolved_root)
+            is_file = not path.is_dir()
+            # Check every component from the original grant: resolve() must
+            # not erase an in-workspace link or dependency environment.
+            parts = path.relative_to(boundary).parts
+            for depth in range(len(parts) + 1):
+                component = boundary.joinpath(*parts[:depth])
+                try:
+                    attrs = getattr(component.lstat(), 'st_file_attributes', 0)
+                except FileNotFoundError:
+                    attrs = 0  # Generated project roots can precede creation.
+                if (component.is_symlink() or component.is_junction()
+                        or attrs & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0)
+                        or component.is_dir() and is_python_environment(component)):
+                    return False
+        except (OSError, ValueError, RuntimeError):
+            return False
+        for parts in (relative.parts, resolved.parts):
+            if any(is_private_path_name(part, allow_env_example=is_file and index == len(parts)-1)
+                    for index, part in enumerate(parts)):
+                return False
+        return True
+
+    return allowed
 
 # Shared with question-directed source lookup; retain its existing language
 # coverage rather than inventing another binary-extension denylist.
@@ -90,6 +142,7 @@ def build_codebase_index(
     workspace_dir: Path,
     *,
     output_path: Path | None = None,
+    access_boundary: Path | None = None,
 ) -> dict[str, Any]:
     """Build a compact, source-oriented index for a code-task workspace.
 
@@ -97,6 +150,9 @@ def build_codebase_index(
         workspace_dir: Copied workspace that may be edited by later code-task
             stages. The original source directory is not read after init.
         output_path: Optional JSON destination for the generated index.
+        access_boundary: Original workspace grant when indexing a nested
+            project. Without it, workspace_dir must already be an admitted
+            workspace root; this low-level inventory does not admit sources.
 
     Returns:
         JSON-serializable index with file inventory, hashes, role tags, and
@@ -112,7 +168,11 @@ def build_codebase_index(
     if not workspace.is_dir():
         raise NotADirectoryError(f"Workspace path is not a directory: {workspace}")
 
-    files = [_index_file(workspace, path) for path in _iter_files(workspace)]
+    allowed = code_task_access_filter(workspace, boundary=access_boundary or workspace)
+    if not allowed(workspace):
+        raise ValueError('Index project is private or outside its authorized workspace boundary')
+    files = [_index_file(workspace, path) for path in _iter_files(workspace,
+             access_boundary=access_boundary or workspace)]
     files.sort(key=lambda item: item["path"])
 
     python_files = [item for item in files if item["kind"] == "python"]
@@ -162,6 +222,7 @@ def _iter_files(root: Path, *, excluded_names: frozenset[str] = frozenset(),
                 include_dotenv_examples: bool = False,
                 excluded_dir_names: frozenset[str] = frozenset(),
                 excluded_dir_suffixes: tuple[str, ...] = (),
+                access_boundary: Path | None = None,
                 path_filter: Callable[[Path], bool] | None = None) -> Iterator[Path]:
     """Own safe project enumeration with consumer-specific visibility policy.
 
@@ -172,7 +233,9 @@ def _iter_files(root: Path, *, excluded_names: frozenset[str] = frozenset(),
     Hidden project directories may be visible; private .env paths, dependency
     environments, links and caller access filters remain excluded.
     """
-    boundary = root.resolve()
+    allowed = code_task_access_filter(root, boundary=access_boundary or root)
+    if not allowed(root):
+        return
     for current, dirnames, filenames in os.walk(root):
         current_path = Path(current)
         dirnames[:] = [
@@ -183,8 +246,7 @@ def _iter_files(root: Path, *, excluded_names: frozenset[str] = frozenset(),
             and (include_hidden_dirs or not dirname.startswith('.'))
             and dirname not in excluded_dir_names and not dirname.endswith(excluded_dir_suffixes)
             and dirname not in excluded_names
-            and _safe_index_path(current_path / dirname, boundary)
-            and not is_python_environment(current_path / dirname)
+            and allowed(current_path / dirname)
             and (path_filter is None or path_filter(current_path / dirname))
         ]
         for filename in filenames:
@@ -193,19 +255,9 @@ def _iter_files(root: Path, *, excluded_names: frozenset[str] = frozenset(),
                     and (not include_dotenv_examples or is_private_dotenv(filename))):
                 continue
             path = current_path / filename
-            if (_safe_index_path(path, boundary) and path.is_file()
+            if (allowed(path) and path.is_file()
                     and (path_filter is None or path_filter(path))):
                 yield path
-
-
-def _safe_index_path(path: Path, boundary: Path) -> bool:
-    """Index approved local bytes, never linked targets outside the inventory."""
-    try:
-        attrs = getattr(path.lstat(), "st_file_attributes", 0)
-        return (not path.is_symlink() and not attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-                and path.resolve().is_relative_to(boundary))
-    except OSError:
-        return False
 
 
 def _index_file(root: Path, path: Path) -> dict[str, Any]:

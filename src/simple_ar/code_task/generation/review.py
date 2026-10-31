@@ -24,7 +24,8 @@ from simple_ar.code_task.analysis.interfaces import (
 )
 from simple_ar.code_task.analysis.resource_static import resource_review_findings
 from simple_ar.code_task.analysis.source_context import read_source_context_text
-from simple_ar.code_task.analysis.index import _iter_files, read_code_task_text
+from simple_ar.code_task.analysis.index import _iter_files, code_task_access_filter, read_code_task_text
+from simple_ar.code_task.runtime.state import review_workspace_boundary
 
 
 GREENFIELD_REVIEW_CONTRACT_VERSION = 14
@@ -57,9 +58,15 @@ def review_generated_project(
     client: LLMClient | None = None,
     meta_dir: Path | None = None,
     use_llm: bool = True,
+    access_boundary: Path | None = None,
 ) -> dict[str, Any]:
-    """Review a generated greenfield project with the shared code-task format."""
+    """Review under an explicit source or saved CodeTask workspace grant.
 
+    Validate the root before structural checks, compilation or source reads.
+    An output directory alone does not grant access to a project beside it.
+    """
+
+    boundary = review_workspace_boundary(project_dir, boundary=access_boundary)
     generated = _generated_file_rows(code_artifacts)
     # One observed interface set for deterministic contract checks and every
     # advisory cluster; do not reconstruct it from clipped source windows.
@@ -74,6 +81,7 @@ def review_generated_project(
         contract=contract or {},
         architecture_plan=architecture_plan or {},
         api_contract=api_contract,
+        access_boundary=boundary,
     )
     model_review = use_llm and client is not None and meta_dir is not None
     contract_view = contract_prompt_view(contract or {}) if model_review else {}
@@ -81,6 +89,7 @@ def review_generated_project(
     total_lines = sum(_int(row.get("line_count"), 0) for row in generated)
     return run_project_review(
         project_dir=project_dir, result_schema=result_schema, contract=contract or {},
+        access_boundary=boundary,
         deterministic=deterministic, reviewer="greenfield-code-reviewer", subject="generated_project",
         meta_dir=meta_dir, use_llm=model_review, total_findings=24,
         before_save=lambda directory: write_analyzer_registry(directory / "analyzer_registry.json"),
@@ -140,6 +149,7 @@ def _deterministic_findings(
     contract: Mapping[str, Any],
     architecture_plan: Mapping[str, Any],
     api_contract: Mapping[str, list[str]],
+    access_boundary: Path,
 ) -> list[ReviewFinding]:
     findings: list[ReviewFinding] = []
     max_files = _int(resource_plan.get("max_files"), 12)
@@ -163,9 +173,10 @@ def _deterministic_findings(
                         f"Core file `{path}` fell back while related files were LLM-generated; cross-file contracts are unsafe.",
                     )
                 )
+    allowed = code_task_access_filter(project_dir, boundary=access_boundary)
     for row in generated:
         path = safe_relative_path(str(row.get("path", "")))
-        if not path:
+        if not path or not allowed(project_dir / path):
             findings.append(_finding("blocking", "unsafe_path", f"Unsafe generated path: {row.get('path', '')}"))
             continue
         target = project_dir / path
@@ -205,7 +216,7 @@ def _deterministic_findings(
             except py_compile.PyCompileError as exc:
                 findings.append(_finding("blocking", "python_compile_failed", f"{path}: {exc.msg}"))
     for metric in _required_metrics(result_schema):
-        if not _metric_name_visible(project_dir, metric):
+        if not _metric_name_visible(project_dir, metric, access_boundary=access_boundary):
             findings.append(
                 _finding(
                     "warning",
@@ -240,7 +251,8 @@ def _deterministic_findings(
     findings.extend(_interface_contract_findings(project_dir, architecture_plan=architecture_plan,
                                                 api_contract=api_contract))
     findings.extend(_return_contract_findings(project_dir))
-    findings.extend(_semantic_scaffold_findings(project_dir, contract=contract, result_schema=result_schema))
+    findings.extend(_semantic_scaffold_findings(project_dir, contract=contract, result_schema=result_schema,
+        access_boundary=access_boundary))
     findings.extend(_implementation_contract_findings(project_dir, contract=contract, architecture_plan=architecture_plan))
     return findings
 
@@ -320,12 +332,14 @@ def _semantic_scaffold_findings(
     *,
     contract: Mapping[str, Any],
     result_schema: Mapping[str, Any],
+    access_boundary: Path,
 ) -> list[ReviewFinding]:
     findings: list[ReviewFinding] = []
     if not _required_metrics(result_schema):
         return findings
     task_text = _task_text(contract)
-    for path in sorted(_iter_files(project_dir, include_hidden_dirs=True)):
+    for path in sorted(_iter_files(project_dir, include_hidden_dirs=True,
+            access_boundary=access_boundary)):
         if path.suffix not in {".py", ".json", ".toml", ".md", ".txt"}:
             continue
         content = read_code_task_text(path, utf8_errors='ignore')
@@ -493,11 +507,12 @@ def _required_metrics(schema: Mapping[str, Any]) -> list[str]:
     return metrics
 
 
-def _metric_name_visible(project_dir: Path, metric: str) -> bool:
+def _metric_name_visible(project_dir: Path, metric: str, *, access_boundary: Path) -> bool:
     needle = metric.strip()
     if not needle:
         return True
-    for path in _iter_files(project_dir, include_hidden_dirs=True):
+    for path in _iter_files(project_dir, include_hidden_dirs=True,
+            access_boundary=access_boundary):
         if path.suffix not in {".py", ".json", ".toml", ".md"}:
             continue
         content = read_code_task_text(path, utf8_errors='ignore')

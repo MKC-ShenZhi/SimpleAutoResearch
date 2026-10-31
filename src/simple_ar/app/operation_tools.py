@@ -198,7 +198,8 @@ class OperationTools:
                 current_assessments(self.workspace,observations())])
         self.registry.register_package(inspection_tool_specs(progressive=self.inspection.progressive,
             adaptive=self.inspection.adaptive,
-            execution_protocol=config.get('inspection_execution_protocol')),
+            execution_protocol=config.get('inspection_execution_protocol'),
+            coverage_policy=config.get('inspection_coverage_policy')),
             self.inspection)
         self.delivery_review = None
         if config.get('delivery_review_protocol') in {'task.v1', 'task.v2', 'task.v3'}:
@@ -385,7 +386,15 @@ class OperationTools:
                 # Keep prior required opinions even after a narrower check, but
                 # do not repeat the identical bound opinion and scope. All
                 # original receipts remain available in the journal.
-                signature = json.dumps([locator, digest, feedback.get('arguments'), assessments],
+                # A versioned envelope without a new scope or reassessment is
+                # the same opinion; its schema tag alone is not new evidence.
+                normalized = [{key:value for key,value in row.items() if key not in
+                    {'schema_version', 'scope', 'reassessed_prior', 'review_id'}}
+                    if isinstance(row, dict) and row.get('schema_version') in
+                        {'artifact_assessment.v1', 'artifact_assessment.v2'}
+                        and row.get('scope') is None and not row.get('reassessed_prior') else row
+                    for row in assessments]
+                signature = json.dumps([locator, digest, feedback.get('arguments'), normalized],
                     sort_keys=True, ensure_ascii=False) if required else None
                 if signature in repeated:
                     duplicate_records.append(signature)

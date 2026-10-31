@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import Mock, PropertyMock, patch
 
 from simple_ar.core.working_context import (
-    current_material_paths, history_view, processed_journal_turns, select_working_context)
+    CITATION_HANDOFF_POLICY, current_material_paths, history_view, processed_journal_turns, select_working_context)
 from simple_ar.app.work_memory import compact_work, checkpoint_artifacts, checkpoint_entries, summary_coverage
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.core.budget import BudgetLedger
@@ -523,6 +523,43 @@ class WorkingContextTests(unittest.TestCase):
 
 
 class RetainedWorkingContextTests(unittest.TestCase):
+    def test_journal_retirement_requires_each_turns_actually_supplied_support(self):
+        rows = [observation(i, f'Original receipt {i}.', kind='operation_result') for i in range(2)]
+        notes = [{'text':'Continuity for '+str(i), 'records':[row['record']],
+            'handoff_policy':CITATION_HANDOFF_POLICY} for i, row in enumerate(rows)]
+        options = dict(material_policy='retained', require_work_notes=True, fit_work_notes=True,
+            processed_turns=[0, 1], observations=rows,
+            turn_blocks=[block(0, rows[0]['text']), block(1, rows[1]['text']), block(2, 'Current work')],
+            context_token_target=20000)
+        before = deepcopy(options)
+        for missing in ([], [{**notes[1], 'current':False}],
+                        [{**notes[1], 'text':' '}],
+                        [{**notes[1], 'text':'Oversized support. '*20000}]):
+            with self.subTest(missing=bool(missing)):
+                messages, selection = select(**options, work_notes=[notes[0], *missing])
+                supplied = json.dumps(messages)
+                self.assertIn(rows[1]['text'], supplied)
+                # The native suffix cannot skip an uncovered intervening turn.
+                self.assertTrue(1 in selection['selected_turns'] or any(
+                    state['source']['record'] == rows[1]['record'] for state in selection['selected_records']))
+                self.assertLessEqual(selection['estimated_input_tokens'], 20000)
+        messages, _ = select(**options, work_notes=notes)
+        self.assertTrue(all(row['text'] not in json.dumps(messages) for row in rows))
+        self.assertEqual(options, before)
+
+    def test_journal_navigation_exposes_support_gap_within_one_processed_turn(self):
+        row = observation(0, 'Retained body of first action.', kind='operation_result')
+        operations = [{'turn':0, 'reply':'reply.json', 'request_count':1,
+            'observation':{'record':record}} for record in (row['record'], 'records/uncovered.json')]
+        messages, selection = select(material_policy='retained', require_work_notes=True,
+            fit_work_notes=True, processed_turns=[0], observations=[row], operation_history=operations,
+            work_notes=[{'text':'Only one action is represented', 'records':[row['record']],
+                'handoff_policy':CITATION_HANDOFF_POLICY}],
+            turn_blocks=[block(0, 'Full original pair'), block(1, 'Current work')],
+            context_token_target=20000)
+        self.assertIn(row['text'], json.dumps(messages))
+        self.assertIn(0, selection['selected_turns'])
+
     def test_journal_coverage_retires_only_processed_originals_and_keeps_needed_bodies(self):
         covered = observation(0, 'Covered original bytes.', path='covered.csv', role='historical_observation')
         fresh = observation(1, 'New original bytes.', path='fresh.csv', role='historical_observation')
@@ -1852,7 +1889,110 @@ class CheckpointFailureTests(unittest.TestCase):
         app._coordination_result = lambda result, record, **kwargs:result
         return app
 
-    def test_journal_partial_turn_batches_derive_frontier_without_rebuying_or_claiming_coverage(self):
+    def test_saved_journal_and_inspection_checkpoints_recover_under_their_recorded_policy(self):
+        from simple_ar.tools.inspection import InspectionToolGateway
+        original_root = self.root
+        results = [{'tool_name':'observe', 'status':'ok', 'data':{'value':3}},
+            {'tool_name':'observe', 'status':'error', 'error':'Original unresolved diagnostic'}]
+        for role in ('main', 'inspection', 'shared-inspection'):
+            for policy in (None, CITATION_HANDOFF_POLICY):
+                with self.subTest(role=role, policy=policy):
+                    self.root = original_root/role/(policy or 'historical')
+                    self.store = ArtifactStore(self.root/'attempts'/'native-turn-test')
+                    self.ledger = BudgetLedger({'llm_requests':20, 'total_tokens':200000})
+                    call_id, attempt = None, 'native-turn-test'
+                    requests = ['Explain the measurements']
+                    if role == 'main':
+                        app = self._journal_app(results)
+                        records = [f'records/reads/result-{i}.json' for i in range(2)]
+                        load = app._working_memory
+                    else:
+                        identity = attempt = 'saved-inspection'
+                        owner = InspectionToolGateway(self.root, SimpleNamespace(ledger=self.ledger),
+                            Mock(side_effect=AssertionError('Recovery must not request new work')),
+                            protocol='subjects.v3')
+                        source = owner._path(identity, 'sources-0')
+                        records = [source+f'#results/{i}' for i in range(2)]
+                        owner.store.write_json(source, {'completed':True, 'response':{
+                            'role':'assistant', 'tool_calls':[{'id':str(i)} for i in range(2)]},
+                            **({'model_receipt':{'attempt':attempt}} if role == 'shared-inspection' else {}),
+                            'results':[{'call_id':str(i), 'arguments':{}, 'result':result}
+                                for i, result in enumerate(results)]})
+                        self.ledger.reserve('source-model', {'llm_requests':1, 'total_tokens':5000},
+                            session_id='session', attempt_id=attempt,
+                            logical_call_id='inspect-artifacts-'+identity, purpose='inspection')
+                        self.ledger.settle('source-model', {'llm_requests':1, 'total_tokens':140})
+                        call_id = f'working-memory-{identity}-sources-1'
+                        self.store = ArtifactStore(self.root/f'tools/inspection/{identity}/sources-1')
+                    view = {'requests':requests, 'previous_notes':[], 'archive_through_turn':1,
+                        'observations':[{'id':f'o{i+1}', 'turn':0, 'request_count':1,
+                            'record':record, 'arguments':{}, 'truncated':False,
+                            'observation_text':json.dumps(result)}
+                            for i, (record, result) in enumerate(zip(records, results))]}
+                    notes = self.bind([{'text':'Only the successful result was retained', 'records':[records[0]]}])
+                    if policy:
+                        view['handoff_policy'] = policy
+                        notes = [{**note, 'handoff_policy':policy} for note in notes]
+                    # Unmarked files model the saved v1 format, not today's writer.
+                    self.store.write_json('memory_input.json', view)
+                    self.store.write_json('memory_response.json', {'notes':[{
+                        'text':notes[0]['text'], 'observations':['o1']}]})
+                    snapshot = {'schema_version':'working_memory.v1', 'through_turn':1, 'notes':notes,
+                        'input_sha256':hashlib.sha256(json.dumps(view, ensure_ascii=False).encode()).hexdigest(),
+                        **({'logical_call_id':call_id} if call_id else {})}
+                    self.store.write_json('memory_snapshot.json', snapshot)
+                    self.ledger.reserve('checkpoint', {'llm_requests':1, 'total_tokens':5000},
+                        session_id='session', attempt_id=attempt,
+                        logical_call_id=call_id or 'working-memory-'+attempt, purpose='working-memory')
+                    self.ledger.settle('checkpoint', {'llm_requests':1, 'total_tokens':140})
+                    if role != 'main':
+                        checkpoint = {path.relative_to(owner.root).as_posix():
+                            hashlib.sha256(path.read_bytes()).hexdigest()
+                            for path in (self.store.resolve(name) for name in
+                                ('memory_input.json', 'memory_response.json', 'memory_snapshot.json'))}
+                        pending = owner._path(identity, 'sources-1')
+                        owner.store.write_json(pending, {'checkpoint':checkpoint,
+                            **({'checkpoint_receipt':{'attempt':attempt}} if role == 'shared-inspection' else {})})
+                        saved = {'identity':identity, 'arguments':{'goal':requests[0]},
+                            'inspection_history_policy':'receipts.v1',
+                            **({'execution_protocol':'shared.v1'} if role == 'shared-inspection' else {}),
+                            'source_rounds':[owner._digest(source), owner._digest(pending)]}
+                        load = lambda:owner._conversation_memory(saved, owner._conversation_rows(saved))
+                    before = self.ledger.to_dict()
+                    retained = {path:path.read_bytes() for path in self.root.rglob('*.json')}
+                    memory = load()
+                    self.assertEqual(memory['compacted_records'], {records[0]} if policy else set(records))
+                    self.assertEqual(memory['through_turn'], 0 if policy else 1)
+                    self.assertEqual(memory['notes'], notes)
+                    rows = [observation(0, json.dumps(result), kind='operation_result', record=record)
+                        for record, result in zip(records, results)]
+                    messages, selection = select(material_policy='retained', require_work_notes=True,
+                        fit_work_notes=True, work_notes=memory['notes'], observations=rows,
+                        processed_turns=processed_journal_turns(rows, memory['compacted_records']),
+                        turn_blocks=[block(0, 'Historical native body'), block(1, 'Continue work')],
+                        context_token_target=12000)
+                    self.assertEqual(results[1]['error'] in json.dumps(messages), bool(policy))
+                    self.assertEqual(selection['selected_turns'], [0, 1] if policy else [1])
+                    if role != 'main':
+                        page = owner._read_history(saved, {'action':1, 'field':'result'}, before_turn=2).data
+                        self.assertEqual(json.loads(page['text']), results[1])
+                    elif not policy:
+                        with patch('simple_ar.integrations.llm._call_openai_sdk') as send:
+                            self.assertEqual(app._compact_work(SimpleNamespace(store=self.store,
+                                attempt=SimpleNamespace(attempt_id=attempt)), self.client.with_budget(
+                                    self.ledger, session_id='session', attempt_id=attempt), 1), ())
+                            send.assert_not_called()
+                    self.assertEqual(load(), memory)
+                    self.assertEqual(self.ledger.to_dict(), before)
+                    self.assertTrue(all(path.read_bytes() == raw for path, raw in retained.items()))
+                    if policy:
+                        self.store.write_json('memory_snapshot.json', {**snapshot,
+                            'notes':[{key:value for key,value in note.items() if key != 'handoff_policy'}
+                                for note in notes]})
+                        with self.assertRaisesRegex(ValueError, 'disagrees|changed'):
+                            load()
+
+    def test_journal_partial_turn_batches_derive_cited_frontier_without_rebuying(self):
         results = [{'tool_name':'read_file', 'status':status, 'data':{'text':text*26000}}
             for status, text in (('ok', 'a'), ('error', 'b'))]
         # Each receipt fits, but their complete native turn exceeds the window.
@@ -1873,15 +2013,81 @@ class CheckpointFailureTests(unittest.TestCase):
                 attempt_id='next', capability='native_turn', status='completed'))
             next_context = SimpleNamespace(store=next_store, attempt=SimpleNamespace(attempt_id='next'))
             next_client = self.client.with_budget(self.ledger, session_id='session', attempt_id='next')
+            send.return_value = self.response(
+                '{"notes":[{"text":"Retained earlier and new work","observations":["p0","o1"]}]}')
             app._compact_work(next_context, next_client, 1)
             second = next_store.read_json('memory_input.json')
             self.assertEqual([row['record'] for row in second['observations']], ['records/reads/result-1.json'])
             self.assertEqual(json.loads(second['observations'][0]['observation_text']), results[1])
             memory = app._working_memory()
-            self.assertEqual(memory['through_turn'], 0)  # Separate partial batches prove no whole turn.
+            self.assertEqual(memory['through_turn'], 1)  # Both cited handoffs now cover the closed turn.
             self.assertEqual(memory['compacted_records'], {'records/reads/result-0.json', 'records/reads/result-1.json'})
             self.assertEqual(app._compact_work(next_context, next_client, 1), ())
             self.assertEqual(send.call_count, 2)
+
+    def test_journal_uncited_failure_remains_selectable_and_reaches_next_checkpoint(self):
+        results = [{'tool_name':'observe', 'status':'ok', 'data':{'value':3}},
+            {'tool_name':'observe', 'status':'error', 'error':'Unresolved original diagnostic'}]
+        app = self._journal_app(results)
+        context = SimpleNamespace(store=self.store, attempt=SimpleNamespace(attempt_id='native-turn-test'))
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
+                '{"notes":[{"text":"The first observation returned 3","observations":["o1"]}]}')) as send:
+            app._compact_work(context, self.client, 1)
+            memory = app._working_memory()
+            first, second = [f'records/reads/result-{i}.json' for i in range(2)]
+            self.assertEqual(memory['compacted_records'], {first})
+            self.assertEqual(memory['through_turn'], 0)
+            rows = [observation(0, json.dumps(result), kind='operation_result', record=record)
+                for result, record in zip(results, (first, second))]
+            messages, selection = select(material_policy='retained', require_work_notes=True,
+                fit_work_notes=True, work_notes=memory['notes'], observations=rows,
+                processed_turns=processed_journal_turns(rows, memory['compacted_records']),
+                turn_blocks=[[], block(1, 'Continue the work')], context_token_target=12000)
+            self.assertIn(results[1]['error'], json.dumps(messages))
+            self.assertLessEqual(selection['estimated_input_tokens'], 12000)
+            before = self.ledger.to_dict()
+            self.assertEqual(app._working_memory(), memory)
+            self.assertEqual(self.ledger.to_dict(), before)
+            next_store = ArtifactStore(self.root/'attempts'/'next')
+            app.session.attempt_lineage().append(SimpleNamespace(
+                attempt_id='next', capability='native_turn', status='completed'))
+            next_context = SimpleNamespace(store=next_store, attempt=SimpleNamespace(attempt_id='next'))
+            next_client = self.client.with_budget(self.ledger, session_id='session', attempt_id='next')
+            send.return_value = self.response(
+                '{"notes":[{"text":"First result retained; second operation still failed",'
+                '"observations":["p0","o1"]}]}')
+            app._compact_work(next_context, next_client, 1)
+            self.assertEqual([row['record'] for row in next_store.read_json('memory_input.json')['observations']],
+                [second])
+            self.assertEqual(app._working_memory()['compacted_records'], {first, second})
+            self.assertEqual(send.call_count, 2)
+            # A subsequent rewrite can drop old citations. Reload must reopen
+            # those originals, rather than accumulate every past admission.
+            third = 'records/later/result.json'
+            app.session.store.write_json('attempts/later/result.json', {
+                'tool_name':'observe', 'status':'ok', 'data':{'value':4}})
+            app.session.store.write_json('attempts/later/reply.json', {'tool_calls':[{
+                'id':'later', 'function':{'name':'observe', 'arguments':'{}'}}]})
+            app.state['turns'].append({'reply':'attempts/later/reply.json', 'request_count':1,
+                'tools':[{'id':'later', 'result':'attempts/later/result.json'}]})
+            app.session.attempt_lineage().extend([
+                SimpleNamespace(attempt_id='later', capability='tool', status='completed'),
+                SimpleNamespace(attempt_id='rewrite', capability='native_turn', status='completed')])
+            rewrite = SimpleNamespace(store=ArtifactStore(self.root/'attempts'/'rewrite'),
+                attempt=SimpleNamespace(attempt_id='rewrite'))
+            send.return_value = self.response(
+                '{"notes":[{"text":"Only the latest result was retained","observations":["o1"]}]}')
+            app._compact_work(rewrite, self.client.with_budget(self.ledger,
+                session_id='session', attempt_id='rewrite'), 2)
+            memory = app._working_memory()
+            self.assertEqual(memory['compacted_records'], {third})
+            self.assertEqual(memory['through_turn'], 0)
+            messages, _ = select(material_policy='retained', require_work_notes=True,
+                fit_work_notes=True, work_notes=memory['notes'], observations=rows,
+                processed_turns=processed_journal_turns(rows, memory['compacted_records']),
+                turn_blocks=[[], block(1, 'Continue the work')], context_token_target=12000)
+            self.assertIn(results[1]['error'], json.dumps(messages))
+            self.assertEqual(send.call_count, 3)
 
     def test_selected_closed_work_keeps_authored_arguments_failures_and_historical_recovery_contract(self):
         result = {'tool_name':'write_file', 'status':'error', 'error':'Original write rejected'}

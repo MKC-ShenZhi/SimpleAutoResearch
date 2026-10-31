@@ -4973,6 +4973,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertTrue(assessment_issues(self.app.workspace, self._observations(), ['notes.md']))
         self.review = lambda _: {'findings':[], 'limitations':[]}
         self._submit(_action('inspect_artifacts', goal='Check only the heading.', targets=['notes.md']))
+        self.assertTrue(assessment_issues(self.app.workspace, self._observations(), ['notes.md']))
+        self.review = lambda _: {'decisions':[{'subject':'target-1', 'conclusion':'complete',
+            'reassessed_prior':True, 'findings':[], 'evidence':[], 'limitations':[]}]}
+        self._submit(_action('inspect_artifacts', goal='Reassess the earlier concern.', targets=['notes.md']))
         self.assertFalse(assessment_issues(self.app.workspace, self._observations(), ['notes.md']))
         feedback = self.app.operations.inspection_feedback(['notes.md'])
         self.assertEqual(json.dumps(feedback).count('The stated claim is not supported by the observed sample.'), 1)

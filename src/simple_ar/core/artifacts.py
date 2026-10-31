@@ -8,6 +8,17 @@ import time
 from typing import Any, Iterable
 
 
+PRIVATE_PATH_COMPONENTS = frozenset({'.git', '.aws', '.ssh', '.codex', '.agents', '__pycache__', '.venv', 'venv'})
+
+
+def is_private_path_name(name: str, *, allow_env_example: bool = False) -> bool:
+    """Identify task-private path components without opening their contents."""
+    name = name.casefold()
+    if name.startswith('.env'):
+        return not (allow_env_example and name.endswith('.example'))
+    return name in PRIVATE_PATH_COMPONENTS
+
+
 def replace_exact_spans(text: str, replacements: Iterable[tuple[str, str]]) -> str:
     """Apply unique, non-overlapping replacements against one original text."""
     spans = []
