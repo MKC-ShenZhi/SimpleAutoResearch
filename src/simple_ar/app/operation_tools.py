@@ -190,6 +190,7 @@ class OperationTools:
         self.inspection = InspectionToolGateway(root, self.workspace,
             client_factory=lambda identity:client_factory(identity, 'writing'),
             protocol=config.get('inspection_protocol'),
+            coverage_policy=config.get('inspection_coverage_policy'),
             material_observations=material_observations,
             user_requests=user_requests,
             feedback_provider=self.inspection_feedback if self.professional else None,

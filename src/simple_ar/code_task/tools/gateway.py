@@ -4,6 +4,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from simple_ar.code_task.memory import code_task_memory_paths
+from simple_ar.code_task.analysis.index import _iter_files, read_code_task_text
 from simple_ar.code_task.runtime.state import code_task_paths, workspace_file
 from simple_ar.core.artifacts import read_json, read_jsonl
 from simple_ar.tools.specs import ToolResult
@@ -108,11 +109,13 @@ class LocalCodeTaskToolGateway:
         extensions = _extension_filter(arguments.get("extensions")) or self.DEFAULT_SEARCH_EXTENSIONS
         needle = query if case_sensitive else query.lower()
         matches: list[dict[str, Any]] = []
-        for path in self._workspace_files(extensions):
-            try:
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
+        for path in sorted(_iter_files(self.paths.workspace_dir, include_hidden_dirs=True, include_dotenv_examples=True)):
+            if path.suffix.lower() not in extensions or path.suffix.lower() in {'.pyc', '.pyo'}:
                 continue
+            text = read_code_task_text(path, utf8_errors='replace')
+            if text is None:
+                continue
+            lines = text.splitlines()
             rel = path.relative_to(self.paths.workspace_dir).as_posix()
             for number, line in enumerate(lines, start=1):
                 haystack = line if case_sensitive else line.lower()
@@ -241,19 +244,6 @@ class LocalCodeTaskToolGateway:
         repairs = _tail_rows(paths.repair_memory_jsonl, limit) if include_repairs else []
         return {"edit_history": edits, "review_findings": reviews, "repair_memory": repairs}
 
-    def _workspace_files(self, extensions: set[str]) -> list[Path]:
-        root = self.paths.workspace_dir
-        if not root.is_dir():
-            return []
-        rows: list[Path] = []
-        for path in sorted(root.rglob("*")):
-            if not path.is_file() or _is_noise(path):
-                continue
-            if extensions and path.suffix.lower() not in extensions:
-                continue
-            rows.append(path)
-        return rows
-
     def _index(self) -> dict[str, Any]:
         return _read_required_json(self.paths.meta_dir / "codebase_index.json")
 
@@ -337,11 +327,6 @@ def _string_list(value: object) -> list[str]:
 
 def _object_dict(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
-
-
-def _is_noise(path: Path) -> bool:
-    parts = {part.lower() for part in path.parts}
-    return "__pycache__" in parts or path.suffix.lower() in {".pyc", ".pyo"}
 
 
 def _rel(root: Path, path: Path) -> str:

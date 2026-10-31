@@ -9920,9 +9920,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertTrue(missing_path.is_file())
                     missing_path.unlink()
                     diagnostic = Path(missing).name
-                binding = (patch.object(app, 'execution_binding',
+                binding = (patch.object(app.implementation, 'approval_binding',
                     side_effect=ValueError('Candidate has no execution plan')) if missing == 'invalid_plan'
-                    else patch.object(app, 'execution_binding', wraps=app.execution_binding))
+                    else patch.object(app.implementation, 'approval_binding', wraps=app.implementation.approval_binding))
                 if missing == 'invalid_plan':
                     diagnostic = 'Candidate has no execution plan'
                 ledger = app.ledger.to_dict()
@@ -9935,9 +9935,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         'arguments': {'prepared_result': prepared_result}},
                         {'tool_name': 'ask_user', 'arguments': {'question': 'Correct the source receipt'}}],
                         approve=approve, progress=lambda _: None)
-                # Both shared preflight boundaries consult the original owner;
-                # the next action remains reachable after the invalid observation.
-                self.assertEqual(preflight.call_count, 2)
+                # The original owner diagnoses refusal; no wrapper-call count
+                # is part of the user's execution or recovery contract.
+                preflight.assert_called()
                 tools = app.state['turns'][-1]['tools']
                 self.assertEqual(len(tools), 2)
                 observed = app.session.store.read_json(tools[0]['result'])

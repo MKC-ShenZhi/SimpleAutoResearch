@@ -413,7 +413,7 @@ class ProjectPreparationTests(unittest.TestCase):
             self.assertIn('declaration', project_preparation_markdown(facts))
 
     def test_notebook_candidates_reuse_index_without_reading_outputs_or_dependency_trees(self):
-        from simple_ar.code_task.review_pipeline import _project_files, read_code_task_text
+        from simple_ar.code_task.review_pipeline import build_review_index, read_code_task_text
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             self.project(root)
@@ -425,11 +425,15 @@ class ProjectPreparationTests(unittest.TestCase):
             checkpoint = root / '.ipynb_checkpoints'
             checkpoint.mkdir()
             (checkpoint / 'copy.ipynb').write_text('old outputs')
-            visited = list(_project_files(root))
-            self.assertNotIn(dependency / 'main.py', visited)
             with patch('simple_ar.code_task.review_pipeline.read_code_task_text', wraps=read_code_task_text) as read:
-                facts = inspect_project_preparation(root)
+                index = build_review_index(root)
+                facts = inspect_project_preparation(root, index=index)
             self.assertFalse(any(call.args[0] == notebook for call in read.call_args_list))
+            self.assertFalse(any(call.args[0].is_relative_to(root / '.venv')
+                or call.args[0].is_relative_to(checkpoint) for call in read.call_args_list))
+            self.assertFalse(any(row['path'].startswith(('.venv/', '.ipynb_checkpoints/'))
+                for row in index['files']))
+            self.assertEqual([row['path'] for row in index['notebooks']], ['experiment.ipynb'])
             self.assertEqual([row['path'] for row in facts['notebook_candidates']], ['experiment.ipynb'])
             self.assertEqual(facts['notebook_candidates'][0]['inspection'], 'path_only_cells_and_outputs_unread')
             self.assertIn('Notebook candidates', project_preparation_markdown(facts))

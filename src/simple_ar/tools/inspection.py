@@ -247,6 +247,7 @@ class InspectionToolGateway:
                  user_requests: Callable[[], list[str]] | None = None,
                  feedback_provider: Callable[[list[str]], list[dict]] | None = None,
                  protocol: str | None = None,
+                 coverage_policy: str | None = None,
                  execution_protocol: str | None = None,
                  operation_specs: Callable[[], list[CommonToolSpec]] | None = None,
                  operation_call: Callable[[str, dict[str, Any], str], ToolResult] | None = None) -> None:
@@ -254,6 +255,8 @@ class InspectionToolGateway:
             raise ValueError('Unknown inspection protocol')
         if execution_protocol not in (None, 'shared.v1'):
             raise ValueError('Unknown inspection execution protocol')
+        if coverage_policy not in (None, 'offered.v1'):
+            raise ValueError('Unknown inspection coverage policy')
         self.root, self.workspace = Path(root), workspace
         self.store, self.client_factory = ArtifactStore(root), client_factory
         self.prior_assessments = prior_assessments
@@ -261,6 +264,7 @@ class InspectionToolGateway:
         self.user_requests = user_requests
         self.feedback_provider = feedback_provider
         self.protocol = protocol
+        self.coverage_policy = coverage_policy
         self.execution_protocol = execution_protocol
         self.operation_specs = operation_specs
         self.operation_call = operation_call
@@ -276,6 +280,13 @@ class InspectionToolGateway:
     @staticmethod
     def _delivery_scope(saved: dict) -> bool:
         return saved.get('delivery_context', {}).get('schema_version') == 'delivery_review.v3'
+
+    @staticmethod
+    def _offered_coverage(saved: dict) -> bool:
+        policy = saved.get('coverage_policy')
+        if policy not in (None, 'offered.v1'):
+            raise ValueError('Unknown saved inspection coverage policy')
+        return policy == 'offered.v1'
 
     def _system(self, saved: dict) -> str:
         if saved.get('execution_protocol') == 'shared.v1':
@@ -332,6 +343,7 @@ class InspectionToolGateway:
             raise ValueError('Inspection dispatcher binding differs from its accepted common action')
         reference = {'attempt':wrapper['attempt'], 'record':wrapper['record'],
             'record_sha256':self._digest(wrapper['record']), 'action_sha256':self._digest(action_path)}
+        self._owned_receipt(reference)
         invocations = saved.setdefault('source_invocations', [])
         if reference not in invocations:
             invocations.append(reference)
@@ -345,6 +357,35 @@ class InspectionToolGateway:
         if not isinstance(result, dict):
             raise ValueError('Inspection common owner receipt has no result object')
         return result
+
+    def _owned_receipt(self, receipt: dict) -> tuple[dict, dict]:
+        """Check an action's original result or its explicitly recovered receipt."""
+        attempt, record = receipt.get('attempt'), receipt.get('record')
+        if not isinstance(attempt, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', attempt):
+            raise ValueError('Inspection receipt has an invalid operation owner')
+        match = (re.fullmatch(rf'attempts/{re.escape(attempt)}((?:-receipt)*)/native_result\.json', record)
+            if isinstance(record, str) else None)
+        if not match:
+            raise ValueError('Inspection history receipt is outside its operation owner')
+        depth = len(match.group(1)) // len('-receipt')
+        paths = [record, *(f"attempts/{attempt}{'-receipt' * level}/action.json" for level in range(depth+1))]
+        for relative in paths:
+            path = self.root
+            for part in ('', *Path(relative).parts):
+                path = path / part
+                if path.is_symlink() or path.is_junction():
+                    raise ValueError('Inspection history cannot traverse links')
+        result = self._receipt_result(receipt)
+        action = self.store.read_json(f'attempts/{attempt}/action.json')
+        previous = action
+        for level in range(1, depth+1):
+            expected = {key:value for key, value in previous.items() if key not in {'result', 'execution_approval'}}
+            expected.update(attempt=previous['attempt']+'-receipt',
+                kind='opinion' if previous['kind'] == 'opinion' else 'receipt', recovered_from=previous['attempt'])
+            if self.store.read_json(f"attempts/{attempt}{'-receipt' * level}/action.json") != expected:
+                raise ValueError('Inspection recovered receipt differs from its original action')
+            previous = expected
+        return result, action
 
     def _accepted_execution_binding(self, receipt: dict) -> dict:
         action_path = f"attempts/{receipt['attempt']}/action.json"
@@ -532,6 +573,8 @@ class InspectionToolGateway:
             return {}
         dependencies: dict[str, str] = {}
         journal_cache = {} if journal_cache is None else journal_cache
+        local_validation = validation_records is None
+        validation_records = {} if validation_records is None else validation_records
 
         def bind(path: str, digest: str) -> None:
             path = str(self.workspace.resolve(path))
@@ -562,7 +605,8 @@ class InspectionToolGateway:
             path = self._path(saved['identity'], f'sources-{number}')
             trace = self._bound_json(path, digest, validation_records,
                 'Inspection source investigation record changed; no replay')
-            if saved.get('source_priming_policy') == 'priority.v1':
+            if (saved.get('source_priming_policy') == 'priority.v1'
+                    and not self._offered_coverage(saved)):
                 cached_views = validation_records.setdefault('supplied', {}) if validation_records is not None else {}
                 if path not in cached_views:
                     windows = set()
@@ -589,6 +633,8 @@ class InspectionToolGateway:
                 if include_delivery:
                     check_owner_receipts(row)
         if not current_inputs:
+            if local_validation:
+                self._verify_bound_json(validation_records)
             return dependencies
         included_visual = set()
         while True:
@@ -646,19 +692,22 @@ class InspectionToolGateway:
                 for locator, digest in self._check_bound_process_inputs(receipt, row['arguments']).items():
                     bind(locator, digest)
         source_rows = list(selected or [])
-        if include_delivery and saved.get('source_priming_policy') == 'priority.v1':
+        if (include_delivery and saved.get('source_priming_policy') == 'priority.v1'
+                and not self._offered_coverage(saved)):
             source_rows.extend(row for row in [*saved['targets'], *saved['evidence']] if row not in source_rows)
         for row in source_rows:
             for window in row.get('windows', []):
                 reference = window.get('source_reference')
-                exposed = (row.get('path'), row.get('sha256'), window.get('offset_bytes'),
-                    window.get('review_next_offset_bytes')) in supplied
+                exposed = ((row.get('path'), row.get('sha256'), window.get('offset_bytes'),
+                    window.get('review_next_offset_bytes')) in supplied)
                 if reference and (row in (selected or []) or exposed) and (
                         saved.get('source_priming_policy') == 'priority.v1' or not include_delivery):
                     for locator, digest in self._reused_source_dependencies(
                             reference, row['path'], visited=visited, journal_cache=journal_cache,
                             producer_index_cache=producer_index_cache, validation_records=validation_records).items():
                         bind(locator, digest)
+        if local_validation:
+            self._verify_bound_json(validation_records)
         return dependencies
 
     def _reused_source_dependencies(self, reference: dict, path: str, *,
@@ -739,10 +788,11 @@ class InspectionToolGateway:
         finally:
             seen.remove(key)
 
-    def _shared_final_bindings(self, saved: dict, response: dict) -> dict[str, dict[str, str]]:
+    def _shared_final_bindings(self, saved: dict, response: dict, *,
+                               validation_records: dict | None = None) -> dict[str, dict[str, str]]:
         observed = {row['subject']:row for row in [*saved['targets'], *saved['evidence']]}
         producer_index_cache: dict = {}
-        validation_records: dict = {}
+        validation_records = {} if validation_records is None else validation_records
 
         def check(selected: list[dict]) -> dict[str, str]:
             return self._check_shared_dependencies(saved, current_inputs=True, selected=selected,
@@ -1287,6 +1337,227 @@ class InspectionToolGateway:
             cursor = max(cursor, end)
         return cursor == next(iter(sizes))
 
+    @staticmethod
+    def _merged_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        merged: list[tuple[int, int]] = []
+        for start, end in sorted(set(ranges)):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    @staticmethod
+    def _range_supplied(ranges: list[tuple[int, int]], start: int, end: int) -> bool:
+        # An empty file needs an actual supplied empty observation, not merely
+        # the vacuous mathematical coverage of an empty interval.
+        if start == end:
+            return any(left <= start <= right for left, right in ranges)
+        cursor = start
+        for left, right in ranges:
+            if right <= cursor:
+                continue
+            if left > cursor:
+                return False
+            cursor = max(cursor, right)
+            if cursor >= end:
+                return True
+        return False
+
+    def _offered_text_ranges(self, saved: dict, *, validation_records: dict | None = None
+                             ) -> dict[tuple[str, str], list[tuple[int, int]]]:
+        """Recover actual supplied source ranges from the existing request projections."""
+        if not self._offered_coverage(saved):
+            return {}
+        if saved.get('execution_protocol') != 'shared.v1':
+            raise ValueError('Offered coverage requires the shared inspection journal')
+        cache = validation_records if validation_records is not None else {}
+        cache_key = (saved['identity'], tuple(saved.get('source_rounds', [])))
+        cached = cache.setdefault('offered_text_ranges', {})
+        if cache_key in cached:
+            return cached[cache_key]
+
+        original = {}
+        for row in [*saved['targets'], *saved['evidence']]:
+            if not row.get('readable') or not row.get('path') or not row.get('sha256'):
+                continue
+            for window in row.get('windows', []):
+                start, end, size = (window.get('offset_bytes'),
+                    window.get('review_next_offset_bytes'), window.get('size_bytes'))
+                text = window.get('review_text', window.get('text'))
+                if (any(type(value) is not int for value in (start, end, size))
+                        or not 0 <= start <= end <= size or not isinstance(text, str)
+                        or len(text.encode('utf-8')) != end-start):
+                    continue
+                item = (row['subject'], row['path'], row['sha256'], start, end, size)
+                if item in original and original[item] != text:
+                    raise ValueError('Inspection windows conflict at the same source identity')
+                original[item] = text
+
+        rounds = [self._closed_source_round(saved, number, allow_final=True, model_only=True,
+                    validation_records=cache) for number in range(len(saved.get('source_rounds', [])))]
+        actions: dict[tuple[int, int], dict | None] = {}
+
+        def action(turn: int, index: int) -> dict | None:
+            key = (turn, index)
+            if key not in actions:
+                trace = rounds[turn] if 0 <= turn < len(rounds) else None
+                rows = trace.get('results', []) if trace else []
+                calls = trace.get('response', {}).get('tool_calls') if trace else []
+                if (not isinstance(calls, list) or not 0 <= index < min(len(rows), len(calls))
+                        or not isinstance(calls[index], dict)
+                        or not isinstance(calls[index].get('function'), dict)):
+                    actions[key] = None
+                else:
+                    row, call = rows[index], calls[index]
+                    if row.get('tool') not in {'read_file', 'read_history'}:
+                        actions[key] = None
+                    else:
+                        receipt, relation = self._history_receipt(saved, turn, index, trace)
+                        actions[key] = (row if receipt is not None
+                            and relation in {'identical', 'inspection_source_omitted'}
+                            and row['call_id'] == call.get('id')
+                            and row['tool'] == call['function'].get('name') else None)
+            return actions[key]
+
+        supplied: dict[tuple[str, str], list[tuple[int, int]]] = {}
+
+        def add(source: dict, *, text_slice: dict | None = None) -> None:
+            item = (source.get('subject'), source.get('path'), source.get('sha256'),
+                source.get('offset_bytes'), source.get('next_offset_bytes'), source.get('size_bytes'))
+            text = original.get(item)
+            if text is None:
+                return
+            start, end = item[3], item[4]
+            if text_slice is not None:
+                first, last, total = (text_slice.get('character_start'), text_slice.get('character_end'),
+                    text_slice.get('total_characters'))
+                if (any(type(value) is not int for value in (first, last, total))
+                        or total != len(text) or not 0 <= first <= last <= total):
+                    return
+                start = item[3] + len(text[:first].encode('utf-8'))
+                end = item[3] + len(text[:last].encode('utf-8'))
+            supplied.setdefault((item[1], item[2]), []).append((start, end))
+
+        identity = saved['identity']
+        input_record = self._path(identity, 'input')
+        prefix = re.escape(input_record.removesuffix('input.json'))
+        history_pages: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        history_values: dict[tuple[int, int], dict] = {}
+        history_actions: dict[str, list[tuple[int, int]]] = {}
+        history_payloads: dict[tuple[int, int], tuple[bytes, str]] = {}
+        seen_pages: set[tuple[int, int]] = set()
+        for turn, trace in enumerate(rounds):
+            for index, row in enumerate(trace.get('results', []) if trace else []):
+                if row.get('tool') == 'read_history':
+                    history_actions.setdefault(row.get('call_id'), []).append((turn, index))
+        for number, trace in enumerate(rounds):
+            if trace is None:
+                continue
+            offer = trace.get('offer') or {}
+            # The common projector owns this selection. Unlike a saved read,
+            # a selected source is part of this settled model request.
+            for state in offer.get('projection', {}).get('selected_records', []):
+                source = state.get('source', {})
+                if (state.get('status') not in {'native', 'working_view'}
+                        or state.get('version_status') != 'matching'
+                        or source.get('kind') != 'source_text'):
+                    continue
+                record = source.get('record')
+                if record != input_record:
+                    match = re.fullmatch(prefix + r'sources-(\d+)\.json#results/(\d+)', str(record))
+                    if not match:
+                        continue
+                    turn, index = map(int, match.groups())
+                    row = action(turn, index) if turn < number else None
+                    data = (row or {}).get('result', {}).get('data') or {}
+                    if ((row or {}).get('tool') != 'read_file'
+                            or any(data.get(field) != source.get(field) for field in ('subject', 'path', 'sha256'))
+                            or not any(all(window.get(field) == source.get(field) for field in
+                                ('offset_bytes', 'next_offset_bytes', 'size_bytes'))
+                                for window in data.get('text_windows', []))):
+                        continue
+                add(source, text_slice=source.get('record_text_slice')
+                    if state['status'] == 'working_view' else None)
+
+            # History pages address canonical JSON, not source-file offsets.
+            # Only a fully supplied, owner-verified read result can restore its
+            # original source windows.
+            for message in offer.get('messages', []):
+                if not isinstance(message, dict) or message.get('role') != 'tool':
+                    continue
+                try:
+                    visible = json.loads(message['content'])
+                except (ValueError, TypeError, KeyError):
+                    continue
+                if (not isinstance(visible, dict) or visible.get('tool_name') != 'read_history'
+                        or visible.get('status') != 'ok'):
+                    continue
+                matches = [(turn, index) for turn, index in history_actions.get(message.get('tool_call_id'), [])
+                    if turn < number and rounds[turn]['results'][index].get('result') == visible]
+                if len(matches) != 1 or action(*matches[0]) is None:
+                    continue
+                if matches[0] in seen_pages:
+                    continue
+                seen_pages.add(matches[0])
+                page = visible.get('data') or {}
+                turn, index = page.get('start_turn'), page.get('action')
+                if (page.get('projection') != 'retained_value' or page.get('field') != 'result'
+                        or type(turn) is not int or type(index) is not int or not 0 <= turn < number):
+                    continue
+                row = action(turn, index)
+                if not row or row.get('tool') != 'read_file' or row.get('result', {}).get('status') != 'ok':
+                    continue
+                value = row['result']
+                if (turn, index) not in history_payloads:
+                    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+                        allow_nan=False).encode('utf-8')
+                    history_payloads[turn, index] = (raw, hashlib.sha256(raw).hexdigest())
+                raw, digest = history_payloads[turn, index]
+                start, end, size = page.get('offset_bytes'), page.get('next_offset_bytes'), page.get('size_bytes')
+                if (any(type(value) is not int for value in (start, end, size))
+                        or not 0 <= start <= end <= size or size != len(raw)
+                        or page.get('record') != self._path(identity, f'sources-{turn}')
+                        or page.get('sha256') != saved['source_rounds'][turn]
+                        or page.get('pointer') != f'/results/{index}/result'
+                        or page.get('projection_sha256') != digest
+                        or not isinstance(page.get('text'), str)
+                        or page['text'].encode('utf-8') != raw[start:end]):
+                    continue
+                history_pages.setdefault((turn, index), []).append((start, end))
+                history_values[turn, index] = value
+
+        for history_key, ranges in history_pages.items():
+            value = history_values[history_key]
+            raw, _ = history_payloads[history_key]
+            if self._range_supplied(self._merged_ranges(ranges), 0, len(raw)):
+                data = value.get('data') or {}
+                for window in data.get('text_windows', []):
+                    add({**window, **{field:data.get(field) for field in ('subject', 'path', 'sha256')}})
+        result = {source:self._merged_ranges(ranges) for source, ranges in supplied.items()}
+        cached[cache_key] = result
+        return result
+    def _offered_row_scope(self, row: dict, offered: dict) -> tuple[bool, str]:
+        """Compare a recorded observation with supplied bytes, not a verdict."""
+        recorded = self._merged_ranges([(window['offset_bytes'], window['review_next_offset_bytes'])
+            for window in row.get('windows', [])])
+        supplied = offered.get((row.get('path'), row.get('sha256')), [])
+        complete = bool(row.get('readable') and recorded) and all(
+            self._range_supplied(supplied, start, end) for start, end in recorded)
+        def describe(ranges: list[tuple[int, int]]) -> str:
+            return json.dumps(ranges[:32]) + (f' (+{len(ranges)-32} further ranges in original records)'
+                if len(ranges) > 32 else '')
+        return complete, (f"{row['subject']}: recorded read byte ranges {describe(recorded)}; "
+            f"byte ranges supplied to settled inspection requests {describe(supplied)}. "
+            'Ranges describe observation, not correctness; incomplete history projections remain unknown.')
+
+    def _offered_target_complete(self, target: dict, rows: list[dict], offered: dict) -> bool:
+        windows = [window for row in rows if row.get('readable') and row.get('path') == target.get('path')
+            and row.get('sha256') == target.get('sha256') for window in row.get('windows', [])]
+        sizes = {window['size_bytes'] for window in windows}
+        return bool(target.get('readable') and len(sizes) == 1 and self._range_supplied(
+            offered.get((target.get('path'), target.get('sha256')), []), 0, next(iter(sizes))))
+
     def _check_versions(self, rows: list[dict[str, Any]], identity: str) -> None:
         for row in rows:
             if not row.get('sha256'):
@@ -1370,11 +1641,14 @@ class InspectionToolGateway:
         """A whole-work opinion, never a representative file's extended pass."""
         delivery = saved['delivery_context']
         observed = {row['subject']:row for row in [*saved['targets'], *saved['evidence']]}
-        error, decision, dependencies = '', None, {}
+        error, decision, dependencies, offered = '', None, {}, {}
+        validation_records: dict = {}
         try:
             if failure:
                 raise ValueError(failure)
             decision = self._delivery_decision(saved, receipt['response'])
+            if self._offered_coverage(saved):
+                offered = self._offered_text_ranges(saved, validation_records=validation_records)
             if saved.get('execution_protocol') == 'shared.v1':
                 bindings = self._stored_shared_bindings(saved, receipt['response'])
                 dependencies = bindings['delivery']
@@ -1382,16 +1656,25 @@ class InspectionToolGateway:
                 selected = self._selected_inspection_rows(saved, receipt['response'])
                 self._check_inspection_versions(saved, identity, selected=selected)
                 if (saved.get('execution_protocol') == 'shared.v1'
-                        and bindings != self._shared_final_bindings(saved, receipt['response'])):
+                        and bindings != self._shared_final_bindings(saved, receipt['response'],
+                            validation_records=validation_records)):
                     raise ValueError('Inspection selected producer bindings changed')
                 if self.workspace.artifact_hashes(delivery['artifacts']) != delivery['artifacts']:
                     raise ValueError('Bound delivery changed during whole-work review')
-        except (ValueError, OSError, KeyError) as exc:
+            self._verify_bound_json(validation_records)
+        except (ValueError, OSError, KeyError, TypeError) as exc:
             error, decision = str(exc), None
         findings = [{'severity':row.severity,'message':row.message,
             'subjects':{path:delivery['artifacts'][path] for path in row.artifacts}}
             for row in decision.findings] if decision else []
-        complete = decision is not None and decision.conclusion == 'complete'
+        scopes = ([self._offered_row_scope(observed[key], offered) for key in decision.evidence]
+            if decision and self._offered_coverage(saved) else [])
+        complete = (decision is not None and decision.conclusion == 'complete'
+            and all(covered for covered, _ in scopes))
+        limitations = ([*decision.limitations, *(scope for _, scope in scopes),
+            *(['Selected evidence includes read windows not proven supplied to an inspection request']
+                if any(not covered for covered, _ in scopes) else [])]
+            if decision else [error or 'Whole-work investigation incomplete'])
         return {'schema_version':'delivery_assessment.v1','artifacts':dict(delivery['artifacts']),
             'coverage':'complete' if complete else 'partial',
             'verdict':'needs_revision' if any(row['severity']=='required' for row in findings)
@@ -1400,16 +1683,19 @@ class InspectionToolGateway:
             'evidence_sha256':self._evidence_with_dependencies(
                 {observed[key]['path']:observed[key]['sha256'] for key in decision.evidence}, dependencies)
                 if decision else {},
-            'limitations':[*decision.limitations] if decision else [error or 'Whole-work investigation incomplete']}, error
+            'limitations':limitations}, error
 
     def _subject_assessments(self, saved: dict[str, Any], receipt: dict[str, Any],
                              identity: str, failure: str, *, check_versions: bool = True) -> tuple[list[dict], str]:
         observed = {row['subject']: row for row in [*saved['targets'], *saved['evidence']]}
-        error, decisions, bindings = '', {}, {}
+        error, decisions, bindings, offered = '', {}, {}, {}
+        validation_records: dict = {}
         try:
             if failure:
                 raise ValueError(failure)
             decisions = {row.subject: row for row in self._subject_decisions(saved, receipt['response'])}
+            if self._offered_coverage(saved):
+                offered = self._offered_text_ranges(saved, validation_records=validation_records)
             if saved.get('execution_protocol') == 'shared.v1':
                 bindings = self._stored_shared_bindings(saved, receipt['response'])
                 if set(bindings) != set(decisions):
@@ -1418,9 +1704,11 @@ class InspectionToolGateway:
                 selected = self._selected_inspection_rows(saved, receipt['response'])
                 self._check_inspection_versions(saved, identity, selected=selected)
                 if (saved.get('execution_protocol') == 'shared.v1'
-                        and bindings != self._shared_final_bindings(saved, receipt['response'])):
+                        and bindings != self._shared_final_bindings(saved, receipt['response'],
+                            validation_records=validation_records)):
                     raise ValueError('Inspection selected producer bindings changed')
-        except (ValueError, OSError, KeyError) as exc:
+            self._verify_bound_json(validation_records)
+        except (ValueError, OSError, KeyError, TypeError) as exc:
             error, decisions = str(exc), {}
         assessments = []
         for target in saved['targets']:
@@ -1428,16 +1716,24 @@ class InspectionToolGateway:
                 continue  # Unbound files cannot receive an assessment or a pass.
             decision = decisions.get(target['subject'])
             sources = [observed[key] for key in decision.evidence] if decision else []
-            target_complete = self._complete_target(target, list(observed.values()))
+            target_complete = (self._offered_target_complete(target, list(observed.values()), offered)
+                if self._offered_coverage(saved) else self._complete_target(target, list(observed.values())))
+            scopes = ([self._offered_row_scope(row, offered) for row in sources]
+                if self._offered_coverage(saved) and decision else [])
             limitations = [f"{row['subject']}: {row['limitation']}"
                 for row in [target, *sources] if row.get('limitation')
                     and not (self.progressive and row is target and target_complete)]
             if not sources:
                 limitations.append('No independently read source evidence; scope is target-text review only')
+            if self._offered_coverage(saved) and decision:
+                limitations.append(self._offered_row_scope(target, offered)[1])
+                limitations.extend(scope for _, scope in scopes)
+                if not target_complete or any(not covered for covered, _ in scopes):
+                    limitations.append('Requested target or selected evidence has read ranges not proven supplied to an inspection request')
             limitations.extend(decision.limitations if decision else [error])
             findings = [{'subjects': {target['path']: target['sha256']},
                 'severity': row.severity, 'message': row.message} for row in decision.findings] if decision else []
-            complete = bool(not error and target_complete
+            complete = bool(not error and target_complete and all(covered for covered, _ in scopes)
                 and (not self.adaptive or decision.conclusion == 'complete'))
             verdict = ('incomplete' if error else
                 'needs_revision' if any(row['severity'] == 'required' for row in findings) else
@@ -1791,6 +2087,10 @@ class InspectionToolGateway:
             # journal; the common selector supplies useful original windows.
             for row in base['targets']:
                 row['text_windows'] = []
+            if self._offered_coverage(saved):
+                base['read_range_scope'] = ('complete and observed_ranges describe retained file reads, '
+                    'not what this model received. Only text_windows, working_view observations and '
+                    'intact tool replies supply original text; archived notes do not.')
         pinned = {(row['path'], row['sha256']): row for role in ('targets', 'evidence')
             for row in base[role] if row.get('text_windows')}
         blocks, current, read_turns = [], [], {}
@@ -1891,25 +2191,42 @@ class InspectionToolGateway:
             raise ValueError('Unknown inspection history policy')
         return policy is not None
 
-    def _closed_source_round(self, saved: dict, number: int) -> dict | None:
-        """The same settled, complete original journal owns compaction and retrieval."""
+    def _closed_source_round(self, saved: dict, number: int, *, allow_final: bool = False,
+                             model_only: bool = False,
+                             validation_records: dict | None = None) -> dict | None:
+        """Validate the original request; consumers decide whether tools must also close."""
         path = self._path(saved['identity'], f'sources-{number}')
-        raw = self.store.resolve(path).read_bytes()
-        if hashlib.sha256(raw).hexdigest() != saved['source_rounds'][number]:
-            raise ValueError('Inspection source investigation record changed; no replay')
-        trace = json.loads(raw)
+        trace = self._bound_json(path, saved['source_rounds'][number], validation_records,
+            'Inspection source investigation record changed; no replay')
         response = trace.get('response')
         if not trace.get('completed') or not response:
             return None
         call_id = 'inspect-artifacts-'+saved['identity'] + (f'-sources-{number}' if number else '')
-        model_attempt = (trace['model_receipt']['attempt'] if saved.get('execution_protocol') == 'shared.v1'
-            else saved['identity'])
+        shared = saved.get('execution_protocol') == 'shared.v1'
+        model_receipt = trace.get('model_receipt') if shared else None
+        if shared and not isinstance(model_receipt, dict):
+            return None
+        model_attempt = model_receipt['attempt'] if shared else saved['identity']
+        if self._offered_coverage(saved) and shared:
+            original, action = self._owned_receipt(model_receipt)
+            if (original != response
+                    or action.get('origin') != {'scope':saved['identity'], 'kind':'model',
+                        'position':self._position(number, 'model')}):
+                raise ValueError('Inspection model response differs from its closed owner receipt')
         usage = [entry.to_dict() for entry in self.workspace.ledger.entries
             if entry.attempt_id == model_attempt and entry.logical_call_id == call_id]
         if not any(entry['status'] == 'settled' for entry in usage) or not self._accounted(usage):
             return None
+        if self._offered_coverage(saved) and not any(entry['status'] == 'settled'
+                and entry['actual'].get('llm_requests', 0) > 0
+                and entry['actual'].get('total_tokens', 0) > 0 for entry in usage):
+            return None
         calls, results = response.get('tool_calls') or [], trace['results']
-        if (trace.get('malformed_calls') or
+        terminal = (allow_final and not trace.get('malformed_calls') and isinstance(calls, list)
+            and len(calls) == 1 and isinstance(calls[0], dict) and not results
+            and isinstance(calls[0].get('function'), dict)
+            and calls[0]['function'].get('name') == 'record_inspection')
+        if not model_only and (trace.get('malformed_calls') or not terminal and
                 [row['call_id'] for row in results] != [call['id'] for call in calls]):
             return None  # A response with unfinished tool work is not closed.
         return trace
@@ -1932,18 +2249,7 @@ class InspectionToolGateway:
         receipt = row.get('receipt')
         if receipt is None:
             return None, 'round_only'  # Historical/local failures remain bound to their round.
-        attempt = receipt['attempt']
-        if (not isinstance(attempt, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', attempt)
-                or receipt['record'] != f'attempts/{attempt}/native_result.json'):
-            raise ValueError('Inspection history receipt is outside its operation owner')
-        for relative in (receipt['record'], f'attempts/{attempt}/action.json'):
-            path = self.root
-            for part in ('', *Path(relative).parts):
-                path = path / part
-                if path.is_symlink() or path.is_junction():
-                    raise ValueError('Inspection history cannot traverse links')
-        original = self._receipt_result(receipt)
-        action = self.store.read_json(f'attempts/{attempt}/action.json')
+        original, action = self._owned_receipt(receipt)
         call = trace['response']['tool_calls'][index]
         if (action.get('origin') != {'scope':saved['identity'], 'kind':'tool',
                     'position':self._position(number, f'tool-{index}', call['id'])}
@@ -2653,7 +2959,10 @@ class InspectionToolGateway:
                 if shared:
                     selected_rows = self._selected_inspection_rows(saved, final)
                     self._check_inspection_versions(saved, saved['identity'], selected=selected_rows)
-                    self._check_shared_dependencies(saved, current_inputs=True, selected=selected_rows)
+                    if not self._offered_coverage(saved):
+                        self._check_shared_dependencies(saved, current_inputs=True, selected=selected_rows)
+                    # New shared work performs the same dependency validation
+                    # once, per final subject, in _shared_final_bindings.
             return parsed, '', final, owner_bindings
         except (ValueError, KeyError, TypeError, OSError) as exc:
             if not shared and isinstance(exc, OSError):
@@ -3126,6 +3435,8 @@ class InspectionToolGateway:
             # observations have their own owner; an unavailable text input is
             # not a model opinion about the artifact or a required correction.
             saved = {'identity': identity, 'arguments': binding, 'targets': [], 'evidence': []}
+            if self.coverage_policy is not None:
+                saved['coverage_policy'] = self.coverage_policy
             if self.execution_protocol == 'shared.v1':
                 if self.operation_specs is None or self.operation_call is None:
                     raise ValueError('Shared inspection requires the actual operation specs and operation gateway')

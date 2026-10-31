@@ -24,6 +24,7 @@ from simple_ar.code_task.analysis.interfaces import (
 )
 from simple_ar.code_task.analysis.resource_static import resource_review_findings
 from simple_ar.code_task.analysis.source_context import read_source_context_text
+from simple_ar.code_task.analysis.index import _iter_files, read_code_task_text
 
 
 GREENFIELD_REVIEW_CONTRACT_VERSION = 14
@@ -324,7 +325,12 @@ def _semantic_scaffold_findings(
     if not _required_metrics(result_schema):
         return findings
     task_text = _task_text(contract)
-    for path, content in _project_text_files(project_dir):
+    for path in sorted(_iter_files(project_dir, include_hidden_dirs=True)):
+        if path.suffix not in {".py", ".json", ".toml", ".md", ".txt"}:
+            continue
+        content = read_code_task_text(path, utf8_errors='ignore')
+        if content is None:
+            continue
         rel = path.relative_to(project_dir).as_posix()
         if _default_metric_fill_detected(content):
             findings.append(
@@ -491,14 +497,12 @@ def _metric_name_visible(project_dir: Path, metric: str) -> bool:
     needle = metric.strip()
     if not needle:
         return True
-    for path in project_dir.rglob("*"):
-        if not path.is_file() or path.suffix not in {".py", ".json", ".toml", ".md"}:
+    for path in _iter_files(project_dir, include_hidden_dirs=True):
+        if path.suffix not in {".py", ".json", ".toml", ".md"}:
             continue
-        try:
-            if needle in path.read_text(encoding="utf-8", errors="ignore"):
-                return True
-        except OSError:
-            continue
+        content = read_code_task_text(path, utf8_errors='ignore')
+        if content is not None and needle in content:
+            return True
     return False
 
 
@@ -586,20 +590,6 @@ def _task_text(contract: Mapping[str, Any]) -> str:
         if isinstance(value, Mapping):
             parts.append(str(value))
     return "\n".join(parts).lower()
-
-
-def _project_text_files(project_dir: Path) -> list[tuple[Path, str]]:
-    rows: list[tuple[Path, str]] = []
-    for path in sorted(project_dir.rglob("*")):
-        if not path.is_file() or path.suffix not in {".py", ".json", ".toml", ".md", ".txt"}:
-            continue
-        if "__pycache__" in path.parts:
-            continue
-        try:
-            rows.append((path, path.read_text(encoding="utf-8", errors="ignore")))
-        except OSError:
-            continue
-    return rows
 
 
 _DEFAULT_METRIC_FILL_PATTERNS = (

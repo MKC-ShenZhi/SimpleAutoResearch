@@ -920,7 +920,34 @@ class WorkspaceToolGateway:
 
     def approval_token(self, call: dict[str, Any]) -> str:
         """Identify the actual command and its bound inputs for approval."""
-        return self.approval_digest(self.approval_binding(call))
+        return self.execution_approval(call)['token']
+
+    def execution_approval(self, call: dict[str, Any], *, pending: dict | None = None,
+                           owner: Any = None) -> dict[str, Any]:
+        """Read the effective binding and token together, without approving work.
+
+        The caller supplies its policy-authorized professional owner, if any.
+        No application load, dispatch, ledger settlement or record write occurs.
+        A nested action owns its own attempt and retained approval; the parent
+        inspection must never supply their identity or historical token shape.
+        """
+        if owner is None:
+            binding = self.approval_binding(call)
+            return {'binding': binding, 'token': self.approval_digest(binding)}
+        active = (pending or {}).get('action') or pending or {}
+        name = call['function']['name']
+        binding = owner.approval_binding(json.loads(call['function']['arguments']),
+            identity=active['attempt'],
+            **({'for_preparation': True} if name == 'prepare_code_task' else {}))
+        retained = active.get('execution_approval') or active.get('implementation_approval')
+        if (name == 'execute_implementation' and active.get('call') == call
+                and retained and 'binding' in retained
+                and 'process_artifacts' not in retained['binding']):
+            # Recompute current bytes, preserving only the original schema.
+            # A legacy approval is never upgraded to a stronger proof on read.
+            binding = {key: value for key, value in binding.items() if key != 'process_artifacts'}
+        return {'binding': binding,
+            'token': self.approval_digest({'call': call, 'inputs': binding})}
 
     def process_artifact_binding(self, arguments: dict[str, Any], *, identity: str | None = None) -> dict[str, Any] | None:
         """Read-only approval hook. Absent declarations preserve historical tokens.

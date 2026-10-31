@@ -9,7 +9,7 @@ import tokenize
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator, Literal
 
 from simple_ar.core.artifacts import write_json
 from simple_ar.retrieval.index import _looks_like_text, json_summary, kind_for_path
@@ -36,6 +36,12 @@ IGNORED_FILE_NAMES = {
     ".git",
 }
 
+
+def is_private_dotenv(name: str) -> bool:
+    """Keep example templates searchable while excluding possible credentials."""
+    name = name.casefold()
+    return name.startswith('.env') and not name.endswith('.example')
+
 # Shared with question-directed source lookup; retain its existing language
 # coverage rather than inventing another binary-extension denylist.
 SOURCE_SUFFIXES = {
@@ -44,14 +50,19 @@ SOURCE_SUFFIXES = {
 }
 
 
-def read_code_task_text(path: Path) -> str | None:
+def read_code_task_text(path: Path, *, utf8_errors: Literal['replace', 'ignore'] | None = None) -> str | None:
     """Read source/context text, not arbitrary inventory artifacts.
 
     Reuse retrieval's UTF-8 sample/NUL detection for unknown formats. Known
     source encodings keep the previous replacement fallback; Python's coding
     declaration is handled by the standard tokenizer before that fallback.
+    Explicit UTF-8 error handling preserves consumers that historically read
+    arbitrary text with replacement or ignored undecodable bytes, without
+    imposing the inventory's format sniff or Python encoding interpretation.
     """
     try:
+        if utf8_errors is not None:
+            return path.read_text(encoding='utf-8', errors=utf8_errors)
         if path.suffix.lower() not in SOURCE_SUFFIXES and not _looks_like_text(path):
             return None
         data = path.read_bytes()
@@ -146,22 +157,44 @@ def project_python_files(root: Path) -> list[Path]:
     return sorted(path for path in _iter_files(root) if path.suffix == ".py")
 
 
-def _iter_files(root: Path) -> Iterator[Path]:
+def _iter_files(root: Path, *, excluded_names: frozenset[str] = frozenset(),
+                include_hidden_dirs: bool = False,
+                include_dotenv_examples: bool = False,
+                excluded_dir_names: frozenset[str] = frozenset(),
+                excluded_dir_suffixes: tuple[str, ...] = (),
+                path_filter: Callable[[Path], bool] | None = None) -> Iterator[Path]:
+    """Own safe project enumeration with consumer-specific visibility policy.
+
+    Filters apply before descending so review/search cannot visit dependency
+    trees just to discard their contents later. Defaults retain the inventory
+    used by copied workspaces and their historical source bindings.
+    Directory-only exclusions never remove ordinary files of the same name.
+    Hidden project directories may be visible; private .env paths, dependency
+    environments, links and caller access filters remain excluded.
+    """
     boundary = root.resolve()
     for current, dirnames, filenames in os.walk(root):
         current_path = Path(current)
         dirnames[:] = [
             dirname
             for dirname in dirnames
-            if dirname not in IGNORED_DIR_NAMES and not dirname.startswith(".")
+            if dirname not in IGNORED_DIR_NAMES
+            and not dirname.casefold().startswith('.env')
+            and (include_hidden_dirs or not dirname.startswith('.'))
+            and dirname not in excluded_dir_names and not dirname.endswith(excluded_dir_suffixes)
+            and dirname not in excluded_names
             and _safe_index_path(current_path / dirname, boundary)
             and not is_python_environment(current_path / dirname)
+            and (path_filter is None or path_filter(current_path / dirname))
         ]
         for filename in filenames:
-            if filename in IGNORED_FILE_NAMES or filename.startswith(".env"):
+            if (filename in IGNORED_FILE_NAMES or filename in excluded_names
+                    or filename.casefold().startswith('.env')
+                    and (not include_dotenv_examples or is_private_dotenv(filename))):
                 continue
             path = current_path / filename
-            if _safe_index_path(path, boundary) and path.is_file():
+            if (_safe_index_path(path, boundary) and path.is_file()
+                    and (path_filter is None or path_filter(path))):
                 yield path
 
 

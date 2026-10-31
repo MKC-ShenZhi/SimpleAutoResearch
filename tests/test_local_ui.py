@@ -3,6 +3,7 @@
 Run on the verification server: python -m unittest discover -s tests -p test_local_ui.py
 """
 import http.client
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -298,6 +299,44 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                 self.assertIsNone(view['approval_unavailable'])
                 self.assertEqual(before, {p.relative_to(app.session.store.root): p.read_bytes()
                     for p in app.session.store.root.rglob('*') if p.is_file()})
+                modern = app.execution_approval(pending['call'])
+                for nested in (False, True):
+                    for retained_key in (None, 'execution_approval', 'implementation_approval'):
+                        with self.subTest(nested=nested, retained_key=retained_key):
+                            active = deepcopy(pending)
+                            expected = deepcopy(modern)
+                            if retained_key:
+                                expected['binding'].pop('process_artifacts')
+                                expected['token'] = app.workspace.approval_digest({
+                                    'call': active['call'], 'inputs': expected['binding']})
+                                active[retained_key] = deepcopy(expected)
+                            app.state['pending'] = ({'kind': 'tool', 'attempt': 'inspection-parent',
+                                'call': {'function': {'name': 'inspect_artifacts', 'arguments': '{}'}},
+                                'execution_approval': {'binding': {}}, 'action': active} if nested else active)
+                            app._save()
+                            app.session.pause('Process requires explicit approval; token=' + expected['token'])
+                            saved = {p.relative_to(app.session.store.root): p.read_bytes()
+                                for p in app.session.store.root.rglob('*') if p.is_file()}
+                            with patch.object(ToolApplication, 'load', side_effect=AssertionError('No app load')), \
+                                    patch.object(Path, 'mkdir', side_effect=AssertionError('No directory writes')):
+                                self.assertEqual(app.execution_approval(active['call']), expected)
+                                self.assertEqual(app.execution_binding(active['call']), expected['binding'])
+                                self.assertEqual(app.approval_token(active['call']), expected['token'])
+                                view = workspace.snapshot('prepared')
+                            self.assertEqual(view['approval']['token'], expected['token'])
+                            self.assertEqual(view['approval']['attempt'], active['attempt'])
+                            self.assertEqual(view['approval']['execution']['cwd'], result['data']['project_dir'])
+                            self.assertEqual(saved, {p.relative_to(app.session.store.root): p.read_bytes()
+                                for p in app.session.store.root.rglob('*') if p.is_file()})
+                            runner.write_text('print("replacement")\n', encoding='utf-8')
+                            self.assertIsNone(workspace.snapshot('prepared')['approval'])
+                            runner.write_text('print("original")\n', encoding='utf-8')
+                            if retained_key:
+                                other_call = {**active['call'], 'id': 'different-call'}
+                                self.assertIn('process_artifacts', app.execution_binding(other_call))
+                app.state['pending'] = pending
+                app._save()
+                app.session.pause('Process requires explicit approval; token=' + token)
                 runner.write_text('print("replacement")\n', encoding='utf-8')
                 changed = workspace.snapshot('prepared')
                 self.assertIsNone(changed['approval'])
@@ -313,6 +352,45 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                         patch.object(Path, 'mkdir', side_effect=AssertionError('GET must not repair directories')):
                     self.assertIsNone(workspace.snapshot('prepared')['approval'])
                 self.assertFalse((app.session.store.root / 'evidence').exists())
+
+    def test_process_snapshot_rechecks_nested_command_cwd_and_interpreter_without_dispatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            root.joinpath('project').mkdir()
+            workspace = Workspace(root / 'project', [], root / 'tasks')
+            app = load_native_history(workspace.task('process'), 'Inspect a pending command',
+                config={'model': None, 'sources': {}, 'allow_execution': True})
+            (app.workspace.workspace / 'other').mkdir()
+            with patch('simple_ar.tools.workspace.run_process', side_effect=AssertionError('No process execution')):
+                app.run(actions=[call('run_process', {'argv': ['python', '-c', 'print("original")'],
+                    'timeout_sec': 5})], progress=lambda _: None)
+                active = app.state['pending']
+                expected = app.execution_approval(active['call'])
+                app.ledger.reserve('snapshot-unknown', {'custom_dimension': 1})
+                app.ledger.mark_unknown('snapshot-unknown', reason='No receipt; viewing must not settle it')
+                app.state['pending'] = {'kind': 'tool', 'attempt': 'inspection-parent', 'action': active}
+                app._save()
+                before = {p.relative_to(app.session.store.root): p.read_bytes()
+                    for p in app.session.store.root.rglob('*') if p.is_file()}
+                with patch.object(ToolApplication, 'load', side_effect=AssertionError('No app load')), \
+                        patch.object(Path, 'mkdir', side_effect=AssertionError('No directory writes')):
+                    self.assertEqual(workspace.snapshot('process')['approval']['token'], expected['token'])
+                self.assertEqual(before, {p.relative_to(app.session.store.root): p.read_bytes()
+                    for p in app.session.store.root.rglob('*') if p.is_file()})
+                for changes in ({'cwd': 'workspace/other'}, {'argv': ['python', '-c', 'print("changed")']}):
+                    with self.subTest(changes=changes):
+                        original = active['call']['function']['arguments']
+                        active['call']['function']['arguments'] = json.dumps({**json.loads(original), **changes})
+                        app._save()
+                        self.assertNotEqual(app.approval_token(active['call']), expected['token'])
+                        self.assertIsNone(workspace.snapshot('process')['approval'])
+                        active['call']['function']['arguments'] = original
+                app._save()
+                interpreter = root / 'other-python'
+                interpreter.write_text('never executed', encoding='utf-8')
+                app.state['config']['project_python'] = str(interpreter)
+                app._save()
+                self.assertIsNone(workspace.snapshot('process')['approval'])
 
     def test_http_owner_feedback_approval_records_and_guards(self):
         with tempfile.TemporaryDirectory() as temporary:

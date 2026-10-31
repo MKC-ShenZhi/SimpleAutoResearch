@@ -8,7 +8,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Callable
 
-from simple_ar.code_task.analysis.index import _iter_files, _sha256, is_python_environment
+from simple_ar.code_task.analysis.index import _iter_files, _sha256, is_private_dotenv, is_python_environment
 
 
 DEFAULT_IGNORED_DIR_NAMES = {
@@ -470,7 +470,7 @@ def _skip_file_reason(path: Path, *, max_file_bytes: int) -> str | None:
         return "symlink_file"
     if name in DEFAULT_IGNORED_FILE_NAMES:
         return "ignored_file"
-    if name.startswith(".env") and not name.endswith(".example"):
+    if is_private_dotenv(name):
         return "possible_secret"
     if path.suffix.lower() in DEFAULT_IGNORED_SUFFIXES:
         return "ignored_suffix"

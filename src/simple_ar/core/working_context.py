@@ -281,7 +281,9 @@ def select_working_context(
 
     for row in rows:
         text = row.get('text')
-        valid = isinstance(text, str) and bool(text) and bool(row.get('record'))
+        empty_source = (row.get('kind') == 'source_text' and row.get('size_bytes') == 0
+                        and row.get('offset_bytes') == 0 and row.get('next_offset_bytes') == 0)
+        valid = isinstance(text, str) and bool(row.get('record')) and (bool(text) or empty_source)
         path = row.get('absolute_path') or row.get('path')
         digest = row.get('sha256')
         version = ('historical' if row.get('kind') == 'operation_result' else
@@ -374,7 +376,7 @@ def select_working_context(
             if state['status'] in {'invalid','summarized'}:
                 continue
             text = observation_text(row)
-            if row.get('turn') in recent and text in native_texts:
+            if row.get('turn') in recent and text and text in native_texts:
                 state['status'] = 'native'
             elif state['version_status'] == 'stale':
                 state['status'] = 'stale'

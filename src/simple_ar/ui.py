@@ -390,7 +390,7 @@ class Workspace:
         if token and pending and pending.get('kind') == 'tool':
             # An independent inspection may pause on its own nested action.
             # The saved parent is the inspection, not the command to approve.
-            active = pending.get('action', pending)
+            active = pending.get('action') or pending
             call = active.get('call') if isinstance(active, dict) else None
             function = call.get('function') if isinstance(call, dict) else None
             if (not isinstance(active, dict) or active.get('kind') != 'tool'
@@ -420,17 +420,12 @@ class Workspace:
                         'records': bounded(root / 'attempts', root)}, ledger,
                         project_python=Path(config['project_python']) if config.get('project_python') else None,
                         create_workspace=False)
-                    if function['name'] == 'execute_implementation':
-                        owner = ImplementationToolGateway(root, byte_owner, ledger,
-                            config['model'], manifest['session_id'])
-                        binding = owner.approval_binding(json.loads(call['function']['arguments']),
-                            identity=active['attempt'])
-                        identity = hashlib.sha256(json.dumps({'call': call,
-                            'inputs': binding}, sort_keys=True).encode()).hexdigest()
-                    else:
-                        binding = byte_owner.approval_binding(call)
-                        identity = byte_owner.approval_digest(binding)
-                    if identity != token[1]:
+                    owner = (ImplementationToolGateway(root, byte_owner, ledger,
+                        config['model'], manifest['session_id'])
+                        if function['name'] == 'execute_implementation' else None)
+                    projection = byte_owner.execution_approval(call, pending=pending, owner=owner)
+                    binding = projection['binding']
+                    if projection['token'] != token[1]:
                         raise ValueError('Execution changed since approval was requested')
                     if (self.record(root, 'actions.json') != state
                             or self.record(root, 'session_manifest.json') != manifest):

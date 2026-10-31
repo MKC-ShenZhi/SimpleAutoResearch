@@ -443,6 +443,12 @@ class ToolApplication:
             raise ValueError('Journal continuity requires the saved shared native work context')
         if config.get('delivery_review_protocol') not in {None, 'task.v1', 'task.v2', 'task.v3'}:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
+        if config.get('inspection_coverage_policy') not in {None, 'offered.v1'}:
+            raise ValueError('Unsupported saved inspection coverage policy; no silent migration')
+        if (config.get('inspection_coverage_policy') == 'offered.v1'
+                and (config.get('inspection_protocol') != 'subjects.v3'
+                     or config.get('inspection_execution_protocol') != 'shared.v1')):
+            raise ValueError('Offered inspection coverage requires the shared subject inspection contract')
         if config.get('professional_operations') is not None and config['professional_operations'] not in PROFESSIONAL_CONTRACTS:
             raise ValueError('Unsupported saved professional operation contract; no silent migration')
         for alias, snapshot in config.get('source_snapshots', {}).items():
@@ -1732,6 +1738,7 @@ class ToolApplication:
         config, reused, limits, attempts = cls._configuration(root, goal, **options)
         config['inspection_protocol'] = 'subjects.v3'
         config['inspection_execution_protocol'] = 'shared.v1'
+        config['inspection_coverage_policy'] = 'offered.v1'
         if config['model'] is not None:
             config['delivery_review_protocol'] = 'task.v3'
         from simple_ar.app.operation_tools import CURRENT_PROFESSIONAL_CONTRACT
@@ -1950,6 +1957,7 @@ class ToolApplication:
             # their original closing obligation. Absent historical fields stay
             # absent unless explicitly supplied, including unrelated supplies.
             for field in ('completion_policy', 'tool_contracts', 'report_protocol', 'tool_completions', 'inspection_protocol',
+                          'inspection_coverage_policy',
                           'delivery_review_protocol', 'publication_assets', 'professional_operations', 'memory_protocol',
                           'context_checkpoint_policy',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
@@ -4787,26 +4795,16 @@ class ToolApplication:
 
     def execution_binding(self, call: dict[str, Any]) -> dict[str, Any]:
         """Describe the actual inputs bound to a pending execution approval."""
-        name = call['function']['name']
-        owner = self.gateway.session_owner(name)
-        binding = owner.approval_binding(json.loads(call['function']['arguments']),
-            identity=self._active_action()['attempt'],
-            **({'for_preparation': True} if name == 'prepare_code_task' else {}))
-        pending = self._active_action()
-        retained = pending.get('execution_approval') or pending.get('implementation_approval')
-        if (name == 'execute_implementation' and pending.get('call') == call
-                and retained and 'binding' in retained
-                and 'process_artifacts' not in retained['binding']):
-            # Recompute all previously approved inputs without changing the
-            # historical token's shape. The original token must still match.
-            binding.pop('process_artifacts', None)
-        return binding
+        return self.execution_approval(call)['binding']
+
+    def execution_approval(self, call: dict[str, Any]) -> dict[str, Any]:
+        """Project approval through the execution owner, without granting it."""
+        return self.workspace.execution_approval(call, pending=self.state.get('pending'),
+            owner=self.gateway.session_owner(call['function']['name']))
 
     def approval_token(self, call: dict[str, Any]) -> str:
         if self.gateway.session_owner(call['function']['name']) is not None:
-            return hashlib.sha256(json.dumps({'call': call,
-                'inputs': self.execution_binding(call)},
-                sort_keys=True).encode()).hexdigest()
+            return self.execution_approval(call)['token']
         if call["function"]["name"] == "export_report":
             request = ExportRequest.model_validate(json.loads(call["function"]["arguments"]))
             source = self.workspace.resolve(request.markdown, write=True)
@@ -5427,13 +5425,11 @@ class ToolApplication:
                 return False
             check_llm_call_stop()
             if token is not None and not started:
-                if token != self.approval_token(call):
+                approval = (self.execution_approval(call)
+                    if self.gateway.session_owner(name) is not None or name == 'run_process'
+                    else {'token': self.approval_token(call)})
+                if token != approval['token']:
                     raise ValueError('Execution inputs changed during approval; approve the current identity')
-                approval = {'token': token}
-                if self.gateway.session_owner(name) is not None:
-                    approval['binding'] = self.execution_binding(call)
-                elif name == 'run_process':
-                    approval['binding'] = self.workspace.approval_binding(call)
                 pending['execution_approval'] = approval
                 self._save()
         return True

@@ -9,33 +9,13 @@ should receive only the relevant cluster context.
 from __future__ import annotations
 
 import ast
-import os
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
 from simple_ar.code_task.analysis.interfaces import public_api_from_source, render_source_snippets, _module_name, _resolve_import_module
-from simple_ar.code_task.analysis.index import IGNORED_FILE_NAMES, is_python_environment, read_code_task_text
+from simple_ar.code_task.analysis.index import _iter_files, read_code_task_text
 from simple_ar.code_task.analysis.source_context import diff_source_anchors, source_context_for_files
 from simple_ar.reviewing.schema import ReviewFinding
-
-
-SKIP_PARTS = {
-    ".git",
-    ".hg",
-    ".svn",
-    ".venv",
-    "venv",
-    "env",
-    "__pycache__",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".tox",
-    "node_modules",
-    "dist",
-    "build",
-    ".ipynb_checkpoints",
-}
 
 
 def build_review_index(
@@ -51,9 +31,10 @@ def build_review_index(
     files: list[dict[str, Any]] = []
     notebooks: list[dict[str, Any]] = []
     required_metrics = _required_metrics(result_schema or {})
-    for path in sorted(_project_files(project_dir, excluded_names=excluded_names, path_filter=path_filter)):
-        if not path.is_file() or path.is_symlink():
-            continue
+    for path in sorted(_iter_files(project_dir,
+            excluded_names=excluded_names, include_hidden_dirs=True,
+            excluded_dir_names=frozenset({'env', 'dist', 'build', '.ipynb_checkpoints'}),
+            excluded_dir_suffixes=('.egg-info', '.dist-info'), path_filter=path_filter)):
         rel = _safe_rel(project_dir, path)
         if not rel:
             continue
@@ -63,7 +44,7 @@ def build_review_index(
             notebooks.append({"path": rel, "size_bytes": path.stat().st_size,
                               "inspection": "path_only_cells_and_outputs_unread"})
             continue
-        if path.name in IGNORED_FILE_NAMES or path.name.startswith(".env") or path.name.endswith(".lock") or path.stat().st_size > 1_000_000:
+        if path.name.endswith(".lock") or path.stat().st_size > 1_000_000:
             continue
         text = read_code_task_text(path)
         if text is None:
@@ -96,22 +77,6 @@ def build_review_index(
         "task_markers": _task_markers(contract or {}),
         "files": files,
     }
-
-
-def _project_files(project_dir: Path, *, excluded_names: frozenset[str] = frozenset(),
-                   path_filter: Callable[[Path], bool] | None = None):
-    """Prune dependency/cache trees before traversal, not after visiting them."""
-    for directory, children, names in os.walk(project_dir, followlinks=False):
-        parent = Path(directory)
-        children[:] = [name for name in children
-                       if name not in SKIP_PARTS and name not in excluded_names and not name.startswith(".env")
-                       and not name.endswith((".egg-info", ".dist-info"))
-                       and not is_python_environment(parent / name)
-                       and not (parent / name).is_symlink()
-                       and (path_filter is None or path_filter(parent / name))]
-        for name in names:
-            if name not in excluded_names and (path_filter is None or path_filter(parent / name)):
-                yield parent / name
 
 
 def build_review_clusters(

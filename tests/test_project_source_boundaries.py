@@ -2,6 +2,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from simple_ar.code_task.analysis.entrypoints import analyze_entrypoint_debuggability
 from simple_ar.code_task.analysis.interfaces import (
@@ -10,11 +11,121 @@ from simple_ar.code_task.analysis.interfaces import (
 from simple_ar.code_task.analysis.resource_static import analyze_resource_risks
 from simple_ar.code_task.execution.failure import _source_signal_files as failure_sources
 from simple_ar.code_task.execution.failure_graph import _source_signal_files as graph_sources
-from simple_ar.code_task.analysis.index import project_python_files
+from simple_ar.code_task.analysis.index import build_codebase_index, project_python_files
 from simple_ar.code_task.generation.generated_project_repair import _compile_project
+from simple_ar.code_task.generation.review import review_generated_project
+from simple_ar.code_task.review_pipeline import build_review_index
+from simple_ar.code_task.tools.gateway import LocalCodeTaskToolGateway
 
 
 class ProjectSourceBoundaryTests(unittest.TestCase):
+    def test_search_and_generated_checks_retain_tolerant_utf8_decoding(self):
+        for encoding, prose in (('gbk', '中文'), ('latin-1', 'café')):
+            for suffix in ('.md', '.json', '.toml'):
+                with self.subTest(encoding=encoding, suffix=suffix), tempfile.TemporaryDirectory() as folder:
+                    run = Path(folder)
+                    root = run / 'code_task/workspace'
+                    root.mkdir(parents=True)
+                    (root / 'main.py').write_text('print("measured")\n')
+                    documents = root / '.project'
+                    documents.mkdir()
+                    payload = (prose + ' score\nmetrics["score"] = 0.0\n').encode(encoding)
+                    (documents / ('results' + suffix)).write_bytes(payload)
+                    result = LocalCodeTaskToolGateway(run).call('search_code_task_code', {'query': 'score'})
+                    self.assertEqual(result.status, 'ok')
+                    self.assertEqual([row['preview'] for row in result.data['matches']],
+                        payload.decode('utf-8', errors='replace').splitlines())
+                    report = review_generated_project(project_dir=root, code_artifacts={}, resource_plan={},
+                        result_schema={'required_metrics': ['score']}, use_llm=False)
+                    categories = {row['category'] for row in report['findings']}
+                    self.assertNotIn('metric_not_visible', categories)
+                    self.assertIn('required_metric_default_fill', categories)
+                    # Ignoring invalid bytes can join an identifier; replacing
+                    # them cannot. Preserve each consumer's original choice.
+                    (documents / ('results' + suffix)).write_bytes(b'sc\xffore\n')
+                    report = review_generated_project(project_dir=root, code_artifacts={}, resource_plan={},
+                        result_schema={'required_metrics': ['score']}, use_llm=False)
+                    self.assertFalse(any(row['category'] == 'metric_not_visible' for row in report['findings']))
+                    result = LocalCodeTaskToolGateway(run).call('search_code_task_code', {'query': 'score'})
+                    self.assertEqual(result.data['matches'], [])
+
+    def test_review_visibility_distinguishes_directory_rules_from_file_names(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / 'code_task/workspace'
+            root.mkdir(parents=True)
+            visible = {'.config/settings.toml', '.project/nested/module.py',
+                'files/env', 'files/dist', 'files/build', 'files/package.dist-info', 'files/package.egg-info'}
+            blocked = {'env', 'dist', 'build', 'package.dist-info', 'package.egg-info',
+                '.venv', '.ipynb_checkpoints', '.env.private', 'private', 'denied'}
+            for relative in visible | {name + '/hidden.py' for name in blocked}:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('VALUE = 1\n')
+            import simple_ar.code_task.review_pipeline as pipeline
+            with patch.object(pipeline, 'read_code_task_text', wraps=pipeline.read_code_task_text) as read:
+                index = build_review_index(root, excluded_names=frozenset({'private'}),
+                    path_filter=lambda path: path.name != 'denied')
+            self.assertEqual({row['path'] for row in index['files']}, visible)
+            self.assertEqual({call.args[0].relative_to(root).as_posix() for call in read.call_args_list}, visible)
+            # The frozen copy/index defaults must not inherit review visibility.
+            self.assertFalse(any(row['path'].startswith(('.config/', '.project/'))
+                for row in build_codebase_index(root)['files']))
+            result = LocalCodeTaskToolGateway(Path(folder)).call('search_code_task_code', {'query': 'VALUE'})
+            matches = {row['path'] for row in result.data['matches']}
+            self.assertTrue({'.config/settings.toml', '.project/nested/module.py'}.issubset(matches))
+            self.assertFalse(any(path.startswith(('.env', '.venv/')) for path in matches))
+            (root / '.env.service.example').write_text('EXAMPLE_PORT=1234\n')
+            template = LocalCodeTaskToolGateway(Path(folder)).call('search_code_task_code',
+                {'query': 'EXAMPLE_PORT', 'extensions': ['.example']})
+            self.assertEqual([row['path'] for row in template.data['matches']], ['.env.service.example'])
+
+    def test_hidden_directory_visibility_never_authorizes_linked_targets(self):
+        with tempfile.TemporaryDirectory() as folder:
+            run = Path(folder)
+            root = run / 'code_task/workspace'
+            hidden = root / '.config'
+            hidden.mkdir(parents=True)
+            outside = run / 'outside'
+            outside.mkdir()
+            (outside / 'secret.py').write_text('SECRET_VALUE = 1\n')
+            try:
+                (hidden / 'linked.py').symlink_to(outside / 'secret.py')
+                (root / '.linked').symlink_to(outside, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest('symlinks unavailable')
+            self.assertEqual(build_review_index(root)['files'], [])
+            result = LocalCodeTaskToolGateway(run).call('search_code_task_code', {'query': 'SECRET_VALUE'})
+            self.assertEqual(result.status, 'ok')
+            self.assertEqual(result.data['matches'], [])
+
+    def test_review_and_reopened_search_use_project_sources_not_installed_metrics(self):
+        with tempfile.TemporaryDirectory() as folder:
+            run = Path(folder)
+            root = run / 'code_task/workspace'
+            root.mkdir(parents=True)
+            (root / 'main.py').write_text('print("measured")\n')
+            source = root / 'environment'
+            source.mkdir()
+            (source / 'metrics.py').write_text('metrics["score"] = 0.0\n')
+            dependency = root / 'previous-attempt/runtime'
+            dependency.mkdir(parents=True)
+            (dependency / 'pyvenv.cfg').write_text('home = /usr/bin\n')
+            (dependency / 'metrics.py').write_text('metrics["dependency_score"] = 0.0\n')
+            (root / '.env.private').write_text('dependency_score=secret\n')
+            result = LocalCodeTaskToolGateway(run).call('search_code_task_code', {'query': 'metrics'})
+            self.assertEqual(result.status, 'ok')
+            self.assertEqual([row['path'] for row in result.data['matches']], ['environment/metrics.py'])
+            hidden = LocalCodeTaskToolGateway(run).call('search_code_task_code', {'query': 'dependency_score'})
+            self.assertEqual(hidden.data['matches'], [])
+            index = build_review_index(root)
+            self.assertEqual({row['path'] for row in index['files']}, {'main.py', 'environment/metrics.py'})
+            report = review_generated_project(project_dir=root, code_artifacts={},
+                result_schema={'required_metrics': ['dependency_score']}, resource_plan={}, use_llm=False)
+            fills = [row for row in report['findings'] if row['category'] == 'required_metric_default_fill']
+            self.assertEqual(len(fills), 1)
+            self.assertIn('environment/metrics.py', fills[0]['summary'])
+            self.assertTrue(any(row['category'] == 'metric_not_visible' for row in report['findings']))
+
     def project(self, root):
         def write(relative, text):
             target = root / relative

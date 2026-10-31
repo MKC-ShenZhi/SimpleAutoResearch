@@ -1216,7 +1216,21 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(accepted['execution_approval']['token'], token)
         self.assertEqual(accepted['execution_approval']['binding']['call'], accepted['call'])
         self._reload()
+        recovered_handler = self.app.session.registry.resolve('native_action')
+        second_interruption = []
+        def lose_recovery_observation(*, context, accepted, perform):
+            if accepted.get('recovered_from') == interrupted[0] and not second_interruption:
+                context.store.write_json('action.json', accepted, kind='operation_binding')
+                self.assertEqual(perform(context.attempt.attempt_id)['status'], 'ok')
+                second_interruption.append(context.attempt.attempt_id)
+                raise OSError('Recovered observation was interrupted before saving')
+            return recovered_handler(context=context, accepted=accepted, perform=perform)
+        self.app.session.registry.register('native_action', lose_recovery_observation, replace=True)
         with patch('simple_ar.tools.workspace.run_process', side_effect=AssertionError('Known process must not rerun')):
+            self._run(approved_execution=token)
+            self.assertEqual(self.app.session.manifest.status, 'paused')
+            self.assertEqual(second_interruption, [interrupted[0]+'-receipt'])
+            self._reload()
             self._run(approved_execution=token)
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         self.assertEqual(self.app.session.store.read_json(
@@ -1264,7 +1278,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             trace = owner.store.read_json(owner._path(pending['inspection'], f'sources-{number}'))
             journal.append(trace)
             self.assertNotIn('pending', trace)
-            for row in trace['results']:
+            for index, row in enumerate(trace['results']):
                 self.assertNotIn('step_identity', row)
                 self.assertNotIn('pending', row)
                 if receipt := row.get('receipt'):
@@ -1274,6 +1288,23 @@ class OperationsWorkLoopTests(unittest.TestCase):
                         owner._receipt_result(receipt))
                     if row['tool']=='run_process':
                         self.assertEqual(receipt['attempt'], interrupted[0])
+                        # The closed observation may be a recovery receipt,
+                        # but retrieving it must not rerun the process.
+                        history = owner._read_history(saved, {'start_turn':number, 'action':index,
+                            'max_bytes':64000}, before_turn=len(saved['source_rounds']))
+                        self.assertEqual(history.data['receipt_projection'], 'identical')
+                        self.assertEqual(json.loads(history.data['text']), row['result'])
+                        recovered_action = self.root/f"attempts/{interrupted[0]}-receipt-receipt/action.json"
+                        raw = recovered_action.read_bytes()
+                        try:
+                            changed = json.loads(raw)
+                            changed['recovered_from'] = 'another-action'
+                            recovered_action.write_text(json.dumps(changed), encoding='utf-8')
+                            with self.assertRaisesRegex(ValueError, 'differs from its original action'):
+                                owner._read_history(saved, {'start_turn':number, 'action':index},
+                                    before_turn=len(saved['source_rounds']))
+                        finally:
+                            recovered_action.write_bytes(raw)
                     for key in ('call', 'pending', 'step_identity', 'execution_binding', 'execution_approval'):
                         self.assertNotIn(key, receipt)
         for document in journal:

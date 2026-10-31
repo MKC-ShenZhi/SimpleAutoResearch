@@ -2786,12 +2786,10 @@ def _run_native_start(args: argparse.Namespace) -> None:
         def approve(call: dict[str, Any], token: str) -> bool:
             print_line(f"Execution proposal ({call['function']['name']}): {call['function']['arguments']}")
             if call['function']['name'] == 'execute_implementation':
-                import hashlib
                 import json
-                binding = app.execution_binding(call)
-                identity = hashlib.sha256(json.dumps({'call': call, 'inputs': binding},
-                    sort_keys=True).encode()).hexdigest()
-                if identity != token:
+                projection = app.execution_approval(call)
+                binding = projection['binding']
+                if projection['token'] != token:
                     raise ValueError('Prepared execution changed since approval was requested; inspect the current proposal')
                 print_line('Prepared command: ' + json.dumps({'argv': binding['argv'],
                     'cwd': binding['cwd'], 'timeout_sec': binding['plan']['timeout_sec']},

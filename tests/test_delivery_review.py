@@ -554,5 +554,233 @@ class DeliveryReviewTests(unittest.TestCase):
         self.assertEqual(len(self.inspector.calls), 1)
 
 
+class InspectionOfferCoverageTests(unittest.TestCase):
+    """Exercise the ordinary shared inspector with its existing offline provider."""
+
+    def setUp(self):
+        from dataclasses import replace
+        from simple_ar.integrations.llm import LLMClient
+        from tests.test_professional_work_loop import OperationsWorkLoopTests
+
+        self.case = OperationsWorkLoopTests('runTest')
+        self.case.setUp()
+        self.addCleanup(self.case.doCleanups)
+        self.case.services.llm_client = LLMClient(replace(
+            self.case.services.llm_client._settings, context_input_tokens=9000))
+        self.case._create(goal='Inspect the report and describe its scope.')
+
+    def _long_report(self):
+        head = ('本报告记录观察条件及样本结果并说明解释范围' * 20)[:170] + '\n\n'
+        text = head + 'record,value,description\n' + ''.join(
+            f'{number},2,observed sample\n' for number in range(1000))
+        (self.case.root / 'workspace' / 'report.md').write_text(text, encoding='utf-8')
+        self.case.review = lambda view: {'decisions': [{'subject':'target-1',
+            'conclusion':'complete', 'findings':[], 'evidence':[], 'limitations':[]}]}
+        return text
+
+    def test_complete_read_with_unsupplied_tail_is_partial_and_recovers(self):
+        from tests.test_professional_work_loop import _assessments
+
+        text = self._long_report()
+        result = self.case._inspect(['report.md'], [])
+        self.assertEqual(result['status'], 'ok', result)
+        identity = Path(result['data']['record']).parts[1]
+        store = self.case.app.session.store
+        saved = store.read_json(f'tools/inspection/{identity}/input.json')
+        trace = store.read_json(f'tools/inspection/{identity}/sources-0.json')
+        view = json.loads(trace['offer']['messages'][1]['content'])
+        bodies = [entry['observation'] for entry in view['working_view']['observations']
+            if entry['observation'].get('path') == saved['targets'][0]['path']]
+        self.assertTrue(saved['targets'][0]['complete'])
+        self.assertTrue(bodies)
+        self.assertLess(max(row['next_offset_bytes'] for row in bodies), len(text.encode('utf-8')))
+        assessment = _assessments(result)[0]
+        self.assertEqual((assessment['coverage'], assessment['verdict']), ('partial', 'incomplete'))
+        self.assertIn('not proven supplied', ' '.join(assessment['limitations']))
+        self.assertEqual(self.case.app.state['config']['inspection_coverage_policy'], 'offered.v1')
+        calls, ledger = self.case.send.call_count, self.case.app.ledger.to_dict()
+        self.case._reload()
+        cached = self.case.app.operations.inspection.call('inspect_artifacts', saved['arguments'], identity)
+        self.assertEqual(cached.model_dump(mode='json'), result)
+        self.assertEqual((self.case.send.call_count, self.case.app.ledger.to_dict()), (calls, ledger))
+
+    def test_old_task_without_started_inspection_keeps_its_original_contract(self):
+        from tests.test_professional_work_loop import _assessments
+
+        # A task saved before this policy has no marker even if it starts its
+        # first inspection after the software is updated.
+        self.case.app.state['config'].pop('inspection_coverage_policy')
+        self.case.app._save()
+        self.case._reload()
+        self.assertIsNone(self.case.app.operations.inspection.coverage_policy)
+        self._long_report()
+        result = self.case._inspect(['report.md'], [])
+        self.assertEqual(result['status'], 'ok', result)
+        self.assertEqual((_assessments(result)[0]['coverage'], _assessments(result)[0]['verdict']),
+            ('complete', 'passed'))
+        identity = Path(result['data']['record']).parts[1]
+        saved = self.case.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+        self.case._reload()
+        cached = self.case.app.operations.inspection.call('inspect_artifacts', saved['arguments'], identity)
+        self.assertEqual(cached.model_dump(mode='json'), result)
+
+    def test_delivery_requires_supply_of_selected_evidence_not_every_artifact(self):
+        from tests.test_professional_work_loop import _action
+
+        paths = []
+        for number in range(8):
+            path = f'record-{number:02}.txt'
+            (self.case.root / 'workspace' / path).write_text(
+                f'Original record {number}\n' + 'Recorded observation and scope.\n' * 180, encoding='utf-8')
+            paths.append(path)
+        chosen = []
+        def review(view):
+            self.assertIn('claim', view['proposed_delivery'])
+            candidates = [row for row in view['evidence'] if row.get('observed_ranges')
+                and bool(row['text_windows']) == bool(chosen)]
+            if chosen and not candidates:
+                # The complete evidence set can exceed the initial context.
+                # Ask for a real source instead of assuming one was supplied.
+                self.assertLessEqual(len(self.case.inspection_requests), 2)
+                return [_action('read_file', path=paths[0], offset_bytes=0, max_bytes=8192)]
+            self.assertTrue(candidates, 'Fixture needs both supplied and capacity-omitted source windows')
+            chosen.append(candidates[0]['subject'])
+            return {'conclusion':'complete', 'findings':[], 'evidence':[chosen[-1]], 'limitations':[]}
+        self.case.review = review
+        delivery = _action('deliver_result', summary='The requested records.', artifacts=paths)
+        self.case._submit(delivery)
+        first = self.case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']
+        assessment = first['metadata']['delivery_assessment']
+        self.assertEqual((assessment['coverage'], assessment['verdict']), ('partial', 'incomplete'))
+        self.assertIn('not proven supplied', ' '.join(assessment['limitations']))
+        self.case._submit(delivery)
+        second = self.case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']
+        assessment = second['metadata']['delivery_assessment']
+        self.assertEqual((assessment['coverage'], assessment['verdict']), ('complete', 'passed'))
+        self.assertGreater(len(second['data']['evidence']), 1)
+
+    def test_supplied_native_read_completes_target_and_direct_answer_remains_valid(self):
+        from tests.test_professional_work_loop import _action, _assessments
+
+        text = 'A bounded observation for ordinary text review.\n' * 30
+        (self.case.root / 'workspace' / 'note.md').write_text(text, encoding='utf-8')
+        def review(view):
+            if 'proposed_delivery' in view:
+                return {'conclusion':'complete', 'findings':[], 'evidence':[], 'limitations':[]}
+            if len(self.case.inspection_requests) == 1:
+                return [_action('read_file', path='note.md', offset_bytes=512, max_bytes=4096)]
+            return {'decisions':[{'subject':'target-1', 'conclusion':'complete',
+                'findings':[], 'evidence':[], 'limitations':[]}]}
+        self.case.review = review
+        result = self.case._inspect([{'path':'note.md', 'max_bytes':512}], [])
+        self.assertEqual((_assessments(result)[0]['coverage'], _assessments(result)[0]['verdict']),
+            ('complete', 'passed'))
+        self.case._submit(_action('deliver_result', summary='The requested brief answer.', artifacts=[]))
+        answer = self.case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']
+        self.assertEqual(answer['metadata']['delivery_assessment']['verdict'], 'passed')
+
+    def test_empty_source_and_frozen_coverage_contract(self):
+        from tests.test_professional_work_loop import _assessments
+
+        (self.case.root / 'workspace' / 'empty.txt').write_text('', encoding='utf-8')
+        self.case.review = lambda view: {'decisions':[{'subject':'target-1', 'conclusion':'complete',
+            'findings':[], 'evidence':[], 'limitations':[]}]}
+        result = self.case._inspect(['empty.txt'], [])
+        self.assertEqual((_assessments(result)[0]['coverage'], _assessments(result)[0]['verdict']),
+            ('complete', 'passed'))
+        owner = self.case.app.operations.inspection
+        identity = Path(result['data']['record']).parts[1]
+        saved = owner.store.read_json(owner._path(identity, 'input'))
+        self.assertEqual(saved['coverage_policy'], 'offered.v1')
+        owner.coverage_policy = None  # Changing future defaults must not reinterpret this inspection.
+        self.assertEqual(owner.call('inspect_artifacts', saved['arguments'], identity).model_dump(mode='json'), result)
+
+    def test_bad_reply_does_not_erase_a_settled_request_supply(self):
+        (self.case.root / 'workspace' / 'note.md').write_text('Source text for independent inspection.\n')
+        self.case.review = lambda view: {'decisions':[{'subject':'target-1', 'conclusion':'complete',
+            'findings':[], 'evidence':[], 'limitations':[]}]}
+        provider, changed = self.case.send.side_effect, []
+        def one_bad_reply(mode, request, **kwargs):
+            response = provider(mode, request, **kwargs)
+            if not changed and any(tool['function']['name'] == 'record_inspection'
+                    for tool in request.get('tools', [])):
+                calls = response['choices'][0]['message']['tool_calls']
+                calls.append(deepcopy(calls[0]))  # Duplicate identities reject the reply, not the request.
+                changed.append(True)
+            return response
+        self.case.send.side_effect = one_bad_reply
+        result = self.case._inspect(['note.md'], [])
+        self.assertEqual(result['status'], 'ok', result)
+        owner = self.case.app.operations.inspection
+        identity = Path(result['data']['record']).parts[1]
+        saved = owner.store.read_json(owner._path(identity, 'input'))
+        first = owner.store.read_json(owner._path(identity, 'sources-0'))
+        self.assertIn('malformed_calls', first)
+        read_round = owner._closed_source_round
+        with patch.object(owner, '_closed_source_round', side_effect=lambda s, n, **kw:
+                read_round(s, n, **kw) if n == 0 else None):
+            supplied = owner._offered_text_ranges(saved)
+        target = saved['targets'][0]
+        self.assertTrue(owner._range_supplied(supplied[(target['path'], target['sha256'])],
+            0, target['windows'][0]['size_bytes']))
+
+    def test_source_coverage_survives_split_input_and_unrelated_large_attachment(self):
+        from tests.test_professional_work_loop import _assessments
+
+        root = self.case.root / 'workspace'
+        parts = ['实验记录：温度与测量范围。\n' * 45, 'Independent observations and limits.\n' * 45]
+        for name, text in [('joined.md', ''.join(parts)), ('part-a.md', parts[0]), ('part-b.md', parts[1]),
+                           ('background.md', 'Unrelated background.\n' * 4000)]:
+            (root / name).write_text(text, encoding='utf-8')
+        self.case.review = lambda view: {'decisions':[{'subject':row['subject'], 'conclusion':'complete',
+            'findings':[], 'evidence':[], 'limitations':[]} for row in view['targets']]}
+        for targets in (['joined.md'], ['part-a.md', 'part-b.md']):
+            with self.subTest(targets=targets):
+                result = self.case._inspect(targets, ['background.md'])
+                self.assertEqual(result['status'], 'ok', result)
+                self.assertTrue(all(row['coverage'] == 'complete' for row in _assessments(result)))
+
+    def test_paginated_history_counts_only_after_the_complete_owner_result_is_supplied(self):
+        from tests.test_professional_work_loop import _action
+
+        (self.case.root / 'workspace' / 'note.md').write_text('Check the supplied source.\n', encoding='utf-8')
+        def review(view):
+            turn = len(self.case.inspection_requests)
+            if turn == 1:
+                return [_action('read_file', path='measurements/conditions.txt', max_bytes=512)]
+            if turn == 2:
+                return [_action('read_history', start_turn=0, action=0, max_bytes=80)]
+            if turn == 3:
+                pages = [json.loads(row['content'])['data'] for row in self.case.inspection_requests[-1]['messages']
+                    if row['role'] == 'tool' and json.loads(row['content']).get('tool_name') == 'read_history']
+                return [_action('read_history', start_turn=0, action=0,
+                    offset_bytes=pages[-1]['next_offset_bytes'], max_bytes=4096)]
+            return {'decisions':[{'subject':'target-1', 'conclusion':'complete',
+                'findings':[], 'evidence':[], 'limitations':[]}]}
+        self.case.review = review
+        result = self.case._inspect(['note.md'], [])
+        self.assertEqual(result['status'], 'ok', result)
+        owner = self.case.app.operations.inspection
+        identity = Path(result['data']['record']).parts[1]
+        saved = owner.store.read_json(owner._path(identity, 'input'))
+        original_round = owner._closed_source_round
+        def only_history(saved, number, *, partial=False, **kwargs):
+            trace = deepcopy(original_round(saved, number, **kwargs))
+            if trace:
+                offer = trace.get('offer', {})
+                offer.get('projection', {})['selected_records'] = []
+                if partial:
+                    offer['messages'] = [message for message in offer.get('messages', [])
+                        if message.get('role') != 'tool' or json.loads(message['content']).get('tool_name') != 'read_history'
+                        or json.loads(message['content']).get('data', {}).get('offset_bytes') == 0]
+            return trace
+        row = next(row for row in saved['evidence'] if row['path'].endswith('conditions.txt'))
+        key = (row['path'], row['sha256'])
+        with patch.object(owner, '_closed_source_round', side_effect=only_history):
+            self.assertIn(key, owner._offered_text_ranges(saved))
+        with patch.object(owner, '_closed_source_round', side_effect=lambda s, n, **kw: only_history(s, n, partial=True, **kw)):
+            self.assertNotIn(key, owner._offered_text_ranges(saved))
+
+
 if __name__ == '__main__':
     unittest.main()
