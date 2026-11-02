@@ -102,7 +102,7 @@ def _work_principles(owned_delivery: bool = False, automatic_memory: bool = Fals
        if delivery_protocol in {'task.v3', 'task.v4'} else
        "Work in complete useful units: investigate enough, implement and run, interpret the "
        "result, then inspect and deliver; do not repeatedly recheck an unchanged result without a concrete gap. ")
-    + ("Submit the actual completion claim and delivered artifacts when the requested work is ready. "
+    + ("Submit the prepared proposed delivery and actual artifacts when the requested work is ready. "
        "The independent inspection owner checks the applicable requirements against the actual work, "
        "using this same ledger. It selects and investigates necessary evidence rather than reading "
        "every file by default. Preserve capacity for checks; address genuine required findings and "
@@ -173,7 +173,14 @@ class OperationTools:
                  execution_observations=None, work_context=None, material_observations=None,
                  user_requests=None, native_route_validator=None):
         from simple_ar.tools.inspection import InspectionToolGateway, inspection_tool_specs
+        from functools import partial
+        from simple_ar.report.delivery import operation_report_content
         self.root, self.config = root, config
+        # Compatibility is selected once from the loaded contract, not exposed
+        # as a model option or inferred from report status, paths or contents.
+        legacy_report_status = config.get('delivery_review_protocol') != 'task.v4'
+        self.report_content = partial(operation_report_content,
+            legacy_report_status=legacy_report_status)
         self.professional = config.get('professional_operations') in PROFESSIONAL_CONTRACTS
         self.observations = observations
         self.user_requests = user_requests
@@ -192,7 +199,7 @@ class OperationTools:
             registry=search_registry)
         self.registry.register_package(source_tool_specs(), self.sources)
         self.publication = PublicationToolGateway(root, self.workspace, ledger,
-            asset_protocol=config.get('publication_assets'))
+            asset_protocol=config.get('publication_assets'), legacy_report_status=legacy_report_status)
         self.registry.register_package(publication_tool_specs(preparation=False), self.publication,
             request_visible=config.get('professional_operations') == 'work.v5')
         self.inspection = InspectionToolGateway(root, self.workspace,
@@ -323,6 +330,16 @@ class OperationTools:
             extension.verify()
             self.registry.register_package(extension.specs(),extension,request_visible=True)
         self.registry.register_package(coordination['specs'],coordination['owner'],request_visible=True)
+        if not legacy_report_status:
+            from simple_ar.tools.workspace import prepared_report_delivery_schema
+            for spec in self.registry.list_specs():
+                if spec.completion is not None and spec.completion.kind == 'delivery':
+                    # Presentation belongs to this loaded registry. Do not
+                    # mutate a package's verified source schema or unrelated
+                    # extension models with coincidentally named definitions.
+                    prepared = spec.model_copy(deep=True)
+                    prepared_report_delivery_schema(prepared.input_schema, prepared.completion.field)
+                    self.registry.register(prepared, replace=True)
         permissions = {'read_only','plan','write_patch'}
         if config['allow_execution']:
             permissions.add('execution')
@@ -465,7 +482,7 @@ class OperationTools:
                          request: DeliveryRequest, resolved: dict, *, proposed=None,
                          include_inspection: bool = True) -> list[str]:
         """Judge actual production using this call's authorized resolved inventory."""
-        from simple_ar.report.delivery import operation_report_content, operation_report_publication
+        from simple_ar.report.delivery import operation_report_publication
 
         issues = self.gateway.delivery_issues(observations, proposed=proposed,
             delivery={**delivery, 'artifacts': resolved['artifacts']})
@@ -485,7 +502,7 @@ class OperationTools:
         if missing:
             issues.append('Delivery is missing required workspace outputs: '+', '.join(missing))
         try:
-            report_issues, required = operation_report_content(request, resolved['artifacts'],
+            report_issues, required = self.report_content(request, resolved['artifacts'],
                 workspace=self.workspace, requirement=self.config.get('report_requirement'))
         except ValueError as exc:
             return [str(exc)]

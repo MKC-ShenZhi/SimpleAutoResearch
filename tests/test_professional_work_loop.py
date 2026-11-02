@@ -1357,6 +1357,90 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertNotIn(self.app.session.manifest.status, {'completed', 'partial'})
         self.assertFalse((self.root / 'delivery.json').exists())
 
+    def test_report_readiness_is_selected_by_loaded_contract_for_all_delivery_tools(self):
+        self._create()
+        self._reload()
+        specs = self.app.gateway.registry.list_specs()
+        projected = set()
+        for spec in specs:
+            definitions = spec.input_schema.get('$defs', {})
+            report = definitions.get('ReportDelivery')
+            if report is None:
+                continue
+            projected.add(spec.name)
+            self.assertIn('Neither asserts checks passed', report['properties']['status']['description'])
+            delivery = spec.input_schema if spec.name == 'deliver_result' else definitions['DeliveryRequest']
+            self.assertIn('Prepared report proposed for delivery', delivery['properties']['report']['description'])
+            self.assertNotIn('legacy_report_status', json.dumps(spec.input_schema))
+        self.assertTrue({'write_file', 'run_process', 'export_report',
+            'deliver_result'} <= projected, projected)
+
+        # Custom tools may inline the common terminal shape and use unrelated
+        # definition names; only the declared completion path is annotated.
+        from simple_ar.tools.workspace import DeliveryRequest, prepared_report_delivery_schema
+        custom = {'type':'object', 'properties':{'ready':DeliveryRequest.model_json_schema()},
+            '$defs':{'ReportDelivery':{'type':'string', 'description':'Unrelated extension data.'}}}
+        # Move this delivery's definitions to its document root, as standard refs require.
+        definitions = custom['properties']['ready'].pop('$defs')
+        custom['$defs']['edition'] = definitions.pop('ReportDelivery')
+        custom['$defs'].update(definitions)
+        custom['properties']['ready']['properties']['report']['anyOf'][0]['$ref'] = '#/$defs/edition'
+        unrelated = deepcopy(custom['$defs']['ReportDelivery'])
+        prepared_report_delivery_schema(custom, 'ready')
+        self.assertEqual(custom['$defs']['ReportDelivery'], unrelated)
+        self.assertIn('Neither asserts checks passed',
+            custom['$defs']['edition']['properties']['status']['description'])
+
+        from tests.native_history_fixture import load_prepared_operation_history
+        for protocol in ('task.v1', 'task.v2', 'task.v3'):
+            with self.subTest(protocol=protocol):
+                root = self.directory / ('saved-report-' + protocol)
+                old = load_prepared_operation_history(root, 'Deliver the requested candidate',
+                    config={'delivery_review_protocol':protocol, 'tool_contracts':'full'}, limits={})
+                (root/'workspace'/'manuscript').write_text('Requested candidate.\n', encoding='utf-8')
+                delivery = {'summary':'Requested candidate', 'artifacts':['manuscript'],
+                    'report':{'status':'candidate', 'manuscript':'manuscript'}}
+                issues = old.operations.delivery_issues([], delivery)
+                self.assertIn('A candidate report must disclose unfinished work', issues)
+                old = ToolApplication.load(root)
+                self.assertEqual(old.operations.delivery_issues([], delivery), issues)
+                schema = old.gateway.registry.get('deliver_result').input_schema
+                self.assertIn('Canonical means current required checks passed',
+                    schema['properties']['report']['description'])
+                self.assertNotIn('description', schema['$defs']['ReportDelivery']['properties']['status'])
+                self.assertEqual(old.operations.delivery_issues([],
+                    {**delivery, 'unresolved':['The required work remains unfinished.']}), [])
+
+    def test_candidate_export_delivery_binds_manuscript_and_checks_before_completion(self):
+        if not shutil.which('pandoc'):
+            self.skipTest('Real publication requires Pandoc')
+        self._create(goal='Deliver the requested candidate report as editable LaTeX.')
+        self._write('manuscript.md', '# Requested candidate\n\nOnly supplied observations are in scope.\n')
+        delivery = {'summary':'Requested candidate report', 'artifacts':[],
+            'report':{'status':'candidate', 'manuscript':'manuscript.md', 'formats':['tex']}}
+        exported = self._export('manuscript.md', delivery=delivery)
+        self.assertEqual(exported['status'], 'ok', exported)
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertEqual(len(self.inspection_requests), 1)
+        locator = self.app.workspace.locator(str(self.app.workspace.resolve('manuscript.md')))
+        self.assertIn(locator, exported['data']['artifact_sha256'])
+        saved = self.app.session.store.read_json('delivery.json')
+        self.assertIn(str(self.app.workspace.resolve('manuscript.md')),
+            {str(self.app.workspace.resolve(path)) for path in saved['artifacts']})
+        self.assertEqual(saved['report']['status'], 'candidate')
+        calls = self.send.call_count
+        self._reload()
+        self.assertTrue(self.app.reusable_materials())
+        self.assertEqual(self.send.call_count, calls)
+        (self.root/'workspace'/'manuscript.md').write_text('Changed source.\n', encoding='utf-8')
+        arguments = {'markdown':'manuscript.md', 'compile_pdf':False, 'delivery':delivery}
+        with patch('simple_ar.tools.publication.export_acm_report') as renderer:
+            stale = self.app.publication.call('export_report', arguments,
+                identity=Path(exported['data']['project']).name)
+        renderer.assert_not_called()
+        self.assertNotEqual(stale.status, 'ok')
+        self.assertTrue(self.app.operations.delivery_issues(self.app._operation_observations(), saved))
+
     def test_shared_inspection_computes_once_after_exact_approval_and_reviews_feedback_delivery(self):
         self._create(goal='Read the supplied CSV, check its sample mean independently, '
             'and deliver a short Markdown account of the supplied observations.')
@@ -2580,14 +2664,25 @@ class OperationsWorkLoopTests(unittest.TestCase):
         context = json.loads(messages[1]['content'])
         self.assertGreater(context['working_context']['recent_start_turn'], 0)
         overview = context['working_view']['operation_overview']
-        groups = overview['entries']
-        if isinstance(groups, dict):
-            table = groups
-            groups = [dict(zip(table['columns'], row)) for row in table['rows']]
-            groups = [{**group, 'observations': [
-                dict(zip(table['observation_columns'][schema], values))
-                for schema, values in group['observations']]} for group in groups]
-        entries = [entry for group in groups for entry in group['observations']]
+        def unpack(groups):
+            if isinstance(groups, dict):
+                table = groups
+                groups = [dict(zip(table['columns'], row)) for row in table['rows']]
+                groups = [{**group, 'observations': [
+                    dict(zip(table['observation_columns'][schema], values))
+                    for schema, values in group['observations']]} for group in groups]
+            return [entry for group in groups for entry in group['observations']]
+        entries = unpack(overview['entries'])
+        if not any(entry['tool'] == 'run_process' for entry in entries):
+            # Navigation is optional, like original bodies. An omission must be
+            # explicit and retrievable, not silently presented as a lost action.
+            self.assertGreater(overview['omitted_entries'], 0)
+            self.assertEqual(overview['access'], 'read_history')
+            page = self.app.call('read_history', {'start_turn':0, 'end_turn':1,
+                'max_turns':1, 'max_bytes':16000}, identity='retained-execution')
+            self.assertTrue(page.ok, page.error)
+            self.assertFalse(page.data['has_more_bytes'])
+            entries += unpack(json.loads(page.data['text']))
         execution = next(entry for entry in entries if entry['tool'] == 'run_process')
         self.assertEqual(execution['arguments']['argv'], command)
         self.assertEqual(execution['observed']['returncode'], 0)
@@ -6407,8 +6502,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
             targets=['report.md'],evidence=['measurements/observations.csv']),
             feedback='Complete the frozen formal report.')
         self._ok('inspect_artifacts')
-        canonical = self._delivery('report.md')
-        self._submit(_action('deliver_result',**canonical))
+        proposed = self._delivery('report.md')
+        proposed['report']['status'] = 'candidate'
+        self._submit(_action('deliver_result',**proposed))
         self.assertIn('fixed section structure',self._last('deliver_result')['error'])
         # The content-rule matrix belongs to the report domain. Keep one
         # restored-loop success here to prove the consumer still routes its
@@ -6418,10 +6514,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         version = self._read('report.md')['sha256']
         self._submit(_action('write_file',path='report.md',expected_sha256=version,content=body))
         self._ok('write_file')
-        self._inspect(['report.md'])
-        self._ok('inspect_artifacts')
         self._reload()
-        self._submit(_action('deliver_result',**canonical))
+        self._submit(_action('deliver_result',**proposed))
         self._ok('deliver_result')
         self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
 

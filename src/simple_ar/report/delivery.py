@@ -13,7 +13,7 @@ from simple_ar.tools.workspace import DeliveryRequest
 
 
 def operation_report_admission(request: DeliveryRequest, requirement: dict | None) -> list[str]:
-    """Check a frozen obligation before admitting an intended final producer.
+    """Check a frozen obligation before admitting a prepared proposed delivery.
 
     Partial delivery retains its existing escape from completeness checks; its
     actual files must still be resolved and byte-bound by the common executor.
@@ -24,18 +24,25 @@ def operation_report_admission(request: DeliveryRequest, requirement: dict | Non
 
 
 def operation_report_content(request: DeliveryRequest, artifacts: list[str], *,
-                             workspace: Any, requirement: dict | None) -> tuple[list[str], list[str]]:
+                             workspace: Any, requirement: dict | None,
+                             legacy_report_status: bool) -> tuple[list[str], list[str]]:
     """Return frozen-content issues and manuscripts needing independent review.
 
     ``artifacts`` is the workspace owner's resolved inventory, including any
     registered outputs from the just-completed producer. No authoring receipt
     or canonical directory name is required on the operation contract.
+
+    ``legacy_report_status`` is selected only from the loaded task contract by
+    OperationTools, never from model arguments. Saved pre-v4 tasks retain their
+    canonical-only admission; v4 submits either edition for owner acceptance.
     """
     report = request.report
     if request.unresolved or report is None:
         return [], []
-    if report.status != 'canonical' or not report.manuscript:
+    if legacy_report_status and (report.status != 'canonical' or not report.manuscript):
         raise ValueError('A candidate report must disclose unfinished work')
+    if not report.manuscript:
+        raise ValueError('A report delivery must identify its actual editable manuscript')
     manuscript = workspace.resolve(report.manuscript)
     if manuscript not in {workspace.resolve(path) for path in artifacts}:
         raise ValueError('Deliver the actual editable manuscript identified by the report claim')

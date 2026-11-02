@@ -690,7 +690,7 @@ class OperationReportDeliveryTests(unittest.TestCase):
             workspace = WorkspaceToolGateway(Path(tmp), {}, None)
             path = workspace.workspace / 'report.md'
             request = DeliveryRequest(summary='Supplied observations', artifacts=['report.md'],
-                report={'status': 'canonical', 'manuscript': 'report.md'})
+                report={'status': 'candidate', 'manuscript': 'report.md'})
             body = '# Observations\n\n' + '\n\n'.join(
                 '## ' + row['heading'] + '\n\nThree supplied observations.'
                 for row in requirement['outline']) + '\n'
@@ -703,7 +703,7 @@ class OperationReportDeliveryTests(unittest.TestCase):
                 with self.subTest(expected=expected):
                     path.write_text(content, encoding='utf-8')
                     issues, required = operation_report_content(request, request.artifacts,
-                        workspace=workspace, requirement=requirement)
+                        workspace=workspace, requirement=requirement, legacy_report_status=False)
                     self.assertEqual(required, ['report.md'])
                     if expected:
                         self.assertTrue(any(expected in issue for issue in issues), issues)
@@ -711,7 +711,15 @@ class OperationReportDeliveryTests(unittest.TestCase):
                         self.assertEqual(issues, [])
             # A claim cannot certify an inventory without the identified source.
             with self.assertRaisesRegex(ValueError, 'actual editable manuscript'):
-                operation_report_content(request, [], workspace=workspace, requirement=requirement)
+                operation_report_content(request, [], workspace=workspace, requirement=requirement,
+                    legacy_report_status=False)
+            request.report.manuscript = None
+            with self.assertRaisesRegex(ValueError, 'identify its actual editable manuscript'):
+                operation_report_content(request, request.artifacts, workspace=workspace,
+                    requirement=requirement, legacy_report_status=False)
+            request.unresolved = ['The editable manuscript is unfinished.']
+            self.assertEqual(operation_report_content(request, [], workspace=workspace,
+                requirement=requirement, legacy_report_status=False), ([], []))
 
     def test_publication_is_optional_for_markdown_but_intent_cannot_prove_outputs(self):
         from simple_ar.report.delivery import operation_report_publication

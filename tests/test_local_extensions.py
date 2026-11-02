@@ -321,11 +321,10 @@ type = "object"
             with self.assertRaisesRegex(ValueError, 'extensions'):
                 validate_resume_options(args)
 
-            fake = Mock()
-            fake.effective_output_limit.return_value = None
-            fake._settings = SimpleNamespace(api_mode='chat', context_input_tokens=120000)
-            fake.connection_binding.return_value = {
-                'profile': 'fixture', 'settings': {'model': 'fixture', 'api_mode': 'chat'}}
+            from simple_ar.integrations.llm import LLMClient, LLMSettings
+            fake = LLMClient(LLMSettings(api_key='offline-fixture', model='fixture',
+                api_mode='chat', context_input_tokens=120000))
+            self.enterContext(patch.object(LLMClient, 'chat_turn'))
             selected = ['local_notes__instructions', 'local_notes__count_words']
 
             def message(name, arguments, identity):
@@ -339,7 +338,11 @@ type = "object"
                 message(selected[1], {'path': 'source0/notes.txt'}, 'count'),
                 message('ask_user', {'question': 'What should follow this observed count?'}, 'question')]
             run_dir = root / 'saved'
-            with patch('simple_ar.app.tool_application.LLMClient.from_env', return_value=fake):
+            def connection(*args, **kwargs):
+                return fake.with_budget(kwargs.get('budget_ledger'),
+                    session_id=kwargs.get('budget_session_id', ''),
+                    attempt_id=kwargs.get('budget_attempt_id', ''))
+            with patch('simple_ar.app.tool_application.LLMClient.from_env', side_effect=connection):
                 app = ToolApplication.create(run_dir, 'Inspect my note with the local notes skill',
                     model='fixture', sources={'source0': project},
                     extensions=args.extensions, max_turns=10)
@@ -348,7 +351,7 @@ type = "object"
                 self.assertTrue(app.gateway.registry.request_visible(selected[1]))
                 self.assertIsNone(app.gateway.registry.get('compose_document'))
                 self.assertTrue(app.gateway.registry.request_visible('write_file'))
-                self.assertTrue(app.gateway.registry.request_visible('execute_implementation'))
+                self.assertIsNone(app.gateway.registry.get('execute_implementation'))
                 self.assertIn(selected[1], {row['function']['name'] for row in app.schemas})
                 # Resume after the result is durable but before controller commit.
                 original = ArtifactStore.write_json
@@ -423,8 +426,12 @@ type = "object"
                 from simple_ar.cli.start import session_materials
                 restored.run(actions=[{'tool_name': 'write_file', 'arguments': {
                     'path': 'workspace/portable.txt', 'content': 'Retained portable output',
-                    'delivery': {'summary': 'Portable result', 'artifacts': ['workspace/portable.txt']}}}],
+                    'delivery': {'summary': 'Portable result', 'artifacts': ['workspace/portable.txt'],
+                        'unresolved':['The next analysis request remains unspecified.']}}}],
                     progress=lambda _: None)
+                # Partial output is byte-recoverable too. Semantic completion
+                # belongs to delivery-owner tests, not this extension fixture.
+                self.assertEqual(restored.session.manifest.status, 'partial')
                 portable = run_dir.resolve() / 'workspace/portable.txt'
                 # Model a domain's declared group in the existing accepted receipt,
                 # including both ownership and its original full output digest.

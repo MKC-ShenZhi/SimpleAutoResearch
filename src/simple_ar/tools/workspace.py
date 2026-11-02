@@ -173,6 +173,47 @@ class DeliveryRequest(BaseModel):
         return value.model_dump(exclude_unset=True) if value is not None else None
 
 
+def prepared_report_delivery_schema(schema: dict, field: str) -> None:
+    """Annotate the declared completion path, without relying on model names.
+
+    This is only the loaded contract's presentation. Validation, serialization
+    and historical wire models stay unchanged. Unrelated extension definitions
+    must not acquire report semantics just because they share a name.
+    """
+    def objects(node: object, seen: frozenset[int] = frozenset()):
+        if not isinstance(node, dict) or id(node) in seen:
+            return
+        seen = seen | {id(node)}
+        yield node
+        ref = node.get('$ref', '')
+        if isinstance(ref, str) and ref.startswith('#/'):
+            target = schema
+            for part in ref[2:].split('/'):
+                target = target.get(part.replace('~1', '/').replace('~0', '~'), {}) if isinstance(target, dict) else {}
+            yield from objects(target, seen)
+        for key in ('anyOf', 'oneOf', 'allOf'):
+            for branch in node.get(key, []):
+                yield from objects(branch, seen)
+
+    completion = schema.get('properties', {}).get(field, {}) if field else schema
+    for delivery in objects(completion):
+        report = delivery.get('properties', {}).get('report')
+        if not isinstance(report, dict):
+            continue
+        report['description'] = (
+            'Prepared report proposed for delivery: identify the actual editable manuscript and '
+            'requested formats. Disclose unfinished requested work in unresolved. '
+            'Edition labels cannot certify checks or waive required findings. '
+            'Only the independent owner conclusion can accept completion; publication must match this manuscript.')
+        for model in objects(report):
+            status = model.get('properties', {}).get('status')
+            if isinstance(status, dict) and status.get('enum') in (['candidate', 'canonical'], ['canonical', 'candidate']):
+                status['description'] = (
+                    'Report edition label only: candidate for a draft/candidate, canonical for a final edition. '
+                    'Neither asserts checks passed or decides task completion. Both enter the same applicable '
+                    'independent owner review when requested work is ready and unresolved is empty.')
+
+
 class _Write(_Path):
     content: str = Field(max_length=256000)
     expected_sha256: str = Field(default="", description="Current digest required before replacing an existing file; empty for a new file.")

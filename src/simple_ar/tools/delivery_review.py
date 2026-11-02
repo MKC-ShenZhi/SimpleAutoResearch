@@ -981,7 +981,7 @@ class DeliveryReview:
                 return [*self._result_issues(result, binding),
                         *self._concern_issues(observations, binding)] if self.track_findings else self._result_issues(result, binding)
             return [('Current delivery lacks a complete independent whole-delivery review'
-                     if self.protocol == 'task.v3' else
+                     if self.protocol in {'task.v3', 'task.v4'} else
                      'Current canonical delivery lacks a complete independent whole-delivery review')]
         except _ERRORS as exc:
             return ['Delivery review cannot be verified: ' + str(exc)]

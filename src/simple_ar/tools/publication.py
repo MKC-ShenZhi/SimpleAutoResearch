@@ -288,7 +288,7 @@ def _publication_artifacts(workspace: Any, project: str, manifest: dict,
     if any(path not in inventory for path in artifacts):
         raise ValueError('Publication project artifact is missing from its retained inventory')
     root = workspace.resolve(project)
-    # Existing terminal bindings can also own the original canonical manuscript.
+    # Existing terminal bindings can also own the original claimed manuscript.
     # It is outside the generated project, and remains part of that delivery.
     artifacts.extend(path for path in inventory if not workspace.resolve(path).is_relative_to(root))
     return artifacts
@@ -309,13 +309,16 @@ class PublicationToolGateway:
     def __init__(self, root: Path, workspace: Any, ledger: Any, *,
                  report_source: Callable[[str], dict | None] | None = None,
                  candidate_source: Callable[[str, str], dict] | None = None,
-                 owned_execution: bool = False, asset_protocol: str | None = None) -> None:
+                 owned_execution: bool = False, asset_protocol: str | None = None,
+                 legacy_report_status: bool = True) -> None:
         if asset_protocol not in {None, PUBLICATION_ASSET_PROTOCOL, PUBLICATION_CONSUMER_PROTOCOL}:
             raise ValueError('Unsupported publication asset protocol')
         self.root, self.workspace, self.ledger = root, workspace, ledger
         self.report_source = report_source
         self.candidate_source, self.owned_execution = candidate_source, owned_execution
         self.asset_protocol = asset_protocol
+        # Internal load-time contract selection; never an ExportRequest option.
+        self.legacy_report_status = legacy_report_status
 
     def input_binding(self, source: Path, request: ExportRequest, *, saved: dict | None = None,
                       include_images: bool = True, image_paths: list[str] | None = None) -> dict:
@@ -856,7 +859,8 @@ class PublicationToolGateway:
                 source_locator = self.workspace.locator(str(source))
                 retained = owner.read_json('result.json').get('artifact_sha256') if saved is not None else None
                 claim = request.delivery.report if request.delivery is not None else None
-                if ((saved is None and claim is not None and claim.status == 'canonical'
+                if ((saved is None and claim is not None
+                        and (not self.legacy_report_status or claim.status == 'canonical')
                         and claim.manuscript and self.workspace.resolve(claim.manuscript) == source)
                         or retained is not None and source_locator in retained):
                     artifacts.append(source_locator)

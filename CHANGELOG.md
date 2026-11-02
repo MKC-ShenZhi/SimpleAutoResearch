@@ -10,6 +10,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Improved
 
 - Retain complete edited text with its version for optional reuse in later work. Large snapshots do not displace required input; authored text remains distinct from source-read evidence.
+- Ordinary tasks can submit a prepared candidate report for independent delivery review without claiming that checks have already passed. Incomplete checks and required findings still prevent completion.
 - Edited Markdown can proceed directly to delivery review without a publication step. Inspection distinguishes reading material from adopting computation results; historical task rules and explicit computation dependency checks remain intact.
 
 ### Fixed

@@ -1817,6 +1817,61 @@ class IndependentDeliveryApplicabilityTests(unittest.TestCase):
         return self.case._submit(_action('deliver_result',
             summary='Requested explanation', artifacts=['note.md']), **kwargs)
 
+    def test_candidate_report_enters_one_review_and_retains_owner_conclusion(self):
+        from tests.test_professional_work_loop import _action
+        from simple_ar.tools.workspace import RetainedDelivery
+        # Report identity is explicit, independent of filename extensions.
+        delivery = {'summary':'Requested candidate explanation', 'artifacts':['explanation'],
+            'report':{'status':'candidate', 'manuscript':'explanation'}}
+        with patch.object(self.case.app, '_validated_report_delivery',
+                side_effect=AssertionError('Ordinary work must not acquire historical Writer control')):
+            self.case._submit(_action('write_file', path='explanation',
+                content='Only the supplied observations are in scope.\n', delivery=delivery))
+        self.assertEqual(self.case.app.session.manifest.status, 'completed')
+        self.assertEqual(len(self.case.inspection_requests), 1)
+        saved = self.case.app.session.store.read_json('delivery.json')
+        self.assertEqual(saved['report']['status'], 'candidate')
+        proof = self.case._last('write_file', reviewed=True)['metadata']['delivery_review']
+        self.assertEqual(proof['binding']['claim']['report']['status'], 'candidate')
+        self.assertEqual(proof['result']['metadata']['delivery_assessment']['verdict'], 'passed')
+        calls = self.case.send.call_count
+        self.case._reload()
+        reader = RetainedDelivery(self.case.root)
+        self.assertTrue(reader.reusable_materials())
+        self.assertEqual(recorded_delivery_review(reader)['verdict'], 'passed')
+        self.assertEqual(self.case.send.call_count, calls)
+        changed = deepcopy(saved)
+        changed['report']['status'] = 'canonical'
+        issues = self.case.app.operations.delivery_issues(
+            self.case.app._operation_observations(), changed)
+        self.assertTrue(issues)  # Relabeling is not a matching owner opinion.
+        self.assertEqual(self.case.send.call_count, calls)
+
+    def test_candidate_report_required_finding_blocks_both_edition_labels_but_allows_partial(self):
+        from tests.test_professional_work_loop import _action
+        self.case._write('explanation', 'The requested explanation is absent.\n')
+        self.case.review = lambda view: {'conclusion':'incomplete',
+            'findings':[{'severity':'required', 'message':'Supply the requested explanation.',
+                'artifacts':[]}], 'evidence':[], 'limitations':[],
+            'applicability':'The exact requested explanation has not been delivered.',
+            'investigations':[]}
+        delivery = {'summary':'Requested candidate explanation', 'artifacts':['explanation'],
+            'report':{'status':'candidate', 'manuscript':'explanation'}}
+        self.case._submit(_action('deliver_result', **delivery))
+        self.case._not_delivered()
+        self.assertEqual(len(self.case.inspection_requests), 1)
+        calls = self.case.send.call_count
+        for edition in ('candidate', 'canonical'):
+            with self.subTest(edition=edition):
+                claim = {**delivery, 'report':{**delivery['report'], 'status':edition}}
+                self.assertTrue(self.case.app.operations.delivery_issues(
+                    self.case.app._operation_observations(), claim))
+        self.assertEqual(self.case.send.call_count, calls)
+        self.case._submit(_action('deliver_result', **delivery,
+            unresolved=['Supply the requested explanation.']))
+        self.assertEqual(self.case.app.session.manifest.status, 'partial')
+        self.assertEqual(len(self.case.inspection_requests), 1)
+
     def test_edited_process_markdown_reaches_applicable_review_without_publication(self):
         import sys
         from tests.test_professional_work_loop import _action
@@ -1969,16 +2024,17 @@ class IndependentDeliveryApplicabilityTests(unittest.TestCase):
     def test_unfinished_delivery_inspection_rebinds_without_starting_or_replaying_work(self):
         from tests.test_professional_work_loop import _action
 
-        self.case.review = lambda view: {'conclusion':'complete', 'findings':[],
-            'evidence':[], 'limitations':[], 'reassessed_prior':[],
-            'applicability':'This direct explanation has no empirical assertion to check.',
-            'investigations':[]}
-        self.case._submit(_action('deliver_result', summary='Current explanation', artifacts=[]),
+        # Retain the fixture's actual observed manuscript support; an empty
+        # evidence declaration cannot certify a nonempty artifact on resume.
+        self.case._write('explanation', 'Only supplied observations are in scope.\n')
+        self.case._submit(_action('deliver_result', summary='Current candidate explanation',
+            artifacts=['explanation'], report={'status':'candidate', 'manuscript':'explanation'}),
             should_stop=lambda: bool((self.case.app.state['pending'] or {}).get('inspection')))
         app = self.case.app
         pending = deepcopy(app.state['pending'])
         self.assertEqual(app.session.manifest.status, 'paused')
         self.assertIsNotNone(pending.get('inspection'))
+        self.assertFalse((self.case.root/'delivery.json').exists())
         owner = app.operations.inspection
         self.assertFalse(owner.store.exists(owner._path(pending['inspection'], 'result')))
         original = app.session.store.read_json(f"attempts/{pending['attempt']}/native_result.json")
