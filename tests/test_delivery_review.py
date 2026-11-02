@@ -101,6 +101,7 @@ class ControlledInspector:
 
 
 class DeliveryReviewTests(unittest.TestCase):
+
     def test_recorded_opinion_exposes_limitations_only_for_the_bound_delivery(self):
         root = self.root
         path = str(root / 'workspace' / 'report.md')
@@ -110,7 +111,7 @@ class DeliveryReviewTests(unittest.TestCase):
             'review_result': 'attempts/native-action-1/native_result.json'}
         state = {'pending': None, 'requests': ['Summarize'], 'config': {},
             'turns': [{'reply': 'reply.json', 'tools': [item], 'remaining': [], 'request_count': 1}]}
-        manifest = {'status': 'completed'}
+        manifest = {'status': 'completed', 'session_id': 'recorded-task'}
         binding = {'schema_version': 'delivery_review.v3', 'artifacts': {path: digest},
             'claim': {'summary': 'Summary', 'artifacts': [path], 'unresolved': []},
             'requests': ['Summarize']}
@@ -127,11 +128,31 @@ class DeliveryReviewTests(unittest.TestCase):
             'coverage': 'complete', 'verdict': 'passed', 'findings': [], 'evidence_sha256': {},
             'limitations': ['The source data was unavailable.']}
         receipt = ToolResult(tool_name='inspect_artifacts', metadata={'delivery_assessment': assessment}).model_dump(mode='json')
-        with patch('simple_ar.tools.materials.accepted_review_journal',
+        with patch('simple_ar.tools.professional_outcomes.accepted_review_journal',
                 return_value={'record': item['review_result'], 'receipt': receipt}):
             opinion = recorded_delivery_review(reader)
             self.assertEqual(opinion['limitations'], assessment['limitations'])
             self.assertIn('not proof', opinion['scope'])
+
+            # A later delivery may reuse the same owner-bound opinion. Its
+            # visible source is still the original accepted opinion action.
+            current = {'id':'call-2', 'result':'attempts/native-tool-2/native_result.json'}
+            current_parent = deepcopy(parent)
+            current_parent['metadata']['delivery_review']['result'] = deepcopy(receipt)
+            records[current['result']] = current_parent
+            records['reply-2.json'] = {'tool_calls':[{'id':'call-2',
+                'function':{'name':'deliver_result'}}]}
+            state['turns'].append({'reply':'reply-2.json', 'tools':[current],
+                'remaining':[], 'request_count':1})
+            with patch('simple_ar.tools.professional_outcomes.accepted_native_result') as accepted:
+                reused = recorded_delivery_review(reader)
+                self.assertEqual(reused['record'], item['review_result'])
+                accepted.assert_called_once()
+                current_parent['metadata']['delivery_review']['result']['data']['invented'] = True
+                with self.assertRaisesRegex(ValueError, 'no matching accepted opinion'):
+                    recorded_delivery_review(reader)
+            state['turns'].pop()
+
             receipt['metadata']['delivery_assessment']['artifacts'][path] = 'b' * 64
             with self.assertRaisesRegex(ValueError, 'scope differs'):
                 recorded_delivery_review(reader)
@@ -663,6 +684,79 @@ class DeliveryFindingContractTests(unittest.TestCase):
             self.inspector.store.write_json(record, proof['result'])
         return observed
 
+    def test_revision_view_keeps_related_versions_and_omits_unrelated_findings(self):
+        from simple_ar.tools.inspection import InspectionToolGateway
+
+        self.inspector.verdict = 'needs_revision'
+        proof = self.review('scoped-guidance')
+        assessment = proof['result']['metadata']['delivery_assessment']
+        first = str(self.workspace.resolve('bundle/manuscript.md'))
+        second = str(self.workspace.resolve('bundle/appendix.txt'))
+        versions = assessment['artifacts']
+        assessment['findings'] = [
+            {'severity':'required', 'message':'First only', 'subjects':{first:versions[first]}},
+            {'severity':'advisory', 'message':'Second only', 'subjects':{second:versions[second]}},
+            {'severity':'advisory', 'message':'Compare both',
+             'subjects':{first:versions[first], second:versions[second]}},
+            {'severity':'required', 'message':'Overall claim', 'subjects':{}},
+        ]
+        self.inspector.store.write_json(self.inspector._path('scoped-guidance', 'result'), proof['result'])
+        self.inspector.expected['scoped-guidance'] = deepcopy(proof['result'])
+        self.observe(proof)
+        raw = deepcopy(proof['result'])
+        original_feedback = self.inspector.feedback_observation
+
+        def projected_feedback(identity, claimed, **kwargs):
+            feedback = original_feedback(identity, claimed, **kwargs)
+            feedback['result'] = InspectionToolGateway.coordination_result(
+                ToolResult.model_validate(feedback['result']),
+                receipt_path=self.inspector._path(identity, 'result'))
+            return feedback
+
+        with patch.object(self.inspector, 'feedback_observation', side_effect=projected_feedback), \
+             patch.object(self.inspector, 'feedback_view',
+                          side_effect=InspectionToolGateway.feedback_view, create=True):
+            view, = self.owner.inspection_feedback(['bundle/manuscript.md'])
+            self.workspace.resolve('bundle/appendix.txt').write_text('Later edit', encoding='utf-8')
+            revised, = self.owner.inspection_feedback(['bundle/manuscript.md'])
+            self.workspace.resolve('bundle/unrelated.txt').write_text('Other work', encoding='utf-8')
+            claim_only, = self.owner.inspection_feedback(['bundle/unrelated.txt'])
+            original_hashes = self.workspace.artifact_hashes
+
+            def inaccessible(paths):
+                if second in paths:
+                    raise OSError('Related source temporarily unavailable')
+                return original_hashes(paths)
+
+            with patch.object(self.workspace, 'artifact_hashes', side_effect=inaccessible):
+                unavailable, = self.owner.inspection_feedback(['bundle/manuscript.md'])
+            original_resolve = self.workspace.resolve
+
+            def revoked(locator, *args, **kwargs):
+                if str(locator) == second:
+                    raise ValueError('Related source no longer authorized')
+                return original_resolve(locator, *args, **kwargs)
+
+            with patch.object(self.workspace, 'resolve', side_effect=revoked):
+                restricted, = self.owner.inspection_feedback(['bundle/manuscript.md'])
+        findings = view['result']['metadata']['delivery_opinion']['findings']
+        self.assertEqual({row['message'] for row in findings}, {'First only', 'Compare both', 'Overall claim'})
+        self.assertEqual({row['path'] for row in view['subjects']}, {first, second})
+        linked = next(row for row in view['subjects'] if row['path'] == second)
+        self.assertEqual(linked['review_role'], 'related_subject')
+        self.assertEqual(linked['reviewed_sha256'], versions[second])
+        self.assertTrue(linked['current_matches_review'])
+        changed = next(row for row in revised['subjects'] if row['path'] == second)
+        self.assertFalse(changed['current_matches_review'])
+        self.assertEqual(changed['reviewed_sha256'], versions[second])
+        self.assertIsNone(next(row for row in unavailable['subjects']
+                               if row['path'] == second)['current_matches_review'])
+        self.assertIsNone(next(row for row in restricted['subjects']
+                               if row['path'] == second)['current_matches_review'])
+        self.assertEqual([row['message'] for row in
+            claim_only['result']['metadata']['delivery_opinion']['findings']], ['Overall claim'])
+        self.assertEqual(proof['result'], raw)
+
     def test_old_package_pass_then_new_local_required_needs_explicit_new_review(self):
         original = self.review()
         self.observe(original)
@@ -819,32 +913,92 @@ class DeliveryFindingContractTests(unittest.TestCase):
         self.local()
         pending = self.concerns()
         self.inspector.reassess = True
+        self.inspector.verdict = 'needs_revision'
         proof = self.review('pending-review')
         observed = self.pending_envelope(proof)
+        with patch.object(self.inspector, 'feedback_observation',
+                          side_effect=AssertionError('Unaccepted opinion must not be decoded')):
+            guidance = self.owner.feedback_from_observation(observed)
+        self.assertFalse(guidance['opinion_available'])
+        self.assertEqual(guidance['result']['status'], 'blocked')
+        self.assertNotIn('The requested explanation is absent.', json.dumps(guidance['result']))
         self.assertEqual(self.concerns(), pending)
         self.assertIn('opinion record', '; '.join(self.issues(self.observations, self.delivery)))
         observed['review_record'] = 'attempts/not-accepted/native_result.json'
         with patch('simple_ar.tools.professional_outcomes.accepted_scoped_opinion',
                    side_effect=ValueError('No accepted opinion action')):
-            self.assertEqual(self.concerns(), pending)
+            unknown = self.owner.feedback_from_observation(observed)
+            self.assertFalse(unknown['opinion_available'])
+            self.assertIsNone(unknown['opinion_accepted'])
+            with self.assertRaisesRegex(ValueError, 'delivery concern opinion cannot be verified'):
+                self.concerns()
             self.assertTrue(self.issues(self.observations, self.delivery))
+
+        # An accepted action whose retained owner result was changed is not an
+        # unaccepted response. It stays unresolved and cannot be silently skipped.
+        path = self.inspector.store.resolve(self.inspector._path('pending-review', 'result'))
+        original_bytes = path.read_bytes()
+        damaged_result = deepcopy(proof['result'])
+        damaged_result['metadata'].pop('delivery_assessment')
+        self.inspector.store.write_json(self.inspector._path('pending-review', 'result'), damaged_result)
+        try:
+            with patch('simple_ar.tools.professional_outcomes.accepted_scoped_opinion',
+                       return_value=(None, proof['result'], 'accepted')):
+                damaged = self.owner.feedback_from_observation(observed)
+                self.assertTrue(damaged['opinion_accepted'])
+                self.assertFalse(damaged['opinion_available'])
+                with self.assertRaisesRegex(ValueError, 'delivery concern opinion cannot be verified'):
+                    self.concerns()
+                other = self.workspace.workspace / 'unrelated.txt'
+                other.write_text('Unrelated work', encoding='utf-8')
+                # Its reassessment ID cannot be related to the selected scope
+                # from the retained events, so do not silently call it unrelated.
+                with self.assertRaisesRegex(ValueError, 'delivery concern opinion cannot be verified'):
+                    self.owner.pending_concerns([str(other)])
+            unrelated_result = deepcopy(proof['result'])
+            unrelated_result['metadata']['delivery_assessment']['reassessed_prior'] = []
+            with patch('simple_ar.tools.professional_outcomes.accepted_scoped_opinion',
+                       return_value=(None, unrelated_result, 'accepted')):
+                self.assertEqual(self.owner.pending_concerns([str(other)]), [])
+            claim_result = deepcopy(unrelated_result)
+            claim_result['metadata']['delivery_assessment']['findings'][0]['subjects'] = {}
+            with patch('simple_ar.tools.professional_outcomes.accepted_scoped_opinion',
+                       return_value=(None, claim_result, 'accepted')):
+                with self.assertRaisesRegex(ValueError, 'delivery concern opinion cannot be verified'):
+                    self.owner.pending_concerns([str(other)])
+        finally:
+            path.write_bytes(original_bytes)
 
     def test_accepted_pending_recovery_and_later_findings_use_one_reducer(self):
         self.local()
         self.inspector.reassess = True
         proof = self.review('shared-review')
         observed = self.pending_envelope(proof, record='attempts/accepted-opinion/native_result.json')
-        with patch('simple_ar.tools.professional_outcomes.accepted_scoped_opinion') as accepted:
+        with patch('simple_ar.tools.professional_outcomes.accepted_scoped_opinion',
+                   return_value=(None, proof['result'], 'accepted')) as accepted:
             self.assertEqual(self.concerns(), [])
             self.assertEqual(self.issues(self.observations, self.delivery), [])
             self.assertTrue(accepted.called)
-            self.assertEqual(accepted.call_args.kwargs['expected'], proof['result'])
+            self.assertTrue(any(call.args[4] == 'shared-review' for call in accepted.call_args_list))
             self.local('later-required')
             self.assertEqual(len(self.concerns()), 1)
             self.assertTrue(self.issues(self.observations, self.delivery))
             count = len(self.inspector.calls)
             self.assertEqual(self.review('shared-review', may_start=False)['identity'], 'shared-review')
             self.assertEqual(len(self.inspector.calls), count)
+            original = self.inspector.feedback_observation
+            def damaged(identity, claimed, **kwargs):
+                return ({'opinion_available':False} if identity == 'shared-review'
+                        else original(identity, claimed, **kwargs))
+            with patch.object(self.inspector, 'feedback_observation', side_effect=damaged):
+                with self.assertRaisesRegex(ValueError, 'delivery concern opinion cannot be verified'):
+                    self.concerns()
+                other = self.workspace.workspace / 'unrelated-after-review.txt'
+                other.write_text('Other work', encoding='utf-8')
+                # The earlier reassessment ID is not in the selected history;
+                # its relevance cannot yet be established from that view.
+                with self.assertRaisesRegex(ValueError, 'delivery concern opinion cannot be verified'):
+                    self.owner.pending_concerns([str(other)])
         self.assertEqual(observed['review_record'], 'attempts/accepted-opinion/native_result.json')
 
     def test_accepted_pending_historical_required_survives_target_revision(self):
@@ -852,7 +1006,8 @@ class DeliveryFindingContractTests(unittest.TestCase):
         proof = self.review('historical-shared')
         self.pending_envelope(proof, record='attempts/accepted-opinion/native_result.json')
         self.inspector.store.write_json('session_manifest.json', {'session_id': 'controlled-session'})
-        with patch('simple_ar.tools.professional_outcomes.accepted_scoped_opinion'):
+        with patch('simple_ar.tools.professional_outcomes.accepted_scoped_opinion',
+                   return_value=(None, proof['result'], 'accepted')):
             pending = self.concerns()
             self.assertEqual(len(pending), 1)
             self.workspace.resolve('bundle/manuscript.md').write_text('new version', encoding='utf-8')
@@ -863,6 +1018,9 @@ class InspectionOfferCoverageTests(unittest.TestCase):
     """Exercise the ordinary shared inspector with its existing offline provider."""
 
     def setUp(self):
+        self._set_up_case('task.v3')
+
+    def _set_up_case(self, protocol):
         from dataclasses import replace
         from simple_ar.integrations.llm import LLMClient
         from tests.test_professional_work_loop import OperationsWorkLoopTests
@@ -873,11 +1031,17 @@ class InspectionOfferCoverageTests(unittest.TestCase):
         self.case.services.llm_client = LLMClient(replace(
             self.case.services.llm_client._settings, context_input_tokens=9000))
         self.case._create(goal='Inspect the report and describe its scope.')
+        # These existing coverage/priming tests exercise the saved v3 contract,
+        # even after ordinary creation moves to v4. Freeze before inspection.
+        if self.case.app.state['config']['delivery_review_protocol'] != protocol:
+            self.case.app.state['config']['delivery_review_protocol'] = protocol
+            self.case.app._save()
+            self.case._reload()
 
-    def _long_report(self):
+    def _long_report(self, rows=1000):
         head = ('本报告记录观察条件及样本结果并说明解释范围' * 20)[:170] + '\n\n'
         text = head + 'record,value,description\n' + ''.join(
-            f'{number},2,observed sample\n' for number in range(1000))
+            f'{number},2,observed sample\n' for number in range(rows))
         (self.case.root / 'workspace' / 'report.md').write_text(text, encoding='utf-8')
         self.case.review = lambda view: {'decisions': [{'subject':'target-1',
             'conclusion':'complete', 'findings':[], 'evidence':[], 'limitations':[]}]}
@@ -885,20 +1049,27 @@ class InspectionOfferCoverageTests(unittest.TestCase):
 
     def test_complete_read_with_unsupplied_tail_is_partial_and_recovers(self):
         from tests.test_professional_work_loop import _assessments
+        from simple_ar.integrations.llm import estimate_tokens
 
-        text = self._long_report()
-        result = self.case._inspect(['report.md'], [])
+        text = self._long_report(rows=2400)
+        # One real caller window reads the entire target, while its body alone
+        # exceeds the actual model input budget. This isolates read-vs-supply
+        # integrity from improvements in adaptive priming and serialization.
+        self.assertLessEqual(len(text.encode('utf-8')), 64000)
+        self.assertGreater(estimate_tokens(text), self.case.services.llm_client._settings.context_input_tokens)
+        result = self.case._inspect([{'path':'report.md', 'max_bytes':64000}], [])
         self.assertEqual(result['status'], 'ok', result)
         identity = Path(result['data']['record']).parts[1]
         store = self.case.app.session.store
         saved = store.read_json(f'tools/inspection/{identity}/input.json')
         trace = store.read_json(f'tools/inspection/{identity}/sources-0.json')
+        self.assertGreater(estimate_tokens(text), trace['offer']['projection']['input_token_target'])
         view = json.loads(trace['offer']['messages'][1]['content'])
         bodies = [entry['observation'] for entry in view['working_view']['observations']
             if entry['observation'].get('path') == saved['targets'][0]['path']]
         self.assertTrue(saved['targets'][0]['complete'])
-        self.assertTrue(bodies)
-        self.assertLess(max(row['next_offset_bytes'] for row in bodies), len(text.encode('utf-8')))
+        if bodies:
+            self.assertLess(max(row['next_offset_bytes'] for row in bodies), len(text.encode('utf-8')))
         assessment = _assessments(result)[0]
         self.assertEqual((assessment['coverage'], assessment['verdict']), ('partial', 'incomplete'))
         self.assertIn('not proven supplied', ' '.join(assessment['limitations']))
@@ -1204,6 +1375,770 @@ class InspectionOfferCoverageTests(unittest.TestCase):
             self.assertIn(key, owner._offered_text_ranges(saved))
         with patch.object(owner, '_closed_source_round', side_effect=lambda s, n, **kw: only_history(s, n, partial=True, **kw)):
             self.assertNotIn(key, owner._offered_text_ranges(saved))
+
+
+class ApplicableDeliveryInspectionTests(unittest.TestCase):
+    """Real shared receipts and projection; offline replies control judgment only."""
+
+    def setUp(self):
+        InspectionOfferCoverageTests._set_up_case(self, 'task.v4')
+
+    def _assessment(self):
+        proof = self.case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        return proof, proof['result']['metadata']['delivery_assessment']
+
+    def _only_requested_sources(self):
+        # These provenance counterexamples intentionally withhold subject bodies
+        # so a receipt fragment/process output is the only offered support. Keep
+        # this evidence precondition explicit as normal delivery priming improves.
+        self.enterContext(patch.object(self.case.app.operations.inspection, '_prime_delivery', return_value=None))
+        self.enterContext(patch('simple_ar.tools.materials.material_observation_seed', return_value=None))
+
+    @staticmethod
+    def _complete(view):
+        return {'conclusion':'complete', 'findings':[], 'limitations':[],
+            'evidence':[row['subject'] for row in view['evidence'] if row['text_windows']]}
+
+
+    def _scientific_delivery(self):
+        from tests.test_professional_work_loop import _action
+
+        source = self.case.inputs / 'values.txt'
+        source.write_text('1\n2\n3\n', encoding='utf-8')
+        output = self.case.root / 'workspace' / 'answer.dat'
+        output.write_text('The supplied three values have mean 2.\n', encoding='utf-8')
+        (self.case.root / 'workspace' / 'attachment').write_text('UNRELATED-ATTACHMENT', encoding='utf-8')
+        phases = []
+        def review(view):
+            paths = ['answer.dat', 'measurements/values.txt']
+            sources = self.case._inspection_sources(view, *paths)
+            missing = [_action('read_file', path=path, max_bytes=4096)
+                for path, row in zip(paths, sources) if row is None]
+            if missing:
+                phases.append('investigate')
+                return missing
+            bodies = {row['path']: ''.join(w['text'] for w in row['text_windows'])
+                for row in view['evidence']}
+            self.assertIn(output.read_text(encoding='utf-8'), bodies.values())
+            values = [float(value) for value in bodies[str(source)].splitlines()]
+            self.assertEqual(sum(values) / len(values), 2)
+            phases.append('observed')
+            return self._complete(view)
+        self.case.review = review
+        self.case._submit(_action('deliver_result',
+            summary='The mean is 2; the conclusion is limited to the supplied values.',
+            artifacts=['answer.dat', 'attachment']))
+        proof, assessment = self._assessment()
+        self.assertEqual(phases, ['investigate', 'observed'])
+        self.assertEqual(assessment['verdict'], 'passed')
+        self.assertIn(str(source), assessment['evidence_sha256'])
+        self.assertIn(str(output), assessment['evidence_sha256'])
+        return source, output, proof
+
+    def test_scientific_evidence_and_delivered_bytes_must_remain_current(self):
+        source, output, proof = self._scientific_delivery()
+        inspector = self.case.app.operations.inspection
+        saved = inspector.store.read_json(inspector._path(proof['identity'], 'input'))
+        before = self.case.send.call_count
+        for path in (source, output):
+            original = path.read_bytes()
+            path.write_bytes(original + b'changed\n')
+            try:
+                result = inspector.call('inspect_artifacts', saved['arguments'], proof['identity'],
+                    delivery_context=saved['delivery_context'])
+                self.assertFalse(result.ok)
+            finally:
+                path.write_bytes(original)
+        self.assertEqual(self.case.send.call_count, before)
+
+    def test_selected_evidence_without_proven_supply_cannot_pass(self):
+        _, _, proof = self._scientific_delivery()
+        inspector = self.case.app.operations.inspection
+        saved = inspector.store.read_json(inspector._path(proof['identity'], 'input'))
+        receipt = inspector._receipt(proof['identity'])
+        # Intact reads and an actual completed opinion are insufficient if their
+        # request-supply proof is absent. All other receipt checks remain real.
+        with patch.object(inspector, '_offered_text_ranges', return_value={}):
+            assessment, _ = inspector._delivery_assessment(saved, receipt, proof['identity'], '')
+        self.assertEqual((assessment['coverage'], assessment['verdict']), ('partial', 'incomplete'))
+
+    def test_selected_parent_receipt_rechecks_source_authority_and_versions(self):
+        from tests.test_professional_work_loop import _action
+
+        source = self.case.inputs / 'archived.txt'
+        source.write_text('An original bounded observation.\n', encoding='utf-8')
+        self.case._read('measurements/archived.txt')
+        (self.case.root / 'workspace' / 'note.dat').write_text('The bounded observation is supplied.\n', encoding='utf-8')
+        (self.case.root / 'workspace' / 'attachment').write_text('UNREAD-ATTACHMENT', encoding='utf-8')
+        records = []
+        def review(view):
+            if not records:
+                # Navigation is selected by the ordinary capacity projector.
+                descriptors = [json.loads(row['observation']['text'])
+                    for row in view['working_view']['observations']
+                    if row['observation'].get('field') == 'source_history']
+                entry = next(row for row in descriptors if row['path'] == str(source))
+                records.append(entry['records'][0]['record'])
+                return [_action('read_file', path=records[-1], max_bytes=64000),
+                    _action('read_file', path='note.dat', max_bytes=4096)]
+            return self._complete(view)
+        self.case.review = review
+        self.case._submit(_action('deliver_result', summary='The bounded original observation.',
+            artifacts=['note.dat', 'attachment']))
+        proof, assessment = self._assessment()
+        self.assertEqual(assessment['verdict'], 'passed')
+        self.assertIn(str(source), assessment['evidence_sha256'])
+        inspector = self.case.app.operations.inspection
+        saved = inspector.store.read_json(inspector._path(proof['identity'], 'input'))
+        before = self.case.send.call_count
+        receipt = self.case.app.workspace.resolve(records[0])
+        for path in (source, receipt):
+            original = path.read_bytes()
+            path.write_bytes(original + b'changed\n')
+            try:
+                result = inspector.call('inspect_artifacts', saved['arguments'], proof['identity'],
+                    delivery_context=saved['delivery_context'])
+                self.assertFalse(result.ok)
+            finally:
+                path.write_bytes(original)
+        self.case.app.workspace.mounts.pop('measurements')
+        result = inspector.call('inspect_artifacts', saved['arguments'], proof['identity'],
+            delivery_context=saved['delivery_context'])
+        self.assertFalse(result.ok)
+        self.assertEqual(self.case.send.call_count, before)
+
+    def test_pending_required_concerns_need_explicit_recheck_in_v4(self):
+        from tests.test_professional_work_loop import _action
+        self._only_requested_sources()
+
+        (self.case.root / 'workspace' / 'note.dat').write_text('The bounded observation.\n', encoding='utf-8')
+        self.case._read('note.dat')  # A parent receipt is navigation, not automatic subject support.
+        self.case.review = lambda view: {'decisions':[{'subject':'target-1',
+            'conclusion':'complete', 'findings':[{'severity':'required',
+                'message':'Explain the observation boundary.'}], 'evidence':[], 'limitations':[]}]}
+        self.case._inspect(['note.dat'], [])
+        (self.case.root / 'workspace' / 'unrelated.txt').write_text('Unrelated readable evidence.\n', encoding='utf-8')
+        (self.case.root / 'workspace' / 'attachment').write_text('UNREAD-ATTACHMENT', encoding='utf-8')
+        def review(view, *, reassess=False, path='note.dat'):
+            if not view['evidence']:
+                # A genuine selected window is sufficient provenance; the
+                # controlled opinion, not this test, judges its relevance.
+                return [_action('read_file', path=path, max_bytes=8)]
+            result = self._complete(view)
+            self.assertTrue(view['prior_required'])
+            if reassess:
+                result['reassessed_prior'] = [row['id'] for row in view['prior_required']]
+            return result
+        delivery = _action('deliver_result', summary='The observation and its boundary.',
+            artifacts=['note.dat', 'attachment'])
+        self.case.review = review
+        self.case._submit(delivery)
+        _, assessment = self._assessment()
+        self.assertEqual(assessment['verdict'], 'incomplete')
+
+        self.case.review = lambda view: review(view, reassess=True, path='unrelated.txt')
+        self.case._submit(delivery)
+        proof, assessment = self._assessment()
+        self.assertEqual((assessment['coverage'], assessment['verdict']), ('partial', 'incomplete'))
+        self.assertEqual(assessment['reassessed_prior'], [])
+        self.assertNotEqual(self.case.app.session.manifest.status, 'completed')
+        owner = self.case.app.operations.delivery_review
+        self.assertTrue(owner.pending_concerns(['note.dat']))
+        inspector = self.case.app.operations.inspection
+        saved = inspector.store.read_json(inspector._path(proof['identity'], 'input'))
+        self.assertEqual(saved['delivery_context']['scope_policy'], 'applicable.v1')
+        self.assertFalse(any(row['path'].endswith('note.dat') for row in saved['evidence']))
+
+        def receipt_fragment(view):
+            if not view['evidence']:
+                descriptors = [json.loads(row['observation']['text'])
+                    for row in view['working_view']['observations']
+                    if row['observation'].get('field') == 'source_history']
+                entry = next(row for row in descriptors if row['path'].endswith('note.dat'))
+                return [_action('read_file', path=entry['records'][0]['record'], max_bytes=32)]
+            result = self._complete(view)
+            result['reassessed_prior'] = [row['id'] for row in view['prior_required']]
+            return result
+
+        self.case.review = receipt_fragment
+        self.case._submit(delivery)
+        _, assessment = self._assessment()
+        self.assertEqual((assessment['coverage'], assessment['verdict']), ('partial', 'incomplete'))
+        self.assertTrue(owner.pending_concerns(['note.dat']))
+
+        self.case.review = lambda view: review(view, reassess=True)
+        self.case._submit(delivery)
+        proof, assessment = self._assessment()
+        self.assertEqual(assessment['verdict'], 'passed')
+        self.assertTrue(assessment['reassessed_prior'])
+        self.assertFalse(owner.pending_concerns(['note.dat']))
+        saved = inspector.store.read_json(inspector._path(proof['identity'], 'input'))
+        self.assertTrue(all(not row['complete'] for row in saved['evidence']))
+        bindings = inspector._stored_shared_bindings(saved, inspector._receipt(proof['identity'])['response'])
+        self.assertTrue(any(str(self.case.root / 'workspace' / 'note.dat') in scope
+            for key, scope in bindings.items() if key.startswith('evidence:')))
+        before = self.case.send.call_count
+        cached = inspector.call('inspect_artifacts', saved['arguments'], proof['identity'],
+            delivery_context=saved['delivery_context'])
+        self.assertEqual(cached.model_dump(mode='json'), proof['result'])
+        self.assertEqual(self.case.send.call_count, before)
+
+        receipt = inspector._receipt(proof['identity'])
+        with patch.object(inspector, '_offered_text_ranges', return_value={}):
+            missing, _ = inspector._delivery_assessment(saved, receipt, proof['identity'], '')
+        self.assertEqual(missing['reassessed_prior'], [])
+        self.assertEqual(missing['verdict'], 'incomplete')
+
+        # Historical task.v3 inspections retain their original dependency shape.
+        historical = deepcopy(saved)
+        historical['delivery_context'].pop('scope_policy')
+        old_bindings = inspector._shared_final_bindings(historical, receipt['response'])
+        self.assertEqual(set(old_bindings), {'delivery'})
+        with patch.object(inspector, '_stored_shared_bindings', return_value=old_bindings):
+            old, error = inspector._delivery_assessment(historical, receipt, proof['identity'], '',
+                check_versions=False)
+        self.assertEqual(error, '')
+        self.assertEqual(old, assessment)
+
+    def test_recheck_accepts_bound_process_evidence_without_reading_subject_body(self):
+        import sys
+        from tests.test_professional_work_loop import _action
+        self._only_requested_sources()
+
+        note = self.case.root / 'workspace' / 'note.dat'
+        note.write_text('A bounded observation.\n', encoding='utf-8')
+        (self.case.root / 'workspace' / 'attachment').write_text('UNREAD-ATTACHMENT', encoding='utf-8')
+        self.case.review = lambda view: {'decisions':[{'subject':'target-1',
+            'conclusion':'complete', 'findings':[{'severity':'required',
+                'message':'Check the observation boundary.'}], 'evidence':[], 'limitations':[]}]}
+        self.case._inspect(['note.dat'], [])
+        delivery = _action('deliver_result', summary='The checked boundary.', artifacts=['note.dat', 'attachment'])
+        for bound in (False, True):
+            with self.subTest(bound=bound):
+                calculation = {}
+                def review(view):
+                    if not calculation:
+                        spec = next(tool['function'] for tool in self.case.inspection_requests[-1]['tools']
+                            if tool['function']['name'] == 'run_process')
+                        scope = spec['parameters']['properties']['cwd']['description'].split(
+                            'workspace/inspection-work/', 1)[1].split('/', 1)[0]
+                        work = 'workspace/inspection-work/' + scope
+                        calculation['output'] = work + '/checked.txt'
+                        # A path embedded in code is not an owner input digest.
+                        # Only the second run declares/binds the subject bytes.
+                        return [_action('run_process', cwd=work, argv=[sys.executable, '-c',
+                            "from pathlib import Path; "
+                            f"value=Path({str(note)!r}).read_text(encoding='utf-8'); "
+                            "Path('checked.txt').write_text(str(len(value)), encoding='utf-8')"],
+                            inputs=['note.dat'] if bound else [], outputs=[calculation['output']], timeout_sec=5)]
+                    if not view['evidence']:
+                        return [_action('read_file', path=calculation['output'])]
+                    result = self._complete(view)
+                    result['reassessed_prior'] = [row['id'] for row in view['prior_required']]
+                    return result
+                self.case.review = review
+                self.case._submit(delivery, approve=lambda *_: True)
+                proof, assessment = self._assessment()
+                self.assertEqual(assessment['verdict'], 'passed' if bound else 'incomplete')
+                self.assertEqual(bool(assessment['reassessed_prior']), bound)
+                inspector = self.case.app.operations.inspection
+                saved = inspector.store.read_json(inspector._path(proof['identity'], 'input'))
+                self.assertTrue(saved['evidence'])
+                self.assertTrue(all(row['path'] != str(note) for row in saved['evidence']))
+                if bound:
+                    self.assertIn(str(note), assessment['evidence_sha256'])
+                    before = self.case.send.call_count
+                    note.write_text('Changed after the bound check.\n', encoding='utf-8')
+                    cached = inspector.call('inspect_artifacts', saved['arguments'], proof['identity'],
+                        delivery_context=saved['delivery_context'])
+                    self.assertFalse(cached.ok)
+                    self.assertEqual(self.case.send.call_count, before)
+
+    def test_subject_support_requires_each_pending_current_subject_not_inventory(self):
+        from simple_ar.tools.delivery_review import reassessment_has_subject_support
+
+        prior = {'subjects':{'a':'0'*64, 'b':'1'*64}, 'pending_subjects':['a', 'b']}
+        current = {'a':'2'*64, 'b':'3'*64}
+        # These scopes may be direct windows or authenticated process/visual
+        # input bindings. They express provenance, never semantic correctness.
+        self.assertFalse(reassessment_has_subject_support(prior, current, [{'unrelated':'4'*64}]))
+        self.assertFalse(reassessment_has_subject_support(prior, current, [{'a':'2'*64}]))
+        self.assertFalse(reassessment_has_subject_support(prior, current, [{'a':'0'*64, 'b':'3'*64}]))
+        self.assertTrue(reassessment_has_subject_support(prior, current, [{'a':'2'*64}, {'b':'3'*64}]))
+        self.assertTrue(reassessment_has_subject_support(
+            {**prior, 'subjects':{'a':'0'*64}, 'pending_subjects':['a']}, current, [{'a':'2'*64}]))
+        self.assertFalse(reassessment_has_subject_support({**prior, 'pending_subjects':[]}, current, []))
+        self.assertTrue(reassessment_has_subject_support({'subjects':{}, 'pending_subjects':[]}, {}, []))
+        self.assertFalse(reassessment_has_subject_support({'subjects':{}, 'pending_subjects':['a']}, current, []))
+
+    def test_native_supply_requires_the_intact_read_reply_not_identical_prose(self):
+        from simple_ar.tools.inspection import _DeliveryInspectionRequest
+
+        _, _, proof = self._scientific_delivery()
+        inspector = self.case.app.operations.inspection
+        saved = inspector.store.read_json(inspector._path(proof['identity'], 'input'))
+        trace = inspector._closed_source_round(saved, 0)
+        history = [{'role':'system', 'content':'unused'}, {'role':'user', 'content':'unused'},
+            trace['response'], *[{'role':'tool', 'tool_call_id':row['call_id'],
+                'content':json.dumps(row['result'])} for row in trace['results']]]
+        request = _DeliveryInspectionRequest.model_validate(saved['arguments'])
+        _, valid = inspector._working_messages(saved, request, history, [], self.case.services.llm_client)
+        native = [row for row in valid['selected_records'] if row['status'] == 'native'
+            and row['source'].get('kind') == 'source_text']
+        expected = {(f"tools/inspection/{proof['identity']}/sources-0.json#results/{index}",
+            f'data.text_windows.{number}.text')
+            for index, row in enumerate(trace['results']) if row['tool'] == 'read_file'
+            and row['result']['status'] == 'ok'
+            for number, _ in enumerate(row['result']['data'].get('text_windows', []))}
+        self.assertTrue(expected)
+        self.assertEqual({(row['source']['record'], row['source']['field']) for row in native}, expected)
+        self.assertTrue(all(row['source']['field'].startswith('data.text_windows.') for row in native))
+        altered = deepcopy(history)
+        for message in altered[3:]:
+            visible = json.loads(message['content'])
+            visible['data']['unrelated_note'] = visible['data'].pop('text_windows')
+            message['content'] = json.dumps(visible)
+        _, projected = inspector._working_messages(saved, request, altered, [], self.case.services.llm_client)
+        self.assertFalse(any(row['status'] == 'native' and row['source'].get('kind') == 'source_text'
+            for row in projected['selected_records']))
+
+    def test_ordinary_inspection_native_supply_uses_its_saved_contract_and_exact_fields(self):
+        from simple_ar.tools.inspection import InspectionRequest
+        from tests.test_professional_work_loop import _action
+
+        (self.case.root/'workspace'/'native-note.md').write_text('Current original text.\n', encoding='utf-8')
+        reads = []
+        def review(view):
+            if not reads:
+                reads.append(True)
+                return [_action('read_file', path='native-note.md')]
+            return {'findings':[], 'limitations':[]}
+        self.case.review = review
+        self.case._inspect(['native-note.md'], [])
+        inspector = self.case.app.operations.inspection
+        result = self.case._ok('inspect_artifacts')
+        identity = Path(result['data']['record']).parts[1]
+        saved = inspector.store.read_json(inspector._path(identity, 'input'))
+        self.assertEqual(saved['native_supply_policy'], 'turns.v1')
+        trace = inspector._closed_source_round(saved, 0)
+        history = [{'role':'system', 'content':'unused'}, {'role':'user', 'content':'unused'},
+            trace['response'], *[{'role':'tool', 'tool_call_id':row['call_id'],
+                'content':json.dumps(row['result'])} for row in trace['results']]]
+        request = InspectionRequest.model_validate(saved['arguments'])
+        ledger = self.case.app.ledger.to_dict()
+        original = deepcopy(saved)
+        _, supplied = inspector._working_messages(saved, request, history, [], self.case.services.llm_client)
+        native = [row for row in supplied['selected_records'] if row['status'] == 'native'
+            and row['source'].get('kind') == 'source_text']
+        self.assertTrue(native)
+        self.assertTrue(all(row['source']['field'].startswith('data.text_windows.') for row in native))
+        for field in ('sha256', 'next_offset_bytes', 'text'):
+            with self.subTest(field=field):
+                altered = deepcopy(history)
+                for message in altered[3:]:
+                    result = json.loads(message['content'])
+                    if field == 'sha256':
+                        result['data']['sha256'] = '0'*64
+                    else:
+                        for window in result['data'].get('text_windows', []):
+                            window[field] = -1 if field == 'next_offset_bytes' else 'Changed text'
+                    message['content'] = json.dumps(result)
+                _, rejected = inspector._working_messages(saved, request, altered, [], self.case.services.llm_client)
+                self.assertFalse(any(row['status'] == 'native' and row['source'].get('kind') == 'source_text'
+                    for row in rejected['selected_records']))
+        historical = {key:value for key,value in saved.items() if key != 'native_supply_policy'}
+        _, old = inspector._working_messages(historical, request, history, [], self.case.services.llm_client)
+        self.assertFalse(any(row['status'] == 'native' and row['source'].get('field', '').startswith(
+            'data.text_windows.') for row in old['selected_records']))
+        self.assertEqual(saved, original)
+        self.assertEqual(self.case.app.ledger.to_dict(), ledger)
+
+    def test_history_is_grouped_without_reference_limit_and_never_adopted(self):
+        from simple_ar.tools.inspection import _DeliveryInspectionRequest
+
+        inspector = self.case.app.operations.inspection
+        first, second = self.case.inputs / 'many.txt', self.case.inputs / 'other.txt'
+        first.write_text('x' * 2000, encoding='utf-8')
+        second.write_text('OTHER-HISTORY-BODY', encoding='utf-8')
+        references = [{'request':{'path':str(first), 'offset_bytes':i * 8, 'max_bytes':8}}
+            for i in range(200)] + [{'request':{'path':str(second), 'max_bytes':18}}]
+        delivery = DeliveryRequest(summary='Explain scope.', artifacts=[])
+        binding = prepare_delivery_review(self.case.app.workspace, delivery, [],
+            lambda: self.case.app.state['requests'], protocol='task.v4')
+        saved = {'identity':'navigation', 'delivery_context':binding, 'arguments':DeliveryReview._arguments(binding),
+            'targets':[], 'evidence':[], 'prior_required':[], 'user_requests':binding['requests'],
+            'execution_protocol':'shared.v1', 'inspection_context_policy':'retained.v1'}
+        remaining = [512000]
+        with patch.object(inspector, 'material_observations', return_value=references):
+            inspector._reuse_observations(saved, remaining)
+        entries = saved['source_history']['entries']
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0]['requested_byte_ranges'], [(0, 1600)])
+        self.assertEqual(saved['evidence'], [])
+        self.assertEqual(remaining, [512000])
+        request = _DeliveryInspectionRequest.model_validate(saved['arguments'])
+        messages, projection = inspector._working_messages(saved, request,
+            [{'role':'system', 'content':''}, {'role':'user', 'content':''}], [], self.case.services.llm_client)
+        wire = json.dumps(messages)
+        self.assertNotIn('OTHER-HISTORY-BODY', wire)
+        navigation = [row for row in projection['selected_records'] if row['source'].get('field') == 'source_history']
+        self.assertEqual(len(navigation), 2)
+        self.assertTrue(all(row['status'] == 'working_view' for row in navigation))
+        # Withdrawn source authority must not be revived by a retained index.
+        self.case.app.workspace.mounts.pop('measurements')
+        _, revoked = inspector._working_messages(saved, request,
+            [{'role':'system', 'content':''}, {'role':'user', 'content':''}], [], self.case.services.llm_client)
+        self.assertFalse(any(row['source'].get('field') == 'source_history'
+            for row in revoked['selected_records']))
+
+    def test_unknown_or_public_policy_cannot_enable_applicable_inspection(self):
+        inspector = self.case.app.operations.inspection
+        arguments = {'goal':'Explain', 'targets':[], 'evidence':[]}
+        for context in ({'schema_version':'delivery_review.v3', 'scope_policy':'unknown'}, None):
+            result = inspector.call('inspect_artifacts', {**arguments, 'scope_policy':'applicable.v1'},
+                'bad-policy', delivery_context=context)
+            self.assertFalse(result.ok)
+        self.case.send.assert_not_called()
+
+
+class IndependentDeliveryApplicabilityTests(unittest.TestCase):
+    """Independent applicability on the existing delivery path; not scientific QA."""
+
+    def setUp(self):
+        from tests.test_professional_work_loop import OperationsWorkLoopTests
+        self.case = OperationsWorkLoopTests()
+        self.case.setUp()
+        self.addCleanup(self.case.doCleanups)
+        self.case._create(goal='Explain the requested scope and independently verify any empirical '
+            'or numerical assertions in the delivered work.')
+
+    def _complete(self, **kwargs):
+        from tests.test_professional_work_loop import _action
+        return self.case._submit(_action('deliver_result',
+            summary='Requested explanation', artifacts=['note.md']), **kwargs)
+
+    def test_edited_process_markdown_reaches_applicable_review_without_publication(self):
+        import sys
+        from tests.test_professional_work_loop import _action
+        self.case._submit(_action('run_process', argv=[sys.executable, '-c',
+            "from pathlib import Path; Path('note.md').write_text('Original wording.\\n')"],
+            outputs=['note.md'], timeout_sec=5), approve=lambda *_: True)
+        self.case._ok('run_process')
+        digest = self.case._read('note.md')['sha256']
+        self.case._submit(_action('edit_file', path='note.md', expected_sha256=digest,
+            old_text='Original wording.', new_text='Revised explanation.'))
+        self.case._ok('edit_file')
+        operations = self.case.app.operations
+        self.assertEqual(operations.config['professional_operations'], 'work.v5')
+        self.assertEqual(operations.config['delivery_review_protocol'], 'task.v4')
+        delivery = {'summary':'Requested explanation', 'artifacts':['note.md']}
+        # Same real stale process record: saved contracts retain their gate.
+        for protocol in ('task.v1', 'task.v2', 'task.v3'):
+            with self.subTest(protocol=protocol), patch.dict(operations.config,
+                    {'delivery_review_protocol':protocol}):
+                issues = operations.delivery_issues(self.case.app._operation_observations(), delivery)
+                self.assertTrue(any('outputs changed' in issue for issue in issues), issues)
+
+        def review(view):
+            self.assertEqual(view['proposed_delivery']['scope_policy'], 'applicable.v1')
+            source, = self.case._inspection_sources(view, 'note.md')
+            self.assertIsNotNone(source)
+            self.assertIn('Revised explanation.', ''.join(row['text'] for row in source['text_windows']))
+            return {'conclusion':'complete', 'findings':[], 'evidence':[source['subject']],
+                'limitations':['Controlled prose decision; no scientific certification.'],
+                'applicability':'This wording revision contains no empirical or numerical claim.',
+                'investigations':[]}
+        self.case.review = review
+        with (patch.object(operations.publication, 'conversion_inputs',
+                    side_effect=AssertionError('task.v4 has no publication exemption')),
+              patch.object(operations.workspace, 'check_artifact_producers',
+                    wraps=operations.workspace.check_artifact_producers) as producer_check):
+            self._complete()
+            producer_check.assert_not_called()
+        self.assertEqual(self.case.app.session.manifest.status, 'completed')
+        self.assertEqual(len(self.case.inspection_requests), 1)
+        proof = self.case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        self.assertEqual(proof['binding']['artifacts'], operations.workspace.artifact_hashes(
+            [str(operations.workspace.resolve('note.md'))]))
+        self.assertFalse((self.case.root/'tools/publications').exists())
+        with self.assertRaisesRegex(ValueError, 'outputs changed'):
+            operations.workspace.check_artifact_producers(['note.md'])
+        # A changed current version cannot reuse the independent opinion.
+        (self.case.root/'workspace/note.md').write_text('Another revision.\n', encoding='utf-8')
+        self.assertTrue(operations.delivery_issues(self.case.app._operation_observations(), delivery))
+
+    def test_explicit_source_and_table_adoption_keeps_original_input_closure(self):
+        import sys
+        from tests.test_professional_work_loop import _action
+        from simple_ar.tools.producer_declarations import delivery_evidence
+        self.case._write('input.txt', 'original\n')
+        self.case._submit(_action('run_process', argv=[sys.executable, '-c',
+            "from pathlib import Path; data=Path('input.txt').read_text(); "
+            "Path('source.py').write_text('# '+data); Path('table.csv').write_text('value\\n'+data)"],
+            inputs=['input.txt'], outputs=['source.py', 'table.csv'], timeout_sec=5),
+            approve=lambda *_: True)
+        self.case._ok('run_process')
+        app = self.case.app
+        owner = SimpleNamespace(root=self.case.root, workspace=app.workspace,
+            ledger=app.ledger, session_id=app.session.manifest.session_id)
+        for path in ('source.py', 'table.csv'):
+            self.assertEqual(delivery_evidence(owner, app._operation_observations(),
+                {'summary':'Explicitly adopt the computation', 'artifacts':[path]}), ([], []))
+        digest = self.case._read('input.txt')['sha256']
+        self.case._submit(_action('write_file', path='input.txt', content='changed\n',
+            expected_sha256=digest))
+        self.case._ok('write_file')
+        for path in ('source.py', 'table.csv'):
+            with self.subTest(subject=path):
+                delivery = {'summary':'Explicitly adopt the computation', 'artifacts':[path]}
+                with self.assertRaisesRegex(ValueError, 'producer inputs/outputs changed'):
+                    delivery_evidence(owner, app._operation_observations(), delivery)
+
+    def test_current_delivery_is_presupplied_but_does_not_finish_unperformed_science(self):
+        from tests.test_professional_work_loop import _action
+        self.case._write('note.md', 'The supplied sample mean is 9.0.\n')
+        self.case._write('another-object', 'A producer result is not an independent observation.\n')
+        def review(view):
+            sources = self.case._inspection_sources(view, 'note.md', 'another-object')
+            self.assertTrue(all(row is not None for row in sources))
+            self.assertIn('9.0', ''.join(window['text'] for window in sources[0]['text_windows']))
+            return {'conclusion':'complete', 'findings':[],
+                'evidence':[row['subject'] for row in sources], 'limitations':[],
+                'applicability':'The numeric assertion requires checking original observations.',
+                'investigations':[{'claim':'The sample mean is 9.0.',
+                    'method':'Not performed: original observations have not been investigated.',
+                    'reasoning':'Supplied producer artifacts cannot independently validate this claim.',
+                    'evidence':[], 'outcome':'unresolved'}]}
+        self.case.review = review
+        self.case._submit(_action('deliver_result', summary='Producer claims a checked result.',
+            artifacts=['another-object', 'note.md']))
+        self.assertEqual(len(self.case.inspection_requests), 1)
+        self.assertNotEqual(self.case.app.session.manifest.status, 'completed')
+        proof = self.case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        assessment = proof['result']['metadata']['delivery_assessment']
+        self.assertEqual((assessment['coverage'], assessment['verdict']), ('partial', 'incomplete'))
+
+    def test_simple_claim_is_scoped_by_one_independent_decision_and_reused(self):
+        from tests.test_professional_work_loop import _action
+        def review(view):
+            self.assertFalse(view['evidence'])
+            return {'conclusion':'complete', 'findings':[], 'evidence':[],
+                'limitations':[], 'reassessed_prior':[],
+                'applicability':'The exact request and direct explanation require no empirical '
+                    'assertion or artifact investigation.', 'investigations':[]}
+        self.case.review = review
+        delivery = _action('deliver_result', summary='Only supplied observations are in scope.', artifacts=[])
+        self.case._submit(delivery)
+        self.assertEqual(self.case.app.session.manifest.status, 'completed')
+        self.assertEqual(len(self.case.inspection_requests), 1)
+        proof = self.case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        before = self.case.send.call_count
+        self.case._reload()
+        owner = self.case.app.operations.delivery_review
+        reused = owner.review(proof['binding'], 'same-scope', may_start=True)
+        self.assertEqual(reused['identity'], proof['identity'])
+        self.assertEqual(self.case.send.call_count, before)
+        self.assertEqual(reused['result']['metadata']['delivery_assessment']['applicability'],
+            proof['result']['metadata']['delivery_assessment']['applicability'])
+
+        # Delivery uses the same owner-verified opinion before requiring a
+        # connection for another review. A changed claim is not that opinion.
+        from simple_ar.core.capabilities import ArtifactStore
+        delivery = self.case.app.session.store.read_json('delivery.json')
+        call = {'id':'reuse-call', 'function':{'name':'deliver_result',
+            'arguments':json.dumps(delivery, ensure_ascii=False)}}
+        payload = ToolResult(tool_name='deliver_result', data=deepcopy(delivery)).model_dump(mode='json')
+        store = ArtifactStore(self.case.root/'attempts'/'reuse-probe')
+        before_ledger = self.case.app.ledger.to_dict()
+        with patch.object(self.case.app, '_client', side_effect=RuntimeError('Connection unavailable')) as client:
+            self.case.app._bind_delivery(call, payload, store, start_review=True)
+        client.assert_not_called()
+        self.assertEqual(payload['metadata']['delivery_review']['identity'], proof['identity'])
+        self.assertEqual(self.case.app.ledger.to_dict(), before_ledger)
+
+        changed = {**delivery, 'summary':'A different completion claim'}
+        call['function']['arguments'] = json.dumps(changed, ensure_ascii=False)
+        other = ToolResult(tool_name='deliver_result', data=changed).model_dump(mode='json')
+        with patch.object(self.case.app, '_client', side_effect=RuntimeError('Connection unavailable')) as client:
+            self.case.app._bind_delivery(call, other,
+                ArtifactStore(self.case.root/'attempts'/'changed-probe'), start_review=True)
+        client.assert_called_once()
+        self.assertNotIn('delivery_review', other['metadata'])
+        self.assertIn('Connection unavailable', other['metadata']['delivery_review_error'])
+
+    def test_unfinished_delivery_inspection_rebinds_without_starting_or_replaying_work(self):
+        from tests.test_professional_work_loop import _action
+
+        self.case.review = lambda view: {'conclusion':'complete', 'findings':[],
+            'evidence':[], 'limitations':[], 'reassessed_prior':[],
+            'applicability':'This direct explanation has no empirical assertion to check.',
+            'investigations':[]}
+        self.case._submit(_action('deliver_result', summary='Current explanation', artifacts=[]),
+            should_stop=lambda: bool((self.case.app.state['pending'] or {}).get('inspection')))
+        app = self.case.app
+        pending = deepcopy(app.state['pending'])
+        self.assertEqual(app.session.manifest.status, 'paused')
+        self.assertIsNotNone(pending.get('inspection'))
+        owner = app.operations.inspection
+        self.assertFalse(owner.store.exists(owner._path(pending['inspection'], 'result')))
+        original = app.session.store.read_json(f"attempts/{pending['attempt']}/native_result.json")
+        self.assertEqual(original['metadata']['delivery_review']['result']['data'],
+            {'inspection_pending':pending['inspection']})
+        input_before = owner.store.resolve(owner._path(pending['inspection'], 'input')).read_bytes()
+        ledger_before, calls = app.ledger.to_dict(), self.case.send.call_count
+        with (patch.object(app, '_client', side_effect=AssertionError('Rebinding is not a model call')),
+              patch.object(owner, 'advance', side_effect=AssertionError('Do not advance an inspection during rebinding'))):
+            rebound = app._bind_delivery(pending['call'], deepcopy(original),
+                ArtifactStore(self.case.root/'attempts'/pending['attempt']), start_review=False)
+        self.assertEqual(rebound['metadata']['delivery_review'], original['metadata']['delivery_review'])
+        self.assertEqual(app.state['pending'], pending)
+        self.assertEqual(owner.store.resolve(owner._path(pending['inspection'], 'input')).read_bytes(), input_before)
+        self.assertEqual(app.ledger.to_dict(), ledger_before)
+        self.assertEqual(self.case.send.call_count, calls)
+
+        # Existing pending work still rejects a changed/unavailable connection
+        # before continuing either the inspection or its saved child actions.
+        with patch.object(app, '_client', side_effect=ValueError('Named model connection differs')) as client:
+            blocked = app.run(progress=lambda _:None)
+        self.assertEqual(blocked['status'], 'paused')
+        self.assertIn('Named model connection differs', blocked['status_reason'])
+        client.assert_called_once()
+        self.assertEqual(app.state['pending'], pending)
+        self.assertEqual(app.ledger.to_dict(), ledger_before)
+        self.assertEqual(self.case.send.call_count, calls)
+
+        self.case._reload()
+        self.case._run()
+        self.assertEqual(self.case.app.session.manifest.status, 'completed', self.case.app.result_snapshot())
+        self.assertEqual(len(self.case.inspection_requests), 1)
+        self.assertEqual(self.case.app.ledger.to_dict()['entries'][:len(ledger_before['entries'])],
+            ledger_before['entries'])
+
+    def test_producer_empty_checklist_cannot_waive_inspection_or_change_frozen_tools(self):
+        from tests.test_professional_work_loop import _action
+        frozen = deepcopy(self.case.app.state['config']['tool_completions'])
+        self.assertNotIn('complete_work', frozen)
+        self.assertIsNotNone(self.case.app.gateway.registry.get('deliver_result'))
+        self.assertIsNotNone(self.case.app.gateway.registry.get('write_file').completion)
+        self.case._submit(_action('deliver_result', summary='A numerical assertion',
+            artifacts=[], checks=[]))
+        self.assertNotEqual(self.case.app.session.manifest.status, 'completed')
+        self.assertFalse(self.case.inspection_requests)  # Invalid producer schema, not a waiver.
+        self.case._reload()
+        self.assertEqual(self.case.app.state['config']['tool_completions'], frozen)
+        self.case.review = lambda view: {'conclusion':'incomplete', 'findings':[],
+            'evidence':[], 'limitations':[], 'reassessed_prior':[],
+            'applicability':'The empirical assertion needs original observations; '
+                'the producer declaration cannot waive independent verification.',
+            'investigations':[{'claim':'The numerical assertion is correct.',
+                'method':'Not performed: original observations are still needed.',
+                'reasoning':'The declaration supplies no scientific verification.',
+                'evidence':[], 'outcome':'unresolved'}]}
+        self.case._submit(_action('deliver_result',
+            summary='The numerical result is correct. No checks needed; checks=[].', artifacts=[]))
+        self.assertEqual(len(self.case.inspection_requests), 1)
+        self.assertNotEqual(self.case.app.session.manifest.status, 'completed')
+        assessment = self.case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+        self.assertEqual(assessment['investigations'][0]['outcome'], 'unresolved')
+
+    def test_saved_v4_actual_offer_keeps_its_response_contract_without_new_calls(self):
+        from tests.test_professional_work_loop import _action
+        inspector = self.case.app.operations.inspection
+        self.case.review = lambda view: {'conclusion':'complete', 'findings':[],
+            'evidence':[], 'limitations':[], 'reassessed_prior':[]}
+        # Freeze the previously shipped response offer, not a synthetic task
+        # version or a migrated completion map. All journal/usage proofs are real.
+        with patch.object(inspector, '_investigation_contract', return_value=False):
+            self.case._submit(_action('deliver_result', summary='The requested scope.', artifacts=[]))
+        proof = self.case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        saved = inspector.store.read_json(inspector._path(proof['identity'], 'input'))
+        self.assertFalse(inspector._investigation_contract(saved, offering=True))
+        self.assertNotIn('applicability', proof['result']['metadata']['delivery_assessment'])
+        calls, ledger = self.case.send.call_count, self.case.app.ledger.to_dict()
+        self.case._reload()
+        inspector = self.case.app.operations.inspection
+        cached = inspector.call('inspect_artifacts', saved['arguments'], proof['identity'],
+            delivery_context=saved['delivery_context'])
+        self.assertEqual(cached.model_dump(mode='json'), proof['result'])
+        self.assertEqual(self.case.send.call_count, calls)
+        self.assertEqual(self.case.app.ledger.to_dict(), ledger)
+
+    def test_independent_investigation_retains_methods_sources_and_unknown_outcome(self):
+        self.case._write('note.md', 'The supplied sample mean is 2.\n')
+        outcome = ['unresolved']
+        calculation = {}
+
+        def review(view):
+            import sys
+            from tests.test_professional_work_loop import _action
+            if not calculation:
+                spec = next(tool['function'] for tool in self.case.inspection_requests[-1]['tools']
+                    if tool['function']['name'] == 'run_process')
+                scope = spec['parameters']['properties']['cwd']['description'].split(
+                    'workspace/inspection-work/', 1)[1].split('/', 1)[0]
+                work = 'workspace/inspection-work/' + scope
+                calculation['output'] = work + '/independent.txt'
+                source = str(self.case.inputs / 'observations.csv')
+                return [_action('run_process', cwd=work, argv=[sys.executable, '-c',
+                    "import csv; from pathlib import Path; "
+                    f"rows=list(csv.DictReader(Path({source!r}).open(encoding='utf-8'))); "
+                    "values=[float(row['value']) for row in rows]; "
+                    "Path('independent.txt').write_text(str(sum(values)/len(values)), encoding='utf-8')"],
+                    inputs=['measurements/observations.csv'], outputs=[calculation['output']], timeout_sec=5)]
+            sources = self.case._inspection_sources(view, calculation['output'])
+            if sources[0] is None:
+                return [_action('read_file', path=calculation['output'])]
+            evidence = [sources[0]['subject']]
+            return {'conclusion':'complete', 'findings':[], 'evidence':evidence,
+                'limitations':[], 'reassessed_prior':[], 'investigations':[{
+                    'claim':'The supplied sample mean is 2.', 'method':'Independently recompute sum and count from the original CSV in a bound process.',
+                    'reasoning':'The observed values are 1, 2, 3; (1+2+3)/3 is 2. '
+                        'Controlled test judgment; no scientific correctness certification.',
+                    'evidence':evidence, 'outcome':outcome[0]}]}
+
+        self.case.review = review
+        self._complete(approve=lambda *_: True)
+        self.assertNotEqual(self.case.app.session.manifest.status, 'completed')
+        first = self.case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        assessment = first['result']['metadata']['delivery_assessment']
+        self.assertEqual(assessment['verdict'], 'incomplete')
+        self.assertEqual(assessment['investigations'][0]['outcome'], 'unresolved')
+        self.assertTrue(any('Unfinished independent' in text for text in assessment['limitations']))
+        outcome[0] = 'supported'
+        calculation.clear()
+        self._complete(approve=lambda *_: True)
+        proof = self.case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        self.assertNotEqual(first['identity'], proof['identity'])
+        self.assertEqual(proof['result']['metadata']['delivery_assessment']['verdict'], 'passed')
+        self.assertIn(str(self.case.inputs / 'observations.csv'),
+            proof['result']['metadata']['delivery_assessment']['evidence_sha256'])
+        self.assertEqual(self.case.app.session.manifest.status, 'completed')
+        # Reuse must still verify original source versions without another call.
+        inspector = self.case.app.operations.inspection
+        saved = inspector.store.read_json(inspector._path(proof['identity'], 'input'))
+        (self.case.inputs / 'observations.csv').write_text('sample,value\na,100\n', encoding='utf-8')
+        calls = self.case.send.call_count
+        result = inspector.call('inspect_artifacts', saved['arguments'], proof['identity'],
+            delivery_context=saved['delivery_context'])
+        self.assertFalse(result.ok)
+        self.assertEqual(self.case.send.call_count, calls)
+
+    def test_schema_opinion_cannot_substitute_for_performed_investigation(self):
+        from simple_ar.tools.inspection import InspectionToolGateway
+        inspector = self.case.app.operations.inspection
+        saved = {'delivery_context': {'schema_version':'delivery_review.v3',
+            'scope_policy':'applicable.v1', 'artifacts': {}},
+            'finding_policy':'linked.v1', 'prior_required':[], 'targets':[], 'evidence':[]}
+        response = {'conclusion':'complete', 'findings':[], 'limitations':[],
+            'applicability':'The numerical assertion needs independent verification.',
+            'evidence':[], 'reassessed_prior':[], 'investigations':[{
+                'claim':'An empirical assertion', 'method':'The files exist.',
+                'reasoning':'The producer says it passed.', 'evidence':[], 'outcome':'supported'}]}
+        with self.assertRaisesRegex(ValueError, 'actual observed evidence'):
+            InspectionToolGateway._delivery_decision(inspector, saved, response)
+        response['applicability'] = ' '
+        with self.assertRaisesRegex(ValueError, 'Independent applicability'):
+            InspectionToolGateway._delivery_decision(inspector, saved, response)
 
 
 if __name__ == '__main__':

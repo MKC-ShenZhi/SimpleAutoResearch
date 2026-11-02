@@ -15,7 +15,7 @@ from simple_ar.code_task.generation.writer import write_implementation_unit
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.integrations.llm import LLMClient, LLMResponseError
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
-from simple_ar.tools.workspace import FileWindow
+from simple_ar.tools.workspace import DeliveryRequest, FileWindow
 from simple_ar.code_task.generation.selection import select_implementation_files, bind_implementation_originals
 from simple_ar.tools.implementation_run import ExecuteImplementationRequest
 
@@ -424,17 +424,20 @@ class ImplementationToolGateway:
         return []
 
     def delivery_issues(self, observations: list[dict[str, Any]]) -> list[str]:
-        if self.preparation_only or self.exact is not None and not self.declaration_review:
-            # Independent source/execute operations do not own task completion.
-            # The common delivery checks actual current process ancestry, not
-            # whichever prepared execution happened to run most recently.
-            return []
-        from simple_ar.tools.implementation_run import delivery_issues
-        return delivery_issues(self, observations)
+        return self.delivery_issues_for(observations, None, [])
 
     def delivery_issues_for(self, observations: list[dict[str, Any]], delivery: dict | None,
-                            adoptions: list[dict]) -> list[str]:
-        if self.preparation_only or self.exact is not None and not self.declaration_review:
+                            adoptions: list[dict], *, require_current_origin: bool = True) -> list[str]:
+        if self.exact is not None:
+            if delivery is None or DeliveryRequest.model_validate(delivery).unresolved:
+                return []
+            try:
+                self.validated_delivery(observations, delivery['artifacts'],
+                    require_current_origin=require_current_origin)
+            except (ValueError, OSError, KeyError, RuntimeError) as exc:
+                return [str(exc)]
+            return []
+        if self.preparation_only:
             return []
         from simple_ar.tools.implementation_run import delivery_issues
         return delivery_issues(self, observations, delivery=delivery, declaration_adoptions=adoptions)
@@ -1508,6 +1511,51 @@ class ImplementationToolGateway:
                              'supply the intended project explicitly as read-only --project material: '
                              + '; '.join(sorted(str(path) for path in candidates)))
         return next(iter(candidates), None)
+
+    def validated_delivery(self, observations: list[dict[str, Any]], artifacts: list[str] | None = None,
+                           *, require_current_origin: bool = True) -> dict[str, Any]:
+        """Select the latest accepted exact candidate, including across feedback."""
+        accepted = next((row for row in reversed(observations)
+            if row.get('contract_current', True) and row.get('tool_name') == 'implement_code_task'), None)
+        if accepted is None or accepted.get('status') != 'ok':
+            raise ValueError('Frozen code contract needs a validated implementation or an explicit partial delivery')
+        data = accepted['data']
+        self.check_delivery(data, artifacts if artifacts is not None else [data['project_path']],
+            require_current_origin=require_current_origin)
+        return data
+
+    def report_evidence(self, observations: list[dict[str, Any]], *,
+                        require_current_origin: bool = True) -> dict[str, Any]:
+        """Bind the exact candidate's accepted predecessor chain for report consumers."""
+        if self.exact is None:
+            return {'implementation_refs': [], 'evidence_sha256': {}}
+        self.validated_delivery(observations, require_current_origin=require_current_origin)
+        refs = [row['artifacts'][0] for row in observations
+            if row.get('tool_name') == 'implement_code_task' and row.get('status') == 'ok']
+        store = ArtifactStore(self.root)
+        lineage, current, paths = [], refs[-1], set()
+        while current:
+            if Path(current).name == 'execution.json':
+                source = self.prepared_source(self.workspace.locator(str(store.resolve(current))),
+                    identity=Path(refs[-1]).parent.name)
+                paths.update(self.workspace.resolve(name).relative_to(self.root).as_posix()
+                    for name in source['evidence_hashes'])
+                break  # An unchanged preparation is evidence, never validated code.
+            if current in lineage or current not in refs:
+                raise ValueError('Implementation lineage is cyclic or lacks an accepted receipt')
+            lineage.append(current)
+            prior = store.read_json(current).get('native_binding', {}).get('binding', {}).get('prior_source')
+            if prior and hashlib.sha256(self.workspace.resolve(prior['record']).read_bytes()).hexdigest() != prior['sha256']:
+                raise ValueError('Implementation predecessor evidence changed')
+            current = self.workspace.resolve(prior['record']).relative_to(self.root).as_posix() if prior else ''
+        refs = list(reversed(lineage))
+        paths.update(refs)
+        for ref in refs:
+            paths.update((Path(ref).parent / row['path']).as_posix()
+                for row in store.read_json(ref).get('artifact_refs', {}).values())
+        return {'implementation_refs': refs,
+            'evidence_sha256': {path: hashlib.sha256(store.resolve(path).read_bytes()).hexdigest()
+                for path in sorted(paths)}}
 
     def check_delivery(self, result: dict[str, Any], artifacts: list[str], *,
                        require_current_origin: bool = True) -> None:

@@ -13,7 +13,7 @@ import shutil
 import sys
 import tempfile
 import zipfile
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable, Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
@@ -26,6 +26,48 @@ from simple_ar.tools.specs import CommonToolSpec, ToolResult, tool_completion
 
 _COPY_MAX_BYTES = 64 * 1024 * 1024
 _FULL_DIGEST_MAX_BYTES = 64 * 1024 * 1024
+
+
+class _ProcessArtifactRecord(NamedTuple):
+    binding: dict | None
+    output_versions: dict
+    complete_outputs: dict | None
+    successful_outputs: dict | None
+    recorded_outputs: dict | None
+
+
+def _process_artifact_record(record: dict) -> _ProcessArtifactRecord:
+    """Interpret one invocation without reading its inputs or output files.
+
+    Declared outputs still establish ownership for failed or interrupted runs.
+    Raw output versions also locate historical edges even if the invocation
+    failed. A working-view binding additionally requires every digest to be
+    well formed. Current and historical checks validate each consumed output
+    separately, so a sibling's digest does not invalidate that output.
+    """
+    binding = (record.get('input_binding') or {}).get('workspace_artifacts')
+    if binding is None:
+        return _ProcessArtifactRecord(None, {}, None, None, None)
+    if binding.get('version') != 1:
+        raise ValueError('Unsupported process artifact binding version')
+    output = record.get('output_binding') or {}
+    if not isinstance(output, dict):
+        output = {}
+    versions = output.get('outputs', {})
+    if not isinstance(versions, dict):
+        versions = {}
+        complete = False
+    else:
+        complete = (output.get('version') == 1
+            and set(versions) == set(binding['outputs']))
+    successful = (record.get('status') == 'finished' and record.get('returncode') == 0
+                  and not record.get('stop_reason') and not record.get('output_binding_error'))
+    complete_outputs = versions if complete else None
+    successful_outputs = complete_outputs if successful else None
+    recorded_outputs = (successful_outputs if successful_outputs is not None
+        and all(isinstance(digest, str) and re.fullmatch(r'[0-9a-fA-F]{64}', digest)
+                for digest in successful_outputs.values()) else None)
+    return _ProcessArtifactRecord(binding, versions, complete_outputs, successful_outputs, recorded_outputs)
 
 
 def validate_delivery_patterns(patterns: list[str]) -> list[str]:
@@ -320,6 +362,14 @@ def workspace_observation_view(result: dict, *, record: str, directory_path: str
     tool result, delivery inventory, or accepted tool-argument transformation.
     Project-copy previews link to the complete immutable file/version inventory.
     """
+    if (result.get('tool_name') == 'edit_file' and result.get('status') == 'ok'
+            and not result.get('error') and isinstance(record, str) and record):
+        data = result.get('data')
+        if isinstance(data, dict) and 'authored_text' in data:
+            return {**result, 'data': {
+                key: value for key, value in data.items() if key != 'authored_text'} | {
+                    'authored_text_source': {'record': record, 'field': 'data.authored_text',
+                        'scope': 'Complete authored edit result retained at this field; not a read or independent evidence. Body is not supplied by this view.'}}}
     if result.get('tool_name') == 'copy_project' and result.get('status') == 'ok' and not result.get('error'):
         data = result.get('data', {})
         files = data.get('files')
@@ -807,27 +857,44 @@ class WorkspaceToolGateway:
                     'scope': 'Recorded delivery for this request count; no current acceptance or byte verification.'}
             if isinstance(pinned, dict):
                 groups.append((owner, pinned, 'delivery_binding'))
+            # Professional owners may have recorded their actual output bytes
+            # in the accepted observation. Registration without an original
+            # observation binding is not enough to upgrade historical files.
+            versions = data.get('artifact_sha256')
+            inspection = metadata.get('inspection_binding') or {}
+            if isinstance(inspection, dict) and data.get('record') and inspection.get('assessment_sha256'):
+                versions = {**(versions if isinstance(versions, dict) else {}),
+                            data['record']: inspection['assessment_sha256']}
+            if successful and name != 'finish_professional_work' and isinstance(versions, dict):
+                try:
+                    from simple_ar.tools.professional_outcomes import accepted_native_result
+                    session_id = read_json(self.root / 'session_manifest.json')['session_id']
+                    accepted_native_result(self.root, session_id, observed, Path(event['record']).parent.name,
+                                           require_content_binding=True)
+                except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+                    pass
+                else:
+                    groups.append((owner, versions, 'professional_output_binding'))
             # The invocation is the output-binding owner for both fresh and
             # recovered runs. Never reinterpret argv or bind historical bytes.
             if successful and name == 'run_process' and isinstance(data.get('receipt'), str):
                 try:
+                    from simple_ar.tools.professional_outcomes import accepted_native_result
+                    session_id = read_json(self.root / 'session_manifest.json')['session_id']
+                    accepted_native_result(self.root, session_id, observed, Path(event['record']).parent.name,
+                                           require_content_binding=True)
                     receipt = self._process_diagnostic_path(str(self.root / data['receipt']))
                     if receipt is not None and receipt.name == 'invocation.json':
-                        process = read_json(receipt)
-                        binding = (process.get('input_binding') or {}).get('workspace_artifacts') or {}
-                        outputs = process.get('output_binding') or {}
+                        raw = receipt.read_bytes()
+                        if hashlib.sha256(raw).hexdigest() != data.get('receipt_sha256'):
+                            raise ValueError('Process receipt is not bound to the accepted observation')
+                        process = json.loads(raw.decode('utf-8'))
+                        outputs = _process_artifact_record(process).recorded_outputs
                         if (receipt.parent.name == Path(event['record']).parent.name
-                                and process.get('invocation_id') == receipt.parent.name
-                                and process.get('status') == 'finished' and process.get('returncode') == 0
-                                and not process.get('stop_reason') and not process.get('output_binding_error')
-                                and binding.get('version') == 1 and outputs.get('version') == 1
-                                and isinstance(outputs.get('outputs'), dict)
-                                and all(isinstance(digest, str) and re.fullmatch(r'[0-9a-fA-F]{64}', digest)
-                                        for digest in outputs['outputs'].values())
-                                and set(outputs['outputs']) == set(binding.get('outputs', []))):
+                                and process.get('invocation_id') == receipt.parent.name and outputs is not None):
                             groups.append(({**owner, 'receipt': str(receipt)},
-                                           outputs['outputs'], 'process_output_binding'))
-                except (OSError, ValueError, KeyError, TypeError):
+                                           outputs, 'process_output_binding'))
+                except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                     pass  # Missing or historical unbound execution is not production proof.
             # Existing native artifact identities remain visible even without a
             # version binding; primitive write receipts already own their digest.
@@ -994,6 +1061,368 @@ class WorkspaceToolGateway:
                     + '. Regenerate the affected outputs from current inputs in an explicitly approved '
                     'process declaring those outputs; no current publication or automatic rerun')
 
+    def artifact_sources(self, versions: dict[str, str], *, records: Iterable[dict] = (),
+                         cache: dict | None = None) -> dict[str, dict]:
+        """Interpret accepted output versions and explicit copies from existing receipts.
+
+        A path and a current hash alone never identify a producer. Each edge is
+        taken from its owner before the consuming event; unbound, overwritten,
+        or ambiguously ordered versions are ordinary material. The index exists
+        only for this read and never upgrades historical receipts.
+        """
+        from simple_ar.core.capabilities import ArtifactStore
+        from simple_ar.tools.professional_outcomes import accepted_native_result
+
+        cache = {} if cache is None else cache
+        session_id = ArtifactStore(self.root).read_json('session_manifest.json')['session_id']
+        extra = list(records)
+        key = tuple((row.get('attempt'), row.get('record'), row.get('record_sha256'), row.get('action_sha256'))
+                    for row in extra if isinstance(row, dict))
+        processes = self.root / 'tools' / 'processes'
+
+        def process_snapshot():
+            if not processes.is_dir():
+                return [], ()
+            rows, stamp = [], []
+            for receipt, record, binding, versions_, successful in self._artifact_producer_records(processes):
+                raw = receipt.read_bytes()
+                if json.loads(raw.decode('utf-8')) != record:
+                    raise ValueError('Process receipt changed during inventory')
+                rows.append((receipt, record, binding, versions_, successful))
+                stamp.append((str(receipt), hashlib.sha256(raw).hexdigest()))
+            return rows, tuple(sorted(stamp))
+
+        try:
+            process_rows, process_stamp = process_snapshot()
+            inventory_uncertain = False
+        except (ValueError, OSError, KeyError, TypeError):
+            process_rows, process_stamp, inventory_uncertain = [], None, True
+        cached = cache.get(('artifact_sources', key))
+        if cached is not None and (inventory_uncertain or cached['process_stamp'] != process_stamp):
+            cached = None
+        if cached is None:
+            store = ArtifactStore(self.root)
+            events, seen = [], set()
+            journal_path = self.root / 'actions.json'
+            journal_raw = journal_path.read_bytes() if journal_path.is_file() else None
+            journal_digest = hashlib.sha256(journal_raw).hexdigest() if journal_raw is not None else None
+
+            def add(locator: str, call: dict | None = None, reference: dict | None = None,
+                    position: int | None = None) -> None:
+                try:
+                    path = self.resolve(str(self.root / locator) if locator.startswith('attempts/') else locator)
+                    relative = path.relative_to((self.root / 'attempts').resolve())
+                    if len(relative.parts) != 2 or relative.name != 'native_result.json' or str(path) in seen:
+                        return
+                    if reference is not None:
+                        action_path = self.root / 'attempts' / reference['attempt'] / 'action.json'
+                        if (hashlib.sha256(path.read_bytes()).hexdigest() != reference.get('record_sha256')
+                                or hashlib.sha256(action_path.read_bytes()).hexdigest() != reference.get('action_sha256')):
+                            return
+                    seen.add(str(path))
+                    observed = read_json(path)
+                    if not isinstance(observed, dict):
+                        return
+                    if not observed.get('artifacts') and observed.get('tool_name') not in {
+                            'write_file', 'edit_file', 'copy_file', 'copy_project', 'run_process',
+                            'execute_implementation'}:
+                        return
+                    identity = relative.parts[0]
+                    trusted = True
+                    try:
+                        accepted_native_result(self.root, session_id, observed, identity,
+                                               require_content_binding=True)
+                    except (ValueError, OSError, KeyError, TypeError, RuntimeError):
+                        trusted = False
+                    action_path = path.parent / 'action.json'
+                    action = read_json(action_path) if action_path.is_file() else {}
+                    original_action, original_identity, recovery_ids = action, identity, set()
+                    while isinstance(original_action, dict) and original_action.get('recovered_from'):
+                        previous = original_action['recovered_from']
+                        if (not isinstance(previous, str) or previous in recovery_ids
+                                or original_identity != previous + '-receipt'):
+                            raise ValueError('Unproved recovered action')
+                        recovery_ids.add(previous)
+                        original_identity = previous
+                        original_action = read_json(self.root / 'attempts' / previous / 'action.json')
+                    if call is None:
+                        call = action.get('call')
+                    arguments = json.loads((call or {}).get('function', {}).get('arguments', '{}'))
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+                    data, metadata = observed.get('data') or {}, observed.get('metadata') or {}
+                    name = observed.get('tool_name')
+                    # Acceptance preserves the actual outcome, not success.
+                    # A known conflict did not write; other failed operations
+                    # may still have published declared artifacts.
+                    if observed.get('status') != 'ok':
+                        if data.get('conflict'):
+                            return
+                        trusted = False
+                    outputs, inputs, links, previous = {}, {}, {}, {}
+
+                    def output(name: str, digest: Any) -> None:
+                        if isinstance(name, str):
+                            try:
+                                outputs[self.resolve(name)] = digest if isinstance(digest, str) and re.fullmatch(
+                                    r'[0-9a-f]{64}', digest) else None
+                            except (ValueError, OSError):
+                                pass
+
+                    # An unproved artifact is a barrier, not a producer.
+                    for artifact in observed.get('artifacts') or []:
+                        output(artifact, None)
+                    if name == 'run_process' and isinstance(arguments.get('outputs'), list):
+                        for declared in arguments['outputs']:
+                            output(declared, None)
+                    hashes = data.get('artifact_sha256')
+                    if trusted and isinstance(hashes, dict) and name != 'finish_professional_work':
+                        for name_, digest in hashes.items():
+                            try:
+                                if self.resolve(name_) in outputs:
+                                    output(name_, digest)
+                            except (ValueError, OSError, TypeError):
+                                continue
+                    if trusted and name in {'write_file', 'edit_file', 'copy_file'}:
+                        output(data.get('absolute_path'), data.get('sha256'))
+                        admitted = _TOOLS[name][0].model_validate(arguments)
+                        before = admitted.expected_sha256
+                        target = self.resolve(admitted.path)
+                        if before:
+                            previous[target] = before
+                        if before == data.get('sha256'):
+                            links[target] = (target, before)
+                    if trusted and name == 'copy_file' and data.get('source_sha256') == data.get('sha256'):
+                        target, source = self.resolve(data['absolute_path']), self.resolve(data['source'])
+                        inputs[source] = data['source_sha256']
+                        links[target] = (source, data['source_sha256'])
+                    if trusted and name == 'copy_project' and isinstance(data.get('files'), dict):
+                        target, source = self.resolve(data['absolute_path']), self.resolve(data['source'])
+                        if not isinstance(call, dict) or not isinstance(call.get('function'), dict):
+                            trusted = False  # The archive/member distinction was not retained.
+                        for member, digest in data['files'].items():
+                            child = self.resolve(str(target / member))
+                            if not child.is_relative_to(target):
+                                continue
+                            output(str(child), digest if trusted else None)
+                            if trusted and member != arguments.get('archive_name'):
+                                original = self.resolve(str(source / member))
+                                if original.is_relative_to(source):
+                                    inputs[original] = digest
+                                    links[child] = (original, digest)
+                    binding = metadata.get('inspection_binding') or {}
+                    if trusted and isinstance(binding, dict) and isinstance(data.get('record'), str):
+                        output(data['record'], binding.get('assessment_sha256'))
+                    source_inputs = data.get('input_sha256')
+                    if trusted and isinstance(source_inputs, dict):
+                        declared_inputs = {self.resolve(path_): digest for path_, digest in source_inputs.items()
+                                  if isinstance(path_, str) and isinstance(digest, str)
+                                  and re.fullmatch(r'[0-9a-f]{64}', digest)}
+                        if (len(declared_inputs) != len(source_inputs)
+                                or any(path_ in inputs and inputs[path_] != digest
+                                       for path_, digest in declared_inputs.items())):
+                            trusted = False
+                        inputs.update(declared_inputs)
+                    if trusted and name == 'inspect_artifacts' and binding.get('assessment_sha256'):
+                        assessments = metadata.get('assessments')
+                        if assessments is None:
+                            assessments = [metadata.get('delivery_assessment') or metadata.get('assessment')]
+                        for assessment in assessments if isinstance(assessments, list) else []:
+                            if not isinstance(assessment, dict):
+                                continue
+                            for field in ('subjects', 'artifacts', 'evidence_sha256'):
+                                for name_, digest in (assessment.get(field) or {}).items():
+                                    source_path = self.resolve(name_)
+                                    if source_path in inputs and inputs[source_path] != digest:
+                                        trusted = False
+                                    inputs[source_path] = digest
+                    process_record = None
+                    if name in {'run_process', 'execute_implementation'} and isinstance(data.get('receipt'), str):
+                        receipt = self.root / data['receipt']
+                        expected_dir = self.root / 'tools' / 'processes'
+                        if (receipt.parent.parent == expected_dir and receipt.name == 'invocation.json'
+                                and receipt.parent.name == original_identity):
+                            try:
+                                raw_receipt = receipt.read_bytes()
+                                process_record = json.loads(raw_receipt.decode('utf-8'))
+                                interpreted = _process_artifact_record(process_record)
+                            except (ValueError, OSError, TypeError):
+                                process_record = None
+                                interpreted = None
+                            if (process_record is not None and process_record.get('invocation_id') == receipt.parent.name
+                                    and interpreted.binding is not None):
+                                # A failed or incomplete declared writer is an
+                                # unknown version boundary, even when the old
+                                # bytes happen to remain on disk.
+                                bound = (trusted and isinstance(data.get('receipt_sha256'), str)
+                                    and hashlib.sha256(raw_receipt).hexdigest() == data['receipt_sha256'])
+                                versions = (interpreted.recorded_outputs or {}) if bound else {}
+                                for name_ in interpreted.binding['outputs']:
+                                    output(name_, versions.get(name_))
+                                inputs = {self.resolve(name_): digest for name_, digest in
+                                          interpreted.binding['inputs'].items()}
+                                trusted = bound and interpreted.recorded_outputs is not None
+                    if outputs:
+                        attempt = ArtifactStore(self.root / 'attempts' / original_identity).read_attempt_manifest()
+                        events.append({'record': str(path), 'observed': observed, 'trusted': trusted,
+                            'outputs': outputs, 'inputs': inputs, 'links': links, 'previous': previous,
+                            'tool_name': name, 'process': process_record, 'reference': reference,
+                            'position': position, 'start': attempt.created_at, 'end': attempt.updated_at})
+                except (ValueError, OSError, KeyError, TypeError, RuntimeError):
+                    return  # Inaccessible unrelated history does not acquire ownership.
+
+            try:
+                journal = json.loads(journal_raw.decode('utf-8')) if journal_raw is not None else {}
+                journal_position = 0
+                for turn in journal.get('turns', []):
+                    try:
+                        reply = store.read_json(turn['reply'])
+                        calls = {row['id']: row for row in reply.get('tool_calls', [])}
+                    except (ValueError, OSError, KeyError, TypeError):
+                        calls = {}
+                    for item in turn.get('tools', []):
+                        journal_position += 1
+                        locator = item.get('result')
+                        if not isinstance(locator, str):
+                            continue
+                        # Child actions are ordered by the parent's accepted
+                        # inspection journal, before its final observation.
+                        try:
+                            parent = store.read_json(locator)
+                            nested = (parent.get('metadata') or {}).get('delivery_review', {}).get('result', parent)
+                            review_locator = item.get('review_result')
+                            if isinstance(review_locator, str):
+                                review_path = self.resolve(str(self.root / review_locator)
+                                    if review_locator.startswith('attempts/') else review_locator)
+                                review = read_json(review_path)
+                                accepted_native_result(self.root, session_id, review, review_path.parent.name,
+                                                       require_content_binding=True)
+                                review_action = read_json(review_path.parent / 'action.json')
+                                review_parts = Path((review.get('data') or {}).get('record', '')).parts
+                                if (len(review_parts) < 4 or review_parts[0] != 'attempts'
+                                        or review_parts[2] != 'inspection'
+                                        or (review_action.get('origin') or {}).get('scope') != review_parts[1]):
+                                    raise ValueError('Separate inspection action has a different scope')
+                                nested = review
+                            artifact = (nested.get('data') or {}).get('record', '')
+                            parts = Path(artifact).parts
+                            binding = (nested.get('metadata') or {}).get('inspection_binding') or {}
+                            if len(parts) >= 4 and parts[0] == 'attempts' and parts[2] == 'inspection':
+                                input_path = self.root / 'tools' / 'inspection' / parts[1] / 'input.json'
+                                raw = input_path.read_bytes()
+                                if hashlib.sha256(raw).hexdigest() == binding.get('input_sha256'):
+                                    for child in json.loads(raw.decode('utf-8')).get('source_invocations', []):
+                                        if isinstance(child, dict) and isinstance(child.get('record'), str):
+                                            add(child['record'], reference=child)
+                        except (ValueError, OSError, KeyError, TypeError, AttributeError):
+                            pass
+                        add(locator, calls.get(item.get('id')), position=journal_position)
+            except (ValueError, OSError, KeyError, TypeError):
+                pass
+            for row in extra:
+                if isinstance(row, dict) and isinstance(row.get('record'), str):
+                    add(row['record'], reference=row)
+            # Operations without an accepted native result may still have
+            # touched declared outputs. Include them as unknown boundaries,
+            # rather than making them disappear from the version history.
+            known = {row['process']['invocation_id'] for row in events if row['process'] is not None}
+            if not inventory_uncertain:
+                try:
+                    for receipt, record, binding, _, _ in process_rows:
+                        if record['invocation_id'] in known:
+                            continue
+                        outputs = {self.resolve(name): None for name in binding['outputs']}
+                        if outputs:
+                            events.append({'record': str(receipt), 'observed': None, 'trusted': False,
+                                'outputs': outputs, 'inputs': {}, 'links': {}, 'tool_name': 'run_process',
+                                'process': record, 'reference': None, 'position': None,
+                                'start': record.get('started_at'), 'end': record.get('finished_at')})
+                except (ValueError, OSError, KeyError, TypeError):
+                    inventory_uncertain = True
+            cached = {'events': events, 'journal_sha256': journal_digest,
+                      'inventory_uncertain': inventory_uncertain, 'process_stamp': process_stamp}
+            cache[('artifact_sources', key)] = cached
+
+        def verify_source(event: dict) -> None:
+            # Revalidate only owners actually reached; unrelated damaged
+            # receipts must not block the selected material.
+            reference = event['reference']
+            if reference is not None:
+                action_path = self.root / 'attempts' / reference['attempt'] / 'action.json'
+                if (hashlib.sha256(Path(event['record']).read_bytes()).hexdigest() != reference['record_sha256']
+                        or hashlib.sha256(action_path.read_bytes()).hexdigest() != reference['action_sha256']):
+                    raise ValueError('Accepted child receipt changed during provenance lookup')
+            if event['process'] is not None:
+                process = event['process']
+                receipt = self.root / 'tools' / 'processes' / process['invocation_id'] / 'invocation.json'
+                raw = receipt.read_bytes()
+                path = Path(event['record'])
+                accepted_native_result(self.root, session_id, event['observed'], path.parent.name,
+                                       require_content_binding=True)
+                if (json.loads(raw.decode('utf-8')) != process or hashlib.sha256(raw).hexdigest()
+                        != event['observed'].get('data', {}).get('receipt_sha256')):
+                    raise ValueError('Process owner receipt changed during provenance lookup')
+            else:
+                path = Path(event['record'])
+                accepted_native_result(self.root, session_id, event['observed'], path.parent.name,
+                                       require_content_binding=True)
+
+        history = [{'position': event['position'], 'start': event['start'], 'end': event['end'],
+                    'outputs': event['outputs'], 'inputs': event['inputs'],
+                    'previous': event.get('previous', {}),
+                    'links': {path: [link] for path, link in event['links'].items()}, 'source': event}
+                   for event in cached['events']]
+        resolved = {}
+        for name, digest in versions.items():
+            path = self.resolve(name)
+            if path in resolved and resolved[path] != digest:
+                raise ValueError('Conflicting versions of one selected artifact')
+            resolved[path] = digest
+        sources = ({path: {'status': 'unknown', 'dependencies': {}} for path in resolved}
+                   if cached['inventory_uncertain'] else
+                   self._check_retained_producers(resolved, history, provenance=True, verify_source=verify_source))
+        journal_path = self.root / 'actions.json'
+        current = hashlib.sha256(journal_path.read_bytes()).hexdigest() if journal_path.is_file() else None
+        if current != cached['journal_sha256']:
+            raise ValueError('Operation journal changed during provenance lookup')
+        if not cached['inventory_uncertain'] and process_snapshot()[1] != cached['process_stamp']:
+            raise ValueError('Process inventory changed during provenance lookup')
+        return {name: sources[self.resolve(name)] for name in versions}
+
+    def artifact_dependencies(self, sources: dict[str, dict]) -> dict[str, str]:
+        """Project consumed inputs from version-bound lineage, never display summaries.
+
+        Copies preserve the original observation boundary; replacing their old
+        source path is not a change to the copy. An edit's prior bytes are an
+        authoring precondition, not a computational input of the new text.
+        """
+        dependencies = {}
+        for source in sources.values():
+            graph = source.get('lineage')
+            if graph is None:
+                continue  # Unrecorded material has no invented process ancestry.
+            nodes = {node['id']: node for node in graph['nodes']}
+            pending, visited = [graph['root']], set()
+            while pending:
+                identity = pending.pop()
+                if identity in visited:
+                    continue
+                visited.add(identity)
+                node = nodes[identity]
+                if node['state'] != 'recorded':
+                    continue  # A diagnostic file is readable, not producer proof.
+                for edge in node['edges']:
+                    if edge['kind'] == 'previous':
+                        continue
+                    upstream = nodes[edge['node']]
+                    if edge['kind'] == 'input':
+                        path, digest = str(upstream['path']), upstream['sha256']
+                        if path in dependencies and dependencies[path] != digest:
+                            raise ValueError('Selected artifacts consume conflicting historical input versions: ' + path)
+                        dependencies[path] = digest
+                    pending.append(edge['node'])
+        return dependencies
+
     def check_artifact_producers(self, locators: Iterable[str], *, cache: dict | None = None,
                                  refresh: bool = False,
                                  retained_versions: dict[Path, str] | None = None,
@@ -1036,6 +1465,9 @@ class WorkspaceToolGateway:
         if producer_index_cache is not None:
             producer_index_cache.setdefault('producers', producers)
         visited = cache.setdefault('checked', set())
+        # Publish newly checked paths only after the whole call succeeds. A
+        # later root failure must not leave earlier roots or dependencies cached.
+        checked_paths = set()
         visiting = set()
         # Share receipt/input validation within this call, by object identity
         # rather than invocation_id. Output bytes are checked per owned path:
@@ -1045,7 +1477,7 @@ class WorkspaceToolGateway:
         def check(path: Path) -> None:
             if producer_index_cache is not None:
                 producer_index_cache.setdefault('observed', set()).add(path)
-            if path in visited or path in visiting or path not in producers:
+            if path in visited or path in checked_paths or path in visiting or path not in producers:
                 return
             _, record, binding = producers[path]
             if record is None:
@@ -1053,14 +1485,12 @@ class WorkspaceToolGateway:
             owner = (id(record), id(binding))
             if record.get('output_binding_error'):
                 raise ValueError(f"Declared producer has no successful output binding for {path.name}: {record['output_binding_error']}; no replay")
-            output = record.get('output_binding') or {}
-            if (record.get('status') != 'finished' or record.get('returncode') != 0
-                    or record.get('stop_reason') or output.get('version') != 1
-                    or set(output.get('outputs', {})) != set(binding['outputs'])):
+            outputs = _process_artifact_record(record).successful_outputs
+            if outputs is None:
                 raise ValueError(f'Declared producer has no successful output binding: {path.name}; inspect receipt, no replay')
             if owner not in checked_records:
                 self._check_process_inputs(binding, identity=record['invocation_id'])
-            owned_outputs = {name: digest for name, digest in output['outputs'].items()
+            owned_outputs = {name: digest for name, digest in outputs.items()
                              if resolve_mounted_path(self.mounts, name, discovery=True) == path}
             if not owned_outputs:
                 raise ValueError(f'Declared producer ownership changed for {path.name}')
@@ -1072,7 +1502,7 @@ class WorkspaceToolGateway:
                     'declared_inputs': list(binding['inputs']), 'declared_outputs': binding['outputs']}, ensure_ascii=False)
                     + '; no current publication or automatic rerun')
             if owner in checked_records:
-                visited.add(path)
+                checked_paths.add(path)
                 return
             visiting.add(path)
             try:
@@ -1081,10 +1511,11 @@ class WorkspaceToolGateway:
             finally:
                 visiting.remove(path)
             checked_records.add(owner)
-            visited.add(path)
+            checked_paths.add(path)
 
         for locator in locators:
             check(resolve_mounted_path(self.mounts, locator, discovery=True))
+        visited.update(checked_paths)
 
     def verify_artifact_producer_index(self, producer_index_cache: dict) -> None:
         """Reject ownership changes during one read-only dependency validation."""
@@ -1126,25 +1557,35 @@ class WorkspaceToolGateway:
                 receipt = self.root / 'tools' / 'processes' / identity / 'invocation.json'
                 if read_json(receipt) != record:
                     raise ValueError('Producer changed during provenance inspection')
+                outputs = _process_artifact_record(record).successful_outputs
+                if outputs is None:
+                    raise ValueError('Producer has no successful recorded output binding')
                 row['producer'] = {
                     'invocation_id': identity,
                     'receipt': str(receipt.relative_to(self.root)),
                     'receipt_sha256': hashlib.sha256(receipt.read_bytes()).hexdigest(),
                     'inputs': dict(binding['inputs']),
-                    'outputs': dict(record['output_binding']['outputs']),
+                    'outputs': dict(outputs),
                 }
             result[name] = row
         return result
 
-    def _check_retained_producers(self, versions: dict[Path, str], history: list[dict]) -> dict:
+    def _check_retained_producers(self, versions: dict[Path, str], history: list[dict], *,
+                                  provenance: bool = False, verify_source: Any = None) -> dict:
         """Traverse a temporary version graph made only from existing receipts.
 
         A node is a path/version at a record boundary. Copies link equal bytes
         across paths; real modifications create new, unverified nodes. Process
         ownership is chosen before that boundary, never from today's path owner.
         Missing/overlapping timing cannot prove ownership and stays unknown.
+
+        Provenance results retain the source view and add lineage.root/nodes.
+        Node IDs are local to this lookup; each node binds path, sha256 and a
+        consuming-event boundary. Its state describes its own owner association;
+        ancestry_states preserves upstream failures/ambiguity separately from
+        ordinary untracked material. Flat dependencies are compatibility only.
         """
-        from datetime import datetime
+        from datetime import datetime, timedelta
 
         def instant(value):
             try:
@@ -1160,14 +1601,14 @@ class WorkspaceToolGateway:
         events = [dict(row) for row in history if 'process_ref' not in row]
         records = {}
         directory = self.root / 'tools' / 'processes'
-        if directory.is_dir():
-            for receipt, record, binding in self._artifact_producer_records(directory):
+        if directory.is_dir() and not provenance:
+            for receipt, record, binding, output_versions, successful in self._artifact_producer_records(directory):
                 ref = receipt.relative_to(self.root).as_posix()
                 records[ref] = record
-                output = (record.get('output_binding') or {}).get('outputs', {})
                 events.append({'position': positions.get(ref), 'start': record.get('started_at'),
                     'end': record.get('finished_at'), 'process': record, 'binding': binding,
-                    'outputs': {resolve_mounted_path(self.mounts, name, write=True, discovery=True): output.get(name)
+                    'successful_outputs': successful,
+                    'outputs': {resolve_mounted_path(self.mounts, name, write=True, discovery=True): output_versions.get(name)
                                 for name in binding['outputs']},
                     'inputs': self.resolved_versions(binding['inputs'])})
         outputs, inputs = {}, {}
@@ -1178,13 +1619,33 @@ class WorkspaceToolGateway:
             for path in event['inputs']:
                 inputs.setdefault(path, []).append(event)
 
+        def ended_before(end, start):
+            if end is None or start is None:
+                return False
+            # Attempt records can have only second precision while process
+            # timestamps have microseconds. Treat the end of that second as
+            # the upper bound instead of inventing a definite order.
+            uncertainty = timedelta(seconds=1) if end.microsecond == 0 else timedelta(microseconds=1)
+            return end + uncertainty <= start
+
         def precedes(left, right):
             if right is None:
                 return True
             if left.get('position') is not None and right.get('position') is not None:
                 return left['position'] < right['position']
+            if provenance:
+                return ended_before(left['end'], right['start'])
             return (left['end'] is not None and right['start'] is not None
                     and left['end'] < right['start'])
+
+        def candidate_before(left, right):
+            if not provenance or right is None or (left.get('position') is not None
+                                                    and right.get('position') is not None):
+                return precedes(left, right)
+            # For an unjournaled process, an overlap or missing timestamp is
+            # ambiguous and must compete with other owners. Only a process
+            # definitely started after this boundary can be excluded.
+            return not ended_before(right['end'], left['start'])
 
         def latest(candidates):
             maximal = [row for row in candidates
@@ -1196,6 +1657,10 @@ class WorkspaceToolGateway:
         def verify(event):
             if id(event) in verified:
                 return
+            if provenance:
+                verify_source(event['source'])
+                verified.add(id(event))
+                return
             if event.get('consistent') is False:
                 raise ValueError('Retained version differs from its recorded owner')
             if 'record' in event:
@@ -1205,6 +1670,138 @@ class WorkspaceToolGateway:
                     raise ValueError('Delivered project copy has inconsistent ownership')
                 records[event['record']] = actual
             verified.add(id(event))
+
+        if provenance:
+            # This graph describes recorded versions, not today's files. Keep
+            # owner association separate from the state of its ancestry; an
+            # ordinary input and a failed declared writer are different facts.
+            event_ids = {id(event): index for index, event in enumerate(events)}
+            nodes, node_ids, active = [], {}, set()
+
+            def lineage(path, digest, boundary):
+                boundary_id = event_ids[id(boundary)] if boundary is not None else None
+                key = (path, digest, boundary_id)
+                if key in node_ids:
+                    if key in active:
+                        raise ValueError('Recorded artifact lineage contains a dependency cycle')
+                    return node_ids[key]
+                number = len(nodes)
+                node_ids[key] = number
+                node = {'id': number, 'path': path, 'sha256': digest,
+                        'boundary': boundary_id, 'state': 'ordinary',
+                        'owner': None, 'producer': None, 'edges': [], 'ancestry_states': []}
+                nodes.append(node)
+                candidates = [row for row in outputs.get(path, [])
+                              if row is not boundary and candidate_before(row, boundary)]
+                event = latest(candidates)
+                if event is None:
+                    if candidates:
+                        node['state'] = 'ambiguous'
+                    return number
+                owner = event['source']
+                node['owner'] = {'event': event_ids[id(event)], 'record': owner['record'],
+                                 'tool_name': owner['tool_name'], 'trusted': owner['trusted']}
+                process = owner.get('process')
+                interpreted = _process_artifact_record(process) if process is not None else None
+                if interpreted is not None:
+                    identity = process['invocation_id']
+                    node['producer'] = {'invocation_id': identity,
+                        'receipt': f'tools/processes/{identity}/invocation.json',
+                        'receipt_sha256': ((owner.get('observed') or {}).get('data') or {}).get('receipt_sha256'),
+                        'inputs': dict((interpreted.binding or {}).get('inputs', {})),
+                        'outputs': dict(interpreted.output_versions)}
+                if boundary is not None and not precedes(event, boundary):
+                    node['state'] = 'ambiguous'
+                elif (interpreted is not None and interpreted.binding is not None
+                      and interpreted.recorded_outputs is None):
+                    # Failed/incomplete declared writes remain visible even when
+                    # they left the previous bytes in place. Never walk behind one.
+                    node['state'] = 'failed'
+                elif not owner['trusted']:
+                    node['state'] = 'unbound'
+                elif event['outputs'][path] != digest:
+                    node['state'] = 'mismatch'
+                else:
+                    verify(event)
+                    node['state'] = 'recorded'
+                    active.add(key)
+                    try:
+                        links = event.get('links', {}).get(path, [])
+                        for source_path, expected in links:
+                            node['edges'].append({'kind': 'copy',
+                                'node': lineage(source_path, expected, event)})
+                        copied_inputs = ({link for group in event.get('links', {}).values() for link in group}
+                                         if links else set())
+                        for source_path, expected in event['inputs'].items():
+                            if (source_path, expected) not in copied_inputs:
+                                node['edges'].append({'kind': 'input',
+                                    'node': lineage(source_path, expected, event)})
+                        previous = event.get('previous', {})
+                        if path in previous and (path, previous[path]) not in links:
+                            node['edges'].append({'kind': 'previous',
+                                'node': lineage(path, previous[path], event)})
+                    finally:
+                        active.remove(key)
+                    states = set()
+                    for edge in node['edges']:
+                        if edge['kind'] == 'previous':
+                            continue  # Superseded bytes are diagnostic, not consumed inputs.
+                        upstream = nodes[edge['node']]
+                        states.add(upstream['state'])
+                        states.update(upstream['ancestry_states'])
+                    node['ancestry_states'] = sorted(states)
+                return number
+
+            projected = {}
+
+            def source_view(number):
+                # Compatibility display, not validation authority. Lineage keeps
+                # every version; a flat map cannot represent conflicting ones.
+                if number in projected:
+                    return projected[number]
+                node = nodes[number]
+                if node['state'] != 'recorded':
+                    result = {'status': 'unknown', 'dependencies': {}}
+                else:
+                    copies = [edge for edge in node['edges'] if edge['kind'] == 'copy']
+                    if copies:
+                        source = source_view(copies[0]['node'])
+                        result = ({**source, 'copy_record': node['owner']['record']}
+                                  if source['status'] != 'unknown' else dict(source))
+                    else:
+                        versions = {}
+                        for edge in node['edges']:
+                            if edge['kind'] != 'input':
+                                continue
+                            upstream = nodes[edge['node']]
+                            versions.setdefault(upstream['path'], set()).add(upstream['sha256'])
+                            source = source_view(edge['node'])
+                            for name, value in source['dependencies'].items():
+                                versions.setdefault(name, set()).add(value)
+                            for name, values in source.get('dependency_conflicts', {}).items():
+                                versions.setdefault(name, set()).update(values)
+                        result = {'status': 'recorded', 'record': node['owner']['record'],
+                                  'tool_name': node['owner']['tool_name'],
+                                  'dependencies': {name: next(iter(values)) for name, values in versions.items()
+                                                   if len(values) == 1}}
+                        conflicts = {name: sorted(values) for name, values in versions.items() if len(values) > 1}
+                        if conflicts:
+                            result['dependency_conflicts'] = conflicts
+                projected[number] = result
+                return result
+
+            roots = {path: lineage(path, digest, None) for path, digest in versions.items()}
+            found = {}
+            for path, number in roots.items():
+                reachable, pending = set(), [number]
+                while pending:
+                    current = pending.pop()
+                    if current not in reachable:
+                        reachable.add(current)
+                        pending.extend(edge['node'] for edge in nodes[current]['edges'])
+                found[path] = {**source_view(number), 'lineage': {'root': number,
+                    'nodes': [nodes[index] for index in sorted(reachable)]}}
+            return found
 
         # Each copied inventory supplies one immutable context for its sibling
         # members. Keep later observations when revisiting the same source path.
@@ -1219,16 +1816,21 @@ class WorkspaceToolGateway:
                 projections[key] = projected
             return projections[key]
 
-        checked = set()
+        checked = {}
 
         def check(path, digest, boundary, context):
-            event = latest([row for row in outputs.get(path, []) if precedes(row, boundary)])
+            candidates = [row for row in outputs.get(path, []) if candidate_before(row, boundary)]
+            event = latest(candidates)
             if event is None:
-                return  # No uniquely ordered record owns these bytes.
+                return None
             key = (path, digest, id(boundary), id(event), context)
             if key in checked:
-                return
+                return checked[key]
             verify(event)
+            if 'process' in event and event['successful_outputs'] is None:
+                # A failed/incomplete writer is a boundary even if its raw
+                # recorded bytes differ. Never bypass it via an earlier anchor.
+                raise ValueError(f'Declared producer has no successful output binding: {path.name}; inspect receipt, no replay')
             owned = event['outputs'][path]
             links = event.get('links', {}).get(path, [])
             if ((owned is not None and owned != digest)
@@ -1241,26 +1843,24 @@ class WorkspaceToolGateway:
                 if anchor is not None:
                     verify(anchor)
                     check(path, digest, anchor, context)
+                result = None
             elif 'process' not in event:
                 for link in links:
                     check(*link, event, project(event, context))
                 # No link means newly created bytes, not verified computation.
+                result = None
             else:
-                record, binding = event['process'], event['binding']
-                output = record.get('output_binding') or {}
-                if (record.get('status') != 'finished' or record.get('returncode') != 0
-                        or record.get('stop_reason') or record.get('output_binding_error')
-                        or output.get('version') != 1 or set(output.get('outputs', {})) != set(binding['outputs'])):
-                    raise ValueError(f'Declared producer has no successful output binding: {path.name}; inspect receipt, no replay')
                 for source, expected in event['inputs'].items():
                     observed = contexts[context].get(source)
                     if observed is not None and observed != expected:
                         raise ValueError('Declared producer inputs/outputs changed: ' + str(source)
                                          + '; no current publication or automatic rerun')
                     check(source, expected, event, context)
+                result = None
             # Retained checks are per output/version/boundary/context. A process
             # with another unrelated output must not short-circuit this node.
-            checked.add(key)
+            checked[key] = result
+            return result
 
         for path, digest in versions.items():
             check(path, digest, None, 0)
@@ -1268,7 +1868,7 @@ class WorkspaceToolGateway:
 
     def _artifact_producers(self, directory: Path) -> dict:
         producers = {}
-        for _, record, binding in self._artifact_producer_records(directory):
+        for _, record, binding, _, _ in self._artifact_producer_records(directory):
             order = record.get('started_at', '')
             for locator in binding['outputs']:
                 path = resolve_mounted_path(self.mounts, locator, write=True, discovery=True)
@@ -1280,7 +1880,7 @@ class WorkspaceToolGateway:
                     producers[path] = (order, None, None)
         return producers
 
-    def _artifact_producer_records(self, directory: Path) -> Iterable[tuple[Path, dict, dict]]:
+    def _artifact_producer_records(self, directory: Path) -> Iterable[tuple[Path, dict, dict, dict, dict | None]]:
         """One bounded reader for current owners and retained version history."""
         total = 0
         for count, entry in enumerate(directory.iterdir(), 1):
@@ -1297,12 +1897,11 @@ class WorkspaceToolGateway:
             if total > _FULL_DIGEST_MAX_BYTES:
                 raise ValueError('Process receipt inventory exceeds 64 MiB')
             record = read_json(receipt)
-            binding = (record.get('input_binding') or {}).get('workspace_artifacts')
-            if binding is None:
+            interpreted = _process_artifact_record(record)
+            if interpreted.binding is None:
                 continue  # Never invent historical dependency coverage.
-            if binding.get('version') != 1:
-                raise ValueError('Unsupported process artifact binding version')
-            yield receipt, record, binding
+            yield (receipt, record, interpreted.binding,
+                   interpreted.output_versions, interpreted.successful_outputs)
 
     def bind_inventory(self, project: Path, *, identity: str,
                        material_candidates: bool | Literal['implementation'] = False) -> dict:
@@ -1359,6 +1958,9 @@ class WorkspaceToolGateway:
             elif name == "run_process":
                 recovering = (self.root / "tools" / "processes" / identity / "invocation.json").exists()
                 data = self._run(model, identity)
+                if not recovering:
+                    receipt = self.root / data['receipt']
+                    data['receipt_sha256'] = hashlib.sha256(receipt.read_bytes()).hexdigest()
                 if data.get('output_binding_error'):
                     return ToolResult(tool_name=name, status='error', data=data,
                         error=data['output_binding_error'],
@@ -1464,6 +2066,10 @@ class WorkspaceToolGateway:
                     if not committed.ok:
                         return committed
                     data = committed.data
+                    if name == 'edit_file':
+                        # Snapshot precisely the bytes accepted by the atomic
+                        # writer, never a later reread or reconstructed patch.
+                        data['authored_text'] = encoded.decode('utf-8')
                     if delivery is not None:
                         data["delivery"] = delivery
             if name in {"read_file", "write_file", "edit_file", "list_directory"}:
@@ -1832,16 +2438,15 @@ class WorkspaceToolGateway:
                     or record.get('cwd') != str(cwd.resolve()) or record.get('timeout_sec') != request.timeout_sec):
                 raise ValueError('Retained process command changed; no reconciliation or replay')
             settle_process_record(record, self.ledger)
-            binding = (record.get('input_binding') or {}).get('workspace_artifacts')
+            interpreted = _process_artifact_record(record)
+            binding, outputs = interpreted.binding, interpreted.complete_outputs
             if binding is not None:
                 if binding['request'] != request.model_dump(exclude_none=True):
                     raise ValueError('Retained process artifact request changed; no replay')
                 if self.process_artifact_binding(request.model_dump(exclude_none=True), identity=identity) != binding:
                     raise ValueError('Retained process inputs changed; no replay')
                 if record.get('returncode') == 0 and not record.get('stop_reason') and not record.get('output_binding_error'):
-                    outputs = record.get('output_binding') or {}
-                    if (outputs.get('version') != 1 or set(outputs.get('outputs', {})) != set(binding['outputs'])
-                            or self._version_hashes(outputs['outputs']) != outputs['outputs']):
+                    if outputs is None or self._version_hashes(outputs) != outputs:
                         raise ValueError('Retained process outputs changed or unbound; no replay')
             elif request.inputs or request.outputs or request.input_snapshot is not None:
                 raise ValueError('Historical process lacks declared artifact binding; no retroactive binding or replay')

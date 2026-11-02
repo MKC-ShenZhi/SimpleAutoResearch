@@ -11,6 +11,7 @@ from urllib.parse import unquote, urlsplit
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from simple_ar.core.budget import BudgetLedger
+from simple_ar.tools.professional_outcomes import accepted_native_result, accepted_review_journal
 from simple_ar.tools.workspace import FileWindow
 
 
@@ -130,6 +131,38 @@ def material_inventories(workspace: Any, roots: list[str], *, identity: str,
 def window_key(workspace: Any, window: FileWindow) -> tuple:
     return (str(workspace.resolve(window.path)), window.offset_bytes, window.max_bytes,
         window.start_line, window.max_lines if 'max_lines' in window.model_fields_set or window.start_line else None)
+
+
+def authored_snapshot(workspace: Any, result: dict, record: str, session_id: str) -> dict | None:
+    """Interpret a producer-bound edit snapshot as authored working material.
+
+    No source read, current-file check, permission or evidence is inferred.
+    The caller may omit malformed/unbound snapshots with a diagnostic; the
+    working selector separately admits matching current versions to capacity.
+    Old edit receipts without this field retain their original presentation.
+    """
+    data = result.get('data')
+    if (result.get('tool_name') != 'edit_file' or result.get('status') != 'ok'
+            or result.get('error') or not isinstance(data, dict) or 'authored_text' not in data):
+        return None
+    text = data['authored_text']
+    if (not isinstance(text, str)
+            or not isinstance(data.get('absolute_path'), str) or not data['absolute_path']
+            or 'path' in data and (not isinstance(data['path'], str) or not data['path'])
+            or not isinstance(record, str) or not record):
+        raise ValueError('Authored snapshot has invalid text, path or record fields')
+    encoded = text.encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != data.get('sha256'):
+        raise ValueError('Authored snapshot does not match its returned digest')
+    accepted_native_result(workspace.root, session_id, result, Path(record).parent.name,
+        require_content_binding=True)
+    return {'field': 'data.authored_text', 'tool': 'edit_file',
+        'kind': 'authored_text', 'role': 'write_context',
+        'path': data.get('path', data['absolute_path']),
+        'absolute_path': data['absolute_path'], 'sha256': data['sha256'],
+        'size_bytes': len(encoded), 'offset_bytes': 0, 'next_offset_bytes': len(encoded),
+        'has_more': False, 'text_bytes': len(encoded), 'text_characters': len(text), 'text': text,
+        'version_scope': 'Complete authored edit result, not a read or independent evidence; reuse only for the matching current file version.'}
 
 
 def journal_read_windows(receipt: dict, request: dict) -> list[dict]:
@@ -353,19 +386,6 @@ def admit_text_window(retained: list[dict], observation: dict, *, pinned: Iterab
         'Whole original observation retained; overlapping decoded text may repeat, no byte slicing.'} if overlap else {})}]
 
 
-def accepted_review_journal(workspace: Any, store: Any, item: dict, receipt: dict) -> dict:
-    """Resolve the separate accepted review without adopting its opinion."""
-    from simple_ar.tools.professional_outcomes import accepted_native_result, accepted_scoped_opinion
-
-    session_id = store.read_json('session_manifest.json')['session_id']
-    parent = Path(item['result']).parent.name
-    accepted_native_result(store.root, session_id, receipt, parent)
-    path, review, digest = accepted_scoped_opinion(
-        store.root, workspace, session_id, item['review_result'], parent)
-    return {'record': 'attempts/' + path.relative_to((store.root / 'attempts').resolve()).as_posix(),
-            'receipt': review, 'sha256': digest}
-
-
 def journal_material_references(workspace: Any, store: Any, turns: list[dict],
                                 targets: list[str], *, include_cross_path: bool = False) -> list[dict]:
     """Locate original reads; optional cross-path lookup grants no target access.
@@ -376,7 +396,11 @@ def journal_material_references(workspace: Any, store: Any, turns: list[dict],
     roots = [workspace.resolve_material_root(path) for path in targets]
     retained = []
     def collect(receipt: dict, request: dict, record: str, digest: str) -> None:
-        for row in journal_read_windows(receipt, request):
+        try:
+            windows = journal_read_windows(receipt, request)
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return  # One malformed retained record does not hide other reads.
+        for row in windows:
             try:
                 path = workspace.resolve(row['request']['path'])
                 data = row.get('data') or {}
@@ -401,7 +425,7 @@ def journal_material_references(workspace: Any, store: Any, turns: list[dict],
                 request = json.loads(call['arguments'])
                 raw = store.resolve(item['result']).read_bytes()
                 receipt = json.loads(raw)
-                if receipt.get('tool_name') != call['name']:
+                if not isinstance(receipt, dict) or receipt.get('tool_name') != call['name']:
                     continue
             except (ValueError, TypeError, KeyError, OSError, RuntimeError):
                 continue

@@ -29,6 +29,7 @@ from tests.native_history_fixture import load_native_history
 from simple_ar.core.assessments import ArtifactAssessment
 from simple_ar.integrations.llm import LLMClient, LLMSettings, estimate_tokens
 from simple_ar.tools.specs import ToolCall, ToolResult
+from simple_ar.tools.workspace import DeliveryRequest
 
 
 # A real, dependency-free calculation and raster chart, not prepared output bytes.
@@ -110,6 +111,239 @@ def _assessments(result):
 
 
 class OperationsWorkLoopTests(unittest.TestCase):
+    def test_edit_authored_snapshot_projects_complete_current_version_without_reads(self):
+        from simple_ar.tools.materials import journal_read_windows
+        from simple_ar.tools.workspace import workspace_observation_view
+
+        self._create()
+        original = '# 保留原文\r\nvalue = 1\r\nprint(value)\r\n'
+        written = self._write('working.py', original)
+        self.decisions.append(_action('edit_file', path='working.py',
+            expected_sha256=written['data']['sha256'], old_text='value = 1', new_text='value = 2'))
+        self._run(should_stop=lambda: bool(self._observations('edit_file')))
+        edited = self._ok('edit_file')
+        first = original.replace('value = 1', 'value = 2')
+        self.assertEqual(edited['data']['authored_text'], first)
+        self.assertEqual(edited['data']['sha256'], hashlib.sha256(first.encode('utf-8')).hexdigest())
+        self.assertEqual(self.app.workspace.resolve('working.py').read_bytes(), first.encode('utf-8'))
+        item = self.app.state['turns'][-1]['tools'][0]
+        record = 'records/' + item['result'].removeprefix('attempts/')
+        view = workspace_observation_view(edited, record=record)
+        self.assertNotIn('authored_text', view['data'])
+        self.assertEqual(view['data']['authored_text_source']['record'], record)
+        self.assertEqual(view['data']['authored_text_source']['field'], 'data.authored_text')
+        self.assertEqual(workspace_observation_view(view, record=record), view)
+        self.assertEqual(journal_read_windows(edited, {}), [])
+
+        def project():
+            state, ledger = deepcopy(self.app.state), deepcopy(self.app.ledger.to_dict())
+            files, calls = self._versions(self.root), self.send.call_count
+            selection = {}
+            with patch.object(self.app.workspace, 'call',
+                    side_effect=AssertionError('Projection must not dispatch a read or operation')):
+                messages = self.app._messages(working_selection=selection)
+            self.assertEqual(self.app.state, state)
+            self.assertEqual(self.app.ledger.to_dict(), ledger)
+            self.assertEqual(self._versions(self.root), files)
+            self.assertEqual(self.send.call_count, calls)
+            rows = [entry['observation'] for entry in
+                json.loads(messages[1]['content'])['working_view']['observations']]
+            return messages, rows, selection
+
+        from simple_ar.tools.professional_outcomes import accepted_native_result
+        with patch('simple_ar.tools.materials.accepted_native_result',
+                wraps=accepted_native_result) as accepted:
+            messages, rows, selection = project()
+        accepted.assert_called_once_with(self.root, self.app.session.manifest.session_id,
+            edited, Path(item['result']).parent.name, require_content_binding=True)
+        snapshot = next(row for row in rows if row.get('field') == 'data.authored_text')
+        self.assertEqual(snapshot['text'], first)
+        self.assertEqual(snapshot['role'], 'write_context')
+        self.assertEqual(snapshot['record'], record)
+        self.assertEqual(snapshot['sha256'], edited['data']['sha256'])
+        self.assertEqual(next(row['version_status'] for row in selection['selected_records']
+            if row['source'].get('record') == record and row['source'].get('field') == 'data.authored_text'),
+            'matching')
+        native = [json.loads(message['content']) for message in messages if message['role'] == 'tool']
+        native_edit = next(result for result in native if result.get('tool_name') == 'edit_file')
+        self.assertNotIn('authored_text', native_edit['data'])
+        self.assertEqual(native_edit['data']['authored_text_source']['record'], record)
+        self.assertFalse(any(row.get('record') == record and row.get('kind') == 'operation_result'
+            for row in rows))
+        self.assertFalse(any(row['source'].get('record') == record
+            and row['source'].get('field') == 'data.authored_text' and row['status'] == 'native'
+            for row in selection['selected_records']))
+
+        self._submit(_action('edit_file', path='working.py', expected_sha256=edited['data']['sha256'],
+            old_text='value = 2', new_text='value = 3'))
+        revised = self._ok('edit_file')
+        _, rows, selection = project()
+        authored = [row for row in rows if row.get('field') == 'data.authored_text']
+        self.assertEqual([row['text'] for row in authored], [original.replace('value = 1', 'value = 3')])
+        self.assertEqual(authored[0]['sha256'], revised['data']['sha256'])
+        self.assertTrue(any(row['source'].get('record') == record and row['status'] == 'stale'
+            for row in selection['omitted_records']))
+
+    def test_edit_authored_snapshot_rejects_malformed_and_forged_receipts(self):
+        from simple_ar.tools.materials import authored_snapshot
+
+        self._create()
+        written = self._write('working.py', 'value = 1\n')
+        self._submit(_action('edit_file', path='working.py', expected_sha256=written['data']['sha256'],
+            old_text='value = 1', new_text='value = 2'))
+        edited = self._ok('edit_file')
+        path = self.app.state['turns'][-1]['tools'][0]['result']
+        record = 'records/' + path.removeprefix('attempts/')
+        for invalid in ('Wrong complete body', {'text': edited['data']['authored_text']}, '\ud800'):
+            with self.subTest(snapshot=repr(invalid)):
+                malformed = deepcopy(edited)
+                malformed['data']['authored_text'] = invalid
+                with self.assertRaises(ValueError):
+                    authored_snapshot(self.app.workspace, malformed, record, self.app.session.manifest.session_id)
+
+        # Forging both snapshot and digest to match the changed output cannot
+        # rewrite the accepted producer-time content binding.
+        receipt_path = self.root / path
+        target = self.app.workspace.resolve('working.py')
+        receipt_bytes, target_bytes = receipt_path.read_bytes(), target.read_bytes()
+        forged = deepcopy(edited)
+        forged['data']['authored_text'] = '# Unauthorized altered result\n'
+        forged['data']['sha256'] = hashlib.sha256(forged['data']['authored_text'].encode('utf-8')).hexdigest()
+        try:
+            receipt_path.write_text(json.dumps(forged, ensure_ascii=False), encoding='utf-8')
+            target.write_bytes(forged['data']['authored_text'].encode('utf-8'))
+            self.assertEqual(_digest(target), forged['data']['sha256'])
+            with self.assertRaises(ValueError):
+                authored_snapshot(self.app.workspace, forged, record, self.app.session.manifest.session_id)
+            # Whole projection also validates accepted history before it can
+            # treat a rejected snapshot as optional material.
+            with self.assertRaises(ValueError):
+                self.app._messages()
+        finally:
+            receipt_path.write_bytes(receipt_bytes)
+            target.write_bytes(target_bytes)
+
+    def test_empty_edit_authored_snapshot_is_optional_version_bound_working_material(self):
+        from simple_ar.tools.materials import journal_read_windows
+
+        self._create()
+        written = self._write('empty.py', '# Remove this complete body.\n')
+        self._submit(_action('edit_file', path='empty.py', expected_sha256=written['data']['sha256'],
+            old_text='# Remove this complete body.\n', new_text=''))
+        edited = self._ok('edit_file')
+        self.assertEqual(edited['data']['authored_text'], '')
+        self.assertEqual(edited['data']['sha256'], hashlib.sha256(b'').hexdigest())
+        state, ledger, files = deepcopy(self.app.state), deepcopy(self.app.ledger.to_dict()), self._versions(self.root)
+        calls, selection = self.send.call_count, {}
+        with patch.object(self.app.workspace, 'call', side_effect=AssertionError('No read during projection')):
+            messages = self.app._messages(working_selection=selection)
+        entries = json.loads(messages[1]['content'])['working_view']['observations']
+        entry = next(entry for entry in entries if entry['observation'].get('field') == 'data.authored_text')
+        self.assertEqual(entry['version_status'], 'matching')
+        self.assertEqual(entry['observation']['role'], 'write_context')
+        self.assertEqual(entry['observation']['text'], '')
+        self.assertEqual(entry['observation']['size_bytes'], 0)
+        self.assertEqual(journal_read_windows(edited, {}), [])
+        self.assertEqual(self.app.state, state)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self._versions(self.root), files)
+        self.assertEqual(self.send.call_count, calls)
+
+    def test_large_edit_authored_snapshot_is_optional_and_old_receipts_still_project(self):
+        from dataclasses import replace
+        from simple_ar.tools.materials import journal_read_windows
+        from simple_ar.tools.workspace import workspace_observation_view
+
+        self._create()
+        original = '# Keep the complete edited source optional.\n' + 'value = 1\n' * 18000
+        written = self._write('large.py', original)
+        self.decisions.append(_action('edit_file', path='large.py', expected_sha256=written['data']['sha256'],
+            old_text='# Keep the complete edited source optional.', new_text='# Revised source.'))
+        self._run(should_stop=lambda: bool(self._observations('edit_file')))
+        edited = self._ok('edit_file')
+        record = 'records/' + self.app.state['turns'][-1]['tools'][0]['result'].removeprefix('attempts/')
+        state, ledger, calls = deepcopy(self.app.state), deepcopy(self.app.ledger.to_dict()), self.send.call_count
+        files = self._versions(self.root)
+        selection = {}
+        with patch.object(self.app.workspace, 'call', side_effect=AssertionError('No read during projection')):
+            baseline = {}
+            self.app._messages(working_selection=baseline)
+            # Fund the measured mandatory contracts/latest compact turn, then
+            # leave modest bookkeeping room without funding the whole snapshot.
+            margin = 2048
+            target = baseline['required_input_tokens'] + margin
+            self.assertGreater(estimate_tokens(edited['data']['authored_text']), margin)
+            projection_client = LLMClient(replace(self.services.llm_client._settings,
+                context_input_tokens=target))
+            messages = self.app._messages(client=projection_client, working_selection=selection)
+        self.assertLessEqual(selection['required_input_tokens'], target)
+        self.assertFalse(selection['context_exceeds_input_target'])
+        self.assertTrue(any(row['source'].get('record') == record
+            and row['source'].get('field') == 'data.authored_text' and row['status'] == 'capacity'
+            for row in selection['omitted_records']))
+        rows = [entry['observation'] for entry in
+            json.loads(messages[1]['content'])['working_view']['observations']]
+        self.assertFalse(any(row.get('field') == 'data.authored_text' for row in rows))
+        native = [json.loads(message['content']) for message in messages if message['role'] == 'tool']
+        native_edit = next(result for result in native if result.get('tool_name') == 'edit_file')
+        self.assertNotIn('authored_text', native_edit['data'])
+        self.assertEqual(native_edit['data']['authored_text_source']['record'], record)
+        self.assertEqual(self.app.state, state)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self._versions(self.root), files)
+        self.assertEqual(journal_read_windows(edited, {}), [])
+        # Earlier edit receipts have no complete authored snapshot to infer.
+        legacy = deepcopy(edited)
+        legacy['data'].pop('authored_text')
+        self.assertEqual(workspace_observation_view(legacy, record=record), legacy)
+        self.assertEqual(journal_read_windows(legacy, {}), [])
+        binary = {'tool_name': 'copy_file', 'status': 'ok', 'data': {
+            'path': 'image.bin', 'absolute_path': str(self.app.workspace.resolve('image.bin')),
+            'sha256': '0' * 64}}
+        self.assertEqual(workspace_observation_view(binary, record=record), binary)
+        self.assertEqual(journal_read_windows(binary, {}), [])
+
+    def test_native_revision_feedback_is_measured_and_omitted_original_remains_readable(self):
+        self._create()
+        self._write('report.md', '# Report\n\n![Figure](figure.png)\n')
+        large = {'tool_name': 'inspect_images', 'status': 'ok',
+            'data': {'review': 'Original large feedback. ' * 60000}}
+        useful = {'tool_name': 'inspect_images', 'status': 'ok',
+            'data': {'review': 'Place the caption beside the figure.'}}
+        feedback = {'user_requests': self.app.state['requests'], 'review_observations': []}
+        for identity, result in [('large-feedback', large), ('useful-feedback', useful)]:
+            path = f'attempts/{identity}/result.json'
+            self.app.session.store.write_json(path, result)
+            feedback['review_observations'].append({'record': path.replace('attempts/', 'records/', 1),
+                'result': result, 'subjects': [{'path': 'workspace/report.md', 'current_matches_review': True}]})
+        ledger = deepcopy(self.app.ledger.to_dict())
+        state = deepcopy(self.app.state)
+        calls = self.send.call_count
+        selection = {}
+        with patch.object(self.app, '_work_context', return_value=feedback) as supply:
+            messages = self.app._messages(client=self.app._client(), working_selection=selection)
+        supply.assert_called_once()
+        self.assertTrue(supply.call_args.kwargs['consumer_selects'])
+        presented = json.loads(messages[1]['content'])
+        bodies = [row['observation'] for row in presented['working_view']['observations']]
+        self.assertTrue(any(row.get('record') == 'records/useful-feedback/result.json'
+            and json.loads(row['text']) == useful for row in bodies))
+        self.assertFalse(any(row.get('record') == 'records/large-feedback/result.json' for row in bodies))
+        self.assertTrue(any(row['source']['record'] == 'records/large-feedback/result.json'
+            and row['status'] == 'capacity' for row in selection['omitted_records']))
+        self.assertFalse(selection['context_exceeds_input_target'])
+        self.assertEqual(self.app.state, state)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self.send.call_count, calls)
+        # The ordinary reader can continue from the model-visible locator;
+        # omission neither deletes the receipt nor requires a new source grant.
+        read = self.app.workspace.call('read_file', {'path': 'records/large-feedback/result.json',
+            'max_bytes': 16000}, identity='feedback-continuation')
+        self.assertEqual(read.status, 'ok', read.error)
+        self.assertIn('Original large feedback.', read.data['text'])
+        self.assertTrue(read.data['has_more'])
+
     def setUp(self):
         self.directory = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.root = self.directory / 'task'
@@ -445,7 +679,17 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._reload()
         self.assertEqual(self.app._coordinator_purpose(), 'code')
         self.assertEqual(json.loads(self.app._messages()[1]['content'])['professional_method']['status'], 'current')
+        self.assertIsNone(self.app.operations.delivery_review)
         self.send.assert_not_called()
+        self._write('legacy-note.md', 'A saved task may still request a review.\n')
+        self.review = lambda _: {'findings':[{'severity':'advisory',
+            'subject':'target-1', 'message':'Clarify the original assumption.'}], 'limitations':[]}
+        self._inspect(['legacy-note.md'])
+        calls = self.send.call_count
+        self._reload()
+        feedback = self.app.operations.inspection.work_inputs(['legacy-note.md'])
+        self.assertIn('Clarify the original assumption.', json.dumps(feedback))
+        self.assertEqual(self.send.call_count, calls)
 
     def test_default_discovery_loads_optional_tools_and_preserves_frozen_owners(self):
         self.app = ToolApplication.create(self.root, 'Inspect the supplied table and retain a note.',
@@ -623,10 +867,20 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertFalse(self._observations('inspect_artifacts'))
         self.assertFalse(self._observations('export_report'))
 
+        self.assertTrue(self.inspection_requests)
+
     def test_feedback_retains_only_actual_process_bindings_without_rechecking_output_bytes(self):
         from simple_ar.core.working_context import select_working_context
         self._create(goal='Retain a small data file and its authorized transformations.')
         self._submit(_action('write_file', path='original.dat', content='original'))
+        original_path = self.root/'workspace/original.dat'
+        real_open = Path.open
+        def guard_before_any_review(path, *args, **kwargs):
+            if path == original_path:
+                raise AssertionError('No review exists that requires matching this file')
+            return real_open(path, *args, **kwargs)
+        with patch.object(Path, 'open', guard_before_any_review):
+            self.app._work_context([str(original_path)], consumer_selects=True)
         self._submit(_action('deliver_result', summary='Original data retained.', artifacts=['original.dat']))
         saved_delivery = (self.root/'delivery.json').read_bytes()
         command = _action('run_process', argv=['python', '-c',
@@ -648,7 +902,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         receipt = self.root/record['data']['receipt']
         original_receipt = receipt.read_bytes()
         try:
-            for defect in ('owner', 'digest', 'unknown', 'unbound'):
+            for defect in ('owner', 'digest', 'unknown', 'unbound', 'changed_receipt'):
                 with self.subTest(receipt=defect):
                     saved = json.loads(original_receipt)
                     if defect == 'owner':
@@ -657,8 +911,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
                         saved['output_binding']['outputs']['workspace/bound.bin'] = 'invalid-sha256'
                     elif defect == 'unknown':
                         saved['status'] = 'unknown'
-                    else:
+                    elif defect == 'unbound':
                         saved.pop('output_binding')
+                    else:
+                        # The receipt still parses and names a successful run;
+                        # changing any bytes invalidates its original binding.
+                        saved['diagnostic_hint'] = 'changed after the native result'
                     receipt.write_text(json.dumps(saved), encoding='utf-8')
                     self.assertNotIn('workspace/bound.bin', self.app.result_snapshot()['retained_work']['artifacts'])
         finally:
@@ -692,9 +950,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 raise AssertionError('Identity projection must not read produced bytes')
             return real_open(path, *args, **kwargs)
         before = self._versions(self.root)
-        with patch.object(Path, 'open', guarded_open), patch(
-                'simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select:
+        with patch.object(Path, 'open', guarded_open):
             snapshot = self.app.result_snapshot()['retained_work']
+        # Building the decision context also matches prior reviews to current
+        # material, including copies. That operation may need current bytes;
+        # the read-only identity projection above must not inspect them.
+        with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select:
             messages = self.app._messages()
         self.assertIn('workspace/original.dat', snapshot['artifacts'])
         self.assertIn('workspace/bound.bin', snapshot['artifacts'])
@@ -736,6 +997,15 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def _review_complete_targets(self, view):
         """Default text review reads missing bytes; custom callbacks own their reads."""
         if 'claim' in view.get('proposed_delivery', {}):
+            delivery = view['proposed_delivery']
+            if delivery.get('scope_policy') == 'applicable.v1':
+                claim = delivery['claim']
+                manuscript = (claim.get('report') or {}).get('manuscript')
+                paths = ([manuscript] if manuscript else [path for path in delivery['artifacts']
+                    if Path(path).suffix.lower() in {'.md', '.txt'}])
+                reads = self._inspection_missing_reads(view, paths)
+                if reads:
+                    return reads
             return {'conclusion':'complete','findings':[],
                 'evidence':[row['subject'] for row in view['evidence'] if row['text_windows']],
                 'limitations':['Only the requested work was reviewed; optional polish is not required.']}
@@ -759,6 +1029,23 @@ class OperationsWorkLoopTests(unittest.TestCase):
         if reads and 'read_file' in offered:
             return reads[:8]
         return {'findings': [], 'limitations': ['Target reading remains partial.'] if reads else []}
+
+    def _inspection_missing_reads(self, view, paths):
+        """Request necessary current text through the real inspection gateway."""
+        rows = [*view['targets'], *view['evidence']]
+        reads = []
+        for path in paths:
+            absolute = str(self.app.workspace.resolve(path))
+            windows = [window for row in rows if row.get('path') == absolute
+                for window in row.get('text_windows', [])]
+            cursor = 0
+            for window in sorted(windows, key=lambda row:row['offset_bytes']):
+                if window['offset_bytes'] > cursor:
+                    break
+                cursor = max(cursor, window['next_offset_bytes'])
+            if not windows or cursor < max(window['size_bytes'] for window in windows):
+                reads.append(_action('read_file', path=path, offset_bytes=cursor, max_bytes=64000))
+        return reads[:8]
 
     def _provider(self, mode, request, **kwargs):
         # A single controlled seam for both the native model and independent review.
@@ -799,6 +1086,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 for row in [*view['targets'], *view['evidence']]:
                     for body in visible:
                         if (body.get('path') == row.get('path') and body.get('sha256') == row.get('sha256')
+                                and body.get('subject') == row.get('subject')
                                 and isinstance(body.get('text'), str)):
                             window = {key:body[key] for key in
                                 ('offset_bytes', 'next_offset_bytes', 'size_bytes', 'text')}
@@ -808,7 +1096,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.assertIn('evidence', view)
                 ids = [row['subject'] for row in view['targets']]
                 self.assertEqual(len(ids), len(set(ids)))
-                self.assertTrue(all(row['text_windows'] for row in view['targets']))
+                # Capacity can omit an entire target window. The inspection
+                # must then report incomplete rather than fabricate supply.
+                self.assertTrue(all(isinstance(row.get('text_windows'), list)
+                                    for row in view['targets']))
                 for row in [*view['targets'], *view['evidence']]:
                     for window in row['text_windows']:
                         self.assertIsInstance(window['text'], str)
@@ -817,6 +1108,41 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 response = self.review(view)
                 terminal = next(tool['function'] for tool in request['tools']
                     if tool['function']['name']=='record_inspection')
+                properties = terminal['parameters'].get('properties', {})
+                if (isinstance(response, dict) and 'conclusion' in properties
+                        and 'decisions' not in properties
+                        and ('findings' in response or 'decisions' in response)):
+                    # Historical callbacks return a final findings opinion. Adapt
+                    # its shape to the actual package offer, preserving explicit
+                    # incomplete conclusions/evidence and every required defect.
+                    observed = [*view['targets'], *view['evidence']]
+                    subjects = {row['subject']:row for row in observed}
+                    artifacts = set(view['proposed_delivery'].get('artifacts', []))
+                    if 'decisions' in response:
+                        # A subject-only opinion is not a whole-delivery opinion.
+                        # Preserve its defects/dependencies but never upcast a
+                        # narrow success when the actual offer asks for the task.
+                        rows = response['decisions']
+                        response = {'conclusion':'incomplete',
+                            'findings':[{**finding, 'subject':row.get('subject')}
+                                for row in rows for finding in row.get('findings', [])],
+                            'evidence':list(dict.fromkeys(key for row in rows for key in row.get('evidence', []))),
+                            'limitations':['Subject-only callback did not conclude the whole-delivery review.',
+                                *(text for row in rows for text in row.get('limitations', []))]}
+                    legacy = set(response) <= {'findings', 'limitations'}
+                    findings = []
+                    for finding in response['findings']:
+                        if 'artifacts' in finding:
+                            findings.append(finding)
+                            continue
+                        subject = subjects.get(finding.get('subject'), {})
+                        path = subject.get('path')
+                        findings.append({**{key:value for key,value in finding.items() if key != 'subject'},
+                            'artifacts':[path] if path in artifacts else []})
+                    response = {**({'conclusion':'complete',
+                        'evidence':[row['subject'] for row in observed if row.get('text_windows')]}
+                        if legacy else {}),
+                        **response, 'findings':findings}
                 if (isinstance(response,dict) and 'findings' in response
                         and 'decisions' in terminal['parameters'].get('properties',{})):
                     # Fixtures describe the same opinions for both frozen contracts.
@@ -847,6 +1173,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
                         and all('conclusion' in branch.get('required', []) for branch in branches)):
                     response = {**response, 'decisions':[
                         {'conclusion':'complete', **decision} for decision in response.get('decisions', [])]}
+                if (isinstance(response, dict) and 'applicability' in terminal['parameters'].get('required', [])):
+                    response = {'applicability':'Controlled independent inspector scopes this fixture; '
+                        'this response is not scientific quality evidence.', 'investigations':[], **response}
                 actions = ([_action('record_inspection', **response)]
                     if isinstance(response, dict) else response)
                 message = {'role': 'assistant', 'content': None,
@@ -880,9 +1209,11 @@ class OperationsWorkLoopTests(unittest.TestCase):
                         'usage': {'prompt_tokens': 100, 'completion_tokens': 40, 'total_tokens': 140}}
                 if 'notes' in view.get('response_schema',{}).get('properties',{}):
                     self.memory_views.append(view)
+                    citations = ([view['previous_notes'][0]['id']] if view['previous_notes'] else [])
+                    citations.extend(row['id'] for row in view['observations'][:4])
                     message = {'role':'assistant','content':json.dumps({'notes':[{
                         'text':'Earlier observations are saved; continue the requested explanation and retain the source scope.',
-                        'observations':[row['id'] for row in view['observations'][:4]]}]})}
+                        'observations':citations}]})}
                     return {'choices':[{'message':message,'finish_reason':'stop'}],
                         'usage':{'prompt_tokens':100,'completion_tokens':40,'total_tokens':140}}
                 self.fail('Unexpected non-native provider request outside working memory')
@@ -1819,6 +2150,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         # Fit the mandatory prompt before testing eviction of accumulated work.
         self._queue_checkpoint_history(context_protocol='auto', initial_notes=False, context_input_tokens=24000)
         self.assertEqual(self.app.state['config']['memory_protocol'], 'journal.v1')
+        self.assertEqual(self.app.state['config']['native_supply_policy'], 'turns.v1')
         # One closed prose reply must not strand all later observations behind
         # an empty turn. It is working judgment, never original-file support.
         provider = self.send.side_effect
@@ -1836,25 +2168,48 @@ class OperationsWorkLoopTests(unittest.TestCase):
             for view in self.memory_views for row in view['observations']))
         self.assertTrue(all('request_count' in row for view in self.memory_views for row in view['observations']))
         memory = self.app._working_memory()
-        self.assertGreater(memory['through_turn'], 0)
+        # A prose-only turn is not an evidentiary receipt, so it can leave the
+        # conservative contiguous prefix at zero even when later reads hand off.
+        self.assertTrue(memory['compacted_records'])
+        self.assertTrue(memory.get('attempted_records'))
         self.assertTrue(memory['notes'])
         self._assert_journal_note_supply(memory)
         ledger = self.app.ledger.to_dict()
         self._reload()
         self.assertEqual(self.app._working_memory(), memory)
         self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self.app.state['config']['native_supply_policy'], 'turns.v1')
         self._assert_journal_note_supply(memory)
+        # A historical task cannot silently adopt a newer checkpoint format.
+        self.app.state['config']['native_supply_policy'] = 'receipts.v1'
+        try:
+            with self.assertRaisesRegex(ValueError, 'saved supply contract'):
+                self.app._working_memory()
+        finally:
+            self.app.state['config']['native_supply_policy'] = 'turns.v1'
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
         self.app.supply(supply_id='additional-source', reason='Expose another authorized material alias',
             changes={'sources':{'extra':self.inputs}})
         self.assertEqual(self.app.state['config']['memory_protocol'], 'journal.v1')
-        self.assertEqual(self.app.state['config']['context_checkpoint_policy'], 'economic.v1')
+        self.assertEqual(self.app.state['config']['context_checkpoint_policy'], 'economic.v2')
+        self.assertEqual(self.app.state['config']['native_supply_policy'], 'turns.v1')
         self._submit(_action('update_work_plan',steps=[{'step':'Continue from existing observations','status':'pending'}]))
         self.assertEqual(self.app._working_memory()['notes'], memory['notes'])
         self._submit(_action('update_work_plan',notes=[{'text':'Explicitly revised working understanding','records':[]}]))
-        self.assertEqual([note['text'] for note in self.app._working_memory()['notes']],
+        revised = self.app._working_memory()
+        self.assertEqual([note['text'] for note in revised['notes']],
             ['Explicitly revised working understanding'])
+        self.assertEqual(revised.get('attempted_records'), memory.get('attempted_records'))
+        self.assertEqual(revised.get('attempted_through_turn'), memory.get('attempted_through_turn'))
+        self.assertEqual(revised['compacted_records'], set())
         self._submit(_action('update_work_plan',notes=[]))
         self.assertEqual(self.app._working_memory()['notes'], [])
+        self.assertEqual(self.app._working_memory().get('attempted_records'), memory.get('attempted_records'))
+        feedback = 'Use the original observations, but reconsider the interpretation and retain the unresolved scope.'
+        self.decisions.append(_action('ask_user', question='Which revised interpretation should be emphasized?'))
+        self._run(feedback=feedback)
+        self.assertIn(feedback, json.dumps(self.app._messages()))
+        self.assertEqual(self.app.state['requests'][-1], feedback)
 
     def test_settled_journal_checkpoint_survives_a_failed_native_decision_and_caller_recovery(self):
         self._queue_checkpoint_history(context_protocol='auto', initial_notes=False, context_input_tokens=24000)
@@ -2121,6 +2476,80 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertTrue(any('sample,value' in row['observation']['text'] for row in retained))
         self.assertEqual({p:p.read_bytes() for p in self.root.rglob('*') if p.is_file()},before)
         self.assertEqual(self.send.call_count,calls)
+
+    def test_native_material_supply_binds_presented_fields_and_preserves_saved_contract(self):
+        self._create()
+        source = self.inputs/'echo.txt'
+        source.write_text('echoecho', encoding='utf-8')
+        other = self.inputs/'other.txt'
+        other.write_text('echo', encoding='utf-8')
+        self.decisions.extend([
+            [_action('read_file', path=str(source), offset_bytes=offset, max_bytes=4, full_digest=True)
+                for offset in (0, 4)] + [_action('read_file', path=str(other), max_bytes=4, full_digest=True)],
+            _action('ask_user', question='Which observation should be explained?')])
+        self._run()
+        self.assertEqual(self.app.state['config']['native_supply_policy'], 'turns.v1')
+        reads = [item for turn in self.app.state['turns'] for item in turn['tools']
+            if self.app.session.store.read_json(item['result'])['tool_name'] == 'read_file']
+        records = ['records/'+item['result'].removeprefix('attempts/') for item in reads]
+        self.assertEqual(len(records), 3)
+        present = self.app._coordination_result
+        before = {p:p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+        ledger, calls = self.app.ledger.to_dict(), self.send.call_count
+
+        for alteration in ('none', 'omit', 'field', 'range', 'version'):
+            def project(result, record, **kwargs):
+                view = deepcopy(present(result, record, **kwargs))
+                if record == records[1]:
+                    if alteration == 'omit':
+                        view['data'].pop('text')
+                    elif alteration == 'field':
+                        view['summary'] = view['data'].pop('text')
+                    elif alteration == 'range':
+                        view['data']['offset_bytes'] = 0
+                    elif alteration == 'version':
+                        view['data']['sha256'] = 'different-presented-version'
+                return view
+            with self.subTest(alteration=alteration), patch.object(self.app, '_coordination_result', side_effect=project):
+                selection = {}
+                self.app._conversation_messages(working_selection=selection)
+                states = {row['source']['record']:row for row in
+                    selection['selected_records'] + selection['omitted_records']
+                    if row['source'].get('tool') == 'read_file'}
+                self.assertEqual(states[records[0]]['status'], 'native')
+                self.assertEqual(states[records[2]]['status'], 'native')
+                self.assertEqual(states[records[1]]['status'], 'native' if alteration == 'none' else 'working_view')
+                self.assertEqual(states[records[1]]['source']['offset_bytes'], 4)
+                self.assertEqual(states[records[1]]['source']['next_offset_bytes'], 8)
+
+                # Marker-absent saved tasks retain their original inference;
+                # unrelated equal text really can stand in for this receipt.
+                self.app.state['config'].pop('native_supply_policy')
+                try:
+                    legacy = {}
+                    self.app._conversation_messages(working_selection=legacy)
+                    self.assertTrue(any(row['status'] == 'native' and row['source']['record'] == records[1]
+                        for row in legacy['selected_records']))
+                finally:
+                    self.app.state['config']['native_supply_policy'] = 'receipts.v1'
+        self.assertEqual({p:p.read_bytes() for p in before}, before)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self.send.call_count, calls)
+
+        # A real source change marks still-present native bytes historical/stale.
+        source.write_text('ECHOCOPY', encoding='utf-8')
+        selection = {}
+        self.app._conversation_messages(working_selection=selection)
+        stale = [row for row in selection['selected_records'] if row['source']['record'] in records[:2]]
+        self.assertEqual(len(stale), 2)
+        self.assertTrue(all(row['status'] == 'native' and row['version_status'] == 'stale' for row in stale))
+        self.app.state['config'].pop('native_supply_policy')
+        self.app._save()
+        self._reload()
+        self.assertNotIn('native_supply_policy', self.app.state['config'])
+        self.app.supply(supply_id='historical-extra-source', reason='Expose another material alias',
+            changes={'sources':{'extra':self.inputs}})
+        self.assertNotIn('native_supply_policy', self.app.state['config'])
 
     def test_working_v3_retains_closed_operations_without_notes_after_native_eviction(self):
         from dataclasses import replace
@@ -2390,6 +2819,14 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(len(package_feedback['subjects']), 1)
         self.assertTrue(package_feedback['subjects'][0]['current_matches_review'])
         self.assertNotIn('delivery_assessment', package_feedback['result']['metadata'])
+        feedback_source = package_feedback['result']['data']['source_observations']
+        self.assertEqual(self.app.workspace.resolve(feedback_source['record']), review_path.resolve())
+        # The next ordinary decision must receive the accepted opinion itself,
+        # not only the producer's saved inspection-pending marker.
+        messages = self.app._messages(client=self.app._client())
+        rendered = json.dumps(messages, ensure_ascii=False)
+        self.assertIn('The stated mean contradicts the actual source observations.', rendered)
+        self.assertIn(feedback_source['record'], rendered)
         self.assertEqual(scope['artifact_count'], 2)
         presented_producer = self.app._coordination_result(self._last('deliver_result'), producer_record,
             review_record=review_record)
@@ -2441,6 +2878,39 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertIn('does not prove', action_view['scope'])
         inspector = self.app.operations.inspection
         inspector._reused_source_dependencies(source, admitted['data']['absolute_path'])
+        # A selected source from an unsuccessful opinion is still an original
+        # read, but both its parent and that read's own action must remain bound.
+        prior_input = self.app.session.store.read_json(inspector._path(first['identity'], 'input'))
+        selected_reads, unrelated_processes = [], []
+        for number in range(len(prior_input['source_rounds'])):
+            trace = inspector._closed_source_round(prior_input, number)
+            if trace is None:
+                continue
+            for row in trace['results']:
+                if 'receipt' not in row:
+                    continue
+                if (row['tool'] == 'read_file' and (row['result'].get('data') or {}).get('path')
+                        == admitted['data']['absolute_path']):
+                    selected_reads.append(row['receipt']['record'])
+                elif row['tool'] == 'run_process':
+                    unrelated_processes.append(row['receipt']['record'])
+        self.assertTrue(selected_reads)
+        self.assertTrue(unrelated_processes)
+        selected_result = self.root / selected_reads[0]
+        saved_result = selected_result.read_bytes()
+        try:
+            selected_result.write_bytes(b'{}')
+            with self.assertRaises(ValueError):
+                inspector._reused_source_dependencies(source, admitted['data']['absolute_path'])
+        finally:
+            selected_result.write_bytes(saved_result)
+        unrelated_result = self.root / unrelated_processes[0]
+        saved_result = unrelated_result.read_bytes()
+        try:
+            unrelated_result.write_bytes(b'{}')
+            inspector._reused_source_dependencies(source, admitted['data']['absolute_path'])
+        finally:
+            unrelated_result.write_bytes(saved_result)
         # A task opened through a directory alias still reads the same receipt.
         if os.name != 'nt':
             from simple_ar.core.capabilities import ArtifactStore
@@ -2539,7 +3009,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         for name, body in [('说明.md','这三个观察值的均值为2.0。\n'), ('summary.json','{"mean":2.0}\n')]:
             self._submit(_action('write_file', path=name, content=body,
                 expected_sha256=_digest(self.root/'workspace'/name)))
-        guidance = self.app.operations.inspection_feedback(['workspace/summary.json'])
+        guidance = self.app.operations.inspection.work_inputs(['workspace/summary.json'])
         prior = next(row for row in guidance if row.get('delivery_context')==scope)
         self.assertFalse(prior['subjects'][0]['current_matches_review'])
         self.assertIn('contradicts', json.dumps(prior['result']))
@@ -2573,7 +3043,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertGreater(len(self.inspection_requests), calls, 'Changed claims require a fresh independent opinion')
         self.assertNotEqual(self.app.session.manifest.status, 'completed')
         negative = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
-        feedback = self.app.operations.inspection_feedback([])
+        feedback = self.app.operations.inspection.work_inputs([])
         self.assertTrue(any(row.get('delivery_context')==self.app.operations.inspection.delivery_scope_view(negative['binding'])
             and 'overstates' in json.dumps(row['result']) for row in feedback))
         def review_direct_answer(view):
@@ -2777,7 +3247,13 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 observed = self._inspection_sources(view, 'measurements/observations.csv')[0]
                 if observed is None:
                     return [_action('read_file', path='measurements/observations.csv')]
-                response = {'conclusion':'complete', 'findings':[], 'evidence':[observed['subject']],
+                evidence = [observed['subject']]
+                if reassess:
+                    target = self._inspection_sources(view, 'note.md')[0]
+                    if target is None:
+                        return [_action('read_file', path='note.md')]
+                    evidence.append(target['subject'])
+                response = {'conclusion':'complete', 'findings':[], 'evidence':evidence,
                     'limitations':[]}
                 if self.app.state['config'].get('inspection_finding_policy') == 'linked.v1':
                     response['reassessed_prior'] = ([row['id'] for row in view['prior_required']]
@@ -2827,6 +3303,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         partial = []
         def review(view):
             if 'claim' in view.get('proposed_delivery', {}):
+                if view['proposed_delivery'].get('scope_policy') == 'applicable.v1':
+                    reads = self._inspection_missing_reads(view, ['analysis.md'])
+                    if reads:
+                        return reads
                 windows = [window for row in view['evidence']
                     if row['path']==str(self.root/'workspace/analysis.md') for window in row['text_windows']]
                 self.assertTrue(windows)
@@ -3006,13 +3486,30 @@ class OperationsWorkLoopTests(unittest.TestCase):
             {'path':'calculation.py','max_bytes':8}],
             [{'path':'./report.md','max_bytes':12000},'measurements/conditions.txt',
                 'copy.md','blank.txt','unreadable.txt'])
-        self.assertEqual([a['verdict'] for a in _assessments(result)],['passed','incomplete'])
+        assessments = _assessments(result)
+        self.assertEqual([(a['coverage'], a['verdict']) for a in assessments],
+            [('scoped','passed'), ('scoped','passed')])
+        self.assertEqual(assessments[1]['scope'], {'start':0, 'end':8,
+            'size_bytes':len('mean = (1 + 2 + 3) / 3\n'.encode())})
         self.assertEqual([row['subject'] for row in result['data']['evidence']],
             ['evidence-2','evidence-3','evidence-4','evidence-5','evidence-6'])
         self.assertEqual(_assessments(result)[1]['evidence_sha256'],
             {str(self.root/'workspace/report.md'):_digest(self.root/'workspace/report.md')})
         observations = self.app._operation_observations()
-        self.assertEqual(assessment_issues(self.app.workspace,observations,['report.md'],require_pass=['report.md']),[])
+        # Both explicit windows are scoped, even when one happens to span EOF.
+        # Their successful local opinions cannot satisfy a whole-file consumer.
+        for path in ('report.md', 'calculation.py'):
+            issues = assessment_issues(self.app.workspace, observations, [path], require_pass=[path])
+            self.assertTrue(any('lacks a complete' in issue for issue in issues), issues)
+        # Establish an actual whole-file opinion with the cross-file dependency
+        # before testing invalidation. Neither sibling's scoped pass supplies it.
+        self.review = lambda view: {'decisions':[{'subject':'target-1', 'conclusion':'complete',
+            'findings':[], 'evidence':['evidence-1'], 'limitations':[]}]}
+        whole = self._inspect(['report.md'], ['calculation.py'])
+        self.assertEqual((_assessments(whole)[0]['coverage'], _assessments(whole)[0]['verdict']),
+            ('complete','passed'))
+        self.assertEqual(assessment_issues(self.app.workspace, self.app._operation_observations(),
+            ['report.md'], require_pass=['report.md']), [])
         source = self._read('calculation.py')
         self._submit(_action('edit_file',path='calculation.py',expected_sha256=source['sha256'],
             old_text='1 + 2 + 3',new_text='7 + 8 + 9'))
@@ -3451,8 +3948,13 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.review = review
         result = self._inspect([{'path':'progressive.md', 'max_bytes':512}], [])
         self.assertEqual(result['status'], 'ok', result)
-        self.assertEqual(self._assessment()['coverage'], 'complete')
-        self.assertEqual(self._assessment()['verdict'], 'passed')
+        assessment = self._assessment()
+        self.assertEqual((assessment['coverage'], assessment['verdict']), ('scoped', 'passed'))
+        self.assertEqual(assessment['scope'], {'start':0, 'end':512, 'size_bytes':len(original)})
+        from simple_ar.core.assessments import assessment_issues
+        issues = assessment_issues(self.app.workspace, self.app._operation_observations(),
+            ['progressive.md'], require_pass=['progressive.md'])
+        self.assertTrue(any('lacks a complete' in issue for issue in issues), issues)
         requests = self.inspection_requests[before:]
         self.assertGreater(len(requests), 3)
         first = self.inspection_views[before]
@@ -3611,18 +4113,20 @@ class OperationsWorkLoopTests(unittest.TestCase):
             # The fixture reader merges only actual working-view/native read
             # bodies with matching path and digest into these visible windows.
             # Neither retired ranges nor checkpoint notes supply original text.
-            basis, = [row for row in view['evidence'] if row['subject']=='evidence-1']
-            if not basis['text_windows']:
+            sources = [row for row in view['evidence']
+                if row.get('path') == str(self.root/'workspace/basis.txt') and row['text_windows']]
+            if not sources:
                 self.assertFalse(reread_requested, 'One reread must restore the original; do not loop')
                 reread_requested = True
                 return [_action('read_file', path='basis.txt', offset_bytes=0, max_bytes=1024)]
+            basis = sources[-1]
             window, = basis['text_windows']
             self.assertEqual(window['text'], 'Observed sample values are 1, 2, 3; their mean is 2.0.\n')
             self.assertEqual(basis['sha256'], _digest(self.root/'workspace/basis.txt'))
             self.assertEqual(window['offset_bytes'], 0)
             self.assertEqual(window['next_offset_bytes'],len(window['text'].encode()))
             self.assertEqual(window['size_bytes'],len(window['text'].encode()))
-            return {'decisions':[{'subject':'target-1','evidence':['evidence-1'],
+            return {'decisions':[{'subject':'target-1','evidence':[basis['subject']],
                 'findings':[],'limitations':[]}]}
 
         self.review = review
@@ -3632,7 +4136,17 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self._assessment()['evidence_sha256'],
             {str(self.root/'workspace/basis.txt'):_digest(self.root/'workspace/basis.txt')})
         for request in self.inspection_requests:
-            self.assertLessEqual(request['messages'][1]['content'].count('working_view'),1)
+            # Count the actual top-level JSON field, not its mention in the
+            # explanatory scope. A copied string does not create a second view.
+            content = request['messages'][1]['content']
+            pairs, _ = json.JSONDecoder(object_pairs_hook=list).raw_decode(content)
+            self.assertEqual(sum(key == 'working_view' for key, _ in pairs), 1)
+            view, _ = json.JSONDecoder().raw_decode(content)
+            originals = [row['observation'] for row in view['working_view']['observations']
+                if row['observation'].get('path') == str(self.root/'workspace/basis.txt')]
+            locators = [tuple(row.get(field) for field in
+                ('record', 'field', 'path', 'sha256', 'offset_bytes', 'next_offset_bytes')) for row in originals]
+            self.assertEqual(len(locators), len(set(locators)))
         identity = Path(result['data']['record']).parts[1]
         self.assertTrue(reread_requested)
         saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
@@ -3756,12 +4270,22 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._inspect(['revision.md'], [])
 
     def test_delivery_review_with_empty_evidence_reuses_journal_sources_and_reads_current_target(self):
-        self._create()
-        # A saved v1 contract retains its original input scope; new tasks use
-        # the whole-delivery material scope covered by the v2 test above.
-        self.app.state['config']['delivery_review_protocol'] = 'task.v1'
-        self.app.operations.delivery_review.protocol = 'task.v1'
-        self.app._save()
+        from tests.native_history_fixture import load_prepared_operation_history
+        # Declare and load the complete historical policy vector before work;
+        # never downgrade a current journal by changing only its protocol tag.
+        self.app = load_prepared_operation_history(self.root,
+            'Explain supplied observations with an editable report and retain evidence limits.',
+            config={'model':'fixture', 'sources':{'measurements':self.inputs},
+                'model_connection':self.services.llm_client.connection_binding(),
+                'professional_operations':'work.v5', 'source_generation_protocol':None,
+                'source_decision_protocol':None, 'context_protocol':'working.v4',
+                'delivery_review_protocol':'task.v1', 'inspection_coverage_policy':'offered.v2',
+                'inspection_execution_protocol':'shared.v1', 'inspection_finding_policy':None,
+                'allow_execution':True, 'tool_contracts':'full', 'max_turns':70},
+            limits={'llm_requests':70, 'total_tokens':900000,
+                'process_invocations':48, 'process_wall_seconds':360},
+            max_attempts=180, services=self.services)
+        self.assertFalse(self.app.operations.delivery_review.track_findings)
         old_body = 'The sample mean is 2.0 across three supplied observations.\n'
         current_body = old_body + 'These observations do not support population inference.\n'
         self._write('report.md', old_body)
@@ -4110,6 +4634,30 @@ class OperationsWorkLoopTests(unittest.TestCase):
             path.write_bytes(raw)
         self.assertEqual(self._versions(self.inputs),originals)
 
+    def test_publication_without_report_claim_keeps_actual_consumed_byte_binding(self):
+        if not shutil.which('pandoc'):
+            self.skipTest('Real publication requires Pandoc')
+        self._create(goal='Convert this short note to editable LaTeX and deliver it with the Markdown.')
+        # Edited process prose is covered on the Markdown-only delivery path.
+        # This case owns conversion bytes, including delivery without a report.
+        self._write('note.md', '# Note\n\nRevised wording.\n')
+        exported = self._export('note.md')
+        self.assertEqual(exported['status'], 'ok', exported)
+        self.assertEqual(exported['data']['consumer_contract'], 'publication_bytes.v1')
+        self._submit(_action('deliver_result', summary='Converted the revised note.',
+            artifacts=['note.md', exported['data']['project']]))
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        delivery = {'summary':'Converted the revised note.',
+            'artifacts':self.app.workspace.resolve_delivery(DeliveryRequest(
+                summary='Converted the revised note.',
+                artifacts=['note.md', exported['data']['project']]))['artifacts']}
+        observations = self.app._operation_observations()
+        gateway = self.app.operations.gateway
+        self.assertEqual(gateway.delivery_issues(observations, delivery=delivery), [])
+        source = self.root/'workspace/note.md'
+        source.write_text('# Note\n\nChanged after export.\n', encoding='utf-8')
+        self.assertTrue(gateway.delivery_issues(observations, delivery=delivery))
+
     def test_publication_consumes_actual_assets_not_unrelated_failed_producer_outputs(self):
         if not shutil.which('pandoc'):
             self.skipTest('Real publication requires Pandoc')
@@ -4152,10 +4700,16 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(_action('deliver_result', **delivery))
         self._ok('deliver_result')
         self.assertEqual(self.app.session.manifest.status, 'completed')
+        # Saved contracts still need their original consumed-input exception.
+        inventory = self.app.workspace.resolve_delivery(DeliveryRequest.model_validate(delivery))['artifacts']
+        historical_inputs = self.app.operations.publication.conversion_inputs(
+            self.app._operation_observations(), inventory)
+        self.assertIn(self.app.workspace.resolve('live/figure.png'), historical_inputs)
+        self.assertNotIn(self.app.workspace.resolve('live/old output/unused.png'), historical_inputs)
         self.assertEqual([row.to_dict() for row in self.app.ledger.entries][:len(ledger_before)], ledger_before)
         identity = Path(project).name
         self._reload()
-        self.assertEqual(self.app.state['config']['publication_assets'], 'referenced.v2')
+        self.assertEqual(self.app.state['config']['publication_assets'], 'consumed.v3')
         ledger = self.app.ledger.to_dict()
         (self.root/'workspace/live/unrelated.svg').write_text('<svg/>')
         with patch('simple_ar.tools.publication.export_acm_report') as renderer:
@@ -4168,14 +4722,30 @@ class OperationsWorkLoopTests(unittest.TestCase):
         script_bytes = script.read_bytes()
         script.write_bytes(script_bytes+b'\n# Changed producer input\n')
         stale = self.app.operations.publication.call('export_report', arguments, identity=identity)
-        self.assertEqual(stale.status, 'error')
-        self.assertIn('producer inputs/outputs changed', stale.error)
+        self.assertEqual(stale.status, 'ok', stale.error)
+        # Conversion consumes the unchanged chart; it does not adopt its old
+        # computation as a fresh run after the source program changed.
+        with self.assertRaisesRegex(ValueError, 'producer inputs/outputs changed'):
+            self.app.workspace.check_artifact_producers(['live/figure.png'])
+        from simple_ar.tools.producer_declarations import delivery_evidence
+        explicit_owner = SimpleNamespace(root=self.root, workspace=self.app.workspace,
+            ledger=self.app.ledger, session_id=self.app.session.manifest.session_id)
+        with self.assertRaisesRegex(ValueError, 'producer inputs/outputs changed'):
+            delivery_evidence(explicit_owner, self.app._operation_observations(), {
+                **delivery, 'artifacts': [*delivery['artifacts'], 'live/figure.png']})
         script.write_bytes(script_bytes)
         # Actual consumed bytes still invalidate the receipt; stale unrelated
         # producers are not an excuse to weaken source/figure provenance.
         (self.root/'workspace/live/figure.png').write_bytes(b'changed consumed image')
         rejected = self.app.operations.publication.call('export_report', arguments, identity=identity)
         self.assertEqual(rejected.status, 'error')
+        # Terminal domain validation keeps the same protection even without
+        # a report declaration, after the generic producer gate is retired.
+        inventory = self.app.workspace.resolve_delivery(DeliveryRequest(
+            summary='Converted report', artifacts=[project]))['artifacts']
+        self.assertTrue(self.app.operations.gateway.delivery_issues(
+            self.app._operation_observations(),
+            delivery={'summary':'Converted report', 'artifacts':inventory}))
         self.assertEqual(self.app.ledger.to_dict(), ledger)
 
     def test_inspection_finishes_within_shared_capacity_and_returns_to_ordinary_delivery(self):
@@ -4341,7 +4911,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             calls = self.send.call_count
             with patch.object(retained, 'actual_source', 'estimated'):
                 with self.assertRaisesRegex(ValueError, 'unknown operations'):
-                    self.app._check_authorization_operations(allow_closed_model_charges=True)
+                    self.app._check_authorization_operations(explicit_continuation=True)
             self.assertEqual(self.send.call_count, calls)
             self.assertEqual(retained.to_dict(), lost)
             self.app.ledger.save()
@@ -4722,6 +5292,23 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), receipts)
                 else:
                     self.assertEqual(self._assessment()['verdict'], 'passed')
+                if name == 'invalid_shape':
+                    # The rejected native call and the owner's placeholder are
+                    # distinct records; compaction must retain both faithfully.
+                    from simple_ar.app.work_memory import checkpoint_arguments, checkpoint_decisions, prepare_checkpoint_input
+                    from simple_ar.core.working_context import TURN_SUPPLY_POLICY
+                    owner = self.app.operations.inspection
+                    identity = Path(result['data']['record']).parts[1]
+                    saved = owner.store.read_json(owner._path(identity, 'input'))
+                    rows = owner._conversation_rows(saved)
+                    view = prepare_checkpoint_input(requests=saved['user_requests'],
+                        previous={'notes':[], 'through_turn':0, 'compacted_records':set()}, rows=rows,
+                        target=30000, estimate_tokens=len, native_supply_policy=TURN_SUPPLY_POLICY)
+                    rejected = view['observations'][0]
+                    self.assertEqual(rejected['recorded_arguments'], {})
+                    self.assertEqual(checkpoint_arguments(rejected, checkpoint_decisions(view)), {})
+                    proposed = view['turn_decisions'][0]['reply']['tool_calls'][0]['function']['arguments']
+                    self.assertEqual(json.loads(proposed), ['measurements/conditions.txt'])
                 self.assertEqual(len(self.inspection_requests)-before, 2)
                 # Admission and version checks can read the target; no rejected
                 # batch may reach a source read or a workspace write.
@@ -5057,9 +5644,21 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertFalse(assessment_issues(self.app.workspace, self._observations(), ['notes.md']))
         self.assertEqual(assessment_issues(self.app.workspace, self._observations(),
             ['notes.md'], retain_stale_findings=True), [])
-        feedback = self.app.operations.inspection_feedback(['notes.md'])
+        feedback = self.app.operations.inspection.work_inputs(['notes.md'])
         self.assertEqual(json.dumps(feedback).count('The stated claim is not supported by the observed sample.'), 1)
         self.assertEqual(sum(len(row.get('related_opinion_records', [])) for row in feedback), 1)
+
+        # An optional suggestion remains available for a later requested edit,
+        # even if a subsequent narrower check passes. It does not block delivery.
+        self.review = lambda _: {'findings':[{'subject':'target-1', 'severity':'advisory',
+            'message':'Consider making the uncertainty explicit.'}], 'limitations':[]}
+        self._inspect(['notes.md'])
+        self._inspect(['notes.md'])
+        self.review = lambda _: {'findings':[], 'limitations':[]}
+        self._submit(_action('inspect_artifacts', goal='Check only the heading.', targets=['notes.md']))
+        feedback = self.app.operations.inspection.work_inputs(['notes.md'])
+        self.assertEqual(json.dumps(feedback).count('Consider making the uncertainty explicit.'), 1)
+        self.assertFalse(assessment_issues(self.app.workspace, self._observations(), ['notes.md']))
 
     def test_pending_required_projection_keeps_versions_until_explicit_current_reassessment(self):
         from simple_ar.core.assessments import (
@@ -5826,6 +6425,185 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._ok('deliver_result')
         self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
 
+    def test_copy_after_failed_process_does_not_inherit_previous_success(self):
+        self._create()
+        self._write('make.py', "from pathlib import Path\nPath('result.txt').write_text('observed')\n")
+        self._submit(_action('run_process', argv=['python', 'make.py'], inputs=['make.py'],
+            outputs=['result.txt'], timeout_sec=5), approve=lambda *_: True)
+        produced = self._ok('run_process')['data']
+        digest = self._read('result.txt')['sha256']
+        self._submit(_action('copy_file', source='result.txt', source_sha256=digest, path='before.txt'))
+        self._ok('copy_file')
+        self._submit(_action('run_process', argv=['python', '-c', 'raise SystemExit(1)'],
+            outputs=['result.txt'], timeout_sec=5), approve=lambda *_: True)
+        failed = self._last('run_process')
+        self.assertEqual(failed['status'], 'error')
+        self._submit(_action('copy_file', source='result.txt', source_sha256=digest, path='after.txt'))
+        self._ok('copy_file')
+        versions = self.app.workspace.artifact_hashes(['before.txt', 'after.txt'])
+        sources = self.app.workspace.artifact_sources(versions)
+        self.assertEqual(sources['before.txt']['status'], 'recorded')
+        self.assertEqual(sources['after.txt']['status'], 'unknown')
+        # The same source bytes at different copy boundaries have different
+        # lineage: the later copy must retain the failed writer diagnostically.
+        before_graph, after_graph = (sources[name]['lineage'] for name in ('before.txt', 'after.txt'))
+        before_nodes = {node['id']: node for node in before_graph['nodes']}
+        after_nodes = {node['id']: node for node in after_graph['nodes']}
+        before_root, after_root = before_nodes[before_graph['root']], after_nodes[after_graph['root']]
+        self.assertEqual(after_root['state'], 'recorded')
+        self.assertEqual([edge['kind'] for edge in before_root['edges']], ['copy'])
+        self.assertEqual([edge['kind'] for edge in after_root['edges']], ['copy'])
+        before_source = before_nodes[before_root['edges'][0]['node']]
+        after_source = after_nodes[after_root['edges'][0]['node']]
+        self.assertEqual((before_source['path'], before_source['sha256']),
+                         (after_source['path'], after_source['sha256']))
+        self.assertEqual(before_source['sha256'], digest)
+        self.assertNotEqual(before_source['boundary'], after_source['boundary'])
+        self.assertEqual(before_source['state'], 'recorded')
+        self.assertEqual(after_source['state'], 'failed')
+        self.assertNotIn('failed', before_root['ancestry_states'])
+        self.assertIn('failed', after_root['ancestry_states'])
+        self.assertEqual(before_source['producer']['invocation_id'], Path(produced['receipt']).parent.name)
+        self.assertEqual(Path(before_source['producer']['receipt']), Path(produced['receipt']))
+        self.assertEqual(before_source['producer']['receipt_sha256'],
+                         hashlib.sha256((self.root / produced['receipt']).read_bytes()).hexdigest())
+        self.assertEqual(after_source['producer']['invocation_id'], Path(failed['data']['receipt']).parent.name)
+        dependencies = self.app.workspace.artifact_dependencies({'before': sources['before.txt']})
+        self.assertEqual(dependencies, {str(self.app.workspace.resolve('make.py')):
+                                       _digest(self.app.workspace.resolve('make.py'))})
+        # Reading diagnostic lineage does not adopt a failed computation or
+        # require today's original source path to certify the retained copy.
+        self.assertEqual(self.app.workspace.artifact_dependencies({'after': sources['after.txt']}), {})
+        receipt_path = self.root / produced['receipt']
+        native_path = self.root / 'attempts' / receipt_path.parent.name / 'native_result.json'
+        original_receipt, original_native = receipt_path.read_bytes(), native_path.read_bytes()
+        altered = json.loads(original_receipt)
+        inputs = altered['input_binding']['workspace_artifacts']['inputs']
+        inputs[next(iter(inputs))] = '0' * 64
+        receipt_path.write_text(json.dumps(altered), encoding='utf-8')
+        try:
+            self.assertEqual(self.app.workspace.artifact_sources(versions)['before.txt']['status'], 'unknown')
+            native = json.loads(original_native)
+            native['data']['receipt_sha256'] = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+            native_path.write_text(json.dumps(native), encoding='utf-8')
+            self.assertEqual(self.app.workspace.artifact_sources(versions)['before.txt']['status'], 'unknown')
+        finally:
+            receipt_path.write_bytes(original_receipt)
+            native_path.write_bytes(original_native)
+        failed_receipt = self.root / failed['data']['receipt']
+        saved_failed_receipt = failed_receipt.read_bytes()
+        failed_receipt.unlink()
+        try:
+            self.assertEqual(self.app.workspace.artifact_sources(versions)['after.txt']['status'], 'unknown')
+        finally:
+            failed_receipt.write_bytes(saved_failed_receipt)
+        cache = {}
+        self.assertEqual(self.app.workspace.artifact_sources(versions, cache=cache)['before.txt']['status'], 'recorded')
+        unaccepted = json.loads(saved_failed_receipt)
+        unaccepted.update(invocation_id='unaccepted-check', status='running',
+                          started_at=json.loads(original_receipt)['started_at'], finished_at=None)
+        shadow = self.root / 'tools' / 'processes' / 'unaccepted-check'
+        shadow.mkdir()
+        (shadow / 'invocation.json').write_text(json.dumps(unaccepted), encoding='utf-8')
+        try:
+            self.assertEqual(self.app.workspace.artifact_sources(versions, cache=cache)['before.txt']['status'], 'unknown')
+        finally:
+            (shadow / 'invocation.json').unlink()
+            shadow.rmdir()
+        # An interrupted operation can leave a process receipt without an
+        # accepted tool result. It must still prevent claiming an older owner.
+        failed_identity = Path(failed['data']['receipt']).parent.name
+        journal_path = self.root / 'actions.json'
+        original = journal_path.read_bytes()
+        journal = json.loads(original)
+        for turn in journal['turns']:
+            turn['tools'] = [item for item in turn.get('tools', [])
+                             if failed_identity not in Path(item.get('result', '')).parts]
+        journal_path.write_text(json.dumps(journal), encoding='utf-8')
+        try:
+            self.assertEqual(self.app.workspace.artifact_sources(versions)['after.txt']['status'], 'unknown')
+        finally:
+            journal_path.write_bytes(original)
+
+        # Recover a real child process after its output was written but before
+        # its native observation was saved. Its output has the same bytes as the
+        # earlier, proven copy, but recovery cannot invent an original binding.
+        if self.app.session.manifest.status != 'running':
+            self.app.session.continue_with_revision('Check retained child provenance')
+        identity = 'a' * 32
+        arguments = {'argv': [sys.executable, '-c',
+            "from pathlib import Path; Path('before.txt').write_text('observed', encoding='utf-8')"],
+            'cwd': 'workspace', 'outputs': ['before.txt'], 'timeout_sec': 5}
+        call = {'id': identity, 'type': 'function', 'function': {
+            'name': 'run_process', 'arguments': json.dumps(arguments)}}
+        approval = self.app.workspace.execution_approval(call)
+        action = {'attempt': identity, 'kind': 'tool', 'call': call,
+            'origin': {'scope': 'provenance-fixture', 'position': 'tool-0', 'kind': 'tool'},
+            'execution_approval': approval}
+
+        def perform(actual):
+            return self.app.gateway.call(ToolCall(tool_name='run_process', arguments=arguments,
+                trace_id=actual)).model_dump(mode='json')
+
+        registry = self.app.session.registry
+        handler, dispatched = registry.resolve('native_action'), []
+
+        def interrupt(*, context, accepted, perform):
+            context.store.write_json('action.json', accepted, kind='operation_binding')
+            dispatched.append(perform(context.attempt.attempt_id))
+            raise OSError('Process finished before its native observation was saved')
+
+        registry.register('native_action', interrupt, replace=True)
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'Operation failed'):
+                self.app._attempt('native_action', action, perform=perform)
+        finally:
+            registry.register('native_action', handler, replace=True)
+        self.assertEqual(dispatched[0]['status'], 'ok', dispatched[0])
+        self.assertIn('receipt_sha256', dispatched[0]['data'])
+        self.assertFalse(self.app.session.store.exists(f'attempts/{identity}/native_result.json'))
+        process_receipt = self.root / 'tools' / 'processes' / identity / 'invocation.json'
+        retained_receipt = process_receipt.read_bytes()
+        failed_capability = self.root / 'attempts' / identity / 'capability_result.json'
+        retained_failure = failed_capability.read_bytes()
+        with patch('simple_ar.tools.workspace.run_process', side_effect=AssertionError('No process replay')):
+            recovered = self.app._attempt('native_action', action, perform=perform)
+        self.assertEqual(recovered, f'attempts/{identity}-receipt/native_result.json')
+        self.assertFalse(self.app.session.store.exists(f'attempts/{identity}/native_result.json'))
+        self.assertEqual(process_receipt.read_bytes(), retained_receipt)
+        self.assertEqual(failed_capability.read_bytes(), retained_failure)
+        observation = self.app.session.store.read_json(recovered)
+        self.assertNotIn('receipt_sha256', observation['data'])
+        capability = self.app.session.store.read_json(f'attempts/{identity}-receipt/capability_result.json')
+        self.assertNotIn('native_result_sha256', capability['provenance'])
+        owner = self.app.operations.inspection
+        reference = owner._closed_receipt({'source_invocations': []}, {
+            'attempt': identity, 'record': recovered, 'result': observation,
+            'execution_binding': approval['binding']})
+
+        is_file, read_bytes = Path.is_file, Path.read_bytes
+
+        def receipt_is_file(path):
+            return False if path == process_receipt else is_file(path)
+
+        def read_without_receipt(path):
+            if path == process_receipt:
+                raise FileNotFoundError(str(path))
+            return read_bytes(path)
+
+        selected = {'before.txt': versions['before.txt']}
+        with patch.object(Path, 'is_file', receipt_is_file), patch.object(Path, 'read_bytes', read_without_receipt):
+            earlier = self.app.workspace.artifact_sources(selected)['before.txt']
+            self.assertEqual(earlier['status'], 'recorded')
+            self.assertEqual(Path(earlier['record']).parent.name, Path(produced['receipt']).parent.name)
+            current = self.app.workspace.artifact_sources(selected, records=[reference])['before.txt']
+            self.assertEqual(current['status'], 'unknown')
+            self.assertEqual(current['dependencies'], {})
+            readable = self.app.workspace.call('read_file', {'path': 'before.txt'}, identity='read-recovered-output')
+            self.assertEqual(readable.status, 'ok', readable.error)
+            self.assertEqual(readable.data['text'], 'observed')
+        self.assertEqual(process_receipt.read_bytes(), retained_receipt)
+
     def test_direct_source_edit_uses_current_producer_and_preserves_consumed_old_proof(self):
         self._create()
         originals = self._versions(self.inputs)
@@ -5862,12 +6640,35 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(_action('edit_file',path=source,expected_sha256=observed['sha256'],
             old_text=code,new_text=revised))
         self._ok('edit_file')
+        views = self.app.workspace.artifact_sources(self.app.workspace.artifact_hashes([source, 'derived.txt']))
+        edited = views[source]
+        graph = edited['lineage']
+        nodes = {node['id']: node for node in graph['nodes']}
+        current_source = nodes[graph['root']]
+        self.assertEqual(current_source['state'], 'recorded')
+        self.assertIsNone(current_source['producer'])
+        self.assertEqual(current_source['sha256'], _digest(Path(source)))
+        self.assertEqual([edge['kind'] for edge in current_source['edges']], ['previous'])
+        previous = nodes[current_source['edges'][0]['node']]
+        self.assertEqual(previous['path'], Path(source))
+        self.assertEqual(previous['sha256'], observed['sha256'])
+        self.assertNotEqual(previous['sha256'], current_source['sha256'])
+        self.assertIsNotNone(previous['boundary'])
+        self.assertEqual(current_source['ancestry_states'], [])
+        self.assertEqual(edited['dependencies'], {})
+        self.assertEqual(self.app.workspace.artifact_dependencies({source: edited}), {})
+        # The edited source has no computational dependency on its prior bytes,
+        # but an existing downstream result still consumes that exact old version.
+        derived = views['derived.txt']
+        historical_sources = [node for node in derived['lineage']['nodes'] if node['path'] == Path(source)]
+        self.assertTrue(historical_sources)
+        self.assertEqual({node['sha256'] for node in historical_sources}, {observed['sha256']})
+        consumed = self.app.workspace.artifact_dependencies({'derived.txt': derived})
+        self.assertEqual(consumed[source], observed['sha256'])
+        self.assertNotEqual(consumed[source], _digest(Path(source)))
         for artifact in (final,'derived.txt'):
             with self.assertRaises(ValueError):
                 self.app.workspace.check_artifact_producers([artifact])
-            self._submit(_action('deliver_result',summary='Unregenerated output',artifacts=[artifact]))
-            self.assertNotEqual(self._last('deliver_result')['status'],'ok')
-            self._not_delivered()
 
         self._submit(_action('run_process',argv=['python',source,raw],cwd=str(candidate),
             inputs=[source,'measurements/observations.csv'],outputs=[final],timeout_sec=5),
@@ -5881,9 +6682,18 @@ class OperationsWorkLoopTests(unittest.TestCase):
             {Path(source).resolve():_digest(Path(source)),Path(raw).resolve():_digest(Path(raw))})
         with self.assertRaises(ValueError):
             self.app.workspace.check_artifact_producers(['derived.txt'])
-        self._submit(_action('deliver_result',summary='Still consumes the old result',artifacts=['derived.txt']))
-        self.assertNotEqual(self._last('deliver_result')['status'],'ok')
-        self._not_delivered()
+        # Reading both retained versions is not adopting either computation as
+        # current. Saved inspections keep their stronger original input gate.
+        selected = [{'path': path, 'sha256': _digest(self.app.workspace.resolve(path))}
+                    for path in (final, 'derived.txt')]
+        saved = {'execution_protocol': 'shared.v1', 'source_provenance': 'versions.v2',
+                 'targets': [], 'evidence': []}
+        inspector = self.app.operations.inspection
+        self.assertEqual(inspector._check_shared_dependencies(saved,
+            current_inputs=True, selected=selected), {})
+        with self.assertRaises(ValueError):
+            inspector._check_shared_dependencies({**saved, 'source_provenance': 'versions.v1'},
+                current_inputs=True, selected=selected)
         self._submit(_action('deliver_result',summary='Current source and freshly computed result',
             artifacts=[source,final]))
         self._ok('deliver_result')
@@ -5982,12 +6792,23 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._create()
         def review(view):
             package = 'claim' in view.get('proposed_delivery', {})
-            return {**(self._review_complete_targets(view) if package else {'limitations': []}), 'findings': [
+            base = self._review_complete_targets(view) if package else {'limitations': []}
+            if isinstance(base, list):
+                return base  # The inspector requested actual missing content.
+            findings = [
             {('artifacts' if package else 'subject'): [row['path']] if package else row['subject'], 'severity': 'required',
              'message': '9.0 contradicts the observed mean 2.0.'}
             for row in (view['evidence'] if package else view['targets'])
             if row['path']==str(self.root/'workspace/report.md')
-                and any('9.0' in window['text'] for window in row['text_windows'])]}
+                and any('9.0' in window['text'] for window in row['text_windows'])]
+            # A fresh package review may retire a prior concern only after the
+            # reviewer has actually checked the corrected current report.
+            reassessed = ([row['id'] for row in view.get('prior_required', [])]
+                if package and not findings and any(
+                    row['path']==str(self.root/'workspace/report.md') and row['text_windows']
+                    for row in view['evidence']) else [])
+            return {**base, 'findings': findings,
+                **({'reassessed_prior': reassessed} if package else {})}
         self.review = review
         self._write('report.md','The sample mean is 2.0.\n')
         self._inspect(['report.md'])
@@ -6035,8 +6856,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.send.call_count, calls)
         self.assertEqual(self.app.ledger.to_dict(), ledger)
 
-        # An inline writer can complete production while its proposed result
-        # still consumes a stale executed output. Reject before review here too.
+        # An ordinary current attachment is admitted to applicable review.
+        # Explicit computational consumption still rejects its stale closure.
         self.root = self.directory/'stale-output-admission'
         self._create()
         self._write('input.txt', 'first\n')
@@ -6055,13 +6876,25 @@ class OperationsWorkLoopTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'producer inputs/outputs changed'):
             inspector._reused_source_dependencies(reference, 'workspace/value.txt')
         calls = self.send.call_count
-        self._submit(_action('write_file', path='report.md', content='# Current report\n',
-            delivery=self._delivery('report.md', 'value.txt')))
+        inspections = len(self.inspection_requests)
+        def review_stale_attachment(view):
+            return {'conclusion':'incomplete', 'findings':[], 'evidence':[],
+                'limitations':['Original input closure is stale; computation not verified.'],
+                'applicability':'The attachment makes a computational claim requiring investigation.',
+                'investigations':[{'claim':'The attachment reflects the current input.',
+                    'method':'Not performed: the original computation inputs changed.',
+                    'reasoning':'Unchanged output bytes do not establish a current calculation.',
+                    'evidence':[], 'outcome':'unresolved'}]}
+        with patch.object(self, 'review', review_stale_attachment):
+            self._submit(_action('write_file', path='report.md', content='# Current report\n',
+                delivery=self._delivery('report.md', 'value.txt')))
         produced = self._ok('write_file')
         self.assertEqual((self.root/'workspace/report.md').read_text(), '# Current report\n')
-        self.assertIn('producer inputs/outputs changed', produced['metadata']['delivery_review_error'])
-        self.assertEqual(self.send.call_count, calls)
-        self.assertFalse((self.root/'tools/inspection').exists())
+        self.assertNotIn('delivery_review_error', produced['metadata'])
+        self.assertGreater(self.send.call_count, calls)
+        self.assertEqual(len(self.inspection_requests), inspections+1)
+        assessed = self._ok('write_file', reviewed=True)['metadata']['delivery_review']['result']
+        self.assertEqual(assessed['metadata']['delivery_assessment']['verdict'], 'incomplete')
         self._not_delivered()
 
         # A successful analysis is also a producer. The admission consumer
@@ -6336,3 +7169,95 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(_action('deliver_result', summary='Actual execution retained', artifacts=['count.txt']))
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         self.assertFalse(self.inspection_views, 'Legacy execution acquired a new inspection lifecycle')
+
+
+class ProcessRecordProjectionTests(unittest.TestCase):
+    """Compare recorded production with current and retained-version checks."""
+
+    def setUp(self):
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.workspace = WorkspaceToolGateway(self.root, {}, None)
+        self.source = self.workspace.workspace/'source.txt'
+        self.output = self.workspace.workspace/'result.txt'
+        self.sibling = self.workspace.workspace/'sibling.txt'
+        self.source.write_bytes(b'source')
+        self.output.write_bytes(b'original result')
+        self.sibling.write_bytes(b'sibling result')
+
+    def _receipt(self, identity, *, status='finished', returncode=0, stop_reason=None,
+                 started='2026-10-20T00:00:00+00:00', bound=True):
+        record = {'schema_version': 'process_invocation.v1', 'invocation_id': identity,
+            'status': status, 'returncode': returncode, 'stop_reason': stop_reason,
+            'started_at': started, 'finished_at': started}
+        if bound:
+            record['input_binding'] = {'workspace_artifacts': {'version': 1,
+                'inputs': {'workspace/source.txt': _digest(self.source)},
+                'outputs': ['workspace/result.txt', 'workspace/sibling.txt']}}
+            if status == 'finished' and returncode == 0 and not stop_reason:
+                record['output_binding'] = {'version': 1, 'outputs': {
+                    'workspace/result.txt': _digest(self.output),
+                    'workspace/sibling.txt': _digest(self.sibling)}}
+        self._save(identity, record)
+        return record
+
+    def _save(self, identity, record):
+        receipt = self.root/'tools'/'processes'/identity/'invocation.json'
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps(record), encoding='utf-8')
+
+    @staticmethod
+    def _event(identity, artifacts=()):
+        return {'record': f'attempts/{identity}/native_result.json', 'request_count': 1,
+            'observation': {'tool_name': 'run_process', 'status': 'ok',
+                'data': {'receipt': f'tools/processes/{identity}/invocation.json'},
+                'artifacts': list(artifacts)}}
+
+    def test_failed_current_owner_does_not_replace_a_copied_historical_version(self):
+        self._receipt('first')
+        old_digest = _digest(self.output)
+        copied = self.workspace.workspace/'copy.txt'
+        copied.write_bytes(self.output.read_bytes())
+        history = [
+            {'process_ref': 'tools/processes/first/invocation.json', 'position': 1},
+            {'position': 2, 'start': None, 'end': None,
+             'inputs': {self.output: old_digest}, 'outputs': {copied: old_digest},
+             'links': {copied: [(self.output, old_digest)]}, 'consistent': True},
+            {'process_ref': 'tools/processes/later/invocation.json', 'position': 3},
+        ]
+        for status, returncode, reason in (('finished', 1, None), ('stopped', None, 'timeout')):
+            with self.subTest(status=status):
+                self._receipt('later', status=status, returncode=returncode, stop_reason=reason,
+                              started='2026-10-20T00:01:00+00:00')
+                with self.assertRaisesRegex(ValueError, 'no successful output binding'):
+                    self.workspace.check_artifact_producers(['result.txt'])
+                self.assertEqual(self.workspace.working_result([self._event('later')],
+                                 saved_delivery=None)['identities'], [])
+                self.workspace.check_artifact_producers([], retained_versions={copied: old_digest},
+                                                        retained_history=history)
+                with self.assertRaisesRegex(ValueError, 'producer inputs/outputs changed'):
+                    self.workspace.check_artifact_producers([], retained_versions={
+                        copied: old_digest, self.source: hashlib.sha256(b'different source').hexdigest()},
+                        retained_history=history)
+                after_failure = deepcopy(history)
+                after_failure[1]['position'] = 4
+                with self.assertRaisesRegex(ValueError, 'no successful output binding'):
+                    self.workspace.check_artifact_producers([], retained_versions={copied: old_digest},
+                                                            retained_history=after_failure)
+
+        # The current path has no unique owner at equal start times, while the
+        # retained copy still has an explicit earlier journal boundary.
+        self._receipt('later', status='stopped', returncode=None, stop_reason='timeout')
+        with self.assertRaisesRegex(ValueError, 'Ambiguous producer timestamps'):
+            self.workspace.check_artifact_producers(['result.txt'])
+        self.workspace.check_artifact_producers([], retained_versions={copied: old_digest},
+                                                retained_history=history)
+
+        # Legacy output without a binding stays visible but has unknown origin.
+        legacy = self.workspace.workspace/'legacy.txt'
+        legacy.write_bytes(b'no recorded binding')
+        self._receipt('legacy', bound=False)
+        view = self.workspace.working_result([self._event('legacy', ['workspace/legacy.txt'])], saved_delivery=None)
+        self.assertEqual(view['identities'][0]['version_binding'], 'unknown')
+        self.assertIsNone(self.workspace.artifact_provenance(['legacy.txt'])['legacy.txt']['producer'])

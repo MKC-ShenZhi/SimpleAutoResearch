@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -8,7 +9,7 @@ from simple_ar.integrations.usage import record_usage
 from simple_ar.integrations.llm import LLMClient, LLMError, LLMResponseError
 from simple_ar.reviewing.schema import ReviewFinding, normalize_review_findings, review_report
 from simple_ar.core.capabilities import ArtifactStore
-from simple_ar.core.artifacts import write_json
+from simple_ar.core.artifacts import write_atomically, write_json
 from simple_ar.code_task.runtime.state import review_workspace_boundary
 from simple_ar.code_task.review_pipeline import (
     build_review_index, build_review_clusters, compact_review_index, snippets_for_cluster,
@@ -78,7 +79,8 @@ def run_project_review(
 
 
 def run_visual_review(*, client: LLMClient, image_paths: tuple[Path, ...],
-                      goal: str, output_dir: Path) -> dict[str, Any]:
+                      goal: str, output_dir: Path,
+                      output_versions: dict[str, str] | None = None) -> dict[str, Any]:
     """Inspect immutable rendered images; do not equate model feedback with proof.
 
     Caller supplies a vision connection and the existing budget ledger. A saved
@@ -90,16 +92,25 @@ def run_visual_review(*, client: LLMClient, image_paths: tuple[Path, ...],
     request = {"goal": goal, "connection": client.connection_binding(),
                "images": [f"source-{i}{path.suffix.lower()}" for i, path in enumerate(image_paths)]}
     response = None
+    retained_versions = None
+    fresh_response = False
     if store.exists("request.json"):
         if (store.read_json("request.json") != request or any(
                 (output_dir / name).read_bytes() != path.read_bytes()
                 for name, path in zip(request["images"], image_paths))):
             raise ValueError("Review inputs changed; use a new review version")
-        if store.exists("review.json"):
-            return store.read_json("review.json")
         if not store.exists("response.json"):
+            if store.exists("review.json"):
+                return store.read_json("review.json")
             raise ValueError("Review interrupted; retain its ledger and use a new authorized version")
         response = store.read_json("response.json")
+        if response.get('schema_version') == 'visual_response.v2':
+            retained_versions = response['output_sha256']
+            response = response['response']
+        elif store.exists("review.json"):
+            # Historical outputs were not bound when produced. Keep their
+            # recovery contract, but do not invent output proof on this read.
+            return store.read_json("review.json")
     elif output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError("Use a new empty review directory")
     # Validate formats/size before copying; the model client also checks its
@@ -135,6 +146,7 @@ def run_visual_review(*, client: LLMClient, image_paths: tuple[Path, ...],
                 "output_limit": client.effective_output_limit()})
             raise
         store.write_json("response.json", response)
+        fresh_response = True
     if not isinstance(response.get("findings"), list):
         raise LLMResponseError("Visual reviewer did not return findings; raw response retained")
     findings = normalize_review_findings(response["findings"], source="model_visual",
@@ -144,12 +156,46 @@ def run_visual_review(*, client: LLMClient, image_paths: tuple[Path, ...],
     report = build_review_artifact(reviewer="model_visual", subject="rendered figures",
         findings=findings, metadata={"inspection": "model_visual", "scientific_validity": "not_assessed",
             "images": request["images"], "goal": goal, "connection": request["connection"]})
-    store.write_json("review.json", report)
-    store.write_text("feedback.md", "# Visual feedback\n\n" + (
+    feedback = ("# Visual feedback\n\n" + (
         "\n\n".join(f"- {row.summary}\n  Evidence: {'; '.join(row.evidence)}\n  Suggested change: {row.recommendation}"
                      for row in findings) or "The model found no visible issue in this inspection.")
         + "\n\nModel inspection is not proof of scientific correctness. Preserve the original "
         "and apply feedback to its source project or a new image-edit version.\n")
+    # A saved response can be recovered without another model call, but it must
+    # never overwrite a user-edited artifact left in the same output directory.
+    # Publish the structured result last: its presence is the existing
+    # completion marker, so a restart can finish an interrupted publication.
+    outputs = {"feedback.md": feedback,
+               "review.json": json.dumps(report, indent=2, ensure_ascii=False) + "\n"}
+    versions = {name: hashlib.sha256(value.encode('utf-8')).hexdigest()
+                for name, value in outputs.items()}
+    if fresh_response:
+        # Persist the owner's expected bytes before publishing either output.
+        # A restart can finish publication from this same response without
+        # hashing an edited file or issuing another model request.
+        store.write_json('response.json', {'schema_version': 'visual_response.v2',
+            'response': response, 'output_sha256': versions})
+        retained_versions = versions
+    elif retained_versions is not None and retained_versions != versions:
+        raise ValueError('Retained visual response differs from its output binding')
+    for name, value in outputs.items():
+        if store.exists(name) and (store.read_json(name) != report if name == "review.json"
+                                   else store.read_text(name) != value):
+            raise ValueError("Retained visual output changed; preserve it and use a new review version")
+    for name, value in outputs.items():
+        try:
+            write_atomically(store.resolve(name), value.encode('utf-8') if retained_versions is not None else value,
+                             overwrite=False)
+        except FileExistsError:
+            if (store.read_json(name) != report if name == "review.json"
+                    else store.read_text(name) != value):
+                raise ValueError("Retained visual output changed; preserve it and use a new review version")
+    if retained_versions is not None:
+        if any(hashlib.sha256(store.resolve(name).read_bytes()).hexdigest() != digest
+               for name, digest in retained_versions.items()):
+            raise ValueError('Retained visual output differs from its original bytes')
+        if output_versions is not None:
+            output_versions.update(retained_versions)
     return report
 
 

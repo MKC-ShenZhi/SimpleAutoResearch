@@ -2,11 +2,37 @@
 
 [中文版](CHANGELOG_zh.md)
 
-User-visible changes in reverse chronological order. Development entries are unreleased;
-engineering checks and real task acceptance are reported separately.
+User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
-## 2026-10-31 — V2.10 development (unreleased)
+## 2026-11-03
+
+### Improved
+
+- Retain complete edited text with its version for optional reuse in later work. Large snapshots do not displace required input; authored text remains distinct from source-read evidence.
+- Edited Markdown can proceed directly to delivery review without a publication step. Inspection distinguishes reading material from adopting computation results; historical task rules and explicit computation dependency checks remain intact.
+
+### Fixed
+
+- Prevent optional-material bookkeeping from falsely overflowing the context limit. Capacity is checked against the complete final input while retaining the latest action and required instructions.
+
+## 2026-11-02
+
+### Improved
+
+- General document conversion validates the consumed manuscript and assets, allowing edited documents to be exported again while explicit computation results retain execution and dependency checks.
+- Working memory and independent checks share source validation, retaining original observations and historical task rules when work continues.
+- Result views and execution checks share process-record interpretation while distinguishing recorded versions from current validity.
+
+### Fixed
+
+- Follow-up revisions can access accepted findings and their original records, retaining relevant suggestions and cross-file findings. Opinions whose acceptance cannot be confirmed are not treated as valid conclusions.
+- Some malformed historical material records no longer interrupt discovery of other materials.
+- New execution results retain a receipt binding; missing provenance is not reconstructed for historical results.
+
+Complete figure-and-text feedback, independent review reliability and total cost still require real-task acceptance.
+
+## 2026-10-31
 
 ### Improved
 
@@ -25,7 +51,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 Complete feedback delivery, independent review quality and total cost still require real-task acceptance on one version.
 
-## 2026-10-30 — V2.10 development (unreleased)
+## 2026-10-30
 
 ### Improved
 
@@ -41,7 +67,7 @@ Complete feedback delivery, independent review quality and total cost still requ
 
 Complete feedback delivery and lower total cost still require real-task acceptance.
 
-## 2026-10-29 — V2.10 development (unreleased)
+## 2026-10-29
 
 ### Improved
 
@@ -53,7 +79,7 @@ Complete feedback delivery and lower total cost still require real-task acceptan
 - Resource exhaustion in search, execution and other operations now pauses shared-loop work instead of buying further investigation of the same blocker. Existing artifacts, failures and accounting remain available for revised requests or explicitly authorized continuation.
 - Saved requests that failed preflight can resume after configuration is restored, without submitting duplicate feedback. Completed clarification turns still wait for a caller response.
 
-## 2026-10-28 — V2.10 development (unreleased)
+## 2026-10-28
 
 ### Improved
 
@@ -64,7 +90,7 @@ Complete feedback delivery and lower total cost still require real-task acceptan
 
 An initial draft has been formally delivered. The latest unassisted feedback remains unclosed; lower total task cost has not been demonstrated.
 
-## 2026-10-27 — V2.10 development (unreleased)
+## 2026-10-27
 
 ### Improved
 
@@ -77,7 +103,7 @@ An initial draft has been formally delivered. The latest unassisted feedback rem
 - Feedback reaches the relevant revision operations. Another successful version cannot clear changed copies, stale outputs or unresolved findings.
 - Publication supports images from authorized directories and can recover saved review receipts. Closing instructions share the material context budget.
 
-## 2026-10-26 — V2.10 development (unreleased)
+## 2026-10-26
 
 ### Improved
 
@@ -91,7 +117,7 @@ An initial draft has been formally delivered. The latest unassisted feedback rem
 - Failed decisions support explicit connection changes or supplied resources. Unknown usage remains reserved and stopped calls do not replay tools.
 - Production and delivery are checked separately, preserving valid work after preparation failures without pairing changed source with stale output.
 
-## 2026-10-25 — V2.10 development (unreleased)
+## 2026-10-25
 
 ### Improved
 
@@ -106,7 +132,7 @@ An initial draft has been formally delivered. The latest unassisted feedback rem
 
 At this date, a cold start had not delivered within its fixed budget and development recovery had not closed feedback. Engineering changes do not establish general success.
 
-## 2026-10-24 — V2.10 development (unreleased)
+## 2026-10-24
 
 ### Added
 
@@ -125,7 +151,7 @@ At this date, a cold start had not delivered within its fixed budget and develop
 
 Project continuity, coordination efficiency and overall slimming remain in development and have not passed full acceptance.
 
-## 2026-10-23 — V2.10 development (unreleased)
+## 2026-10-23
 
 ### Added
 

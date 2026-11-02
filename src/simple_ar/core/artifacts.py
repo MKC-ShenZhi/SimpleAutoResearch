@@ -58,8 +58,8 @@ def write_json(path: Path, data: Any) -> None:
     write_atomically(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
-def write_atomically(path: Path, content: str | bytes) -> None:
-    """Replace text or exact bytes with a unique sibling file and shared lock retry."""
+def write_atomically(path: Path, content: str | bytes, *, overwrite: bool = True) -> None:
+    """Publish a complete sibling file, optionally refusing to replace an existing path."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -74,8 +74,18 @@ def write_atomically(path: Path, content: str | bytes) -> None:
         ) as handle:
             temporary_path = Path(handle.name)
             handle.write(content)
-        _replace_file(temporary_path, path)
-        temporary_path = None
+        if overwrite:
+            _replace_file(temporary_path, path)
+            temporary_path = None
+        elif os.name == "nt":
+            # Windows rename refuses an existing destination; unlike a hard
+            # link it also works on common Windows filesystems without links.
+            os.rename(temporary_path, path)
+            temporary_path = None
+        else:
+            # A same-directory hard link publishes fully written bytes in one
+            # operation and fails if the destination appeared concurrently.
+            os.link(temporary_path, path)
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)

@@ -860,9 +860,6 @@ class ScientificToolGateway:
                         if row['kind'] not in {'analysis_result', 'experiment_set_analysis', 'experiment_comparison', 'experiment_set'}:
                             continue
                         artifact = store.resolve(ArtifactRef.from_dict(row))
-                        if (self._locator(artifact) not in receipt['hashes']
-                                or row['kind'] in evidence['analysis_artifacts']):
-                            raise ValueError('Analysis has an unbound or ambiguous registered artifact kind')
                         evidence['analysis_artifacts'][row['kind']] = artifact.relative_to(self.root).as_posix()
                     evidence['analysis_records'] = [record]
         return evidence
@@ -884,6 +881,12 @@ class ScientificToolGateway:
                     or observed.get('data') != receipt['result']['data']
                     or observed.get('artifacts') != receipt['result']['artifacts']):
                 raise ValueError('Analysis observation disagrees with its verified receipt')
+            kinds = set()
+            for row in receipt['result'].get('metadata', {}).get('capability_artifacts', []):
+                if row['kind'] in {'analysis_result', 'experiment_set_analysis', 'experiment_comparison', 'experiment_set'}:
+                    if self._locator(store.resolve(ArtifactRef.from_dict(row))) not in receipt['hashes'] or row['kind'] in kinds:
+                        raise ValueError('Analysis has an unbound or ambiguous registered artifact kind')
+                    kinds.add(row['kind'])
             return path, receipt
         return None
 
@@ -901,18 +904,9 @@ class ScientificToolGateway:
 
     def delivery_requirement(self, evidence: dict[str, Any]) -> list[str]:
         """Frozen obligations survive feedback; old request failures do not."""
-        if 'conditions' in (self.execution_contract or {}):
-            locators = [self._locator(self.root / ref) for ref in evidence.get('measurement_refs', [])]
-            selected = self._condition_results(locators, implementation_refs=evidence['implementation_refs'])
-            return self.evidence_requirement(list(selected.values()), evidence.get('analysis_records', []))
-        selected = evidence['implementation_refs'][-1]
-        refs = [ref for ref in evidence.get('measurement_refs', [])
-            if (ArtifactStore(self.root).read_json(ref).get('implementation_ref') or {}).get('path') == selected]
-        if not refs:
-            return ['The current implementation has no formal measurement for its frozen scientific contract']
-        path = self.root / refs[-1]
-        receipt = self._receipt(path.parent.name, 'measure_experiment')
-        return self._measurement_issues(ArtifactStore(self.root).read_json(refs[-1]), receipt['result']['data'])
+        return self.evidence_requirement(
+            [self._locator(self.root / ref) for ref in evidence.get('measurement_refs', [])],
+            evidence.get('analysis_records', []), implementation_refs=evidence['implementation_refs'])
 
     def _measurement_request(self, locator: str) -> dict[str, Any]:
         """Project a verified source for readers; imports never create requests or processes."""
@@ -958,8 +952,9 @@ class ScientificToolGateway:
             request = self._measurement_request(locator)
             source = request.get('execution_approval', request.get('implementation_approval', {})).get('binding', {}).get('source')
             implementation = ((source or {}).get('implementation_ref') or {}).get('path')
-            if implementation_refs is not None and implementation and (
-                    not implementation_refs or implementation != implementation_refs[-1]):
+            if implementation_refs is not None and (
+                    implementation and (not implementation_refs or implementation != implementation_refs[-1])
+                    or implementation_refs and not implementation and 'conditions' not in (self.execution_contract or {})):
                 continue  # Obsolete or unrelated revisions cannot satisfy current slots.
             pending.append((locator, request, source))
         revisions = {source['implementation_ref']['path'] for _, _, source in pending
@@ -1013,13 +1008,17 @@ class ScientificToolGateway:
 
     def evidence_requirement(self, locators: list[str], analysis_records: list[str],
                              *, proposed_analysis: dict[str, Any] | None = None,
-                             proposed_measurement: dict[str, Any] | None = None) -> list[str]:
+                             proposed_measurement: dict[str, Any] | None = None,
+                             implementation_refs: list[str] | None = None) -> list[str]:
         """Full frozen coverage survives feedback and cannot be replaced by a subset."""
-        if proposed_measurement is not None and 'conditions' not in self.execution_contract:
+        if proposed_measurement is not None and implementation_refs is None and 'conditions' not in self.execution_contract:
             parsed = MeasurementRequest.model_validate(proposed_measurement)
             if parsed.model_dump(exclude={'delivery', 'implementation_ref', 'preparation_ref', 'workspace_outputs', 'condition_id'}) == self.execution_contract:
                 return []  # Literal single-run inline delivery; commit verifies the actual receipt.
-        selected = self._condition_results(locators)
+        selected = self._condition_results(locators, implementation_refs=implementation_refs)
+        exact_single = implementation_refs is not None and 'conditions' not in self.execution_contract
+        if exact_single and not selected:
+            return ['The current implementation has no formal measurement for its frozen scientific contract']
         issues = []
         for row in measurement_conditions(self.execution_contract):
             locator = selected.get(row['id'])
@@ -1027,11 +1026,13 @@ class ScientificToolGateway:
                 issues.append(f"Missing declared measurement: {row['id']}")
                 continue
             ref, receipt = self._measurement_input(locator)
-            issues.extend(f"{row['id']}: {issue}" for issue in self._measurement_issues(
+            issues.extend((f"{row['id']}: " if not exact_single else '') + issue for issue in self._measurement_issues(
                 ArtifactStore(self.root).read_json(ref), receipt['result']['data']))
         if 'conditions' not in self.execution_contract or issues:
+            if exact_single and analysis_records:
+                self._matching_analysis(analysis_records, {'result_refs': [selected['candidate']]})
             return issues
-        expected = MeasurementAnalysisRequest.model_validate(self.analysis_arguments(locators))
+        expected = MeasurementAnalysisRequest.model_validate(self.analysis_arguments(list(selected.values())))
         fields = {'result_refs', 'baseline_ref', 'pairs'}
         if proposed_analysis is not None and self._analysis_selection(MeasurementAnalysisRequest.model_validate(
                 proposed_analysis)) == self._analysis_selection(expected):
@@ -1151,13 +1152,36 @@ class ScientificToolGateway:
             issues.append('Declared candidate outputs missing: ' + ', '.join(data['missing_workspace_outputs']))
         return issues
 
-    def delivery_issues(self, observations: list[dict[str, Any]]) -> list[str]:
-        """Disclose only this request's accepted evidence, without execution or analysis.
+    @staticmethod
+    def measurement_refs(observations: list[dict[str, Any]]) -> list[str]:
+        return [row['data']['result_ref'] for row in observations
+            if row.get('contract_current', True)
+            and row.get('tool_name') == 'measure_experiment' and row.get('status') == 'ok']
+
+    @staticmethod
+    def analysis_records(observations: list[dict[str, Any]]) -> list[str]:
+        return [row['record'] for row in observations
+            if row.get('contract_current', True)
+            and row.get('tool_name') == 'analyze_measurements' and row.get('status') == 'ok']
+
+    def delivery_preflight(self, observations: list[dict[str, Any]], arguments: dict[str, Any]) -> list[str]:
+        return self.delivery_issues(observations, delivery=arguments.get('delivery'), proposed=arguments)
+
+    def delivery_issues_for(self, observations: list[dict[str, Any]], delivery: dict | None,
+                            adoptions: list[dict], *, require_current_origin: bool = True) -> list[str]:
+        # Origin admission belongs to the code owner; scientific receipts still
+        # prove their actual producing source, inputs and physical accounting.
+        return self.delivery_issues(observations, delivery=delivery)
+
+    def delivery_issues(self, observations: list[dict[str, Any]], *, delivery: dict | None = None,
+                        proposed: dict | None = None) -> list[str]:
+        """Check current failures and, for a full claim, the frozen scientific work.
 
         The caller supplies observations in accepted chronological order and
         owns request/feedback scoping. A later valid measurement supersedes a
         failure only for the identical approved command and conditions.
         """
+        observations = [row for row in observations if row.get('contract_current', True)]
         issues, measurements = [], {}
         for observation in observations:
             if not observation.get('current_request', True):
@@ -1193,7 +1217,22 @@ class ScientificToolGateway:
                     issues.extend(f'{record}: {issue}' for issue in self._analysis_issues(receipt['result']['data'], store))
             except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError) as exc:
                 issues.append(f'{record or name}: scientific evidence unavailable or changed ({exc}); disclose this gap')
-        return list(dict.fromkeys([*issues, *measurements.values()]))
+        issues.extend(measurements.values())
+        if (delivery is not None and not DeliveryRequest.model_validate(delivery).unresolved
+                and self.execution_contract is not None):
+            implementation = next((row for row in reversed(observations)
+                if row.get('tool_name') == 'implement_code_task'), None)
+            # Code completion is judged by its own owner. Scientific coverage
+            # selects that revision, never a globally active or newer directory.
+            if implementation is None or implementation.get('status') == 'ok':
+                refs = [implementation['artifacts'][0]] if implementation is not None else None
+                if refs is not None or self.implementation is None or self.implementation.exact is None:
+                    issues.extend(self.evidence_requirement(self.measurement_refs(observations),
+                        self.analysis_records(observations),
+                        implementation_refs=refs,
+                        proposed_measurement=proposed if proposed and 'command' in proposed else None,
+                        proposed_analysis=proposed if refs is None and proposed and 'command' not in proposed else None))
+        return list(dict.fromkeys(issues))
 
     def execute_tool(self, name: str, context: CapabilityContext, arguments: dict[str, Any],
                      *, approval: dict | None = None) -> ToolResult:

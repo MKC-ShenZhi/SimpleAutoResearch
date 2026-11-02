@@ -9,6 +9,31 @@ from typing import Any, Literal
 
 
 CITATION_HANDOFF_POLICY = 'citations.v1'
+TURN_SUPPLY_POLICY = 'turns.v1'
+RECEIPT_SUPPLY_POLICIES = frozenset({'receipts.v1', TURN_SUPPLY_POLICY})
+
+
+def feedback_observations(context: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Project related feedback as optional guidance, never source reads.
+
+    Requests and working notes already have their native presentation. The
+    original result record remains readable even if its whole body cannot fit.
+    Subject bindings describe relevance/currentness, not new certification.
+    """
+    reviews = [*context.get('review_observations', ()), *context.get('professional_findings', ())]
+    reviews.sort(key=lambda row: not any(
+        subject.get('current_matches_review') for subject in row.get('subjects', ())))
+    projected = []
+    for row in reviews:
+        source = (row['result'].get('data', {}).get('source_observations') or {}).get('record')
+        record = source if isinstance(source, str) and source.startswith('records/') else row['record']
+        role = ('Retained related feedback' if row.get('opinion_available', True)
+                else 'Unavailable feedback diagnostic')
+        projected.append({'record': record, 'kind': 'operation_result',
+            'text': json.dumps(row['result'], ensure_ascii=False, separators=(',', ':')),
+            'subjects': deepcopy(row['subjects']),
+            'evidence_role': role + '; guidance only, not source evidence, current certification or permission.'})
+    return projected
 
 
 def history_view(turns: list[dict[str, Any]]) -> Any:
@@ -81,6 +106,8 @@ def select_working_context(
     processed_turns: Sequence[int] | None = None,
     economical_checkpoint: bool = False,
     economical_after_turn: int = 0,
+    sparse_handoffs: bool = False,
+    native_observations: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -95,7 +122,9 @@ def select_working_context(
     work. Excerpts address original character ranges, not invented offsets.
     Context (including any checkpoint/through_turn) and inputs stay unchanged.
     Schema cost and mandatory trailing instructions are included in selection;
-    callers enforce hard budgets after selection. Trailing messages cannot add
+    final optional admissions converge against the complete serialized input.
+    Mandatory overflow remains visible for callers to enforce hard budgets.
+    Trailing messages cannot add
     assistant/tool work outside its atomic history block.
 
     ``referenced`` retains owner notes beside recent native work and admits
@@ -118,6 +147,8 @@ def select_working_context(
     them before optional navigation under the same input target. The caller's
     historical_observation role is a provenance claim: a matching file digest
     does not itself establish that the recorded text is an actual read window.
+    authored_text snapshots with write_context retain version-bound authored
+    material separately, including empty files; they never establish read evidence.
     ``require_work_notes`` includes all supplied notes in mandatory context
     before optional material admission, independently of original body supply.
     With usable required notes, retained current/referenced material precedes
@@ -138,7 +169,24 @@ def select_working_context(
     older work outweighs mandatory input, without shrinking the model window.
     The saved failure boundary prevents re-buying a failed summary for little
     new work; originals remain available if no usable checkpoint is adopted.
+    ``sparse_handoffs`` retires individually cited closed turns while retaining
+    recent work and explicitly selected/current originals; uncited gaps stay.
+
+    ``native_observations`` contains transient source locators derived by the
+    message owner from actual presentation. Explicit supply matches receipt,
+    field, recorded version and range, never text elsewhere in a block. Stale
+    native bytes remain historical and marked stale. None retains the saved
+    legacy text-inference contract for consumers not migrated to this policy.
     """
+    # None preserves historical consumers. An explicit (possibly empty) supply
+    # is derived by the message owner, never inferred from matching prose.
+    def source_key(row: Mapping[str, Any]) -> str:
+        return json.dumps([row.get(key) for key in (
+            'turn', 'record', 'field', 'call_id', 'kind', 'role', 'path',
+            'absolute_path', 'sha256', 'offset_bytes', 'next_offset_bytes', 'chunk_id')],
+            ensure_ascii=False)
+
+    native_sources = {source_key(row) for row in native_observations or ()}
     if schema_tokens < 0 or context_token_target < 0:
         raise ValueError('Token costs and target must be nonnegative')
     if type(economical_after_turn) is not int or economical_after_turn < 0:
@@ -226,6 +274,8 @@ def select_working_context(
     journal_selection = processed_turns is not None
     if journal_selection and not fit_work_notes:
         raise ValueError('Processed journal turns require fitted work notes')
+    if type(sparse_handoffs) is not bool or sparse_handoffs and not journal_selection:
+        raise ValueError('Sparse handoffs require a journal selection')
     def active(note: Mapping[str, Any]) -> bool:
         return note.get('current') is not False and note.get('status') in (
             None, 'current', 'active', 'ok')
@@ -288,7 +338,10 @@ def select_working_context(
         text = row.get('text')
         empty_source = (row.get('kind') == 'source_text' and row.get('size_bytes') == 0
                         and row.get('offset_bytes') == 0 and row.get('next_offset_bytes') == 0)
-        valid = isinstance(text, str) and bool(row.get('record')) and (bool(text) or empty_source)
+        empty_authored = (row.get('kind') == 'authored_text' and row.get('role') == 'write_context'
+                          and row.get('size_bytes') == 0 and row.get('offset_bytes') == 0
+                          and row.get('next_offset_bytes') == 0)
+        valid = isinstance(text, str) and bool(row.get('record')) and (bool(text) or empty_source or empty_authored)
         path = row.get('absolute_path') or row.get('path')
         digest = row.get('sha256')
         version = ('historical' if row.get('kind') == 'operation_result' else
@@ -310,7 +363,7 @@ def select_working_context(
             if version != 'stale':
                 version = ('unknown' if current is None or digest is None else
                            'matching' if current == digest else 'stale')
-        keys.append(dump([path, digest, row.get('kind'),
+        keys.append(source_key(row) if native_observations is not None else dump([path, digest, row.get('kind'),
                           row.get('record') if not path or row.get('kind') == 'operation_result' else None,
                           row.get('offset_bytes'),
                           row.get('next_offset_bytes'), row.get('chunk_id'), text]))
@@ -336,6 +389,7 @@ def select_working_context(
     if retained_records:
         view['scope'] += (' Archived original text requires a supplied historical_observation role '
                           'and matching file digest; authored payloads are not read observations. '
+                          'Matching authored_text snapshots with write_context are working material, never source reads or independent evidence. '
                           'The role and text/range provenance are supplied by the caller, not verified here.')
     context['working_view'] = view
     if operation_history is not None:
@@ -374,14 +428,22 @@ def select_working_context(
                 pass
         return text
 
+    def in_native(row: Mapping[str, Any], turns: Sequence[int]) -> bool:
+        if row.get('turn') not in turns:
+            return False
+        if native_observations is not None:
+            return source_key(row) in native_sources
+        text = observation_text(row)
+        return bool(text) and text in native_texts
+
     def mark_native() -> None:
         native_texts.clear()
-        collect_text([message for i in recent for message in blocks[i]])
+        if native_observations is None:
+            collect_text([message for i in recent for message in blocks[i]])
         for row, state in zip(rows, states):
             if state['status'] in {'invalid','summarized'}:
                 continue
-            text = observation_text(row)
-            if row.get('turn') in recent and text and text in native_texts:
+            if in_native(row, recent):
                 state['status'] = 'native'
             elif state['version_status'] == 'stale':
                 state['status'] = 'stale'
@@ -392,17 +454,28 @@ def select_working_context(
             elif (scoped_records or retained_records) and state['version_status'] not in {'matching', 'historical'}:
                 state['status'] = 'unavailable'
             elif (retained_records and state['version_status'] != 'historical'
-                  and row.get('role') != 'historical_observation'):
+                  and row.get('role') != 'historical_observation'
+                  and not (row.get('role') == 'write_context' and row.get('kind') == 'authored_text')):
                 state['status'] = 'unavailable'
             else:
                 state['status'] = 'not_attempted' if scoped_records or retained_records else 'capacity'
         view['stale_native_observations'] = [state['source'] for state in states
             if state['status'] == 'native' and state['version_status'] == 'stale']
         start = recent[0] if recent and any(blocks[:recent[0]]) else 0
+        ranges = [[0, start]] if start else []
+        if sparse_handoffs:
+            ranges = []
+            for i, block in enumerate(blocks):
+                if not block or i in recent:
+                    continue
+                if ranges and ranges[-1][1] == i:
+                    ranges[-1][1] = i + 1
+                else:
+                    ranges.append([i, i + 1])
         view['history'] = {'total_turns': len(blocks), 'retained_turn': latest,
                           'notes_through_turn':summarized_through_turn,
                           'recent_start_turn': start, 'archive_end_turn': start,
-                          'archived_turn_ranges': [[0, start]] if start else []}
+                          'archived_turn_ranges': ranges}
 
     def project() -> tuple[list[dict[str, Any]], int]:
         # Selection and model-visible bookkeeping share one admission cost.
@@ -480,6 +553,23 @@ def select_working_context(
         capacity_omitted.add(recent.pop(0))
         mark_native()
     _, required_cost = project()
+    # Undo optional admissions in reverse priority/order against the complete
+    # final projection, including supply states and compaction bookkeeping.
+    # Initial suffix blocks are optional too; the latest block never is.
+    admissions: list[tuple[str, Any]] = [('initial_native', i) for i in reversed(recent[:-1])]
+
+    def native_snapshot() -> tuple:
+        return (list(recent), deepcopy(states), deepcopy(view['observations']),
+                deepcopy(view['history']), deepcopy(view['stale_native_observations']))
+
+    def restore_native(snapshot: tuple) -> None:
+        old_recent, old_states, old_observations, old_history, old_stale = snapshot
+        recent[:] = old_recent
+        states[:] = old_states
+        view['observations'] = old_observations
+        view['history'] = old_history
+        view['stale_native_observations'] = old_stale
+
     # Keep a bounded evidence share beside fresh work.
     material_ceiling = (context_token_target if whole_records else
                         min(context_token_target, required_cost + context_token_target // 3))
@@ -539,6 +629,7 @@ def select_working_context(
         state['source'] = locator(supplied)
         state['estimated_tokens'] = estimate_tokens(dump(supplied))
         state['status'] = 'working_view'
+        admissions.append(('observation', (i, supplied)))
 
     # Spend navigation capacity on the archived work absent from native input
     # first, newest first. Do not permanently privilege old errors or penalize
@@ -554,6 +645,8 @@ def select_working_context(
             operation_indices.append(i)
             if project()[1] > context_token_target:
                 operation_indices.pop()  # Never excerpt a serialized operation.
+            else:
+                admissions.append(('navigation', i))
 
     if not scoped_records and not retained_records:
         admit_navigation()
@@ -562,6 +655,8 @@ def select_working_context(
         # Explicit references and current objects precede the rest; original
         # text precedes historical operations within each priority group.
         ordered = sorted(range(len(rows)), key=lambda i: (
+            int(rows[i].get('record') in explicit_references or rows[i].get('path') in artifacts
+                or rows[i].get('absolute_path') in artifacts),
             int(rows[i].get('record') in references or rows[i].get('path') in artifacts
                 or rows[i].get('absolute_path') in artifacts),
             int(rows[i].get('kind') != 'operation_result'), *priority(i)), reverse=True)
@@ -580,6 +675,16 @@ def select_working_context(
                 view['notes'].pop()
             else:
                 note_states[i]['status'] = 'working_view'
+                admissions.append(('note', i))
+
+    # Current material and explicit selections take precedence over optional
+    # model notes and navigation. They still pass the same version checks.
+    if retained_records and fit_work_notes:
+        for i in ordered:
+            row = rows[i]
+            if (row.get('record') in explicit_references or row.get('path') in artifacts
+                    or row.get('absolute_path') in artifacts):
+                admit(i)
 
     if fit_work_notes:
         # Notes are useful judgments, not an unbounded mandatory payload. Actual
@@ -606,6 +711,8 @@ def select_working_context(
                         turn_records.setdefault(row['turn'], set()).add(row['record'])
                 supplied_handoffs = {turn for turn in processed
                     if turn_records.get(turn) and turn_records[turn] <= supplied_citations}
+            elif sparse_handoffs:
+                supplied_handoffs = set()  # Unmarked notes cannot retire individual turns.
             if supplied_handoffs:
                 ordered = [i for i in ordered if rows[i].get('turn') not in supplied_handoffs
                     or rows[i].get('record') in explicit_references
@@ -619,35 +726,51 @@ def select_working_context(
         # Keep a contiguous, complete suffix only when it fits beside current
         # work. Repeating a body already supplied from its receipt wastes that
         # room; its original operation remains in the navigation/archive.
+        protected_turns = set()
+        if sparse_handoffs:
+            protected_turns.update(row['turn'] for row in rows if isinstance(row.get('turn'), int)
+                and (row.get('record') in explicit_references or row.get('path') in artifacts
+                     or row.get('absolute_path') in artifacts))
+            protected_turns.update(operation['turn'] for operation in operations
+                if isinstance(operation.get('turn'), int) and (
+                    operation.get('reply') in explicit_references
+                    or operation['observation'].get('record') in explicit_references))
+            previous = next((i for i in reversed(range(latest or 0)) if blocks[i]), None)
+            if previous is not None:
+                protected_turns.add(previous)
         for i in reversed(range(latest or 0)):
             if not blocks[i]:
                 continue
-            if (journal_selection and all(n in supplied_handoffs for n in range(i+1) if blocks[n])):
+            if sparse_handoffs and i in supplied_handoffs and i not in protected_turns:
+                continue
+            if (not sparse_handoffs and journal_selection
+                    and all(n in supplied_handoffs for n in range(i+1) if blocks[n])):
                 break  # Already bought continuity; originals remain retrievable.
             texts: set[str] = set()
-            collect_text(blocks[i], texts)
-            if (not fit_work_notes and any(keys[j] in represented and observation_text(row) in texts
+            if native_observations is None:
+                collect_text(blocks[i], texts)
+            if (not fit_work_notes and any(keys[j] in represented and (
+                    in_native(row, [i]) if native_observations is not None else observation_text(row) in texts)
                     for j, row in enumerate(rows) if isinstance(row.get('text'), str))
                     or not fit_work_notes and estimate_tokens(dump([m for n in [i, *recent] for m in blocks[n]]))
                         > context_token_target // 2):
                 break
-            if fit_work_notes:
-                saved_observations, saved_states = deepcopy(view['observations']), deepcopy(states)
+            snapshot = native_snapshot()
             recent.insert(0, i)
             mark_native()
             if fit_work_notes:
                 # Replace an already selected body with its actual native
                 # block before measuring. Paying for both creates false pressure.
                 view['observations'] = [entry for entry in view['observations']
-                    if not (entry['observation'].get('turn') in recent
-                        and observation_text(entry['observation']) in native_texts)]
+                    if not in_native(entry['observation'], recent)]
             if project()[1] > context_token_target:
-                recent.pop(0)
-                if fit_work_notes:
-                    view['observations'], states[:] = saved_observations, saved_states
-                mark_native()
+                # Restore presentation and admission states together. Calling
+                # mark_native here would turn settled capacity omissions back
+                # into not_attempted and enlarge the model-visible bookkeeping.
+                restore_native(snapshot)
                 capacity_omitted.update(n for n in range(i+1) if blocks[n])
                 break
+            admissions.append(('native', snapshot))
             represented.update(keys[j] for j, state in enumerate(states) if state['status'] == 'native')
         for i in ordered:
             if i not in preferred:
@@ -673,10 +796,6 @@ def select_working_context(
         # Original bodies share this budget and precede optional navigation.
         admit_navigation()
 
-    if journal_selection:
-        for state in states:
-            if state['status'] == 'not_attempted':
-                state['status'] = 'not_requested'
     if required_cost > context_token_target:
         capacity_omitted.clear()  # Old-history compaction cannot fix required-input overflow.
     if economical_checkpoint and journal_selection and latest is not None and required_cost <= context_token_target:
@@ -694,6 +813,54 @@ def select_working_context(
         replay_cost = estimate_tokens(dump([message for i in new_work for message in blocks[i]]))
         if repeated and replay_cost > required_cost:
             economical_history.update(repeated)
+
+    def settle_projection() -> tuple[list[dict[str, Any]], int]:
+        supplied_keys = {keys[i] for i, state in enumerate(states)
+                         if state['status'] in {'native', 'working_view'}}
+        for i, state in enumerate(states):
+            if state['status'] == 'duplicate' and keys[i] not in supplied_keys:
+                state['status'] = 'capacity'
+        if journal_selection:
+            for state in states:
+                if state['status'] == 'not_attempted':
+                    state['status'] = 'not_requested'
+        return project()
+
+    messages, cost = settle_projection()
+    while cost > context_token_target and admissions:
+        # One convergence path for every optional presentation. Each step
+        # removes a whole admitted unit, never a whole file's other windows,
+        # and remeasures actual serialized input rather than reserving slack.
+        kind, value = admissions.pop()
+        if kind == 'navigation':
+            operation_indices.remove(value)
+        elif kind == 'note':
+            view['notes'].remove(notes[value])
+            note_states[value]['status'] = 'capacity'
+        elif kind == 'observation':
+            index, supplied = value
+            view['observations'].remove({'observation': supplied,
+                                        'version_status': states[index]['version_status']})
+            states[index].update(source=locator(rows[index]), status='capacity',
+                                 estimated_tokens=estimate_tokens(dump(rows[index])))
+        elif kind == 'native':
+            removed = set(recent) - set(value[0])
+            restore_native(value)
+            capacity_omitted.update(removed)
+        else:
+            recent.remove(value)
+            capacity_omitted.add(value)
+            mark_native()
+        messages, cost = settle_projection()
+    if cost > context_token_target:
+        # No optional admission remains: report the actual mandatory envelope,
+        # including final bookkeeping, without clipping requests or native work.
+        capacity_omitted.clear()
+        economical_history.clear()
+        messages, cost = settle_projection()
+        required_cost = cost
+    else:
+        required_cost = min(required_cost, cost)
     # Once an unprocessed closed turn actually falls out of the window,
     # checkpoint the other closed unsummarized turns as one bounded batch too.
     # Otherwise each subsequent turn can evict one more block and force a
@@ -702,7 +869,6 @@ def select_working_context(
     compaction_turns = ([i for i, block in enumerate(blocks)
         if block and i != latest and i not in processed]
         if capacity_omitted - processed else sorted(economical_history - processed))
-    messages, cost = project()
     selected = [state for state in states if state['status'] in {'native', 'working_view'}]
     omitted = [state for state in states if state['status'] not in {'native', 'working_view'}]
     metadata = {
@@ -718,7 +884,8 @@ def select_working_context(
         'selected_turns': list(recent),
         'recent_start_turn': view['history']['recent_start_turn'],
         **({'compaction_needed':context['working_context']['compaction_needed']} if fit_work_notes else {}),
-        **({'compaction_turns':compaction_turns} if journal_selection else {}),
+        **({'compaction_turns':compaction_turns,
+            'economical_compaction':bool(economical_history - processed)} if journal_selection else {}),
         'archive_end_turn': view['history']['archive_end_turn'],
         'recent_native_tokens': estimate_tokens(dump([message for i in recent for message in blocks[i]])),
         'material_input_ceiling': material_ceiling,

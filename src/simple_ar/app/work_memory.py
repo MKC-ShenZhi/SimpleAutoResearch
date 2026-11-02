@@ -13,12 +13,46 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from simple_ar.core.working_context import CITATION_HANDOFF_POLICY
+from simple_ar.core.working_context import CITATION_HANDOFF_POLICY, RECEIPT_SUPPLY_POLICIES, TURN_SUPPLY_POLICY
 from simple_ar.integrations.llm import LLMResponseError, check_llm_call_stop
 
 
 _LEGACY_OUTPUT_LIMIT = 8192
 MEMORY_PURPOSES = {'working-memory', 'working-memory-no-response-format'}
+
+
+def observation_digest(value: Any) -> str:
+    """Identify an original JSON observation independently of its presentation."""
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':')).encode('utf-8')).hexdigest()
+
+
+def direct_file_observation(value: dict, *, absolute: bool = False) -> bool:
+    """Only a direct file read can bind its observed bytes without inferred dependencies."""
+    data = value.get('data') or {}
+    path = data.get('absolute_path') if absolute else data.get('path')
+    digest = data.get('sha256')
+    return (value.get('tool_name') == 'read_file' and value.get('status') == 'ok'
+        and isinstance(path, str) and bool(path)
+        and isinstance(digest, str) and len(digest) == 64
+        and all(character in '0123456789abcdef' for character in digest))
+
+
+def observation_currentness(value: dict, *, absolute: bool = False) -> str:
+    if value.get('tool_name') == 'assistant_reply':
+        return 'historical'  # A recorded decision, not an independent factual observation.
+    return 'file_bytes' if direct_file_observation(value, absolute=absolute) else 'unknown'
+
+
+def note_currentness(note: dict, *, versions_match: Any) -> bool | None:
+    """Known changed files override uncertainty about other note sources."""
+    versions = note.get('observed_versions', {})
+    try:
+        if versions and not versions_match(versions):
+            return False
+    except (KeyError, ValueError, OSError):
+        return False
+    return None if note.get('source_integrity') == 'unknown' else True
 
 
 def summary_records(*, previous: dict, snapshot: dict, view: dict,
@@ -31,6 +65,7 @@ def summary_records(*, previous: dict, snapshot: dict, view: dict,
     were supplied intact and whose record citations survived the rewrite.
     Missing citations reopen original selection; no task status is inferred.
     """
+    decisions = checkpoint_decisions(view)
     citation_handoff = view.get('handoff_policy') == CITATION_HANDOFF_POLICY
     covered = set(previous.get('compacted_records', ()))
     if citation_handoff:
@@ -43,8 +78,13 @@ def summary_records(*, previous: dict, snapshot: dict, view: dict,
         covered &= inherited
     for row in view['observations']:
         operations = operations_for_turn(row['turn'])
-        if (row.get('truncated') is False and row['record'] in operations
-                and row.get('arguments', {}) == operations[row['record']]):
+        arguments = (checkpoint_arguments(row, decisions) if view.get('native_supply_policy') == TURN_SUPPLY_POLICY
+                     else row.get('arguments', {}))
+        matches = (row['record'] in operations and
+            (observation_digest(arguments) == observation_digest(operations[row['record']])
+             if view.get('native_supply_policy') == TURN_SUPPLY_POLICY
+             else arguments == operations[row['record']]))
+        if row.get('truncated') is False and matches:
             covered.add(row['record'])
     if citation_handoff:
         covered &= {record for note in snapshot.get('notes', [])
@@ -92,6 +132,111 @@ def summary_coverage(*, previous: dict, snapshot: dict, view: dict, operations_f
 
 class CheckpointResponseError(ValueError):
     """A closed checkpoint response cannot supply a usable note snapshot."""
+
+
+def checkpoint_decisions(view: dict) -> dict[int, dict]:
+    """Return only complete decisions accompanying the supplied journal rows."""
+    if view.get('native_supply_policy') != TURN_SUPPLY_POLICY:
+        return {}
+    entries = view.get('turn_decisions')
+    if not isinstance(entries, list):
+        raise ValueError('Checkpoint requires its supplied turn decisions')
+    decisions = {}
+    for entry in entries:
+        if (not isinstance(entry, dict) or set(entry) != {'turn', 'reply'}
+                or type(entry['turn']) is not int or entry['turn'] < 0
+                or not isinstance(entry['reply'], dict) or entry['turn'] in decisions):
+            raise ValueError('Checkpoint turn decision is malformed or repeated')
+        decisions[entry['turn']] = entry['reply']
+    if set(decisions) != {row['turn'] for row in view['observations']}:
+        raise ValueError('Checkpoint decisions do not match the supplied observations')
+    return decisions
+
+
+def checkpoint_arguments(row: dict, decisions: dict[int, dict]) -> Any:
+    """Recover a call's original arguments from the one supplied decision."""
+    reply = decisions[row['turn']]
+    calls = reply.get('tool_calls') or []
+    call_id = row.get('call_id')
+    if call_id is None and row.get('tool') == 'assistant_reply' and not calls:
+        if 'recorded_arguments' in row:
+            raise ValueError('A reply-only observation cannot replace call arguments')
+        return {}
+    matches = [call for call in calls if isinstance(call, dict) and call.get('id') == call_id]
+    if not isinstance(call_id, str) or len(matches) != 1 or not isinstance(matches[0].get('function'), dict):
+        raise ValueError('Checkpoint observation has no unique decision call')
+    raw = matches[0]['function'].get('arguments')
+    try:
+        decoded = json.loads(raw)
+    except (ValueError, TypeError):
+        decoded = raw
+    # An owner can record a rejected batch with a placeholder for calls which
+    # were never admitted. That recorded value remains distinct from the
+    # original proposed arguments, which are still visible in the decision.
+    return row.get('recorded_arguments', decoded)
+
+
+def validate_checkpoint_sources(view: dict, *, source: Any, owner: str,
+                                journal: bool = False, before_turn: int | None = None,
+                                error: str | None = None) -> None:
+    """Compare supplied checkpoint rows with the owner's original closed events.
+
+    ``source`` resolves a row only through the calling owner's journal and
+    returns its original turn, decision, call, arguments and result. Native
+    historical checkpoints bind positions only; inspection checkpoints always
+    require complete original results. Modern native checkpoints may supply a
+    marked partial presentation, but its original identity still has to match.
+    This validates no ledger entries and writes no state.
+    """
+    if owner not in {'native', 'inspection'}:
+        raise ValueError('Unknown checkpoint source owner')
+    native = owner == 'native'
+    strict = view.get('native_supply_policy') == TURN_SUPPLY_POLICY
+    decisions = checkpoint_decisions(view)
+    mismatch = error or ('Checkpoint observation differs from its original source and coverage'
+                         if native else 'Inspection checkpoint disagrees with its closed source receipt')
+    for row in view['observations']:
+        turn = row['turn']
+        original = source(row)
+        # The historical inspection contract always decoded its complete source,
+        # including on a rejected or missing record. Native partials need not be
+        # valid JSON because their original bytes are not claimed as supplied.
+        present = json.loads(row['observation_text']) if not native else None
+        if native:
+            if (type(turn) is not int or original is None or turn != original['turn']
+                    or journal and row.get('request_count') != original.get('request_count', 1)):
+                raise ValueError('Checkpoint observation disagrees with its original journal position')
+            if not strict:
+                continue  # Unmarked native records had position-only admission.
+        elif (original is None or before_turn is not None and original['turn'] >= before_turn
+                or turn != original['turn']):
+            raise ValueError(mismatch)
+
+        if strict:
+            if observation_digest(decisions[turn]) != observation_digest(original.get('decision')):
+                raise ValueError('Checkpoint decision differs from the original reply' if native else mismatch)
+            if row.get('call_id') != original.get('call_id'):
+                raise ValueError(('Reply-only checkpoint cannot name a tool call'
+                    if original.get('call_id') is None else 'Checkpoint observation changed its call identity')
+                    if native else mismatch)
+            if native and 'recorded_arguments' in row:
+                raise ValueError('Native checkpoint cannot replace its original call arguments')
+            arguments = checkpoint_arguments(row, decisions)
+            same = lambda left, right: observation_digest(left) == observation_digest(right)
+        else:
+            arguments = row.get('arguments', {})
+            same = lambda left, right: left == right
+
+        truncated = row.get('truncated')
+        if ((type(truncated) is not bool if native else truncated is not False)
+                or not same(arguments, original['arguments'])
+                or strict and (row.get('source_sha256') != observation_digest(original['result'])
+                    or row.get('source_currentness') != observation_currentness(original['result'], absolute=native))):
+            raise ValueError(mismatch)
+        if native and not truncated:
+            present = json.loads(row['observation_text'])
+        if (not native or not truncated) and not same(present, original['result']):
+            raise ValueError(mismatch)
 
 
 def checkpoint_entries(ledger: Any, attempt_id: str, session_id: str, *,
@@ -143,17 +288,32 @@ def _bound_response(response: dict, view: dict, bind_notes: Any) -> list[dict]:
     parsed = _Snapshot.model_validate(response)
     supplied = {row['id']:row.get('records', []) for row in view['previous_notes']}
     supplied.update({row['id']:row.get('records', [row['record']]) for row in view['observations']})
-    notes = []
+    uncertain = {}
+    if view.get('native_supply_policy') == TURN_SUPPLY_POLICY:
+        uncertain.update({row['id']:bool(row.get('references_omitted')
+            or row.get('source_integrity') == 'unknown'
+            or not row.get('observed_versions')) for row in view['previous_notes']})
+        uncertain.update({row['id']:row.get('source_currentness') != 'file_bytes'
+                          for row in view['observations']})
+    notes, unresolved = [], []
     for note in parsed.notes:
         if any(key not in supplied for key in note.observations):
             raise CheckpointResponseError('Checkpoint cited an observation ID outside its recorded input')
         records = list(dict.fromkeys(locator for key in note.observations
-            for locator in supplied[key]))[:16]
+            for locator in supplied[key]))
+        if view.get('native_supply_policy') != TURN_SUPPLY_POLICY:
+            records = records[:16]  # Saved checkpoints keep their original binding.
         notes.append({'text':note.text, 'records':records})
+        unresolved.append(view.get('native_supply_policy') == TURN_SUPPLY_POLICY
+                          and (not note.observations or any(uncertain[key] for key in note.observations)))
     bound = bind_notes(notes)
+    if not isinstance(bound, list) or len(bound) != len(notes):
+        raise ValueError('Checkpoint note binding did not preserve its input notes')
     # Derived after owner binding so existing binders need no new interface.
     # Recovery rebuilds and compares this marker under the input digest too.
-    return [{**note, 'handoff_policy':policy} for note in bound] if policy else bound
+    return [{**note, **({'source_integrity':'unknown'} if unknown else {}),
+             **({'handoff_policy':policy} if policy else {})}
+            for note, unknown in zip(bound, unresolved)]
 
 
 def checkpoint_artifacts(*, store: Any, ledger: Any, attempt_id: str,
@@ -165,6 +325,12 @@ def checkpoint_artifacts(*, store: Any, ledger: Any, attempt_id: str,
         return ()
     checkpoint_entries(ledger, attempt_id, session_id, call_id=call_id, completed_retry=completed_retry)
     view = store.read_json('memory_input.json')
+    if (view.get('native_supply_policy') is not None
+            and view.get('native_supply_policy') not in RECEIPT_SUPPLY_POLICIES
+            or view.get('native_supply_policy') in RECEIPT_SUPPLY_POLICIES
+                and view.get('handoff_policy') != CITATION_HANDOFF_POLICY):
+        raise ValueError('Invalid checkpoint native supply contract')
+    checkpoint_decisions(view)
     digest = hashlib.sha256(json.dumps(view,ensure_ascii=False).encode()).hexdigest()
     supplied_through = max(row['turn'] for row in view['observations'])+1
     archive_through = view.get('archive_through_turn',supplied_through)
@@ -190,7 +356,8 @@ def checkpoint_artifacts(*, store: Any, ledger: Any, attempt_id: str,
         if (failure.get('schema_version') != 'working_memory_failure.v1'
                 or failure.get('input_sha256') != digest
                 or type(failure.get('attempted_through_turn')) is not int
-                or failure['attempted_through_turn'] != archive_through
+                or failure['attempted_through_turn'] != (supplied_through
+                    if view.get('native_supply_policy') in RECEIPT_SUPPLY_POLICIES else archive_through)
                 or failure.get('supplied_through_turn') != supplied_through
                 or failure.get('logical_call_id') != (call_id or 'working-memory-'+attempt_id)
                 or failure.get('error_type') not in {'LLMResponseError','ValidationError','CheckpointResponseError'}
@@ -224,11 +391,189 @@ SYSTEM = (
 )
 
 
+def prepare_checkpoint_input(*, requests: list[str], previous: dict, rows: list[dict],
+                             target: int, estimate_tokens: Any,
+                             native_supply_policy: str | None = None,
+                             economic_floor: int | None = None) -> dict | None:
+    """Pure input planning shared by purchase and interrupted owner recovery.
+
+    Only actually supplied receipts enter replay's purchase deduplication.
+    Capacity omissions stay in the original journal and can fit a later batch
+    or a larger input window. No paid work or ledger mutation happens here.
+    ``economic_floor`` is the shared selector's measured mandatory-input cost.
+    Only actual fitted receipts and their original decisions can exceed it.
+    """
+    journal = 'compacted_records' in previous
+    rolling = journal and native_supply_policy in RECEIPT_SUPPLY_POLICIES
+    if economic_floor is not None and (not rolling or type(economic_floor) is not int or economic_floor < 0):
+        raise ValueError('Economic checkpoint cost requires a rolling journal and nonnegative integer')
+    if not rows:
+        return None
+    previous_notes = previous.get('notes',[])
+    attempted_through = previous.get('attempted_through_turn',0)
+    unhandled: dict[int, set[str]] = {}
+    if economic_floor is not None:
+        for row in rows:
+            if row['record'] not in previous.get('compacted_records', ()):
+                unhandled.setdefault(row['turn'], set()).add(row['record'])
+    if rolling:
+        # Derived only from paid checkpoint inputs, including failed summaries.
+        # A turn watermark cannot distinguish two receipts in the same turn.
+        rows = [row for row in rows if row['record'] not in previous.get('attempted_records', ())]
+        if not rows:
+            return None
+    elif attempted_through:
+        # Historical failure replay keeps its original admission contract.
+        # This frontier still grants no coverage.
+        unseen = [row for row in rows if row['turn'] >= attempted_through]
+        unseen_volume = sum(estimate_tokens(json.dumps(row['result'],ensure_ascii=False)[:16000])
+            for row in unseen)
+        if not unseen or not journal and unseen_volume < target//4:
+            return None
+    view = {'requests':requests,'previous_notes':[{'id':'p'+str(i), **(
+            {key:value for key,value in row.items() if key not in {'current', 'version_scope'}}
+            if native_supply_policy == TURN_SUPPLY_POLICY else row)}
+            for i,row in enumerate(previous_notes)],
+            'archive_through_turn':max(row['turn'] for row in rows)+1,
+            'archive_scope':'Considered closed history, including capacity-omitted rows; not summarized coverage.',
+            'observations':[], 'response_schema':_Snapshot.model_json_schema(),
+            'scope':'Working summary only. Actual records, file versions and checks remain authoritative.'}
+    if native_supply_policy is not None:
+        view['native_supply_policy'] = native_supply_policy
+    if native_supply_policy == TURN_SUPPLY_POLICY:
+        view['turn_decisions'] = []
+        view['scope'] += (' Each supplied turn decision is the original assistant reply for the '
+            'observations with that turn number. Decisions and earlier notes are fallible, may be '
+            'out of date and are not independent evidence.')
+    if journal:
+        view['handoff_policy'] = CITATION_HANDOFF_POLICY
+        view['scope'] += (
+            ' Observation citations hand off working continuity: cite an input only when the note '
+            'carries its relevant results, conditions, failures and unresolved work. '
+            'Being supplied is not being covered. Preserve useful previous-note citations when '
+            'rewriting; uncited originals remain eligible for later context. '
+            'Citations are model judgments, not proof of completeness or task completion.')
+    if rolling:
+        view['scope'] += (
+            ' Keep a bounded current understanding, not an exhaustive citation history. '
+            'Replace obsolete conclusions with newer evidence and preserve unresolved uncertainty. '
+            'Drop obsolete or lower-priority notes and references when needed; there is no '
+            'requirement to retain every old receipt. Dropped references reopen original '
+            'source selection, never certify coverage. Prior notes are judgments to reassess.')
+    batches = ((row['turn'], [row]) for row in rows) if journal else groupby(rows,key=lambda row:row['turn'])
+    for turn, grouped in batches:
+        group = list(grouped)
+        additions = []
+        decision_count = len(view.get('turn_decisions', ()))
+        if native_supply_policy == TURN_SUPPLY_POLICY:
+            decision = group[0].get('decision')
+            if (not isinstance(decision, dict) or any(not isinstance(row.get('decision'), dict)
+                    or observation_digest(row['decision']) != observation_digest(decision) for row in group)):
+                continue  # A result cannot stand in for an unavailable decision.
+            existing = next((row for row in view['turn_decisions'] if row['turn'] == turn), None)
+            if existing is not None and observation_digest(existing['reply']) != observation_digest(decision):
+                continue
+            if existing is None:
+                view['turn_decisions'].append({'turn':turn, 'reply':decision})
+        for row in group:
+            identity = 'o'+str(len(view['observations'])+len(additions)+1)
+            raw = json.dumps(row['result'],ensure_ascii=False)
+            original = row.get('original', row['result'])
+            complete = row.get('complete', True) if native_supply_policy == TURN_SUPPLY_POLICY else True
+            source_hash = observation_digest(original) if native_supply_policy == TURN_SUPPLY_POLICY else None
+            if (type(complete) is not bool or native_supply_policy == TURN_SUPPLY_POLICY
+                    and complete and observation_digest(row['result']) != source_hash):
+                raise ValueError('Checkpoint completeness must describe the actual owner presentation')
+            additions.append({'id':identity,'record':row['record'],'turn':turn,
+                'tool':row['result'].get('tool_name'),
+                **({'call_id':row.get('call_id')} if native_supply_policy == TURN_SUPPLY_POLICY
+                   else {'arguments':row.get('arguments',{})}),
+                'observation_text':raw, 'truncated':not complete,
+                **({'source_sha256':source_hash} if native_supply_policy == TURN_SUPPLY_POLICY else {}),
+                **({'source_currentness':row.get('source_currentness', 'unknown')}
+                   if native_supply_policy == TURN_SUPPLY_POLICY else {}),
+                'scope':('Complete original owner receipt; the recorded version remains authoritative.'
+                    if native_supply_policy == TURN_SUPPLY_POLICY and complete else
+                    'Partial owner presentation; omitted original content is not covered.'
+                    if native_supply_policy == TURN_SUPPLY_POLICY else
+                    'Complete supplied owner presentation; the original receipt remains authoritative.')})
+            for key in ('request_count', 'records'):
+                if key in row:
+                    additions[-1][key] = row[key]
+            if native_supply_policy == TURN_SUPPLY_POLICY:
+                proposed = checkpoint_arguments(additions[-1], {turn:decision})
+                if observation_digest(proposed) != observation_digest(row.get('arguments', {})):
+                    additions[-1]['recorded_arguments'] = row.get('arguments', {})
+        view['observations'].extend(additions)
+        supplied_notes = list(view['previous_notes'])
+
+        def input_cost():
+            return (estimate_tokens(json.dumps(view,ensure_ascii=False)) +
+                (estimate_tokens(SYSTEM+'\n\nReturn valid JSON only. Do not include markdown or extra text.') if journal else 0))
+
+        if rolling:
+            # Finite citations need not fit every future model window. Give
+            # actual new observations room by retiring trailing prior notes;
+            # summary_records cannot inherit support from omitted notes.
+            while view['previous_notes'] and input_cost() > target:
+                prior = view['previous_notes'][-1]
+                if (native_supply_policy == TURN_SUPPLY_POLICY and prior.get('records')
+                        and not prior.get('references_omitted')):
+                    # Keep the fallible understanding when its growing locator
+                    # list no longer fits. This cannot hand off any source;
+                    # the original journal remains available for targeted reads.
+                    view['previous_notes'][-1] = {
+                        'id':prior['id'], 'text':prior['text'], 'records':[],
+                        'observed_versions':{}, 'references_omitted':True,
+                        'scope':'Earlier model judgment only; original support was not supplied.'}
+                else:
+                    view['previous_notes'].pop()
+        if input_cost() > (target if journal else target*0.6):
+            del view['observations'][-len(additions):]
+            if native_supply_policy == TURN_SUPPLY_POLICY:
+                del view['turn_decisions'][decision_count:]
+            view['previous_notes'] = supplied_notes
+            if journal:
+                # Keep the receipt intact in the journal. A capacity omission
+                # proves no coverage and must not block later usable work.
+                continue
+            break
+    # The threshold refers to observed history volume, not a scientific stage
+    # or fixed task-specific call count. The recent working sequence remains.
+    if not view['observations'] or (not journal and
+            estimate_tokens(json.dumps(view['observations'],ensure_ascii=False)) < target//4):
+        return None
+    if native_supply_policy == TURN_SUPPLY_POLICY and not any(
+            not row['truncated'] and row.get('records', [row['record']])
+            for row in view['observations']):
+        # Partial and reply-only history stays available in the original
+        # journal. A checkpoint which cannot hand off any original receipt
+        # would add a model call without reducing repeated native history.
+        return None
+    if rolling and economic_floor is not None:
+        fitted = [row for row in view['observations'] if not row['truncated']
+                  and row.get('records', [row['record']])]
+        records = {row['record'] for row in fitted}
+        turns = {row['turn'] for row in fitted if unhandled.get(row['turn'], set()) <= records}
+        fitted = [row for row in fitted if row['turn'] in turns]
+        decisions = [row for row in view.get('turn_decisions', []) if row['turn'] in turns]
+        if estimate_tokens(json.dumps([fitted, decisions], ensure_ascii=False)) <= economic_floor:
+            return None
+    elif rolling and (attempted_through or previous.get('attempted_records')) and estimate_tokens(json.dumps(
+            view['observations'], ensure_ascii=False)) < target//4:
+        # Measure only complete observations that actually fit, not huge
+        # capacity-omitted bodies, previous notes, or growing archive metadata.
+        return None
+    return view
+
+
 def compact_work(*, store: Any, client: Any, requests: list[str],
                  previous: dict, rows: list[dict], bind_notes: Any,
                  estimate_tokens: Any, attempt_id: str,
                  required_decision_tokens: int = 0, call_id: str | None = None,
-                 additional_protection: bool = False, completed_retry: bool = False) -> tuple[dict | None, tuple]:
+                 additional_protection: bool = False, completed_retry: bool = False,
+                 native_supply_policy: str | None = None,
+                 economic_floor: int | None = None) -> tuple[dict | None, tuple]:
     """One bounded checkpoint when unrepresented history warrants compaction.
 
     ``rows`` are exact closed operation observations with journal positions.
@@ -248,13 +593,22 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
     Explicit call_id also binds successful snapshots to that logical call.
     additional_protection stacks the decision/note floor above an owner's
     existing final-opinion and caller floors on the same ledger.
+    New receipts.v1 inputs let notes and their finite citations be replaced,
+    while replay of actual supplied receipts prevents repurchasing
+    old input. It is not a coverage frontier. Saved inputs without
+    this marker retain their earlier adoption behavior.
     """
     if type(required_decision_tokens) is not int or required_decision_tokens < 0:
         raise ValueError('Required decision tokens must be a nonnegative integer')
+    if native_supply_policy is not None and native_supply_policy not in RECEIPT_SUPPLY_POLICIES:
+        raise ValueError('Unknown checkpoint native supply policy')
     if not rows:
         return None, ()
     target = client._settings.context_input_tokens
     journal = 'compacted_records' in previous
+    rolling = journal and native_supply_policy in RECEIPT_SUPPLY_POLICIES
+    if native_supply_policy in RECEIPT_SUPPLY_POLICIES and not journal:
+        raise ValueError('Receipt supply requires a journal owner')
     # A journal shares its owner's actual decoding capacity, including thinking.
     # The old non-journal protocol keeps its recorded checkpoint behavior.
     output_limit = client.effective_output_limit() if journal else _LEGACY_OUTPUT_LIMIT
@@ -262,61 +616,12 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
         # Optional continuity must not create an unbounded generated response
         # inside a finite allowance. Do not invent a smaller hidden output cap.
         return None, ()
-    previous_notes = previous.get('notes',[])
-    failed_through = previous.get('attempted_through_turn',0)
-    if failed_through:
-        # A failed checkpoint did not summarize anything. Its closed input
-        # scope only prevents buying the same summary again without new work.
-        unseen = [row for row in rows if row['turn'] >= failed_through]
-        unseen_volume = sum(estimate_tokens(json.dumps(row['result'],ensure_ascii=False)[:16000])
-            for row in unseen)
-        if not unseen or not journal and unseen_volume < target//4:
-            return None, ()
-    view = {'requests':requests,'previous_notes':[{'id':'p'+str(i),**row}
-            for i,row in enumerate(previous_notes)],
-            'archive_through_turn':max(row['turn'] for row in rows)+1,
-            'archive_scope':'Considered closed history, including capacity-omitted rows; not summarized coverage.',
-            'observations':[], 'response_schema':_Snapshot.model_json_schema(),
-            'scope':'Working summary only. Actual records, file versions and checks remain authoritative.'}
-    if journal:
-        view['handoff_policy'] = CITATION_HANDOFF_POLICY
-        view['scope'] += (
-            ' Observation citations hand off working continuity: cite an input only when the note '
-            'carries its relevant results, conditions, failures and unresolved work. '
-            'Being supplied is not being covered. Preserve useful previous-note citations when '
-            'rewriting; uncited originals remain eligible for later context. '
-            'Citations are model judgments, not proof of completeness or task completion.')
-    through = previous.get('through_turn',0)
-    batches = ((row['turn'], [row]) for row in rows) if journal else groupby(rows,key=lambda row:row['turn'])
-    for turn, grouped in batches:
-        group = list(grouped)
-        additions = []
-        for row in group:
-            identity = 'o'+str(len(view['observations'])+len(additions)+1)
-            raw = json.dumps(row['result'],ensure_ascii=False)
-            additions.append({'id':identity,'record':row['record'],'turn':turn,
-                'tool':row['result'].get('tool_name'),'arguments':row.get('arguments',{}),
-                'observation_text':raw, 'truncated':False,
-                'scope':'Complete supplied owner presentation; the original receipt remains authoritative.'})
-            for key in ('request_count', 'records'):
-                if key in row:
-                    additions[-1][key] = row[key]
-        view['observations'].extend(additions)
-        if (estimate_tokens(json.dumps(view,ensure_ascii=False)) +
-                (estimate_tokens(SYSTEM+'\n\nReturn valid JSON only. Do not include markdown or extra text.') if journal else 0)) > (
-                target if journal else target*0.6):
-            del view['observations'][-len(additions):]
-            if journal:
-                # Keep the receipt intact in the journal. A capacity omission
-                # proves no coverage and must not block later usable work.
-                continue
-            break
-        through = turn+1
-    # The threshold refers to observed history volume, not a scientific stage
-    # or fixed task-specific call count. The recent working sequence remains.
-    if not view['observations'] or (not journal and
-            estimate_tokens(json.dumps(view['observations'],ensure_ascii=False)) < target//4):
+    view = prepare_checkpoint_input(requests=requests, previous=previous, rows=rows,
+        target=target, estimate_tokens=estimate_tokens, native_supply_policy=native_supply_policy,
+        economic_floor=economic_floor)
+    if view is None:
         return None, ()
+    through = max(row['turn'] for row in view['observations'])+1
     text = json.dumps(view,ensure_ascii=False)
     ledger = client._budget_ledger
     if required_decision_tokens and any(entry.status in {'reserved', 'unknown'} and (
@@ -380,7 +685,8 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
                 'schema_version':'working_memory_failure.v1',
                 'logical_call_id':call_id or 'working-memory-'+attempt_id,
                 'input_sha256':hashlib.sha256(text.encode()).hexdigest(),
-                'attempted_through_turn':view['archive_through_turn'], 'supplied_through_turn':through,
+                'attempted_through_turn':through if rolling else view['archive_through_turn'],
+                'supplied_through_turn':through,
                 'error_type':type(exc).__name__, 'diagnostic':str(exc),
                 'finish_reason':getattr(exc,'finish_reason',None),
                 'raw_response':getattr(exc,'raw_response',''),

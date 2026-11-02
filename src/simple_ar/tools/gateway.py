@@ -186,22 +186,32 @@ class CommonToolGateway:
             return False
 
     def delivery_issues(self, observations: list[dict[str, Any]], *, proposed: ToolCall | None = None,
-                        delivery: dict | None = None) -> list[str]:
-        """Domains judge their accepted evidence; the gateway does not reinterpret it."""
+                        delivery: dict | None = None, require_current_origin: bool = True) -> list[str]:
+        """Domains judge accepted evidence once per owner.
+
+        Historical conversion may retain its original source. The caller derives
+        that transient requirement from its verified report/request context;
+        retained artifact, receipt and ledger checks are never optional.
+        """
+        observations = [row for row in observations if row.get('contract_current', True)]
         issues = []
         adoptions = []
-        for owner in self._domain_gateways.values():
+        # Multiple operation domains may belong to one professional owner.
+        # Completion consumes its production evidence once, not per registration.
+        owners = {id(owner): owner for owner in self._domain_gateways.values()}.values()
+        for owner in owners:
             adopt = getattr(owner, 'delivery_adoptions', None)
             if adopt is not None:
                 adoptions.extend(adopt(observations, delivery, proposed))
-        for owner in self._domain_gateways.values():
+        for owner in owners:
             check = getattr(owner, 'delivery_issues', None)
             if check is not None:
                 preflight = getattr(owner, 'delivery_preflight', None)
                 if proposed is not None and self.session_owner(proposed.tool_name) is owner and preflight:
                     issues.extend(preflight(observations, proposed.arguments))
                 elif (adoption := getattr(owner, 'delivery_issues_for', None)) is not None:
-                    issues.extend(adoption(observations, delivery, adoptions))
+                    issues.extend(adoption(observations, delivery, adoptions,
+                        require_current_origin=require_current_origin))
                 else:
                     issues.extend(check(observations))
         return issues

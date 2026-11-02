@@ -98,8 +98,9 @@ CHECK_GROUPS: dict[str, CheckGroup] = {
         targets=("discover", "-s", "tests", "-t", "."),
     ),
     "application": CheckGroup(
-        description="Research intake, application advancement, candidate assessment and recovery.",
-        targets=("tests.test_research_intake", "tests.test_research_application", "tests.test_idea_assessment", "tests.test_research_design", "tests.test_session_migration", "tests.test_tool_agent_handoff"),
+        description="Current work loop, delivery and recovery; historical application compatibility.",
+        targets=("tests.test_research_intake", "tests.test_research_application", "tests.test_idea_assessment", "tests.test_research_design", "tests.test_session_migration", "tests.test_tool_agent_handoff",
+                 "tests.test_professional_work_loop", "tests.test_delivery_review", "tests.test_working_context"),
     ),
     "llm": CheckGroup(
         description="LLM transport, retries and budget accounting; no live provider calls.",

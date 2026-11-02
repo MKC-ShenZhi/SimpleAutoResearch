@@ -2537,6 +2537,8 @@ def _render_native_result(app: Any, status: dict[str, Any]) -> None:
             artifacts = delivery["artifacts"]
             if not isinstance(artifacts, list):
                 raise ValueError("Invalid saved artifact list")
+            for unresolved in delivery.get('unresolved', []):
+                lines.append(f"Unfinished / 未完成: {unresolved}")
             for limitation in delivery.get('limitations', []):
                 lines.append(f"Delivery limitation / 交付局限: {limitation}")
             for locator in artifacts[:4]:
@@ -2560,6 +2562,8 @@ def _render_native_result(app: Any, status: dict[str, Any]) -> None:
                     lines.extend(f"- {row['message']}" for row in review['findings'])
                     lines.extend(f"- {limit}" for limit in review['limitations'])
                     lines.append(f"Opinion record / 意见记录: {review['record']}")
+                else:
+                    lines.append('No independent opinion available in this view / 当前视图没有可展示的独立检查意见，不应据此认为已核查')
             except (OSError, ValueError, KeyError, TypeError):
                 lines.append('Independent opinion unavailable / 检查意见记录不可核对')
     else:

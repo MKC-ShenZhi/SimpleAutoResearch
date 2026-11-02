@@ -11,8 +11,10 @@ import unittest
 from unittest.mock import Mock, PropertyMock, patch
 
 from simple_ar.core.working_context import (
-    CITATION_HANDOFF_POLICY, current_material_paths, history_view, processed_journal_turns, select_working_context)
-from simple_ar.app.work_memory import compact_work, checkpoint_artifacts, checkpoint_entries, summary_coverage
+    CITATION_HANDOFF_POLICY, TURN_SUPPLY_POLICY, current_material_paths, history_view, processed_journal_turns, select_working_context)
+from simple_ar.app.work_memory import (
+    _bound_response, compact_work, checkpoint_arguments, checkpoint_artifacts, checkpoint_decisions, checkpoint_entries, observation_digest,
+    prepare_checkpoint_input, summary_coverage, validate_checkpoint_sources)
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.core.capabilities import ArtifactStore
@@ -55,6 +57,54 @@ def expand_history_view(view):
 
 
 class WorkingContextTests(unittest.TestCase):
+    def test_related_feedback_uses_whole_originals_and_does_not_block_later_body(self):
+        from simple_ar.core.working_context import feedback_observations
+        feedback = {'review_observations': [
+            {'record': 'records/large/result.json', 'subjects': [{'current_matches_review': True}],
+             'result': {'data': {'review': 'large original ' * 30000}}},
+            {'record': 'records/relevant/result.json', 'subjects': [{'current_matches_review': True}],
+             'result': {'data': {'review': 'Move the figure caption beside its image.'}}}],
+            'working_notes': [{'text': 'A summary must not become an original observation'}]}
+        original = deepcopy(feedback)
+        rows = feedback_observations(feedback)
+        messages, selection = select(observations=rows,
+            selected_records=[row['record'] for row in rows], material_policy='referenced',
+            context_token_target=10000)
+        self.assertEqual(feedback, original)
+        view = json.loads(messages[1]['content'])['working_view']['observations']
+        self.assertEqual(len(view), 1)
+        self.assertEqual(json.loads(view[0]['observation']['text']), feedback['review_observations'][1]['result'])
+        self.assertTrue(any(row['source']['record'] == 'records/large/result.json'
+            and row['status'] == 'capacity' for row in selection['omitted_records']))
+        self.assertNotIn('A summary must not become an original observation', json.dumps(messages))
+
+    def test_related_feedback_preserves_changed_subject_history_without_certifying_it(self):
+        from simple_ar.core.working_context import feedback_observations
+        stale = {'record': 'records/stale/result.json',
+            'subjects': [{'path': 'workspace/figure.png', 'current_matches_review': False}],
+            'result': {'data': {'review': 'Earlier figure observation'}}}
+        current = {'record': 'records/current/result.json',
+            'subjects': [{'path': 'workspace/figure.png', 'current_matches_review': True}],
+            'result': {'data': {'review': 'Current bound observation'}}}
+        rows = feedback_observations({'review_observations': [stale, current]})
+        self.assertEqual([row['record'] for row in rows], [current['record'], stale['record']])
+        self.assertFalse(rows[1]['subjects'][0]['current_matches_review'])
+        self.assertNotIn('sha256', rows[1])
+        self.assertIn('not source evidence', rows[1]['evidence_role'])
+
+    def test_inspection_history_can_recover_nonfinite_numeric_results(self):
+        from simple_ar.tools.inspection import InspectionToolGateway
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        owner = InspectionToolGateway(root, SimpleNamespace(), Mock(), protocol='subjects.v3')
+        saved = {'identity':'numeric-history', 'inspection_history_policy':'receipts.v1',
+                 'source_rounds':['unchanged']}
+        value = {'tool_name':'run_process', 'status':'ok', 'data':{'value':float('nan')}}
+        trace = {'results':[{'result':value}]}
+        with patch.object(owner, '_history_round', return_value=trace), patch.object(
+                owner, '_history_receipt', return_value=(None, 'round_only')):
+            page = owner._read_history(saved, {'start_turn':0, 'action':0, 'field':'result'}, before_turn=1)
+        self.assertTrue(__import__('math').isnan(json.loads(page.data['text'])['data']['value']))
+
     def test_inspection_history_projects_selected_owner_values_without_replaying_offers(self):
         from simple_ar.tools.inspection import InspectionToolGateway
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -126,6 +176,93 @@ class WorkingContextTests(unittest.TestCase):
         self.assertEqual(ledger.to_dict(), unsettled)
         self.assertEqual(store.resolve(relative).read_bytes(), original)
         owner.client_factory.assert_not_called()
+
+    def test_retained_rollback_and_final_bookkeeping_fit_the_complete_projection(self):
+        # Calibrate from a real, fully serialized admission, not a guessed
+        # envelope. Sixteen rejected windows make capacity -> not_requested
+        # growth observable at the boundary after an older native trial fails.
+        for target, size, estimator, scale in (
+                (12000, 37, len, 1), (24000, 700, len, 1),
+                (8000, 113, estimate_tokens, 4)):
+            with self.subTest(target=target, size=size, scale=scale):
+                latest = block(1, 'latest result')
+                rows = [observation(None, 'a' * size, chunk_id='first',
+                            role='historical_observation'),
+                        observation(None, 'second complete window', chunk_id='second',
+                            offset_bytes=size, role='historical_observation')]
+                rows += [observation(None, 'large' * target, chunk_id=str(i),
+                             record=f'records/omitted-{i}.json', role='historical_observation')
+                         for i in range(16)]
+                notes = [{'text': 'optional judgment', 'records': [], 'current': True}]
+                tail = [{'role': 'user', 'content': 'Submit the final opinion.'}]
+                measured_admissions = []
+
+                def measure(text):
+                    # Only message-list projections have this framing; other
+                    # estimator calls measure raw rows/notes/native blocks.
+                    if text.startswith('[{"role": "system"'):
+                        messages = json.loads(text)
+                        context = json.loads(messages[1]['content'])
+                        omitted = context['material_supply']['omitted']
+                        if (context['working_view']['notes'] and len(omitted) == 16
+                                and all(row['status'] == 'capacity' for row in omitted)
+                                and not any(message.get('tool_call_id') == '0' for message in messages)):
+                            measured_admissions.append(30 + estimator(text))
+                    return estimator(text)
+
+                arguments = dict(material_policy='retained', require_work_notes=True,
+                    fit_work_notes=True, processed_turns=[], native_observations=[],
+                    turn_blocks=[block(0, 'old' * (target * 8)), latest], observations=rows,
+                    current_artifacts=['materials/source.txt'], work_notes=notes,
+                    version_resolver=lambda _: 'recorded-digest', trailing_messages=tail,
+                    context_token_target=target, estimate_tokens=measure)
+                select(**arguments)
+                self.assertTrue(measured_admissions)
+                # Leave only twelve serialized characters of headroom. The
+                # historical status-reset bug adds up to eighty characters.
+                growth = (target - measured_admissions[-1]) * scale - 12
+                self.assertGreater(growth, 0)
+                rows[0]['text'] += 'a' * growth
+                rows[0]['next_offset_bytes'] = len(rows[0]['text'])
+                before = deepcopy((rows, arguments['turn_blocks'], notes, tail))
+                messages, budget = select(**arguments)
+                context = json.loads(messages[1]['content'])
+                self.assertLessEqual(budget['estimated_input_tokens'], target)
+                self.assertGreaterEqual(budget['estimated_input_tokens'],
+                    30 + estimator(json.dumps(messages, ensure_ascii=False)))
+                self.assertEqual(budget['selected_turns'], [1])
+                self.assertTrue(budget['compaction_needed'])
+                self.assertEqual(budget['compaction_turns'], [0])
+                self.assertTrue(all(row['status'] == 'capacity' for row in budget['omitted_records']))
+                self.assertEqual([entry['observation'] for entry in context['working_view']['observations']],
+                                 rows[:2])
+                self.assertEqual(context['working_view']['notes'], notes)
+                self.assertEqual(messages[-4:-2], latest)
+                self.assertEqual(messages[-1], tail[0])
+                self.assertEqual((rows, arguments['turn_blocks'], notes, tail), before)
+                # A tighter target must retain the other window of the same
+                # file; it cannot reject the file as a single large object.
+                smaller, reduced = select(**{**arguments, 'context_token_target': target // 2})
+                self.assertLessEqual(reduced['estimated_input_tokens'], target // 2)
+                supplied = json.loads(smaller[1]['content'])['working_view']['observations']
+                self.assertEqual([entry['observation'] for entry in supplied], rows[1:2])
+                navigation = [{'turn': 0, 'request_count': 1, 'reply': 'records/reply.json',
+                    'observation': {'tool': 'list_directory', 'arguments': {'path': body}}}
+                    for body in ('x' * (target * 16), 'materials/')]
+                navigated, indexed = select(**{**arguments, 'context_token_target': target * 2,
+                                               'operation_history': navigation})
+                overview = json.loads(navigated[1]['content'])['working_view']['operation_overview']
+                self.assertLessEqual(indexed['estimated_input_tokens'], target * 2)
+                self.assertEqual(overview['omitted_entries'], 1)
+                entries = expand_history_view(overview['entries'])
+                self.assertEqual(entries[0]['observations'][0]['arguments'], {'path': 'materials/'})
+                # When required input itself cannot fit, preserve it and report
+                # the overflow instead of hiding it through optional eviction.
+                overflow, required = select(**{**arguments, 'context_token_target': 1})
+                self.assertGreater(required['required_input_tokens'], 1)
+                self.assertTrue(required['context_exceeds_input_target'])
+                self.assertEqual(overflow[-4:-2], latest)
+                self.assertEqual(overflow[-1], tail[0])
 
     def test_required_notes_are_charged_once_before_retained_originals(self):
         original = observation(0, 'Original measurement ' * 200,
@@ -349,13 +486,15 @@ class WorkingContextTests(unittest.TestCase):
 
     def test_latest_observation_is_not_projected_twice_and_stale_version_is_marked(self):
         row = observation(0, 'Original latest evidence\n"quoted" \\ path')
-        messages, budget = select(turn_blocks=[block(0, row['text'])], observations=[row],
-                                  version_resolver=lambda _: 'changed')
-        view = json.loads(messages[1]['content'])['working_view']
-        self.assertEqual(view['observations'], [])
-        self.assertEqual(view['stale_native_observations'][0]['record'], row['record'])
-        self.assertEqual(budget['selected_records'][0]['version_status'], 'stale')
-        self.assertEqual(messages[-3:-1], block(0, row['text']))
+        for supply in (None, [{key: value for key, value in row.items() if key != 'text'}]):
+            with self.subTest(supply=supply is not None):
+                messages, budget = select(turn_blocks=[block(0, row['text'])], observations=[row],
+                    native_observations=supply, version_resolver=lambda _: 'changed')
+                view = json.loads(messages[1]['content'])['working_view']
+                self.assertEqual(view['observations'], [])
+                self.assertEqual(view['stale_native_observations'][0]['record'], row['record'])
+                self.assertEqual(budget['selected_records'][0]['version_status'], 'stale')
+                self.assertEqual(messages[-3:-1], block(0, row['text']))
 
     def test_recent_coherent_work_sequence_keeps_reasoning_and_directory_process_outcomes(self):
         blocks = [block(0, 'old full material ' * 1000)]
@@ -523,6 +662,27 @@ class WorkingContextTests(unittest.TestCase):
 
 
 class RetainedWorkingContextTests(unittest.TestCase):
+    def test_current_material_precedes_optional_notes_and_keeps_version_checks(self):
+        current = observation(0, 'Current measured material. ' * 140,
+            path='outputs/current.txt', role='historical_observation')
+        old = observation(1, 'Earlier source. ' * 180, path='inputs/old.txt',
+            record='records/old.json', role='historical_observation')
+        notes = [{'text':'Previous model understanding. ' * 130, 'records':[old['record']]}]
+        arguments = dict(material_policy='retained', require_work_notes=True, fit_work_notes=True,
+            processed_turns=[], observations=[old, current], work_notes=notes,
+            version_resolver=lambda _:'recorded-digest', context_token_target=7000)
+        for selection in ({'current_artifacts':[current['path']]}, {'selected_records':[current['record']]}):
+            with self.subTest(selection=selection):
+                messages, metadata = select(**arguments, **selection)
+                view = json.loads(messages[1]['content'])['working_view']
+                self.assertIn(current['text'], json.dumps(view))
+                self.assertLessEqual(metadata['estimated_input_tokens'], 7000)
+                stale, metadata = select(**{**arguments, 'version_resolver':lambda _:'changed'},
+                    **selection)
+                self.assertNotIn(current['text'], json.dumps(stale))
+                self.assertTrue(any(row['source']['record'] == current['record']
+                    and row['version_status'] == 'stale' for row in metadata['omitted_records']))
+
     def test_journal_retirement_requires_each_turns_actually_supplied_support(self):
         rows = [observation(i, f'Original receipt {i}.', kind='operation_result') for i in range(2)]
         notes = [{'text':'Continuity for '+str(i), 'records':[row['record']],
@@ -647,6 +807,7 @@ class RetainedWorkingContextTests(unittest.TestCase):
         old[1]['content'] = json.dumps(result)
         messages, selection = select(material_policy='retained', require_work_notes=True, fit_work_notes=True,
             processed_turns=[], observations=[row], selected_records=[row['record']],
+            native_observations=[{key: value for key, value in row.items() if key != 'text'}],
             turn_blocks=[old, block(1, 'Continue')], context_token_target=20000)
         self.assertEqual(selection['selected_turns'], [0, 1])
         self.assertEqual(json.loads(messages[1]['content'])['working_view']['observations'], [])
@@ -666,6 +827,7 @@ class RetainedWorkingContextTests(unittest.TestCase):
         self.assertIn('Write was rejected', json.dumps(messages))
         self.assertEqual(selection['compaction_turns'], [0])
         self.assertTrue(selection['compaction_needed'])
+        self.assertFalse(selection['economical_compaction'])
         self.assertEqual(selection['selected_turns'], [1])
 
     def test_partial_processed_history_and_required_overflow_do_not_claim_compaction_value(self):
@@ -679,6 +841,29 @@ class RetainedWorkingContextTests(unittest.TestCase):
             processed_turns=[], turn_blocks=[blocks[0], block(1, 'Required latest. '*4000)], context_token_target=3000)
         self.assertTrue(selection['context_exceeds_input_target'])
         self.assertFalse(selection['compaction_needed'])
+
+    def test_sparse_handoffs_keep_uncited_and_explicit_work_with_feedback(self):
+        texts = [f'Original observation {number}: ' + chr(65 + number) * 300 for number in range(6)]
+        rows = [observation(number, text, kind='operation_result') for number, text in enumerate(texts)]
+        notes = [{'text': 'Earlier work with retained sources',
+            'records': ['records/2.json', 'records/3.json'], 'current': True,
+            'handoff_policy': CITATION_HANDOFF_POLICY}]
+        options = dict(material_policy='retained', require_work_notes=True, fit_work_notes=True,
+            processed_turns=[0, 2, 3], sparse_handoffs=True, work_notes=notes,
+            observations=rows, turn_blocks=[block(i, text) for i, text in enumerate(texts)],
+            block_request_counts=[1, 1, 1, 1, 2, 2], context_token_target=50000)
+        messages, selection = select(**options)
+        self.assertEqual(selection['selected_turns'], [0, 1, 4, 5])
+        self.assertEqual(json.loads(messages[1]['content'])['working_view']['history']['archived_turn_ranges'], [[2, 4]])
+        self.assertIn(texts[0], json.dumps(messages))  # Processed but not cited.
+        self.assertNotIn(texts[3], json.dumps(messages))
+        self.assertIn('Keep the error bars', json.dumps(messages))
+        _, selected = select(**options, selected_records=['records/2.json'])
+        self.assertIn(2, selected['selected_turns'])
+        _, uncited = select(**{**options, 'work_notes': [{**notes[0], 'records': []}]})
+        self.assertEqual(uncited['selected_turns'], list(range(6)))
+        _, stale = select(**{**options, 'work_notes': [{**notes[0], 'current': False}]})
+        self.assertEqual(stale['selected_turns'], list(range(6)))
 
     def test_processed_but_uncited_failure_remains_discoverable_in_compact_history(self):
         texts = ['Original source body. '*300, 'Full failed execution output. '*300]
@@ -724,6 +909,7 @@ class RetainedWorkingContextTests(unittest.TestCase):
         proposed, budget = select(**options, economical_checkpoint=True)
         self.assertFalse(legacy_budget['compaction_needed'])
         self.assertTrue(budget['compaction_needed'])
+        self.assertTrue(budget['economical_compaction'])
         self.assertEqual(budget['compaction_turns'], [0])
         self.assertEqual([m for m in proposed if m['role'] in {'assistant', 'tool'}], old[0] + old[1] + current)
         compacted, compacted_budget = select(**{**options, 'processed_turns':[0]},
@@ -735,6 +921,7 @@ class RetainedWorkingContextTests(unittest.TestCase):
         self.assertEqual(legacy_budget['selected_turns'], [0, 1, 2])
         _, after_failure = select(**options, economical_checkpoint=True, economical_after_turn=1)
         self.assertFalse(after_failure['compaction_needed'])
+        self.assertFalse(after_failure['economical_compaction'])
         future = {**options, 'turn_blocks':[*old, current, block(3, 'Later decision')]}
         _, after_new_work = select(**future, economical_checkpoint=True, economical_after_turn=1)
         self.assertTrue(after_new_work['compaction_needed'])
@@ -1099,6 +1286,32 @@ class ReferencedWorkingContextTests(unittest.TestCase):
         supply = json.loads(messages[1]['content'])['material_supply']['references']
         self.assertEqual([entry['status'] for entry in supply], ['duplicate', 'native'])
 
+        # Keep the assertions above for saved historical text-based contracts.
+        # The new contract cannot borrow an identical body from another receipt,
+        # field, file, version or window, even inside the same native turn.
+        current = {**rows[-1], 'field':'data.text', 'role':'historical_observation'}
+        variants = [dict(current, **change) for change in (
+            {'record':'records/another.json'}, {'field':'metadata.other.text'},
+            {'path':'materials/another.txt'}, {'sha256':'earlier-version'},
+            {'offset_bytes':50, 'next_offset_bytes':50+len(text.encode('utf-8'))})]
+        originals = [current, *variants]
+        before = deepcopy(originals)
+        arguments = dict(material_policy='referenced', observations=originals,
+            turn_blocks=[[], [], latest], selected_records=list(dict.fromkeys(row['record'] for row in originals)),
+            version_resolver=lambda _:'recorded-digest', context_token_target=100000)
+        for visible in ([], [{key:value for key,value in current.items() if key != 'text'}]):
+            with self.subTest(actual_supply=bool(visible)):
+                messages, budget = select(**arguments, native_observations=visible)
+                states = budget['selected_records'] + budget['omitted_records']
+                native = [state['source'] for state in states if state['status'] == 'native']
+                self.assertEqual(native, [{key:value for key,value in current.items() if key != 'text'}]
+                    if visible else [])
+                self.assertFalse(any(state['status'] == 'duplicate' for state in states))
+                self.assertEqual(sum(state['status'] == 'working_view' for state in states), 4 if visible else 5)
+                self.assertTrue(any(state['status'] == 'stale' and state['source']['sha256'] == 'earlier-version'
+                    for state in states))
+        self.assertEqual(originals, before)
+
     def test_referenced_oversized_text_is_not_lexically_rewritten(self):
         row = observation(0, 'Compare source measurements. ' * 1000)
         # A receipt can contain several windows. Supplying one must not hide
@@ -1237,6 +1450,614 @@ class ReferencedWorkingContextTests(unittest.TestCase):
 
 
 class CheckpointFailureTests(unittest.TestCase):
+    def test_checkpoint_sources_preserve_native_and_inspection_contracts(self):
+        decision = {'role':'assistant', 'tool_calls':[{'id':'read', 'function':{
+            'name':'read_file', 'arguments':'{}'}}]}
+        result = {'tool_name':'read_file', 'status':'ok', 'data':{'path':'inputs/a.txt',
+            'absolute_path':'/workspace/inputs/a.txt', 'sha256':'a'*64, 'text':'original'}}
+        original = {'turn':0, 'request_count':1, 'decision':decision, 'call_id':'read',
+                    'arguments':{}, 'result':result}
+        row = {'turn':0, 'record':'original', 'request_count':1, 'call_id':'read',
+            'tool':'read_file', 'truncated':False, 'observation_text':json.dumps(result),
+            'source_sha256':observation_digest(result), 'source_currentness':'file_bytes'}
+        view = {'native_supply_policy':TURN_SUPPLY_POLICY,
+            'turn_decisions':[{'turn':0, 'reply':decision}], 'observations':[row]}
+        sources = {'original':original}
+        def check(value, owner):
+            validate_checkpoint_sources(value, source=lambda item:sources.get(item['record']),
+                owner=owner, journal=owner == 'native', before_turn=1 if owner == 'inspection' else None)
+
+        for owner in ('native', 'inspection'):
+            with self.subTest(owner=owner):
+                check(view, owner)
+                for field, value in (('record', 'missing'), ('call_id', 'other'),
+                        ('source_sha256', 'changed'), ('source_currentness', 'unknown'),
+                        ('observation_text', json.dumps({**result, 'data':{'text':'changed'}}))):
+                    with self.subTest(field=field), self.assertRaises(ValueError):
+                        check({**view, 'observations':[{**row, field:value}]}, owner)
+                changed_decision = {**view, 'turn_decisions':[{'turn':0, 'reply':{
+                    **decision, 'content':'changed'}}]}
+                with self.assertRaises(ValueError):
+                    check(changed_decision, owner)
+
+        changed_count = {**view, 'observations':[{**row, 'request_count':2}]}
+        with self.assertRaises(ValueError):
+            check(changed_count, 'native')
+        check(changed_count, 'inspection')
+        sources['original'] = {**original, 'turn':1}
+        for owner in ('native', 'inspection'):
+            with self.subTest(owner=owner, changed_source_turn=True), self.assertRaises(ValueError):
+                check(view, owner)
+        sources['original'] = original
+        with self.assertRaises(ValueError):
+            validate_checkpoint_sources(view, source=lambda item:sources.get(item['record']),
+                owner='inspection', before_turn=0)
+
+        partial = {**view, 'observations':[{**row, 'truncated':True,
+                                            'observation_text':json.dumps({'partial':'view'})}]}
+        check(partial, 'native')  # Its identity is bound without claiming complete coverage.
+        with self.assertRaises(ValueError):
+            check(partial, 'inspection')
+
+        # A rejected inspection action may retain its recorded placeholder;
+        # native history must still use the arguments in the original decision.
+        rejected_decision = {'role':'assistant', 'tool_calls':[{'id':'read', 'function':{
+            'name':'read_file', 'arguments':'{'}}]}
+        sources['original'] = {**original, 'decision':rejected_decision}
+        rejected = {**view, 'turn_decisions':[{'turn':0, 'reply':rejected_decision}],
+            'observations':[{**row, 'recorded_arguments':{}}]}
+        check(rejected, 'inspection')
+        with self.assertRaises(ValueError):
+            check(rejected, 'native')
+
+        # Unmarked native history only required its original position; old
+        # inspection history required the full result and recorded arguments.
+        sources['original'] = original
+        legacy = {'observations':[{'turn':0, 'record':'original', 'request_count':1,
+            'arguments':{}, 'truncated':False, 'observation_text':json.dumps(result)}]}
+        check(legacy, 'native')
+        check(legacy, 'inspection')
+        partial_legacy = {'observations':[{**legacy['observations'][0], 'truncated':True}]}
+        check(partial_legacy, 'native')
+        with self.assertRaises(ValueError):
+            check(partial_legacy, 'inspection')
+
+    def test_owner_selected_checkpoint_keeps_decision_and_original_receipt(self):
+        # A large useful decision can have a tiny execution receipt. The shared
+        # selector has already considered replay cost; the model window size
+        # must not impose a second, unrelated floor on that receipt.
+        arguments = {'path': 'analysis.py', 'content': 'value = 1\n' * 350}
+        decision = {'role': 'assistant', 'content': '', 'tool_calls': [
+            {'id': 'write', 'function': {'name': 'write_file',
+                'arguments': json.dumps(arguments)}}]}
+        result = {'tool_name': 'write_file', 'status': 'ok', 'data': {'path': 'analysis.py'}}
+        row = {'turn': 2, 'record': 'records/write.json', 'arguments': arguments,
+            'decision': decision, 'call_id': 'write', 'result': result}
+        previous = {'notes': [], 'through_turn': 0, 'compacted_records': set(),
+            'attempted_through_turn': 1, 'attempted_records': {'records/old.json'}}
+        options = dict(requests=['Analyze the inputs'], previous=previous, rows=[row],
+            target=100000, estimate_tokens=len, native_supply_policy=TURN_SUPPLY_POLICY)
+        self.assertIsNone(prepare_checkpoint_input(**options))  # Historical policy remains unchanged.
+        view = prepare_checkpoint_input(**options, economic_floor=1000)
+        self.assertEqual([item['record'] for item in view['observations']], [row['record']])
+        self.assertEqual(checkpoint_decisions(view), {2: decision})
+        self.assertEqual(previous['attempted_records'], {'records/old.json'})
+        self.assertIsNone(prepare_checkpoint_input(**{**options, 'previous': {
+            **previous, 'attempted_records': {'records/old.json', row['record']}}},
+            economic_floor=1000))
+        tiny_arguments = {'path': 'small.py', 'content': 'x = 1'}
+        tiny_decision = {'role': 'assistant', 'content': '', 'tool_calls': [
+            {'id': 'small', 'function': {'name': 'write_file',
+                'arguments': json.dumps(tiny_arguments)}}]}
+        tiny = {**row, 'record': 'records/small.json', 'arguments': tiny_arguments,
+            'decision': tiny_decision, 'call_id': 'small'}
+        oversized_arguments = {'path': 'large.py', 'content': 'x' * 120000}
+        oversized_decision = {'role': 'assistant', 'content': '', 'tool_calls': [
+            {'id': 'large', 'function': {'name': 'write_file',
+                'arguments': json.dumps(oversized_arguments)}}]}
+        oversized = {**row, 'turn': 3, 'record': 'records/large.json',
+            'arguments': oversized_arguments, 'decision': oversized_decision, 'call_id': 'large'}
+        self.assertIsNone(prepare_checkpoint_input(**{**options, 'rows': [tiny, oversized]},
+            economic_floor=1000))
+        both = {**decision, 'tool_calls': [*decision['tool_calls'],
+            {'id': 'read', 'function': {'name': 'read_file', 'arguments': '{}'}}]}
+        first = {**row, 'decision': both}
+        missing = {**row, 'record': 'records/read.json', 'decision': both, 'call_id': 'read',
+            'arguments': {}, 'result': {'tool_name': 'read_file', 'data': {'text': 'x' * 120000}}}
+        self.assertIsNone(prepare_checkpoint_input(**{**options, 'rows': [first, missing]},
+            economic_floor=1000))
+
+    def test_note_owners_do_not_mark_indirect_or_conflicting_sources_current(self):
+        from simple_ar.app.operation_tools import OperationTools
+        from simple_ar.app.work_memory import note_currentness
+        from simple_ar.tools.inspection import InspectionToolGateway
+
+        def read(digest):
+            return {'tool_name':'read_file', 'status':'ok', 'data':{
+                'path':'inputs/a.txt', 'absolute_path':'/workspace/inputs/a.txt', 'sha256':digest}}
+        first, second = read('a'*64), read('b'*64)
+        process = {'tool_name':'run_process', 'status':'ok', 'data':{'returncode':0}}
+        items = [{**value, 'record':f'attempts/r{i}/native_result.json'}
+                 for i,value in enumerate((first,second,process))]
+        owner = OperationTools.__new__(OperationTools)
+        owner.config, owner.professional = {'native_supply_policy':TURN_SUPPLY_POLICY}, False
+        owner.observations = lambda:items
+        owner.workspace = SimpleNamespace(artifact_hashes=lambda value:value)
+        mixed = {'text':'Working observation', 'records':['records/r1/native_result.json',
+                                                           'records/r2/native_result.json']}
+        conflicting = {'text':'Comparison across versions', 'records':['records/r0/native_result.json',
+                                                                        'records/r1/native_result.json']}
+        notes = owner.bind_notes([mixed,conflicting])
+        self.assertEqual([note['source_integrity'] for note in notes], ['unknown','unknown'])
+        self.assertEqual([note['current'] for note in owner.project_notes(notes)], [None,None])
+        self.assertEqual(notes[1]['observed_versions']['/workspace/inputs/a.txt'], 'a'*64)
+        inspector_rows = [{'record':item['record'], 'result':value, 'source_currentness':'file_bytes'}
+                          for item,value in zip(items,(first,second,process))]
+        inspection_notes = InspectionToolGateway._bind_conversation_notes(
+            [{**mixed, 'records':[items[1]['record'],items[2]['record']]},
+             {**conflicting, 'records':[items[0]['record'],items[1]['record']]}], inspector_rows)
+        self.assertEqual([note['source_integrity'] for note in inspection_notes], ['unknown','unknown'])
+        owner.workspace.artifact_hashes = lambda versions: {path:'c'*64 for path in versions}
+        self.assertEqual([note['current'] for note in owner.project_notes(notes)], [False,False])
+        self.assertFalse(note_currentness(inspection_notes[0], versions_match=lambda versions: False))
+        self.assertIsNone(note_currentness(inspection_notes[0], versions_match=lambda versions: True))
+        owner.config = {'native_supply_policy':'receipts.v1'}
+        old = owner.bind_notes([conflicting])[0]
+        self.assertNotIn('source_integrity',old)
+        self.assertEqual(old['observed_versions']['/workspace/inputs/a.txt'], 'b'*64)
+
+    def test_checkpoint_supplies_complete_decision_and_preserves_source_bindings(self):
+        decision = {'role':'assistant', 'content':'Compare the measurements before reporting.',
+            'tool_calls':[{'id':'read', 'function':{'name':'read_file', 'arguments':'{}'}},
+                          {'id':'check', 'function':{'name':'run_process', 'arguments':'{}'}},
+                          {'id':'prepared', 'function':{'name':'prepare_implementation', 'arguments':'{}'}},
+                          {'id':'invalid', 'function':{'name':'read_file', 'arguments':'{'}}]}
+        rows = [
+            {'turn':0, 'record':'records/huge.json', 'arguments':{},
+             'call_id':'huge', 'decision':{'role':'assistant', 'content':'Old large work',
+                 'tool_calls':[{'id':'huge', 'function':{'name':'read_file', 'arguments':'{}'}}]},
+             'result':{'tool_name':'read_file', 'data':{'text':'x'*40000}}},
+            {'turn':1, 'record':'records/read.json', 'arguments':{}, 'decision':decision, 'call_id':'read',
+             'source_currentness':'file_bytes', 'result':{'tool_name':'read_file', 'status':'ok',
+                 'data':{'path':'inputs/values.txt', 'sha256':'a'*64, 'text':'Actual observed values'}}},
+            {'turn':1, 'record':'records/check.json', 'arguments':{}, 'decision':decision, 'call_id':'check',
+             'result':{'tool_name':'run_process', 'data':{'returncode':0}}},
+            {'turn':1, 'record':'records/invalid.json', 'arguments':{}, 'decision':decision, 'call_id':'invalid',
+             'result':{'tool_name':'read_file', 'status':'blocked', 'error':'Invalid arguments'}},
+        ]
+        old_records = [f'records/prior-{i}.json' for i in range(16)]
+        previous = {'notes':[{'text':'Earlier work', 'records':old_records, 'observed_versions':{}}],
+                    'through_turn':0, 'compacted_records':set()}
+        view = prepare_checkpoint_input(requests=['Explain the results'], previous=previous,
+            rows=rows, target=10000, estimate_tokens=len, native_supply_policy=TURN_SUPPLY_POLICY)
+        self.assertEqual([row['record'] for row in view['observations']],
+                         ['records/read.json', 'records/check.json', 'records/invalid.json'])
+        self.assertEqual(checkpoint_decisions(view), {1:decision})
+        self.assertNotIn('arguments', view['observations'][0])
+        self.assertNotIn('recorded_arguments', view['observations'][0])
+        self.assertEqual(view['observations'][2]['recorded_arguments'], {})
+        self.assertEqual(checkpoint_arguments(view['observations'][2], checkpoint_decisions(view)), {})
+        self.assertEqual(json.loads(view['observations'][0]['observation_text']), rows[1]['result'])
+        response = {'notes':[{'text':'Current comparison', 'observations':['p0', 'o1']}]}
+        bound = _bound_response(response, view, lambda notes:notes)
+        self.assertEqual(bound[0]['records'], old_records+['records/read.json'])
+        with self.assertRaisesRegex(ValueError, 'decisions do not match'):
+            checkpoint_decisions({**view, 'turn_decisions':[]})
+        legacy = {**view, 'native_supply_policy':'receipts.v1'}
+        self.assertEqual(_bound_response(response, legacy, lambda notes:notes)[0]['records'], old_records)
+        projected = {**previous, 'notes':[{**previous['notes'][0], 'current':False,
+                                            'version_scope':'Changed since the observation'}]}
+        refreshed = {**projected, 'notes':[{**projected['notes'][0], 'current':True,
+                                            'version_scope':'Original bytes restored'}]}
+        make_view = lambda memory:prepare_checkpoint_input(requests=['Explain the results'], previous=memory,
+            rows=rows, target=10000, estimate_tokens=len, native_supply_policy=TURN_SUPPLY_POLICY)
+        self.assertEqual(make_view(projected), make_view(refreshed))
+        self.assertNotIn('current', make_view(projected)['previous_notes'][0])
+
+        # A long-lived note retains its useful wording when its growing source
+        # list no longer fits, but cannot claim those sources were handed off.
+        from simple_ar.app.professional_conversation import ProfessionalConversation
+        large_records = [f'records/{i:04d}-' + 'x'*40 + '.json' for i in range(1000)]
+        prior = {'text':'Working understanding to reassess', 'records':large_records,
+                 'observed_versions':{}, 'handoff_policy':CITATION_HANDOFF_POLICY}
+        previous = {'notes':[prior], 'through_turn':0, 'compacted_records':set(large_records)}
+        compact = prepare_checkpoint_input(requests=['Explain the results'], previous=previous,
+            rows=rows[1:2], target=10000, estimate_tokens=len, native_supply_policy=TURN_SUPPLY_POLICY)
+        self.assertEqual(compact['previous_notes'][0]['text'], prior['text'])
+        self.assertTrue(compact['previous_notes'][0]['references_omitted'])
+        bound = _bound_response(response, compact, lambda notes:notes)
+        self.assertEqual(bound[0]['records'], ['records/read.json'])
+        self.assertEqual(bound[0]['source_integrity'], 'unknown')
+        memory = ProfessionalConversation.adopt(previous=previous,
+            snapshot={'through_turn':2, 'notes':bound}, view=compact,
+            operations_for_turn=lambda turn: {'records/read.json':{}} if turn == 1 else {})
+        self.assertEqual(memory['compacted_records'], {'records/read.json'})
+        self.assertNotIn(large_records[0], memory['compacted_records'])
+
+        # A specialized owner's useful presentation is still handed over,
+        # without pretending that omitted source fields were summarized.
+        partial = {**rows[1], 'record':'records/prepared.json', 'call_id':'prepared',
+                   'original':{**rows[1]['result'], 'omitted':'original material'}, 'complete':False}
+        partial_view = prepare_checkpoint_input(requests=['Explain the results'],
+            previous={'notes':[], 'through_turn':0, 'compacted_records':set()},
+            rows=[partial, rows[1]], target=10000, estimate_tokens=len, native_supply_policy=TURN_SUPPLY_POLICY)
+        self.assertTrue(partial_view['observations'][0]['truncated'])
+        self.assertEqual(checkpoint_decisions(partial_view), {1:decision})
+        snapshot = {'through_turn':2, 'notes':_bound_response(
+            {'notes':[{'text':'Observed work', 'observations':['o1']}]}, partial_view, lambda notes:notes)}
+        memory = ProfessionalConversation.adopt(previous={'notes':[], 'through_turn':0,
+            'compacted_records':set()}, snapshot=snapshot, view=partial_view,
+            operations_for_turn=lambda turn: {'records/prepared.json':{}, 'records/read.json':{}} if turn == 1 else {})
+        self.assertEqual(memory['compacted_records'], set())
+
+        # Mixing a changed/omitted source or an indirect process result with a
+        # current file cannot make the old conclusion current again.
+        indirect = {**view, 'previous_notes':[], 'observations':[
+            {**view['observations'][0], 'source_currentness':'file_bytes'},
+            {**view['observations'][1], 'source_currentness':'unknown'}]}
+        bound = _bound_response({'notes':[{'text':'Historical comparison', 'observations':['o1','o2']}]},
+            indirect, lambda notes:notes)
+        self.assertEqual(bound[0]['source_integrity'], 'unknown')
+        memory = ProfessionalConversation.adopt(previous={'notes':[], 'through_turn':0,
+            'compacted_records':set()}, snapshot={'through_turn':2,'notes':bound}, view=indirect,
+            operations_for_turn=lambda turn:{'records/read.json':{}, 'records/check.json':{}} if turn == 1 else {})
+        self.assertEqual(memory['compacted_records'], {'records/read.json','records/check.json'})
+
+        # A complete but temporarily stale binding is different from missing
+        # provenance: it can become current again if its original bytes return.
+        stale = {'id':'p0', 'text':'Earlier file observation', 'records':['records/read.json'],
+                 'observed_versions':{'inputs/values.txt':'a'*64}, 'current':False}
+        stale_view = {**view, 'previous_notes':[stale]}
+        stale_note = _bound_response({'notes':[{'text':'Earlier file observation','observations':['p0']}]},
+            stale_view, lambda notes:[{**note,'observed_versions':stale['observed_versions']} for note in notes])[0]
+        self.assertNotIn('source_integrity', stale_note)
+        historical = {**view, 'previous_notes':[], 'observations':[
+            {**view['observations'][0], 'tool':'assistant_reply', 'records':[],
+             'source_currentness':'historical'}, view['observations'][1]]}
+        decision_note = _bound_response({'notes':[{'text':'Earlier decision','observations':['o1']}]},
+            historical, lambda notes:notes)[0]
+        self.assertEqual(decision_note['source_integrity'], 'unknown')
+        repeated = {**historical, 'previous_notes':[{'id':'p0', **decision_note}], 'observations':[]}
+        repeated_note = _bound_response({'notes':[{'text':'Earlier decision','observations':['p0']}]},
+            repeated, lambda notes:notes)[0]
+        self.assertEqual(repeated_note['source_integrity'], 'unknown')
+        numeric = {**rows[1], 'result':{**rows[1]['result'],
+            'data':{**rows[1]['result']['data'], 'value':float('nan')}}}
+        numeric_view = prepare_checkpoint_input(requests=['Explain the results'],
+            previous={'notes':[], 'through_turn':0, 'compacted_records':set()}, rows=[numeric],
+            target=10000, estimate_tokens=len, native_supply_policy=TURN_SUPPLY_POLICY)
+        recorded = numeric_view['observations'][0]
+        self.assertEqual(recorded['source_sha256'], observation_digest(json.loads(recorded['observation_text'])))
+        numeric_decision = {**decision, 'tool_calls':[
+            {'id':'read', 'function':{'name':'read_file', 'arguments':'{"value":NaN}'}}]}
+        numeric = {**rows[1], 'decision':numeric_decision, 'arguments':{'value':float('nan')}}
+        numeric_view = prepare_checkpoint_input(requests=['Explain the results'],
+            previous={'notes':[], 'through_turn':0, 'compacted_records':set()}, rows=[numeric],
+            target=10000, estimate_tokens=len, native_supply_policy=TURN_SUPPLY_POLICY)
+        self.assertNotIn('recorded_arguments', numeric_view['observations'][0])
+        self.assertEqual(summary_coverage(previous={'notes':[], 'through_turn':0, 'compacted_records':set()},
+            snapshot={'through_turn':2, 'notes':[{'text':'Measured', 'records':['records/read.json']}]},
+            view=numeric_view, operations_for_turn=lambda turn:{'records/read.json':{'value':float('nan')}}
+            if turn == 1 else {'records/prior':{}}), 0)
+        from simple_ar.app.work_memory import summary_records
+        self.assertEqual(summary_records(previous={'notes':[], 'through_turn':0, 'compacted_records':set()},
+            snapshot={'notes':[{'text':'Measured', 'records':['records/read.json']}]}, view=numeric_view,
+            operations_for_turn=lambda turn:{'records/read.json':{'value':float('nan')}}), {'records/read.json'})
+
+    def test_rolling_adoption_replaces_knowledge_and_reopens_dropped_receipts(self):
+        from simple_ar.app.professional_conversation import ProfessionalConversation
+
+        old = {'text':'Earlier conclusion', 'records':['old'],
+            'observed_versions':{}, 'handoff_policy':CITATION_HANDOFF_POLICY}
+        previous = {'notes':[old], 'through_turn':1, 'compacted_records':{'old'}}
+        view = {'native_supply_policy':'receipts.v1',
+            'handoff_policy':CITATION_HANDOFF_POLICY, 'archive_through_turn':3,
+            'previous_notes':[{'id':'p0', **old}], 'observations':[
+                {'record':'new', 'turn':2, 'truncated':False, 'arguments':{}}]}
+        before = deepcopy((previous, view))
+        for records, covered in ((['new'], {'new'}), (['old'], {'old'}),
+                                 ([], set()), (['invented'], set())):
+            with self.subTest(records=records):
+                snapshot = {'through_turn':3, 'notes':[{'text':'Revised conclusion', 'records':records}]}
+                actual = ProfessionalConversation.adopt(previous=previous, snapshot=snapshot,
+                    view=view, operations_for_turn=lambda turn:{['old','gap','new'][turn]:{}})
+                self.assertEqual(actual['notes'], snapshot['notes'])
+                self.assertEqual(actual['compacted_records'], covered)
+                self.assertEqual(actual['through_turn'], 1 if covered == {'old'} else 0)
+                self.assertEqual(actual['attempted_through_turn'], 3)
+                self.assertEqual(ProfessionalConversation.adopt(previous=previous, snapshot=snapshot,
+                    view=deepcopy(view), operations_for_turn=lambda turn:{['old','gap','new'][turn]:{}}), actual)
+        for snapshot in (None, {'notes':[]}):
+            self.assertEqual(ProfessionalConversation.adopt(previous=previous, snapshot=snapshot,
+                view=view, operations_for_turn=lambda _:{}), {**previous, 'attempted_through_turn':3,
+                    'attempted_records':{'new'}})
+        # Neither capacity-omitted, partial nor mismatched-argument receipts are coverage.
+        for change in ({'truncated':True}, {'arguments':{'offset':1}}):
+            actual = ProfessionalConversation.adopt(previous=previous,
+                snapshot={'through_turn':3, 'notes':[{'text':'New judgment', 'records':['new']}]},
+                view={**view, 'observations':[{**view['observations'][0], **change}]},
+                operations_for_turn=lambda turn:{['old','gap','new'][turn]:{}})
+            self.assertEqual(actual['compacted_records'], set())
+        self.assertEqual((previous, view), before)
+
+    def test_rolling_references_stay_bounded_past_256_receipts(self):
+        from simple_ar.app.professional_conversation import ProfessionalConversation
+
+        originals = [observation(i, f'Original measurement {i}', role='historical_observation') for i in range(273)]
+        before = deepcopy(originals)
+        previous = {'notes':[], 'through_turn':0, 'compacted_records':set()}
+        # Fill all 16 x 16 reference slots, then replace them with genuinely new
+        # results. The old all-history invariant would reject both later batches.
+        for start, end in ((0, 256), (256, 272), (272, 273)):
+            batch = originals[start:end]
+            view = {'native_supply_policy':'receipts.v1',
+                'handoff_policy':CITATION_HANDOFF_POLICY, 'archive_through_turn':end,
+                'previous_notes':[{'id':f'p{i}', **note} for i,note in enumerate(previous['notes'])],
+                'observations':[{'id':f'o{i}', 'turn':row['turn'], 'record':row['record'],
+                    'truncated':False, 'arguments':{}} for i,row in enumerate(batch)]}
+            response = {'notes':[{'text':f'Current findings {i}',
+                'observations':[f'o{j}' for j in range(i, min(i+16, len(batch)))]}
+                for i in range(0, len(batch), 16)]}
+            snapshot = {'through_turn':end, 'notes':_bound_response(response, view, self.bind)}
+            previous = ProfessionalConversation.adopt(previous=previous, snapshot=snapshot, view=view,
+                operations_for_turn=lambda turn:{f'records/{turn}.json':{}})
+            self.assertEqual(previous['compacted_records'], {row['record'] for row in batch})
+            self.assertLessEqual(len(previous['compacted_records']), 256)
+            self.assertEqual(previous['through_turn'], 256 if start == 0 else 0)
+            self.assertEqual(previous['attempted_through_turn'], end)
+        self.assertEqual(previous['attempted_records'], {row['record'] for row in originals})
+        self.assertIsNone(prepare_checkpoint_input(requests=['Continue'], previous=previous,
+            rows=[{'turn':row['turn'], 'record':row['record'], 'result':{'data':row['text']}}
+                for row in originals], target=12000, estimate_tokens=estimate_tokens,
+            native_supply_policy='receipts.v1'))
+        # Finite supporting locators cannot launder all inherited references
+        # through one p-ID. Only the bound records can remain handed off.
+        response = {'notes':[{'text':'Still relevant', 'observations':['p0', 'o0']}]}
+        bound = _bound_response(response, view, self.bind)
+        self.assertEqual(len(bound[0]['records']), 16)
+        self.assertNotIn('records/272.json', bound[0]['records'])
+        processed = processed_journal_turns(originals, previous['compacted_records'])
+        self.assertEqual(processed, [272])
+        messages, _ = select(material_policy='retained', require_work_notes=True, fit_work_notes=True,
+            work_notes=previous['notes'], observations=originals, processed_turns=processed,
+            selected_records=['records/0.json'], turn_blocks=[[] for _ in originals]+[block(273, 'Continue')],
+            context_token_target=100000, version_resolver=lambda _: 'recorded-digest')
+        self.assertIn('Original measurement 0', json.dumps(messages))
+        self.assertEqual(originals, before)
+
+    def test_rolling_purchase_floor_counts_only_fitted_new_originals(self):
+        previous = {'notes':[], 'through_turn':0, 'compacted_records':set(), 'attempted_through_turn':1,
+            'attempted_records':{'records/old.json'}}
+        old = {'turn':0, 'record':'records/old.json', 'result':{'data':{'text':'old '*20000}}}
+        tiny = {'turn':1, 'record':'records/tiny.json', 'result':{'data':{'value':1}}}
+        oversized = {'turn':2, 'record':'records/huge.json', 'result':{'data':{'text':'large '*20000}}}
+        before = self.ledger.to_dict()
+        with patch('simple_ar.integrations.llm._call_openai_sdk') as send:
+            for index, rows in enumerate(([old], [old, tiny], [old, oversized], [old, tiny, oversized])):
+                with self.subTest(rows=index):
+                    store = ArtifactStore(self.root/f'skipped-{index}')
+                    self.assertEqual(compact_work(store=store, client=self.client, requests=['Different request'],
+                        previous=previous, rows=rows, bind_notes=self.bind, estimate_tokens=estimate_tokens,
+                        attempt_id='native-turn-test', native_supply_policy='receipts.v1'), (None, ()))
+                    self.assertFalse(store.exists('memory_input.json'))
+            send.assert_not_called()
+        self.assertEqual(self.ledger.to_dict(), before)
+
+        # A below-floor omission waits for enough actually fitted work. An
+        # oversized receipt cannot inflate this floor or seal the tiny gap.
+        fresh = {'turn':3, 'record':'records/fresh.json', 'result':{'tool_name':'observe',
+            'data':{'text':'Additional measured conditions. '*500}}}
+        rows = [old, tiny, oversized, fresh]
+        from simple_ar.app.professional_conversation import ProfessionalConversation
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
+                '{"notes":[{"text":"Tiny result and new conditions","observations":["o1","o2"]}]}')) as send:
+            snapshot, _ = compact_work(store=self.store, client=self.client, requests=['Continue'],
+                previous=previous, rows=rows, bind_notes=self.bind, estimate_tokens=estimate_tokens,
+                attempt_id='native-turn-test', native_supply_policy='receipts.v1')
+            view = self.store.read_json('memory_input.json')
+            self.assertEqual([row['record'] for row in view['observations']],
+                [tiny['record'], fresh['record']])
+            memory = ProfessionalConversation.adopt(previous=previous, snapshot=snapshot, view=view,
+                operations_for_turn=lambda turn:{row['record']:{} for row in rows if row['turn'] == turn})
+            self.assertNotIn(oversized['record'], memory['attempted_records'])
+            self.assertNotIn(oversized['record'], memory['compacted_records'])
+            paid = self.ledger.to_dict()
+            self.assertEqual(compact_work(store=ArtifactStore(self.root/'still-oversized'),
+                client=self.client, requests=['Continue'], previous=memory, rows=rows, bind_notes=self.bind,
+                estimate_tokens=estimate_tokens, attempt_id='native-turn-test',
+                native_supply_policy='receipts.v1'), (None, ()))
+            self.assertEqual(self.ledger.to_dict(), paid)
+            self.assertEqual(send.call_count, 1)
+
+    def test_rolling_uncited_or_failed_response_is_accounted_and_not_rebought(self):
+        from simple_ar.app.professional_conversation import ProfessionalConversation
+
+        rows = [{'turn':0, 'record':'records/new.json', 'result':{
+            'tool_name':'observe', 'data':{'text':'Actual original '*300}}}]
+        for index, response in enumerate(({'notes':[{'text':'Revised model judgment', 'observations':[]}]},
+                                          {'notes':[]})):
+            with self.subTest(response=response):
+                attempt = f'no-gain-{index}'
+                store = ArtifactStore(self.root/attempt)
+                client = self.client.with_budget(self.ledger, session_id='session', attempt_id=attempt)
+                previous = {'notes':[], 'through_turn':0, 'compacted_records':set()}
+                with patch('simple_ar.integrations.llm._call_openai_sdk',
+                        return_value=self.response(json.dumps(response))) as send:
+                    snapshot, refs = compact_work(store=store, client=client, requests=['First input'],
+                        previous=previous, rows=rows, bind_notes=self.bind, estimate_tokens=estimate_tokens,
+                        attempt_id=attempt, native_supply_policy='receipts.v1')
+                    self.assertEqual(checkpoint_artifacts(store=store, ledger=self.ledger, attempt_id=attempt,
+                        session_id='session', bind_notes=self.bind), refs)
+                    view = store.read_json('memory_input.json')
+                    actual = ProfessionalConversation.adopt(previous=previous, snapshot=snapshot, view=view,
+                        failure=store.read_json('memory_failure.json') if snapshot is None else None,
+                        operations_for_turn=lambda _:{'records/new.json':{}})
+                    self.assertEqual(actual['compacted_records'], set())
+                    self.assertEqual(actual['through_turn'], 0)
+                    self.assertEqual(actual['attempted_through_turn'], 1)
+                    if snapshot is not None:
+                        self.assertEqual(actual['notes'][0]['text'], 'Revised model judgment')
+                    paid = self.ledger.to_dict()
+                    self.assertEqual(compact_work(store=ArtifactStore(self.root/f'retry-{index}'),
+                        client=client, requests=['Changed question, same original history'],
+                        previous=actual, rows=deepcopy(rows), bind_notes=self.bind,
+                        estimate_tokens=estimate_tokens, attempt_id=attempt,
+                        native_supply_policy='receipts.v1'), (None, ()))
+                    self.assertEqual(self.ledger.to_dict(), paid)
+                    self.assertEqual(send.call_count, 1)
+                store.write_json('memory_input.json', {**view, 'native_supply_policy':'unknown.v9'})
+                with self.assertRaisesRegex(ValueError, 'native supply contract'):
+                    checkpoint_artifacts(store=store, ledger=self.ledger, attempt_id=attempt,
+                        session_id='session', bind_notes=self.bind)
+                store.write_json('memory_input.json', view)
+
+    def test_rolling_full_prior_notes_leave_room_for_actual_new_evidence(self):
+        from simple_ar.app.professional_conversation import ProfessionalConversation
+
+        notes = self.bind([{'text':'Earlier interpretation. '*60,
+            'records':[f'records/{i}/{j}/'+('long-locator-'*12)+'.json' for j in range(16)]}
+            for i in range(16)])
+        previous = {'notes':notes, 'through_turn':0, 'attempted_through_turn':1,
+            'compacted_records':{record for note in notes for record in note['records']}}
+        before = deepcopy(previous)
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
+                '{"notes":[{"text":"Updated measurement","observations":["o1"]}]}')) as send:
+            snapshot, refs = compact_work(store=self.store, client=self.client, requests=['Update findings'],
+                previous=previous, rows=[{'turn':1, 'record':'records/new.json', 'result':{
+                    'tool_name':'observe', 'data':{'text':'New measurement with conditions. '*500}}}],
+                bind_notes=self.bind, estimate_tokens=estimate_tokens, attempt_id='native-turn-test',
+                native_supply_policy='receipts.v1')
+            view = self.store.read_json('memory_input.json')
+            self.assertLess(len(view['previous_notes']), 16)
+            self.assertEqual([row['record'] for row in view['observations']], ['records/new.json'])
+            actual = ProfessionalConversation.adopt(previous=previous, snapshot=snapshot, view=view,
+                operations_for_turn=lambda turn:{'records/new.json':{}} if turn == 1 else {'old':{}})
+            self.assertEqual(actual['compacted_records'], {'records/new.json'})
+            self.assertEqual(actual['attempted_through_turn'], 2)
+            self.assertEqual(self.artifacts(), refs)
+            self.assertEqual(send.call_count, 1)
+        self.assertEqual(previous, before)
+
+    def test_capacity_omissions_are_not_purchases_even_within_one_turn(self):
+        from simple_ar.app.professional_conversation import ProfessionalConversation
+
+        for layout in ('same-turn', 'suffix', 'earlier-gap'):
+            for failed in (False, True):
+                with self.subTest(layout=layout, failed=failed):
+                    first = {'turn':2 if layout == 'earlier-gap' else 0,
+                        'record':'records/first.json', 'arguments':{},
+                        'result':{'tool_name':'observe', 'data':{'text':'a'*7000}}}
+                    omitted = {'turn':1 if layout == 'suffix' else 0,
+                        'record':'records/omitted.json', 'arguments':{},
+                        'result':{'tool_name':'observe', 'data':{'text':'b'*(24000 if layout == 'earlier-gap' else 7000)}}}
+                    rows = [omitted, first] if layout == 'earlier-gap' else [first, omitted]
+                    originals = deepcopy(rows)
+                    memory = {'notes':[], 'through_turn':0, 'compacted_records':set()}
+                    prefix = f'{layout}-{failed}'
+                    operations = lambda turn:{row['record']:{} for row in rows if row['turn'] == turn}
+
+                    def buy(number, capacity):
+                        attempt = f'{prefix}-{number}'
+                        store = ArtifactStore(self.root/attempt)
+                        client = LLMClient(replace(self.client._settings, context_input_tokens=capacity),
+                            budget_ledger=self.ledger, budget_session_id='session', budget_attempt_id=attempt)
+                        snapshot, refs = compact_work(store=store, client=client, requests=['Continue'],
+                            previous=memory, rows=rows, bind_notes=self.bind, estimate_tokens=len,
+                            attempt_id=attempt, native_supply_policy='receipts.v1')
+                        if not refs:
+                            return None, memory
+                        self.assertEqual(checkpoint_artifacts(store=store, ledger=self.ledger,
+                            attempt_id=attempt, session_id='session', bind_notes=self.bind), refs)
+                        view = store.read_json('memory_input.json')
+                        adopted = ProfessionalConversation.adopt(previous=memory, snapshot=snapshot, view=view,
+                            failure=store.read_json('memory_failure.json') if snapshot is None else None,
+                            operations_for_turn=operations)
+                        return view, adopted
+
+                    with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
+                            '{"notes":[]}' if failed else
+                            '{"notes":[{"text":"Actual supplied result","observations":["o1"]}]}')) as send:
+                        view, memory = buy(0, 12000)
+                        self.assertEqual([row['record'] for row in view['observations']], [first['record']])
+                        self.assertEqual(memory['attempted_records'], {first['record']})
+                        self.assertEqual(memory['attempted_through_turn'], first['turn']+1)
+                        self.assertNotIn(omitted['record'], memory['compacted_records'])
+                        if layout == 'earlier-gap':
+                            paid = self.ledger.to_dict()
+                            self.assertIsNone(buy('still-too-small', 12000)[0])
+                            self.assertEqual(self.ledger.to_dict(), paid)
+                        send.return_value = self.response(
+                            '{"notes":[{"text":"Previously omitted result","observations":["o1"]}]}')
+                        view, memory = buy(1, 36000 if layout == 'earlier-gap' else 12000)
+                        self.assertEqual([row['record'] for row in view['observations']], [omitted['record']])
+                        self.assertEqual(memory['attempted_records'], {first['record'], omitted['record']})
+                        self.assertEqual(memory['attempted_through_turn'], max(row['turn'] for row in rows)+1)
+                        paid = self.ledger.to_dict()
+                        for retry in range(3):
+                            self.assertIsNone(buy(f'no-new-{retry}', 36000)[0])
+                        self.assertEqual(send.call_count, 2)
+                        self.assertEqual(self.ledger.to_dict(), paid)
+                    self.assertEqual(rows, originals)
+
+    def test_inspection_paid_checkpoint_recovers_capacity_retired_notes(self):
+        from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
+        from simple_ar.tools.inspection import InspectionToolGateway
+
+        notes = self.bind([{'text':'Earlier interpretation. '*60,
+            'records':[f'records/{i}/{j}/'+('long-locator-'*12)+'.json' for j in range(16)]}
+            for i in range(16)])
+        memory = {'notes':notes, 'through_turn':0, 'attempted_through_turn':1,
+            'attempted_records':{'records/prior.json'},
+            'compacted_records':{record for note in notes for record in note['records']}}
+        rows = [{'turn':1, 'record':'records/new.json', 'arguments':{}, 'result':{
+            'tool_name':'observe', 'data':{'text':'New measurement with conditions. '*500}}}]
+        before = deepcopy((memory, rows))
+        owner = InspectionToolGateway(self.root, SimpleNamespace(ledger=self.ledger),
+            lambda attempt:self.client.with_budget(self.ledger, session_id='session', attempt_id=attempt))
+        saved = {'identity':'inspection', 'user_requests':['Update findings'],
+            'native_supply_policy':'receipts.v1'}
+        record, captured = {}, {}
+        store = ArtifactStore(self.root/'tools/inspection/inspection/sources-2')
+
+        def dispatch(kind, position, arguments, perform):
+            captured['perform'] = perform
+            captured['result'] = perform('paid-checkpoint')
+            raise InterruptedError('After paid checkpoint, before dispatcher receipt')
+
+        def prepare(conversation, project, **kwargs):
+            kwargs['checkpoint'](ConversationInput([], [], {'compaction_turns':[1]}), 0)
+
+        with patch.object(owner, '_conversation_rows', return_value=rows), \
+                patch.object(owner, '_conversation_memory', return_value=memory), \
+                patch.object(ProfessionalConversation, 'prepare', autospec=True, side_effect=prepare), \
+                patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
+                    '{"notes":[{"text":"Updated measurement","observations":["o1"]}]}')) as send:
+            with self.assertRaises(InterruptedError):
+                owner._prepare_conversation_round(saved, SimpleNamespace(goal='Update findings'),
+                    [], [], {}, None, self.client, 2, [10], dispatch=dispatch,
+                    record=record, save_round=Mock())
+            view = store.read_json('memory_input.json')
+            self.assertLess(len(view['previous_notes']), len(notes))
+            self.assertEqual(record['checkpoint_input']['context_input_tokens'],
+                self.client._settings.context_input_tokens)
+            paid = self.ledger.to_dict()
+            retained = {path:path.read_bytes() for path in store.root.glob('memory_*.json')}
+            with patch.object(owner, 'client_factory', side_effect=AssertionError(
+                    'Recovery uses retained capacity, not the active client configuration')):
+                for _ in range(2):
+                    self.assertEqual(captured['perform'].recover('paid-checkpoint'), captured['result'])
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(self.ledger.to_dict(), paid)
+            self.assertTrue(all(path.read_bytes() == raw for path, raw in retained.items()))
+            # Even a correctly paid/digested checkpoint must match the owner's
+            # exact preparation, including its original source content.
+            rows[0]['result']['data']['text'] = 'Changed original'
+            with self.assertRaisesRegex(ValueError, 'retained preparation'):
+                captured['perform'].recover('paid-checkpoint')
+            rows[0]['result'] = deepcopy(before[1][0]['result'])
+            self.assertEqual(self.ledger.to_dict(), paid)
+        self.assertEqual((memory, rows), before)
+
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.store = ArtifactStore(self.root/'attempts'/'native-turn-test')
@@ -1895,7 +2716,7 @@ class CheckpointFailureTests(unittest.TestCase):
         results = [{'tool_name':'observe', 'status':'ok', 'data':{'value':3}},
             {'tool_name':'observe', 'status':'error', 'error':'Original unresolved diagnostic'}]
         for role in ('main', 'inspection', 'shared-inspection'):
-            for policy in (None, CITATION_HANDOFF_POLICY):
+            for policy in (None, CITATION_HANDOFF_POLICY, TURN_SUPPLY_POLICY):
                 with self.subTest(role=role, policy=policy):
                     self.root = original_root/role/(policy or 'historical')
                     self.store = ArtifactStore(self.root/'attempts'/'native-turn-test')
@@ -1904,7 +2725,10 @@ class CheckpointFailureTests(unittest.TestCase):
                     requests = ['Explain the measurements']
                     if role == 'main':
                         app = self._journal_app(results)
+                        if policy == TURN_SUPPLY_POLICY:
+                            app.state['config']['native_supply_policy'] = policy
                         records = [f'records/reads/result-{i}.json' for i in range(2)]
+                        decision = app.session.store.read_json('attempts/reads/reply.json')
                         load = app._working_memory
                     else:
                         identity = attempt = 'saved-inspection'
@@ -1913,8 +2737,11 @@ class CheckpointFailureTests(unittest.TestCase):
                             protocol='subjects.v3')
                         source = owner._path(identity, 'sources-0')
                         records = [source+f'#results/{i}' for i in range(2)]
-                        owner.store.write_json(source, {'completed':True, 'response':{
-                            'role':'assistant', 'tool_calls':[{'id':str(i)} for i in range(2)]},
+                        decision = {'role':'assistant', 'tool_calls':[
+                            {'id':str(i), **({'function':{'name':result['tool_name'], 'arguments':'{}'}}
+                                if policy == TURN_SUPPLY_POLICY else {})}
+                            for i, result in enumerate(results)]}
+                        owner.store.write_json(source, {'completed':True, 'response':decision,
                             **({'model_receipt':{'attempt':attempt}} if role == 'shared-inspection' else {}),
                             'results':[{'call_id':str(i), 'arguments':{}, 'result':result}
                                 for i, result in enumerate(results)]})
@@ -1930,9 +2757,17 @@ class CheckpointFailureTests(unittest.TestCase):
                             'observation_text':json.dumps(result)}
                             for i, (record, result) in enumerate(zip(records, results))]}
                     notes = self.bind([{'text':'Only the successful result was retained', 'records':[records[0]]}])
+                    if policy == TURN_SUPPLY_POLICY:
+                        view['native_supply_policy'] = policy
+                        view['turn_decisions'] = [{'turn':0, 'reply':decision}]
+                        view['observations'] = [{key:value for key,value in row.items() if key != 'arguments'}
+                            | {'tool':results[i]['tool_name'], 'call_id':str(i),
+                               'source_sha256':observation_digest(results[i]), 'source_currentness':'unknown'}
+                            for i, row in enumerate(view['observations'])]
+                        notes = [{**note, 'source_integrity':'unknown'} for note in notes]
                     if policy:
-                        view['handoff_policy'] = policy
-                        notes = [{**note, 'handoff_policy':policy} for note in notes]
+                        view['handoff_policy'] = CITATION_HANDOFF_POLICY
+                        notes = [{**note, 'handoff_policy':CITATION_HANDOFF_POLICY} for note in notes]
                     # Unmarked files model the saved v1 format, not today's writer.
                     self.store.write_json('memory_input.json', view)
                     self.store.write_json('memory_response.json', {'notes':[{
@@ -1955,6 +2790,7 @@ class CheckpointFailureTests(unittest.TestCase):
                             **({'checkpoint_receipt':{'attempt':attempt}} if role == 'shared-inspection' else {})})
                         saved = {'identity':identity, 'arguments':{'goal':requests[0]},
                             'inspection_history_policy':'receipts.v1',
+                            **({'native_supply_policy':policy} if policy == TURN_SUPPLY_POLICY else {}),
                             **({'execution_protocol':'shared.v1'} if role == 'shared-inspection' else {}),
                             'source_rounds':[owner._digest(source), owner._digest(pending)]}
                         load = lambda:owner._conversation_memory(saved, owner._conversation_rows(saved))
@@ -1985,6 +2821,32 @@ class CheckpointFailureTests(unittest.TestCase):
                     self.assertEqual(load(), memory)
                     self.assertEqual(self.ledger.to_dict(), before)
                     self.assertTrue(all(path.read_bytes() == raw for path, raw in retained.items()))
+                    if policy == TURN_SUPPLY_POLICY:
+                        # Exercise the real owner adapters, not just the shared
+                        # row validator: a changed original decision must not
+                        # be adopted even when the checkpoint itself is intact.
+                        if role == 'main':
+                            original_path = app.session.store.resolve('attempts/reads/reply.json')
+                            original_bytes = original_path.read_bytes()
+                            app.session.store.write_json('attempts/reads/reply.json',
+                                {**decision, 'content':'Changed original decision'})
+                        else:
+                            original_path = owner.store.resolve(source)
+                            original_bytes = original_path.read_bytes()
+                            original_round = owner.store.read_json(source)
+                            saved_digest = saved['source_rounds'][0]
+                            owner.store.write_json(source, {**original_round,
+                                'response':{**decision, 'content':'Changed original decision'}})
+                            saved['source_rounds'][0] = owner._digest(source)
+                        try:
+                            with self.assertRaisesRegex(ValueError, 'differs|disagrees'):
+                                load()
+                        finally:
+                            original_path.write_bytes(original_bytes)
+                            if role != 'main':
+                                saved['source_rounds'][0] = saved_digest
+                        self.assertEqual(load(), memory)
+                        self.assertEqual(self.ledger.to_dict(), before)
                     if policy:
                         self.store.write_json('memory_snapshot.json', {**snapshot,
                             'notes':[{key:value for key,value in note.items() if key != 'handoff_policy'}
@@ -2024,6 +2886,115 @@ class CheckpointFailureTests(unittest.TestCase):
             self.assertEqual(memory['compacted_records'], {'records/reads/result-0.json', 'records/reads/result-1.json'})
             self.assertEqual(app._compact_work(next_context, next_client, 1), ())
             self.assertEqual(send.call_count, 2)
+
+    def test_rolling_journal_does_not_rebuy_history_and_can_replace_old_knowledge(self):
+        results = [{'tool_name':'observe', 'status':'ok', 'data':{'value':3}},
+            {'tool_name':'observe', 'status':'error', 'error':'Unresolved original diagnostic'}]
+        app = self._journal_app(results)
+        app.state['config']['native_supply_policy'] = 'receipts.v1'
+        original = {path:path.read_bytes() for path in (self.root/'attempts/reads').glob('*.json')}
+
+        def context(identity):
+            if identity != 'native-turn-test':
+                app.session.attempt_lineage().append(SimpleNamespace(
+                    attempt_id=identity, capability='native_turn', status='completed'))
+            return SimpleNamespace(store=ArtifactStore(self.root/'attempts'/identity),
+                attempt=SimpleNamespace(attempt_id=identity))
+
+        def compact(identity, cutoff):
+            return app._compact_work(context(identity), self.client.with_budget(self.ledger,
+                session_id='session', attempt_id=identity), cutoff)
+
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
+                '{"notes":[{"text":"First result retained","observations":["o1"]}]}')) as send:
+            compact('native-turn-test', 1)
+            first = app._working_memory()
+            self.assertEqual(first['compacted_records'], {'records/reads/result-0.json'})
+            self.assertEqual(first['attempted_through_turn'], 1)
+            self.assertEqual(self.store.read_json('memory_input.json')['native_supply_policy'], 'receipts.v1')
+            rows = [observation(0, json.dumps(result), kind='operation_result',
+                record=f'records/reads/result-{i}.json') for i, result in enumerate(results)]
+            messages, _ = select(material_policy='retained', require_work_notes=True,
+                fit_work_notes=True, work_notes=first['notes'], observations=rows,
+                processed_turns=processed_journal_turns(rows, first['compacted_records']),
+                turn_blocks=[[], block(1, 'Continue')], context_token_target=12000)
+            self.assertIn(results[1]['error'], json.dumps(messages))
+            retained = {path:path.read_bytes() for path in (self.root/'attempts').rglob('memory_*.json')}
+            ledger = self.ledger.to_dict()
+            for number in range(9):
+                self.assertEqual(compact(f'same-range-{number}', 1), ())
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(app._working_memory(), first)
+            self.assertEqual(self.ledger.to_dict(), ledger)
+
+            app.session.store.write_json('attempts/tiny/result.json', {
+                'tool_name':'observe', 'status':'ok', 'data':{}})
+            app.session.store.write_json('attempts/tiny/reply.json', {'tool_calls':[{
+                'id':'tiny', 'function':{'name':'observe', 'arguments':'{}'}}]})
+            app.state['turns'].append({'reply':'attempts/tiny/reply.json', 'request_count':1,
+                'tools':[{'id':'tiny', 'result':'attempts/tiny/result.json'}]})
+            self.assertEqual(compact('tiny-work', 2), ())
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(self.ledger.to_dict(), ledger)
+
+            app.session.store.write_json('attempts/new/result.json', {'tool_name':'observe',
+                'status':'ok', 'data':{'text':'Meaningful additional observation. '*500}})
+            app.session.store.write_json('attempts/new/reply.json', {'tool_calls':[{
+                'id':'new', 'function':{'name':'observe', 'arguments':'{}'}}]})
+            app.state['turns'].append({'reply':'attempts/new/reply.json', 'request_count':1,
+                'tools':[{'id':'new', 'result':'attempts/new/result.json'}]})
+            send.return_value = self.response(
+                '{"notes":[{"text":"New evidence supersedes the earlier result; original diagnostic remains unresolved",'
+                '"observations":["o2"]}]}')
+            compact('new-batch', 3)
+            advanced = app._working_memory()
+            self.assertEqual(advanced['compacted_records'],
+                {'records/new/result.json'})
+            self.assertEqual(advanced['through_turn'], 0)  # Failure remains in the original journal.
+            self.assertEqual(advanced['attempted_through_turn'], 3)
+            self.assertEqual(send.call_count, 2)
+            self.assertEqual(self.ledger.to_dict()['entries'][:len(ledger['entries'])], ledger['entries'])
+            self.assertTrue(all(path.read_bytes() == raw for path, raw in {**original, **retained}.items()))
+            self.assertEqual(app._working_memory(), advanced)
+            messages, selection = select(material_policy='retained', require_work_notes=True,
+                fit_work_notes=True, work_notes=advanced['notes'], observations=rows,
+                processed_turns=processed_journal_turns(rows, advanced['compacted_records']),
+                turn_blocks=[[], block(1, 'Continue')], context_token_target=12000)
+            self.assertIn(results[1]['error'], json.dumps(messages))
+            self.assertTrue(any(row['source']['record'] == rows[0]['record']
+                for row in selection['selected_records']))
+
+    def test_rolling_journal_complete_handoffs_advance_real_replayed_coverage(self):
+        results = [{'tool_name':'observe', 'status':'ok', 'data':{'value':3}},
+            {'tool_name':'observe', 'status':'error', 'error':'Original diagnostic'}]
+        app = self._journal_app(results)
+        app.state['config']['native_supply_policy'] = 'receipts.v1'
+        context = SimpleNamespace(store=self.store, attempt=SimpleNamespace(attempt_id='native-turn-test'))
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
+                '{"notes":[{"text":"Value 3; diagnostic unresolved","observations":["o1","o2"]}]}')) as send:
+            app._compact_work(context, self.client, 1)
+            self.assertEqual(app._working_memory()['through_turn'], 1)
+            app.session.store.write_json('attempts/fresh/result.json', {'tool_name':'observe',
+                'status':'ok', 'data':{'text':'Fresh measurement and conditions. '*500}})
+            app.session.store.write_json('attempts/fresh/reply.json', {'tool_calls':[{
+                'id':'fresh', 'function':{'name':'observe', 'arguments':'{}'}}]})
+            app.state['turns'].append({'reply':'attempts/fresh/reply.json', 'request_count':1,
+                'tools':[{'id':'fresh', 'result':'attempts/fresh/result.json'}]})
+            app.session.attempt_lineage().append(SimpleNamespace(
+                attempt_id='advance', capability='native_turn', status='completed'))
+            store = ArtifactStore(self.root/'attempts/advance')
+            send.return_value = self.response('{"notes":[{"text":"New measurement; prior diagnostic still '
+                'unresolved","observations":["p0","o1"]}]}')
+            app._compact_work(SimpleNamespace(store=store, attempt=SimpleNamespace(attempt_id='advance')),
+                self.client.with_budget(self.ledger, session_id='session', attempt_id='advance'), 2)
+            actual = app._working_memory()
+            self.assertEqual(actual['through_turn'], 2)
+            self.assertEqual(actual['attempted_through_turn'], 2)
+            self.assertEqual(actual['compacted_records'], {'records/reads/result-0.json',
+                'records/reads/result-1.json', 'records/fresh/result.json'})
+            self.assertEqual([row['turn'] for row in store.read_json('memory_input.json')['observations']], [1])
+            self.assertEqual(send.call_count, 2)
+            self.assertEqual(app._working_memory(), actual)
 
     def test_journal_uncited_failure_remains_selectable_and_reaches_next_checkpoint(self):
         results = [{'tool_name':'observe', 'status':'ok', 'data':{'value':3}},
@@ -2117,6 +3088,7 @@ class CheckpointFailureTests(unittest.TestCase):
 
     def test_journal_explicit_notes_replacement_resets_derived_frontier(self):
         app = self._journal_app([{'tool_name':'read_file', 'status':'ok', 'data':{'text':'x'*20000}}])
+        app.state['config']['native_supply_policy'] = 'receipts.v1'
         context = SimpleNamespace(store=self.store, attempt=SimpleNamespace(attempt_id='native-turn-test'))
         with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
                 '{"notes":[{"text":"Retained","observations":["o1"]}]}')):
@@ -2135,7 +3107,9 @@ class CheckpointFailureTests(unittest.TestCase):
                         {'id':'read', 'result':'attempts/replacement/read.json'}]})
                     app.session.attempt_lineage().append(SimpleNamespace(
                         attempt_id='replacement', capability='tool', status='completed'))
-                self.assertEqual(app._working_memory(), {'notes':notes, 'through_turn':0, 'compacted_records':set()})
+                self.assertEqual(app._working_memory(), {'notes':notes, 'through_turn':0,
+                    'compacted_records':set(), 'attempted_records':{'records/reads/result-0.json'},
+                    'attempted_through_turn':1})
 
     def test_journal_oversized_receipt_does_not_block_later_complete_observation(self):
         rows = [{'turn':0, 'record':f'records/{index}.json', 'result':{

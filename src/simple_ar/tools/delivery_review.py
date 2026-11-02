@@ -41,6 +41,60 @@ _CLAIM_GOAL = (
     'unsupported conclusions and incomplete investigation; grant no scientific or visual certification.'
 )
 
+_APPLICABLE_GOAL = (
+    'Determine and complete the checks necessary for the current completion claim against the '
+    'exact original requests and feedback and actual delivered work. Own applicability and '
+    'investigation in this same inspection, not a separate classification or producer declaration. '
+    'A simple explanation may conclude promptly when the available facts suffice. Investigate '
+    'scientific, numerical, behavioral and visual claims according to their actual substance, '
+    'including necessary independent verification; generated outputs agreeing is not enough. '
+    'Never waive checks based on file suffixes, task labels, inventory size or producer assurances. '
+    'Use the offered authorized tools to read relevant current work and original evidence on demand. '
+    'Historical source and receipt locators are navigation, not supplied evidence or a current pass. '
+    'Preserve prior required concerns and explicitly recheck those actually resolved. For a '
+    'file concern, select a current window of that subject or an owner-bound process or '
+    'visual check of it; a fragment of a historical receipt does not supply its embedded '
+    'source. Reassess claim-only concerns against the exact claim and requests. Conclude '
+    'incomplete when necessary evidence or investigation is unavailable; distinguish inherent '
+    'uncertainty and optional improvements from unfinished requested work. Return the same final '
+    'inspection opinion, without imposing unrelated reading, execution or publication.'
+)
+
+
+def applicable_delivery_scope(binding: dict) -> bool:
+    """Recognize an owner-only policy in the existing version-bound context.
+
+    Absence preserves historical behavior; unknown policies must never silently
+    fall back to either contract. Public InspectionRequest has no such field.
+    """
+    if 'scope_policy' not in binding:
+        return False
+    if (binding.get('schema_version') != 'delivery_review.v3'
+            or binding['scope_policy'] != 'applicable.v1'):
+        raise ValueError('Unsupported delivery inspection scope policy')
+    return True
+
+
+def reassessment_has_subject_support(prior: dict, artifacts: dict,
+                                     evidence_scopes: list[dict[str, str]]) -> bool:
+    """Require a provenance link to each pending subject, not semantic proof.
+
+    Scopes come from supplied observations and their owner-validated inputs,
+    never from inventory membership or a model's assertion of relevance. The
+    inspector still judges which windows/checks actually resolve the concern.
+    Empty subjects identify the exact completion claim already in its input;
+    they must not borrow a file finding's scope (or vice versa).
+    """
+    subjects, pending = prior.get('subjects'), prior.get('pending_subjects')
+    if not isinstance(subjects, dict) or not isinstance(pending, list):
+        return False
+    if not subjects:
+        return not pending
+    if not pending or not set(pending) <= subjects.keys():
+        return False
+    return all(path in artifacts and any(scope.get(path) == artifacts[path]
+        for scope in evidence_scopes) for path in pending)
+
 
 class _DeliveryFinding(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
@@ -59,6 +113,8 @@ class _DeliveryAssessment(BaseModel):
     findings: list[_DeliveryFinding]
     evidence_sha256: dict[str, str]
     limitations: list[str]
+    applicability: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    investigations: list[dict] | None = Field(default=None, exclude_if=lambda value: value is None)
     reassessed_prior: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode='after')
@@ -98,15 +154,29 @@ def recorded_delivery_review(reader: Any) -> dict | None:
             or turn.get('request_count', 1) != len(state.get('requests', []))):
         return None
     item = turn['tools'][-1]
+    parent = None
     if not item.get('review_result'):
-        return None
+        # Historical/unreviewed deliveries had no opinion action. Preserve
+        # their read-only behavior; only inspect a possible reused envelope.
+        try:
+            parent = reader.record(item['result'])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        if not isinstance(parent, dict) or not isinstance(parent.get('metadata') or {}, dict):
+            return None
+        possible = (parent.get('metadata') or {}).get('delivery_review') or {}
+        if (not isinstance(possible, dict) or not isinstance(possible.get('binding'), dict)
+                or possible['binding'].get('schema_version') != 'delivery_review.v3'
+                or DeliveryReview._pending_envelope(possible)):
+            return None
     calls = reader.record(turn['reply']).get('tool_calls') or []
     if not calls or calls[-1].get('id') != item.get('id'):
         raise ValueError('Delivery review has no matching terminal call')
     completion = tool_completion(calls[-1]['function']['name'], state['config'].get('tool_completions'))
     if completion is None or completion.kind != 'delivery':
         raise ValueError('Review is not attached to a delivery')
-    parent = reader.record(item['result'])
+    if parent is None:
+        parent = reader.record(item['result'])
     data, metadata = parent.get('data') or {}, parent.get('metadata') or {}
     delivered = data.get(completion.field) if completion.field else data
     from simple_ar.tools.workspace import DeliveryRequest
@@ -118,12 +188,44 @@ def recorded_delivery_review(reader: Any) -> dict | None:
     binding = envelope.get('binding') or {}
     if binding.get('schema_version') != 'delivery_review.v3':
         return None  # Older review formats retain their own presentation.
-    if (envelope.get('identity') != Path(item['result']).parent.name
-            or not DeliveryReview._pending_envelope(envelope)):
-        raise ValueError('Review does not belong to the terminal delivery')
     from simple_ar.core.capabilities import ArtifactStore
-    from simple_ar.tools.materials import accepted_review_journal
-    journal = accepted_review_journal(reader, ArtifactStore(reader.root), item, parent)
+    from simple_ar.tools.professional_outcomes import accepted_review_journal
+    store = ArtifactStore(reader.root)
+    if DeliveryReview._pending_envelope(envelope):
+        if not item.get('review_result'):
+            return None  # No accepted opinion action was recorded.
+        if envelope.get('identity') != Path(item['result']).parent.name:
+            raise ValueError('Review does not belong to the terminal delivery')
+        journal = accepted_review_journal(reader, store, item, parent)
+    else:
+        # A later terminal action can reuse a previously accepted opinion only
+        # for the exact same request, claim and file versions. Find the actual
+        # earlier opinion action; a copied result or model assertion is not one.
+        from simple_ar.tools.professional_outcomes import accepted_native_result
+        accepted_native_result(reader.root, manifest['session_id'],
+            parent, Path(item['result']).parent.name)
+        journal = None
+        for earlier in reversed(state['turns'][:-1]):
+            earlier_calls = reader.record(earlier['reply']).get('tool_calls') or []
+            for candidate in reversed(earlier.get('tools', [])):
+                if not candidate.get('review_result') or not any(
+                        call.get('id') == candidate.get('id') for call in earlier_calls):
+                    continue
+                previous = reader.record(candidate['result'])
+                prior = (previous.get('metadata') or {}).get('delivery_review') or {}
+                if (not DeliveryReview._pending_envelope(prior)
+                        or prior.get('identity') != envelope.get('identity')
+                        or prior.get('binding') != binding
+                        or Path(candidate['result']).parent.name != prior['identity']):
+                    continue
+                origin = accepted_review_journal(reader, store, candidate, previous)
+                if origin['receipt'] == envelope.get('result'):
+                    journal = origin
+                    break
+            if journal is not None:
+                break
+        if journal is None:
+            raise ValueError('Reused review has no matching accepted opinion record')
     result = ToolResult.model_validate(journal['receipt'])
     assessment = _DeliveryAssessment.model_validate(result.metadata.get('delivery_assessment'))
     pinned = metadata.get('delivery_hashes')
@@ -145,6 +247,8 @@ def recorded_delivery_review(reader: Any) -> dict | None:
         raise ValueError('Task changed while reading the delivery review')
     return {'coverage': assessment.coverage, 'verdict': assessment.verdict,
         'limitations': assessment.limitations,
+        **({'applicability': assessment.applicability} if assessment.applicability is not None else {}),
+        **({'investigations': assessment.investigations} if assessment.investigations is not None else {}),
         'findings': [{'severity': row.severity, 'message': row.message} for row in assessment.findings],
         'record': journal['record'],
         'scope': 'Recorded model opinion at delivery time; not proof of current sources or scientific correctness.'}
@@ -153,13 +257,174 @@ def recorded_delivery_review(reader: Any) -> dict | None:
 class DeliveryReview:
     def __init__(self, workspace: Any, inspector: Any, *,
                  observations: Callable[[], list[dict]] | None = None,
-                 protocol: str = 'task.v1', track_findings: bool = False) -> None:
-        if protocol not in {'task.v1', 'task.v2', 'task.v3'}:
+                 protocol: str = 'task.v1', track_findings: bool = False,
+                 include_package_feedback: bool = True) -> None:
+        if protocol not in {'task.v1', 'task.v2', 'task.v3', 'task.v4'}:
             raise ValueError('Unknown delivery review protocol')
         self.workspace, self.inspector = workspace, inspector
         self.observations = observations
         self.protocol = protocol
         self.track_findings = track_findings
+        self.include_package_feedback = include_package_feedback
+
+    def feedback_from_observation(self, observed: dict) -> dict | None:
+        """Resolve original opinions once for revision and completion consumers."""
+        envelope = (observed.get('metadata') or {}).get('delivery_review')
+        if isinstance(envelope, dict) and self.include_package_feedback:
+            accepted, accepted_result = None, None
+            if self._pending_envelope(envelope):
+                path = self.inspector._path(envelope['identity'], 'result')
+                try:
+                    raw = (self.inspector.store.read_json(path) if self.inspector.store.exists(path)
+                           else envelope['result'])
+                except _ERRORS:
+                    raw = None
+                accepted, intact, accepted_result = self._accepted_pending_opinion(observed, envelope, raw)
+                if accepted is not True or not intact:
+                    # A closed response can precede the action that accepts it.
+                    # A previously accepted opinion may also have lost its
+                    # original binding. Neither supplies guidance or a pass.
+                    binding = envelope['binding']
+                    return {'arguments': {}, 'opinion_available': False, 'opinion_accepted': accepted,
+                        'delivery_context': deepcopy(binding), 'reviewed_subjects': {},
+                        'reviewed_inventory': dict(binding.get('artifacts', {})),
+                        'result': ToolResult(tool_name='inspect_artifacts', status='blocked',
+                            error=('Independent opinion no longer matches its accepted record' if accepted is True
+                                   else 'Independent opinion has no accepted action record' if accepted is False
+                                   else 'Independent opinion acceptance cannot be verified')).model_dump(mode='json'),
+                        **({'_accepted_result': accepted_result} if accepted_result is not None else {}),
+                        'scope': 'Diagnostic only; the original review remains available for recovery.'}
+            feedback = self.feedback_observation(envelope)
+            if accepted is not None:
+                feedback['opinion_accepted'] = accepted
+                if not feedback.get('opinion_available') and accepted_result is not None:
+                    feedback['_accepted_result'] = accepted_result
+            return feedback
+        if observed.get('tool_name') == 'inspect_artifacts':
+            return self.inspector.feedback_from_observation(observed)
+        return None
+
+    def inspection_feedback(self, targets: list[str]) -> list[dict]:
+        """Project original owner-verified opinions through the shared work-input port.
+
+        Changed subjects keep guidance with explicit old/current versions, never
+        acceptance. Source bodies remain in the original read observations.
+        """
+        roots = [self.workspace.resolve(path) for path in targets]
+        selected = None
+        result, concluded, repeated = [], set(), {}
+        for observed in reversed(self.observations() if self.observations is not None else []):
+            feedback = self.feedback_from_observation(observed)
+            if feedback is None:
+                continue
+            if selected is None:
+                selected = {path: self.workspace.artifact_hashes([str(path)])[str(path)]
+                    for path in roots if path.is_file()}
+            feedback.pop('_accepted_result', None)  # The original stays in its journal receipt.
+            subjects = []
+            targets_reviewed = feedback.pop('reviewed_subjects')
+            inventory = feedback.pop('reviewed_inventory', {})
+            package = (feedback.get('delivery_context') or {}).get('schema_version') == 'delivery_review.v3'
+            metadata = feedback['result'].get('metadata') or {}
+            assessments = metadata.get('assessments', [metadata.get('assessment')])
+            signatures, duplicate_records = [], []
+            for locator, digest in {**inventory, **targets_reviewed}.items():
+                try:
+                    subject = self.workspace.resolve(locator)
+                except ValueError:
+                    continue  # Old locators do not grant new access.
+                copy = next((path for path, value in selected.items() if value == digest), None)
+                has_guidance = any(finding.get('severity') in {'required', 'advisory'}
+                    and locator in (finding.get('subjects') or {})
+                    for assessment in assessments if isinstance(assessment, dict)
+                    for finding in assessment.get('findings', []) if isinstance(finding, dict))
+                # Revision can use advisory findings as well as required ones.
+                # A later narrow pass cannot erase earlier guidance; duplicate
+                # opinions retain their original receipts without repeated text.
+                # A versioned envelope without a new scope or reassessment is
+                # the same opinion; its schema tag alone is not new evidence.
+                normalized = [{key:value for key,value in row.items() if key not in
+                    {'schema_version', 'scope', 'reassessed_prior', 'review_id'}}
+                    if isinstance(row, dict) and row.get('schema_version') in
+                        {'artifact_assessment.v1', 'artifact_assessment.v2'}
+                        and row.get('scope') is None and not row.get('reassessed_prior') else row
+                    for row in assessments]
+                signature = json.dumps([locator, digest, feedback.get('arguments'), normalized],
+                    sort_keys=True, ensure_ascii=False) if has_guidance else None
+                if signature in repeated:
+                    duplicate_records.append(signature)
+                    continue
+                if (not package and (subject, digest) in concluded and not has_guidance or not (copy is not None or any(subject == root
+                        or root.is_dir() and subject.is_relative_to(root) for root in roots))):
+                    continue
+                if signature is not None:
+                    signatures.append(signature)
+                current_path = copy or subject
+                current = (self.workspace.artifact_hashes([str(current_path)])[str(current_path)]
+                    if current_path.is_file() else None)
+                subjects.append({'path': locator, 'reviewed_sha256': digest,
+                    'selected_path': str(current_path), 'current_sha256': current,
+                    'current_matches_review': current == digest,
+                    'review_role': 'inspection_target' if locator in targets_reviewed else 'delivery_inventory_member'})
+                conclusive = lambda row: row and row['coverage'] == 'complete' and row['verdict'] != 'incomplete'
+                if (any(conclusive(row) and locator in row['subjects'] for row in assessments)
+                        or inventory and assessments and all(conclusive(row) for row in assessments)):
+                    concluded.add((subject, digest))
+            # A local file opinion cannot retire a whole-claim opinion. Direct
+            # answers and claim-level defects have no file scope at all, yet
+            # remain relevant guidance for the next whole-work judgment.
+            claim_findings = (feedback['result'].get('metadata') or {}).get('delivery_opinion', {}).get('findings', [])
+            # A finding may join several files. Keep the original version and
+            # current status of every related subject when any one is selected;
+            # unrelated findings remain available in the retained receipt.
+            selected_paths = {row['path'] for row in subjects}
+            findings = [*claim_findings, *(finding for assessment in assessments
+                if isinstance(assessment, dict) for finding in assessment.get('findings', [])
+                if isinstance(finding, dict))]
+            linked = set()
+            for finding in findings:
+                paths = set(finding.get('artifacts', finding.get('subjects', {})))
+                if paths & selected_paths:
+                    linked.update(paths)
+            bindings = {**inventory, **targets_reviewed}
+            for locator in sorted(linked - selected_paths):
+                if locator not in bindings:
+                    continue
+                path, current = None, None
+                try:
+                    path = self.workspace.resolve(locator)
+                    if path.is_file():
+                        current = self.workspace.artifact_hashes([str(path)])[str(path)]
+                except (ValueError, OSError):
+                    pass  # An inaccessible related subject must not hide selected guidance.
+                subjects.append({'path': locator, 'reviewed_sha256': bindings[locator],
+                    'selected_path': str(path) if path is not None else None, 'current_sha256': current,
+                    'current_matches_review': current == bindings[locator] if current is not None else None,
+                    'review_role': 'related_subject'})
+            record = 'records/' + observed['record'].removeprefix('attempts/')
+            for signature in duplicate_records:
+                references = repeated[signature].setdefault('related_opinion_records', [])
+                if record not in references:
+                    references.append(record)
+            if subjects or package and (not inventory or not roots or any(not row['artifacts'] for row in claim_findings)):
+                # An accepted independent opinion may live in a separate
+                # action; embedded historical opinions remain in production.
+                envelope = (observed.get('metadata') or {}).get('delivery_review')
+                pending = isinstance(envelope, dict) and self._pending_envelope(envelope)
+                source = self._opinion_record(observed.get('review_record') if pending else observed.get('record'))
+                source_prefix = '' if pending or not isinstance(envelope, dict) else 'metadata.delivery_review.result.'
+                view = self.inspector.feedback_view({**feedback, 'kind': 'inspection_feedback',
+                    'subjects': subjects, 'record': record,
+                    **({'source_record': source, 'source_prefix': source_prefix}
+                       if source and feedback.get('opinion_available') else {})})
+                result.append(view)
+                for signature in signatures:
+                    repeated[signature] = view
+        return result
+
+    def _validate_scope(self, binding: dict) -> None:
+        if applicable_delivery_scope(binding) != (self.protocol == 'task.v4'):
+            raise ValueError('Delivery scope policy differs from the saved review protocol')
 
     def _reassessed_ids(self, identity: str, assessment: _DeliveryAssessment) -> list[str]:
         """Only the original inspection work order may authorize a reassessment."""
@@ -195,44 +460,79 @@ class DeliveryReview:
             return None
         return record
 
-    def _accepted_package(self, observed: dict, envelope: dict, raw: dict) -> tuple[bool, bool]:
-        """Acceptance and current applicability are different owner proofs."""
-        if not self._pending_envelope(envelope):
-            try:
-                self._verified(envelope['identity'], envelope['binding'], envelope)
-                return True, True
-            except _ERRORS:
-                # Original feedback was verified before this call. Stale
-                # historical findings remain concerns, never retirement proof.
-                return True, False
+    def _accepted_pending_opinion(self, observed: dict, envelope: dict, raw: dict | None
+                                  ) -> tuple[bool | None, bool, dict | None]:
+        """Prove historical acceptance without relying on current file versions."""
         record = observed.get('review_record')
         if not isinstance(record, str) or not record:
-            return False, False
-        _, resolved = self._resolve_observation(observed, review_record=record)
-        if resolved is not None:
-            return True, True
-        # _resolve_observation also checks current source bytes. A genuinely
-        # accepted historical opinion may now be stale: prove the accepted
-        # action independently, retaining findings without retirement power.
+            return False, False, None
         try:
             from simple_ar.tools.professional_outcomes import accepted_scoped_opinion
-            self._pending_input(envelope)
             if (Path(observed.get('record', '')).name != 'native_result.json'
                     or Path(observed['record']).parent.name != envelope['identity']):
-                return False, False
+                return None, False, None
             root = self.inspector.store.root
-            accepted_scoped_opinion(root, self.workspace,
-                self.inspector.store.read_json('session_manifest.json')['session_id'],
-                record, envelope['identity'], expected=raw)
-            return True, False
+            session_id = self.inspector.store.read_json('session_manifest.json')['session_id']
+            _, accepted_raw, _ = accepted_scoped_opinion(root, self.workspace, session_id,
+                record, envelope['identity'])
+            if not isinstance(raw, dict) or accepted_raw != raw:
+                return True, False, accepted_raw
+            try:
+                self._pending_input(envelope)
+            except _ERRORS:
+                return True, False, accepted_raw
+            return True, True, accepted_raw
         except _ERRORS:
-            return False, False
+            # A recorded action whose proof is unreadable is unknown, not an
+            # assertion that the opinion was never accepted.
+            return None, False, None
+
+    def _accepted_opinion_is_unrelated(self, raw: dict | None, binding: dict,
+                                       selected: set[str], prior_events: list[dict]) -> bool:
+        """Skip damaged history only when its accepted opinion proves no relevant concern."""
+        try:
+            assessment = _DeliveryAssessment.model_validate((raw.get('metadata') or {}).get('delivery_assessment'))
+            if assessment.artifacts != binding['artifacts']:
+                return False
+            if assessment.reassessed_prior:
+                known = {finding.get('finding_id') or finding_id(event, finding)
+                    for event in prior_events for finding in event['findings']
+                    if finding['severity'] == 'required'}
+                if not set(assessment.reassessed_prior) <= known:
+                    return False  # An unknown original concern cannot be classified as unrelated.
+                _, pending = assessment_state(prior_events, resolve=self.workspace.resolve,
+                    require_explicit_reassessment=True)
+                relevant = {identity for path, findings in pending.items()
+                    if path is None or path in selected for identity in findings}
+                if relevant.intersection(assessment.reassessed_prior):
+                    return False
+            return all(row.subjects and not self._relevant(row.subjects, selected)
+                       for row in assessment.findings if row.severity == 'required')
+        except _ERRORS + (AttributeError,):
+            return False
+
+    def _accepted_package(self, observed: dict, envelope: dict, raw: dict, *,
+                          accepted_pending: bool = False) -> tuple[bool | None, bool]:
+        """Separate accepted history from applicability to the current bytes."""
+        pending = self._pending_envelope(envelope)
+        if pending and not accepted_pending:
+            accepted, intact, _ = self._accepted_pending_opinion(observed, envelope, raw)
+            if accepted is not True or not intact:
+                return accepted, False
+        try:
+            result = self._verified(envelope['identity'], envelope['binding'], None if pending else envelope)
+            return True, result.model_dump(mode='json') == raw
+        except _ERRORS:
+            # A previously accepted result can remain useful guidance after
+            # sources change, without granting current retirement authority.
+            return True, False
 
     def _reassessment_events(self, identity: str, scope: str, assessment: _DeliveryAssessment,
                              prior_events: list[dict], *, current: bool) -> list[dict]:
         """Project completed individual rechecks without completing the package.
 
-        The inspector only emits IDs after validating selected evidence supply.
+        The inspector only emits IDs after validating selected evidence supply;
+        new subject-scoped work also binds that evidence to pending subjects.
         Partial packages additionally need actual bound evidence. Scope comes
         exclusively from the original, integrity-checked inspection work order.
         """
@@ -298,6 +598,17 @@ class DeliveryReview:
                 if binding.get('schema_version') != 'delivery_review.v3':
                     continue
                 identity = envelope['identity']
+                feedback = None
+                if self._pending_envelope(envelope):
+                    # Establish whether a historical action was accepted before
+                    # interpreting its mutable owner result or skipping a scope.
+                    feedback = self.feedback_from_observation(observed)
+                    if feedback.get('opinion_accepted') is False:
+                        continue
+                    if not feedback.get('opinion_available'):
+                        if self._accepted_opinion_is_unrelated(feedback.get('_accepted_result'), binding, selected, events):
+                            continue
+                        raise ValueError('Retained delivery concern opinion cannot be verified')
                 raw = (self.inspector.store.read_json(self.inspector._path(identity, 'result'))
                        if self._pending_envelope(envelope)
                        and self.inspector.store.exists(self.inspector._path(identity, 'result'))
@@ -306,17 +617,26 @@ class DeliveryReview:
                 if value is None:
                     continue  # Pending/failed work has no independent opinion.
                 assessment = _DeliveryAssessment.model_validate(value)
+                if raw.get('status') != 'ok' and not any(
+                        row.severity == 'required' for row in assessment.findings):
+                    # A rejected or interrupted response with no accepted
+                    # finding is diagnostic, not an opinion that can block a
+                    # fresh review. Earlier verified concerns remain in events.
+                    continue
                 if not (self._relevant(assessment.artifacts, selected)
                         or any(not row.subjects for row in assessment.findings)
                         or assessment.reassessed_prior):
                     continue
-                feedback = self.feedback_observation(envelope)
+                feedback = feedback or self.feedback_from_observation(observed)
+                if feedback.get('opinion_accepted') is False:
+                    continue  # A closed but unaccepted response is not an opinion.
                 if not feedback.get('opinion_available'):
                     raise ValueError('Retained delivery concern opinion cannot be verified')
                 if assessment.artifacts != binding['artifacts']:
                     raise ValueError('Delivery concern inventory differs from its original scope')
                 self._reassessed_ids(identity, assessment)
-                accepted, applicable = self._accepted_package(observed, envelope, raw)
+                accepted, applicable = self._accepted_package(observed, envelope, raw,
+                    accepted_pending=feedback.get('opinion_accepted') is True)
                 if not accepted:
                     continue  # Unregistered independent replies are diagnostic only.
                 # Applicability is established by the existing verified review
@@ -345,7 +665,7 @@ class DeliveryReview:
             if not any(isinstance(row, dict) and self._relevant(row.get('subjects', {}), selected)
                        for row in values):
                 continue
-            feedback = self.inspector.feedback_from_observation(observed)
+            feedback = self.feedback_from_observation(observed)
             if feedback is None or not feedback.get('opinion_available'):
                 raise ValueError('Retained artifact concern opinion cannot be verified')
             native = {**feedback['result'], 'record': observed.get('record')}
@@ -400,6 +720,8 @@ class DeliveryReview:
 
     @staticmethod
     def _arguments(binding: dict) -> dict:
+        if applicable_delivery_scope(binding):
+            return {'goal': _APPLICABLE_GOAL, 'targets': [], 'evidence': []}
         if binding['schema_version'] == 'delivery_review.v3':
             return {'goal': _CLAIM_GOAL, 'targets': [], 'evidence': []}
         return {'goal': _GOAL, 'targets': [binding['manuscript']], 'evidence': []}
@@ -426,6 +748,7 @@ class DeliveryReview:
             [binding['manuscript']], require_pass=[binding['manuscript']])
 
     def _verified(self, identity: str, binding: dict, claimed: dict | None = None) -> ToolResult:
+        self._validate_scope(binding)
         # A retained failure is diagnostic only: no final opinion is needed to
         # report it. Every possible acceptance still goes through _cached's
         # completed response, usage, integrity and version verification.
@@ -472,6 +795,7 @@ class DeliveryReview:
 
     def _pending_input(self, envelope: dict) -> dict:
         identity, binding = envelope['identity'], envelope['binding']
+        self._validate_scope(binding)
         saved = self.inspector.store.read_json(self.inspector._path(identity, 'input'))
         if (saved.get('execution_protocol') != 'shared.v1' or saved.get('identity') != identity
                 or saved.get('delivery_context') != binding or saved.get('arguments') != self._arguments(binding)
@@ -572,6 +896,7 @@ class DeliveryReview:
             return None
         result = None
         try:
+            self._validate_scope(binding)
             if self.inspector.has_started(identity):
                 if self.inspector.store.read_json(self.inspector._path(identity, 'input')).get(
                         'execution_protocol') == 'shared.v1' and not self.inspector.store.exists(
@@ -635,6 +960,7 @@ class DeliveryReview:
         try:
             if binding is None:
                 return []
+            self._validate_scope(binding)
             for observed in reversed(observations):
                 candidate = (observed.get('metadata') or {}).get('delivery_review')
                 if not isinstance(candidate, dict) or candidate.get('binding') != binding:

@@ -20,6 +20,16 @@ from simple_ar.tools.workspace import DeliveryRequest, _private_name, resolve_mo
 
 
 PUBLICATION_ASSET_PROTOCOL = 'referenced.v2'
+PUBLICATION_CONSUMER_PROTOCOL = 'consumed.v3'
+_PUBLICATION_BYTES_CONTRACT = 'publication_bytes.v1'
+
+
+def _general_conversion(binding: dict) -> bool:
+    """Consume authored bytes without adopting an earlier computation."""
+    identity = binding.get('report_identity')
+    return (binding.get('consumer_contract') == _PUBLICATION_BYTES_CONTRACT
+            and not binding.get('candidate_result')
+            and (identity is None or isinstance(identity, dict) and identity.get('kind') == 'conversion'))
 
 
 def _authorized_image(workspace: Any, path: Path) -> Path:
@@ -300,7 +310,7 @@ class PublicationToolGateway:
                  report_source: Callable[[str], dict | None] | None = None,
                  candidate_source: Callable[[str, str], dict] | None = None,
                  owned_execution: bool = False, asset_protocol: str | None = None) -> None:
-        if asset_protocol not in {None, PUBLICATION_ASSET_PROTOCOL}:
+        if asset_protocol not in {None, PUBLICATION_ASSET_PROTOCOL, PUBLICATION_CONSUMER_PROTOCOL}:
             raise ValueError('Unsupported publication asset protocol')
         self.root, self.workspace, self.ledger = root, workspace, ledger
         self.report_source = report_source
@@ -310,10 +320,18 @@ class PublicationToolGateway:
     def input_binding(self, source: Path, request: ExportRequest, *, saved: dict | None = None,
                       include_images: bool = True, image_paths: list[str] | None = None) -> dict:
         version = (saved.get('image_binding_version', 1) if saved is not None else
-            2 if self.asset_protocol == PUBLICATION_ASSET_PROTOCOL else 1)
-        return export_input_binding(source, request, output_root=self.workspace.workspace / 'publications',
+            2 if self.asset_protocol in {PUBLICATION_ASSET_PROTOCOL, PUBLICATION_CONSUMER_PROTOCOL} else 1)
+        consumer = (saved.get('consumer_contract') if saved is not None else
+                    _PUBLICATION_BYTES_CONTRACT if self.asset_protocol == PUBLICATION_CONSUMER_PROTOCOL
+                    and not request.candidate_result else None)
+        if consumer not in {None, _PUBLICATION_BYTES_CONTRACT}:
+            raise ValueError('Unsupported saved publication consumer contract')
+        binding = export_input_binding(source, request, output_root=self.workspace.workspace / 'publications',
             include_images=include_images, image_paths=image_paths,
             image_binding_version=version, workspace=self.workspace, saved=saved)
+        if consumer is not None:
+            binding['consumer_contract'] = consumer
+        return binding
 
     def _source_identity(self, request: ExportRequest) -> dict | None:
         if request.candidate_result:
@@ -362,7 +380,7 @@ class PublicationToolGateway:
         owner = ArtifactStore(self.root/'tools/publications'/relative.parts[0])
         saved, result = owner.read_json('request.json'), owner.read_json('result.json')
         request = {key: value for key, value in saved.items()
-            if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity', 'article_rendering'}}
+            if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity', 'article_rendering', 'consumer_contract'}}
         manifest = ArtifactStore(self.workspace.resolve(data['project'])).read_json('export.json')
         binding = self.approval_binding(request, identity=relative.parts[0],
             saved=saved,
@@ -370,8 +388,9 @@ class PublicationToolGateway:
         inputs = _publication_inputs(self.workspace.resolve(saved['markdown']),
             ExportRequest.model_validate(request), saved, manifest, binding,
             output_root=self.workspace.workspace / 'publications')
-        self.workspace.check_artifact_producers(os.path.abspath(self.workspace.resolve(saved['markdown']).parent/key)
-            for key, digest in inputs.items() if digest is not None)
+        if not _general_conversion(saved):
+            self.workspace.check_artifact_producers(os.path.abspath(self.workspace.resolve(saved['markdown']).parent/key)
+                for key, digest in inputs.items() if digest is not None)
         if ({**binding, 'inputs': inputs} != {key: value for key, value in saved.items()
                 if key != 'output_binding_version'} | {'inputs': inputs}):
             raise ValueError('Prepared publication source or inputs changed')
@@ -401,6 +420,108 @@ class PublicationToolGateway:
             'view_path': self.workspace.locator(str(view_path)), 'view_sha256': ref['sha256'],
             'view': view, 'adopted': False,
             'pages': data.get('preview_images', []), 'visual_reviewed': False}
+
+    def _bound_publication(self, saved: dict, result: dict, data: dict) -> tuple[dict, list[str]]:
+        """Validate one export's actual source, assets, policy and output bytes."""
+        project = self.workspace.resolve(data['project'])
+        hashes = result.get('artifact_sha256')
+        if (not hashes or data.get('artifact_sha256') != hashes
+                or self.workspace.artifact_hashes(hashes) != hashes
+                or ArtifactStore(project).read_json('export.json') != data['manifest']
+                or saved.get('report_identity') != result.get('report_identity')
+                or saved.get('report_identity') != data.get('report_identity')):
+            raise ValueError('Publication project or owner evidence changed')
+        request = ExportRequest.model_validate({key: value for key, value in saved.items()
+            if key not in {'inputs', 'image_binding_version', 'output_binding_version',
+                           'report_identity', 'article_rendering', 'consumer_contract'}})
+        source = self.workspace.resolve(saved['markdown'])
+        manifest = data['manifest']
+        current = self.input_binding(source, request, saved=saved,
+            image_paths=list(manifest['consumed_inputs']) if 'consumed_inputs' in manifest else None)
+        inputs = _publication_inputs(source, request, saved, manifest, current,
+            output_root=self.workspace.workspace / 'publications')
+        if (saved.get('consumer_contract') != result.get('consumer_contract')
+                or saved.get('consumer_contract') != data.get('consumer_contract')):
+            raise ValueError('Publication consumer contract differs from its bound result')
+        if _general_conversion(saved):
+            if (saved.get('output_binding_version') != 1 or not isinstance(manifest.get('consumed_inputs'), dict)
+                    or manifest.get('status') not in {'exported', 'compiled'}
+                    or request.compile_pdf and manifest.get('compiled') is not True
+                    or request.checks is not None and (manifest.get('compiled') is not True
+                        or manifest.get('checks', {}).get('status') != 'passed')
+                    or request.render_preview and (manifest.get('compiled') is not True
+                        or manifest.get('pdf_preview', {}).get('rendered') is not True)):
+                raise ValueError('General publication has no successful bound rendering/check outcome')
+        else:
+            self.workspace.check_artifact_producers(os.path.abspath(source.parent / key)
+                for key, digest in inputs.items() if digest is not None)
+        return inputs, _publication_artifacts(self.workspace, data['project'], manifest, hashes)
+
+    def delivery_issues(self, observations: list[dict]) -> list[str]:
+        return self.delivery_issues_for(observations, None, [])
+
+    def delivery_issues_for(self, observations: list[dict], delivery: dict | None,
+                            adoptions: list[dict], *, require_current_origin: bool = True) -> list[str]:
+        """Validate delivered general exports independently of a report claim.
+
+        Conversion proves consumed bytes, never adoption of their computation.
+        Requested formats and authored report identities have their own checks.
+        """
+        if delivery is None:
+            return []
+        try:
+            for _ in self._delivered_conversions(observations, delivery['artifacts']):
+                pass
+        except (ValueError, OSError, KeyError, RuntimeError) as exc:
+            return [str(exc)]
+        return []
+
+    def _delivered_conversions(self, observations: list[dict], artifacts: list[str]):
+        """Yield byte-verified consumed inputs of delivered general exports."""
+        delivered = {self.workspace.resolve(path) for path in artifacts}
+        for observed in observations:
+            data = observed.get('data') or {}
+            if (observed.get('tool_name') != 'export_report' or observed.get('status') != 'ok'
+                    or observed.get('error') or not observed.get('contract_current', True)
+                    or data.get('consumer_contract') != _PUBLICATION_BYTES_CONTRACT
+                    or data.get('candidate_preparation')):
+                continue
+            project = data.get('project', '')
+            if not isinstance(project, str) or not re.fullmatch(
+                    r'workspace/publications/[A-Za-z0-9][A-Za-z0-9_-]{0,100}', project):
+                continue
+            root = self.workspace.resolve(project)
+            if not any(path.is_relative_to(root) for path in delivered):
+                continue
+            owner = ArtifactStore(self.root / 'tools/publications' / root.name)
+            saved, result = owner.read_json('request.json'), owner.read_json('result.json')
+            if not _general_conversion(saved):
+                continue
+            consumed, public = self._bound_publication(saved, result, data)
+            # A delivered input alone (including one inside the project) cannot
+            # select an export. Require an actual public conversion output.
+            if not any(self.workspace.resolve(path) in delivered
+                       and self.workspace.resolve(path).is_relative_to(root) for path in public):
+                continue
+            source = self.workspace.resolve(saved['markdown'])
+            yield source, consumed
+
+    def conversion_inputs(self, observations: list[dict], artifacts: list[str]) -> dict[Path, str]:
+        """Historical producer-gate exception; task.v4 no longer consumes it.
+
+        Keep saved task.v1/v2/v3 delivery semantics. Explicit execution/unit
+        selectors must still check their original inputs without this exception.
+        """
+        inputs = {}
+        for source, consumed in self._delivered_conversions(observations, artifacts):
+            for name, digest in consumed.items():
+                if digest is None:
+                    continue
+                path = self.workspace.resolve(os.path.abspath(source.parent / name))
+                if path in inputs and inputs[path] != digest:
+                    raise ValueError('Delivered publications bind conflicting input versions')
+                inputs[path] = digest
+        return inputs
 
     def check_requested_delivery(self, observations: list[dict], artifacts: list[str], *,
                                  formats: list[str], manuscript: str | None,
@@ -468,22 +589,9 @@ class PublicationToolGateway:
                         or saved.get('report_identity') != identity or data.get('report_identity') != identity
                         or result.get('report_identity') != identity):
                     continue
-                hashes = result.get('artifact_sha256')
-                if (not hashes or data.get('artifact_sha256') != hashes
-                        or self.workspace.artifact_hashes(hashes) != hashes
-                        or ArtifactStore(project).read_json('export.json') != data['manifest']):
-                    raise ValueError('Publication project or owner evidence changed')
-                request = ExportRequest.model_validate({key: value for key, value in saved.items()
-                    if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity', 'article_rendering'}})
-                current = self.input_binding(self.workspace.resolve(saved['markdown']), request, saved=saved,
-                    image_paths=list(data['manifest']['consumed_inputs']) if 'consumed_inputs' in data['manifest'] else None)
-                inputs = _publication_inputs(self.workspace.resolve(saved['markdown']), request,
-                    saved, data['manifest'], current, output_root=self.workspace.workspace / 'publications')
-                self.workspace.check_artifact_producers(os.path.abspath(self.workspace.resolve(saved['markdown']).parent / key)
-                    for key, digest in inputs.items() if digest is not None)
+                _, public = self._bound_publication(saved, result, data)
                 if 'pdf' in formats and data['manifest'].get('compiled') is not True:
                     continue
-                public = _publication_artifacts(self.workspace, data['project'], data['manifest'], hashes)
                 if 'tex' in formats:
                     required.update(self.workspace.resolve(path) for path in public)
                 if required.issubset(delivered) and all(path.is_file() for path in required):
@@ -530,12 +638,14 @@ class PublicationToolGateway:
                 consumed = _publication_inputs(source, request, saved, retained_manifest, binding,
                     output_root=self.workspace.workspace / 'publications')
             producer_cache = {}
-            self.workspace.check_artifact_producers((os.path.abspath(source.parent / key)
-                for key, digest in (consumed if consumed is not None else binding['inputs']).items()
-                if digest is not None), cache=producer_cache)
             report_identity = self._source_identity(request)
             if report_identity is not None:
                 binding['report_identity'] = report_identity
+            general_conversion = _general_conversion(binding)
+            if not general_conversion:
+                self.workspace.check_artifact_producers((os.path.abspath(source.parent / key)
+                    for key, digest in (consumed if consumed is not None else binding['inputs']).items()
+                    if digest is not None), cache=producer_cache)
             if saved is not None:
                 output_binding_version = saved.get('output_binding_version')
                 if output_binding_version not in {None, 1}:
@@ -652,7 +762,8 @@ class PublicationToolGateway:
                             consumed[key] = binding['inputs'][key]
                         return digest
                     authorized = self.workspace.resolve(str(path))
-                    self.workspace.check_artifact_producers([str(authorized)], cache=producer_cache)
+                    if not general_conversion:
+                        self.workspace.check_artifact_producers([str(authorized)], cache=producer_cache)
                     key = _input_key(source.parent, authorized)
                     with authorized.open('rb') as file:
                         digest = hashlib.file_digest(file, 'sha256').hexdigest()
@@ -703,9 +814,10 @@ class PublicationToolGateway:
                     changed = sorted(key for key in set(before) | set(after) if before.get(key) != after.get(key))
                     raise ValueError('Publication differs from the independently inspected candidate in '
                         + ', '.join(changed) + '; retain both without delivery')
-            self.workspace.check_artifact_producers((os.path.abspath(source.parent / key)
-                for key, digest in (consumed if consumed is not None else binding['inputs']).items()
-                if digest is not None), cache=producer_cache, refresh=True)
+            if not general_conversion:
+                self.workspace.check_artifact_producers((os.path.abspath(source.parent / key)
+                    for key, digest in (consumed if consumed is not None else binding['inputs']).items()
+                    if digest is not None), cache=producer_cache, refresh=True)
             if saved is None or self.report_source is not None or request.candidate_result:
                 current = self.input_binding(source, request, saved=binding,
                     image_paths=list(consumed) if consumed is not None else None)
@@ -752,6 +864,8 @@ class PublicationToolGateway:
                 if saved is not None:
                     if not retained or retained != hashes:
                         raise ValueError('Publication project files changed or are missing; saved rendering applies only to the original byte-bound version, not this project. Preserve both versions; no replay')
+                    if owner.read_json('result.json').get('consumer_contract') != binding.get('consumer_contract'):
+                        raise ValueError('Publication consumer contract changed; preserve the original')
                 else:
                     if request.checks is not None:
                         receipt = manifest.get('checks', {})
@@ -766,6 +880,7 @@ class PublicationToolGateway:
                 artifacts = _publication_artifacts(self.workspace, prefix, manifest, hashes)
                 if saved is None:
                     owner.write_json('result.json', {'artifact_sha256': hashes,
+                        **({'consumer_contract': binding['consumer_contract']} if 'consumer_contract' in binding else {}),
                         **({'report_identity': report_identity} if report_identity is not None else {})})
             elif 'public_artifacts' in manifest:
                 # A failed, never-bound export has no successful hash receipt
@@ -784,6 +899,7 @@ class PublicationToolGateway:
                 error='' if completed else str((manifest.get('error') if request.checks is not None else None)
                     or manifest.get('compile_note') or manifest.get('error') or 'Publication did not complete; inspect the retained manifest'),
                 data={"manifest": manifest, "project": prefix, "artifacts": artifacts,
+                    **({'consumer_contract': binding['consumer_contract']} if 'consumer_contract' in binding else {}),
                     **({'failure_kind': manifest['failure_kind'],
                         'next_action': 'Rendering resource allowance exhausted. Retain the manuscript and failed publication; explicit resource authorization is required before new rendering.'}
                        if manifest.get('failure_kind') == 'resource_exhausted' else {}),

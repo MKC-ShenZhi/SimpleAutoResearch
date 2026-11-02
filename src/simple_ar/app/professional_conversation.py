@@ -10,6 +10,7 @@ import json
 from typing import Any, Callable
 
 from simple_ar.integrations.llm import check_llm_call_stop, estimate_tokens
+from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES
 
 
 @dataclass
@@ -35,16 +36,25 @@ class ProfessionalConversation:
         checkpoints replay their historical admission-based contract.
         Projection of note versions is an owner responsibility, separate from
         this replay; citations do not verify note semantics.
+        Current checkpoints replace knowledge and bounded supporting references;
+        their attempted scope prevents repurchasing history, never claims coverage.
         """
         from simple_ar.app.work_memory import summary_coverage, summary_records
+        receipt_supply = view.get('native_supply_policy') in RECEIPT_SUPPLY_POLICIES
+        # Purchase scope is not citation coverage. Reconstruct it from the same
+        # immutable inputs, never from the candidate end or surviving notes.
+        attempted = ({'attempted_through_turn':max(previous.get('attempted_through_turn', 0),
+                         max(row['turn'] for row in view['observations'])+1),
+            'attempted_records':set(previous.get('attempted_records', ())) |
+                {row['record'] for row in view['observations']}} if receipt_supply else {})
         if not snapshot or not snapshot.get('notes'):
             return {**previous, **({'attempted_through_turn':failure['attempted_through_turn']}
-                                  if failure else {})}
+                                  if failure and not receipt_supply else {}), **attempted}
         compacted = summary_records(previous=previous, snapshot=snapshot,
             view=view, operations_for_turn=operations_for_turn)
         return {'notes':snapshot['notes'], 'compacted_records':compacted,
             'through_turn':summary_coverage(previous=previous, snapshot=snapshot,
-                view=view, operations_for_turn=operations_for_turn)}
+                view=view, operations_for_turn=operations_for_turn), **attempted}
 
     def tokens(self, value: ConversationInput) -> int:
         return (estimate_tokens(json.dumps(value.messages, ensure_ascii=False))

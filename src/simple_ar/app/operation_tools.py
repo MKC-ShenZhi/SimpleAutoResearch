@@ -5,7 +5,6 @@ lives here. Historical control is selected only by the loader of its saved task.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,9 +28,9 @@ CURRENT_PROFESSIONAL_CONTRACT = 'work.v5'
 
 def delivery_requires_review(request: DeliveryRequest, protocol: str) -> bool:
     """Saved delivery admission and capacity obligation; partial remains an exit."""
-    if protocol not in {'task.v1', 'task.v2', 'task.v3'}:
+    if protocol not in {'task.v1', 'task.v2', 'task.v3', 'task.v4'}:
         raise ValueError('Unknown delivery review protocol')
-    return not request.unresolved and (protocol == 'task.v3' or (
+    return not request.unresolved and (protocol in {'task.v3', 'task.v4'} or (
         request.report is not None and request.report.status == 'canonical'
         and bool(request.report.manuscript)))
 
@@ -51,7 +50,7 @@ def prepare_delivery_review(workspace: Any, request: DeliveryRequest, artifacts:
     requests = user_requests()
     if not isinstance(requests, list) or any(not isinstance(text, str) for text in requests):
         raise ValueError('Delivery review requires exact original request and feedback strings')
-    if protocol == 'task.v3':
+    if protocol in {'task.v3', 'task.v4'}:
         claim = request.model_dump(mode='json', exclude_none=True)
         claim['artifacts'] = artifacts
         if request.report is not None:
@@ -61,7 +60,9 @@ def prepare_delivery_review(workspace: Any, request: DeliveryRequest, artifacts:
                 claim['report']['formats'] = sorted(set(request.report.formats))
         if request.summary_source is not None:
             claim['summary_source']['path'] = str(workspace.resolve(request.summary_source.path))
-        return {'schema_version': 'delivery_review.v3', 'requests': list(requests),
+        return {'schema_version': 'delivery_review.v3',
+                **({'scope_policy': 'applicable.v1'} if protocol == 'task.v4' else {}),
+                'requests': list(requests),
                 'claim': claim,
                 'authorized_roots': {name: str(path) for name, path in workspace.mounts.items()},
                 'artifacts': workspace.artifact_hashes(artifacts)}
@@ -98,10 +99,17 @@ def _work_principles(owned_delivery: bool = False, automatic_memory: bool = Fals
     "remain evidence. ")
     + ("Work in complete useful units: investigate enough, implement and run when needed, interpret "
        "the result and deliver; do not repeatedly recheck an unchanged result without a concrete gap. "
-       if delivery_protocol == 'task.v3' else
+       if delivery_protocol in {'task.v3', 'task.v4'} else
        "Work in complete useful units: investigate enough, implement and run, interpret the "
        "result, then inspect and deliver; do not repeatedly recheck an unchanged result without a concrete gap. ")
     + ("Submit the actual completion claim and delivered artifacts when the requested work is ready. "
+       "The independent inspection owner checks the applicable requirements against the actual work, "
+       "using this same ledger. It selects and investigates necessary evidence rather than reading "
+       "every file by default. Preserve capacity for checks; address genuine required findings and "
+       "disclose unfinished work as unresolved. Local checks may inform the investigation but do not "
+       "automatically certify the complete task. "
+       if delivery_protocol == 'task.v4' else
+       "Submit the actual completion claim and delivered artifacts when the requested work is ready. "
        "The delivery owner automatically reviews that claim and the complete bound inventory against "
        "the original requests before acceptance, using this same ledger, including ordinary code, "
        "tables and text deliveries without a report claim. Leave shared model capacity for that review. "
@@ -124,7 +132,7 @@ def _work_principles(owned_delivery: bool = False, automatic_memory: bool = Fals
     + ("For a formal report claim, identify the editable manuscript and requested formats; existing "
        "report and publication rules still apply. Authorized scripts may produce PDF artifacts; "
        "a PDF suffix alone does not make an artifact a formal report. "
-       if delivery_protocol == 'task.v3' else
+       if delivery_protocol in {'task.v3', 'task.v4'} else
        "A canonical report claim identifies the inspected manuscript and requested formats in the delivery. ")
     + "Fix actual required findings; "
     "a process exit code or files existing is not a scientific or visual certificate. Use image inspection "
@@ -192,9 +200,9 @@ class OperationTools:
             protocol=config.get('inspection_protocol'),
             coverage_policy=config.get('inspection_coverage_policy'),
             finding_policy=config.get('inspection_finding_policy'),
+            native_supply_policy=config.get('native_supply_policy'),
             material_observations=material_observations,
             user_requests=user_requests,
-            feedback_provider=self.inspection_feedback if self.professional else None,
             prior_concerns=lambda targets: self.delivery_review.pending_concerns(targets)
                 if self.delivery_review is not None else [],
             prior_assessments=lambda:[row.model_dump() for row in
@@ -205,12 +213,23 @@ class OperationTools:
             coverage_policy=config.get('inspection_coverage_policy')),
             self.inspection)
         self.delivery_review = None
-        if config.get('delivery_review_protocol') in {'task.v1', 'task.v2', 'task.v3'}:
+        if config.get('delivery_review_protocol') in {'task.v1', 'task.v2', 'task.v3', 'task.v4'}:
             from simple_ar.tools.delivery_review import DeliveryReview
             self.delivery_review = DeliveryReview(workspace=self.workspace, inspector=self.inspection,
                 observations=observations,
                 protocol=config['delivery_review_protocol'],
                 track_findings=config.get('inspection_finding_policy') == 'linked.v1')
+        if self.professional:
+            # One owner supplies both revision guidance and delivery concerns.
+            # Older professional tasks without package review still receive
+            # their independent artifact opinions under the saved contract.
+            if self.delivery_review is None:
+                from simple_ar.tools.delivery_review import DeliveryReview
+                feedback_owner = DeliveryReview(workspace=self.workspace, inspector=self.inspection,
+                    observations=observations, include_package_feedback=False)
+            else:
+                feedback_owner = self.delivery_review
+            self.inspection.feedback_provider = feedback_owner.inspection_feedback
         self.registry.register_package(analysis_tool_specs(),
             AnalysisToolGateway(root,self.workspace,contract=config.get('table_analysis')),
             request_visible=config.get('table_analysis') is not None)
@@ -259,8 +278,7 @@ class OperationTools:
                     if exact and config.get('scientific_tools') else None,
                 research_inputs=self.sources.implementation_evidence,
                 measurement_inputs=(lambda origin,required:self.scientific.implementation_inputs(
-                    self._measurement_refs([row for row in self.observations()
-                        if row.get('contract_current',True)]),origin,required=required)) if exact else None,
+                    self.scientific.measurement_refs(self.observations()),origin,required=required)) if exact else None,
                 candidate_outputs=(lambda record:self.scientific.candidate_outputs(record) if self.scientific else {})
                     if exact else None)
             self.registry.register_package(implementation_tool_specs(exact=exact,preparation_only=not exact,
@@ -345,91 +363,6 @@ class OperationTools:
     def method_context(self) -> dict | None:
         return self.methods.context() if self.methods is not None else None
 
-    def inspection_feedback(self, targets: list[str]) -> list[dict]:
-        """Project original owner-verified opinions through the shared work-input port.
-
-        Changed subjects keep guidance with explicit old/current versions, never
-        acceptance. Source bodies remain in the original read observations.
-        """
-        roots = [self.workspace.resolve(path) for path in targets]
-        selected = {path: self.workspace.artifact_hashes([str(path)])[str(path)]
-            for path in roots if path.is_file()}
-        result, concluded, repeated = [], set(), {}
-        for observed in reversed(self.observations()):
-            envelope = (observed.get('metadata') or {}).get('delivery_review')
-            if isinstance(envelope, dict) and self.delivery_review is not None:
-                feedback = self.delivery_review.feedback_observation(envelope)
-            elif observed.get('tool_name') == 'inspect_artifacts':
-                feedback = self.inspection.feedback_from_observation(observed)
-                if feedback is None:
-                    continue
-            else:
-                continue
-            subjects = []
-            targets_reviewed = feedback.pop('reviewed_subjects')
-            inventory = feedback.pop('reviewed_inventory', {})
-            package = (feedback.get('delivery_context') or {}).get('schema_version') == 'delivery_review.v3'
-            metadata = feedback['result'].get('metadata') or {}
-            assessments = metadata.get('assessments', [metadata.get('assessment')])
-            signatures, duplicate_records = [], []
-            for locator, digest in {**inventory, **targets_reviewed}.items():
-                try:
-                    subject = self.workspace.resolve(locator)
-                except ValueError:
-                    continue  # Old locators do not grant new access.
-                copy = next((path for path, value in selected.items() if value == digest), None)
-                required = any(finding.get('severity') == 'required' and locator in (finding.get('subjects') or {})
-                    for assessment in assessments if isinstance(assessment, dict)
-                    for finding in assessment.get('findings', []) if isinstance(finding, dict))
-                # Keep prior required opinions even after a narrower check, but
-                # do not repeat the identical bound opinion and scope. All
-                # original receipts remain available in the journal.
-                # A versioned envelope without a new scope or reassessment is
-                # the same opinion; its schema tag alone is not new evidence.
-                normalized = [{key:value for key,value in row.items() if key not in
-                    {'schema_version', 'scope', 'reassessed_prior', 'review_id'}}
-                    if isinstance(row, dict) and row.get('schema_version') in
-                        {'artifact_assessment.v1', 'artifact_assessment.v2'}
-                        and row.get('scope') is None and not row.get('reassessed_prior') else row
-                    for row in assessments]
-                signature = json.dumps([locator, digest, feedback.get('arguments'), normalized],
-                    sort_keys=True, ensure_ascii=False) if required else None
-                if signature in repeated:
-                    duplicate_records.append(signature)
-                    continue
-                if (not package and (subject, digest) in concluded and not required or not (copy is not None or any(subject == root
-                        or root.is_dir() and subject.is_relative_to(root) for root in roots))):
-                    continue
-                if signature is not None:
-                    signatures.append(signature)
-                current_path = copy or subject
-                current = (self.workspace.artifact_hashes([str(current_path)])[str(current_path)]
-                    if current_path.is_file() else None)
-                subjects.append({'path': locator, 'reviewed_sha256': digest,
-                    'selected_path': str(current_path), 'current_sha256': current,
-                    'current_matches_review': current == digest,
-                    'review_role': 'inspection_target' if locator in targets_reviewed else 'delivery_inventory_member'})
-                conclusive = lambda row: row and row['coverage'] == 'complete' and row['verdict'] != 'incomplete'
-                if (any(conclusive(row) and locator in row['subjects'] for row in assessments)
-                        or inventory and assessments and all(conclusive(row) for row in assessments)):
-                    concluded.add((subject, digest))
-            # A local file opinion cannot retire a whole-claim opinion. Direct
-            # answers and claim-level defects have no file scope at all, yet
-            # remain relevant guidance for the next whole-work judgment.
-            claim_findings = (feedback['result'].get('metadata') or {}).get('delivery_opinion', {}).get('findings', [])
-            record = 'records/' + observed['record'].removeprefix('attempts/')
-            for signature in duplicate_records:
-                references = repeated[signature].setdefault('related_opinion_records', [])
-                if record not in references:
-                    references.append(record)
-            if subjects or package and (not inventory or not roots or any(not row['artifacts'] for row in claim_findings)):
-                view = self.inspection.feedback_view({**feedback, 'kind': 'inspection_feedback',
-                    'subjects': subjects, 'record': record})
-                result.append(view)
-                for signature in signatures:
-                    repeated[signature] = view
-        return result
-
     def presentation(self, selected: set[str], mode: str):
         active, catalog = set(), {}
         for spec in self.registry.list_specs():
@@ -450,49 +383,61 @@ class OperationTools:
 
     def bind_notes(self, notes: list[dict]) -> list[dict]:
         """Bind model notes to real observations without granting truth or authority."""
+        from simple_ar.app.work_memory import observation_currentness
+        from simple_ar.core.working_context import TURN_SUPPLY_POLICY
         observations = {row['record'].removeprefix('attempts/'):row for row in self.observations()}
+        strict = self.config.get('native_supply_policy') == TURN_SUPPLY_POLICY
         result = []
         for note in notes:
             bindings, records = {}, []
+            unknown = strict and not note['records']
+
+            def bind(path, digest):
+                nonlocal unknown
+                if strict and path in bindings and bindings[path] != digest:
+                    unknown = True
+                else:
+                    bindings[path] = digest
+
             for locator in note['records']:
                 key = locator.removeprefix('records/').removeprefix('attempts/')
                 row = observations.get(key)
                 if row is None:
                     raise ValueError('Working notes require existing observation records: '+locator)
+                if strict and observation_currentness(row, absolute=True) == 'unknown':
+                    unknown = True
                 records.append('records/'+key)
                 data = row.get('data') or {}
                 if isinstance(data.get('absolute_path'), str) and isinstance(data.get('sha256'), str):
-                    bindings[data['absolute_path']] = data['sha256']
+                    bind(data['absolute_path'], data['sha256'])
                 if self.professional:
                     for window in (row.get('metadata') or {}).get('material_observations', []):
                         observed = window['data']
                         if isinstance(observed.get('absolute_path'), str) and isinstance(observed.get('sha256'), str):
-                            bindings[observed['absolute_path']] = observed['sha256']
+                            bind(observed['absolute_path'], observed['sha256'])
                     # Producer-owned output hashes bind understanding of the
                     # delivered candidate as well as its observed source bytes.
                     for path, digest in data.get('artifact_sha256', {}).items():
-                        bindings[str(self.workspace.resolve(path))] = digest
+                        bind(str(self.workspace.resolve(path)), digest)
             result.append({'text':note['text'],'records':list(dict.fromkeys(records)),
-                'observed_versions':bindings,'scope':'model_note_not_verified_evidence'})
+                'observed_versions':bindings,'scope':'model_note_not_verified_evidence',
+                **({'source_integrity':'unknown'} if unknown else {})})
         return result
 
     def project_notes(self, notes: list[dict]) -> list[dict]:
+        from simple_ar.app.work_memory import note_currentness
         result = []
         for note in notes:
             bindings = note.get('observed_versions', {})
-            try:
-                current = not bindings or self.workspace.artifact_hashes(bindings) == bindings
-            except (ValueError,OSError):
-                current = False
+            current = note_currentness(note,
+                versions_match=lambda versions: self.workspace.artifact_hashes(versions) == versions)
             result.append({**note,'current':current,
-                'version_scope':'Bound observations unchanged' if bindings and current else
-                    'Unversioned working judgment' if current else 'Referenced files changed; reassess before reuse'})
+                'version_scope':'Referenced file bytes unchanged; derived claims still need checking' if bindings and current else
+                    'Unversioned working judgment' if current else
+                    'Source support is incomplete or indirect; reassess before reuse'
+                        if current is None else
+                    'Referenced files changed; reassess before reuse'})
         return result
-
-    @staticmethod
-    def _measurement_refs(observations: list[dict]) -> list[str]:
-        return [row['data']['result_ref'] for row in observations
-                if row.get('tool_name')=='measure_experiment' and row.get('status')=='ok']
 
     def delivery_issues(self, observations: list[dict], delivery: dict, *, proposed=None):
         request = DeliveryRequest.model_validate(delivery)
@@ -522,12 +467,19 @@ class OperationTools:
         """Judge actual production using this call's authorized resolved inventory."""
         from simple_ar.report.delivery import operation_report_content, operation_report_publication
 
-        owned = [row for row in observations if row.get('contract_current',True)]
-        issues = self.gateway.delivery_issues(owned,proposed=proposed,delivery=delivery)
-        try:
-            self.workspace.check_artifact_producers(resolved['artifacts'])
-        except (ValueError, OSError, KeyError, RuntimeError) as exc:
-            issues.append(str(exc))
+        issues = self.gateway.delivery_issues(observations, proposed=proposed,
+            delivery={**delivery, 'artifacts': resolved['artifacts']})
+        # task.v4 binds current files and delegates explicit computation adoption
+        # to domain owners and applicability to DeliveryReview. Old process path
+        # ownership cannot re-certify an ordinary edited delivery. Saved contracts
+        # retain both their producer gate and its publication-input exception.
+        if self.config.get('delivery_review_protocol') != 'task.v4':
+            try:
+                conversion_inputs = self.publication.conversion_inputs(observations, resolved['artifacts'])
+                self.workspace.check_artifact_producers(path for path in resolved['artifacts']
+                    if self.workspace.resolve(path) not in conversion_inputs)
+            except (ValueError, OSError, KeyError, RuntimeError) as exc:
+                issues.append(str(exc))
         from simple_ar.tools.workspace import missing_delivery_files
         missing = missing_delivery_files(self.workspace,resolved['artifacts'],self.config.get('delivery_files') or [])
         if missing:
@@ -539,7 +491,7 @@ class OperationTools:
             return [str(exc)]
         issues.extend(report_issues)
         scoped_review = self.requires_delivery_review(request)
-        package_review = scoped_review and self.delivery_review.protocol == 'task.v3'
+        package_review = scoped_review and self.delivery_review.protocol in {'task.v3', 'task.v4'}
         # Admission need not already have the review it is about to perform.
         # The whole-work owner reconsiders retained local opinions against this
         # exact claim and inventory; a second local gate would force duplicate
@@ -555,27 +507,6 @@ class OperationTools:
                 issues.extend(self.delivery_review.issues(observations, binding))
             except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
                 issues.append('Delivery review cannot be verified: ' + str(exc))
-        implementation = None
-        if self.config.get('code_task') is not None:
-            implementation = next((row for row in reversed(owned)
-                if row.get('tool_name')=='implement_code_task'),None)
-            if implementation is None or implementation.get('status')!='ok':
-                issues.append('Frozen code contract needs a validated implementation or an explicit partial delivery')
-            else:
-                try:
-                    self.implementation.check_delivery(implementation['data'],resolved['artifacts'])
-                except (ValueError,OSError,KeyError,RuntimeError) as exc:
-                    issues.append(str(exc))
-        if self.scientific is not None and self.scientific.execution_contract is not None:
-            measurements=self._measurement_refs(owned)
-            analyses=[row['record'] for row in owned
-                if row.get('tool_name')=='analyze_measurements' and row.get('status')=='ok']
-            if implementation is not None and implementation.get('status')=='ok':
-                refs = [implementation['artifacts'][0]]
-                evidence = self.scientific.report_evidence(measurements,refs,analysis_records=analyses)
-                issues.extend(self.scientific.delivery_requirement({**evidence,'implementation_refs':refs}))
-            elif self.config.get('code_task') is None:
-                issues.extend(self.scientific.evidence_requirement(measurements,analyses))
         issues.extend(operation_report_publication(request, resolved['artifacts'], observations,
             publication=self.publication, proposed=proposed))
         return issues

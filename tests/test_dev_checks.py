@@ -22,6 +22,9 @@ class DevChecksTests(unittest.TestCase):
             self.assertTrue(group.targets)
         self.assertIn('tests.test_architecture_boundaries', CHECK_GROUPS['quick'].targets)
         self.assertIn('tests.test_tool_agent_handoff', CHECK_GROUPS['application'].targets)
+        for target in ('tests.test_professional_work_loop', 'tests.test_delivery_review',
+                       'tests.test_working_context'):
+            self.assertIn(target, CHECK_GROUPS['application'].targets)
 
     def test_named_check_targets_exist(self) -> None:
         tests_dir = Path(__file__).parent

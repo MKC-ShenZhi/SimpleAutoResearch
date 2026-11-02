@@ -14,6 +14,26 @@ from typing import Any
 from simple_ar.core.capabilities import ArtifactRef, ArtifactStore
 
 
+def native_result_digest(observed: dict) -> str:
+    """Digest the original structured observation, independent of JSON formatting."""
+    return hashlib.sha256(json.dumps(observed, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+
+
+def accepted_review_journal(workspace: Any, store: Any, item: dict, receipt: dict) -> dict:
+    """Resolve the separate accepted review without adopting its opinion.
+
+    This explicitly proves registration and parent scope; journal reads alone
+    do neither. Accounting checks remain with the consumers that require them.
+    """
+    session_id = store.read_json('session_manifest.json')['session_id']
+    parent = Path(item['result']).parent.name
+    accepted_native_result(store.root, session_id, receipt, parent)
+    path, review, digest = accepted_scoped_opinion(
+        store.root, workspace, session_id, item['review_result'], parent)
+    return {'record': 'attempts/' + path.relative_to((store.root / 'attempts').resolve()).as_posix(),
+            'receipt': review, 'sha256': digest}
+
+
 def native_result_path(root: Path, workspace: Any, locator: str) -> Path:
     """Resolve the journal or mounted spelling of one same-task native result.
 
@@ -51,8 +71,27 @@ def registered_native_output(root: Path, session_id: str, record: Path, *,
             raise ValueError('Native action lacks its registered action binding')
         action = store.read_json(bindings[0])
         if (not isinstance(action, dict) or action.get('attempt') != attempt.attempt_id
-                or action.get('kind') not in ('tool', 'opinion')):
+                or action.get('kind') not in ('tool', 'opinion', 'receipt')):
             raise ValueError('Native action binding is not an accepted tool or opinion')
+        current = action
+        seen = set()
+        while current.get('recovered_from') is not None:
+            previous_id = current['recovered_from']
+            if (not isinstance(previous_id, str) or previous_id in seen
+                    or current.get('attempt') != previous_id + '-receipt'):
+                raise ValueError('Native action recovery chain is invalid')
+            seen.add(previous_id)
+            previous = ArtifactStore(Path(root) / 'attempts' / previous_id).read_json('action.json')
+            expected = {key: value for key, value in previous.items()
+                        if key not in {'result', 'execution_approval'}}
+            expected.update(attempt=previous_id + '-receipt',
+                kind='opinion' if previous.get('kind') == 'opinion' else 'receipt',
+                recovered_from=previous_id)
+            if current != expected:
+                raise ValueError('Native action recovery differs from its original binding')
+            current = previous
+        if current.get('kind') not in ('tool', 'opinion'):
+            raise ValueError('Native action recovery has no original tool or opinion')
         if action['kind'] == 'opinion':
             result = store.read_json('native_result.json')
             digest = hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
@@ -71,8 +110,13 @@ def registered_native_output(root: Path, session_id: str, record: Path, *,
 
 
 def accepted_native_result(root: Path, session_id: str, observed: dict,
-                           attempt_id: str, *, ledger: Any = None) -> tuple[ArtifactStore, str]:
-    """Prove registration and hash the very bytes compared with the observation."""
+                           attempt_id: str, *, ledger: Any = None,
+                           require_content_binding: bool = False) -> tuple[ArtifactStore, str]:
+    """Check registration and any producer-time content binding.
+
+    Historical registration remains usable for its original contracts; callers
+    claiming a file's provenance must require a producer-time binding.
+    """
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', attempt_id):
         raise ValueError('Invalid accepted attempt identity')
     store = ArtifactStore(Path(root) / 'attempts' / attempt_id)
@@ -81,6 +125,15 @@ def accepted_native_result(root: Path, session_id: str, observed: dict,
     raw = store.resolve(ref).read_bytes()
     if json.loads(raw.decode('utf-8')) != observed:
         raise ValueError('Professional outcome requires the exact accepted native observation')
+    binding = store.read_capability_result().provenance.get('native_result_sha256')
+    if binding is None and store.read_attempt_manifest().capability == 'native_action':
+        action = store.read_json('action.json')
+        if action.get('kind') == 'opinion':
+            binding = action.get('result_sha256')
+    if binding is None and require_content_binding:
+        raise ValueError('Accepted native observation has no original content binding')
+    if binding is not None and binding != native_result_digest(observed):
+        raise ValueError('Accepted native observation changed since production')
     if ledger is not None:
         from simple_ar.core.budget import completed_llm_usage_is_accounted
         if not completed_llm_usage_is_accounted(row.to_dict() for row in ledger.entries
@@ -103,75 +156,6 @@ def accepted_scoped_opinion(root: Path, workspace: Any, session_id: str, locator
             or not isinstance(action.get('origin'), dict) or action['origin'].get('scope') != scope):
         raise ValueError('Opinion is not the accepted action for this scope')
     return path, result, digest
-
-
-def journal_input_dependencies(root: Path, workspace: Any, locator: str, *,
-                               cache: dict | None = None,
-                               producer_index_cache: dict | None = None) -> dict[str, str]:
-    """Check declared input versions in existing same-task operation receipts.
-
-    The index is temporary and contains no new facts or task state. Results
-    lacking an input binding stay unknown; a file read never certifies them.
-    Process outputs remain the workspace owner's responsibility.
-    """
-    store = ArtifactStore(root)
-    cache = {} if cache is None else cache
-    index = cache.get('journal_input_owners')
-    if index is None:
-        index = {}
-        for turn in store.read_json('actions.json').get('turns', []):
-            for item in turn.get('tools', []):
-                try:
-                    result = store.read_json(item['result'])
-                    inputs = (result.get('data') or {}).get('input_sha256')
-                    if result.get('status') != 'ok' or not isinstance(inputs, dict):
-                        continue
-                    for artifact in result.get('artifacts', []):
-                        try:
-                            index[str(workspace.resolve(artifact))] = item['result']
-                        except (ValueError, OSError):
-                            continue  # Unrelated inaccessible artifacts do not displace current ones.
-                except (ValueError, TypeError, KeyError, OSError, RuntimeError):
-                    continue
-        cache['journal_input_owners'] = index
-
-    session_id = store.read_json('session_manifest.json')['session_id']
-    dependencies, active, completed = {}, set(), set()
-
-    def visit(name: str) -> None:
-        path = str(workspace.resolve(name))
-        if path in active:
-            raise ValueError('Recorded material dependencies form a cycle')
-        if path in completed:
-            return
-        record = index.get(path)
-        if record is None:
-            return  # No recorded producer is not a proof of no dependencies.
-        result = store.read_json(record)
-        accepted_native_result(root, session_id, result, Path(record).parent.name)
-        inputs = (result.get('data') or {}).get('input_sha256')
-        if result.get('status') != 'ok' or not isinstance(inputs, dict):
-            raise ValueError('Recorded material producer no longer has its input binding')
-        if workspace.artifact_hashes(inputs) != inputs:
-            raise ValueError('Recorded material producer input version changed')
-        active.add(path)
-        try:
-            workspace.check_artifact_producers(inputs, cache=cache, **(
-                {'producer_index_cache': producer_index_cache} if producer_index_cache is not None else {}))
-            for name, digest in inputs.items():
-                if not isinstance(digest, str) or len(digest) != 64:
-                    raise ValueError('Recorded material producer has an invalid input version')
-                canonical = str(workspace.resolve(name))
-                if canonical in dependencies and dependencies[canonical] != digest:
-                    raise ValueError('Recorded material producers have conflicting input versions')
-                dependencies[canonical] = digest
-                visit(name)
-        finally:
-            active.remove(path)
-        completed.add(path)
-
-    visit(locator)
-    return dependencies
 
 
 def stop_decision(owner: Any, observed: dict, attempt_id: str, reason: str, detail: str) -> dict:

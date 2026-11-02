@@ -57,8 +57,9 @@ class VisualToolGateway:
             client = self.client_factory(identity) if self.client_factory else LLMClient.from_env(purpose="vision", budget_ledger=self.ledger,
                 budget_session_id=self.session_id, budget_attempt_id=identity)
             directory = self.workspace.resolve(f"workspace/visual-reviews/{identity}", write=True)
+            versions: dict[str, str] = {}
             report = run_visual_review(client=client, image_paths=paths,
-                goal=request.goal, output_dir=directory)
+                goal=request.goal, output_dir=directory, output_versions=versions)
             # Bind findings to the bytes actually sent, not the later file at
             # the same path. Old accepted receipts keep their historical shape.
             snapshots = ArtifactStore(directory).read_json('request.json')['images']
@@ -68,9 +69,12 @@ class VisualToolGateway:
                 raise ValueError('Visual inputs changed during inspection; retain the unbound review')
             prefix = f"workspace/visual-reviews/{identity}"
             return ToolResult(tool_name=name, data={"review": report, "input_sha256": input_hashes,
+                **({'artifact_sha256': {f'{prefix}/{name}': digest for name, digest in versions.items()}}
+                   if versions else {}),
                 "feedback": f"{prefix}/feedback.md",
                 "scientific_validity": "not_assessed"},
-                artifacts=[f"{prefix}/review.json", f"{prefix}/feedback.md"])
+                artifacts=[f"{prefix}/review.json", f"{prefix}/feedback.md"],
+                metadata={'output_binding': 'owner.v1'} if versions else {})
         except Exception as exc:
             # SDK/provider messages may contain private request material.
             return ToolResult(tool_name=name, status="error",
