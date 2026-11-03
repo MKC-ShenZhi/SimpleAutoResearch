@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from simple_ar.core.capabilities import ArtifactStore
-from simple_ar.tools.specs import ToolResult
+from simple_ar.tools.specs import ToolResult, tool_result_payload
 from simple_ar.tools.workspace import DeliveryRequest
 
 
@@ -438,8 +438,7 @@ def delivery_issues(owner: Any, observations: list[dict], *, delivery: dict | No
             try:
                 locator = prepared['data']['prepared_result']
                 preparation = owner.workspace.resolve(locator).parent.parent
-                _accepted(owner, {key: value for key, value in prepared.items()
-                    if key not in {'arguments', 'record', 'current_request'}}, preparation.name)
+                _accepted(owner, tool_result_payload(prepared), preparation.name)
                 candidate, payload, source = candidate_source(owner, locator)
                 hashes = {str(candidate / row['path']): row['sha256'] for row in payload['data']['files']}
                 if owner.workspace.artifact_hashes(hashes) != hashes:

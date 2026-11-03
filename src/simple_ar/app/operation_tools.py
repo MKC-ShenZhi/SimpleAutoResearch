@@ -402,7 +402,7 @@ class OperationTools:
                 continue
             # Saved preparation contracts keep their original presentation.
             # Ordinary source work is owned by these common workspace tools.
-            if executable:
+            if executable and mode == 'on_demand':
                 deferred = spec.name not in {'write_file', 'run_process', 'deliver_result', 'ask_user',
                     'export_report', 'load_tools', 'read_history'}
             elif mode == 'outcomes':

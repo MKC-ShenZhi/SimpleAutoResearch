@@ -11,6 +11,16 @@ NATIVE_WORK_METHODS = frozenset({'goal.v1', 'execute.v1'})
 CURRENT_WORK_METHOD = 'execute.v1'
 
 
+def tool_result_payload(observation: dict) -> dict:
+    """Separate common observation context from the unchanged physical payload.
+
+    This projection verifies no receipt. Consumers must still compare the result
+    with its original owner record, including unknown fields and all metadata.
+    """
+    context = {'record', 'arguments', 'current_request', 'request_count', 'contract_current', 'review_record'}
+    return {key: value for key, value in observation.items() if key not in context}
+
+
 class PermissionLevel(str, Enum):
     """Common permission categories for local tools and external backends."""
 

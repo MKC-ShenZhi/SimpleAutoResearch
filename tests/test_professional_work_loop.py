@@ -794,8 +794,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
             allow_execution=True, max_turns=12, max_tokens=200000, max_attempts=30)
         self.assertEqual(self.app.state['config']['tool_contracts'], 'on_demand')
         core = {row['function']['name'] for row in self.app.schemas}
-        self.assertTrue({'read_file','search_files','write_file','edit_file','run_process',
-            'deliver_result','load_tools','read_history','update_work_plan','export_report'} <= core)
+        self.assertEqual({'write_file','run_process','ask_user',
+            'deliver_result','load_tools','read_history','export_report'}, core)
         self.assertFalse({'select_work_method','prepare_implementation','execute_implementation','work_document',
             'begin_professional_work','finish_professional_work'} & core)
         optional = {'inspect_table','analyze_table','measure_experiment','analyze_measurements',
@@ -2441,7 +2441,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     self.root = self.directory/('optional-memory-'+mode)
                     self.app = ToolApplication.create(self.root, 'Explain the actual supplied observations',
                         model='profile:offline', sources={'measurements':self.inputs},
-                        max_turns=70, max_tokens=900000, max_attempts=180)
+                        max_turns=70, max_tokens=900000, max_attempts=180, tool_contracts='full')
                     self.decisions.clear()
                     for index in range(12):
                         name = f'unknown-memory-{index}.txt'

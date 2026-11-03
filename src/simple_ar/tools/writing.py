@@ -13,7 +13,7 @@ from typing import Any, Callable, Iterable, Literal
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
 from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
-from simple_ar.tools.specs import CommonToolSpec, ToolResult
+from simple_ar.tools.specs import CommonToolSpec, ToolResult, tool_result_payload
 from simple_ar.tools.workspace import DeliveryRequest, FileWindow
 from simple_ar.tools.sources import SourceToolGateway
 from simple_ar.tools.materials import material_inventories, inspect_materials, selected_material_windows, window_key
@@ -400,8 +400,7 @@ def accepted_composition_receipt(*, root: Path, workspace: Any, session_id: str,
     Review disposition and delivery suitability remain consuming policies.
     """
     from simple_ar.tools.professional_outcomes import native_result_path
-    raw = {key: value for key, value in observed.items()
-        if key not in {'arguments', 'record', 'current_request'}}
+    raw = tool_result_payload(observed)
     if raw.get('tool_name') != 'compose_document':
         raise ValueError('Expected an accepted composition observation')
     if 'record' in observed:

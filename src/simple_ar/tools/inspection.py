@@ -16,7 +16,7 @@ from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.budget import completed_llm_usage_is_accounted
 from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES, TURN_SUPPLY_POLICY
 from simple_ar.integrations.llm import LLMCallStopped, LLMSettings, estimate_tokens
-from simple_ar.tools.specs import CommonToolSpec, ToolResult, NATIVE_WORK_METHODS
+from simple_ar.tools.specs import CommonToolSpec, ToolResult, NATIVE_WORK_METHODS, tool_result_payload
 from simple_ar.tools.workspace import FileWindow, workspace_tool_specs
 from simple_ar.tools.delivery_review import applicable_delivery_scope, reassessment_has_subject_support
 
@@ -1336,9 +1336,7 @@ class InspectionToolGateway:
         arguments = observed.get('arguments')
         if not isinstance(arguments, dict):
             raise ValueError('Inspection feedback has no accepted arguments')
-        claimed = {key: value for key, value in observed.items() if key not in
-            {'record', 'arguments', 'current_request', 'contract_current', 'review_record'}}
-        return self.feedback_observation(identity, claimed, expected_arguments=arguments)
+        return self.feedback_observation(identity, tool_result_payload(observed), expected_arguments=arguments)
 
     def can_reconcile(self, name: str, identity: str) -> bool:
         if name != 'inspect_artifacts' or not self.has_started(identity):

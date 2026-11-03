@@ -925,8 +925,8 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     entered.set()
                     if not release.wait(10):
                         raise AssertionError('Test did not release model boundary')
-                    tool, arguments = 'update_work_plan', {'steps': [
-                        {'step': 'Inspect the authorized evidence for the requested outcome', 'status': 'in_progress'}]}
+                    tool, arguments = 'write_file', {'path': 'retained-note.md',
+                        'content': 'Inspect the authorized evidence for the requested outcome.\n'}
                 else:
                     tool, arguments = 'ask_user', {'question': 'Inspect this retained result'}
                 self.assertIn(tool, {row['function']['name'] for row in kwargs['tools']},
@@ -1188,9 +1188,8 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     self.assertEqual(request('/api/action', dict(op='resume', task=name))[0], 200)
                     workspace.workers[name][0].join(10)
                     self.assertFalse(workspace.workers[name][0].is_alive())
-                    adopted = ToolApplication.load(root)._work_plan()
-                    self.assertEqual(adopted['steps'], [
-                        {'step': 'Inspect the authorized evidence for the requested outcome', 'status': 'in_progress'}])
+                    self.assertEqual((root / 'workspace/retained-note.md').read_text(),
+                        'Inspect the authorized evidence for the requested outcome.\n')
                     self.assertEqual(len(json.loads((root / 'actions.json').read_text())['requests']), 1)
                     self.assertEqual(request('/api/task?task=' + name)[1]['manifest']['session_id'], name)
                 finally:
