@@ -1333,15 +1333,8 @@ class ToolApplication:
                     accepted_native_result(self.session.store.root, self.session.manifest.session_id,
                         result, attempt.root.name, require_content_binding=True)
                 if name == 'inspect_images':
-                    owner = self.workspace.resolve(f'workspace/visual-reviews/{Path(item["result"]).parent.name}')
-                    saved_request = ArtifactStore(owner).read_json('request.json')
-                    snapshots = saved_request['images']
-                    if (snapshots != [f'source-{i}{Path(locator).suffix.lower()}'
-                            for i, locator in enumerate(arguments['images'])] or set(inputs) != set(arguments['images'])
-                            or ArtifactStore(owner).read_json('review.json') != data.get('review')
-                            or any(hashlib.sha256(self.workspace.resolve(str(owner / snapshot)).read_bytes()).hexdigest() != inputs[locator]
-                                for snapshot, locator in zip(snapshots, arguments['images']))):
-                        raise ValueError('Retained visual feedback or its reviewed inputs changed')
+                    VisualToolGateway.validate_feedback(self.workspace,
+                        Path(item['result']).parent.name, arguments, data)
                 else:
                     owner = ArtifactStore(self.session.store.root / 'tools/writing' / Path(item['result']).parent.name)
                     if (owner.read_json('result.json').get('data') != data

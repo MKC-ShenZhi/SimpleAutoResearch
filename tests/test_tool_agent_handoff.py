@@ -11340,6 +11340,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_related_feedback_uses_original_checks_and_marks_changed_subjects(self) -> None:
         from PIL import Image
+        from simple_ar.core.capabilities import ArtifactStore
         inputs, fake, app, visual = self._visual_fixture(historical=True)
         fake.connection_binding.return_value = {'profile': 'fixture-vision'}
         fake.effective_output_limit.return_value = 16000
@@ -11384,6 +11385,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             app.session.store.write_json(record, historical)
             self.assertEqual(app._work_context([str(image)])['review_observations'], [])
             app.session.store.write_json(record, result.model_dump(mode='json'))
+            owner = ArtifactStore(app.workspace.workspace / 'visual-reviews' / identity)
+            request = owner.read_json('request.json')
+            owner.write_json('request.json', {**request, 'goal': 'A different inspection'})
+            with self.assertRaisesRegex(ValueError, 'reviewed inputs changed'):
+                app._work_context([str(image)])
+            owner.write_json('request.json', request)
             snapshot = app.workspace.workspace / 'visual-reviews' / identity / f'source-0{image.suffix}'
             snapshot.write_bytes(b'changed review input')
             with self.assertRaisesRegex(ValueError, 'reviewed inputs changed'):

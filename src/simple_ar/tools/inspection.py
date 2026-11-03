@@ -427,11 +427,11 @@ class InspectionToolGateway:
             invocations.append(reference)
         return reference
 
-    def _receipt_result(self, receipt: dict) -> dict:
-        if (self._digest(receipt['record']) != receipt['record_sha256']
-                or self._digest(f"attempts/{receipt['attempt']}/action.json") != receipt['action_sha256']):
-            raise ValueError('Inspection common owner receipt changed; no replay')
-        result = self.store.read_json(receipt['record'])
+    def _receipt_result(self, receipt: dict, *, validation_records: dict | None = None) -> dict:
+        error = 'Inspection common owner receipt changed; no replay'
+        result = self._bound_json(receipt['record'], receipt['record_sha256'], validation_records, error)
+        self._bound_json(f"attempts/{receipt['attempt']}/action.json",
+            receipt['action_sha256'], validation_records, error)
         if not isinstance(result, dict):
             raise ValueError('Inspection common owner receipt has no result object')
         return result
@@ -709,7 +709,7 @@ class InspectionToolGateway:
             closed.extend(row['receipt'] for row in trace.get('results', []) if 'receipt' in row)
             if include_delivery:
                 for receipt in closed:
-                    self._receipt_result(receipt)
+                    self._receipt_result(receipt, validation_records=validation_records)
             for index, row in enumerate(trace.get('results', [])):
                 rows.append(row)
                 if include_delivery:

@@ -33,6 +33,29 @@ def visual_tool_specs() -> list[CommonToolSpec]:
 
 
 class VisualToolGateway:
+    @staticmethod
+    def validate_feedback(workspace: Any, identity: str, arguments: dict, data: dict) -> None:
+        """Bind feedback to the owner's saved request and consumed image bytes.
+
+        Production and retained consumers share this rule. Current source images
+        may change later; their comparison with the reviewed version belongs to
+        the consumer, rather than invalidating the original observation.
+        """
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,100}", identity):
+            raise ValueError('Invalid visual invocation')
+        owner = workspace.resolve(f'workspace/visual-reviews/{identity}')
+        store = ArtifactStore(owner)
+        request = store.read_json('request.json')
+        images, inputs = arguments['images'], data['input_sha256']
+        snapshots = request['images']
+        if (request['goal'] != arguments['goal']
+                or snapshots != [f'source-{i}{Path(path).suffix.lower()}' for i, path in enumerate(images)]
+                or set(inputs) != set(images)
+                or store.read_json('review.json') != data.get('review')
+                or any(hashlib.sha256(workspace.resolve(str(owner / snapshot)).read_bytes()).hexdigest() != inputs[path]
+                    for snapshot, path in zip(snapshots, images))):
+            raise ValueError('Retained visual feedback or its reviewed inputs changed')
+
     def can_reconcile(self, name: str, identity: str) -> bool:
         directory = self.workspace.workspace / 'visual-reviews' / identity
         return name == 'inspect_images' and any(
@@ -62,11 +85,8 @@ class VisualToolGateway:
                 goal=request.goal, output_dir=directory, output_versions=versions)
             # Bind findings to the bytes actually sent, not the later file at
             # the same path. Old accepted receipts keep their historical shape.
-            snapshots = ArtifactStore(directory).read_json('request.json')['images']
-            if (snapshots != [f'source-{i}{path.suffix.lower()}' for i, path in enumerate(paths)]
-                    or any(hashlib.sha256(self.workspace.resolve(str(directory / snapshot)).read_bytes()).hexdigest() != input_hashes[locator]
-                        for snapshot, locator in zip(snapshots, request.images))):
-                raise ValueError('Visual inputs changed during inspection; retain the unbound review')
+            self.validate_feedback(self.workspace, identity, arguments,
+                {'input_sha256': input_hashes, 'review': report})
             prefix = f"workspace/visual-reviews/{identity}"
             return ToolResult(tool_name=name, data={"review": report, "input_sha256": input_hashes,
                 **({'artifact_sha256': {f'{prefix}/{name}': digest for name, digest in versions.items()}}

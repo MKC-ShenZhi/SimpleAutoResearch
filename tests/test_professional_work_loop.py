@@ -5741,6 +5741,19 @@ class OperationsWorkLoopTests(unittest.TestCase):
         finally:
             owner.store.resolve(record_path).write_bytes(record_bytes)
         owner._verify_bound_json(bound_records)
+        trace = owner.store.read_json(record_path)
+        receipt = trace['model_receipt']
+        for path in (receipt['record'], f"attempts/{receipt['attempt']}/action.json"):
+            original_bytes = owner.store.resolve(path).read_bytes()
+            bound_records = {}
+            owner._receipt_result(receipt, validation_records=bound_records)
+            owner.store.resolve(path).write_bytes(original_bytes + b' ')
+            try:
+                with self.assertRaisesRegex(ValueError, 'common owner receipt changed'):
+                    owner._verify_bound_json(bound_records)
+            finally:
+                owner.store.resolve(path).write_bytes(original_bytes)
+            owner._verify_bound_json(bound_records)
         checkpoints = [owner.store.read_json(owner._path(identity, f'sources-{number}')).get('checkpoint', {})
             for number in range(len(saved['source_rounds']))]
         self.assertTrue(any(checkpoints))
