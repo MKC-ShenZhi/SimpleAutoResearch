@@ -593,11 +593,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             def inspect_supplied_material(messages, *, tools, budget_call_id, **_):
                 view = json.loads(messages[1]['content'])
                 visible = [row['observation'] for row in view.get('working_view', {}).get('observations', [])]
-                offered = {row['subject'] for row in view.get('evidence', [])}
-                evidence = list(dict.fromkeys(row['subject'] for row in visible
-                    if row.get('subject') in offered and isinstance(row.get('text'), str)))
-                if not evidence:
-                    raise AssertionError('Fixture review requires actually supplied file text')
+                for message in messages:
+                    if message['role'] == 'tool':
+                        result = json.loads(message['content'])
+                        data = result.get('data') or {}
+                        if result.get('tool_name') == 'read_file' and result.get('status') == 'ok':
+                            visible.extend({**data, **window} for window in data.get('text_windows', []))
                 # The real client settles provider usage before its response can
                 # become an accepted inspection; preserve that contract here.
                 reservation = 'fixture-' + budget_call_id
@@ -606,6 +607,22 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     session_id=fake._budget_session_id, attempt_id=fake._budget_attempt_id,
                     logical_call_id=budget_call_id, purpose='fixture inspection')
                 fake._budget_ledger.settle(reservation, amounts, actual_source='fixture')
+                paths = view.get('proposed_delivery', {}).get('artifacts', [])
+                for path in paths:
+                    if not any(row.get('path') == path and isinstance(row.get('text'), str)
+                               for row in visible):
+                        return self._native_message('read_file', {'path': path}, 'fixture-read')
+                evidence = list(dict.fromkeys(row['subject'] for row in visible
+                    if row.get('path') in paths and isinstance(row.get('text'), str)))
+                if not evidence:
+                    raise AssertionError('Fixture review requires actually supplied file text')
+                terminal = next(tool['function'] for tool in tools
+                    if tool['function']['name'] == 'record_inspection')
+                schema = terminal['parameters']
+                investigation = schema['properties']['investigations']['items']
+                if '$ref' in investigation:
+                    investigation = schema['$defs'][investigation['$ref'].rsplit('/', 1)[-1]]
+                scoped = 'basis' in investigation.get('properties', {})
                 return self._native_message('record_inspection', {
                     'conclusion': 'complete', 'findings': [], 'evidence': evidence,
                     'limitations': ['Controlled fixture opinion, not scientific validation.'],
@@ -613,7 +630,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     'investigations': [{'claim': 'The saved artifacts contain the supplied work.',
                         'method': 'Read the provided file windows.',
                         'reasoning': 'The inspected file text was actually supplied.',
-                        'evidence': evidence, 'outcome': 'supported'}],
+                        'evidence': evidence, 'outcome': 'supported',
+                        **({'scope': 'The supplied fixture file text only.', 'basis': 'observed'} if scoped else {})}],
                     'reassessed_prior': []}, 'fixture-review')
             fake.tool_turn.side_effect = inspect_supplied_material
         binding = {'profile': 'fixture', 'settings': {'model': 'fixture', 'api_mode': 'chat'}}
@@ -4630,7 +4648,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         identity = app.state['pending']['attempt']
         resumed = ToolApplication.load(app.session.store.root)
         with patch('simple_ar.tools.workspace.run_process', side_effect=AssertionError('Recovery must not execute')):
-            self.assertEqual(resumed.run(progress=lambda _: None)["status"], "completed")
+            self.assertEqual(resumed.run(progress=lambda _: None)["status"], "completed",
+                             resumed.session.manifest.status_reason)
         recovered = resumed.session.store.read_json(f'attempts/{identity}/native_result.json')['data']
         self.assertEqual(recovered['returncode'], 0)
         self.assertIsNone(recovered['stop_reason'])
@@ -4683,9 +4702,11 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual((inputs / "notes.txt").read_text(), "original source")
         self.assertEqual(len(list((resumed.session.store.root / "tools/processes").glob("*/invocation.json"))), 1)
         # No second model/tool owner or repeated command on terminal resume.
+        review_calls = fake.tool_turn.call_count
+        self.assertGreater(review_calls, 0)
         self.assertEqual(resumed.run(progress=lambda _: None)["status"], "completed")
         self.assertEqual(fake.chat_turn.call_count, 4)
-        self.assertEqual(fake.tool_turn.call_count, 1)
+        self.assertEqual(fake.tool_turn.call_count, review_calls)
         # Long literal command arguments are not filesystem paths.
         self.assertTrue(resumed.approval_token(self._native_message("run_process", {
             "argv": ["python", "-c", "print('literal')\n" * 30]}, "literal")["tool_calls"][0]))
