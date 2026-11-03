@@ -21,8 +21,9 @@ A task can investigate sources, change code, run calculations and produce a repo
 Existing results can be reused without rerunning experiments. Grant only the access
 needed by the recipe; commands still need approval and model/API calls may incur charges.
 
-A usable candidate can be checked independently before revision and final delivery.
-An unchanged delivery can reuse an applicable opinion. Inspect the actual checked scope
+Submit a usable candidate for delivery; the same submission includes independent checking
+and commits that version when its conditions are met. Revise real gaps without repeating
+unchanged valid work. Inspect the actual checked scope
 and unfinished work; neither a successful process nor a model opinion proves a scientific conclusion.
 
 This page describes the current branch. Keep documentation and installation versions aligned.

@@ -6,6 +6,11 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+# Saved method identities select behavior; loading never upgrades an old task.
+NATIVE_WORK_METHODS = frozenset({'goal.v1', 'execute.v1'})
+CURRENT_WORK_METHOD = 'execute.v1'
+
+
 class PermissionLevel(str, Enum):
     """Common permission categories for local tools and external backends."""
 

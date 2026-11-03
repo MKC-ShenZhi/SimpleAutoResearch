@@ -94,11 +94,13 @@ class GoalWorkTests(unittest.TestCase):
                          proof['identity'])
         case._submit(_action('write_file', path='note.md', content='Changed note for the next request.\n'),
                      feedback='Revise the note but preserve the original observations.')
-        case._submit(_action('review_result', **claim))
+        case._submit(_action('deliver_result', **claim))
         self.assertGreater(case.send.call_count, calls)
+        self.assertEqual(case.app.session.manifest.status, 'completed')
+        self.assertEqual(len(case.app.result_snapshot()['delivery_versions']), 2)
         self.assertFalse(case._process_receipts())
 
-    def test_independent_calculation_uses_real_approved_action_and_bound_outputs(self):
+    def test_one_submission_checks_then_commits_after_approval_and_reload(self):
         case = self.case
         case._write('claim.md', 'The supplied observations have mean 2.0.\n')
         work = {}
@@ -132,21 +134,46 @@ class GoalWorkTests(unittest.TestCase):
                     'evidence': ids, 'outcome': 'supported'}]}
         case.review = review
         claim = {'summary': 'Supplied sample mean', 'artifacts': ['claim.md']}
-        case._submit(_action('review_result', **claim))
+        case._submit(_action('deliver_result', **claim))
         self.assertIsNotNone(case.app.state['pending'], case.app.session.manifest.status_reason)
         self.assertEqual(case.app.state['pending']['action']['call']['function']['name'], 'run_process')
         token = case.app.approval_token(case.app.state['pending']['action']['call'])
         case._reload()
         case._run(approved_execution=token)
-        proof = case._last('review_result', reviewed=True)['metadata']['delivery_review']
+        proof = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
         assessment = proof['result']['metadata']['delivery_assessment']
         self.assertEqual(assessment['verdict'], 'passed')
         self.assertTrue(assessment['investigations'][0]['execution_records'])
         self.assertEqual(len(case._process_receipts()), 1)
         calls = case.send.call_count
-        case._submit(_action('deliver_result', **claim))
         self.assertEqual(case.app.session.manifest.status, 'completed')
+        ledger = deepcopy(case.app.ledger.to_dict())
+        case._reload()
+        case._run(should_stop=lambda: True)
         self.assertEqual(case.send.call_count, calls)
+        self.assertEqual(case.app.ledger.to_dict(), ledger)
+
+    def test_default_work_interface_selects_existing_operations_without_changing_permission(self):
+        case = self.case
+        self.assertEqual(case.app.state['config']['work_method'], 'execute.v1')
+        case.app.state['config']['tool_contracts'] = 'on_demand'
+        case.app._save()
+        case._reload()
+        offered = {tool['function']['name'] for tool in case.app.schemas}
+        self.assertTrue({'write_file', 'run_process', 'deliver_result', 'load_tools', 'read_history'} <= offered)
+        self.assertFalse({'review_result', 'inspect_artifacts', 'edit_file', 'list_directory'} & offered)
+        self.assertIn('read_file', case.app._specialist_catalog())
+        case._submit(_action('load_tools', names=['read_file']))
+        self.assertIn('read_file', {tool['function']['name'] for tool in case.app.schemas})
+        self.assertTrue(case.app.workspace.call('read_file', {'path': 'measurements/observations.csv'},
+            identity='selected-read').ok)
+        self.assertFalse(case.app.workspace.call('write_file', {'path': 'measurements/observations.csv',
+            'content': 'Forbidden source mutation'}, identity='source-write').ok)
+        case.app.state['config']['work_method'] = 'goal.v1'
+        case.app._save()
+        case._reload()
+        self.assertIn('review_result', {tool['function']['name'] for tool in case.app.schemas})
+        self.assertEqual(case.app.state['config']['work_method'], 'goal.v1')
 
     def test_last_affordable_call_can_deliver_partial_without_unexecutable_read(self):
         case = self.case

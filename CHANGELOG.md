@@ -5,6 +5,14 @@
 User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-11-04
+
+### Improved
+
+- New ordinary tasks organize related investigation and implementation into executable work units; other existing operations remain selectable and command approvals are unchanged.
+- One candidate submission includes independent checking and commits the exact checked version when eligible. Delivery owns claim, inventory and opinion binding across execution, recovery and feedback.
+- Independent checking challenges consequential inferences against original evidence and alternative explanations, while reusing applicable execution records.
+
 ## 2026-11-03
 
 ### Added

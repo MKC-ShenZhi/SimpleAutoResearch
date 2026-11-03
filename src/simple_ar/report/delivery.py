@@ -7,11 +7,13 @@ operation delivery eligibility without scheduling work or storing acceptance sta
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
 
 from simple_ar.core.assessments import assessment_issues
 from simple_ar.tools.delivery_review import delivery_requires_review, prepare_delivery_review
+from simple_ar.tools.specs import tool_completion
 from simple_ar.tools.workspace import DeliveryRequest
 
 
@@ -96,6 +98,30 @@ class Delivery:
         self.publication, self.review_owner = publication, review_owner
         self.config, self.observations, self.user_requests = config, observations, user_requests
         self.legacy_report_status = config.get('delivery_review_protocol') not in {'task.v4', 'task.v5'}
+
+    def feedback(self, observations: list[dict], accepted_delivery: dict | None) -> dict | None:
+        """Reconsider the latest actual proposal through the same eligibility rules."""
+        for row in reversed(observations):
+            contract = tool_completion(row.get('tool_name', ''), self.config.get('tool_completions'))
+            if row.get('status') != 'ok' or contract is None or contract.kind not in {'delivery', 'review'}:
+                continue
+            data = row.get('data') or {}
+            delivery = data.get(contract.field) if contract.field else data
+            if delivery is None:
+                continue
+            if not row.get('current_request', True) and delivery == accepted_delivery:
+                return None
+            try:
+                issues = self.issues(observations, delivery)
+            except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
+                issues = [str(exc)]
+            return {'record': 'records/' + row['record'].removeprefix('attempts/'),
+                'request_count': row.get('request_count', 1),
+                'status': 'rejected' if issues else 'conditions_met', 'issues': issues,
+                'scope': 'Current check of the previous delivery proposal; execution success is not acceptance. '
+                    'Preserve completed work; the current user request determines whether to continue or replace this proposal. '
+                    'This grants no permission and does not add requirements to a new goal.'}
+        return None
 
     def issues(self, observations: list[dict], delivery: dict, *, proposed=None):
         request = DeliveryRequest.model_validate(delivery)
@@ -215,3 +241,56 @@ class Delivery:
         binding = prepare_delivery_review(self.workspace, request, resolved['artifacts'],
             self.user_requests, protocol=self.review_owner.protocol)
         return self.review_owner.review(binding, identity, may_start=may_start)
+
+    def bind_result(self, request: DeliveryRequest, payload: dict, identity: str, *,
+                    current_outputs: tuple[Path, ...], current_result: dict,
+                    retain: Callable[[], None], review_capacity: Callable[[], Any],
+                    may_start: bool = False) -> dict:
+        """Bind completed production and applicable review to one exact claim.
+
+        The executor supplies receipt persistence and physical resource protection;
+        this owner alone interprets summary, inventory and review applicability.
+        Neither an inspection opinion nor this projection commits the task.
+        """
+        delivery = self.workspace.resolve_delivery(request, current_outputs=current_outputs)
+        hashes = self.workspace.artifact_hashes(delivery['artifacts'])
+        metadata = payload.setdefault('metadata', {})
+        retained = metadata.get('delivery_hashes')
+        if retained is not None and hashes != retained:
+            raise ValueError('Final work outputs changed before delivery binding; no delivery or replay')
+        package_review = (self.review_owner is not None
+            and self.review_owner.protocol in {'task.v3', 'task.v4', 'task.v5'})
+        if package_review and request.summary_source is not None:
+            delivery['summary'] = self.workspace.delivery_summary(delivery, hashes)
+        try:
+            if may_start and self.review_owner is not None:
+                metadata['delivery_hashes'] = hashes
+                retain()  # Pin production before paid work; recovery never reruns it.
+            review = self.review_delivery(delivery, identity, may_start=False,
+                current_result=current_result, current_outputs=current_outputs)
+            if review is None and may_start:
+                with review_capacity() if self.requires_review(request) else nullcontext():
+                    review = self.review_delivery(delivery, identity, may_start=True,
+                        current_result=current_result, current_outputs=current_outputs)
+            if review is not None:
+                if metadata.get('delivery_review', review) != review:
+                    raise ValueError('Retained delivery review differs from its actual receipt')
+                metadata['delivery_review'] = review
+                if not review.get('error'):
+                    reviewed = review['result']['metadata']
+                    for key in (('inspection_binding',) if package_review
+                                else ('assessments', 'inspection_binding')):
+                        if key in reviewed:
+                            metadata[key] = reviewed[key]
+                    if review['identity'] == identity:
+                        artifacts = metadata.setdefault('capability_artifacts', [])
+                        artifacts.extend(ref for ref in reviewed.get('capability_artifacts', [])
+                            if ref not in artifacts)
+            if hashes != self.workspace.artifact_hashes(delivery['artifacts']):
+                raise ValueError('Delivery changed during its independent review')
+        except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
+            metadata['delivery_review_error'] = str(exc)
+        if request.summary_source is not None and not package_review:
+            delivery['summary'] = self.workspace.delivery_summary(delivery, hashes)
+        metadata['delivery_hashes'] = hashes
+        return delivery

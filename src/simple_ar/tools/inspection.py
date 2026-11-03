@@ -16,7 +16,7 @@ from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.budget import completed_llm_usage_is_accounted
 from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES, TURN_SUPPLY_POLICY
 from simple_ar.integrations.llm import LLMCallStopped, LLMSettings, estimate_tokens
-from simple_ar.tools.specs import CommonToolSpec, ToolResult
+from simple_ar.tools.specs import CommonToolSpec, ToolResult, NATIVE_WORK_METHODS
 from simple_ar.tools.workspace import FileWindow, workspace_tool_specs
 from simple_ar.tools.delivery_review import applicable_delivery_scope, reassessment_has_subject_support
 
@@ -342,7 +342,7 @@ class InspectionToolGateway:
             raise ValueError('Unknown inspection checkpoint policy')
         if context_checkpoint_policy and protocol != 'subjects.v3':
             raise ValueError('Inspection checkpoint policy requires journal continuity')
-        if work_method not in (None, 'goal.v1') or work_method and protocol != 'subjects.v3':
+        if work_method is not None and work_method not in NATIVE_WORK_METHODS or work_method and protocol != 'subjects.v3':
             raise ValueError('Unsupported inspection working method')
         self.root, self.workspace = Path(root), workspace
         self.store, self.client_factory = ArtifactStore(root), client_factory
@@ -418,7 +418,18 @@ class InspectionToolGateway:
                 'investigation, not proof of a defect; required findings need an established '
                 'contradiction with the requested outcome. Optional polish is advisory. '
                 'Do not certify scientific truth from valid record IDs or execution success.')
-                if saved.get('work_method') == 'goal.v1' and self._delivery_scope(saved) else '')
+                if saved.get('work_method') in NATIVE_WORK_METHODS and self._delivery_scope(saved) else '')
+            if saved.get('work_method') == 'execute.v1' and self._delivery_scope(saved):
+                method += (' Investigate the smallest sufficient body of evidence for the requested outcome. '
+                    'Reuse applicable recorded executions when judging reproducibility; independently test '
+                    'the consequential claims rather than replaying every producer operation. A successful '
+                    'reproduction supports the measurement, not every interpretation. Try to falsify '
+                    'important inferences: consider alternative underlying situations consistent with '
+                    'the observations, and test whether they permit a different conclusion. If evidence '
+                    'cannot distinguish them, narrow the claim or identify necessary unresolved evidence. '
+                    'Do not endorse an inference merely because the producer and generated tables agree. '
+                    'Batch useful reads or calculations, finish necessary investigations, and return '
+                    'an opinion without adding unrequested statistical or presentation projects.')
             return (contract + method + ' You may use only operations offered in this decision. '
                 'Original targets and sources are immutable. Create or change helper files only under '
                 f"workspace/inspection-work/{saved['identity']}/. "
@@ -1909,7 +1920,7 @@ class InspectionToolGateway:
     def _delivery_decision(self, saved: dict, value: dict) -> _DeliveryResponse:
         linked = saved.get('finding_policy') == 'linked.v1'
         investigated = ('applicability' in value or self._investigation_contract(saved))
-        decision = (_ScopedDeliveryResponse if saved.get('work_method') == 'goal.v1' else
+        decision = (_ScopedDeliveryResponse if saved.get('work_method') in NATIVE_WORK_METHODS else
             _InvestigatedDeliveryResponse if investigated else
             _DeliveryResponseLinked if linked else _DeliveryResponse).model_validate(value)
         if investigated:
@@ -2542,7 +2553,7 @@ class InspectionToolGateway:
             if remaining is not None:
                 target = min(target, max(0, remaining - (client.effective_output_limit() or 0)))
         base = self._view(saved, request)
-        if saved.get('work_method') == 'goal.v1' and self._delivery_scope(saved):
+        if saved.get('work_method') in NATIVE_WORK_METHODS and self._delivery_scope(saved):
             base['executed_checks'] = sorted(self._executed_check_records(saved))
         if saved.get('execution_protocol') == 'shared.v1':
             # A primary target is a current material, not permanently pinned
@@ -2672,7 +2683,7 @@ class InspectionToolGateway:
                                 {'delivery_review.v2','delivery_review.v3'} else []))),
                 'processed_turns':processed_journal_turns(journal_rows, memory['compacted_records']),
                 **({'archived_turns':processed_journal_turns(journal_rows, memory.get('archived_records', ())) }
-                   if saved.get('work_method') == 'goal.v1' else {})
+                   if saved.get('work_method') in NATIVE_WORK_METHODS else {})
                 } if continuity else {}),
             history_access=('read_history' if history else 'read_file at the recorded authorized source path and range'),
             trailing_messages=[finish] if finish is not None else [])
@@ -3040,7 +3051,7 @@ class InspectionToolGateway:
             memory = ProfessionalConversation.adopt(previous=memory, view=view, operations_for_turn=operations,
                 snapshot=store.read_json('memory_snapshot.json') if store.exists('memory_snapshot.json') else None,
                 failure=store.read_json('memory_failure.json') if store.exists('memory_failure.json') else None,
-                archive=saved.get('work_method') == 'goal.v1')
+                archive=saved.get('work_method') in NATIVE_WORK_METHODS)
         return memory
 
     def _conversation_material(self, saved: dict) -> tuple[dict, list, list]:
@@ -3678,7 +3689,7 @@ class InspectionToolGateway:
                     'Historical observations grant no current evidence, permission or repeated execution.',
                 'parameters':_InspectionHistory.model_json_schema()}})
         package = self._delivery_scope(saved)
-        response_model = ((_ScopedDeliveryResponse if saved.get('work_method') == 'goal.v1' else
+        response_model = ((_ScopedDeliveryResponse if saved.get('work_method') in NATIVE_WORK_METHODS else
                            _InvestigatedDeliveryResponse if self._investigation_contract(saved, offering=True)
                            else _DeliveryResponseLinked if saved.get('finding_policy') == 'linked.v1'
                            else _DeliveryResponse) if package else

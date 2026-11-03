@@ -1501,15 +1501,15 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 (root/'workspace'/'manuscript').write_text('Requested candidate.\n', encoding='utf-8')
                 delivery = {'summary':'Requested candidate', 'artifacts':['manuscript'],
                     'report':{'status':'candidate', 'manuscript':'manuscript'}}
-                issues = old.operations.delivery_issues([], delivery)
+                issues = old.operations.delivery.issues([], delivery)
                 self.assertIn('A candidate report must disclose unfinished work', issues)
                 old = ToolApplication.load(root)
-                self.assertEqual(old.operations.delivery_issues([], delivery), issues)
+                self.assertEqual(old.operations.delivery.issues([], delivery), issues)
                 schema = old.gateway.registry.get('deliver_result').input_schema
                 self.assertIn('Canonical means current required checks passed',
                     schema['properties']['report']['description'])
                 self.assertNotIn('description', schema['$defs']['ReportDelivery']['properties']['status'])
-                self.assertEqual(old.operations.delivery_issues([],
+                self.assertEqual(old.operations.delivery.issues([],
                     {**delivery, 'unresolved':['The required work remains unfinished.']}), [])
 
     def test_candidate_export_delivery_binds_manuscript_and_checks_before_completion(self):
@@ -1540,7 +1540,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 identity=Path(exported['data']['project']).name)
         renderer.assert_not_called()
         self.assertNotEqual(stale.status, 'ok')
-        self.assertTrue(self.app.operations.delivery_issues(self.app._operation_observations(), saved))
+        self.assertTrue(self.app.operations.delivery.issues(self.app._operation_observations(), saved))
 
     def test_shared_inspection_computes_once_after_exact_approval_and_reviews_feedback_delivery(self):
         self._create(goal='Read the supplied CSV, check its sample mean independently, '
@@ -2047,7 +2047,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertIn('workspace/v1/report.md',first_export['artifacts'])
         text_only = self._delivery('v1/report.md')
         text_only['report']['formats'] = ['markdown']
-        self.assertTrue(self.app.operations.delivery_issues(self.app._operation_observations(),text_only))
+        self.assertTrue(self.app.operations.delivery.issues(self.app._operation_observations(),text_only))
         first_project = self.app.workspace.resolve(first_export['data']['project'])
         self.assertIn('sample mean', (first_project / 'source.md').read_text(encoding='utf-8'))
         if compile_pdf:

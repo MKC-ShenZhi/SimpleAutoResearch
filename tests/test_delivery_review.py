@@ -1894,11 +1894,11 @@ class DemandDrivenDeliveryInspectionTests(unittest.TestCase):
         self.assertEqual({row['path'] for row in saved['evidence']},
             {str(self.case.root/'workspace/tool.py')})
         calls = self.case.send.call_count
-        reused = self.case.app.operations.review_delivery(request, 'reuse-current-opinion', may_start=True)
+        reused = self.case.app.operations.delivery.review_delivery(request, 'reuse-current-opinion', may_start=True)
         self.assertEqual(reused['identity'], proof['identity'])
         self.assertEqual(self.case.send.call_count, calls)
         (self.case.root/'workspace/tool.py').write_text('def identity(value):\n    return None\n')
-        self.assertTrue(self.case.app.operations.delivery_issues(self.case._observations(), request))
+        self.assertTrue(self.case.app.operations.delivery.issues(self.case._observations(), request))
         self.assertEqual(self.case.send.call_count, calls)
 
     def test_unperformed_independent_calculation_remains_incomplete_with_partial_exit(self):
@@ -1969,7 +1969,7 @@ class IndependentDeliveryApplicabilityTests(unittest.TestCase):
         self.assertEqual(self.case.send.call_count, calls)
         changed = deepcopy(saved)
         changed['report']['status'] = 'canonical'
-        issues = self.case.app.operations.delivery_issues(
+        issues = self.case.app.operations.delivery.issues(
             self.case.app._operation_observations(), changed)
         self.assertTrue(issues)  # Relabeling is not a matching owner opinion.
         self.assertEqual(self.case.send.call_count, calls)
@@ -1991,7 +1991,7 @@ class IndependentDeliveryApplicabilityTests(unittest.TestCase):
         for edition in ('candidate', 'canonical'):
             with self.subTest(edition=edition):
                 claim = {**delivery, 'report':{**delivery['report'], 'status':edition}}
-                self.assertTrue(self.case.app.operations.delivery_issues(
+                self.assertTrue(self.case.app.operations.delivery.issues(
                     self.case.app._operation_observations(), claim))
         self.assertEqual(self.case.send.call_count, calls)
         self.case._submit(_action('deliver_result', **delivery,
@@ -2018,7 +2018,7 @@ class IndependentDeliveryApplicabilityTests(unittest.TestCase):
         for protocol in ('task.v1', 'task.v2', 'task.v3'):
             with self.subTest(protocol=protocol), patch.dict(operations.config,
                     {'delivery_review_protocol':protocol}):
-                issues = operations.delivery_issues(self.case.app._operation_observations(), delivery)
+                issues = operations.delivery.issues(self.case.app._operation_observations(), delivery)
                 self.assertTrue(any('outputs changed' in issue for issue in issues), issues)
 
         def review(view):
@@ -2047,7 +2047,7 @@ class IndependentDeliveryApplicabilityTests(unittest.TestCase):
             operations.workspace.check_artifact_producers(['note.md'])
         # A changed current version cannot reuse the independent opinion.
         (self.case.root/'workspace/note.md').write_text('Another revision.\n', encoding='utf-8')
-        self.assertTrue(operations.delivery_issues(self.case.app._operation_observations(), delivery))
+        self.assertTrue(operations.delivery.issues(self.case.app._operation_observations(), delivery))
 
     def test_explicit_source_and_table_adoption_keeps_original_input_closure(self):
         import sys

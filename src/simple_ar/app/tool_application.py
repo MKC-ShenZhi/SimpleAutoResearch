@@ -29,7 +29,7 @@ from simple_ar.tools.openai_schema import compact_json_schema, export_openai_too
 from simple_ar.tools.permissions import ToolPermissionPolicy
 from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.extensions import LocalExtension, freeze_extensions
-from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, ToolCompletion, tool_completion
+from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, ToolCompletion, tool_completion, NATIVE_WORK_METHODS, CURRENT_WORK_METHOD
 from simple_ar.tools.professional_outcomes import (
     accepted_review_journal, check_professional_stop, stop_decision)
 from simple_ar.tools.workspace import (WorkspaceToolGateway, workspace_tool_specs,
@@ -444,7 +444,7 @@ class ToolApplication:
             raise ValueError('Unsupported saved native material supply policy')
         if config.get('context_checkpoint_policy') not in {None, 'economic.v1', 'economic.v2', 'economic.v3'}:
             raise ValueError('Unsupported saved context checkpoint policy')
-        if config.get('work_method') not in (None, 'goal.v1'):
+        if config.get('work_method') is not None and config['work_method'] not in NATIVE_WORK_METHODS:
             raise ValueError('Unsupported saved professional working method')
         if config.get('work_method') and (config.get('memory_protocol') != 'journal.v1'
                 or config.get('context_checkpoint_policy') != 'economic.v3'):
@@ -527,20 +527,21 @@ class ToolApplication:
                 spec = self.gateway.registry.get(call['function']['name'])
                 result.append(self._operation_observation(observed, call, item['result'],
                     current_request=turn.get('request_count', 1) == len(self.state['requests']),
+                    request_count=turn.get('request_count', 1),
                     contract_current=spec is None or spec.domain not in active
                         or id(turn) in active[spec.domain], review_record=item.get('review_result')))
         return result
 
     @staticmethod
     def _operation_observation(payload: dict, call: dict, record: str, *,
-                               current_request: bool = True, contract_current: bool = True,
+                               current_request: bool = True, request_count: int = 1, contract_current: bool = True,
                                review_record: str | None = None) -> dict:
         try:
             arguments = json.loads(call['function']['arguments'])
         except (ValueError, TypeError):
             arguments = {}
         return {**payload, 'record':record, 'arguments':arguments,
-                'current_request':current_request, 'contract_current':contract_current,
+                'current_request':current_request, 'request_count':request_count, 'contract_current':contract_current,
                 **({'review_record':review_record} if review_record is not None else {})}
 
     def _configure_tools(self) -> None:
@@ -885,13 +886,13 @@ class ToolApplication:
         approval and delivery checks still own every returned action.
         """
         if (self.state['config'].get('completion_policy') == _OPERATION_EXIT
-                and self.state['config'].get('work_method') != 'goal.v1'):
+                and self.state['config'].get('work_method') not in NATIVE_WORK_METHODS):
             return self.schemas
         # Restrict the active contracts rather than loading deferred specialists:
         # expanding an on-demand catalog here can evict original input windows.
         schemas = [row for row in self.schemas
             if (contract := self._completion(row['function']['name'])) is not None and contract.closing
-                and (self.state['config'].get('work_method') != 'goal.v1' or not contract.field)]
+                and (self.state['config'].get('work_method') not in NATIVE_WORK_METHODS or not contract.field)]
         result = []
         for original in schemas:
             schema = json.loads(json.dumps(original))
@@ -1079,7 +1080,7 @@ class ToolApplication:
                             snapshot=store.read_json('memory_snapshot.json') if store.exists('memory_snapshot.json') else None,
                             failure=store.read_json('memory_failure.json') if store.exists('memory_failure.json') else None,
                             view=store.read_json('memory_input.json'), operations_for_turn=self._memory_operations,
-                            archive=self.state['config'].get('work_method') == 'goal.v1')
+                            archive=self.state['config'].get('work_method') in NATIVE_WORK_METHODS)
                 for path in notes.get(attempt.attempt_id, []):
                     result = self.session.store.read_json(path)
                     data = result.get('data') or {}
@@ -1089,7 +1090,7 @@ class ToolApplication:
                         # checkpoint inputs. Coverage still reopens originals.
                         purchases = ({key: memory[key] for key in
                             ('attempted_records', 'attempted_through_turn', 'archived_records') if key in memory
-                                and (key != 'archived_records' or self.state['config'].get('work_method') == 'goal.v1')}
+                                and (key != 'archived_records' or self.state['config'].get('work_method') in NATIVE_WORK_METHODS)}
                             if self.state['config'].get('native_supply_policy') in RECEIPT_SUPPLY_POLICIES else {})
                         memory = {'notes':data['notes'], 'through_turn':0,
                             'compacted_records':set(), **purchases}
@@ -1830,7 +1831,7 @@ class ToolApplication:
         if automatic_memory:
             config['memory_protocol'] = 'journal.v1'
             config['context_checkpoint_policy'] = 'economic.v3'
-            config['work_method'] = 'goal.v1'
+            config['work_method'] = CURRENT_WORK_METHOD
         return config, reused, limits, attempts
 
     @classmethod
@@ -2491,7 +2492,7 @@ class ToolApplication:
         if self.operations is not None:
             exit_text = (_OPERATION_EXIT_DECISION
                 if self.state['config'].get('completion_policy') == _OPERATION_EXIT else _CLOSING_DECISION)
-            if self.state['config'].get('work_method') == 'goal.v1':
+            if self.state['config'].get('work_method') in NATIVE_WORK_METHODS:
                 exit_text = ('This is the last affordable decision. Use exactly one offered delivery '
                     'or indispensable question. Do not propose further reads, edits or computations. '
                     'Reuse an applicable existing review for complete delivery; otherwise deliver '
@@ -3698,7 +3699,7 @@ class ToolApplication:
                 operation_history=operation_history,
                 **({'processed_turns':processed_journal_turns(journal_rows, memory.get('compacted_records', ())),
                     **({'archived_turns':processed_journal_turns(journal_rows, memory.get('archived_records', ()))}
-                       if config.get('work_method') == 'goal.v1' else {})} if journal else {}))
+                       if config.get('work_method') in NATIVE_WORK_METHODS else {})} if journal else {}))
             if working_selection is not None:
                 working_selection.update(selection)
             cost = estimate_tokens(json.dumps(messages,ensure_ascii=False))+schema_cost
@@ -3946,7 +3947,7 @@ class ToolApplication:
                     if journal:
                         working_memory = ProfessionalConversation.adopt(previous=previous,
                             snapshot=snapshot, view=view, operations_for_turn=self._memory_operations,
-                            archive=self.state['config'].get('work_method') == 'goal.v1')
+                            archive=self.state['config'].get('work_method') in NATIVE_WORK_METHODS)
                     else:
                         from simple_ar.app.work_memory import summary_coverage
                         working_memory = {'notes':snapshot['notes'], 'through_turn':summary_coverage(
@@ -4197,102 +4198,47 @@ class ToolApplication:
             outputs = tuple(store.require(ArtifactRef.from_dict(row))
                 for row in payload.get('metadata', {}).get('capability_artifacts', []))
             request = DeliveryRequest.model_validate(delivery)
-            delivery = self.workspace.resolve_delivery(request, current_outputs=outputs)
             if self.state['config'].get('report_protocol') == _REPORT_PROTOCOL:
                 try:
-                    self._validated_report_delivery(delivery['artifacts'], claim=request.report,
+                    canonical = self.workspace.resolve_delivery(request, current_outputs=outputs)
+                    self._validated_report_delivery(canonical['artifacts'], claim=request.report,
                         partial=bool(request.unresolved),
                         publication=payload if call['function']['name'] == 'export_report' else None)
                 except (ValueError, OSError, KeyError, RuntimeError) as exc:
                     payload.update(status='blocked', error=str(exc))
                     return payload
-            hashes = self.workspace.artifact_hashes(delivery['artifacts'])
-            package_review = (self.operations is not None and self.operations.delivery_review is not None
-                              and self.operations.delivery_review.protocol in {'task.v3', 'task.v4', 'task.v5'})
-            if package_review and request.summary_source is not None:
-                # v3 binds the completion claim itself, including the actual
-                # summary source. Never change that claim after its review.
-                retained = payload.get('metadata', {}).get('delivery_hashes')
-                if retained is not None and hashes != retained:
-                    payload.update(status='blocked', error='Final work outputs changed before summary binding; no delivery or replay')
-                    return payload
-                try:
-                    delivery['summary'] = self.workspace.delivery_summary(delivery, hashes)
-                except (ValueError, OSError) as exc:
-                    payload.update(status='blocked', error=str(exc))
-                    return payload
             if self.operations is not None:
+                record = (store.root.relative_to(self.session.store.root) / 'native_result.json').as_posix()
                 try:
-                    # Domain consumers verify an actual observation record, not
-                    # an anonymous in-memory result. Pin completed production
-                    # before review, so any producer can recover without replay.
-                    if start_review and self.operations.delivery_review is not None:
-                        metadata = payload.setdefault('metadata', {})
-                        if metadata.get('delivery_hashes', hashes) != hashes:
-                            raise ValueError('Completed production differs from its retained delivery binding')
-                        metadata['delivery_hashes'] = hashes
-                        store.write_json('native_result.json', payload, kind='native_observation')
-                    current = self._operation_observation(payload, call,
-                        (store.root.relative_to(self.session.store.root) / 'native_result.json').as_posix())
-                    # A review can reject delivery. It is not a terminal
-                    # success until verified; leave the caller capacity to
-                    # act on the result through this same ledger.
-                    # Reuse an owner-verified matching opinion before resolving
-                    # a model or protecting capacity for a new inspection.
-                    # A missing/stale opinion still follows normal admission;
-                    # the terminal gate rechecks production and current bytes.
-                    review = self.operations.review_delivery(delivery, store.root.name,
-                        may_start=False, current_result=current, current_outputs=outputs)
-                    if review is None and start_review:
-                        review_floor = (self._completion_floor(self._client(store.root.name), dispatch=True)
-                            if self.operations.requires_delivery_review(request) else {})
-                        with self.ledger.protect_remaining(review_floor):
-                            review = self.operations.review_delivery(delivery, store.root.name,
-                                may_start=True, current_result=current, current_outputs=outputs)
-                    if review is not None:
-                        metadata = payload.setdefault('metadata', {})
-                        retained_review = metadata.get('delivery_review')
-                        if retained_review is not None and retained_review != review:
-                            raise ValueError('Retained delivery review differs from its actual receipt')
-                        metadata['delivery_review'] = review
-                        if not review.get('error'):
-                            reviewed = review['result']['metadata']
-                            keys = (('inspection_binding',) if package_review
-                                    else ('assessments', 'inspection_binding'))
-                            for key in keys:
-                                if key in reviewed:
-                                    metadata[key] = reviewed[key]
-                            if review['identity'] == store.root.name:
-                                metadata['capability_artifacts'] = [
-                                    *metadata.get('capability_artifacts', []),
-                                    *[ref for ref in reviewed.get('capability_artifacts', [])
-                                        if ref not in metadata.get('capability_artifacts', [])]]
-                    if hashes != self.workspace.artifact_hashes(delivery['artifacts']):
-                        raise ValueError('Delivery changed during its independent review')
+                    delivery = self.operations.delivery.bind_result(request, payload, store.root.name,
+                        current_outputs=outputs,
+                        current_result=self._operation_observation(payload, call, record),
+                        retain=lambda: store.write_json('native_result.json', payload, kind='native_observation'),
+                        review_capacity=lambda: self.ledger.protect_remaining(
+                            self._completion_floor(self._client(store.root.name), dispatch=True)),
+                        may_start=start_review)
                 except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
-                    # Keep completed production and review diagnostics. The
-                    # terminal gate requires the actual current full-scope proof.
-                    payload.setdefault('metadata', {})['delivery_review_error'] = str(exc)
-            retained = payload['metadata'].get('delivery_hashes')
-            if request.summary_source is not None and not package_review:
-                try:
-                    if retained is not None and hashes != retained:
-                        raise ValueError('Final work outputs changed before summary binding; no delivery or replay')
-                    # Use this same inventory binding; terminal commit already
-                    # rechecks the files before saving or recovering a delivery.
-                    delivery['summary'] = self.workspace.delivery_summary(delivery, hashes)
-                except (ValueError, OSError) as exc:
                     payload.update(status='blocked', error=str(exc))
                     return payload
+            else:
+                # Saved canonical Writer contracts retain their original admission.
+                delivery = self.workspace.resolve_delivery(request, current_outputs=outputs)
+                hashes = self.workspace.artifact_hashes(delivery['artifacts'])
+                retained = payload.setdefault('metadata', {}).get('delivery_hashes')
+                if retained is not None and hashes != retained:
+                    payload.update(status='blocked', error='Final work outputs changed before delivery observation; no delivery or replay')
+                    return payload
+                if request.summary_source is not None:
+                    try:
+                        delivery['summary'] = self.workspace.delivery_summary(delivery, hashes)
+                    except (ValueError, OSError) as exc:
+                        payload.update(status='blocked', error=str(exc))
+                        return payload
+                payload['metadata']['delivery_hashes'] = hashes
             if not self._completion(call['function']['name']).field:
                 payload['data'] = delivery
             else:
                 payload['data'][self._completion(call['function']['name']).field] = delivery
-            if retained is not None and hashes != retained:
-                payload['status'] = 'blocked'
-                payload['error'] = 'Final work outputs changed before delivery observation; preserve the pinned version and inspect results. No delivery or replay.'
-            else:
-                payload['metadata']['delivery_hashes'] = hashes
         return payload
 
     @staticmethod
@@ -4551,7 +4497,7 @@ class ToolApplication:
                     self.operations.delivery.validate_actual(
                         delivery, observations, include_inspection=True)
                     return ''
-                return '; '.join(self.operations.delivery_issues(
+                return '; '.join(self.operations.delivery.issues(
                     observations, delivery, proposed=proposed))
             except (ValueError,OSError,KeyError,TypeError,RuntimeError) as exc:
                 return str(exc)
@@ -4640,31 +4586,8 @@ class ToolApplication:
         return count
 
     def _delivery_feedback(self) -> dict | None:
-        """Current fulfillment check of the latest proposal, not another task state."""
-        observations = self._operation_observations()
-        for turn in reversed(self.state['turns']):
-            calls = {row['id']:row for row in self.session.store.read_json(turn['reply']).get('tool_calls',[])}
-            for item in reversed(turn['tools']):
-                call = calls[item['id']]
-                payload = self.session.store.read_json(item['result'])
-                delivery = self._delivery(call,payload)
-                if payload.get('status') != 'ok' or delivery is None:
-                    continue
-                request_count = turn.get('request_count',1)
-                if (request_count != len(self.state['requests']) and self.session.store.exists('delivery.json')
-                        and self.session.store.read_json('delivery.json') == delivery):
-                    return None  # Accepted prior work is not a new revision's unfinished proposal.
-                try:
-                    issues = self.operations.delivery_issues(observations,delivery)
-                except (ValueError,OSError,KeyError,TypeError,RuntimeError) as exc:
-                    issues = [str(exc)]
-                return {'record':'records/'+item['result'].removeprefix('attempts/'),
-                    'request_count':request_count,
-                    'status':'rejected' if issues else 'conditions_met',
-                    'issues':issues,'scope':'Current check of the previous delivery proposal; execution success is not acceptance. '
-                        'Preserve completed work; the current user request determines whether to continue or replace this proposal. '
-                        'This grants no permission and does not add requirements to a new goal.'}
-        return None
+        return self.operations.delivery.feedback(self._operation_observations(),
+            self.session.store.read_json('delivery.json') if self.session.store.exists('delivery.json') else None)
 
     def _commit_terminal(self, progress: Callable[[str], None]) -> bool:
         """Consume a closed current-revision observation before any new decision."""
