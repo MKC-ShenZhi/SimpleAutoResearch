@@ -160,11 +160,18 @@ class GoalWorkTests(unittest.TestCase):
         case.app._save()
         case._reload()
         offered = {tool['function']['name'] for tool in case.app.schemas}
-        self.assertTrue({'write_file', 'run_process', 'deliver_result', 'load_tools', 'read_history'} <= offered)
-        self.assertFalse({'review_result', 'inspect_artifacts', 'edit_file', 'list_directory'} & offered)
-        self.assertIn('read_file', case.app._specialist_catalog())
-        case._submit(_action('load_tools', names=['read_file']))
-        self.assertIn('read_file', {tool['function']['name'] for tool in case.app.schemas})
+        ordinary = {'read_file', 'search_files', 'list_directory', 'copy_project', 'edit_file',
+            'write_file', 'run_process', 'deliver_result', 'load_tools', 'read_history'}
+        self.assertTrue(ordinary <= offered)
+        self.assertFalse({'review_result', 'inspect_artifacts'} & offered)
+        self.assertIn('inspect_artifacts', case.app._specialist_catalog())
+        case._submit(_action('load_tools', names=['inspect_artifacts']))
+        case._submit(_action('read_file', path='measurements/observations.csv'))
+        case._reload()
+        self.assertTrue(ordinary <= {tool['function']['name'] for tool in case.app.schemas})
+        case._submit(_action('load_tools', names=['review_result']))
+        case._submit(_action('read_file', path='measurements/observations.csv'))
+        case._ok('read_file')
         self.assertTrue(case.app.workspace.call('read_file', {'path': 'measurements/observations.csv'},
             identity='selected-read').ok)
         self.assertFalse(case.app.workspace.call('write_file', {'path': 'measurements/observations.csv',

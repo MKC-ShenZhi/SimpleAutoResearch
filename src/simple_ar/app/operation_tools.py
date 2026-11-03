@@ -404,14 +404,15 @@ class OperationTools:
                 continue
             # Saved preparation contracts keep their original presentation.
             # Ordinary source work is owned by these common workspace tools.
-            if executable and mode == 'on_demand':
-                deferred = spec.name not in {'write_file', 'run_process', 'deliver_result', 'ask_user',
-                    'export_report', 'load_tools', 'read_history'}
-            elif mode == 'outcomes':
+            if mode == 'outcomes':
                 deferred = (self.config.get('source_generation_protocol') is not None
                     and spec.name in {'write_file', 'edit_file', 'run_process'})
             else:
-                deferred = not self.registry.request_visible(spec.name)
+                # Package owners already identify ordinary request operations.
+                # Method choice must not hide everyday reads/edits or discard
+                # their availability when another optional tool is selected.
+                deferred = (not self.registry.request_visible(spec.name)
+                    or executable and mode == 'on_demand' and spec.name == 'review_result')
             if mode == 'full' or not deferred or spec.name in selected:
                 active.add(spec.name)
             else:
