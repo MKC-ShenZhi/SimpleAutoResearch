@@ -734,7 +734,7 @@ class PublicationToolGateway:
                         input_path = logs / "input.txt"
                         input_path.write_text(text, encoding="utf-8")
                         command.append(str(input_path))  # Pandoc accepts a file instead of stdin.
-                    environment = {key: os.environ[key] for key in ("PATH", "LANG", "SYSTEMROOT", "WINDIR") if key in os.environ}
+                    environment = self.workspace.process_environment()
                     environment.update({key: value for key, value in (env or {}).items()
                                         if key in {"openin_any", "openout_any", "shell_escape", "LC_ALL"}})
                     try:

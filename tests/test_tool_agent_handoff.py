@@ -4586,7 +4586,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_native_execution_requires_matching_approval_and_recovers_without_reexecution(self) -> None:
         run_dir, inputs, fake, binding, app, code = self._native_fixture(counter=True, review_delivery=True)
-        code += ("import os\n"
+        code += ("from pathlib import Path\n"
+                 "assert Path.home() == Path.cwd()\n"
+                 "(Path.home() / '.native-cache').mkdir(exist_ok=True)\n"
+                 "import os\n"
                  "os.write(1, ('界'*80000+'\\r\\nfinal metric: 0.75\\r\\n').encode())\n"
                  "os.write(2, b'y'*240000+b'\\xfffinal diagnostic\\r\\n')\n")
         replies = list(fake.chat_turn.side_effect)
@@ -4614,6 +4617,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         observed = []
 
         def interrupted(spec, **kwargs):
+            self.assertEqual(spec.env['HOME'], str(app.workspace.workspace))
             self.assertEqual(spec.env['PYTHONDONTWRITEBYTECODE'], '1')
             self.assertEqual(spec.env['PATH'].split(os.pathsep)[0], str(app.workspace.python.parent))
             self.assertEqual(spec.argv[0], str(app.workspace.python))

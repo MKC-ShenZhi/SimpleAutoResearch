@@ -2588,8 +2588,10 @@ class WorkspaceToolGateway:
         env = {name: os.environ[name] for name in ("PATH", "LANG", "SYSTEMROOT", "WINDIR") if name in os.environ}
         inherited_path = env.get("PATH", "")
         env["PATH"] = str(self.python.parent) + (os.pathsep + inherited_path if inherited_path else "")
-        env.update(MPLBACKEND="Agg", OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1",
-                   PYTHONDONTWRITEBYTECODE="1")
+        # Tools may need a writable cache home; never inherit the operator's
+        # profile or rely on a library's relative fallback when HOME is absent.
+        env.update(HOME=str(self.workspace), MPLBACKEND="Agg", OPENBLAS_NUM_THREADS="1",
+                   OMP_NUM_THREADS="1", PYTHONDONTWRITEBYTECODE="1")
         return env
 
 

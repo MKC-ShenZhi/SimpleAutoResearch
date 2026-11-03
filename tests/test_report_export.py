@@ -220,6 +220,7 @@ class ReportExportTests(unittest.TestCase):
 
             def render(spec, **kwargs):
                 self.assertIs(kwargs['budget_ledger'], ledger)
+                self.assertEqual(spec.env['HOME'], str(workspace.workspace))
                 self.assertNotIn('OPENAI_API_KEY', spec.env)
                 spec.output_dir.mkdir(parents=True, exist_ok=True)
                 if spec.argv[0] in {'xelatex', 'bibtex'}:
