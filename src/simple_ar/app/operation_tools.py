@@ -395,8 +395,10 @@ class OperationTools:
 
     def presentation(self, selected: set[str], mode: str):
         active, catalog = set(), {}
-        executable = (self.config.get('work_method') == 'execute.v1'
-            and not self.config.get('code_task') and not self.config.get('source_generation_protocol'))
+        # Explicit frozen work keeps the operations required by its domain owner.
+        executable = (self.config.get('work_method') == 'execute.v1' and not any(
+            self.config.get(key) for key in
+            ('code_task', 'execution_contract', 'table_analysis', 'source_generation_protocol')))
         for spec in self.registry.list_specs():
             if not self.gateway.policy.is_allowed(spec)[0]:
                 continue
