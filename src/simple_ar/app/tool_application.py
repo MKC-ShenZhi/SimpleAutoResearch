@@ -435,6 +435,8 @@ class ToolApplication:
             raise ValueError('Unsupported saved operation control protocol')
         if config.get('context_protocol') not in _CONTEXT_PROTOCOLS:
             raise ValueError('Unsupported saved operation context; no silent migration')
+        if config.get('context_authority') not in (None, 'sources.v1'):
+            raise ValueError('Unsupported saved context authority; no silent migration')
         if config.get('memory_protocol') not in {None, 'journal.v1'}:
             raise ValueError('Unsupported saved working memory; no silent migration')
         if config.get('native_supply_policy') is not None and config['native_supply_policy'] not in RECEIPT_SUPPLY_POLICIES:
@@ -1819,6 +1821,8 @@ class ToolApplication:
         config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
         if context_protocol is not None:
             config['context_protocol'] = context_protocol
+        if context_protocol in _WORKING_CONTEXT_PROTOCOLS:
+            config['context_authority'] = 'sources.v1'
         config['native_supply_policy'] = TURN_SUPPLY_POLICY
         if automatic_memory:
             config['memory_protocol'] = 'journal.v1'
@@ -2034,7 +2038,7 @@ class ToolApplication:
             for field in ('completion_policy', 'tool_contracts', 'report_protocol', 'tool_completions', 'inspection_protocol',
                           'inspection_coverage_policy', 'inspection_finding_policy',
                           'delivery_review_protocol', 'publication_assets', 'professional_operations', 'memory_protocol',
-                          'context_checkpoint_policy', 'native_supply_policy',
+                          'context_checkpoint_policy', 'native_supply_policy', 'context_authority',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
                     if field in old:
@@ -3625,6 +3629,7 @@ class ToolApplication:
                 selected_records = list(dict.fromkeys([
                     *selected_records, *(row['record'] for row in related)]))
             messages, selection = select_working_context(user_requests=self.state['requests'],
+                context_authority=config.get('context_authority'),
                 system_text=prefix[0]['content'],base_context=context,
                 turn_blocks=[block if position>=boundary else [] for position,block in enumerate(blocks)],
                 observations=working_rows, schema_tokens=schema_cost,context_token_target=target,

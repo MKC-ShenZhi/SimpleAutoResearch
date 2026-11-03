@@ -205,6 +205,7 @@ class OperationTools:
         self.inspection = InspectionToolGateway(root, self.workspace,
             client_factory=lambda identity:client_factory(identity, 'writing'),
             protocol=config.get('inspection_protocol'),
+            context_authority=config.get('context_authority'),
             coverage_policy=config.get('inspection_coverage_policy'),
             finding_policy=config.get('inspection_finding_policy'),
             native_supply_policy=config.get('native_supply_policy'),

@@ -111,6 +111,42 @@ def _assessments(result):
 
 
 class OperationsWorkLoopTests(unittest.TestCase):
+    def test_user_requests_stay_separate_from_plan_and_inspection_context(self):
+        goal = 'Explain the supplied observations in a short editable note.'
+        self._create(goal=goal)
+        self._submit(_action('update_work_plan', steps=[{
+            'step': 'Consider an optional formatting improvement', 'status': 'pending'}]))
+        before = deepcopy(self.app.ledger.to_dict())
+        messages = self.app._messages(client=self.services.llm_client)
+        self.assertEqual(messages[1]['role'], 'assistant')
+        self.assertEqual(messages[1]['reasoning_content'], '')
+        self.assertIn('optional formatting', messages[1]['content'])
+        self.assertEqual([row['content'] for row in messages if row['role'] == 'user'], [goal])
+        self.assertEqual(self.app.ledger.to_dict(), before)
+        self._write('note.md', 'Three supplied observations: 1, 2, and 3.\n')
+        self._inspect(['note.md'])
+        self._ok('inspect_artifacts')
+        for request in self.inspection_requests:
+            self.assertEqual(request['messages'][1]['role'], 'assistant')
+            self.assertEqual(request['messages'][1]['reasoning_content'], '')
+            self.assertIn(goal, [row['content'] for row in request['messages'] if row['role'] == 'user'])
+        inputs = list((self.root/'tools/inspection').glob('*/input.json'))
+        self.assertTrue(inputs)
+        self.assertTrue(all(json.loads(path.read_text())['context_authority'] == 'sources.v1'
+                            for path in inputs))
+        self.app = ToolApplication.load(self.root, services=self.services)
+        self.assertEqual(self.app.state['config']['context_authority'], 'sources.v1')
+        # Absence is the actual historical layout contract, not an implicit upgrade.
+        self.app.state['config'].pop('context_authority')
+        self.app._save()
+        calls = self.send.call_count
+        self.app = ToolApplication.load(self.root, services=self.services)
+        legacy = self.app._messages(client=self.services.llm_client)
+        self.assertEqual(legacy[1]['role'], 'user')
+        self.assertNotIn('context_authority', self.app.state['config'])
+        self.assertIsNone(self.app.operations.inspection.context_authority)
+        self.assertEqual(self.send.call_count, calls)
+
     def test_edit_authored_snapshot_projects_complete_current_version_without_reads(self):
         from simple_ar.tools.materials import journal_read_windows
         from simple_ar.tools.workspace import workspace_observation_view
@@ -1227,7 +1263,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def _inspection_history(self):
         """Check provider-visible native chronology and return the latest tool replies."""
         messages = self.inspection_requests[-1]['messages']
-        retained = [row for row in messages if row['role']=='assistant']
+        # The first two messages are the system contract and derived work view;
+        # only the following messages can be actual provider replies.
+        retained = [row for row in messages[2:] if row['role']=='assistant']
         positions = [self.inspection_messages.index(row) for row in retained]
         self.assertEqual(positions, sorted(set(positions)))
         self.assertEqual(retained[-1], self.inspection_messages[-1])
@@ -2553,7 +2591,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.app._messages(client=client)
         boundary = len(self.app.state['turns'])
         messages = self.app._messages(client=client,native_history_start_turn=boundary)
-        self.assertFalse(any(row['role'] in {'assistant','tool'} for row in messages))
+        self.assertFalse(any(row['role'] in {'assistant','tool'} for row in messages[2:]))
         context = json.loads(messages[1]['content'])
         self.assertEqual(context['history_archive']['native_history_start_turn'],boundary)
         retained = context['working_view']['observations']

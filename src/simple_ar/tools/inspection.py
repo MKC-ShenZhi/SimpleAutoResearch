@@ -296,6 +296,7 @@ class InspectionToolGateway:
                  user_requests: Callable[[], list[str]] | None = None,
                  feedback_provider: Callable[[list[str]], list[dict]] | None = None,
                  protocol: str | None = None,
+                 context_authority: str | None = None,
                  coverage_policy: str | None = None,
                  finding_policy: str | None = None,
                  native_supply_policy: str | None = None,
@@ -304,6 +305,8 @@ class InspectionToolGateway:
                  operation_call: Callable[[str, dict[str, Any], str], ToolResult] | None = None) -> None:
         if protocol not in (None, 'subjects.v1', 'subjects.v2', 'subjects.v3'):
             raise ValueError('Unknown inspection protocol')
+        if context_authority not in (None, 'sources.v1'):
+            raise ValueError('Unknown inspection context authority')
         if execution_protocol not in (None, 'shared.v1'):
             raise ValueError('Unknown inspection execution protocol')
         if coverage_policy not in (None, 'offered.v1', 'offered.v2'):
@@ -320,6 +323,7 @@ class InspectionToolGateway:
         self.user_requests = user_requests
         self.feedback_provider = feedback_provider
         self.protocol = protocol
+        self.context_authority = context_authority
         self.coverage_policy = coverage_policy
         self.finding_policy = finding_policy
         self.native_supply_policy = native_supply_policy
@@ -686,8 +690,10 @@ class InspectionToolGateway:
                 cached_views = validation_records.setdefault('supplied', {}) if validation_records is not None else {}
                 if path not in cached_views:
                     windows = set()
-                    for message in trace.get('offer', {}).get('messages', []):
-                        if message.get('role') != 'user':
+                    separated = saved.get('context_authority') == 'sources.v1'
+                    for index, message in enumerate(trace.get('offer', {}).get('messages', [])):
+                        if (message.get('role') != ('assistant' if separated else 'user')
+                                or separated and index != 1):
                             continue
                         try:
                             view = json.loads(message['content']).get('working_view', {})
@@ -2572,6 +2578,7 @@ class InspectionToolGateway:
             'and self-reported manifests do not replace actual source versions or scientific reasoning.')
         system = self._system(saved)
         messages, metadata = select_working_context(
+            context_authority=saved.get('context_authority'),
             user_requests=saved.get('user_requests', [request.goal]),system_text=system,
             base_context=base,turn_blocks=blocks,observations=observations,
             block_request_counts=([len(saved['user_requests'])] * len(blocks)
@@ -4066,6 +4073,8 @@ class InspectionToolGateway:
                 if not isinstance(originals, list) or any(not isinstance(text, str) for text in originals):
                     raise ValueError('Inspection context requires original journal request strings')
                 saved['user_requests'] = list(originals)
+                if self.context_authority is not None:
+                    saved['context_authority'] = self.context_authority
             if package:
                 if (saved.get('user_requests') != delivery_context['requests']
                         or self.workspace.artifact_hashes(delivery_context['artifacts']) != delivery_context['artifacts']):

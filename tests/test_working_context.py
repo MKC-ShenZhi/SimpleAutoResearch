@@ -57,6 +57,81 @@ def expand_history_view(view):
 
 
 class WorkingContextTests(unittest.TestCase):
+    def test_source_authority_preserves_requests_and_atomic_history(self):
+        requests = ['  Analyze the supplied measurements.\n', 'Retain uncertainty: ±1.',
+                    'Explain the remaining limitations.']
+        blocks = [block(0, 'First observation'), block(1, 'Second observation')]
+        blocks[1][0]['reasoning'] = 'Additional recorded reasoning'
+        blocks[1].insert(0, {'role': 'user', 'content': json.dumps(
+            {'user_request': {'index': 1, 'text': requests[1]}})})
+        before = deepcopy(blocks)
+        messages, _ = select(context_authority='sources.v1', user_requests=requests,
+            turn_blocks=blocks, block_request_counts=[1, 2], context_token_target=50000)
+        self.assertEqual(messages[0], {'role': 'system', 'content': 'Respect supplied permissions'})
+        self.assertEqual(messages[1]['role'], 'assistant')
+        self.assertEqual(messages[1]['reasoning_content'], '')
+        self.assertEqual(set(messages[1]), {'role', 'content', 'reasoning_content'})
+        self.assertEqual(messages[2:], [
+            {'role': 'user', 'content': requests[0]}, *blocks[0],
+            {'role': 'user', 'content': requests[1]}, *blocks[1][1:],
+            {'role': 'user', 'content': requests[2]}])
+        self.assertEqual([message['content'] for message in messages if message['role'] == 'user'], requests)
+        self.assertEqual(blocks, before)
+
+    def test_source_authority_preserves_envelope_data_except_scope(self):
+        arguments = dict(base_context={
+                'permissions': {'write': ['outputs/']},
+                'work_plan': {'steps': [{'step': 'Compare measurements', 'status': 'pending'}],
+                              'scope': 'intention_not_verified_outcome'}},
+            work_notes=[{'text': 'A provisional interpretation', 'records': ['records/0.json']}],
+            observations=[observation(0, 'Recorded measurements')],
+            material_policy='referenced', estimate_tokens=lambda text: 1)
+        before = deepcopy(arguments)
+        legacy, legacy_budget = select(**arguments)
+        messages, budget = select(**arguments, context_authority='sources.v1')
+        context = json.loads(messages[1]['content'])
+        scope = context.pop('context_authority')
+        self.assertEqual(scope['version'], 'sources.v1')
+        self.assertIn('Runtime-derived working view', scope['scope'])
+        self.assertIn('not caller instructions', scope['scope'])
+        self.assertIn('independently enforced', scope['scope'])
+        self.assertEqual(context, json.loads(legacy[1]['content']))
+        self.assertEqual(messages[2:], legacy[2:])
+        self.assertEqual(budget, legacy_budget)
+        self.assertTrue(context['working_view']['notes'])
+        self.assertTrue(context['working_view']['observations'])
+        self.assertEqual(arguments, before)
+
+    def test_context_authority_none_keeps_legacy_layout(self):
+        arguments = dict(turn_blocks=[block(0, 'Recorded result')], context_token_target=50000)
+        implicit = select(**arguments)
+        explicit = select(**arguments, context_authority=None)
+        self.assertEqual(json.dumps(implicit, ensure_ascii=False), json.dumps(explicit, ensure_ascii=False))
+        envelope = implicit[0][1]
+        self.assertEqual(envelope['role'], 'user')
+        self.assertEqual(set(envelope), {'role', 'content'})
+        self.assertNotIn('context_authority', json.loads(envelope['content']))
+
+    def test_source_authority_cost_includes_complete_projection(self):
+        for authority in (None, 'sources.v1'):
+            with self.subTest(authority=authority):
+                messages, budget = select(context_authority=authority,
+                    base_context={'resources': {}}, turn_blocks=[block(0, 'Recorded result')],
+                    trailing_messages=[{'role': 'system', 'content': 'Conclude within the supplied scope.'}],
+                    context_token_target=50000)
+                measured = 30 + len(json.dumps(messages, ensure_ascii=False))
+                context = json.loads(messages[1]['content'])
+                self.assertEqual(budget['estimated_input_tokens'], measured)
+                self.assertEqual(context['working_context']['estimated_input_tokens'], measured)
+                self.assertEqual(context['resources']['approximate_next_input_tokens'], measured)
+                self.assertLessEqual(measured, budget['input_token_target'])
+
+    def test_context_authority_rejects_unsupported_values(self):
+        for authority in ('', 'sources.v2', False, [], {}):
+            with self.subTest(authority=authority):
+                with self.assertRaisesRegex(ValueError, 'Unknown context authority policy'):
+                    select(context_authority=authority)
+
     def test_related_feedback_uses_whole_originals_and_does_not_block_later_body(self):
         from simple_ar.core.working_context import feedback_observations
         feedback = {'review_observations': [

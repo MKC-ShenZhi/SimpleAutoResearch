@@ -15,6 +15,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- New tasks and independent checks pass original user requests separately from derived working context. Assistant-authored plans, notes and observations no longer appear as user messages; saved historical layouts remain intact.
 - Prevent optional-material bookkeeping from falsely overflowing the context limit. Capacity is checked against the complete final input while retaining the latest action and required instructions.
 
 ## 2026-11-02
