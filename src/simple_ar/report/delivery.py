@@ -95,7 +95,7 @@ class Delivery:
         self.workspace, self.gateway = workspace, gateway
         self.publication, self.review_owner = publication, review_owner
         self.config, self.observations, self.user_requests = config, observations, user_requests
-        self.legacy_report_status = config.get('delivery_review_protocol') != 'task.v4'
+        self.legacy_report_status = config.get('delivery_review_protocol') not in {'task.v4', 'task.v5'}
 
     def issues(self, observations: list[dict], delivery: dict, *, proposed=None):
         request = DeliveryRequest.model_validate(delivery)
@@ -129,7 +129,7 @@ class Delivery:
         # to domain owners and applicability to DeliveryReview. Old process path
         # ownership cannot re-certify an ordinary edited delivery. Saved contracts
         # retain both their producer gate and its publication-input exception.
-        if self.config.get('delivery_review_protocol') != 'task.v4':
+        if self.config.get('delivery_review_protocol') not in {'task.v4', 'task.v5'}:
             try:
                 conversion_inputs = self.publication.conversion_inputs(observations, resolved['artifacts'])
                 self.workspace.check_artifact_producers(path for path in resolved['artifacts']
@@ -148,7 +148,7 @@ class Delivery:
             return [str(exc)]
         issues.extend(report_issues)
         scoped_review = self.requires_review(request)
-        package_review = scoped_review and self.review_owner.protocol in {'task.v3', 'task.v4'}
+        package_review = scoped_review and self.review_owner.protocol in {'task.v3', 'task.v4', 'task.v5'}
         # Admission need not already have the review it is about to perform.
         # The whole-work owner reconsiders retained local opinions against this
         # exact claim and inventory; a second local gate would force duplicate

@@ -300,6 +300,7 @@ class InspectionToolGateway:
                  coverage_policy: str | None = None,
                  finding_policy: str | None = None,
                  native_supply_policy: str | None = None,
+                 context_checkpoint_policy: str | None = None,
                  execution_protocol: str | None = None,
                  operation_specs: Callable[[], list[CommonToolSpec]] | None = None,
                  operation_call: Callable[[str, dict[str, Any], str], ToolResult] | None = None) -> None:
@@ -315,6 +316,10 @@ class InspectionToolGateway:
             raise ValueError('Unknown inspection finding policy')
         if native_supply_policy is not None and native_supply_policy not in RECEIPT_SUPPLY_POLICIES:
             raise ValueError('Unknown inspection native supply policy')
+        if context_checkpoint_policy not in (None, 'economic.v3'):
+            raise ValueError('Unknown inspection checkpoint policy')
+        if context_checkpoint_policy and protocol != 'subjects.v3':
+            raise ValueError('Inspection checkpoint policy requires journal continuity')
         self.root, self.workspace = Path(root), workspace
         self.store, self.client_factory = ArtifactStore(root), client_factory
         self.prior_assessments = prior_assessments
@@ -327,6 +332,7 @@ class InspectionToolGateway:
         self.coverage_policy = coverage_policy
         self.finding_policy = finding_policy
         self.native_supply_policy = native_supply_policy
+        self.context_checkpoint_policy = context_checkpoint_policy
         self.execution_protocol = execution_protocol
         self.operation_specs = operation_specs
         self.operation_call = operation_call
@@ -2367,7 +2373,7 @@ class InspectionToolGateway:
                 view['prior_work_opinions'] = [self.feedback_view(row)
                     for row in saved.get('prior_work_opinions', [])]
             if self._applicable_scope(saved):
-                view['proposed_delivery']['scope_policy'] = 'applicable.v1'
+                view['proposed_delivery']['scope_policy'] = saved['delivery_context']['scope_policy']
                 history = saved.get('source_history', {})
                 view['source_history'] = {'indexed_paths': len(history.get('entries', [])),
                     'scope': history.get('scope', 'No parent read locators available; use authorized roots.'),
@@ -2442,6 +2448,12 @@ class InspectionToolGateway:
             raise ValueError('Unknown inspection context policy')
         retained = self.adaptive and policy == 'retained.v1'
         continuity = retained and saved.get('memory_protocol') == 'journal.v1'
+        checkpoint_policy = saved.get('context_checkpoint_policy')
+        if checkpoint_policy not in (None, 'economic.v3'):
+            raise ValueError('Unknown saved inspection checkpoint policy')
+        economic = checkpoint_policy == 'economic.v3'
+        if economic and not continuity:
+            raise ValueError('Inspection checkpoint policy requires its saved journal')
 
         def version(path: str) -> str | None:
             # artifact_hashes resolves current mount/private-path authority before
@@ -2571,10 +2583,13 @@ class InspectionToolGateway:
                 if 'user_requests' in saved else None),
             schema_tokens=estimate_tokens(json.dumps(offered,ensure_ascii=False)),
             context_token_target=target,estimate_tokens=estimate_tokens,
-            material_policy='retained' if retained else 'ranked',
+            material_policy='working' if economic else 'retained' if retained else 'ranked',
             native_observations=native_observations,
             version_resolver=version if retained else None,
             **({'work_notes':notes, 'require_work_notes':True, 'fit_work_notes':True,
+                'economical_checkpoint':economic,
+                'economical_after_turn':memory.get('attempted_through_turn', 0),
+                'sparse_handoffs':economic,
                 'summarized_through_turn':min(memory['through_turn'], len(blocks)),
                 'current_artifacts':sorted(current_material_paths(
                     request_count=len(saved.get('user_requests', [request.goal])),
@@ -3058,6 +3073,7 @@ class InspectionToolGateway:
                     estimate_tokens=estimate_tokens, attempt_id=actual_id, call_id=call_id,
                     required_decision_tokens=checkpoint_input['decision_tokens'], additional_protection=True,
                     native_supply_policy=saved.get('native_supply_policy'),
+                    economic_floor=checkpoint_input.get('economic_floor'),
                     completed_retry=True)
                 return {'snapshot':snapshot, 'artifacts':[ref.to_dict() for ref in refs]}
 
@@ -3082,7 +3098,8 @@ class InspectionToolGateway:
                     expected = prepare_checkpoint_input(
                         requests=saved.get('user_requests', [request.goal]), previous=memory, rows=pending,
                         target=checkpoint_input['context_input_tokens'],
-                        estimate_tokens=estimate_tokens, native_supply_policy=saved.get('native_supply_policy'))
+                        estimate_tokens=estimate_tokens, native_supply_policy=saved.get('native_supply_policy'),
+                        economic_floor=checkpoint_input.get('economic_floor'))
                     if view != expected:
                         raise ValueError('Inspection checkpoint differs from its retained preparation')
                     snapshot = store.read_json('memory_snapshot.json') if store.exists('memory_snapshot.json') else None
@@ -3146,6 +3163,9 @@ class InspectionToolGateway:
                     return
                 checkpoint_input = {'records':[row['record'] for row in pending],
                     'decision_tokens':decision_tokens, 'floor':deepcopy(last_floor)}
+                if (saved.get('context_checkpoint_policy') == 'economic.v3'
+                        and value.projection.get('economical_compaction')):
+                    checkpoint_input['economic_floor'] = value.projection['required_input_tokens']
                 if saved.get('native_supply_policy') in RECEIPT_SUPPLY_POLICIES:
                     # Recovery must reproduce the purchased input even if the
                     # active client's capacity changes after interruption.
@@ -3161,6 +3181,8 @@ class InspectionToolGateway:
                     estimate_tokens=estimate_tokens, attempt_id=saved['identity'],
                     call_id=f"working-memory-{saved['identity']}-sources-{number}",
                     native_supply_policy=saved.get('native_supply_policy'),
+                    economic_floor=(value.projection['required_input_tokens']
+                        if value.projection.get('economical_compaction') else None),
                     required_decision_tokens=decision_tokens, additional_protection=True)
             finally:
                 # Bind all paid work, even when the following model turn fails.
@@ -3285,6 +3307,11 @@ class InspectionToolGateway:
                 (claim.get('summary_source') or {}).get('path')) if path]
             originals = []
             for path, digest in delivery['artifacts'].items():
+                if delivery.get('scope_policy') == 'applicable.v2' and path not in priority:
+                    # An explicitly named manuscript/summary is current work;
+                    # inventory membership alone is not relevance. Other actual
+                    # evidence is selected on demand by this same inspector.
+                    continue
                 if Path(path).suffix.lower() in _BINARY:
                     continue  # Text decoding capability, never a check exemption.
                 owners = [row for row in saved['evidence'] if row.get('readable')
@@ -4031,6 +4058,8 @@ class InspectionToolGateway:
                 saved['inspection_context_policy'] = 'retained.v1'
                 saved['memory_protocol'] = 'journal.v1'
                 saved['inspection_history_policy'] = 'receipts.v1'
+                if self.context_checkpoint_policy is not None:
+                    saved['context_checkpoint_policy'] = self.context_checkpoint_policy
             if delivery_context is not None:
                 if (not isinstance(delivery_context, dict)
                         or delivery_context.get('schema_version') not in

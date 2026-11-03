@@ -30,9 +30,9 @@ def delivery_claim(request: DeliveryRequest, artifacts: list[str], resolve: Call
 
 def delivery_requires_review(request: DeliveryRequest, protocol: str) -> bool:
     """Saved delivery admission and capacity obligation; partial remains an exit."""
-    if protocol not in {'task.v1', 'task.v2', 'task.v3', 'task.v4'}:
+    if protocol not in {'task.v1', 'task.v2', 'task.v3', 'task.v4', 'task.v5'}:
         raise ValueError('Unknown delivery review protocol')
-    return not request.unresolved and (protocol in {'task.v3', 'task.v4'} or (
+    return not request.unresolved and (protocol in {'task.v3', 'task.v4', 'task.v5'} or (
         request.report is not None and request.report.status == 'canonical'
         and bool(request.report.manuscript)))
 
@@ -52,10 +52,11 @@ def prepare_delivery_review(workspace: Any, request: DeliveryRequest, artifacts:
     requests = user_requests()
     if not isinstance(requests, list) or any(not isinstance(text, str) for text in requests):
         raise ValueError('Delivery review requires exact original request and feedback strings')
-    if protocol in {'task.v3', 'task.v4'}:
+    if protocol in {'task.v3', 'task.v4', 'task.v5'}:
         claim = delivery_claim(request, artifacts, workspace.resolve)
         return {'schema_version': 'delivery_review.v3',
-                **({'scope_policy': 'applicable.v1'} if protocol == 'task.v4' else {}),
+                **({'scope_policy': 'applicable.v2' if protocol == 'task.v5' else 'applicable.v1'}
+                   if protocol in {'task.v4', 'task.v5'} else {}),
                 'requests': list(requests),
                 'claim': claim,
                 'authorized_roots': {name: str(path) for name, path in workspace.mounts.items()},
@@ -127,7 +128,7 @@ def applicable_delivery_scope(binding: dict) -> bool:
     if 'scope_policy' not in binding:
         return False
     if (binding.get('schema_version') != 'delivery_review.v3'
-            or binding['scope_policy'] != 'applicable.v1'):
+            or binding['scope_policy'] not in {'applicable.v1', 'applicable.v2'}):
         raise ValueError('Unsupported delivery inspection scope policy')
     return True
 
@@ -310,7 +311,7 @@ class DeliveryReview:
                  observations: Callable[[], list[dict]] | None = None,
                  protocol: str = 'task.v1', track_findings: bool = False,
                  include_package_feedback: bool = True) -> None:
-        if protocol not in {'task.v1', 'task.v2', 'task.v3', 'task.v4'}:
+        if protocol not in {'task.v1', 'task.v2', 'task.v3', 'task.v4', 'task.v5'}:
             raise ValueError('Unknown delivery review protocol')
         self.workspace, self.inspector = workspace, inspector
         self.observations = observations
@@ -474,7 +475,9 @@ class DeliveryReview:
         return result
 
     def _validate_scope(self, binding: dict) -> None:
-        if applicable_delivery_scope(binding) != (self.protocol == 'task.v4'):
+        if (applicable_delivery_scope(binding) != (self.protocol in {'task.v4', 'task.v5'})
+                or self.protocol in {'task.v4', 'task.v5'} and binding.get('scope_policy') != (
+                    'applicable.v2' if self.protocol == 'task.v5' else 'applicable.v1')):
             raise ValueError('Delivery scope policy differs from the saved review protocol')
 
     def _reassessed_ids(self, identity: str, assessment: _DeliveryAssessment) -> list[str]:
@@ -1032,7 +1035,7 @@ class DeliveryReview:
                 return [*self._result_issues(result, binding),
                         *self._concern_issues(observations, binding)] if self.track_findings else self._result_issues(result, binding)
             return [('Current delivery lacks a complete independent whole-delivery review'
-                     if self.protocol in {'task.v3', 'task.v4'} else
+                     if self.protocol in {'task.v3', 'task.v4', 'task.v5'} else
                      'Current canonical delivery lacks a complete independent whole-delivery review')]
         except _ERRORS as exc:
             return ['Delivery review cannot be verified: ' + str(exc)]

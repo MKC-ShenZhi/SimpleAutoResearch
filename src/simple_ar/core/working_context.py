@@ -99,7 +99,7 @@ def select_working_context(
     summarized_through_turn: int = 0,
     history_access: str = 'read_history',
     trailing_messages: Sequence[Mapping[str, Any]] = (),
-    material_policy: Literal['ranked', 'referenced', 'scoped', 'retained'] = 'ranked',
+    material_policy: Literal['ranked', 'referenced', 'scoped', 'retained', 'working'] = 'ranked',
     operation_history: Sequence[Mapping[str, Any]] | None = None,
     require_work_notes: bool = False,
     fit_work_notes: bool = False,
@@ -173,6 +173,11 @@ def select_working_context(
     ``sparse_handoffs`` retires individually cited closed turns while retaining
     recent work and explicitly selected/current originals; uncited gaps stay.
 
+    ``working`` uses that same journal and version admission, but current
+    production names only prioritize material: a usable supplied handoff may
+    retire its repeated body. Explicit selections and the latest atomic turn
+    remain original input. Inventory membership never pins a body indefinitely.
+
     ``native_observations`` contains transient source locators derived by the
     message owner from actual presentation. Explicit supply matches receipt,
     field, recorded version and range, never text elsewhere in a block. Stale
@@ -199,10 +204,11 @@ def select_working_context(
         raise ValueError('Token costs and target must be nonnegative')
     if type(economical_after_turn) is not int or economical_after_turn < 0:
         raise ValueError('Invalid economical checkpoint history boundary')
-    if material_policy not in ('ranked', 'referenced', 'scoped', 'retained'):
+    if material_policy not in ('ranked', 'referenced', 'scoped', 'retained', 'working'):
         raise ValueError('Unknown working context selection policy')
     scoped_records = material_policy == 'scoped'
-    retained_records = material_policy == 'retained'
+    retained_records = material_policy in {'retained', 'working'}
+    working_records = material_policy == 'working'
     if fit_work_notes and not (retained_records and require_work_notes):
         raise ValueError('Fitted notes require the retained journal working policy')
     owner_records = material_policy in {'referenced', 'scoped'}
@@ -284,6 +290,8 @@ def select_working_context(
         raise ValueError('Processed journal turns require fitted work notes')
     if type(sparse_handoffs) is not bool or sparse_handoffs and not journal_selection:
         raise ValueError('Sparse handoffs require a journal selection')
+    if working_records and not (journal_selection and sparse_handoffs):
+        raise ValueError('Working material requires the sparse journal handoff policy')
     def active(note: Mapping[str, Any]) -> bool:
         return note.get('current') is not False and note.get('status') in (
             None, 'current', 'active', 'ok')
@@ -697,8 +705,8 @@ def select_working_context(
     if retained_records and fit_work_notes:
         for i in ordered:
             row = rows[i]
-            if (row.get('record') in explicit_references or row.get('path') in artifacts
-                    or row.get('absolute_path') in artifacts):
+            if (row.get('record') in explicit_references or not working_records and (
+                    row.get('path') in artifacts or row.get('absolute_path') in artifacts)):
                 admit(i)
 
     if fit_work_notes:
@@ -731,7 +739,8 @@ def select_working_context(
             if supplied_handoffs:
                 ordered = [i for i in ordered if rows[i].get('turn') not in supplied_handoffs
                     or rows[i].get('record') in explicit_references
-                    or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts]
+                    or not working_records and (rows[i].get('path') in artifacts
+                        or rows[i].get('absolute_path') in artifacts)]
             # Retained originals precede optional native history; otherwise an
             # evicted read can lose its only body to unrelated native blocks.
             preferred = set(ordered)
@@ -744,8 +753,8 @@ def select_working_context(
         protected_turns = set()
         if sparse_handoffs:
             protected_turns.update(row['turn'] for row in rows if isinstance(row.get('turn'), int)
-                and (row.get('record') in explicit_references or row.get('path') in artifacts
-                     or row.get('absolute_path') in artifacts))
+                and (row.get('record') in explicit_references or not working_records and (
+                    row.get('path') in artifacts or row.get('absolute_path') in artifacts)))
             protected_turns.update(operation['turn'] for operation in operations
                 if isinstance(operation.get('turn'), int) and (
                     operation.get('reply') in explicit_references

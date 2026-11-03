@@ -442,14 +442,14 @@ class ToolApplication:
             raise ValueError('Unsupported saved working memory; no silent migration')
         if config.get('native_supply_policy') is not None and config['native_supply_policy'] not in RECEIPT_SUPPLY_POLICIES:
             raise ValueError('Unsupported saved native material supply policy')
-        if config.get('context_checkpoint_policy') not in {None, 'economic.v1', 'economic.v2'}:
+        if config.get('context_checkpoint_policy') not in {None, 'economic.v1', 'economic.v2', 'economic.v3'}:
             raise ValueError('Unsupported saved context checkpoint policy')
         if config.get('context_checkpoint_policy') and config.get('memory_protocol') != 'journal.v1':
             raise ValueError('Economic checkpointing requires journal continuity')
         if config.get('memory_protocol') and (config.get('context_protocol') != 'working.v4'
                 or config.get('professional_operations') != 'work.v5'):
             raise ValueError('Journal continuity requires the saved shared native work context')
-        if config.get('delivery_review_protocol') not in {None, 'task.v1', 'task.v2', 'task.v3', 'task.v4'}:
+        if config.get('delivery_review_protocol') not in {None, 'task.v1', 'task.v2', 'task.v3', 'task.v4', 'task.v5'}:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
         if config.get('inspection_coverage_policy') not in {None, 'offered.v1', 'offered.v2'}:
             raise ValueError('Unsupported saved inspection coverage policy; no silent migration')
@@ -457,7 +457,7 @@ class ToolApplication:
             raise ValueError('Unsupported saved inspection finding policy; no silent migration')
         if (config.get('inspection_finding_policy') == 'linked.v1'
                 and (config.get('inspection_coverage_policy') != 'offered.v2'
-                     or config.get('delivery_review_protocol') not in {'task.v3', 'task.v4'})):
+                     or config.get('delivery_review_protocol') not in {'task.v3', 'task.v4', 'task.v5'})):
             raise ValueError('Linked findings require shared inspection and delivery review')
         if (config.get('inspection_coverage_policy') in {'offered.v1', 'offered.v2'}
                 and (config.get('inspection_protocol') != 'subjects.v3'
@@ -1247,7 +1247,7 @@ class ToolApplication:
                 'native_supply_policy':self.state['config'].get('native_supply_policy'),
                 'additional_protection':additional_protection,
                 **({'economic_floor':economic_floor} if economic_floor is not None
-                    and self.state['config'].get('context_checkpoint_policy') == 'economic.v2' else {})}
+                    and self.state['config'].get('context_checkpoint_policy') in {'economic.v2', 'economic.v3'} else {})}
                if journal else {}))
         return refs
 
@@ -1809,7 +1809,7 @@ class ToolApplication:
         config['inspection_execution_protocol'] = 'shared.v1'
         config['inspection_coverage_policy'] = 'offered.v2'
         if config['model'] is not None:
-            config['delivery_review_protocol'] = 'task.v4'
+            config['delivery_review_protocol'] = 'task.v5'
             config['inspection_finding_policy'] = 'linked.v1'
         from simple_ar.app.operation_tools import CURRENT_PROFESSIONAL_CONTRACT
         config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
@@ -1820,7 +1820,7 @@ class ToolApplication:
         config['native_supply_policy'] = TURN_SUPPLY_POLICY
         if automatic_memory:
             config['memory_protocol'] = 'journal.v1'
-            config['context_checkpoint_policy'] = 'economic.v2'
+            config['context_checkpoint_policy'] = 'economic.v3'
         return config, reused, limits, attempts
 
     @classmethod
@@ -3665,13 +3665,14 @@ class ToolApplication:
                 estimate_tokens=estimate_tokens,work_notes=work_notes,
                 require_work_notes=config.get('memory_protocol') == 'journal.v1',
                 fit_work_notes=config.get('memory_protocol') == 'journal.v1',
-                economical_checkpoint=config.get('context_checkpoint_policy') in {'economic.v1', 'economic.v2'},
+                economical_checkpoint=config.get('context_checkpoint_policy') in {'economic.v1', 'economic.v2', 'economic.v3'},
                 economical_after_turn=memory.get('attempted_through_turn', 0),
-                sparse_handoffs=config.get('context_checkpoint_policy') == 'economic.v2',
+                sparse_handoffs=config.get('context_checkpoint_policy') in {'economic.v2', 'economic.v3'},
                 summarized_through_turn=memory['through_turn'],
                 selected_records=selected_records,current_artifacts=sorted(current_artifacts),version_resolver=version,
                 block_request_counts=[turn.get('request_count',1) for turn in turns],
-                material_policy=('retained' if config.get('professional_operations') == 'work.v5'
+                material_policy=('working' if config.get('context_checkpoint_policy') == 'economic.v3' else
+                    'retained' if config.get('professional_operations') == 'work.v5'
                     and config['context_protocol'] == 'working.v4' else
                     'scoped' if config['context_protocol'] == 'working.v4' else
                     'referenced' if config['context_protocol'] in _REFERENCED_CONTEXT_PROTOCOLS else 'ranked'),
@@ -3918,7 +3919,7 @@ class ToolApplication:
                 memory_refs = self._compact_work(context, client, cutoff,
                     decision_tokens=decision_tokens, additional_protection=True, selected_turns=omitted,
                     **({'economic_floor':selection['required_input_tokens']}
-                       if self.state['config'].get('context_checkpoint_policy') == 'economic.v2'
+                       if self.state['config'].get('context_checkpoint_policy') in {'economic.v2', 'economic.v3'}
                           and selection.get('economical_compaction', False) else {}))
             if memory_refs:
                 memory_refs = self._memory_artifacts(context.store, context.attempt.attempt_id)
@@ -4189,7 +4190,7 @@ class ToolApplication:
                     return payload
             hashes = self.workspace.artifact_hashes(delivery['artifacts'])
             package_review = (self.operations is not None and self.operations.delivery_review is not None
-                              and self.operations.delivery_review.protocol in {'task.v3', 'task.v4'})
+                              and self.operations.delivery_review.protocol in {'task.v3', 'task.v4', 'task.v5'})
             if package_review and request.summary_source is not None:
                 # v3 binds the completion claim itself, including the actual
                 # summary source. Never change that claim after its review.

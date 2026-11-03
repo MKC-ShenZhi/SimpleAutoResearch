@@ -737,6 +737,39 @@ class WorkingContextTests(unittest.TestCase):
 
 
 class RetainedWorkingContextTests(unittest.TestCase):
+    def test_working_inventory_prioritizes_current_bodies_without_permanently_pinning_them(self):
+        original = observation(0, 'Observed original conditions. ' * 400,
+            role='historical_observation')
+        arguments = dict(turn_blocks=[block(0, original['text']), block(1, 'Investigated'), block(2, 'Next action')],
+            observations=[original], current_artifacts=[original['path']],
+            version_resolver=lambda _: 'recorded-digest',
+            work_notes=[{'text':'Retained understanding with original conditions and remaining gap.',
+                'records':[original['record']], 'handoff_policy':'citations.v1', 'current':True}],
+            require_work_notes=True, fit_work_notes=True, sparse_handoffs=True,
+            processed_turns=[0], context_token_target=50000)
+        before = deepcopy(arguments)
+        historical, old = select(material_policy='retained', **arguments)
+        current, selected = select(material_policy='working', **arguments)
+        self.assertIn(original['text'], json.dumps(historical))
+        self.assertNotIn(original['text'], json.dumps(current))
+        self.assertIn(arguments['work_notes'][0]['text'], json.dumps(current))
+        self.assertEqual(selected['selected_turns'], [1, 2])
+        self.assertLess(selected['estimated_input_tokens'], old['estimated_input_tokens'])
+        self.assertEqual(arguments, before)
+        # Explicit source selection, failed notes and changed versions each keep
+        # their own behavior; an archived read is never silently re-certified.
+        explicit, _ = select(material_policy='working', selected_records=[original['record']], **arguments)
+        self.assertIn(original['text'], json.dumps(explicit))
+        for notes in ([], [{**arguments['work_notes'][0], 'current':False}]):
+            messages, _ = select(material_policy='working', **{**arguments, 'work_notes':notes})
+            self.assertIn(original['text'], json.dumps(messages))
+        messages, metadata = select(material_policy='working', **{
+            **arguments, 'version_resolver':lambda _: 'changed-digest',
+            'work_notes':[{**arguments['work_notes'][0], 'current':False}]})
+        supplied = json.loads(messages[1]['content'])
+        self.assertTrue(supplied['working_view']['stale_native_observations'])
+        self.assertFalse(any(row['version_status']=='current' for row in metadata['selected_records']))
+
     def test_current_material_precedes_optional_notes_and_keeps_version_checks(self):
         current = observation(0, 'Current measured material. ' * 140,
             path='outputs/current.txt', role='historical_observation')

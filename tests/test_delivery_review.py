@@ -1858,6 +1858,76 @@ class ApplicableDeliveryInspectionTests(unittest.TestCase):
         self.case.send.assert_not_called()
 
 
+class DemandDrivenDeliveryInspectionTests(unittest.TestCase):
+    def setUp(self):
+        from tests.test_professional_work_loop import OperationsWorkLoopTests
+        self.case = OperationsWorkLoopTests()
+        self.case.setUp()
+        self.addCleanup(self.case.doCleanups)
+        self.case._create(goal='Deliver the requested source and supporting appendix. Independently '
+            'verify any empirical or numerical conclusions.', delivery_protocol=None)
+
+    def test_inspector_selects_actual_work_without_automatic_inventory_reading_and_reuses_opinion(self):
+        from tests.test_professional_work_loop import _action
+        self.case._write('tool.py', 'def identity(value):\n    return value\n')
+        unrelated = '# Bundled context, not a requested behavioral claim.\n' * 2000
+        self.case._write('appendix.py', unrelated)
+        def review(view):
+            self.assertEqual(view['proposed_delivery']['scope_policy'], 'applicable.v2')
+            self.assertEqual(len(view['proposed_delivery']['artifacts']), 2)
+            self.assertNotIn(unrelated, json.dumps(self.case.inspection_requests[-1]['messages']))
+            if not view['evidence']:
+                return [_action('read_file', path='workspace/tool.py')]
+            return {'conclusion':'complete', 'findings':[],
+                'evidence':[row['subject'] for row in view['evidence']], 'limitations':[],
+                'applicability':'The bounded source behavior is in scope; the appendix adds no behavioral or empirical claim.',
+                'investigations':[]}
+        self.case.review = review
+        request = {'summary':'Source with bundled appendix', 'artifacts':['tool.py','appendix.py']}
+        self.case._submit(_action('deliver_result', **request))
+        self.assertEqual(self.case.app.session.manifest.status, 'completed')
+        self.assertEqual(len(self.case.inspection_requests), 2)
+        proof = self.case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        inspector = self.case.app.operations.inspection
+        saved = inspector.store.read_json(inspector._path(proof['identity'], 'input'))
+        self.assertEqual(saved['context_checkpoint_policy'], 'economic.v3')
+        self.assertEqual({row['path'] for row in saved['evidence']},
+            {str(self.case.root/'workspace/tool.py')})
+        calls = self.case.send.call_count
+        reused = self.case.app.operations.review_delivery(request, 'reuse-current-opinion', may_start=True)
+        self.assertEqual(reused['identity'], proof['identity'])
+        self.assertEqual(self.case.send.call_count, calls)
+        (self.case.root/'workspace/tool.py').write_text('def identity(value):\n    return None\n')
+        self.assertTrue(self.case.app.operations.delivery_issues(self.case._observations(), request))
+        self.assertEqual(self.case.send.call_count, calls)
+
+    def test_unperformed_independent_calculation_remains_incomplete_with_partial_exit(self):
+        from tests.test_professional_work_loop import _action
+        self.case._write('analysis', 'The observed sample mean is 2.0.\n')
+        def review(view):
+            if not view['evidence']:
+                return [_action('read_file', path='workspace/analysis')]
+            evidence = [row['subject'] for row in view['evidence']]
+            return {'conclusion':'incomplete', 'findings':[], 'evidence':evidence,
+                'limitations':['Independent calculation is unfinished.'],
+                'applicability':'The numerical conclusion requires independent calculation from original observations.',
+                'investigations':[{'claim':'The sample mean is supported by the observations.',
+                    'method':'Read the statement; independent calculation not performed.',
+                    'evidence':evidence, 'reasoning':'The producer statement alone does not verify the mean.',
+                    'outcome':'unresolved'}]}
+        self.case.review = review
+        request = {'summary':'Sample mean', 'artifacts':['analysis']}
+        self.case._submit(_action('deliver_result', **request))
+        self.case._not_delivered()
+        proof = self.case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        self.assertEqual(proof['result']['metadata']['delivery_assessment']['verdict'], 'incomplete')
+        calls = self.case.send.call_count
+        self.case._submit(_action('deliver_result', **request,
+            unresolved=['Independent calculation is unfinished.']))
+        self.assertEqual(self.case.app.session.manifest.status, 'partial')
+        self.assertEqual(self.case.send.call_count, calls)
+
+
 class IndependentDeliveryApplicabilityTests(unittest.TestCase):
     """Independent applicability on the existing delivery path; not scientific QA."""
 
