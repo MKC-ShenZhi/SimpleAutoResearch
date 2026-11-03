@@ -10,7 +10,7 @@ import os
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-from tests.report_review_fixtures import changed_record as _changed_record
+from tests.report_review_fixtures import changed_record as _changed_record, inspection_wire_opinion
 from tests.native_history_fixture import load_native_history
 
 from simple_ar.agent_backends import (
@@ -627,7 +627,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 if '$ref' in investigation:
                     investigation = schema['$defs'][investigation['$ref'].rsplit('/', 1)[-1]]
                 scoped = 'basis' in investigation.get('properties', {})
-                return self._native_message('record_inspection', {
+                opinion = {
                     'conclusion': 'complete', 'findings': [], 'evidence': evidence,
                     'limitations': ['Controlled fixture opinion, not scientific validation.'],
                     'applicability': 'Inspect the supplied artifacts for this fixture.',
@@ -636,7 +636,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         'reasoning': 'The inspected file text was actually supplied.',
                         'evidence': evidence, 'outcome': 'supported',
                         **({'scope': 'The supplied fixture file text only.', 'basis': 'observed'} if scoped else {})}],
-                    'reassessed_prior': []}, 'fixture-review')
+                    'reassessed_prior': []}
+                return self._native_message('record_inspection',
+                    inspection_wire_opinion(opinion, schema), 'fixture-review')
             fake.tool_turn.side_effect = inspect_supplied_material
         binding = {'profile': 'fixture', 'settings': {'model': 'fixture', 'api_mode': 'chat'}}
         fake.connection_binding.return_value = binding

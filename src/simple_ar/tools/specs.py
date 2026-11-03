@@ -7,8 +7,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # Saved method identities select behavior; loading never upgrades an old task.
-NATIVE_WORK_METHODS = frozenset({'goal.v1', 'execute.v1'})
-CURRENT_WORK_METHOD = 'execute.v1'
+EXECUTABLE_WORK_METHODS = frozenset({'execute.v1', 'execute.v2'})
+NATIVE_WORK_METHODS = EXECUTABLE_WORK_METHODS | {'goal.v1'}
+CURRENT_WORK_METHOD = 'execute.v2'
 
 
 def tool_result_payload(observation: dict) -> dict:

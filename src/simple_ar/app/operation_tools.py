@@ -12,7 +12,7 @@ from simple_ar.core.assessments import current_assessments
 from simple_ar.tools.gateway import CommonToolGateway
 from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.permissions import ToolPermissionPolicy
-from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, NATIVE_WORK_METHODS
+from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS
 from simple_ar.tools.workspace import WorkspaceToolGateway, workspace_tool_specs
 from simple_ar.tools.sources import SourceToolGateway, source_tool_specs
 from simple_ar.tools.publication import PublicationToolGateway, publication_tool_specs
@@ -275,7 +275,7 @@ class OperationTools:
                 delivery_protocol=self.delivery_review.protocol if self.delivery_review is not None else None)
         if config.get('work_method') == 'goal.v1':
             self.system = _GOAL_WORK
-        elif config.get('work_method') == 'execute.v1':
+        elif config.get('work_method') in EXECUTABLE_WORK_METHODS:
             self.system = _EXECUTABLE_WORK
         if exact or (preparation is not None or source_owner) and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
@@ -396,7 +396,7 @@ class OperationTools:
     def presentation(self, selected: set[str], mode: str):
         active, catalog = set(), {}
         # Explicit frozen work keeps the operations required by its domain owner.
-        executable = (self.config.get('work_method') == 'execute.v1' and not any(
+        executable = (self.config.get('work_method') in EXECUTABLE_WORK_METHODS and not any(
             self.config.get(key) for key in
             ('code_task', 'execution_contract', 'table_analysis', 'source_generation_protocol')))
         for spec in self.registry.list_specs():

@@ -1276,6 +1276,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 if (isinstance(response, dict) and 'applicability' in terminal['parameters'].get('required', [])):
                     response = {'applicability':'Controlled independent inspector scopes this fixture; '
                         'this response is not scientific quality evidence.', 'investigations':[], **response}
+                from tests.report_review_fixtures import inspection_wire_opinion
+                if isinstance(response, dict):
+                    response = inspection_wire_opinion(response, terminal['parameters'])
                 actions = ([_action('record_inspection', **response)]
                     if isinstance(response, dict) else response)
                 message = {'role': 'assistant', 'content': None,

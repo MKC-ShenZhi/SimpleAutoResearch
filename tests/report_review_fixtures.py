@@ -15,6 +15,33 @@ class CheckpointStop(BaseException):
     """Interrupt outside the agent's handled provider/runtime failures."""
 
 
+def inspection_wire_opinion(response, schema):
+    """Translate controlled flat callbacks to the offered claim-owned wire shape."""
+    if 'findings' in schema.get('properties', {}) or 'findings' not in response:
+        return response
+    response = copy.deepcopy(response)
+    findings = response.pop('findings')
+    evidence = response.pop('evidence', [])
+    checks = response.get('investigations', [])
+    if not checks and (evidence or findings):
+        required = any(row['severity'] == 'required' for row in findings)
+        checks = [{'claim':'The supplied fixture work satisfies its requested statement.',
+            'scope':'Actually supplied fixture text only.', 'basis':'observed' if evidence else 'not_checked',
+            'method':'Read the supplied fixture observations.',
+            'reasoning':'Controlled fixture judgment; not autonomous scientific validation.',
+            'evidence':evidence, 'necessary':True,
+            'outcome':'contradicted' if required else 'supported' if evidence else 'unresolved'}]
+    for check in checks:
+        check['findings'] = []
+    for finding in findings:
+        index = finding.pop('investigation', 0 if len(checks) == 1 else -1)
+        if not 0 <= index < len(checks):
+            raise AssertionError('Fixture finding must identify its actual investigation')
+        checks[index]['findings'].append(finding)
+    response['investigations'] = checks
+    return response
+
+
 def interrupt_checkpoint(saved, predicate):
     def checkpoint(row):
         saved.append(copy.deepcopy(row))

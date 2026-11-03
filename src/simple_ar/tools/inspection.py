@@ -16,7 +16,7 @@ from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.budget import completed_llm_usage_is_accounted
 from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES, TURN_SUPPLY_POLICY
 from simple_ar.integrations.llm import LLMCallStopped, LLMSettings, estimate_tokens
-from simple_ar.tools.specs import CommonToolSpec, ToolResult, NATIVE_WORK_METHODS, tool_result_payload
+from simple_ar.tools.specs import CommonToolSpec, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS, tool_result_payload
 from simple_ar.tools.workspace import FileWindow, workspace_tool_specs
 from simple_ar.tools.delivery_review import applicable_delivery_scope, reassessment_has_subject_support
 
@@ -123,6 +123,29 @@ class _ScopedFinding(_DeliveryFinding):
 class _ScopedDeliveryResponse(_InvestigatedDeliveryResponse):
     investigations: list[_ScopedInvestigation]
     findings: list[_ScopedFinding]
+
+
+class _ClaimInvestigation(_ScopedInvestigation):
+    findings: list[_DeliveryFinding]
+
+
+class _ClaimDeliveryResponse(BaseModel):
+    """Each check owns its evidence and findings; aggregation belongs to the owner."""
+    model_config = ConfigDict(extra='forbid', strict=True)
+    conclusion: Literal['complete', 'incomplete']
+    applicability: str = Field(min_length=1, description='Why the selected checks are sufficient '
+        'for the actual request and completion claim; identify necessary remaining scope.')
+    investigations: list[_ClaimInvestigation]
+    limitations: list[str]
+    reassessed_prior: list[str] = Field(default_factory=list)
+
+    @property
+    def evidence(self) -> list[str]:
+        return list(dict.fromkeys(key for row in self.investigations for key in row.evidence))
+
+    @property
+    def findings(self) -> list[_DeliveryFinding]:
+        return [finding for row in self.investigations for finding in row.findings]
 
 
 class _Finding(BaseModel):
@@ -419,7 +442,7 @@ class InspectionToolGateway:
                 'contradiction with the requested outcome. Optional polish is advisory. '
                 'Do not certify scientific truth from valid record IDs or execution success.')
                 if saved.get('work_method') in NATIVE_WORK_METHODS and self._delivery_scope(saved) else '')
-            if saved.get('work_method') == 'execute.v1' and self._delivery_scope(saved):
+            if saved.get('work_method') in EXECUTABLE_WORK_METHODS and self._delivery_scope(saved):
                 method += (' Investigate the smallest sufficient body of evidence for the requested outcome. '
                     'Reuse applicable recorded executions when judging reproducibility; independently test '
                     'the consequential claims rather than replaying every producer operation. A successful '
@@ -430,6 +453,17 @@ class InspectionToolGateway:
                     'Do not endorse an inference merely because the producer and generated tables agree. '
                     'Batch useful reads or calculations, finish necessary investigations, and return '
                     'an opinion without adding unrequested statistical or presentation projects.')
+            if saved.get('work_method') == 'execute.v2' and self._delivery_scope(saved):
+                method += (' Select the consequential claims before choosing checks. For a comparison, '
+                    'identify both quantities, their units and reference conditions, then independently '
+                    'test the stated direction or difference. Correct table entries do not establish '
+                    'that prose compares them correctly. Distinguish arithmetic ordering, association '
+                    'and causal explanation; test which relation the actual evidence supports. '
+                    'Each investigation carries its own evidence and findings; do not repeat a global '
+                    'evidence list or assign findings to numeric investigation indexes. Reuse successful '
+                    'observations within this review. Once text extraction succeeds, read that text '
+                    'instead of repeatedly extracting it or probing keywords. If a capability is '
+                    'unavailable, state that limit once and judge only the scope actually checked.')
             return (contract + method + ' You may use only operations offered in this decision. '
                 'Original targets and sources are immutable. Create or change helper files only under '
                 f"workspace/inspection-work/{saved['identity']}/. "
@@ -571,7 +605,9 @@ class InspectionToolGateway:
                 raise ValueError('Inspection work directory cannot be a link')
         target = self.workspace.resolve(value, write=True)
         if target == base or not target.is_relative_to(base):
-            raise ValueError('Inspection helper destination must be inside its own work directory')
+            detail = (': ' + json.dumps({'path':value, 'resolved':str(target), 'required_parent':str(base)})
+                if saved.get('work_method') == 'execute.v2' else '')
+            raise ValueError('Inspection helper destination must be inside its own work directory' + detail)
         originals = [Path(row['path']).resolve() for row in saved['targets'] if row.get('path')]
         originals.extend(Path(row['path']).resolve() for row in saved['evidence']
             if row.get('path') and self._shared_original(saved, row))
@@ -595,9 +631,15 @@ class InspectionToolGateway:
             and (self._shared_original(saved, row) or row['subject'] in selected_ids))]
         self._check_versions(rows, identity)
 
+    @staticmethod
+    def _delivery_evidence(saved: dict, response: dict) -> list[str]:
+        if saved.get('work_method') == 'execute.v2':
+            return list(dict.fromkeys(key for row in response['investigations'] for key in row['evidence']))
+        return response.get('evidence', [])
+
     def _selected_inspection_rows(self, saved: dict, response: dict) -> list[dict]:
         if self._delivery_scope(saved):
-            selected = set(response.get('evidence', []))
+            selected = set(self._delivery_evidence(saved, response))
         elif self.protocol:
             selected = {source for decision in response.get('decisions', [])
                 for source in decision.get('evidence', [])}
@@ -925,7 +967,7 @@ class InspectionToolGateway:
                 journal_cache=journal_cache, validation_records=validation_records)
 
         if self._delivery_scope(saved):
-            selected = [observed[key] for key in response['evidence']]
+            selected = [observed[key] for key in self._delivery_evidence(saved, response)]
             bindings = {'delivery':check(selected)}
             if self._applicable_scope(saved) and response.get('reassessed_prior'):
                 # The package inventory is an acceptance/version obligation,
@@ -1915,10 +1957,11 @@ class InspectionToolGateway:
                     return 'applicability' in function['parameters'].get('required', [])
         return offering
 
-    def _delivery_decision(self, saved: dict, value: dict) -> _DeliveryResponse:
+    def _delivery_decision(self, saved: dict, value: dict) -> _DeliveryResponse | _ClaimDeliveryResponse:
         linked = saved.get('finding_policy') == 'linked.v1'
         investigated = ('applicability' in value or self._investigation_contract(saved))
-        decision = (_ScopedDeliveryResponse if saved.get('work_method') in NATIVE_WORK_METHODS else
+        decision = (_ClaimDeliveryResponse if saved.get('work_method') == 'execute.v2' else
+            _ScopedDeliveryResponse if saved.get('work_method') in NATIVE_WORK_METHODS else
             _InvestigatedDeliveryResponse if investigated else
             _DeliveryResponseLinked if linked else _DeliveryResponse).model_validate(value)
         if investigated:
@@ -1934,7 +1977,7 @@ class InspectionToolGateway:
                 if (row.outcome == 'contradicted' and getattr(row, 'necessary', True) and not any(
                         finding.severity == 'required' for finding in decision.findings)):
                     raise ValueError('A contradicted requested claim must retain a required finding')
-        if isinstance(decision, _ScopedDeliveryResponse):
+        if isinstance(decision, (_ScopedDeliveryResponse, _ClaimDeliveryResponse)):
             executed = None
             for i, row in enumerate(decision.investigations):
                 if not row.scope.strip() or row.basis == 'not_checked' and row.outcome != 'unresolved':
@@ -1947,15 +1990,20 @@ class InspectionToolGateway:
                     if (not row.execution_records or len(set(row.execution_records)) != len(row.execution_records)
                             or not set(row.execution_records) <= executed):
                         raise ValueError('Executed investigations require actual own successful action records')
-                findings = [f for f in decision.findings if f.investigation == i]
+                findings = (row.findings if isinstance(decision, _ClaimDeliveryResponse) else
+                    [f for f in decision.findings if f.investigation == i])
                 if row.necessary and row.outcome == 'contradicted' and not any(f.severity == 'required' for f in findings):
                     raise ValueError('Each contradicted requested claim needs its own required finding')
-            for finding in decision.findings:
-                if (finding.investigation >= len(decision.investigations)
-                        or finding.severity == 'required'
-                        and (not decision.investigations[finding.investigation].necessary
-                             or decision.investigations[finding.investigation].outcome != 'contradicted')):
+                if (isinstance(decision, _ClaimDeliveryResponse) and any(f.severity == 'required' for f in findings)
+                        and (not row.necessary or row.outcome != 'contradicted')):
                     raise ValueError('Required findings must bind an actually contradicted investigation')
+            if isinstance(decision, _ScopedDeliveryResponse):
+                for finding in decision.findings:
+                    if (finding.investigation >= len(decision.investigations)
+                            or finding.severity == 'required'
+                            and (not decision.investigations[finding.investigation].necessary
+                                 or decision.investigations[finding.investigation].outcome != 'contradicted')):
+                        raise ValueError('Required findings must bind an actually contradicted investigation')
         if linked:
             allowed = {row['id'] for row in saved['prior_required']}
             if (len(set(decision.reassessed_prior)) != len(decision.reassessed_prior)
@@ -2052,7 +2100,7 @@ class InspectionToolGateway:
                 else 'passed' if complete else 'incomplete',
             'findings':findings,
             **({'applicability': decision.applicability,
-                'investigations': [row.model_dump(mode='json') for row in investigations]}
+                'investigations': [row.model_dump(mode='json', exclude={'findings'}) for row in investigations]}
                 if investigations is not None else {}),
             **({'reassessed_prior': reassessed} if linked else {}),
             'evidence_sha256':self._evidence_with_dependencies(
@@ -2256,7 +2304,10 @@ class InspectionToolGateway:
                 for row in rows[:4] if isinstance(rows, list) else []:
                     if not isinstance(row, dict):
                         continue
-                    findings = row.get('findings', [])
+                    findings = ([finding for check in row.get('investigations', [])
+                        if isinstance(check, dict) and isinstance(check.get('findings'), list)
+                        for finding in check['findings']]
+                        if package and saved.get('work_method') == 'execute.v2' else row.get('findings', []))
                     candidates.append({**({'scope': 'proposed_delivery'} if package else
                         {'subject': str(row.get('subject', '<omitted>'))[:120]}),
                         'candidate_messages': [str(item.get('message', ''))[:320]
@@ -3680,6 +3731,35 @@ class InspectionToolGateway:
                 'remaining_after':allowance[0]}})
         return result.model_dump(mode='json')
 
+    def _delivery_schema(self, saved: dict, response_model: type[BaseModel]) -> dict:
+        schema = response_model.model_json_schema()
+        sources = [row['subject'] for row in [*saved['targets'], *saved['evidence']]
+            if row.get('readable') and row.get('sha256') and row.get('windows')]
+        nested = response_model is _ClaimDeliveryResponse
+
+        def choices(field: dict, values: list) -> None:
+            field['uniqueItems'] = True
+            if values:
+                field['items']['enum'] = values
+            else:
+                field['maxItems'] = 0
+
+        for definition in [schema, *schema.get('$defs', {}).values()]:
+            properties = definition.get('properties', {})
+            if 'artifacts' in properties:
+                field = properties['artifacts']
+                if saved['delivery_context']['artifacts']:
+                    field['items']['enum'] = sorted(saved['delivery_context']['artifacts'])
+                else:
+                    field['maxItems'] = 0
+            if 'evidence' in properties and (nested or definition is schema):
+                choices(properties['evidence'], sources)
+            if nested and 'execution_records' in properties:
+                choices(properties['execution_records'], sorted(self._executed_check_records(saved)))
+        if response_model is _DeliveryResponseLinked or nested:
+            choices(schema['properties']['reassessed_prior'], [row['id'] for row in saved['prior_required']])
+        return schema
+
     def _inspect(self, saved: dict[str, Any], request: InspectionRequest, identity: str,
                  remaining: list[int], client: Any, *, dispatch: Callable | None = None) -> dict:
         """One native conversation; the existing owner binds its final opinion."""
@@ -3701,7 +3781,8 @@ class InspectionToolGateway:
                     'Historical observations grant no current evidence, permission or repeated execution.',
                 'parameters':_InspectionHistory.model_json_schema()}})
         package = self._delivery_scope(saved)
-        response_model = ((_ScopedDeliveryResponse if saved.get('work_method') in NATIVE_WORK_METHODS else
+        response_model = ((_ClaimDeliveryResponse if saved.get('work_method') == 'execute.v2' else
+                           _ScopedDeliveryResponse if saved.get('work_method') in NATIVE_WORK_METHODS else
                            _InvestigatedDeliveryResponse if self._investigation_contract(saved, offering=True)
                            else _DeliveryResponseLinked if saved.get('finding_policy') == 'linked.v1'
                            else _DeliveryResponse) if package else
@@ -3742,28 +3823,7 @@ class InspectionToolGateway:
         invalid_finals = 0
         while True:
             if package:
-                schema = response_model.model_json_schema()
-                finding_type = schema['properties']['findings']['items']['$ref'].rsplit('/', 1)[-1]
-                artifact_schema = schema['$defs'][finding_type]['properties']['artifacts']
-                if saved['delivery_context']['artifacts']:
-                    artifact_schema['items']['enum'] = sorted(saved['delivery_context']['artifacts'])
-                else:
-                    artifact_schema['maxItems'] = 0
-                sources = [row['subject'] for row in [*saved['targets'], *saved['evidence']]
-                    if row.get('readable') and row.get('sha256') and row.get('windows')]
-                schema['properties']['evidence']['uniqueItems'] = True
-                if sources:
-                    schema['properties']['evidence']['items']['enum'] = sources
-                else:
-                    schema['properties']['evidence']['maxItems'] = 0
-                if response_model is _DeliveryResponseLinked:
-                    prior = [row['id'] for row in saved['prior_required']]
-                    schema['properties']['reassessed_prior']['uniqueItems'] = True
-                    if prior:
-                        schema['properties']['reassessed_prior']['items']['enum'] = prior
-                    else:
-                        schema['properties']['reassessed_prior']['maxItems'] = 0
-                terminal['function']['parameters'] = schema
+                terminal['function']['parameters'] = self._delivery_schema(saved, response_model)
             elif self.adaptive:
                 # Rebuild from cumulative real observations before projection and
                 # capacity estimates, including sources absent from the working view.

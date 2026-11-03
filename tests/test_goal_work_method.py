@@ -4,6 +4,7 @@ Model decisions are controlled here; execution, approvals, receipts and recovery
 are real. These tests do not measure autonomous model quality.
 """
 from copy import deepcopy
+import hashlib
 import json
 import sys
 import unittest
@@ -72,7 +73,12 @@ class GoalWorkTests(unittest.TestCase):
         def review(view):
             response = case._review_complete_targets(view)
             if isinstance(response, dict):
-                response['investigations'] = [{'claim': 'Optional colour refinement.',
+                response['investigations'] = [{'claim':'The note is a bounded statement of supplied observations.',
+                    'necessary':True, 'scope':'Actually read note and supplied source observations.',
+                    'basis':'observed', 'method':'Read the supplied text.',
+                    'reasoning':'The note retains the supplied evidence limits.',
+                    'evidence':response['evidence'], 'outcome':'supported'},
+                    {'claim': 'Optional colour refinement.',
                     'necessary': False, 'scope': 'Optional presentation only.', 'basis': 'not_checked',
                     'method': 'Not undertaken; not requested.', 'reasoning': 'No necessary work is missing.',
                     'evidence': [], 'outcome': 'unresolved'}]
@@ -92,8 +98,11 @@ class GoalWorkTests(unittest.TestCase):
         self.assertEqual(case.send.call_count, calls)
         self.assertEqual(case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['identity'],
                          proof['identity'])
-        case._submit(_action('write_file', path='note.md', content='Changed note for the next request.\n'),
+        case._submit(_action('write_file', path='note.md', content='Changed note for the next request.\n',
+            expected_sha256=hashlib.sha256((case.root/'workspace/note.md').read_bytes()).hexdigest()),
                      feedback='Revise the note but preserve the original observations.')
+        case._ok('write_file')
+        self.assertEqual((case.root/'workspace/note.md').read_text(), 'Changed note for the next request.\n')
         case._submit(_action('deliver_result', **claim))
         self.assertGreater(case.send.call_count, calls)
         self.assertEqual(case.app.session.manifest.status, 'completed')
@@ -155,7 +164,7 @@ class GoalWorkTests(unittest.TestCase):
 
     def test_default_work_interface_selects_existing_operations_without_changing_permission(self):
         case = self.case
-        self.assertEqual(case.app.state['config']['work_method'], 'execute.v1')
+        self.assertEqual(case.app.state['config']['work_method'], 'execute.v2')
         case.app.state['config']['tool_contracts'] = 'on_demand'
         case.app._save()
         case._reload()
@@ -181,6 +190,66 @@ class GoalWorkTests(unittest.TestCase):
         case._reload()
         self.assertIn('review_result', {tool['function']['name'] for tool in case.app.schemas})
         self.assertEqual(case.app.state['config']['work_method'], 'goal.v1')
+
+    def test_claim_owned_defect_survives_rejected_opinion_reload_and_revision(self):
+        case = self.case
+        case._write('note.md', 'The population mean is 2.0.\n')
+        source_bytes = (case.inputs/'observations.csv').read_bytes()
+        malformed, revised = True, False
+        concern = 'The three supplied observations support a sample mean, not a population mean.'
+
+        def review(view):
+            schema = next(row['function']['parameters'] for row in
+                case.inspection_requests[-1]['tools'] if row['function']['name'] == 'record_inspection')
+            self.assertNotIn('evidence', schema['properties'])
+            self.assertNotIn('findings', schema['properties'])
+            paths = ['measurements/observations.csv', 'note.md']
+            sources = case._inspection_sources(view, *paths)
+            missing = [_action('read_file', path=path) for path, row in zip(paths, sources) if row is None]
+            if missing:
+                return missing
+            note = ''.join(window['text'] for window in sources[1]['text_windows'])
+            self.assertIn('sample' if revised else 'population', note)
+            check = {'claim':'The note limits inference to the supplied observations.',
+                'scope':'The actual note and three supplied CSV rows.', 'basis':'observed',
+                'method':'Compare the stated inference scope with the supplied observation scope.',
+                'reasoning': 'Controlled fixture judgment of the text actually read.',
+                'evidence':[row['subject'] for row in sources], 'necessary':True,
+                'outcome':'supported' if revised else 'contradicted',
+                'findings':[] if revised else [{'severity':'required', 'message':concern,
+                    'artifacts':[str(case.root/'workspace/note.md')]}]}
+            if malformed:
+                check['claim_short'] = 'Undeclared field must remain rejected.'
+            return {'applicability':'Check the requested note against the supplied observation scope.',
+                'conclusion':'complete', 'investigations':[check], 'limitations':[],
+                'reassessed_prior':[row['id'] for row in view.get('prior_required', [])]}
+
+        case.review = review
+        claim = {'summary':'Bounded explanation of the supplied observations.', 'artifacts':['note.md']}
+        case._submit(_action('deliver_result', **claim))
+        rejected = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        self.assertIn('claim_short', rejected['error'])
+        self.assertEqual(rejected['result']['data']['rejected_opinion']['candidate_excerpt'][0]['candidate_messages'],
+                         [concern])
+        self.assertFalse((case.root/'delivery.json').exists())
+        trace = case.app.session.store.resolve(rejected['result']['data']['rejected_opinion']['record'])
+        original_trace = trace.read_bytes()
+        case._reload()
+        malformed = False
+        case._submit(_action('deliver_result', **claim))
+        assessment = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+        self.assertEqual(assessment['verdict'], 'needs_revision')
+        self.assertEqual(assessment['findings'][0]['message'], concern)
+        self.assertFalse((case.root/'delivery.json').exists())
+        revised = True
+        case._submit(_action('write_file', path='note.md',
+            content='The sample mean of the three supplied observations is 2.0.\n',
+            expected_sha256=hashlib.sha256((case.root/'workspace/note.md').read_bytes()).hexdigest()))
+        case._ok('write_file')
+        case._submit(_action('deliver_result', **claim))
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertEqual(trace.read_bytes(), original_trace)
+        self.assertEqual((case.inputs/'observations.csv').read_bytes(), source_bytes)
 
     def test_last_affordable_call_can_deliver_partial_without_unexecutable_read(self):
         case = self.case
@@ -211,10 +280,20 @@ class GoalWorkTests(unittest.TestCase):
                 'basis': 'executed', 'execution_records': ['made-up-receipt'], 'method': 'Claimed a run.',
                 'reasoning': 'No actual computation was performed.', 'evidence': ['evidence-1'],
                 'outcome': 'unresolved'}]}
-        with self.assertRaisesRegex(ValueError, 'actual own successful'):
-            inspector._delivery_decision(saved, value)
-        value['investigations'][0].update(basis='not_checked', execution_records=[])
-        value['findings'] = [{'severity': 'required', 'message': 'Must be wrong because not checked.',
-                              'artifacts': ['note'], 'investigation': 0}]
-        with self.assertRaisesRegex(ValueError, 'actually contradicted'):
-            inspector._delivery_decision(saved, value)
+        for method in ('goal.v1', 'execute.v2'):
+            with self.subTest(method=method):
+                saved['work_method'] = method
+                opinion = deepcopy(value)
+                if method == 'execute.v2':
+                    opinion.pop('evidence')
+                    opinion['investigations'][0]['findings'] = opinion.pop('findings')
+                with self.assertRaisesRegex(ValueError, 'actual own successful'):
+                    inspector._delivery_decision(saved, opinion)
+                opinion['investigations'][0].update(basis='not_checked', execution_records=[])
+                finding = {'severity':'required', 'message':'Must be wrong because not checked.', 'artifacts':['note']}
+                if method == 'execute.v2':
+                    opinion['investigations'][0]['findings'] = [finding]
+                else:
+                    opinion['findings'] = [{**finding, 'investigation':0}]
+                with self.assertRaisesRegex(ValueError, 'actually contradicted'):
+                    inspector._delivery_decision(saved, opinion)
