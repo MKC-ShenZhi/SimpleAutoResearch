@@ -13,6 +13,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
+- Inspection reuses selected materials and deliverables without filling spare context with unrelated historical source text; additional evidence remains available on demand.
 - The local interface accepts feedback while work is running, shows pending input, and avoids duplicate execution when the same submission is resent.
 - Terminal and interface reuse share retained-delivery checks. Reusing an ordinary project does not load its old model or inherit execution permissions and allowances.
 - Terminal and local-interface views share saved task status and pending command approvals; viewing status does not call a model or execute commands.

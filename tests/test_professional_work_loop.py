@@ -4630,6 +4630,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._create()
         target = 'Current user material.\n' + 'x ' * 60000
         self._write('target.txt', target)
+        self._submit(_action('read_file', path='target.txt', offset_bytes=512,
+            max_bytes=64000, full_digest=True))
         for index in range(8):
             name = f'prior-{index}.txt'
             self._write(name, f'Prior observation {index}.\n' + 'a ' * 31000)
@@ -4655,7 +4657,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         identity = Path(result['data']['record']).parts[1]
         saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
         self.assertEqual(saved['source_priming_policy'], 'priority.v1')
-        self.assertTrue(any(window.get('source_reference') for row in saved['evidence'] for window in row['windows']))
+        self.assertTrue(any(window.get('source_reference')
+            for row in [*saved['targets'], *saved['evidence']] for window in row['windows']))
+        self.assertFalse(any(Path(row['path']).name.startswith('prior-') for row in saved['evidence']))
+        self.assertTrue(any(Path(row['path']).name == 'conditions.txt' for row in saved['evidence']))
 
     def test_delivery_reuses_large_set_before_reserving_missing_ranges(self):
         from simple_ar.tools.workspace import FileWindow

@@ -1486,11 +1486,11 @@ class InspectionToolGateway:
                 excluded_paths=targets, context={}, remaining_capacity=min(96000, remaining[0])))
             return
 
-        # Reuse actual current target/delivery windows first. Only then reserve
-        # the missing current ranges before offering unrelated historical reads.
-        # The original read is not an inherited opinion or a new permission.
+        # Reuse originals selected by this inspection, not everything the parent
+        # happened to read. Available capacity is not evidence relevance. Other
+        # sources remain discoverable through source_history and workspace reads.
         default_window = FileWindow.model_fields['max_bytes'].default
-        primary = set(targets)
+        primary = set(targets) | set(paths)
         if self._delivery_scope(saved):
             primary.update(str(self.workspace.resolve(path)) for path in saved['delivery_context']['artifacts'])
         candidates = {}
@@ -1506,20 +1506,6 @@ class InspectionToolGateway:
                 inventories=[{'candidate_files': candidates}], provider=self.material_observations,
                 roots=list(candidates), excluded_paths=set(), context={},
                 remaining_bytes=remaining[0] - default_window))
-        reserved = default_window
-        for path, size in candidates.items():
-            owners = [row for row in subjects if row['path'] == path and row.get('readable')]
-            missing = sum(end-start for start, end in self._missing_original_ranges(size, owners))
-            reserved += missing if path in targets else min(missing, default_window)
-        capacity = max(0, remaining[0] - reserved)
-        if capacity:
-            inventories = ([{'candidate_files': {row['path']: row['windows'][0]['size_bytes']
-                            for row in saved['evidence'] if row.get('readable') and row.get('sha256')}}]
-                           if paths else None)
-            supply(material_observation_seed(workspace=self.workspace, inventories=inventories,
-                provider=self.material_observations,
-                roots=paths or [str(root) for root in self.workspace.mounts.values()],
-                excluded_paths=set(candidates), context={}, remaining_bytes=capacity))
 
     def _complete_target(self, target: dict, rows: list[dict]) -> bool:
         """Actual decoded ranges, not a model declaration or a matching copy."""

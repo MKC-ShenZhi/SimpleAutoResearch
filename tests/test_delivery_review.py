@@ -1536,6 +1536,7 @@ class ApplicableDeliveryInspectionTests(unittest.TestCase):
                 entry = next(row for row in descriptors if row['path'] == str(source))
                 records.append(entry['records'][0]['record'])
                 return [_action('read_file', path=records[-1], max_bytes=64000),
+                    _action('read_file', path=str(source), max_bytes=4096),
                     _action('read_file', path='note.dat', max_bytes=4096)]
             return self._complete(view)
         self.case.review = review
