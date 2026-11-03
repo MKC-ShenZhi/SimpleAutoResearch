@@ -4408,7 +4408,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     if row['text'] in (basis, line_text)))}]}
         self.review = revised
         self._reload()
-        result = self._inspect(['revision.md'], ['basis.txt', 'lines.txt'])
+        selected_evidence = ['basis.txt', {'path':'lines.txt', 'start_line':3, 'max_lines':2}]
+        result = self._inspect(['revision.md'], selected_evidence)
         self.assertEqual(result['status'], 'ok', result)
         self.assertEqual(len(self.inspection_requests)-before, 1,
                          'Previously observed supporting bytes need no new model read requests')
@@ -4416,8 +4417,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         identity = Path(result['data']['record']).parts[1]
         saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
         self.assertFalse(any(w.get('source_reference') for row in saved['targets'] for w in row['windows']))
-        self.assertTrue(any(w.get('source_reference') for row in saved['evidence'] for w in row['windows']))
-        self.assertEqual(saved['arguments']['evidence'], ['basis.txt', 'lines.txt'])
+        self.assertEqual(saved['arguments']['evidence'], selected_evidence)
         self.assertEqual(_assessments(result)[0]['evidence_sha256'], {
             str(self.root/'workspace'/name): _digest(self.root/'workspace'/name)
             for name in ('basis.txt', 'lines.txt')})
@@ -4527,7 +4527,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(saved['arguments']['evidence'], [])
         self.assertEqual(saved['arguments']['targets'], [str(self.root/'workspace/report.md')])
         self.assertFalse(any(w.get('source_reference') for row in saved['targets'] for w in row['windows']))
-        self.assertTrue(any(w.get('source_reference') for row in saved['evidence'] for w in row['windows']))
+        self.assertFalse(any(w.get('source_reference') for row in saved['evidence'] for w in row['windows']),
+            'A new independent read is not relabeled as an automatically inherited parent receipt')
         self.assertEqual(self._versions(self.root/f'tools/inspection/{prior_identity}'), prior_records)
         self.assertEqual([entry.to_dict() for entry in self.app.ledger.entries][:len(old_entries)], old_entries)
         for path, raw in original_receipts.items():
