@@ -2516,10 +2516,14 @@ class InspectionToolGateway:
             view['source_rounds_remaining'] = 6-len(saved.get('source_rounds',[]))
         return view
 
-    def _working_messages(self, saved: dict, request: InspectionRequest, history: list,
+    def _working_messages(self, saved: dict, request: InspectionRequest, history: list | None,
                           offered: list, client: Any, *, finish: dict | None = None,
                           validate_capacity: bool = True) -> tuple[list, dict]:
-        """Reuse the common pure projector; original read/response records stay intact."""
+        """Project actual turns; admission uses the owner's closed journal.
+
+        ``None`` requests that journal for a capacity probe. An empty live prefix
+        cannot represent turns already handed off to working notes.
+        """
         from simple_ar.core.working_context import (
             current_material_paths, processed_journal_turns, select_working_context)
 
@@ -2566,27 +2570,37 @@ class InspectionToolGateway:
         pinned = {(row['path'], row['sha256']): row for role in ('targets', 'evidence')
             for row in base[role] if row.get('text_windows')}
         blocks, current, read_turns = [], [], {}
-        for message in history[2:]:
-            if message['role'] == 'assistant' and current:
+        if history is None:
+            # Preserve original round positions, including unfinished gaps. Only
+            # verified closed receipts may enter an admission projection.
+            for number in range(len(saved.get('source_rounds', []))) if continuity else ():
+                trace = self._closed_source_round(saved, number)
+                blocks.append([] if trace is None else [trace['response'], *[
+                    {'role': 'tool', 'tool_call_id': row['call_id'],
+                     'content': json.dumps(row['result'], ensure_ascii=False)} for row in trace['results']]])
+        else:
+            for message in history[2:]:
+                if message['role'] == 'assistant' and current:
+                    blocks.append(current)
+                    current = []
+                current.append(message)
+            if current:
                 blocks.append(current)
-                current = []
-            if message['role'] == 'tool':
+        for number, block in enumerate(blocks):
+            for index, message in enumerate(block):
+                if message['role'] != 'tool':
+                    continue
                 result = json.loads(message['content'])
                 data = result.get('data', {})
                 if result.get('tool_name') == 'read_file' and result.get('status') == 'ok':
-                    read_turns[data.get('subject')] = len(blocks)
+                    read_turns[data.get('subject')] = number
                 owner = pinned.get((data.get('path'), data.get('sha256')))
                 if (result.get('tool_name') == 'read_file' and result.get('status') == 'ok'
                         and owner and data.get('subject') == owner.get('subject') and data.get('text_windows')
                         and all(window in owner['text_windows'] for window in data['text_windows'])):
-                    # Keep the atomic tool reply, but supply its exact body once
-                    # through its current material owner. Raw receipts stay intact.
                     data = {key: value for key, value in data.items() if key != 'text_windows'}
                     data['text_window_owner'] = owner['subject']
-                    message = {**message, 'content': json.dumps({**result, 'data': data}, ensure_ascii=False)}
-            current.append(message)
-        if current:
-            blocks.append(current)
+                    block[index] = {**message, 'content': json.dumps({**result, 'data': data}, ensure_ascii=False)}
         # Supplementary evidence uses the same bounded material selector as
         # ordinary work. Retiring a native turn must not retire its only usable
         # source body while unused input capacity remains. Original read IDs,
@@ -2681,7 +2695,7 @@ class InspectionToolGateway:
                                 {'delivery_review.v2','delivery_review.v3'} else []))),
                 'processed_turns':processed_journal_turns(journal_rows, memory['compacted_records']),
                 **({'archived_turns':processed_journal_turns(journal_rows, memory.get('archived_records', ())) }
-                   if saved.get('work_method') in NATIVE_WORK_METHODS else {})
+                   if economic and saved.get('work_method') in NATIVE_WORK_METHODS else {})
                 } if continuity else {}),
             history_access=('read_history' if history else 'read_file at the recorded authorized source path and range'),
             trailing_messages=[finish] if finish is not None else [])
@@ -3337,7 +3351,7 @@ class InspectionToolGateway:
             row = saved['targets'][index]
             if not isinstance(value, str) or row.get('complete') or not row.get('readable'):
                 continue
-            _, projection = self._working_messages(saved, request, [], offered, client)
+            _, projection = self._working_messages(saved, request, None, offered, client)
             # Optional originals can yield to required target bytes. The final
             # candidate projection below still enforces the actual input target.
             cost = ('required_input_tokens' if self.adaptive
@@ -3361,7 +3375,7 @@ class InspectionToolGateway:
             merged['complete'] = self._complete_target(merged, [merged])
             if merged['complete']:
                 merged.pop('limitation', None)
-            _, admitted = self._working_messages(candidate, request, [], offered, client,
+            _, admitted = self._working_messages(candidate, request, None, offered, client,
                 validate_capacity=False)
             if admitted['estimated_input_tokens'] <= admitted['input_token_target']:
                 saved['targets'][index] = merged
@@ -3497,7 +3511,7 @@ class InspectionToolGateway:
         reserve = (FileWindow.model_fields['max_bytes'].default
             if saved.get('source_priming_policy') == 'priority.v1' else 0)
         while pending and remaining[0] > reserve:
-            _, projection = self._working_messages(saved, request, [], offered, client,
+            _, projection = self._working_messages(saved, request, None, offered, client,
                 validate_capacity=False)
             if projection['required_input_tokens'] >= projection['input_token_target']:
                 break  # Source reads cannot repair required-input overflow.
@@ -3555,7 +3569,7 @@ class InspectionToolGateway:
                 break
             # Evaluate the whole round once instead of rebuilding the complete
             # context and rechecking every file after each decoded window.
-            messages, projection = self._working_messages(saved, request, [], offered, client,
+            messages, projection = self._working_messages(saved, request, None, offered, client,
                 validate_capacity=False)
             visible = json.loads(messages[1]['content']).get('working_view', {}).get('observations', [])
             following = []
@@ -3963,7 +3977,7 @@ class InspectionToolGateway:
             if shared and 'read_limit' in record:
                 read_limit = record['read_limit']
             elif self.progressive and not rejected_final:
-                _, base_projection = self._working_messages(saved,request,messages[:2],[*tools,terminal],client)
+                _, base_projection = self._working_messages(saved,request,None,[*tools,terminal],client)
                 # Reused optional originals can be evicted for a useful unseen
                 # window; the next actual request still has to fit its target.
                 cost = ('required_input_tokens' if self.adaptive

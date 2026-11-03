@@ -5712,7 +5712,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         from simple_ar.app.professional_conversation import ProfessionalConversation
         self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
             context_input_tokens=12000))
-        self._create(goal='Deliver a Markdown text report describing only the supplied record scope.')
+        self._create(goal='Deliver a Markdown text report describing only the supplied record scope.',
+            current_method=True)
         for number in range(4):
             (self.inputs/f'source-{number}.txt').write_text(f'Original source {number}.\n'+'scope '*4000, encoding='utf-8')
         author = 'Author interpretation must not become independent evidence.'
@@ -5787,6 +5788,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         memory = owner._conversation_memory(saved, owner._conversation_rows(saved))
         self.assertTrue(memory['notes'])
         self.assertTrue(memory['compacted_records'])
+        self.assertTrue(memory['archived_records'])
         self.assertTrue(all(note['observed_versions'] for note in memory['notes']))
         self.assertTrue(all(record.startswith(source_prefix)
             for record in memory['compacted_records']))

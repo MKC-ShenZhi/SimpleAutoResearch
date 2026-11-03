@@ -13,6 +13,10 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - One candidate submission includes independent checking and commits the exact checked version when eligible. Delivery owns claim, inventory and opinion binding across execution, recovery and feedback.
 - Independent checking challenges consequential inferences against original evidence and alternative explanations, while reusing applicable execution records.
 
+### Fixed
+
+- Independent checks retain their original closed turns when estimating input capacity after compaction, so working notes do not prevent further source investigation.
+
 ## 2026-11-03
 
 ### Added
