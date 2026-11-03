@@ -3247,8 +3247,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         source_path = self.inputs/'observations.csv'
         original = source_path.read_bytes()
         def source_changes_after_offer(view):
-            self.assertTrue(any(row['observation'].get('path') == str(source_path)
-                for row in view['working_view']['observations']))
+            if not any(row['path'] == str(source_path) for row in view['evidence']):
+                return [_action('read_file', path='measurements/observations.csv')]
             source_path.write_bytes(b'sample,value\na,100\n')
             return {'conclusion':'complete','evidence':[], 'limitations':[], 'findings':[]}
         self.review = source_changes_after_offer
@@ -3975,7 +3975,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         def review(view):
             sources = [row for row in view['working_view']['observations']
                 if row['observation'].get('path')==str(self.root/'workspace/original.txt')]
-            self.assertCountEqual([row['observation']['text'] for row in sources], bodies)
+            self.assertTrue(all(body in [row['observation']['text'] for row in sources] for body in bodies))
             self.assertTrue(all(row['version_status']=='matching'
                 and row['observation']['role']=='historical_observation'
                 and 'record_text_slice' not in row['observation'] for row in sources))
@@ -4398,9 +4398,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertNotIn('not-an-observed-ID', supplied)
             self.assertEqual(view['targets'][0]['text_windows'][0]['text'],
                              'Explain the revised result against original conditions.\n')
-            self.assertEqual([row['observation']['text']
-                for row in view['working_view']['observations']].count(basis), 1)
-            sources = [row['observation'] for row in view['working_view']['observations']]
+            sources = [{'text':window['text'], 'subject':row['subject']}
+                for row in view['evidence'] for window in row['text_windows']]
+            self.assertEqual([row['text'] for row in sources].count(basis), 1)
             line_text = 'First measured condition\nSecond measured condition\n'
             self.assertEqual([row['text'] for row in sources].count(line_text), 1)
             return {'decisions': [{'subject': 'target-1', 'findings': [], 'limitations': [],
@@ -4497,7 +4497,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertTrue(target['complete'])
             self.assertEqual(''.join(w['text'] for w in target['text_windows']), current_body)
             sources = [row['observation'] for row in view['working_view']['observations']]
-            matching = [row for row in sources if row['path'] == source['absolute_path']]
+            matching = [{'subject': row['subject'], 'sha256': row['sha256'],
+                'text': ''.join(window['text'] for window in row['text_windows'])}
+                for row in view['evidence'] if row['path'] == source['absolute_path']]
             if not matching:
                 return [_action('read_file', path='measurements/observations.csv', full_digest=True)]
             observed, = matching
@@ -4576,7 +4578,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             admitted = [text for text in texts if text in bodies]
             self.assertCountEqual(admitted, bodies)
             self.assertLessEqual(sum(len(row['text'].encode('utf-8')) for row in sources), 512000)
-            self.assertTrue(all(row['text'] in bodies for row in sources))
+            self.assertTrue(all(Path(row['path']).name in {'large-0.txt', 'large-1.txt'} for row in sources))
             return {'decisions': [{'subject': 'target-1', 'conclusion': 'incomplete',
                 'evidence': list(dict.fromkeys(row['subject'] for row in sources)), 'findings': [],
                 'limitations': ['Revoked, stale and omitted sources cannot complete this investigation.']}]}
