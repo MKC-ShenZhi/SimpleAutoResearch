@@ -193,6 +193,8 @@ uv run simple-ar start --tasks-in runs/assistant --resume-task EXACT_DIRECTORY_N
 列表只读所给目录及其直接子目录，最多检查256项，不建立额外任务索引。交互选择需要终端；脚本使用列表中的精确目录名。
 显示的 `partial` 保留未完成项；记录状态不代表成果质量已认证。
 反馈沿原任务、材料和账本继续；再次用配置文件启动则会创建新任务。
+
+希望连续交流时，运行 `uv run simple-ar start --resume-task SESSION --interactive`。每轮完成后直接输入下一条反馈；用 `/status` 查看状态，`/exit` 离开并保留任务。
 继续时不能用创建参数悄悄重设进程额度，额外资源仍使用显式续额授权。
 
 ### 更换已配置连接

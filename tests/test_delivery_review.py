@@ -12,10 +12,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from simple_ar.app.operation_tools import delivery_requires_review, prepare_delivery_review
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.core.capabilities import ArtifactStore
-from simple_ar.tools.delivery_review import DeliveryReview, recorded_delivery_review
+from simple_ar.tools.delivery_review import (DeliveryReview, recorded_delivery_review,
+    delivery_requires_review, prepare_delivery_review)
 from simple_ar.tools.specs import ToolResult
 from simple_ar.tools.workspace import DeliveryRequest, WorkspaceToolGateway
 
@@ -555,6 +555,62 @@ class DeliveryReviewTests(unittest.TestCase):
                 self.assertNotEqual(current['identity'], prior['identity'])
                 self.observe(current)
                 self.assertEqual(self.issues(self.observations, self.delivery), [])
+
+    def test_actual_delivery_owner_checks_production_before_starting_review(self):
+        from simple_ar.report.delivery import Delivery
+        owner = Delivery(workspace=self.workspace,
+            gateway=SimpleNamespace(delivery_issues=lambda *args, **kwargs: []),
+            publication=SimpleNamespace(check_requested_delivery=lambda *args, **kwargs: None,
+                conversion_inputs=lambda *args: set()),
+            review_owner=self.owner, config={'delivery_review_protocol': 'task.v3',
+                'delivery_files': ['required-output']},
+            observations=lambda: self.observations, user_requests=lambda: self.requests)
+        with self.assertRaisesRegex(ValueError, 'missing required workspace outputs'):
+            owner.review_delivery(self.delivery, 'not-started', may_start=True)
+        self.assertEqual(self.inspector.calls, [])
+        self.assertFalse(self.inspector.has_started('not-started'))
+
+        with patch.dict(owner.config, {'report_requirement': {}}):
+            with self.assertRaisesRegex(ValueError, 'explicit report claim'):
+                owner.validate_actual({'summary': 'No report claim', 'artifacts': []}, [])
+        self.assertEqual(self.inspector.calls, [])
+
+        # A partial exit retains usable files; it cannot invent missing files.
+        partial = {**self.delivery, 'unresolved': ['Required output is unfinished.']}
+        resolved = owner.validate_actual(partial, [])
+        self.assertEqual(len(resolved['artifacts']), 2)
+        self.assertEqual(resolved['unresolved'], partial['unresolved'])
+        with self.assertRaisesRegex(ValueError, 'missing workspace file'):
+            owner.validate_actual({**partial, 'artifacts': ['absent']}, [])
+
+    def test_actual_delivery_owner_binds_registered_current_outputs_and_rechecks_versions(self):
+        from simple_ar.report.delivery import Delivery
+        owner = Delivery(workspace=self.workspace,
+            gateway=SimpleNamespace(delivery_issues=lambda *args, **kwargs: []),
+            publication=SimpleNamespace(check_requested_delivery=lambda *args, **kwargs: None,
+                conversion_inputs=lambda *args: set()),
+            review_owner=self.owner, config={'delivery_review_protocol': 'task.v3'},
+            observations=lambda: self.observations, user_requests=lambda: self.requests)
+        output = self.root / 'attempts' / 'producer' / 'manuscript'
+        output.parent.mkdir(parents=True)
+        self.workspace.mounts['records'] = output.parent.parent
+        output.write_text('Editable current result.', encoding='utf-8')
+        delivery = {'summary': 'Current producer result', 'artifacts': [str(output)],
+            'report': {'status': 'canonical', 'manuscript': str(output)}}
+        with self.assertRaisesRegex(ValueError, 'registered domain output'):
+            owner.validate_actual(delivery, [])
+        resolved = owner.validate_actual(delivery, [], current_outputs=(output,))
+        self.assertEqual(resolved['artifacts'], [str(output)])
+        proof = owner.review_delivery(delivery, 'current-output', may_start=True,
+            current_outputs=(output,))
+        self.observe(proof)
+        self.assertEqual(owner.validate_actual(delivery, self.observations,
+            current_outputs=(output,), include_inspection=True), resolved)
+        output.write_text('Changed after the independent opinion.', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'independent|review'):
+            owner.validate_actual(delivery, self.observations,
+                current_outputs=(output,), include_inspection=True)
+        self.assertEqual(len(self.inspector.calls), 1)
 
     def test_partial_skips_review_and_legacy_plain_scope_is_unchanged(self):
         partial = {**self.delivery, 'unresolved': ['unfinished']}

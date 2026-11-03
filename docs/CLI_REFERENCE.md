@@ -99,6 +99,7 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME. | env |
 | `--output-root PATH` | Parent directory for a new task/run. | runs/assistant |
 | `--prepare-only` | Save/preview without model/process calls; new native tasks still check credentials. | Off |
+| `--interactive` | Continue the same ordinary task in a terminal: enter feedback, use `/status` to view it, or `/exit` to leave it saved. Existing permissions and allowances apply. Separate from structured `--chat` setup. | Off |
 | `--yes` | Accept displayed creation/access/resource summary; never approves a pending native process. | Off |
 
 #### Access and resource allowances
@@ -205,6 +206,7 @@ simple-ar start "Explain these results" --source ./results --model profile:daily
 simple-ar start --write-task-config task.toml
 simple-ar start --task-config task.toml --yes
 simple-ar start --resume-task SESSION "Shorten the explanation"
+simple-ar start --resume-task SESSION --interactive
 simple-ar start --resume-task SESSION --approve-execution TOKEN
 simple-ar start --resume-task SESSION --authorize-remaining llm_requests=10 --authorize-remaining total_tokens=100000 --authorization-id continuation-1 --authorization-reason "Finish the saved goal" --yes
 simple-ar start --kind data_analysis --data-file measurements.csv --value-column score --observation-unit "one independent run" --yes

@@ -23,9 +23,14 @@ function saveDrafts() {
   if (!viewKey) return;
   view.create = Object.fromEntries(createFields.map(id => [id,
     $(id).type === 'checkbox' ? $(id).checked : $(id).value]));
-  if (selected) view.tasks[selected] = {feedback: $('feedback').value,
-    switchReason: $('switchReason').value, switchProfile: $('switchProfile').value,
-    mount: $('mount').value || view.tasks[selected]?.mount || '', folder, preview: previewTarget};
+  if (selected) {
+    const previous = view.tasks[selected] || {};
+    const feedback = $('feedback').value;
+    view.tasks[selected] = {...previous, feedback,
+      submission: previous.submission?.feedback === feedback ? previous.submission : undefined,
+      switchReason: $('switchReason').value, switchProfile: $('switchProfile').value,
+      mount: $('mount').value || previous.mount || '', folder, preview: previewTarget};
+  }
   view.selected = selected;
   persistView();
 }
@@ -79,6 +84,11 @@ function renderActivity() {
   if (pending?.receipt) paragraph($('currentAction'), '当前 attempt 保存状态：' + pending.receipt.status + '\n' +
     (pending.receipt.diagnostics || []).join('\n') + '\n回执：' + pending.receipt.record, 'receipt');
   if (snapshot.worker_error) paragraph($('currentAction'), snapshot.worker_error, 'receipt');
+  for (const receipt of snapshot.feedback_submissions || []) {
+    paragraph($('currentAction'), '反馈 ' + receipt.submission_id + ' · ' +
+      (receipt.status === 'applied' ? '已采用' : '已收到，待安全边界采用') +
+      (receipt.reason ? '\n' + receipt.reason : ''), 'receipt');
+  }
   const rows = snapshot.activity || [];
   const key = pretty({task: selected, rows, total: snapshot.activity_total});
   if (activityKey === key) return; // Preserve focus and open receipt details on polls.
@@ -142,6 +152,16 @@ async function api(path, data) {
 async function json(path, data) { return (await api(path, data)).json(); }
 async function action(op, extra = {}, task = selected) {
   if (actionSending) return;
+  if (op === 'feedback' && !extra.submission_id) {
+    // This identity belongs to the exact draft, including uncertain transport
+    // responses. Reusing it cannot append or execute the same feedback twice.
+    const draft = view.tasks[task] ||= {};
+    if (draft.submission?.feedback !== extra.feedback) {
+      draft.submission = {submission_id: crypto.randomUUID(), feedback: extra.feedback};
+    }
+    extra = {...extra, submission_id: draft.submission.submission_id};
+    persistView();
+  }
   actionSending = true; confirmationControls();
   let result;
   try {
@@ -162,7 +182,7 @@ function confirmationControls() {
   $('approve').disabled = locked || busy || !snapshot?.approval;
   $('switch').disabled = locked || busy || snapshot?.task !== selected;
   $('resume').disabled = locked || busy || snapshot?.task !== selected;
-  $('feedbackSubmit').disabled = locked || busy || snapshot?.task !== selected;
+  $('feedbackSubmit').disabled = locked || actionSending || snapshot?.task !== selected;
   $('stop').disabled = locked || actionSending || !snapshot?.worker_live || !!snapshot?.stop_requested;
   $('confirmationSubmit').disabled = confirmationSending;
   $('confirmationCancel').disabled = confirmationSending;

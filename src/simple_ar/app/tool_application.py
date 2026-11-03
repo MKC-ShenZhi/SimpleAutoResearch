@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from simple_ar.core.budget import BudgetLedger, completed_llm_usage_is_accounted
+from simple_ar.app.task_view import history_observation, saved_work_connection
 from simple_ar.core.working_context import history_view, RECEIPT_SUPPLY_POLICIES, TURN_SUPPLY_POLICY
 from simple_ar.core.capabilities import ArtifactRef, ArtifactStore, AttemptManifest, CapabilityContext, CapabilityRegistry, CapabilityResult
 from simple_ar.core.session import BudgetState, SessionController
@@ -32,7 +33,7 @@ from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, ToolComp
 from simple_ar.tools.professional_outcomes import (
     accepted_review_journal, check_professional_stop, stop_decision)
 from simple_ar.tools.workspace import (WorkspaceToolGateway, workspace_tool_specs,
-    DeliveryRequest, FileWindow, validate_workspace_arguments, workspace_observation_view, workspace_history_identity,
+    DeliveryRequest, FileWindow, validate_workspace_arguments, workspace_observation_view,
     resolve_source_mount)
 from simple_ar.tools.materials import (
     authored_snapshot, read_material_window, journal_material_references, journal_read_windows, observe_text_window,
@@ -1897,6 +1898,85 @@ class ToolApplication:
         self.session.store.write_json("actions.json", self.state)
         self.session.save()
 
+    @classmethod
+    def _feedback_journal(cls, root: Path):
+        from simple_ar.core.feedback import FeedbackSubmissions
+        store = ArtifactStore(root)
+        manifest = store.read_json('session_manifest.json')
+        if (manifest.get('transition_recipe') != cls.RECIPE
+                or manifest.get('schema_version') != 'session_manifest.v2'):
+            raise ValueError('Feedback reception requires a writable native task; retain its historical recovery command')
+        store.read_json('actions.json')  # Do not create a task by accepting text.
+        return FeedbackSubmissions(store)
+
+    @classmethod
+    def submit_feedback(cls, root: Path, *, submission_id: str, feedback: str) -> dict:
+        """Receive exact text once, including while run() owns the execution lock.
+
+        Reuse the same id and exact text on transport retry; a conflicting text
+        raises ValueError without replacing the original. This never starts or
+        retries work, changes access, or reserves resources. ``status=pending``
+        acknowledges receipt only; run() adopts it at a safe action boundary.
+        """
+        journal = cls._feedback_journal(root)
+        row = journal.accept(submission_id, feedback)
+        return journal.receipt(row, journal.store.read_json('actions.json'))
+
+    @classmethod
+    def feedback_status(cls, root: Path, *, submission_id: str) -> dict:
+        """Read a submission's pending/applied receipt without loading a model."""
+        journal = cls._feedback_journal(root)
+        for row in journal.records():
+            if row['submission_id'] == submission_id:
+                return journal.receipt(row, journal.store.read_json('actions.json'))
+        raise ValueError('Unknown feedback submission_id; no receipt is recorded')
+
+    def _apply_feedback(self, feedback: str, *, submission_id: str | None = None) -> bool:
+        """Adopt a request through the original cancellation/lifecycle boundary."""
+        try:
+            if self.state.get('pending_supply') is not None:
+                raise ValueError('Complete the retained caller supply before adopting feedback')
+            if self.state['pending'] and self.state['pending']['kind'] == 'model':
+                raise ValueError('Unreconciled model operation; feedback cannot silently replay it')
+            self._check_cancellation()
+            if self.session.manifest.status not in {'created', 'running'}:
+                self.session.continue_with_revision(feedback)
+        except (ValueError, RuntimeError) as exc:
+            if submission_id is None:
+                raise  # Preserve the legacy string entry's explicit refusal.
+            waiting = {'status': 'pending', 'reason': str(exc)}
+            if self.state.get('feedback_submissions', {}).get(submission_id) != waiting:
+                self.state.setdefault('feedback_submissions', {})[submission_id] = waiting
+                self._save()
+            return False
+        # IO failures and errors committing request/adoption must propagate;
+        # they are not policy refusals and cannot be marked as adopted earlier.
+        self._cancel_unstarted('Unstarted action cancelled by new user feedback')
+        self.state['requests'].append(feedback)
+        if submission_id is not None:
+            self.state.setdefault('feedback_submissions', {})[submission_id] = {
+                'status': 'applied', 'request_index': len(self.state['requests']) - 1}
+        self._save()
+        return True
+
+    def _consume_feedback(self) -> bool:
+        """Execution owner only: reconcile started work before adopting input.
+
+        Reception and adoption have separate locks and never write each other's
+        files. Requests and their adoption markers share one atomic actions.json
+        write, so reloading after a crash cannot append an input a second time.
+        """
+        from simple_ar.core.feedback import FeedbackSubmissions
+        journal = FeedbackSubmissions(self.session.store)
+        applied = False
+        for row in journal.records():
+            if journal.receipt(row, self.state)['status'] == 'applied':
+                continue
+            if not self._apply_feedback(row['feedback'], submission_id=row['submission_id']):
+                break  # Arrival order is preserved, including deferred input.
+            applied = True
+        return applied
+
     def supply(self, *, supply_id: str, reason: str, changes: dict[str, Any],
                resource_allowances: dict[str, int | float] | None = None,
                replace_existing: bool = False) -> dict[str, Any]:
@@ -2541,53 +2621,8 @@ class ToolApplication:
 
     @staticmethod
     def _history_observation(call: dict, result: dict, record: str, *, navigation: bool = False) -> dict:
-        """One receipt-derived index for both current context and history pages."""
-        try:
-            arguments = json.loads(call['function']['arguments'])
-        except (ValueError, TypeError):
-            arguments = {}
-        if not isinstance(arguments, dict):
-            arguments = {}
-        data = result.get('data') or {}
-        name = call['function']['name']
-        argument_keys = (arguments.keys() if navigation else
-            ('path', 'document_record', 'query', 'offset_bytes', 'start_line', 'max_lines',
-             'argv', 'cwd', 'timeout_sec', 'url', 'paper_id', 'search_record'))
-        indexed_arguments = {key: arguments[key] for key in argument_keys
-            if key in arguments and (not navigation or key not in {'content', 'text', 'replacements'})
-            and len(json.dumps(arguments[key], ensure_ascii=False)) <= 1024}
-        observed = {key: value for key, value in data.items()
-            if key != 'text' and not (navigation and key == 'streams')
-            and len(json.dumps(value, ensure_ascii=False)) <= 1024
-            and not (name == 'focus_work' and key == 'inputs')
-            and not (key in indexed_arguments and value == indexed_arguments[key])
-            and not (key == 'absolute_path' and value == indexed_arguments.get('path'))}
-        if result.get('status') == 'ok' and not result.get('error'):
-            observed.update(SourceToolGateway.history_identity(name, data)
-                or workspace_history_identity(name, data))
-        outcome = {'tool': name,
-            'record': 'records/' + record.removeprefix('attempts/') if record.startswith('attempts/') else None,
-            'inline_result': result if not record.startswith('attempts/') else None,
-            'status': result.get('status'), 'error': result.get('error', ''),
-            'arguments': indexed_arguments, 'observed': observed,
-            'artifacts': result.get('artifacts', []), 'summary': result.get('summary', '')}
-        if navigation:
-            # Same receipt index, with explicit recovery for omitted payloads.
-            # No inferred facts, rereads or new persisted memory. Legacy/history
-            # callers keep their frozen projection unless explicitly selected.
-            outcome['omitted_fields'] = {
-                'arguments': [key for key in arguments if key not in indexed_arguments],
-                'data': [key for key in data if key not in observed],
-            }
-            for key in ('error', 'summary'):
-                value = outcome[key]
-                if isinstance(value, str) and len(value) > 1024:
-                    outcome[key] = {'preview': value[:1024],
-                        'omitted_characters': len(value) - 1024,
-                        'record': outcome['record'], 'field': key}
-        return {key: value for key, value in outcome.items()
-            if key in {'arguments', 'observed'}
-            or (value is not None and value != '' and value != [] and value != {})}
+        """Compatibility delegate to the public receipt projection."""
+        return history_observation(call, result, record, navigation=navigation)
 
     _history_view = staticmethod(history_view)
 
@@ -3745,9 +3780,8 @@ class ToolApplication:
 
     @staticmethod
     def _work_connection(binding: dict[str, Any], purpose: str) -> dict[str, Any]:
-        """Resolve the saved professional route or original task settings."""
-        route = binding.get(f'{purpose}_route') if purpose in {'code', 'writing'} else None
-        return route or {'connection': binding.get('settings') if purpose != 'code' else None}
+        """Compatibility delegate to the public saved-connection projection."""
+        return saved_work_connection(binding, purpose)
 
     def _client(self, attempt_id: str = "", *, purpose: str | None = None,
                 native: bool = True, vision_catalog_hint: str | None = None) -> LLMClient:
@@ -4501,8 +4535,12 @@ class ToolApplication:
                 observations = self._operation_observations()
                 proposed = (ToolCall(tool_name=call['function']['name'],
                     arguments=json.loads(call['function']['arguments'])) if retained is None else None)
-                errors = self.operations.delivery_issues(observations,delivery,proposed=proposed)
-                return '; '.join(errors)
+                if retained is not None:
+                    self.operations.delivery.validate_actual(
+                        delivery, observations, include_inspection=True)
+                    return ''
+                return '; '.join(self.operations.delivery_issues(
+                    observations, delivery, proposed=proposed))
             except (ValueError,OSError,KeyError,TypeError,RuntimeError) as exc:
                 return str(exc)
         versioned_report = self.state['config'].get('report_protocol') == _REPORT_PROTOCOL
@@ -5324,7 +5362,13 @@ class ToolApplication:
 
     def result_snapshot(self) -> dict[str, Any]:
         """Read saved results for users; never execute, certify or change state."""
+        from simple_ar.app.task_view import read_task_view
         result = self.session.status_snapshot()
+        from simple_ar.core.feedback import FeedbackSubmissions
+        result['feedback_submissions'] = FeedbackSubmissions(self.session.store).receipts(self.state)
+        result['task_view'] = read_task_view(self.session.store.root,
+            read_record=self.session.store.read_json, ledger=self.ledger,
+            native_recipe=self.RECIPE)
         result['retained_work'] = self._retained_work()
         result['delivery_version_scope'] = ('Only captured terminal deliveries have restorable bytes; '
             'missing historical versions are not reconstructed from current files.')
@@ -5345,7 +5389,8 @@ class ToolApplication:
             result['delivery_versions_error'] = str(exc)
         return result
 
-    def run(self, *, feedback: str = "", approved_execution: str = "",
+    def run(self, *, feedback: str = "", submission_id: str | None = None,
+            approved_execution: str = "",
             actions: list[dict[str, Any]] | None = None,
             retry_model: bool = False, retry_model_selector: str = "",
             read_only_sources: tuple[Path, ...] = (), allow_execution: bool = False,
@@ -5356,6 +5401,16 @@ class ToolApplication:
             approve: Callable[[dict[str, Any], str], bool] | None = None,
             progress: Callable[[str], None] = print,
             should_stop: Callable[[], bool] | None = None) -> dict[str, Any]:
+        if submission_id is not None:
+            if (actions is not None or approved_execution or retry_model or retry_model_selector
+                    or read_only_sources or allow_execution or allow_network or allow_vision
+                    or resource_allowances or authorization_id or authorization_reason or decision is not None):
+                raise ValueError('Run a feedback submission separately from actions, retries or authorization')
+            if feedback:
+                self.submit_feedback(self.session.store.root, submission_id=submission_id, feedback=feedback)
+            else:
+                self.feedback_status(self.session.store.root, submission_id=submission_id)
+            feedback = ''  # The reception journal, not the legacy string path, owns adoption.
         observer = progress
         for extension in self.extensions:
             extension.verify()
@@ -5371,6 +5426,13 @@ class ToolApplication:
                     observer = None
 
         with self.session.mutation_scope():
+            from simple_ar.core.feedback import FeedbackSubmissions
+            if (self.session.store.exists(FeedbackSubmissions.path)
+                    and self.session.store.read_json('actions.json') != self.state):
+                raise RuntimeError('Request journal changed since loading; reload before adopting feedback')
+            if submission_id is not None and self.feedback_status(
+                    self.session.store.root, submission_id=submission_id)['status'] == 'applied':
+                return self.result_snapshot()  # A transport retry is never an execution retry.
             if self.state.get('pending_supply') is not None:
                 raise ValueError('Complete the retained caller supply before running, revising or authorizing work')
             if decision is not None:
@@ -5415,6 +5477,7 @@ class ToolApplication:
                 # uncommitted task that accepts new work without feedback.
                 # Explicit feedback may instead correct an uncommittable
                 # changed output; its original observation remains retained.
+                self._consume_feedback()
                 self._commit_terminal(progress)
             if retry_model:
                 if (feedback or actions is not None or approved_execution or read_only_sources or allow_execution
@@ -5428,18 +5491,13 @@ class ToolApplication:
             if authorization:
                 feedback = authorization + ('\n' + feedback if feedback else '')
             if feedback:
-                if self.state["pending"] and self.state["pending"]["kind"] == "model":
-                    raise ValueError("Unreconciled model operation; feedback cannot silently replay it")
-                self._cancel_unstarted('Unstarted action cancelled by new user feedback')
-                self.state["requests"].append(feedback)
-                if self.session.manifest.status not in {'created', 'running'}:
-                    self.session.continue_with_revision(feedback)
-                self._save()
+                self._apply_feedback(feedback)
             if actions is not None:
                 self._submit_actions(actions)
             if resource_allowances and self.session.manifest.status in {'paused', 'blocked', 'failed'}:
                 self.session.continue_with_revision('Explicit resource continuation: ' + authorization_id)
             try:
+                self._consume_feedback()
                 if self._commit_terminal(progress):
                     return self.result_snapshot()
                 if self.session.manifest.status in {'completed', 'partial'} and not feedback:
@@ -5564,6 +5622,8 @@ class ToolApplication:
                              perform: Callable[[str], dict], approved_execution: str,
                              approve: Any, progress: Callable[[str], None]) -> dict:
         """Translate a professional proposal into the common accepted-action path."""
+        if self._consume_feedback():
+            raise _ActionSuspended()  # Prior child receipts stay with their original owner.
         origin = {'scope': scope, 'position': position, 'kind': kind}
         identity = 'native-action-' + hashlib.sha256(json.dumps(origin,
             sort_keys=True).encode()).hexdigest()[:40]
@@ -5587,6 +5647,9 @@ class ToolApplication:
         if not action.get('result'):
             if kind == 'tool' and not self._approve_action(action, approved_execution,
                     approve, progress, scoped=True):
+                self._consume_feedback()
+                raise _ActionSuspended()
+            if self._consume_feedback():
                 raise _ActionSuspended()
             progress(f'Independent {kind} — {identity}')
         fresh = not any(row.attempt_id == identity for row in self.session.list_attempts())
@@ -5637,10 +5700,11 @@ class ToolApplication:
 
     def _run(self, approved_execution: str, approve: Any, progress: Callable[[str], None],
              should_stop: Callable[[], bool] | None = None) -> None:
-        caller_takeover = self._caller_takeover()
-        reserve_completion = (self.state['config'].get('completion_policy') in _COMPLETION_POLICIES | {_OPERATION_EXIT}
-            and self.state['config']['model'] is not None and not caller_takeover)
         while True:
+            self._consume_feedback()
+            caller_takeover = self._caller_takeover()
+            reserve_completion = (self.state['config'].get('completion_policy') in _COMPLETION_POLICIES | {_OPERATION_EXIT}
+                and self.state['config']['model'] is not None and not caller_takeover)
             if self._commit_terminal(progress):
                 return
             if should_stop is not None and should_stop():
@@ -5726,6 +5790,8 @@ class ToolApplication:
                     "request_count": len(self.state["requests"])})
                 self.state["pending"] = None
                 self._save()
+                if self._consume_feedback():
+                    continue  # The saved response remains history, not a new request's work.
                 if not calls:
                     if (self.operations is not None and self._unacted_reply_count()==1
                             and self._request_capacity()>0
@@ -5739,11 +5805,17 @@ class ToolApplication:
             call = pending["call"]
             name = call["function"]["name"]
             if not pending.get('inspection') and not self._approve_action(pending, approved_execution, approve, progress):
+                if self._consume_feedback():
+                    continue
                 return
+            if self._consume_feedback():
+                continue  # Input received during approval precedes physical dispatch.
             progress(f"Tool {name} — {pending['attempt']}")
             if pending.get('inspection'):
                 relative = self._advance_inspection(pending, approved_execution, approve, progress)
                 if relative is None:
+                    if self.state['pending'] is None:
+                        continue  # A received request cancelled only the unstarted scope.
                     return
             else:
                 relative = self._attempt("native_tool", pending)

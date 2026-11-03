@@ -1468,7 +1468,8 @@ class WorkspaceToolGateway:
                                  refresh: bool = False,
                                  retained_versions: dict[Path, str] | None = None,
                                  retained_history: list[dict] | None = None,
-                                 producer_index_cache: dict | None = None) -> dict | None:
+                                 producer_index_cache: dict | None = None,
+                                 retained_reader: RetainedDelivery | None = None) -> dict | None:
         """Reject known stale declared edges; untracked files remain unverified.
 
         Inspect only existing process-owner receipts, never workspace contents.
@@ -1480,7 +1481,8 @@ class WorkspaceToolGateway:
         it never reduces past ownership to the latest path owner.
         """
         if retained_versions is not None:
-            return self._check_retained_producers(retained_versions, retained_history or [])
+            return self._check_retained_producers(retained_versions, retained_history or [],
+                reader=retained_reader)
         directory = self.root / 'tools' / 'processes'
         if not directory.is_dir():
             if producer_index_cache is not None:
@@ -1612,7 +1614,8 @@ class WorkspaceToolGateway:
         return result
 
     def _check_retained_producers(self, versions: dict[Path, str], history: list[dict], *,
-                                  provenance: bool = False, verify_source: Any = None) -> dict:
+                                  provenance: bool = False, verify_source: Any = None,
+                                  reader: RetainedDelivery | None = None) -> dict:
         """Traverse a temporary version graph made only from existing receipts.
 
         A node is a path/version at a record boundary. Copies link equal bytes
@@ -1643,15 +1646,25 @@ class WorkspaceToolGateway:
         records = {}
         directory = self.root / 'tools' / 'processes'
         if directory.is_dir() and not provenance:
-            for receipt, record, binding, output_versions, successful in self._artifact_producer_records(directory):
+            producer_records = (self._artifact_producer_records(directory) if reader is None else
+                                self._artifact_producer_records(directory, reader=reader))
+            for receipt, record, binding, output_versions, successful in producer_records:
                 ref = receipt.relative_to(self.root).as_posix()
                 records[ref] = record
+                inputs = self.resolved_versions(binding['inputs']) if reader is None else {}
+                if reader is not None:
+                    for locator, digest in binding['inputs'].items():
+                        path = reader.resolve(locator)
+                        if path in inputs and inputs[path] != digest:
+                            raise ValueError('Conflicting hashes for aliases of the same artifact')
+                        inputs[path] = digest
                 events.append({'position': positions.get(ref), 'start': record.get('started_at'),
                     'end': record.get('finished_at'), 'process': record, 'binding': binding,
                     'successful_outputs': successful,
-                    'outputs': {resolve_mounted_path(self.mounts, name, write=True, discovery=True): output_versions.get(name)
+                    'outputs': {resolve_mounted_path(self.mounts, name, write=True, discovery=True,
+                        authorize=reader.admit if reader is not None else None): output_versions.get(name)
                                 for name in binding['outputs']},
-                    'inputs': self.resolved_versions(binding['inputs'])})
+                    'inputs': inputs})
         outputs, inputs = {}, {}
         for event in events:
             event['start'], event['end'] = instant(event.get('start')), instant(event.get('end'))
@@ -1705,8 +1718,11 @@ class WorkspaceToolGateway:
             if event.get('consistent') is False:
                 raise ValueError('Retained version differs from its recorded owner')
             if 'record' in event:
-                path = resolve_mounted_path({'workspace': self.root}, event['record'], discovery=True)
-                actual = read_json(path)
+                if reader is not None:
+                    actual = reader.record(event['record'])
+                else:
+                    path = resolve_mounted_path({'workspace': self.root}, event['record'], discovery=True)
+                    actual = read_json(path)
                 if not event['consistent'] or actual != event['expected_record']:
                     raise ValueError('Delivered project copy has inconsistent ownership')
                 records[event['record']] = actual
@@ -1921,23 +1937,31 @@ class WorkspaceToolGateway:
                     producers[path] = (order, None, None)
         return producers
 
-    def _artifact_producer_records(self, directory: Path) -> Iterable[tuple[Path, dict, dict, dict, dict | None]]:
+    def _artifact_producer_records(self, directory: Path, *, reader: RetainedDelivery | None = None
+                                   ) -> Iterable[tuple[Path, dict, dict, dict, dict | None]]:
         """One bounded reader for current owners and retained version history."""
         total = 0
+        if reader is not None:
+            reader.admit(directory)
         for count, entry in enumerate(directory.iterdir(), 1):
             if count > 4096:
                 raise ValueError('Process receipt inventory exceeds 4096 entries')
             if entry.is_symlink() or entry.is_junction():
                 raise ValueError('Process receipt directory cannot be a link')
+            if reader is not None:
+                reader.admit(entry)
             receipt = entry / 'invocation.json'
             if not receipt.is_file():
                 continue
             if receipt.is_symlink():
                 raise ValueError('Process receipt cannot be a link')
+            if reader is not None:
+                reader.admit(receipt)
             total += receipt.stat().st_size
             if total > _FULL_DIGEST_MAX_BYTES:
                 raise ValueError('Process receipt inventory exceeds 64 MiB')
-            record = read_json(receipt)
+            record = (reader.record(receipt.relative_to(reader.root).as_posix())
+                      if reader is not None else read_json(receipt))
             interpreted = _process_artifact_record(record)
             if interpreted.binding is None:
                 continue  # Never invent historical dependency coverage.

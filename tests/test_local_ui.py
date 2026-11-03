@@ -3,6 +3,7 @@
 Run on the verification server: python -m unittest discover -s tests -p test_local_ui.py
 """
 import http.client
+import hashlib
 from copy import deepcopy
 import json
 import os
@@ -16,6 +17,8 @@ from urllib.parse import quote
 from unittest.mock import Mock, patch
 
 from simple_ar.app.tool_application import ToolApplication
+from simple_ar.app.task_view import read_task_view
+from simple_ar.app.reuse import ReuseAccess, select_reuse
 from tests.native_history_fixture import load_native_history
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.integrations.llm import LLMClient
@@ -29,6 +32,224 @@ def call(name, arguments, identity='test-call'):
 
 
 class LocalWorkspaceTests(unittest.TestCase):
+    def _reuse_project(self, root, *, sources=None):
+        app = ToolApplication.create(root, 'Deliver a complete editable project', model=None,
+            sources=sources or {}, process_limits={'process_invocations': 2, 'process_wall_seconds': 10})
+        result = app.run(actions=[
+            call('write_file', {'path': 'working/compute.py', 'content': 'print("retained source")\n'}),
+            call('copy_project', {'source': 'working', 'path': 'package'}),
+            call('deliver_result', {'summary': 'Complete project, without execution authority',
+                'artifacts': ['package']}),
+        ], progress=lambda _: None)
+        self.assertEqual(result['status'], 'completed', result)
+        return app, root / 'workspace/package'
+
+    def test_granted_project_reuse_uses_shared_proof_without_loading_old_task(self):
+        from simple_ar.cli.start import migrate_new_start, native_creation_options
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            app, project = self._reuse_project(base / 'old')
+            inputs = base / 'inputs'
+            inputs.mkdir()
+            workspace = Workspace(inputs, [base / 'old'], base / 'new-tasks')
+            config = inputs / 'reuse.toml'
+            config.write_text('[task]\nrequest="Revise the retained project"\nmodel="profile:fixture"\n'
+                + 'from_session=' + json.dumps(str(base / 'old')) + '\nreuse=["code_project", "artifacts"]\n',
+                encoding='utf-8')
+            before = {p: p.read_bytes() for p in app.session.store.root.rglob('*') if p.is_file()}
+            catalog = Mock()
+            catalog.select.return_value = ('fixture', Mock())
+            with patch.object(ToolApplication, 'load', side_effect=AssertionError('No old executable assembly')), \
+                    patch.object(LLMClient, 'from_env', side_effect=AssertionError('No model resolution')), \
+                    patch.object(Path, 'mkdir', side_effect=AssertionError('No task/proof writes')), \
+                    patch.object(BudgetLedger, 'save', side_effect=AssertionError('No old ledger settlement')), \
+                    patch('simple_ar.ui.load_model_catalog', return_value=catalog), \
+                    patch.object(workspace, 'profiles', return_value=[{'selector': 'profile:fixture'}]), \
+                    patch.object(workspace, 'connection', return_value=({}, 'fixture-binding')):
+                selected = select_reuse(base / 'old', ['code_project', 'artifacts'],
+                    access=ReuseAccess(authorize=workspace.read, preflight=workspace.material_grants))
+                self.assertEqual(selected.project, (project, None, {}))
+                self.assertEqual(selected.package_mounts, ())
+                args, _ = workspace.creation_inputs({'task_config': str(config)})
+                cli = native_arguments()
+                cli.request, cli.from_session, cli.reuse = args.request, base / 'old', ['code_project', 'artifacts']
+                cli.yes = cli.prepare_only = True
+                migrate_new_start(cli)
+            options = native_creation_options(args)
+            self.assertEqual(args.project, project)
+            self.assertEqual(args._reuse_origin, cli._reuse_origin)
+            self.assertEqual(args._creation_declarations['reuse_origin'], cli._creation_declarations['reuse_origin'])
+            self.assertIn(project, options['sources'].values())
+            self.assertNotIn(base / 'old', options['sources'].values())
+            self.assertFalse(options['allow_execution'])
+            self.assertIsNone(options['project_python'])
+            self.assertIsNone(options['code_task'])
+            self.assertEqual({p: p.read_bytes() for p in before}, before)
+            narrow = Workspace(inputs, [project], base / 'narrow-tasks')
+            with self.assertRaises(ValueError):
+                select_reuse(base / 'old', ['code_project'], access=ReuseAccess(authorize=narrow.read))
+            member = project / 'compute.py'
+            member.write_text('changed after delivery', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                select_reuse(base / 'old', ['code_project'], access=ReuseAccess(authorize=workspace.read))
+
+    def test_retained_project_checker_admits_receipts_and_external_inputs_before_reads(self):
+        from simple_ar.core.artifacts import read_json
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            external = base / 'external'
+            external.mkdir()
+            secret = external / 'input.txt'
+            secret.write_text('outside UI grants', encoding='utf-8')
+            app, project = self._reuse_project(base / 'old', sources={'external': external})
+            workspace = Workspace(base / 'old', [], base / 'new')
+            receipt = base / 'old/tools/processes/unrecorded/invocation.json'
+            receipt.parent.mkdir(parents=True)
+            output = 'workspace/package/compute.py'
+            digest = hashlib.sha256((project / 'compute.py').read_bytes()).hexdigest()
+            receipt.write_text(json.dumps({'status': 'finished', 'returncode': 0,
+                'input_binding': {'workspace_artifacts': {'version': 1,
+                    'inputs': {'external/input.txt': '0' * 64}, 'outputs': [output]}},
+                'output_binding': {'version': 1, 'outputs': {output: digest}}}), encoding='utf-8')
+            admitted = []
+
+            def admit(path):
+                admitted.append(path)
+                return workspace.read(path)
+
+            with patch.object(ToolApplication, 'load', side_effect=AssertionError('No old executable assembly')):
+                with self.assertRaises(ValueError):
+                    select_reuse(app.session.store.root, ['code_project'], access=ReuseAccess(authorize=admit))
+            self.assertIn(secret, admitted)
+            admitted.clear()
+
+            def deny_receipt(path):
+                if path == receipt:
+                    raise ValueError('Denied exact process receipt')
+                return workspace.read(path)
+
+            def read_allowed(path):
+                if Path(path) == receipt:
+                    raise AssertionError('Receipt bytes read before exact admission')
+                return read_json(path)
+
+            with patch('simple_ar.tools.workspace.read_json', side_effect=read_allowed):
+                with self.assertRaisesRegex(ValueError, 'Denied exact process receipt'):
+                    select_reuse(base / 'old', ['code_project'], access=ReuseAccess(authorize=deny_receipt))
+
+    def test_running_ui_feedback_reuses_submission_receipts_and_execution_boundary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            app = ToolApplication.create(base / 'tasks/task', 'Original request', model=None, sources={})
+            workspace = Workspace(base, [], base / 'tasks')
+            live = Mock()
+            live.is_alive.return_value = True
+            workspace.workers['task'] = live, threading.Event()
+            original = {name: (app.session.store.root / name).read_bytes() for name in
+                ('actions.json', 'session_manifest.json', 'budget_ledger.json')}
+            request = {'op': 'feedback', 'task': 'task', 'submission_id': 'ui-stable-id', 'feedback': 'Revise this work'}
+            with patch.object(ToolApplication, 'load', side_effect=AssertionError('Receiving does not load execution')), \
+                    patch.object(LLMClient, 'from_env', side_effect=AssertionError('No model resolution')):
+                first = workspace.mutate(request)
+                self.assertEqual(first['submission']['status'], 'pending')
+                self.assertEqual(workspace.mutate(request)['submission'], first['submission'])
+                view = workspace.snapshot('task')
+                self.assertEqual(view['feedback_submissions'], [first['submission']])
+                with self.assertRaises(ValueError):
+                    workspace.mutate({**request, 'feedback': 'Conflicting retry text'})
+            self.assertEqual({name: (app.session.store.root / name).read_bytes() for name in original}, original)
+            del workspace.workers['task']
+            with patch.object(workspace, 'dispatch') as dispatch:
+                pending = workspace.mutate(request)
+            self.assertEqual(pending['submission']['status'], 'pending')
+            dispatch.assert_called_once_with('task', app.session.store.root,
+                {'submission_id': request['submission_id']})
+            # The original execution owner also receives the id, so adoption
+            # between receipt and dispatch cannot turn this into generic resume.
+            app.run(submission_id=request['submission_id'], progress=lambda _: None)
+            with patch.object(workspace, 'dispatch', side_effect=AssertionError('No duplicate execution')):
+                adopted = workspace.mutate(request)
+            self.assertEqual(adopted['submission']['status'], 'applied')
+            self.assertEqual(app.state['requests'], ['Original request', 'Revise this work'])
+            self.assertEqual(workspace.snapshot('task')['feedback_submissions'], [adopted['submission']])
+            record = workspace.record
+
+            def denied(root, name):
+                if name == 'tools/submissions/feedback.json':
+                    raise ValueError('Feedback journal outside exact display grant')
+                return record(root, name)
+
+            with patch.object(workspace, 'record', side_effect=denied):
+                with self.assertRaisesRegex(ValueError, 'exact display grant'):
+                    workspace.snapshot('task')
+
+    def test_public_task_view_reads_receipts_without_live_dependencies_or_writes(self):
+        ledger = BudgetLedger({'custom': 10})
+        ledger.reserve('unknown', {'custom': 2})
+        ledger.reserve('reserved', {'custom': 1})
+        ledger.mark_unknown('unknown', reason='Keep original uncertainty')
+        records = {
+            'tools/submissions/feedback.json': {'schema_version': 'feedback_submissions.v1', 'submissions': []},
+            'session_manifest.json': {'session_id': 'saved', 'status': 'paused'},
+            'actions.json': {'config': {'model': None, 'sources': {'old': '/missing/source'}},
+                'requests': ['first', 'revision'],
+                'pending': {'kind': 'model', 'attempt': 'model-002'},
+                'turns': [{'request_count': 1, 'reply': 'missing-reply.json', 'remaining': [],
+                    'tools': [{'id': 'plan', 'result': 'attempts/plan/result.json'}]},
+                    {'request_count': 2, 'reply': 'missing-reply.json', 'remaining': ['not executed'],
+                     'tools': [{'id': 'refused', 'result': 'attempts/refused/result.json'},
+                               {'id': 'missing', 'result': 'attempts/missing/result.json'}]}]},
+            'attempts/plan/result.json': {'tool_name': 'update_work_plan', 'status': 'ok',
+                'data': {'request_count': 1, 'notes': 'Old request only'}},
+            'attempts/refused/result.json': {'tool_name': 'run_process', 'status': 'error',
+                'error': 'No execution permission', 'data': {}},
+            'attempts/model-002/capability_result.json': {'status': 'blocked',
+                'diagnostics': ['Preflight stopped; nothing dispatched']},
+        }
+        before = deepcopy(records)
+        entries = [entry.to_dict() for entry in ledger.entries]
+        with patch.object(ToolApplication, 'load', side_effect=AssertionError('No application assembly')), \
+                patch.object(LLMClient, 'from_env', side_effect=AssertionError('No model resolution')), \
+                patch.object(Path, 'mkdir', side_effect=AssertionError('No directory repair')), \
+                patch.object(BudgetLedger, 'save', side_effect=AssertionError('No ledger writes')):
+            view = read_task_view(Path('/missing/task'), read_record=records.__getitem__, ledger=ledger)
+            bounded_view = read_task_view(Path('/missing/task'), read_record=records.__getitem__,
+                ledger=ledger, activity_limit=1)
+        self.assertIsNone(view['plan'])  # An old successful plan is not the current plan.
+        self.assertEqual(view['pending']['receipt']['status'], 'blocked')
+        self.assertEqual([row['status'] for row in view['activity']], ['unavailable', 'error', 'ok'])
+        self.assertTrue(view['activity'][1]['action_unavailable'])
+        self.assertEqual(view['activity'][1]['error'], 'No execution permission')
+        self.assertEqual(view['activity_total'], 3)
+        self.assertEqual(view['queued_actions'], 1)
+        self.assertEqual(len(bounded_view['activity']), 1)
+        self.assertEqual(bounded_view['activity_total'], 3)
+        self.assertEqual([entry['status'] for entry in view['resources']['entries']], ['unknown', 'reserved'])
+        view['requests'].append('Display edits must not change saved requests')
+        view['pending']['receipt']['diagnostics'].append('Display only')
+        self.assertEqual(records, before)
+        self.assertEqual([entry.to_dict() for entry in ledger.entries], entries)
+
+    def test_public_task_view_withholds_approval_when_records_change(self):
+        manifest = {'status_reason': 'Process requires explicit approval; token=' + 'a' * 64}
+        state = {'config': {}, 'requests': ['original'], 'turns': [],
+            'pending': {'kind': 'tool', 'attempt': 'export-001', 'call': {
+                'function': {'name': 'export_report', 'arguments': '{}'}}}}
+        reads = 0
+
+        def read_record(name):
+            nonlocal reads
+            if name == 'session_manifest.json':
+                return deepcopy(manifest)
+            if name == 'actions.json':
+                reads += 1
+                return deepcopy(state if reads == 1 else {**state, 'requests': ['changed']})
+            raise FileNotFoundError(name)
+
+        view = read_task_view(Path('/missing/task'), read_record=read_record, ledger=BudgetLedger({}))
+        self.assertIsNone(view['approval'])
+        self.assertTrue(view['approval_unavailable'])
+
     def test_delivery_validity_is_independent_of_http_file_visibility(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -85,15 +306,14 @@ class LocalWorkspaceTests(unittest.TestCase):
                     raise ValueError('Exact selected material denied')
                 return workspace.read(path)
 
-            args._material_authorize = admit
-            args._material_preflight = workspace.material_grants
             with patch.object(RetainedDelivery, 'hashes', side_effect=AssertionError('Grant before hash')):
                 with self.assertRaisesRegex(ValueError, 'Exact selected material denied'):
-                    reuse_session_materials(args, native=True)
+                    reuse_session_materials(args, native=True,
+                        access=ReuseAccess(authorize=admit, preflight=workspace.material_grants))
             self.assertIn(denied, admitted)
-            args._material_authorize = workspace.read
             with patch.object(ToolApplication, 'load', side_effect=AssertionError('No executable assembly')):
-                reuse_session_materials(args, native=True)
+                reuse_session_materials(args, native=True,
+                    access=ReuseAccess(authorize=workspace.read, preflight=workspace.material_grants))
             self.assertEqual(set(args.material), {denied, log})
             # The actual UI configuration entry wires the same admission into
             # migration, despite missing historical sources and extensions.
@@ -125,6 +345,7 @@ class LocalWorkspaceTests(unittest.TestCase):
         mode = source[source.index('function creationMode()'):source.index('async function refresh()')]
         script = r"""
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const elements = new Map();
 const $ = id => {
   if (!elements.has(id)) elements.set(id, {value: '', checked: false, hidden: false,
@@ -182,6 +403,7 @@ function json(path, data) {
   await action('feedback', {feedback: 'double click'});
   assert.equal(requests.length, 1);
   assert.equal(requests[0].task, 'alpha');
+  assert.equal(typeof requests[0].submission_id, 'string');
   selectTask('beta');
   finish({task: 'alpha', message: 'accepted'});
   await new Promise(resolve => setImmediate(resolve));
@@ -194,6 +416,7 @@ function json(path, data) {
   assert.ok(messages.some(text => text.includes('服务器已接受操作')));
   assert.equal(actionSending, false);
   assert.equal(view.tasks.alpha.feedback, 'Revise the figure and caption');
+  assert.equal(view.tasks.alpha.submission.submission_id, requests[0].submission_id);
   selected = '';
   $('taskConfig').value = '/approved/task.toml';
   creationMode();
@@ -287,11 +510,16 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     'prepared_result': result['data']['prepared_result']})], progress=lambda _: None)
                 pending = app.state['pending']
                 token = app.approval_token(pending['call'])
+                self.assertEqual(app.session.manifest.status_reason,
+                    'Process requires explicit approval; token=' + token)
                 before = {p.relative_to(app.session.store.root): p.read_bytes()
                     for p in app.session.store.root.rglob('*') if p.is_file()}
                 with patch.object(ToolApplication, 'load', side_effect=AssertionError('GET must not load an application')), \
                         patch.object(Path, 'mkdir', side_effect=AssertionError('GET must not create directories')):
                     view = workspace.snapshot('prepared')
+                self.assertIsNotNone(view['approval'], {
+                    'status_reason': view['manifest']['status_reason'],
+                    'approval_unavailable': view['approval_unavailable']})
                 self.assertEqual(view['approval']['token'], token)
                 self.assertEqual(view['approval']['execution'], {
                     'argv': [str(app.workspace.python), str(runner)],
@@ -318,11 +546,18 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                             saved = {p.relative_to(app.session.store.root): p.read_bytes()
                                 for p in app.session.store.root.rglob('*') if p.is_file()}
                             with patch.object(ToolApplication, 'load', side_effect=AssertionError('No app load')), \
+                                    patch.object(LLMClient, 'from_env', side_effect=AssertionError('No model resolution')), \
                                     patch.object(Path, 'mkdir', side_effect=AssertionError('No directory writes')):
                                 self.assertEqual(app.execution_approval(active['call']), expected)
                                 self.assertEqual(app.execution_binding(active['call']), expected['binding'])
                                 self.assertEqual(app.approval_token(active['call']), expected['token'])
                                 view = workspace.snapshot('prepared')
+                                shared = read_task_view(app.session.store.root,
+                                    read_record=app.session.store.read_json, ledger=app.ledger,
+                                    native_recipe=ToolApplication.RECIPE)
+                                self.assertEqual(shared, {key: view[key] for key in shared})
+                                self.assertEqual(workspace.snapshot_unlocked_approval(app.session.store.root),
+                                    shared['approval']['token'])
                             self.assertEqual(view['approval']['token'], expected['token'])
                             self.assertEqual(view['approval']['attempt'], active['attempt'])
                             self.assertEqual(view['approval']['execution']['cwd'], result['data']['project_dir'])
@@ -373,8 +608,13 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                 before = {p.relative_to(app.session.store.root): p.read_bytes()
                     for p in app.session.store.root.rglob('*') if p.is_file()}
                 with patch.object(ToolApplication, 'load', side_effect=AssertionError('No app load')), \
+                        patch.object(LLMClient, 'from_env', side_effect=AssertionError('No model resolution')), \
                         patch.object(Path, 'mkdir', side_effect=AssertionError('No directory writes')):
-                    self.assertEqual(workspace.snapshot('process')['approval']['token'], expected['token'])
+                    view = workspace.snapshot('process')
+                    shared = read_task_view(app.session.store.root,
+                        read_record=app.session.store.read_json, ledger=app.ledger)
+                    self.assertEqual(shared, {key: view[key] for key in shared})
+                    self.assertEqual(shared['approval']['token'], expected['token'])
                 self.assertEqual(before, {p.relative_to(app.session.store.root): p.read_bytes()
                     for p in app.session.store.root.rglob('*') if p.is_file()})
                 for changes in ({'cwd': 'workspace/other'}, {'argv': ['python', '-c', 'print("changed")']}):
@@ -440,6 +680,8 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                 return result
 
             def action(op, **kwargs):
+                if op == 'feedback':
+                    kwargs.setdefault('submission_id', 'ui-feedback-' + str(kwargs['feedback']))
                 status, raw = request('/api/action', {'op': op, 'task': name, **kwargs})
                 self.assertEqual(status, 200, raw)
                 if op in {'feedback', 'resume', 'approve'}:

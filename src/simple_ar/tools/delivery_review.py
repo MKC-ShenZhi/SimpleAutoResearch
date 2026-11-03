@@ -11,6 +11,63 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from simple_ar.core.assessments import assessment_issues, assessment_state, current_assessments, finding_id
 from simple_ar.tools.specs import ToolResult, tool_completion
+from simple_ar.tools.workspace import DeliveryRequest
+
+
+def delivery_claim(request: DeliveryRequest, artifacts: list[str], resolve: Callable) -> dict:
+    """Canonical wire claim shared by live binding and recorded opinion reading."""
+    claim = request.model_dump(mode='json', exclude_none=True)
+    claim['artifacts'] = artifacts
+    if request.report is not None:
+        if request.report.manuscript:
+            claim['report']['manuscript'] = str(resolve(request.report.manuscript))
+        if request.report.formats:
+            claim['report']['formats'] = sorted(set(request.report.formats))
+    if request.summary_source is not None:
+        claim['summary_source']['path'] = str(resolve(request.summary_source.path))
+    return claim
+
+
+def delivery_requires_review(request: DeliveryRequest, protocol: str) -> bool:
+    """Saved delivery admission and capacity obligation; partial remains an exit."""
+    if protocol not in {'task.v1', 'task.v2', 'task.v3', 'task.v4'}:
+        raise ValueError('Unknown delivery review protocol')
+    return not request.unresolved and (protocol in {'task.v3', 'task.v4'} or (
+        request.report is not None and request.report.status == 'canonical'
+        and bool(request.report.manuscript)))
+
+
+def prepare_delivery_review(workspace: Any, request: DeliveryRequest, artifacts: list[str],
+                            user_requests: Callable[[], list[str]], *, protocol: str) -> dict | None:
+    """Bind the acceptance owner's freshly resolved inventory, never cached authority.
+
+    The caller resolves delivery eligibility, including registered current outputs.
+    Paths and bytes are checked here again; review and commit retain their own
+    freshness checks. This value adds no persisted state or acceptance decision.
+    Keep the saved v1/v2/v3 wire representations unchanged.
+    """
+    if not delivery_requires_review(request, protocol):
+        return None
+    artifacts = sorted({str(workspace.resolve(path)) for path in artifacts})
+    requests = user_requests()
+    if not isinstance(requests, list) or any(not isinstance(text, str) for text in requests):
+        raise ValueError('Delivery review requires exact original request and feedback strings')
+    if protocol in {'task.v3', 'task.v4'}:
+        claim = delivery_claim(request, artifacts, workspace.resolve)
+        return {'schema_version': 'delivery_review.v3',
+                **({'scope_policy': 'applicable.v1'} if protocol == 'task.v4' else {}),
+                'requests': list(requests),
+                'claim': claim,
+                'authorized_roots': {name: str(path) for name, path in workspace.mounts.items()},
+                'artifacts': workspace.artifact_hashes(artifacts)}
+    manuscript = str(workspace.resolve(request.report.manuscript))
+    if manuscript not in artifacts:
+        raise ValueError('Delivery review requires the actual manuscript among delivered artifacts')
+    return {'schema_version': 'delivery_review.v2' if protocol == 'task.v2' else 'delivery_review.v1',
+            'requests': list(requests),
+            'manuscript': manuscript, 'formats': sorted(set(request.report.formats)),
+            'authorized_roots': {name: str(path) for name, path in workspace.mounts.items()},
+            'artifacts': workspace.artifact_hashes(artifacts)}
 
 
 _GOAL = (
@@ -179,10 +236,11 @@ def recorded_delivery_review(reader: Any) -> dict | None:
         parent = reader.record(item['result'])
     data, metadata = parent.get('data') or {}, parent.get('metadata') or {}
     delivered = data.get(completion.field) if completion.field else data
-    from simple_ar.tools.workspace import DeliveryRequest
     if (parent.get('status') != 'ok' or parent.get('tool_name') != calls[-1]['function']['name']
-            or not isinstance(delivered, dict)
-            or DeliveryRequest.model_validate(delivered) != DeliveryRequest.model_validate(reader.record('delivery.json'))):
+            or not isinstance(delivered, dict)):
+        raise ValueError('Review differs from the recorded terminal delivery')
+    request = DeliveryRequest.model_validate(delivered)
+    if request != DeliveryRequest.model_validate(reader.record('delivery.json')):
         raise ValueError('Review differs from the recorded terminal delivery')
     envelope = metadata.get('delivery_review') or {}
     binding = envelope.get('binding') or {}
@@ -233,14 +291,7 @@ def recorded_delivery_review(reader: Any) -> dict | None:
             or {str(reader.resolve(path)): digest for path, digest in pinned.items()} != binding.get('artifacts')
             or assessment.artifacts != binding['artifacts']):
         raise ValueError('Review scope differs from the recorded delivery')
-    claim = DeliveryRequest.model_validate(delivered).model_dump(mode='json', exclude_none=True)
-    claim['artifacts'] = sorted(binding['artifacts'])
-    if claim.get('report', {}).get('manuscript'):
-        claim['report']['manuscript'] = str(reader.resolve(claim['report']['manuscript']))
-    if claim.get('report', {}).get('formats'):
-        claim['report']['formats'] = sorted(set(claim['report']['formats']))
-    if claim.get('summary_source') is not None:
-        claim['summary_source']['path'] = str(reader.resolve(claim['summary_source']['path']))
+    claim = delivery_claim(request, sorted(binding['artifacts']), reader.resolve)
     if claim != binding.get('claim') or state['requests'] != binding.get('requests'):
         raise ValueError('Review claim differs from the recorded delivery request')
     if reader.record('session_manifest.json') != manifest or reader.record('actions.json') != state:

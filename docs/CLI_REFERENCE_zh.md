@@ -99,6 +99,7 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--model SELECTOR` | 模型选择器：env、profile:NAME 或 route:NAME。 | env |
 | `--output-root PATH` | 新任务／运行目录的父目录。 | runs/assistant |
 | `--prepare-only` | 保存／预览，不调用模型／进程；新原生任务仍检查凭据。 | 关闭 |
+| `--interactive` | 在终端中持续使用同一个普通任务：输入反馈继续工作，`/status` 查看状态，`/exit` 退出并保留任务。沿用原权限和额度；与结构化设置的 `--chat` 不同。 | 关闭 |
 | `--yes` | 接受显示的新建／访问／资源摘要；不批准待执行的原生进程。 | 关闭 |
 
 #### 访问与资源额度
@@ -205,6 +206,7 @@ simple-ar start "解释这些结果" --source ./results --model profile:daily
 simple-ar start --write-task-config task.toml
 simple-ar start --task-config task.toml --yes
 simple-ar start --resume-task SESSION "精简结果说明"
+simple-ar start --resume-task SESSION --interactive
 simple-ar start --resume-task SESSION --approve-execution TOKEN
 simple-ar start --resume-task SESSION --authorize-remaining llm_requests=10 --authorize-remaining total_tokens=100000 --authorization-id continuation-1 --authorization-reason "完成当前任务的剩余工作" --yes
 simple-ar start --kind data_analysis --data-file measurements.csv --value-column score --observation-unit "一次独立运行" --yes

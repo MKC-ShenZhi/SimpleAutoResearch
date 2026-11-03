@@ -19,6 +19,246 @@ from tests.native_history_fixture import load_native_history
 
 
 class StartTests(unittest.TestCase):
+    def _interactive_cli_app(self):
+        from unittest.mock import MagicMock
+        from simple_ar.core.budget import BudgetLedger
+        app = MagicMock()
+        app.session.store.root = Path('saved-interactive-task').resolve()
+        app.session.store.exists.return_value = False
+        app.workspace.workspace = app.session.store.root / 'workspace'
+        app.state = {'config': {'model': 'profile:saved', 'control_protocol': 'operations.v1',
+            'code_task': None, 'execution_contract': None, 'research_policy': None},
+            'pending': None, 'requests': ['Original request'], 'turns': []}
+        app.ledger = BudgetLedger({'llm_requests': 3, 'total_tokens': 500})
+        app.run.return_value = {'status': 'failed'}
+        app.result_snapshot.return_value = {'task_view': {
+            'manifest': {'status': 'owner-projected-status'}, 'requests': ['Original request'],
+            'plan': None, 'activity': [], 'approval': None, 'approval_unavailable': None,
+            'resources': app.ledger.snapshot()}}
+        return app
+
+    def test_interactive_native_feedback_reuses_app_approval_and_ledger(self):
+        from simple_ar.cli.main import main, _render_native_result
+        app = self._interactive_cli_app()
+        before = app.ledger.to_dict()
+        with patch('sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', side_effect=['/status', '/retry', '/exit now', '  Revise the explanation  ', '/exit']), \
+                patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app) as load, \
+                patch('simple_ar.app.tool_application.ToolApplication.create') as create, \
+                patch('simple_ar.cli.main._render_native_result', wraps=_render_native_result) as renderer, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            main(['start', '--resume-task', str(app.session.store.root), '--interactive'])
+        load.assert_called_once_with(app.session.store.root)
+        create.assert_not_called()
+        self.assertEqual(renderer.call_count, 3)
+        for call in renderer.call_args_list:
+            self.assertIs(call.kwargs['task_view'], app.result_snapshot.return_value['task_view'])
+        self.assertEqual(app.run.call_count, 2)
+        initial, feedback = [call.kwargs for call in app.run.call_args_list]
+        self.assertFalse(initial['retry_model'])
+        self.assertIsNone(initial['resource_allowances'])
+        self.assertEqual(initial['read_only_sources'], ())
+        self.assertEqual(set(feedback), {'feedback', 'approve', 'progress'})
+        self.assertEqual(feedback['feedback'], '  Revise the explanation  ')
+        self.assertIs(feedback['approve'], initial['approve'])
+        self.assertTrue(callable(feedback['approve']))
+        self.assertEqual(app.result_snapshot.call_count, 3)
+        app.session.status_snapshot.assert_not_called()
+        self.assertEqual(app.ledger.to_dict(), before)
+        self.assertIn('owner-projected-status', output.getvalue())
+        self.assertIn('Unknown command', output.getvalue())
+        self.assertIn(str(app.session.store.root), output.getvalue())
+
+    def test_interactive_native_creation_enters_same_feedback_consumer(self):
+        from simple_ar.cli.main import main
+        app = self._interactive_cli_app()
+        with patch('sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', side_effect=['Revise the result', '/exit']), \
+                patch('simple_ar.cli.start.select_start_model'), \
+                patch('simple_ar.app.tool_application.ToolApplication.create', return_value=app) as create, \
+                patch('simple_ar.app.tool_application.ToolApplication.load') as load, \
+                contextlib.redirect_stdout(io.StringIO()):
+            main(['start', 'Original request', '--interactive', '--yes', '--model', 'profile:saved'])
+        create.assert_called_once()
+        load.assert_not_called()
+        self.assertEqual(app.run.call_count, 2)
+        self.assertEqual(app.run.call_args.kwargs['feedback'], 'Revise the result')
+        options = create.call_args.kwargs
+        self.assertFalse(options['allow_execution'])
+        self.assertFalse(options['allow_network'])
+        self.assertEqual(options['max_turns'], 30)
+        self.assertEqual(options['max_tokens'], 600000)
+
+    def test_interactive_status_and_exit_never_retry_failed_work(self):
+        from simple_ar.cli.main import main
+        for failure in (RuntimeError('Stopped after saving an operation'),
+                        ValueError('Feedback cannot replay an unreconciled operation')):
+            app = self._interactive_cli_app()
+            app.run.side_effect = failure
+            with self.subTest(failure=type(failure).__name__), \
+                    patch('sys.stdin.isatty', return_value=True), \
+                    patch('builtins.input', side_effect=['/status', '/retry', '', '/exit']), \
+                    patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                main(['start', '--resume-task', str(app.session.store.root), '--interactive'])
+            app.run.assert_called_once()
+            self.assertEqual(app.result_snapshot.call_count, 2)
+            self.assertIn('Task retained', output.getvalue())
+            self.assertIn(str(failure), output.getvalue())
+            self.assertIn('session_manifest.json', output.getvalue())
+            self.assertIn('attempts', output.getvalue())
+
+    def test_interactive_result_renderer_shows_delivery_issues_and_history_without_mutation(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.cli.main import main
+        with tempfile.TemporaryDirectory() as directory:
+            app = ToolApplication.create(Path(directory) / 'task', 'Explain supplied facts', sources={}, model=None)
+            app.run(actions=[
+                {'tool_name': 'write_file', 'arguments': {'path': 'explanation.md',
+                    'content': 'Usable supplied explanation.\n'}},
+                {'tool_name': 'deliver_result', 'arguments': {'summary': 'Editable explanation delivered',
+                    'artifacts': ['explanation.md'], 'unresolved': ['Independent verification unfinished'],
+                    'limitations': ['Only supplied observations are available']}}], progress=lambda _: None)
+            root = app.session.store.root
+            before = {path: path.read_bytes() for path in root.rglob('*') if path.is_file()}
+            ledger = app.ledger.to_dict()
+            with patch('sys.stdin.isatty', return_value=True), \
+                    patch('builtins.input', side_effect=['/status', '/exit']), \
+                    patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+                    patch.object(app, 'run', return_value=app.result_snapshot()) as run, \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                main(['start', '--resume-task', str(root), '--interactive'])
+            run.assert_called_once()
+            text = output.getvalue()
+            for expected in ('explanation.md', 'Editable explanation delivered',
+                             'Independent verification unfinished', 'Only supplied observations are available',
+                             'Reason', 'write_file', 'deliver_result'):
+                self.assertIn(expected, text)
+            self.assertEqual(app.ledger.to_dict(), ledger)
+            self.assertEqual({path: path.read_bytes() for path in root.rglob('*') if path.is_file()}, before)
+
+    def test_interactive_eof_and_interrupt_retain_task_without_resubmitting(self):
+        from simple_ar.cli.main import main
+        for during_run in (False, True):
+            for stop in (EOFError, KeyboardInterrupt):
+                app = self._interactive_cli_app()
+                if during_run:
+                    app.run.side_effect = stop
+                with self.subTest(during_run=during_run, stop=stop.__name__), \
+                        patch('sys.stdin.isatty', return_value=True), \
+                        patch('builtins.input', side_effect=stop), \
+                        patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    main(['start', '--resume-task', str(app.session.store.root), '--interactive'])
+                app.run.assert_called_once()
+                self.assertIn(str(app.session.store.root), output.getvalue())
+                self.assertIn('--interactive', output.getvalue())
+
+    def test_interactive_failed_feedback_and_unavailable_view_are_not_replayed(self):
+        from simple_ar.cli.main import main
+        app = self._interactive_cli_app()
+        app.run.side_effect = [{'status': 'completed'}, ValueError('Feedback rejected by task owner')]
+        app.result_snapshot.side_effect = OSError('Saved task view is unavailable')
+        with patch('sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', side_effect=['Revise only the conclusion', '/status', '/exit']), \
+                patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            main(['start', '--resume-task', str(app.session.store.root), '--interactive'])
+        self.assertEqual(app.run.call_count, 2)
+        self.assertEqual(app.run.call_args.kwargs['feedback'], 'Revise only the conclusion')
+        self.assertEqual(app.result_snapshot.call_count, 3)
+        self.assertIn('Feedback rejected by task owner', output.getvalue())
+        self.assertIn('Saved task view is unavailable', output.getvalue())
+        self.assertIn('session_manifest.json', output.getvalue())
+
+    def test_interactive_unexpected_error_is_visible_and_retains_resume_location(self):
+        from simple_ar.cli.main import main
+        app = self._interactive_cli_app()
+        app.run.side_effect = KeyError('Unexpected application error')
+        with patch('sys.stdin.isatty', return_value=True), \
+                patch('builtins.input') as prompt, \
+                patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+                contextlib.redirect_stdout(io.StringIO()) as output, \
+                self.assertRaisesRegex(KeyError, 'Unexpected application error'):
+            main(['start', '--resume-task', str(app.session.store.root), '--interactive'])
+        app.run.assert_called_once()
+        prompt.assert_not_called()
+        self.assertIn(str(app.session.store.root), output.getvalue())
+
+    def test_without_interactive_keeps_one_shot_and_nonterminal_behavior(self):
+        from simple_ar.cli.main import main
+        for tty in (True, False):
+            app = self._interactive_cli_app()
+            with self.subTest(tty=tty), patch('sys.stdin.isatty', return_value=tty), \
+                    patch('builtins.input') as prompt, \
+                    patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+                    patch('simple_ar.cli.main._render_native_result') as renderer:
+                main(['start', '--resume-task', str(app.session.store.root)])
+            app.run.assert_called_once()
+            renderer.assert_called_once_with(app, app.run.return_value)
+            app.result_snapshot.assert_not_called()
+            prompt.assert_not_called()
+            self.assertEqual(callable(app.run.call_args.kwargs['approve']), tty)
+
+    def test_interactive_rejects_nonterminal_and_structured_options_before_dispatch(self):
+        from simple_ar.cli.main import main
+        variants = [(['start', 'Explain', '--interactive'], False)]
+        variants.extend((['start', '--interactive', *extra], True) for extra in (
+            ['--chat'], ['--resume-setup', 'setup'], ['--prepare-only'],
+            ['--kind', 'survey', '--sources', 'search', '--goal', 'Read'],
+            ['--kind', 'data_analysis', '--value-column', 'value', '--goal', 'Analyze'],
+            ['--kind', 'bug_fix', '--allow', 'src/**', '--validate', 'python check.py'],
+            ['--resume-task', 'saved', '--retry-model'],
+            ['--resume-task', 'saved', '--authorize-remaining', 'total_tokens=10'],
+            ['--resume-task', 'saved', '--allow-network'],
+            ['--resume-task', 'saved', '--source', 'additional-material'],
+            ['--resume-task', 'saved', '/status']))
+        with patch('simple_ar.app.tool_application.ToolApplication.create') as create, \
+                patch('simple_ar.app.tool_application.ToolApplication.load') as load, \
+                patch('simple_ar.cli.start.select_start_model') as model, \
+                patch('simple_ar.cli.intake_dialogue.discuss_start') as chat, \
+                patch('builtins.input') as prompt, contextlib.redirect_stdout(io.StringIO()):
+            for argv, tty in variants:
+                with self.subTest(argv=argv), patch('sys.stdin.isatty', return_value=tty), \
+                        self.assertRaises(SystemExit):
+                    main(argv)
+            create.assert_not_called()
+            load.assert_not_called()
+            model.assert_not_called()
+            chat.assert_not_called()
+            prompt.assert_not_called()
+        parsed = build_parser().parse_args(['start', '--chat'])
+        self.assertTrue(parsed.chat)
+        self.assertFalse(parsed.interactive)
+
+    def test_interactive_rejects_saved_structured_contract_before_run(self):
+        from simple_ar.cli.main import main
+        for contract in ('code_task', 'execution_contract', 'research_policy', 'report_protocol'):
+            app = self._interactive_cli_app()
+            app.state['config'][contract] = {}
+            with self.subTest(contract=contract), patch('sys.stdin.isatty', return_value=True), \
+                    patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+                    patch('builtins.input') as prompt, contextlib.redirect_stdout(io.StringIO()), \
+                    self.assertRaisesRegex(SystemExit, 'saved structured contracts'):
+                main(['start', '--resume-task', str(app.session.store.root), '--interactive'])
+            app.run.assert_not_called()
+            prompt.assert_not_called()
+
+    def test_interactive_flag_is_not_a_persisted_task_setting(self):
+        from simple_ar.cli.task_options import apply_task_config
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'task.toml'
+            config.write_text('[task]\nrequest="Explain supplied facts"\nmax_tokens=100\n', encoding='utf-8')
+            args = build_parser().parse_args(['start', '--task-config', str(config), '--interactive'])
+            args._explicit_start_destinations = {'task_config', 'interactive'}
+            apply_task_config(args)
+            self.assertTrue(args.interactive)
+            self.assertEqual(args.request, 'Explain supplied facts')
+            self.assertEqual(args.max_tokens, 100)
+            config.write_text('[task]\ninteractive=true\n', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'Unknown task settings: interactive'):
+                apply_task_config(args)
+
     def _ordinary_project_delivery(self, root, *, projects=1, deliver_count=None,
                                    archive=False, omitted=False, partial=False):
         from simple_ar.app.tool_application import ToolApplication
@@ -524,24 +764,19 @@ class StartTests(unittest.TestCase):
             self.assertEqual(args.request, 'Revise the supplied draft')
 
     def test_native_prepared_approval_prints_bound_command_before_confirmation(self):
-        import hashlib
+        from types import SimpleNamespace
         from unittest.mock import MagicMock
+        from simple_ar.app.tool_application import ToolApplication
         from simple_ar.cli.main import main
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.tools.workspace import WorkspaceToolGateway
 
         app = MagicMock()
-        app.session.store.root = Path('saved-task').resolve()
-        app.state = {'config': {'model': None}, 'pending': None}
         app.measurement_completion_actions.return_value = []
         proposal = {'id': 'prepared-run', 'type': 'function', 'function': {
             'name': 'execute_implementation', 'arguments': json.dumps({
                 'prepared_result': 'records/prepared/implementation/result.json'})}}
-        binding = {'argv': ['task-python', 'worker.py', '--literal=two words'],
-            'cwd': str(app.session.store.root / 'workspace/implementations/prepared'),
-            'plan': {'timeout_sec': 7}}
-        token = hashlib.sha256(json.dumps({'call': proposal, 'inputs': binding},
-            sort_keys=True).encode()).hexdigest()
         lines = []
-        app.execution_binding.return_value = binding
 
         def confirm(_):
             command = next(line for line in lines if line.startswith('Prepared command: '))
@@ -554,20 +789,41 @@ class StartTests(unittest.TestCase):
             return {'status': 'paused'}
 
         app.run.side_effect = run
-        with patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
                 patch('simple_ar.integrations.llm.LLMClient.from_env', side_effect=AssertionError('No live model')), \
                 patch('simple_ar.cli.main._render_native_result'), \
                 patch('simple_ar.core.console.print_line', side_effect=lines.append), \
                 patch('sys.stdin.isatty', return_value=True), \
                 patch('builtins.input', side_effect=confirm) as prompt:
-            main(['start', '--resume-task', 'saved-task'])
+            root = Path(directory).resolve()
+            app.session.store.root = root
+            app.state = {'config': {'model': None}, 'pending': {
+                'kind': 'tool', 'attempt': 'prepared-run', 'call': proposal}}
+            app.ledger = BudgetLedger()
+            app.workspace = WorkspaceToolGateway(root, {}, app.ledger)
+            binding = {'argv': ['task-python', 'worker.py', '--literal=two words'],
+                'cwd': str(root / 'workspace/implementations/prepared'),
+                'plan': {'timeout_sec': 7}}
+            owner = SimpleNamespace(approval_binding=MagicMock(return_value=binding))
+            app.gateway.session_owner.return_value = owner
+            # Use the actual public app/workspace projection, including its
+            # token format and pending identity, rather than a stale hash fixture.
+            app.execution_approval.side_effect = lambda call: ToolApplication.execution_approval(app, call)
+            token = app.execution_approval(proposal)['token']
+            app.execution_approval.reset_mock()
+            owner.approval_binding.reset_mock()
+            main(['start', '--resume-task', str(root)])
             prompt.assert_called_once()
-            app.execution_binding.assert_called_once_with(proposal)
+            app.execution_approval.assert_called_once_with(proposal)
+            owner.approval_binding.assert_called_once_with(
+                json.loads(proposal['function']['arguments']), identity='prepared-run')
+            app.execution_binding.assert_not_called()
             lines.clear()
-            app.execution_binding.return_value = {**binding, 'argv': ['changed-command']}
+            owner.approval_binding.return_value = {**binding, 'argv': ['changed-command']}
             prompt.reset_mock()
             with self.assertRaisesRegex(SystemExit, 'changed since approval'):
-                main(['start', '--resume-task', 'saved-task'])
+                main(['start', '--resume-task', str(root)])
             prompt.assert_not_called()
             self.assertFalse(any(line.startswith('Prepared command: ') for line in lines))
 

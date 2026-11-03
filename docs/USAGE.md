@@ -203,6 +203,8 @@ Discovery reads the supplied directory and direct children only, at most 256 ent
 Interactive selection requires a terminal; scripts use an exact listed directory name.
 Recorded status does not certify quality; `partial` retains unresolved work.
 Feedback continues the same task and ledger; starting from a configuration again creates a new task.
+
+For continued conversation, run `uv run simple-ar start --resume-task SESSION --interactive`. Enter feedback after each turn, use `/status` to inspect progress, and `/exit` to leave while retaining the task.
 Creation flags cannot reset saved process limits on resume; additional resources require explicit continuation authorization.
 
 ### Change a configured connection

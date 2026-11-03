@@ -6,7 +6,7 @@ import shlex
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from simple_ar.core.artifacts import read_json, read_text
 from simple_ar.cli.research_view import ResearchConsole, report_audit_line
@@ -242,6 +242,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         from simple_ar.cli.start import prepare_start
         from simple_ar.core.locking import SessionLockError
         try:
+            from simple_ar.cli.task_options import validate_interactive_options
+            validate_interactive_options(args)
             from simple_ar.cli.project_tasks import handle_project_tasks
             if handle_project_tasks(args, interactive=sys.stdin.isatty()):
                 return
@@ -2464,7 +2466,7 @@ def _delivery_version_lines(root: Path) -> list[str]:
     return lines
 
 
-def _render_native_result(app: Any, status: dict[str, Any]) -> None:
+def _render_native_result(app: Any, status: dict[str, Any], *, task_view: dict | None = None) -> None:
     """Read the existing owners; never commit, reconcile or certify a result."""
     from simple_ar.core.console import make_console
     from rich.console import Group
@@ -2479,7 +2481,9 @@ def _render_native_result(app: Any, status: dict[str, Any]) -> None:
         except ValueError:
             return str(path)
 
-    pending = app.state.get("pending") or {}
+    if task_view is not None:
+        status = {**status, **task_view['manifest']}
+    pending = (task_view.get('pending') if task_view is not None else app.state.get('pending')) or {}
     reason = str(status.get("status_reason") or "")
     # Exception messages can contain provider URLs, headers or credentials.
     if reason.startswith("BudgetExceededError:") or (
@@ -2504,6 +2508,18 @@ def _render_native_result(app: Any, status: dict[str, Any]) -> None:
     lines = [f"Status: {status['status']}", f"Reason / 原因: {reason or 'not recorded'}",
              f"Saved session / 会话: {root}", "Locations below are relative to this session unless absolute.",
              f"Workspace / 工作区: {location(app.workspace.workspace)}", "Attempts / 尝试记录: attempts"]
+    if task_view is not None:
+        if task_view['requests']:
+            lines.append('Request / 当前请求: ' + task_view['requests'][-1])
+        for row in task_view.get('activity', [])[:6]:
+            lines.append(f"Recent action / 最近动作: {row.get('tool', 'action')} | "
+                         f"{row.get('status', 'unavailable')} | {row['record']}")
+        if task_view.get('approval_unavailable'):
+            lines.append(task_view['approval_unavailable'])
+        approval = task_view.get('approval')
+        if approval:
+            import json
+            lines.append('Pending approval / 待审批: ' + json.dumps(approval, ensure_ascii=False))
     if pending.get("kind") in {"model", "tool"}:
         lines.append(f"Pending action / 待处理动作: {pending['kind']}")
     attempt = pending.get("attempt") or status.get("current_attempt")
@@ -2534,6 +2550,8 @@ def _render_native_result(app: Any, status: dict[str, Any]) -> None:
         lines.append("Request/version binding not checked here; this record may precede the current feedback.")
         try:
             delivery = app.session.store.read_json("delivery.json")
+            if task_view is not None:
+                lines.append('Recorded summary / 交付说明: ' + delivery.get('summary', ''))
             artifacts = delivery["artifacts"]
             if not isinstance(artifacts, list):
                 raise ValueError("Invalid saved artifact list")
@@ -2570,7 +2588,7 @@ def _render_native_result(app: Any, status: dict[str, Any]) -> None:
         lines.append("No saved delivery record / 无已保存交付记录")
 
     lines.extend(_delivery_version_lines(root))
-    budget = app.ledger.snapshot()
+    budget = task_view['resources'] if task_view is not None else app.ledger.snapshot()
     entries = app.ledger.entries
     table = Table("Resource", "Cumulative accounting / 累计账目", "Remaining / 剩余", expand=True)
     for dimension, remaining in budget["remaining"].items():
@@ -2591,6 +2609,66 @@ def _render_native_result(app: Any, status: dict[str, Any]) -> None:
     make_console().print(Panel(Group(Text("\n".join(lines)), table, note), title="Task result / 任务读出"))
 
 
+def _run_native_conversation(app: Any, initial_run: Callable[[], dict[str, Any]],
+                             approve: Callable[[dict[str, Any], str], bool]) -> None:
+    """Terminal input adapter; the existing app owns feedback, stops and recovery."""
+    from simple_ar.cli.task_options import resume_command
+
+    def retained() -> None:
+        print_line(f'Task retained / 任务已保留: {app.session.store.root}')
+        print_line(f'Resume: {resume_command(app.session.store.root)} --interactive')
+
+    def display() -> None:
+        try:
+            snapshot = app.result_snapshot()
+            _render_native_result(app, snapshot, task_view=snapshot['task_view'])
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError, LLMError) as exc:
+            print_line(f'Task view unavailable: {type(exc).__name__}: {str(exc)[:300]}')
+            print_line(f'Diagnostics: {app.session.store.root / "session_manifest.json"}; {app.session.store.root / "attempts"}')
+
+    def run(feedback: str | None = None) -> bool:
+        try:
+            if feedback is None:
+                initial_run()
+            else:
+                app.run(feedback=feedback, approve=approve, progress=print_line)
+        except (EOFError, KeyboardInterrupt):
+            return False
+        except (OSError, ValueError, RuntimeError, LLMError) as exc:
+            # Never retry, replenish resources, or resubmit this input. The app
+            # may already have persisted feedback or started an operation.
+            print_line(f'Task action stopped: {type(exc).__name__}: {str(exc)[:300]}')
+            print_line(f'Diagnostics: {app.session.store.root / "session_manifest.json"}; {app.session.store.root / "attempts"}')
+            retained()
+        return True
+
+    try:
+        if not run():
+            return
+        display()
+        print_line('Feedback / 反馈; /status reads saved facts; /exit leaves this task saved.')
+        while True:
+            feedback = input('Task / 任务> ')
+            command = feedback.strip()
+            if not command:
+                continue
+            if command == '/exit':
+                return
+            if command == '/status':
+                display()
+                continue
+            if command.startswith('/'):
+                print_line('Unknown command; use /status or /exit. No feedback submitted.')
+                continue
+            if not run(feedback):
+                return
+            display()
+    except (EOFError, KeyboardInterrupt):
+        pass
+    finally:
+        retained()
+
+
 def _run_native_start(args: argparse.Namespace) -> None:
     from simple_ar.app.session_roots import new_research_session_root
     from simple_ar.app.tool_application import ToolApplication
@@ -2600,7 +2678,14 @@ def _run_native_start(args: argparse.Namespace) -> None:
     from rich.panel import Panel
     from rich.text import Text
     interactive = sys.stdin.isatty()
+    app = None
     try:
+        from simple_ar.cli.task_options import validate_interactive_options
+        validate_interactive_options(args)
+        conversation = getattr(args, 'interactive', False)
+        if conversation and any(getattr(args, name, None) is not None for name in
+                                ('_code_task', '_execution_contract', '_research_policy')):
+            raise ValueError('--interactive supports ordinary native tasks only, not structured contracts')
         decision = {name: getattr(args, name, None) for name in
                     ('decision_id', 'decision_response', 'decision_guidance')}
         if any(value is not None for value in decision.values()):
@@ -2648,6 +2733,10 @@ def _run_native_start(args: argparse.Namespace) -> None:
             from simple_ar.cli.task_options import validate_resume_options
             validate_resume_options(args)
             app = ToolApplication.load(args.resume_task.resolve())
+            if conversation and (app.state['config'].get('control_protocol') != 'operations.v1'
+                    or any(app.state['config'].get(name) is not None for name in
+                           ('code_task', 'execution_contract', 'research_policy', 'report_protocol'))):
+                raise ValueError('--interactive supports ordinary native tasks only, not saved structured contracts')
             if args.supply_task:
                 if (args.request or args.goal or args.retry_model or args.approve_execution or decision
                         or args.source or args.allow_execution or args.allow_network or args.allow_vision
@@ -2808,25 +2897,38 @@ def _run_native_start(args: argparse.Namespace) -> None:
             print_line("Execution is not sandboxed. Inspect the generated code before approving.")
             return interactive and input("Execute this command / 执行此命令? [y/N]: ").strip().lower() in {"y", "yes"}
 
-        status = app.run(feedback=feedback, approved_execution=args.approve_execution,
-                         retry_model=args.retry_model,
-                         retry_model_selector=replacement_model if args.resume_task else '',
-                         read_only_sources=tuple(args.source) if args.resume_task else (),
-                         allow_execution=args.allow_execution if args.resume_task else False,
-                         allow_network=args.allow_network if args.resume_task else False,
-                         allow_vision=args.allow_vision if args.resume_task else False,
-                         resource_allowances=allowances or None,
-                         authorization_id=authorization_id, authorization_reason=authorization_reason,
-                         decision=decision,
-                         approve=approve if interactive else None, progress=print_line)
-        if (args.resume_task and app.state['config'].get('model') is None
-                and not feedback and not args.retry_model and not allowances
-                and not (args.source or args.allow_execution or args.allow_network or args.allow_vision)):
-            completion = app.measurement_completion_actions()
-            if completion:
-                status = app.run(actions=completion, progress=print_line)
-        _render_native_result(app, status)
+        def run_initial():
+            status = app.run(feedback=feedback, approved_execution=args.approve_execution,
+                retry_model=args.retry_model,
+                retry_model_selector=replacement_model if args.resume_task else '',
+                read_only_sources=tuple(args.source) if args.resume_task else (),
+                allow_execution=args.allow_execution if args.resume_task else False,
+                allow_network=args.allow_network if args.resume_task else False,
+                allow_vision=args.allow_vision if args.resume_task else False,
+                resource_allowances=allowances or None,
+                authorization_id=authorization_id, authorization_reason=authorization_reason,
+                decision=decision, approve=approve if interactive else None, progress=print_line)
+            if (not conversation and args.resume_task and app.state['config'].get('model') is None
+                    and not feedback and not args.retry_model and not allowances
+                    and not (args.source or args.allow_execution or args.allow_network or args.allow_vision)):
+                completion = app.measurement_completion_actions()
+                if completion:
+                    status = app.run(actions=completion, progress=print_line)
+            return status
+
+        if conversation:
+            _run_native_conversation(app, run_initial, approve)
+        else:
+            _render_native_result(app, run_initial())
+    except (EOFError, KeyboardInterrupt):
+        if not getattr(args, 'interactive', False) or app is None:
+            raise
+        from simple_ar.cli.task_options import resume_command
+        print_line(f'Task retained: {app.session.store.root}\nResume: {resume_command(app.session.store.root)} --interactive')
     except (OSError, ValueError, RuntimeError, LLMError) as exc:
+        if getattr(args, 'interactive', False) and app is not None:
+            from simple_ar.cli.task_options import resume_command
+            print_line(f'Task retained: {app.session.store.root}\nResume: {resume_command(app.session.store.root)} --interactive')
         raise SystemExit(f"Native task stopped; saved operations are not replayed: {exc}") from exc
 
 

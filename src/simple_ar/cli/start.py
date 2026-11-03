@@ -12,10 +12,10 @@ import json
 import os
 from pathlib import Path
 import shlex
-import stat
 import sys
 
 from simple_ar.app.session_roots import new_research_session_root
+from simple_ar.app.reuse import ReuseAccess, select_reuse, session_materials as _session_materials
 from simple_ar.cli.research_config import data_options_supplied, data_settings, setup_option_contract
 from simple_ar.core.console import print_line
 from simple_ar.result_analysis.table import TABLE_CHOICES, TABLE_MODE_DESCRIPTIONS, TABLE_PLOT_DESCRIPTIONS, TableSpec
@@ -111,6 +111,7 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("start", help="Start a native goal-driven task; structured protocols retain explicit compatibility.")
     native = parser.add_argument_group("Native task")
     native.add_argument("request", nargs="?", help="Natural-language task using the native action loop; no function selection.")
+    native.add_argument("--interactive", action="store_true", help="Terminal only: continue the same ordinary native task with feedback; /status reads saved facts, /exit leaves the task saved. Separate from structured --chat setup.")
     native.add_argument("--resume-task", type=Path, help="Resume a native task directory, or an exact displayed name with --tasks-in; never replays unknown operations.")
     native.add_argument("--tasks-in", type=Path, help="Read-only native task listing in PATH and its immediate children (at most 256 entries); no recursive search.")
     native.add_argument("--select-task", action="store_true", help="With --tasks-in, interactively select an existing native task; blank cancels.")
@@ -226,7 +227,7 @@ def _select_start_preference(args: argparse.Namespace, *, interactive: bool) -> 
         raise ValueError("Choose a displayed preference number or name.")
 
 
-def migrate_new_start(args: argparse.Namespace) -> bool:
+def migrate_new_start(args: argparse.Namespace, *, reuse_access: ReuseAccess | None = None) -> bool:
     """Translate ordinary preferences, never a saved or explicit protocol.
 
     This only adapts inputs to _run_native_start. The native application remains
@@ -260,9 +261,7 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
             return False  # Scientific/confirmed technical protocols keep their original owner.
         registered_origin = {'session': str(args.from_session.resolve()) if args.from_session else None,
                              'results': list(args.reuse)}
-        reuse_session_materials(args, native=True)
-        if getattr(args, '_material_authorize', None) is None:
-            args.source.extend(path.parent for path in args.material)
+        reuse_session_materials(args, native=True, access=reuse_access)
         reuse_inputs = False
     if hasattr(args, '_reuse_edit_policy') and args.kind == 'reproduction':
         return False
@@ -324,13 +323,7 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
     if reuse_inputs:
         reuse_origin = {"session": str(args.from_session.resolve()) if args.from_session else None,
                         "results": list(args.reuse)}
-        reuse_session_materials(args, native=True)
-        # Mount complete registered result packages, not just their JSON index
-        # or Markdown body. Their source data/figures must remain available to
-        # the common inventory and writing owners. Never mount the whole old
-        # session or import its execution state/allowances into a new task.
-        if getattr(args, '_material_authorize', None) is None:
-            args.source.extend(path.parent for path in args.material)
+        reuse_session_materials(args, native=True, access=reuse_access)
     if args.goal and args.request:
         raise ValueError("Use either the positional request or --goal, not both.")
     goal = args.request if args.request is not None else args.goal
@@ -881,136 +874,13 @@ def _reproduction_options(args: argparse.Namespace, *, interactive: bool) -> dic
             "process_invocations": invocations, "process_wall_seconds": timeout * invocations}
 
 
-def _session_project(session) -> tuple[Path, dict | None, dict] | None:
-    """Resolve an owner-proved project and its optional exact contract."""
-    from simple_ar.app.tool_application import ToolApplication
-    if session.manifest.transition_recipe == ToolApplication.RECIPE:
-        return ToolApplication.load(session.store.root).reusable_code_project()
-    from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest
-    ref = session.manifest.state_refs.get("implementation")
-    if ref is None or ref.status != "available":
-        return None
-    result = session.store.read_json(ref)
-    if result.get("status") != "validated" or not result.get("workspace_dir") or not result.get("code_task_run_dir"):
-        return None
-    workspace, run = Path(result["workspace_dir"]).resolve(), Path(result["code_task_run_dir"]).resolve()
-    if (not workspace.is_relative_to(session.store.root) or not run.is_relative_to(session.store.root)
-            or not workspace.is_dir() or code_task_paths(run).workspace_dir.resolve() != workspace):
-        # A retired or relocated workspace is not an editable offering. Its
-        # absence must not block independently registered portable deliveries.
-        return None
-    manifest = load_code_task_manifest(run)
-    if not manifest.get("benchmark", {}).get("command") or not manifest.get("edit_scope", {}).get("allowed_patterns"):
-        return None
-    policy = {}
-    for prepared in session.manifest.state_refs.values():
-        if prepared.kind != "prepared_execution" or prepared.status != "available":
-            continue
-        execution = session.store.read_json(prepared).get("execution", {})
-        if execution.get("cwd") and Path(execution["cwd"]).resolve() == workspace:
-            task = execution.get("code_task", {})
-            policy = {key: task[key] for key in ("budget_profile", "allow_large_edits", "edit_budget_overrides") if key in task}
-            break
-    return workspace, manifest, policy
-
-
 def session_materials(root: Path, *, authorize=None, include_project: bool = True) -> dict[str, list[Path]]:
-    """Resolve current registered deliveries, not arbitrary historical files."""
-    root = root.resolve()
-    if authorize is not None:
-        # UI reuse uses the same artifact owner and admits each exact path
-        # before reads; executable project assembly needs broader authority.
-        from simple_ar.tools.workspace import RetainedDelivery
-        available = RetainedDelivery(root, authorize=authorize).reusable_materials()
-        available.pop('code_project', None)
-        return available
-    from simple_ar.core.capabilities import CapabilityRegistry
-    from simple_ar.core.session import SessionController
-    session = SessionController.load(root, registry=CapabilityRegistry())
-    from simple_ar.app.tool_application import ToolApplication
-    if session.manifest.transition_recipe == ToolApplication.RECIPE:
-        # A previous delivery remains on disk during feedback. It is not the
-        # current completion while the revised task is active or paused.
-        if session.manifest.status not in {"completed", "partial"}:
-            return {}
-        from simple_ar.tools.workspace import RetainedDelivery
-        available = RetainedDelivery(root).reusable_materials()
-        available.pop('code_project', None)  # Complete project proof is separate from portable file groups.
-        if not include_project:
-            return available
-        try:
-            project = _session_project(session)
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            # Portable files retain their own proof even when the complete
-            # executable project is ambiguous, unavailable or changed.
-            print_line(f'code_project unavailable: {exc}')
-            project = None
-        if project is not None:
-            available['code_project'] = [project[0]]
-        return available
-    available: dict[str, list[Path]] = {}
-    project = _session_project(session)
-    if project is not None:
-        available["code_project"] = [project[0]]
-    for name in ("data_analysis", "report", "summary"):
-        ref = session.manifest.state_refs.get(name)
-        if ref is None or ref.status != "available":
-            continue
-        path = session.store.resolve(ref).resolve()
-        if not path.is_relative_to(session.store.root) or not path.is_file():
-            raise ValueError(f"Registered {name} result is missing or outside its session.")
-        if name == "report":
-            body = path.parent / "report_body.md"
-            if not body.is_file():
-                continue
-            # Keep the draft and its evidence together; the draft alone is not
-            # independently verified literature or a measured result.
-            paths = [body]
-            paths.extend(p for p in (path.parent / "experiment_evidence.json",
-                                    path.parent / "citation_map.json") if p.is_file())
-            documents = session.manifest.state_refs.get("documents")
-            # Reuse the evidence actually consumed by this draft, including
-            # later reading/linked documents, not the initial ingest alone.
-            writer = session.manifest.state_refs.get("writer")
-            if writer is not None and writer.status == "available":
-                payload = session.store.read_json(writer)
-                snapshot = payload.get("input_snapshot", {}).get("path")
-                if snapshot:
-                    snapshot_ref = session.store.ref(Path(writer.path).parent / snapshot)
-                    sources = session.store.read_json(snapshot_ref).get("sources", [])
-                    bundles = [row for row in sources if row.get("schema") == "document_bundle.v1"]
-                    if len(bundles) > 1:
-                        raise ValueError("Registered report has ambiguous source bundles.")
-                    if bundles:
-                        from simple_ar.core.capabilities import ArtifactRef
-                        documents = ArtifactRef.from_dict(bundles[0])
-            if documents is not None and documents.status == "available":
-                retained = session.store.resolve(documents).resolve()
-                if not retained.is_relative_to(session.store.root) or not retained.is_file():
-                    raise ValueError("Registered report sources are missing or outside their session.")
-                paths.append(retained)
-        else:
-            paths = [path]
-        available[name] = paths
-    implementation = session.manifest.state_refs.get("implementation")
-    if implementation is not None and implementation.status == "available":
-        payload = session.store.read_json(implementation)
-        delivery = payload.get("artifact_refs", {}).get("code_analysis")
-        if payload.get("status") == "validated" and isinstance(delivery, dict):
-            path = (session.store.resolve(implementation).parent / delivery["path"]).resolve()
-            if not path.is_relative_to(session.store.root) or not path.is_file():
-                raise ValueError("Registered code analysis package is missing or outside its session.")
-            available["code_analysis"] = [path]
-            return available
-        if payload.get("status") == "validated" and payload.get("workspace_dir"):
-            workspace = Path(payload["workspace_dir"]).resolve()
-            files = [workspace / "outputs/report.md", workspace / "outputs/results.json"]
-            if workspace.is_relative_to(session.store.root) and all(path.is_file() for path in files):
-                available["code_analysis"] = files
-    return available
+    """Compatibility entry for scripts; retained reading belongs to app.reuse."""
+    return _session_materials(root, authorize=authorize, include_project=include_project)
 
 
-def reuse_session_materials(args: argparse.Namespace, *, native: bool = False) -> None:
+def reuse_session_materials(args: argparse.Namespace, *, native: bool = False,
+                            access: ReuseAccess | None = None) -> None:
     root = getattr(args, "from_session", None)
     selected = getattr(args, "reuse", [])
     if root is None:
@@ -1020,28 +890,28 @@ def reuse_session_materials(args: argparse.Namespace, *, native: bool = False) -
     root = root.resolve()
     if not selected:
         raise ValueError("Select registered result names with --reuse; inspect with results SESSION.")
-    args._reuse_origin = {'session': str(root), 'results': list(selected)}
-    def materials():
-        return session_materials(root, authorize=getattr(args, '_material_authorize', None),
-                                 include_project='code_project' in selected)
+    if 'code_project' in selected and (args.project or args.validate or args.allow):
+        raise ValueError("Select code_project or an explicit project/scope/checker; do not override the selected project's proof in the same request.")
+    selection = select_reuse(root, selected, access=access)
+    args._reuse_origin = selection.origin
+    if native:
+        args.source = list(dict.fromkeys([*args.source, *selection.package_mounts]))
+    available = selection.groups
+
+    def append_materials():
+        args.material = list(dict.fromkeys([*args.material, *selection.materials]))
+        if selection.prior_drafts:
+            args._reuse_report_drafts = selection.prior_drafts
 
     if "code_project" in selected:
-        if getattr(args, '_material_authorize', None) is not None:
-            raise ValueError('code_project proof requires executable-owner assembly unavailable in UI retained-material grants; use portable delivery groups or the original CLI')
-        if args.project or args.validate or args.allow:
-            raise ValueError("Select code_project or an explicit project/scope/checker; do not override the selected project's proof in the same request.")
-        from simple_ar.core.capabilities import CapabilityRegistry
-        from simple_ar.core.session import SessionController
-        session = SessionController.load(root, registry=CapabilityRegistry())
-        project = _session_project(session)
+        project = selection.project
         if project is None:
             raise ValueError("No current reusable code_project; complete and validate the original project first.")
         workspace, manifest, policy = project
         if manifest is None:
             if not native:
                 raise ValueError('Native project reuse requires ordinary start without --chat or a structured execution protocol')
-            available = materials()
-            _append_reused_materials(args, root, [name for name in selected if name != 'code_project'], available)
+            append_materials()
             args.project = workspace
             args.from_session, args.reuse = None, []
             print_line('Reuse the delivered native project as read-only material. New work uses its own budgets, interpreter and permissions; saved execution is not replayed.')
@@ -1056,6 +926,9 @@ def reuse_session_materials(args: argparse.Namespace, *, native: bool = False) -
                     args.environment != "current", args.requirements, args.install_project,
                     args.check_argv is not None, args.project_python)):
                 raise ValueError("Reusing reproduction retains its measured protocol, checker and interpreter; start a separate task to change execution conditions.")
+            from simple_ar.core.capabilities import CapabilityRegistry
+            from simple_ar.core.session import SessionController
+            session = SessionController.load(root, registry=CapabilityRegistry())
             prepared = session.manifest.state_refs.get("preparation")
             from simple_ar.app.tool_application import ToolApplication
             if session.manifest.transition_recipe == ToolApplication.RECIPE:
@@ -1090,10 +963,9 @@ def reuse_session_materials(args: argparse.Namespace, *, native: bool = False) -
         args.allow = list(manifest["edit_scope"]["allowed_patterns"])
         args._reuse_protected = list(manifest["edit_scope"].get("protected_patterns", []))
         args._reuse_edit_policy = policy
-        available = materials()
         args._analysis_project = "code_analysis" in available
         if native:
-            _append_reused_materials(args, root, [name for name in selected if name != 'code_project'], available)
+            append_materials()
         python = manifest.get("environment", {}).get("policy", {}).get("python_executable")
         if reproduction:
             python = execution.get("code_task", {}).get("python_executable") or python
@@ -1106,7 +978,6 @@ def reuse_session_materials(args: argparse.Namespace, *, native: bool = False) -
                    (" Repeat the saved reproduction protocol; no environment installation is requested." if reproduction else ""))
         return
     if args.kind == "survey" and not native:
-        available = materials()
         if selected != ["report"] or "report" not in available:
             raise ValueError("Survey follow-up reuses --reuse report's source bundle, not its prose or analysis results.")
         bundles = [path for path in available["report"] if path.suffix == ".json"
@@ -1141,26 +1012,11 @@ def reuse_session_materials(args: argparse.Namespace, *, native: bool = False) -
         return
     if not native and args.kind not in {None, "writing"}:
         raise ValueError("Registered deliveries currently enter writing; use their source data for a new analysis.")
-    _append_reused_materials(args, root, selected, materials())
+    append_materials()
     if not native:
         args.kind = "writing"
     args.from_session = None
     args.reuse = []
-
-
-def _append_reused_materials(args: argparse.Namespace, root: Path, selected: list[str],
-                             available: dict[str, list[Path]]) -> None:
-    """Import declared result groups for both scoped code and material goals."""
-    for name in selected:
-        if name not in available:
-            raise ValueError(f"No current reusable {name} delivery in {root}.")
-        preflight = getattr(args, '_material_preflight', None)
-        if preflight is not None:
-            preflight(available[name])
-        args.material.extend(available[name])
-        if name == "report":
-            args._reuse_report_drafts = [str(available[name][0])]
-    args.material = list(dict.fromkeys(args.material))
 
 
 def prepare_start(args: argparse.Namespace, *, for_execution: bool = False) -> Path | argparse.Namespace | None:
@@ -1170,6 +1026,8 @@ def prepare_start(args: argparse.Namespace, *, for_execution: bool = False) -> P
     requests arguments for direct execution, without loading the exported TOML.
     """
     interactive = sys.stdin.isatty()
+    from simple_ar.cli.task_options import validate_interactive_options
+    validate_interactive_options(args)
     migrated = migrate_new_start(args)
     native_destinations = getattr(args, "_native_start_destinations", None)
     if native_destinations is None:
@@ -1184,9 +1042,12 @@ def prepare_start(args: argparse.Namespace, *, for_execution: bool = False) -> P
     legacy = supplied - contract._native_start_destinations - contract._shared_start_destinations
     if not migrated and legacy and (args.request or native_options):
         raise ValueError("Do not mix native task and legacy setup options: " + ", ".join(sorted(legacy)))
-    if migrated or (not hasattr(args, "_setup_state") and
+    native = migrated or (not hasattr(args, "_setup_state") and
                     (args.request or args.resume_task or (not legacy and args.kind is None
-                        and not (args.chat or args.resume_setup or args.from_session or args.reuse)))):
+                        and not (args.chat or args.resume_setup or args.from_session or args.reuse))))
+    if getattr(args, 'interactive', False) and not native:
+        raise ValueError('--interactive supports ordinary native tasks only; structured protocols retain their existing entry')
+    if native:
         from simple_ar.cli.main import _run_native_start
         _run_native_start(args)
         return None

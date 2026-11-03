@@ -8,7 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
-from simple_ar.core.assessments import assessment_issues, current_assessments
+from simple_ar.core.assessments import current_assessments
 from simple_ar.tools.gateway import CommonToolGateway
 from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.permissions import ToolPermissionPolicy
@@ -18,62 +18,14 @@ from simple_ar.tools.sources import SourceToolGateway, source_tool_specs
 from simple_ar.tools.publication import PublicationToolGateway, publication_tool_specs
 from simple_ar.tools.analysis import AnalysisToolGateway, analysis_tool_specs
 from simple_ar.tools.extensions import LocalExtension
+# Compatibility imports for existing callers; the inspection owner owns the wire contract.
+from simple_ar.tools.delivery_review import delivery_requires_review, prepare_delivery_review
 
 
 PROTOCOL = 'operations.v1'
 PROFESSIONAL_CONTRACTS = {'work.v1': 'source_owner.v1', 'work.v2': 'source_owner.v2',
                           'work.v3': None, 'work.v4': None, 'work.v5': None}
 CURRENT_PROFESSIONAL_CONTRACT = 'work.v5'
-
-
-def delivery_requires_review(request: DeliveryRequest, protocol: str) -> bool:
-    """Saved delivery admission and capacity obligation; partial remains an exit."""
-    if protocol not in {'task.v1', 'task.v2', 'task.v3', 'task.v4'}:
-        raise ValueError('Unknown delivery review protocol')
-    return not request.unresolved and (protocol in {'task.v3', 'task.v4'} or (
-        request.report is not None and request.report.status == 'canonical'
-        and bool(request.report.manuscript)))
-
-
-def prepare_delivery_review(workspace: Any, request: DeliveryRequest, artifacts: list[str],
-                            user_requests: Callable[[], list[str]], *, protocol: str) -> dict | None:
-    """Bind the acceptance owner's freshly resolved inventory, never cached authority.
-
-    The caller resolves delivery eligibility, including registered current outputs.
-    Paths and bytes are checked here again; review and commit retain their own
-    freshness checks. This value adds no persisted state or acceptance decision.
-    Keep the saved v1/v2/v3 wire representations unchanged.
-    """
-    if not delivery_requires_review(request, protocol):
-        return None
-    artifacts = sorted({str(workspace.resolve(path)) for path in artifacts})
-    requests = user_requests()
-    if not isinstance(requests, list) or any(not isinstance(text, str) for text in requests):
-        raise ValueError('Delivery review requires exact original request and feedback strings')
-    if protocol in {'task.v3', 'task.v4'}:
-        claim = request.model_dump(mode='json', exclude_none=True)
-        claim['artifacts'] = artifacts
-        if request.report is not None:
-            if request.report.manuscript:
-                claim['report']['manuscript'] = str(workspace.resolve(request.report.manuscript))
-            if request.report.formats:
-                claim['report']['formats'] = sorted(set(request.report.formats))
-        if request.summary_source is not None:
-            claim['summary_source']['path'] = str(workspace.resolve(request.summary_source.path))
-        return {'schema_version': 'delivery_review.v3',
-                **({'scope_policy': 'applicable.v1'} if protocol == 'task.v4' else {}),
-                'requests': list(requests),
-                'claim': claim,
-                'authorized_roots': {name: str(path) for name, path in workspace.mounts.items()},
-                'artifacts': workspace.artifact_hashes(artifacts)}
-    manuscript = str(workspace.resolve(request.report.manuscript))
-    if manuscript not in artifacts:
-        raise ValueError('Delivery review requires the actual manuscript among delivered artifacts')
-    return {'schema_version': 'delivery_review.v2' if protocol == 'task.v2' else 'delivery_review.v1',
-            'requests': list(requests),
-            'manuscript': manuscript, 'formats': sorted(set(request.report.formats)),
-            'authorized_roots': {name: str(path) for name, path in workspace.mounts.items()},
-            'artifacts': workspace.artifact_hashes(artifacts)}
 
 
 _DIRECT_WORK = (
@@ -173,14 +125,10 @@ class OperationTools:
                  execution_observations=None, work_context=None, material_observations=None,
                  user_requests=None, native_route_validator=None):
         from simple_ar.tools.inspection import InspectionToolGateway, inspection_tool_specs
-        from functools import partial
-        from simple_ar.report.delivery import operation_report_content
         self.root, self.config = root, config
         # Compatibility is selected once from the loaded contract, not exposed
         # as a model option or inferred from report status, paths or contents.
         legacy_report_status = config.get('delivery_review_protocol') != 'task.v4'
-        self.report_content = partial(operation_report_content,
-            legacy_report_status=legacy_report_status)
         self.professional = config.get('professional_operations') in PROFESSIONAL_CONTRACTS
         self.observations = observations
         self.user_requests = user_requests
@@ -367,6 +315,10 @@ class OperationTools:
                 or spec.name == 'inspect_images') and self.gateway.policy.is_allowed(spec)[0]]
         self.inspection.operation_call = lambda name, arguments, identity: self.gateway.call(
             ToolCall(tool_name=name, arguments=arguments, trace_id=identity))
+        from simple_ar.report.delivery import Delivery
+        self.delivery = Delivery(workspace=self.workspace, gateway=self.gateway,
+            publication=self.publication, review_owner=self.delivery_review, config=config,
+            observations=observations, user_requests=user_requests)
         self.session_id = session_id
         self.ledger = ledger
 
@@ -458,107 +410,16 @@ class OperationTools:
         return result
 
     def delivery_issues(self, observations: list[dict], delivery: dict, *, proposed=None):
-        request = DeliveryRequest.model_validate(delivery)
-        if request.unresolved:
-            return []  # Existing terminal binding still proves actual partial files.
-        from simple_ar.report.delivery import operation_report_admission
-        admission = operation_report_admission(request, self.config.get('report_requirement'))
-        if admission:
-            return admission
-        spec = self.registry.get(proposed.tool_name) if proposed is not None else None
-        producing = spec is not None and spec.completion is not None and bool(spec.completion.field)
-        # A producer's declared delivery is an intention. Its owner admits the
-        # request and binds the actual inventory; all acceptance checks below run
-        # again on that retained result before the common terminal hash commit.
-        if producing:
-            return []
-        resolved = self.workspace.resolve_delivery(request)
-        return self._delivery_issues(observations, delivery, request, resolved, proposed=proposed)
+        return self.delivery.issues(observations, delivery, proposed=proposed)
 
     def requires_delivery_review(self, request: DeliveryRequest) -> bool:
-        return (self.delivery_review is not None
-                and delivery_requires_review(request, self.delivery_review.protocol))
-
-    def _delivery_issues(self, observations: list[dict], delivery: dict,
-                         request: DeliveryRequest, resolved: dict, *, proposed=None,
-                         include_inspection: bool = True) -> list[str]:
-        """Judge actual production using this call's authorized resolved inventory."""
-        from simple_ar.report.delivery import operation_report_publication
-
-        issues = self.gateway.delivery_issues(observations, proposed=proposed,
-            delivery={**delivery, 'artifacts': resolved['artifacts']})
-        # task.v4 binds current files and delegates explicit computation adoption
-        # to domain owners and applicability to DeliveryReview. Old process path
-        # ownership cannot re-certify an ordinary edited delivery. Saved contracts
-        # retain both their producer gate and its publication-input exception.
-        if self.config.get('delivery_review_protocol') != 'task.v4':
-            try:
-                conversion_inputs = self.publication.conversion_inputs(observations, resolved['artifacts'])
-                self.workspace.check_artifact_producers(path for path in resolved['artifacts']
-                    if self.workspace.resolve(path) not in conversion_inputs)
-            except (ValueError, OSError, KeyError, RuntimeError) as exc:
-                issues.append(str(exc))
-        from simple_ar.tools.workspace import missing_delivery_files
-        missing = missing_delivery_files(self.workspace,resolved['artifacts'],self.config.get('delivery_files') or [])
-        if missing:
-            issues.append('Delivery is missing required workspace outputs: '+', '.join(missing))
-        try:
-            report_issues, required = self.report_content(request, resolved['artifacts'],
-                workspace=self.workspace, requirement=self.config.get('report_requirement'))
-        except ValueError as exc:
-            return [str(exc)]
-        issues.extend(report_issues)
-        scoped_review = self.requires_delivery_review(request)
-        package_review = scoped_review and self.delivery_review.protocol in {'task.v3', 'task.v4'}
-        # Admission need not already have the review it is about to perform.
-        # The whole-work owner reconsiders retained local opinions against this
-        # exact claim and inventory; a second local gate would force duplicate
-        # reviews or preserve a rejected old opinion forever. Historical file
-        # contracts keep their gate. A package pass is never a local file pass.
-        if include_inspection and not package_review and not (scoped_review and proposed is not None):
-            issues.extend(assessment_issues(self.workspace,observations,resolved['artifacts'],
-                require_pass=[] if scoped_review else required))
-        if include_inspection and scoped_review and proposed is None:
-            try:
-                binding = prepare_delivery_review(self.workspace, request, resolved['artifacts'],
-                    self.user_requests, protocol=self.delivery_review.protocol)
-                issues.extend(self.delivery_review.issues(observations, binding))
-            except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
-                issues.append('Delivery review cannot be verified: ' + str(exc))
-        issues.extend(operation_report_publication(request, resolved['artifacts'], observations,
-            publication=self.publication, proposed=proposed))
-        return issues
+        return self.delivery.requires_review(request)
 
     def review_delivery(self, delivery: dict, identity: str, *, may_start: bool,
                         current_result: dict | None = None,
                         current_outputs: tuple[Path, ...] = ()) -> dict | None:
-        if self.delivery_review is None:
-            return None
-        request = DeliveryRequest.model_validate(delivery)
-        if request.unresolved:
-            return None  # The executor still binds and commits actual partial files.
-        if not may_start and not self.requires_delivery_review(request):
-            return None  # Historical noncanonical claims had no review binding.
-        if may_start:
-            from simple_ar.report.delivery import operation_report_admission
-
-            admission = operation_report_admission(request, self.config.get('report_requirement'))
-            if admission:
-                raise ValueError('Delivery review not started: ' + '; '.join(admission))
-        resolved = self.workspace.resolve_delivery(request, current_outputs=current_outputs)
-        if may_start:
-            # Production has finished; validate its actual inventory before any
-            # paid content investigation. An intended export cannot prove a PDF,
-            # current inputs or successful execution. Prior opinions are omitted
-            # here so a fresh review can legitimately reassess them.
-            observations = [*self.observations(), *([current_result] if current_result is not None else [])]
-            issues = self._delivery_issues(observations, delivery, request, resolved,
-                include_inspection=False)
-            if issues:
-                raise ValueError('Delivery review not started: ' + '; '.join(dict.fromkeys(issues)))
-        binding = prepare_delivery_review(self.workspace, request, resolved['artifacts'],
-            self.user_requests, protocol=self.delivery_review.protocol)
-        return self.delivery_review.review(binding, identity, may_start=may_start)
+        return self.delivery.review_delivery(delivery, identity, may_start=may_start,
+            current_result=current_result, current_outputs=current_outputs)
 
     def coordination_result(self, result: dict, record: str, *, review_record: str | None = None) -> dict:
         if self.delivery_review is not None:

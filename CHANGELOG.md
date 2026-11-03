@@ -7,8 +7,16 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ## 2026-11-03
 
+### Added
+
+- Ordinary tasks support continued feedback with `start --interactive`: inspect status, revise results, leave and resume the same task while retaining its permissions, records and allowances.
+
 ### Improved
 
+- The local interface accepts feedback while work is running, shows pending input, and avoids duplicate execution when the same submission is resent.
+- Terminal and interface reuse share retained-delivery checks. Reusing an ordinary project does not load its old model or inherit execution permissions and allowances.
+- Terminal and local-interface views share saved task status and pending command approvals; viewing status does not call a model or execute commands.
+- Submission, review and final delivery share artifact checks while retaining historical recovery and rechecks after version changes.
 - Retain complete edited text with its version for optional reuse in later work. Large snapshots do not displace required input; authored text remains distinct from source-read evidence.
 - Ordinary tasks can submit a prepared candidate report for independent delivery review without claiming that checks have already passed. Incomplete checks and required findings still prevent completion.
 - Edited Markdown can proceed directly to delivery review without a publication step. Inspection distinguishes reading material from adopting computation results; historical task rules and explicit computation dependency checks remain intact.

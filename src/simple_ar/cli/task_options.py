@@ -34,9 +34,30 @@ def resume_command(path: Path) -> str:
 
 def _creation_only(args: argparse.Namespace) -> None:
     unsupported = set(args._explicit_start_destinations) - (FIELDS.keys() | {
-        'task_config', 'write_task_config', 'goal', 'yes', 'prepare_only'})
+        'task_config', 'write_task_config', 'goal', 'yes', 'prepare_only', 'interactive'})
     if unsupported:
         raise ValueError('Native creation configuration cannot preserve: ' + ', '.join(sorted(unsupported)))
+
+
+def validate_interactive_options(args: argparse.Namespace) -> None:
+    """CLI presentation mode, never a saved task setting or new authority."""
+    if not getattr(args, 'interactive', False):
+        return
+    if not sys.stdin.isatty():
+        raise ValueError('--interactive requires a terminal; omit it for the existing one-shot entry')
+    separate = ('chat', 'resume_setup', 'prepare_only', 'write_task_config',
+                'retry_model', 'switch_model', 'switch_id', 'switch_reason', 'supply_task',
+                'authorize_remaining', 'authorization_id', 'authorization_reason',
+                'decision_id', 'decision_response', 'decision_guidance', 'allow', 'validate')
+    conflicts = [name for name in separate if getattr(args, name, None)]
+    if getattr(args, 'resume_task', None):
+        conflicts.extend(name for name in ('source', 'project', 'document', 'material', 'data_file',
+            'data_path', 'allow_execution', 'allow_network', 'allow_vision') if getattr(args, name, None))
+    if conflicts or hasattr(args, '_setup_state'):
+        raise ValueError('--interactive is for ordinary native feedback; use structured setup, '
+                         'retry, access, contract or resource changes separately: ' + ', '.join(conflicts))
+    if (getattr(args, 'request', None) or getattr(args, 'goal', None) or '').lstrip().startswith('/'):
+        raise ValueError('Use slash commands at the --interactive prompt, not as positional feedback')
 
 
 def native_process_limits(args: argparse.Namespace) -> dict | None:

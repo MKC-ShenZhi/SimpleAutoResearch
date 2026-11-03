@@ -111,6 +111,56 @@ def _assessments(result):
 
 
 class OperationsWorkLoopTests(unittest.TestCase):
+    def test_feedback_received_during_model_call_precedes_its_unstarted_proposals(self):
+        self._create(goal='Original request before concurrent feedback')
+        feedback = 'Keep the original observations and answer the revised request.'
+
+        def receive_during_response():
+            receipt = ToolApplication.submit_feedback(self.root,
+                submission_id='during-provider', feedback=feedback)
+            self.assertEqual(receipt['status'], 'pending')
+            self.assertEqual(len(self.app.state['requests']), 1)
+            return _action('write_file', path='superseded.txt', content='Old unstarted proposal')
+
+        self.decisions.extend([receive_during_response,
+            _action('ask_user', question='Which of the supplied observations should be explained?')])
+        self._run()
+        self.assertEqual(self.app.state['requests'], ['Original request before concurrent feedback', feedback])
+        self.assertEqual(self.send.call_count, 2)
+        self.assertFalse((self.root / 'workspace/superseded.txt').exists())
+        self.assertEqual([turn['request_count'] for turn in self.app.state['turns']], [1, 2])
+        old = self.app.session.store.read_json(self.app.state['turns'][0]['tools'][0]['result'])
+        self.assertEqual(old['status'], 'blocked')
+        self.assertFalse(old['data']['executed'])
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        self._reload()
+        self._run(submission_id='during-provider')
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+
+    def test_received_feedback_leaves_finished_inspection_actions_with_original_scope(self):
+        self._create(goal='Explain the supplied observations')
+        self._write('note.md', 'A candidate explanation of supplied observations.\n')
+        previous_review = self.review
+
+        def receive_during_review(view):
+            ToolApplication.submit_feedback(self.root, submission_id='during-inspection',
+                feedback='Preserve the candidate; revise the requested explanation before delivery.')
+            return previous_review(view)
+
+        self.review = receive_during_review
+        self._submit(_action('deliver_result', summary='Candidate explanation', artifacts=['note.md']))
+        receipt = ToolApplication.feedback_status(self.root, submission_id='during-inspection')
+        self.assertEqual(receipt['status'], 'applied')
+        self.assertFalse((self.root / 'delivery.json').exists())
+        self.assertTrue((self.root / 'workspace/note.md').is_file())
+        cancelled = self.app.session.store.read_json(self.app.state['turns'][-1]['tools'][-1]['result'])
+        self.assertEqual(cancelled['status'], 'blocked')
+        self.assertTrue(cancelled['data']['executed'])
+        self.assertIn('retained_inspection', cancelled['data'])
+        self.assertTrue(self.app.session.store.exists(cancelled['data']['production_record']))
+        self.assertFalse(any(entry.status == 'reserved' for entry in self.app.ledger.entries))
+
     def test_user_requests_stay_separate_from_plan_and_inspection_context(self):
         goal = 'Explain the supplied observations in a short editable note.'
         self._create(goal=goal)

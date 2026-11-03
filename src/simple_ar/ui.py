@@ -23,6 +23,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from simple_ar.app.tool_application import ToolApplication
+from simple_ar.app.reuse import ReuseAccess
+from simple_ar.app.task_view import read_task_view, saved_model_recipients
 from simple_ar.cli.project_tasks import discover_project_tasks
 from simple_ar.cli.start import add_start_parser, migrate_new_start, native_creation_options
 from simple_ar.cli.task_options import apply_task_config
@@ -30,9 +32,7 @@ from simple_ar.core.budget import BudgetLedger
 from simple_ar.integrations.llm import LLMClient
 from simple_ar.integrations.model_profiles import load_model_catalog
 from simple_ar.tools.sources import SourceToolGateway
-from simple_ar.tools.implementation import ImplementationToolGateway
-from simple_ar.tools.workspace import (RetainedDelivery, WorkspaceToolGateway,
-    resolve_mounted_path, resolve_source_mount, validate_workspace_arguments)
+from simple_ar.tools.workspace import RetainedDelivery, resolve_mounted_path, resolve_source_mount
 
 
 def native_arguments() -> argparse.Namespace:
@@ -71,16 +71,6 @@ def public_data(value):
     if isinstance(value, list):
         return [public_data(item) for item in value]
     return public_text(value) if isinstance(value, str) else value
-
-
-def _model_recipients(binding: dict) -> dict:
-    """Display retained recipients, not current credentials or live routing."""
-    settings = binding.get('settings') or {}
-    connections = {'task': settings}
-    connections.update({purpose: ToolApplication._work_connection(binding, purpose).get('connection')
-                        for purpose in ('code', 'writing')})
-    return {purpose: {key: value.get(key) for key in ('base_url', 'model', 'api', 'api_mode') if key in value}
-            if value else None for purpose, value in connections.items()}
 
 
 class Workspace:
@@ -131,7 +121,7 @@ class Workspace:
                 continue
             try:
                 binding, identity = self.connection('profile:' + name)
-                rows.append(dict(selector='profile:' + name, model=profile.model, default=name == default_name, recipients=_model_recipients(binding),
+                rows.append(dict(selector='profile:' + name, model=profile.model, default=name == default_name, recipients=saved_model_recipients(binding),
                     binding_id=identity, input_price=profile.input_price_per_million,
                     output_price=profile.output_price_per_million))
             except Exception:
@@ -218,8 +208,6 @@ class Workspace:
         args.extensions = [self.read(p) for p in args.extensions]
         if args.from_session is not None:
             args.from_session = self.read(args.from_session)
-            args._material_authorize = self.read
-            args._material_preflight = self.material_grants
         # Common CLI migration rechecks declared analysis packages. Grant their
         # explicitly referenced attachments BEFORE that owner opens any bytes.
         # This is path admission, not a second package validator or importer.
@@ -229,7 +217,7 @@ class Workspace:
         # UI main detaches terminal input. These flags suppress access/selection
         # questions: the browser previews and confirms the complete projection.
         args.yes = args.prepare_only = True
-        migrate_new_start(args)
+        migrate_new_start(args, reuse_access=ReuseAccess(authorize=self.read, preflight=self.material_grants))
         args.source = [self.read(p) for p in args.source]
         args.request = args.request or args.goal
         catalog = load_model_catalog()
@@ -285,9 +273,9 @@ class Workspace:
         config, _, limits, attempts = result = self.creation_configuration(self.tasks, args.request, options)
         seal, image = self.creation_identity(args, digest, options, result)
         binding = config['model_connection']
-        recipients = _model_recipients(binding)
+        recipients = saved_model_recipients(binding)
         if config.get('vision_connection'):
-            recipients['vision'] = _model_recipients(config['vision_connection'])['task']
+            recipients['vision'] = saved_model_recipients(config['vision_connection'])['task']
         if image:
             recipients['image'] = {k: image[k] for k in ('profile', 'api', 'base_url', 'model')}
         return dict(preview_id=seal, goal=args.request, task_config=str(args.task_config) if args.task_config else None,
@@ -374,140 +362,29 @@ class Workspace:
                 result['diagnostic'] = public_text(str(exc))
             return result
 
+    def task_view(self, root: Path) -> dict:
+        """Supply UI read grants; the app layer owns saved-task interpretation."""
+        def admit_execution():
+            self.validate_sources(root)
+            for directory in ('workspace', 'evidence'):
+                if not bounded(root / directory, root).is_dir():
+                    raise ValueError('Prepared task directory unavailable')
+
+        return read_task_view(root, read_record=lambda name: self.record(root, name),
+            ledger=BudgetLedger.load(bounded(root / 'budget_ledger.json', root)),
+            authorize_execution=admit_execution, native_recipe=ToolApplication.RECIPE)
+
     def snapshot(self, name: str) -> dict:
-        root = self.task(name)
-        manifest = self.record(root, 'session_manifest.json')
-        state = self.record(root, 'actions.json')
-        # Ordinary polling reads original records directly. Only a pending
-        # prepared approval below needs its registered execution owner.
-        ledger_path = bounded(root / 'budget_ledger.json', root)
-        ledger = BudgetLedger.load(ledger_path)
-        pending = state.get('pending')
-        reason = manifest.get('status_reason', '')
-        token = re.search(r'Process requires explicit approval; token=([a-f0-9]{64})', reason)
-        approval = None
-        approval_unavailable = None
-        if token and pending and pending.get('kind') == 'tool':
-            # An independent inspection may pause on its own nested action.
-            # The saved parent is the inspection, not the command to approve.
-            active = pending.get('action') or pending
-            call = active.get('call') if isinstance(active, dict) else None
-            function = call.get('function') if isinstance(call, dict) else None
-            if (not isinstance(active, dict) or active.get('kind') != 'tool'
-                    or not isinstance(function, dict) or not isinstance(function.get('name'), str)
-                    or not isinstance(function.get('arguments'), str) or not active.get('attempt')
-                    or active.get('result')):
-                approval_unavailable = 'Pending command unavailable; resume to inspect the current proposal.'
-            else:
-                approval = {'token': token[1], 'call': call, 'attempt': active['attempt']}
-            if approval and function['name'] in {'run_process', 'execute_implementation'}:
-                try:
-                    self.validate_sources(root)
-                    for directory in ('workspace', 'evidence'):
-                        if not bounded(root / directory, root).is_dir():
-                            raise ValueError('Prepared task directory unavailable')
-                    # Resolve this registered proposal through its existing owner,
-                    # only while awaiting approval. Never infer argv from a path
-                    # or expose an unverified replacement under the saved token.
-                    config = state['config']
-                    if (function['name'] == 'execute_implementation'
-                            and (manifest.get('transition_recipe') != ToolApplication.RECIPE
-                                or config.get('code_task') is not None)):
-                        raise ValueError('Prepared approval is not available for this task owner')
-                    byte_owner = WorkspaceToolGateway(root, {
-                        **{alias: Path(path) for alias, path in config['sources'].items()},
-                        'evidence': bounded(root / 'evidence', root),
-                        'records': bounded(root / 'attempts', root)}, ledger,
-                        project_python=Path(config['project_python']) if config.get('project_python') else None,
-                        create_workspace=False)
-                    owner = (ImplementationToolGateway(root, byte_owner, ledger,
-                        config['model'], manifest['session_id'])
-                        if function['name'] == 'execute_implementation' else None)
-                    projection = byte_owner.execution_approval(call, pending=pending, owner=owner)
-                    binding = projection['binding']
-                    if projection['token'] != token[1]:
-                        raise ValueError('Execution changed since approval was requested')
-                    if (self.record(root, 'actions.json') != state
-                            or self.record(root, 'session_manifest.json') != manifest):
-                        raise ValueError('Pending task changed during approval inspection')
-                    if function['name'] == 'execute_implementation':
-                        approval['execution'] = {'argv': binding['argv'], 'cwd': binding['cwd'],
-                            'timeout_sec': binding['plan']['timeout_sec']}
-                    else:
-                        arguments = validate_workspace_arguments('run_process', json.loads(function['arguments']))
-                        approval['execution'] = {'argv': binding['argv'],
-                            'cwd': binding['cwd'],
-                            'timeout_sec': arguments.timeout_sec}
-                except (OSError, ValueError, KeyError, TypeError, RuntimeError):
-                    approval = None
-                    approval_unavailable = 'Command unavailable or changed; resume to inspect the current proposal before approval.'
-        # A bounded read of accepted observations, never a saved UI index. Do
-        # not mistake remaining proposals (or model prose) for executed work.
-        plan, activity = None, []
-        recent = islice(((turn, item) for turn in reversed(state['turns'])
-                         for item in reversed(turn['tools'])), 24)
-        for turn, item in recent:
-            ref = item['result']
-            row = dict(record=ref, call_id=item['id'], request_count=turn.get('request_count'),
-                       attempt=Path(ref).parent.name if ref.startswith('attempts/') else None)
-            try:
-                result = self.record(root, ref)
-                # Reuse the action owner's bounded, receipt-derived facts;
-                # no tool registration, application load or journal mutation.
-                try:
-                    reply = self.record(root, turn['reply'])
-                    call = next(c for c in reply.get('tool_calls', []) if c['id'] == item['id'])
-                except (OSError, ValueError, KeyError, TypeError, StopIteration):
-                    # A missing reply must not conceal the saved tool refusal.
-                    call = {'function': {'name': result['tool_name'], 'arguments': '{}'}}
-                    row['action_unavailable'] = True
-                row.update(ToolApplication._history_observation(call, result, ref))
-                row['record'] = ref
-                if (plan is None and result.get('tool_name') == 'update_work_plan'
-                        and result.get('status') == 'ok'
-                        and result.get('data', {}).get('request_count') == len(state['requests'])):
-                    plan = result['data']
-            except (OSError, ValueError, KeyError, TypeError, StopIteration):
-                row.update(status='unavailable', error='Original action/receipt unavailable; no outcome inferred')
-            activity.append(row)
-        pending_view = dict(pending) if pending else None
-        if pending_view:
-            # A failed preflight can retain a pending identity without any
-            # provider/tool dispatch. Display the original capability receipt.
-            ref = f"attempts/{pending['attempt']}/capability_result.json"
-            try:
-                result = self.record(root, ref)
-                pending_view['receipt'] = {k: result.get(k) for k in ('status', 'diagnostics')}
-                pending_view['receipt']['record'] = ref
-            except (OSError, ValueError, KeyError, TypeError):
-                pending_view['receipt'] = None
-        config = state['config']
+        view = self.task_view(self.task(name))
         with self.lock:
             worker = self.workers.get(name)
             live = bool(worker and worker[0].is_alive())
             stopping = bool(live and worker[1].is_set())
             error = self.errors.get(name)
             local_workers = [task for task, (thread, _) in self.workers.items() if thread.is_alive()]
-        return dict(task=name, mode='live execution' if live else 'saved results browser',
+        return dict(view, task=name, mode='live execution' if live else 'saved results browser',
             worker_live=live, stop_requested=stopping, worker_error=error,
-            local_workers=local_workers,
-            manifest={k: manifest.get(k) for k in ('session_id', 'topic', 'status', 'status_reason',
-                'current_attempt', 'revision', 'budget', 'updated_at')},
-            requests=state['requests'], plan=plan, pending=pending_view, approval=approval,
-            approval_unavailable=approval_unavailable,
-            activity=activity, activity_total=sum(len(t['tools']) for t in state['turns']),
-            queued_actions=sum(len(t.get('remaining', [])) for t in state['turns']),
-            model=config.get('model'), saved_connections={
-                **_model_recipients(config.get('model_connection') or {}),
-                **{purpose: _model_recipients(config[field])['task']
-                   for purpose, field in (('vision', 'vision_connection'), ('feasibility', 'feasibility_connection'))
-                   if config.get(field)}},
-            catalog_hints=config.get('model_catalogs', {}), access={k: config.get(k) for k in
-                ('allow_network', 'allow_execution', 'allow_vision')},
-            sources=list(config.get('sources', {})),
-            resources=ledger.snapshot() | {'entries': [
-                {k: e.to_dict()[k] for k in ('reservation_id', 'status', 'reserved', 'actual',
-                    'purpose', 'attempt_id', 'actual_source', 'reason')} for e in ledger.entries]})
+            local_workers=local_workers)
 
     def file(self, name: str, mount: str, relative: str) -> Path:
         root = self.task(name)
@@ -549,6 +426,30 @@ class Workspace:
     def mutate(self, data: dict) -> dict:
         op = data['op']
         name = data.get('task', '')
+        if op == 'feedback':
+            root = self.task(name)
+            for path in ('session_manifest.json', 'actions.json',
+                         'tools/submissions/feedback.json', 'tools/submissions/.feedback.lock'):
+                bounded(root / path, root)
+            # Reception has its own original owner/lock. A running worker must
+            # not prevent acceptance or write feedback into a loaded snapshot.
+            receipt = ToolApplication.submit_feedback(root, submission_id=data['submission_id'],
+                feedback=data['feedback'])
+            result = {'task': name, 'submission': receipt,
+                'message': 'Feedback received; adoption remains pending at a safe action boundary'}
+            with self.lock:
+                if receipt['status'] == 'applied':
+                    result['message'] = 'Feedback was already adopted; no duplicate execution dispatched'
+                elif any(thread.is_alive() for thread, _ in self.workers.values()):
+                    result['message'] += '; use resume if this task has no active worker'
+                else:
+                    try:
+                        self.validate_sources(root)
+                    except (OSError, ValueError, KeyError, TypeError):
+                        result['message'] += '; restore launch read grants before resuming execution'
+                    else:
+                        self.dispatch(name, root, {'submission_id': data['submission_id']})
+            return result
         if op == 'stop':
             with self.lock:
                 worker = self.workers.get(name)
@@ -602,37 +503,36 @@ class Workspace:
                 ToolApplication.load(root).switch_model(data['model'], switch_id=data['switch_id'],
                     reason=data['reason'], expected_connection=binding)
                 return {'task': name}
-            if op not in {'resume', 'feedback', 'approve'}:
+            if op not in {'resume', 'approve'}:
                 raise ValueError('Unsupported operation')
             kwargs = {}
-            if op == 'feedback':
-                if not isinstance(data['feedback'], str) or not data['feedback'].strip():
-                    raise ValueError('Feedback is required')
-                kwargs['feedback'] = data['feedback']
             if op == 'approve':
                 approval = self.snapshot_unlocked_approval(root)
                 if not approval or data['token'] != approval:
                     raise ValueError('Approval differs from current pending proposal')
                 kwargs['approved_execution'] = data['token']
-            stop = threading.Event()
-
-            def run():
-                try:
-                    ToolApplication.load(root).run(**kwargs, progress=lambda _: None, should_stop=stop.is_set)
-                except Exception:
-                    with self.lock:
-                        self.errors[name] = 'Worker could not continue; inspect original task records with CLI'
-
-            thread = threading.Thread(target=run, daemon=True)
-            self.errors.pop(name, None)
-            self.workers[name] = thread, stop
-            thread.start()
+            self.dispatch(name, root, kwargs)
             return {'task': name, 'message': 'Worker dispatched; task outcome remains in original manifest'}
 
+    def dispatch(self, name: str, root: Path, kwargs: dict) -> None:
+        """Launch a local worker under self.lock; no input or task state is owned here."""
+        stop = threading.Event()
+
+        def run():
+            try:
+                ToolApplication.load(root).run(**kwargs, progress=lambda _: None, should_stop=stop.is_set)
+            except Exception:
+                with self.lock:
+                    self.errors[name] = 'Worker could not continue; inspect original task records with CLI'
+
+        thread = threading.Thread(target=run, daemon=True)
+        self.errors.pop(name, None)
+        self.workers[name] = thread, stop
+        thread.start()
+
     def snapshot_unlocked_approval(self, root: Path) -> str | None:
-        reason = self.record(root, 'session_manifest.json').get('status_reason', '')
-        found = re.search(r'Process requires explicit approval; token=([a-f0-9]{64})', reason)
-        return found[1] if found else None
+        approval = self.task_view(root)['approval']
+        return approval['token'] if approval else None
 
 
 def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
