@@ -2441,7 +2441,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     self.root = self.directory/('optional-memory-'+mode)
                     self.app = ToolApplication.create(self.root, 'Explain the actual supplied observations',
                         model='profile:offline', sources={'measurements':self.inputs},
-                        max_turns=70, max_tokens=900000, max_attempts=180, tool_contracts='full')
+                        max_turns=70, max_tokens=900000, max_attempts=180)
+                    # Keep this saved checkpoint-purchase fixture's method and
+                    # pressure; default operation discovery is tested separately.
+                    self.app.state['config']['work_method'] = 'goal.v1'
+                    self.app._save()
+                    self._reload()
                     self.decisions.clear()
                     for index in range(12):
                         name = f'unknown-memory-{index}.txt'
