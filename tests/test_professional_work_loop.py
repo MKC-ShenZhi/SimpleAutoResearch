@@ -794,8 +794,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
             allow_execution=True, max_turns=12, max_tokens=200000, max_attempts=30)
         self.assertEqual(self.app.state['config']['tool_contracts'], 'on_demand')
         core = {row['function']['name'] for row in self.app.schemas}
-        self.assertEqual({'write_file','run_process','ask_user',
-            'deliver_result','load_tools','read_history','export_report'}, core)
+        self.assertEqual({'read_file','search_files','list_directory','inspect_project',
+            'copy_file','copy_project','edit_file','write_file','run_process','ask_user',
+            'deliver_result','load_tools','read_history','update_work_plan','export_report'}, core)
         self.assertFalse({'select_work_method','prepare_implementation','execute_implementation','work_document',
             'begin_professional_work','finish_professional_work'} & core)
         optional = {'inspect_table','analyze_table','measure_experiment','analyze_measurements',
