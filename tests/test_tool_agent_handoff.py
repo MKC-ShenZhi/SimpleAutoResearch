@@ -607,7 +607,11 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     session_id=fake._budget_session_id, attempt_id=fake._budget_attempt_id,
                     logical_call_id=budget_call_id, purpose='fixture inspection')
                 fake._budget_ledger.settle(reservation, amounts, actual_source='fixture')
-                paths = view.get('proposed_delivery', {}).get('artifacts', [])
+                # This fixture knows the declared candidate inventory; only
+                # actual gateway reads below can supply inspection evidence.
+                paths = [str(file) for path in view.get('proposed_delivery', {}).get('artifacts', [])
+                    for file in (sorted(Path(path).rglob('*')) if Path(path).is_dir() else [Path(path)])
+                    if file.is_file()]
                 for path in paths:
                     if not any(row.get('path') == path and isinstance(row.get('text'), str)
                                for row in visible):
@@ -5012,7 +5016,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 contract = {**original, **({'edit_policy': policy} if policy else {})}
                 # Exact-code reuse tests an eagerly offered implementation owner,
                 # not discovery or the capacity of the short default catalog.
-                _, inputs, fake, _, app, _ = self._native_fixture(code_task=contract, max_turns=3,
+                _, inputs, fake, _, app, _ = self._native_fixture(code_task=contract, max_turns=12,
                     tool_contracts='full', context_target=64000, review_delivery=True)
                 (inputs / 'main.py').write_text('VALUE = 1\n')
                 (inputs / 'check.py').write_text('assert True\n')
