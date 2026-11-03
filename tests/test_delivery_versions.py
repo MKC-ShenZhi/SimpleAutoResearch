@@ -280,17 +280,16 @@ ToolApplication.load(Path(sys.argv[1]))._commit_terminal(lambda _: None)
         record = self.app.state['turns'][-1]['tools'][-1]['result']
         observation = (self.root / record).read_bytes()
         pinned = self.figure.read_bytes()
-        acceptance = self.app.operations.delivery_issues
+        acceptance = self.app.operations.delivery.validate_actual
 
         def changed_after_acceptance(*args, **kwargs):
-            issues = acceptance(*args, **kwargs)
-            self.assertEqual(issues, [])
+            result = acceptance(*args, **kwargs)
             self.figure.write_bytes(b'changed after semantic acceptance')
-            return issues
+            return result
 
         # Removing duplicate completeness policy must not remove the byte check
         # between operation acceptance and retention/publication.
-        with patch.object(self.app.operations, 'delivery_issues', side_effect=changed_after_acceptance):
+        with patch.object(self.app.operations.delivery, 'validate_actual', side_effect=changed_after_acceptance):
             with self.assertRaisesRegex(ValueError, 'Delivery version is unbound or changed'):
                 self.app._commit_terminal(lambda _: None)
         self.assertEqual((self.root / 'delivery.json').read_bytes(), old)

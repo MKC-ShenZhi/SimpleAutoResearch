@@ -13,19 +13,21 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
-- Inspection reuses selected materials and deliverables without filling spare context with unrelated historical source text; additional evidence remains available on demand.
+- Working memory separates current understanding, source citations and the complete archive. Shortening note citations no longer resupplies all previously handed-off history; original text remains retrievable under current permissions and version checks.
 - The local interface accepts feedback while work is running, shows pending input, and avoids duplicate execution when the same submission is resent.
 - Terminal and interface reuse share retained-delivery checks. Reusing an ordinary project does not load its old model or inherit execution permissions and allowances.
 - Terminal and local-interface views share saved task status and pending command approvals; viewing status does not call a model or execute commands.
 - Submission, review and final delivery share artifact checks while retaining historical recovery and rechecks after version changes.
 - Retain complete edited text with its version for optional reuse in later work. Large snapshots do not displace required input; authored text remains distinct from source-read evidence.
-- Ordinary tasks can submit a prepared candidate report for independent delivery review without claiming that checks have already passed. Incomplete checks and required findings still prevent completion.
+- Ordinary tasks can submit a usable candidate for independent checking before final delivery and revise it afterward. An unchanged claim and artifacts reuse an applicable opinion; necessary unfinished checks and required findings still prevent completion.
 - Edited Markdown can proceed directly to delivery review without a publication step. Inspection distinguishes reading material from adopting computation results; historical task rules and explicit computation dependency checks remain intact.
 
 ### Fixed
 
 - New tasks and independent checks pass original user requests separately from derived working context. Assistant-authored plans, notes and observations no longer appear as user messages; saved historical layouts remain intact.
 - Prevent optional-material bookkeeping from falsely overflowing the context limit. Capacity is checked against the complete final input while retaining the latest action and required instructions.
+- Inspection records its actual scope and method, distinguishing unperformed checks, established defects and optional suggestions. Claimed executed calculations must link to actual execution receipts from that inspection.
+- The last affordable decision offers only a delivery or question that can end the task, avoiding a read that is then cancelled. Useful partial work can be delivered with its unfinished requirements.
 
 ## 2026-11-02
 

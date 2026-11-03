@@ -284,6 +284,7 @@ _TOOLS = {
     "edit_file": (_Edit, "Replace one or multiple exact unique, non-overlapping spans in a workspace file atomically, with one observed digest and backup. Batch related changes rather than repeating calls.", "write_patch"),
     "run_process": (_Run, "Execute an argv without a shell in the workspace. Bare python/python3 use the task interpreter; its directory leads the filtered PATH for child commands. Use sys.executable for portable Python children. For requested figure generation or revision, explicitly declare the script and known data in inputs and the generated figure paths in outputs so publication can reject known stale versions. Other commands need not declare outputs. Requires explicit process authorization, not a sandbox. Optional explicit delivery completes the task after successful final work and binds actual output bytes without another model decision; execution alone is not delivery or verification.", "execution"),
     "deliver_result": (DeliveryRequest, "Deliver actual workspace artifacts and optional retained task-evidence references; name unresolved work honestly.", "plan"),
+    "review_result": (DeliveryRequest, "Submit a usable candidate and its actual completion claim for independent checking before final delivery. This does not finish the task. Keep the same claim and artifacts when delivering to reuse an applicable opinion; revise only affected work after findings.", "plan"),
     "ask_user": (_Question, "Ask a concentrated question only when needed to proceed; pause with all work preserved.", "plan"),
 }
 def resolve_source_mount(value: Path) -> Path:
@@ -347,9 +348,11 @@ def resolve_mounted_path(mounts: dict[str, Path], value: str, *, write: bool = F
     return candidate
 
 
-def workspace_tool_specs() -> list[CommonToolSpec]:
+def workspace_tool_specs(*, candidate_review: bool = False) -> list[CommonToolSpec]:
     specs = []
     for name, (model, description, permission) in _TOOLS.items():
+        if name == 'review_result' and not candidate_review:
+            continue  # Historical and standalone owners retain their offered tools.
         schema = model.model_json_schema()
         if name == 'run_process':
             # Professional execution supplies this owner reference internally.
@@ -366,6 +369,7 @@ def workspace_tool_specs() -> list[CommonToolSpec]:
             permission_level=permission, risk_level="high" if permission == "execution" else "low",
             domain="workspace", completion=(
                 {'kind': 'question', 'closing': True} if name == 'ask_user' else
+                {'kind': 'review'} if name == 'review_result' else
                 {'closing': True} if name == 'deliver_result' else
                 {'field': 'delivery', 'closing': True} if name in {'write_file', 'run_process'} else None)))
     return specs
@@ -2016,7 +2020,7 @@ class WorkspaceToolGateway:
                 return ToolResult(tool_name=name, status=copied.status, error=copied.error,
                     data={**copied.data, 'source': model.source, 'source_sha256': digest}
                     if copied.ok or 'conflict' in copied.data else copied.data)
-            if name == "deliver_result":
+            if name in {"deliver_result", "review_result"}:
                 data = self.resolve_delivery(model)
             elif name == "ask_user":
                 data = model.model_dump()

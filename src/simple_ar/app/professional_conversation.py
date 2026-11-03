@@ -29,7 +29,8 @@ class ProfessionalConversation:
 
     @staticmethod
     def adopt(*, previous: dict, snapshot: dict | None, view: dict,
-              operations_for_turn: Callable, failure: dict | None = None) -> dict:
+              operations_for_turn: Callable, failure: dict | None = None,
+              archive: bool = False) -> dict:
         """Use only owner-validated, settled checkpoint artifacts.
 
         New marked checkpoints require surviving note citations. Unmarked
@@ -52,9 +53,17 @@ class ProfessionalConversation:
                                   if failure and not receipt_supply else {}), **attempted}
         compacted = summary_records(previous=previous, snapshot=snapshot,
             view=view, operations_for_turn=operations_for_turn)
+        # Presentation retirement is not citation coverage. A settled usable
+        # checkpoint may archive complete actually supplied receipts even when
+        # its fallible working understanding drops their old citations. All
+        # originals remain in the owner's journal and can be selected again.
+        archived = ({'archived_records': summary_records(
+            previous={'compacted_records': previous.get('archived_records', ())},
+            snapshot=snapshot, view={**view, 'handoff_policy': None},
+            operations_for_turn=operations_for_turn)} if archive else {})
         return {'notes':snapshot['notes'], 'compacted_records':compacted,
             'through_turn':summary_coverage(previous=previous, snapshot=snapshot,
-                view=view, operations_for_turn=operations_for_turn), **attempted}
+                view=view, operations_for_turn=operations_for_turn), **attempted, **archived}
 
     def tokens(self, value: ConversationInput) -> int:
         return (estimate_tokens(json.dumps(value.messages, ensure_ascii=False))

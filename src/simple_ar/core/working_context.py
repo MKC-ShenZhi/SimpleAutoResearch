@@ -104,6 +104,7 @@ def select_working_context(
     require_work_notes: bool = False,
     fit_work_notes: bool = False,
     processed_turns: Sequence[int] | None = None,
+    archived_turns: Sequence[int] | None = None,
     economical_checkpoint: bool = False,
     economical_after_turn: int = 0,
     sparse_handoffs: bool = False,
@@ -177,6 +178,11 @@ def select_working_context(
     production names only prioritize material: a usable supplied handoff may
     retire its repeated body. Explicit selections and the latest atomic turn
     remain original input. Inventory membership never pins a body indefinitely.
+    ``archived_turns`` separately names complete receipts actually supplied to
+    usable checkpoints. With supplied active notes these may leave routine
+    presentation without retaining every old citation. This is neither evidence
+    coverage nor a claim of understanding; explicit selections and recent atomic
+    work stay available and the original journal remains retrievable.
 
     ``native_observations`` contains transient source locators derived by the
     message owner from actual presentation. Explicit supply matches receipt,
@@ -285,6 +291,10 @@ def select_working_context(
     capacity_omitted: set[int] = set()
     economical_history: set[int] = set()
     processed = set(processed_turns or ())
+    archived = set(archived_turns or ())
+    if archived_turns is not None and (not working_records or any(
+            type(i) is not int or not 0 <= i < len(blocks) for i in archived)):
+        raise ValueError('Working archive requires original working journal turns')
     journal_selection = processed_turns is not None
     if journal_selection and not fit_work_notes:
         raise ValueError('Processed journal turns require fitted work notes')
@@ -407,6 +417,10 @@ def select_working_context(
                           'and matching file digest; authored payloads are not read observations. '
                           'Matching authored_text snapshots with write_context are working material, never source reads or independent evidence. '
                           'The role and text/range provenance are supplied by the caller, not verified here.')
+    if archived_turns is not None:
+        view['scope'] += (' Working archive retires routine presentation after usable checkpoints, '
+            'not evidence or task coverage. A dropped note citation does not erase a prior operation. '
+            'Use the original journal and authorized sources for necessary original contents.')
     context['working_view'] = view
     if operation_history is not None:
         view['operation_overview'] = {
@@ -721,8 +735,9 @@ def select_working_context(
             # retire a historical body. Empty coverage, new reads and sources
             # outside this journal retain ordinary whole-window admission.
             # Explicit/current originals override retirement, not version checks.
-            supplied_handoffs = processed if any(active(note) for note in view['notes']) else set()
-            if any(note.get('handoff_policy') == CITATION_HANDOFF_POLICY for note in notes):
+            supplied_handoffs = (archived if archived_turns is not None else processed
+                ) if any(active(note) for note in view['notes']) else set()
+            if archived_turns is None and any(note.get('handoff_policy') == CITATION_HANDOFF_POLICY for note in notes):
                 supplied_citations = {record for note in view['notes'] if active(note)
                     and note.get('handoff_policy') == CITATION_HANDOFF_POLICY
                     and isinstance(note.get('text'), str) and note['text'].strip()
@@ -734,7 +749,7 @@ def select_working_context(
                         turn_records.setdefault(row['turn'], set()).add(row['record'])
                 supplied_handoffs = {turn for turn in processed
                     if turn_records.get(turn) and turn_records[turn] <= supplied_citations}
-            elif sparse_handoffs:
+            elif archived_turns is None and sparse_handoffs:
                 supplied_handoffs = set()  # Unmarked notes cannot retire individual turns.
             if supplied_handoffs:
                 ordered = [i for i in ordered if rows[i].get('turn') not in supplied_handoffs

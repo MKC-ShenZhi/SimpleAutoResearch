@@ -444,6 +444,11 @@ class ToolApplication:
             raise ValueError('Unsupported saved native material supply policy')
         if config.get('context_checkpoint_policy') not in {None, 'economic.v1', 'economic.v2', 'economic.v3'}:
             raise ValueError('Unsupported saved context checkpoint policy')
+        if config.get('work_method') not in (None, 'goal.v1'):
+            raise ValueError('Unsupported saved professional working method')
+        if config.get('work_method') and (config.get('memory_protocol') != 'journal.v1'
+                or config.get('context_checkpoint_policy') != 'economic.v3'):
+            raise ValueError('Goal working method requires the shared working journal')
         if config.get('context_checkpoint_policy') and config.get('memory_protocol') != 'journal.v1':
             raise ValueError('Economic checkpointing requires journal continuity')
         if config.get('memory_protocol') and (config.get('context_protocol') != 'working.v4'
@@ -879,12 +884,14 @@ class ToolApplication:
         Selection is not permission or acceptance. Existing domain validation,
         approval and delivery checks still own every returned action.
         """
-        if self.state['config'].get('completion_policy') == _OPERATION_EXIT:
+        if (self.state['config'].get('completion_policy') == _OPERATION_EXIT
+                and self.state['config'].get('work_method') != 'goal.v1'):
             return self.schemas
         # Restrict the active contracts rather than loading deferred specialists:
         # expanding an on-demand catalog here can evict original input windows.
         schemas = [row for row in self.schemas
-            if (contract := self._completion(row['function']['name'])) is not None and contract.closing]
+            if (contract := self._completion(row['function']['name'])) is not None and contract.closing
+                and (self.state['config'].get('work_method') != 'goal.v1' or not contract.field)]
         result = []
         for original in schemas:
             schema = json.loads(json.dumps(original))
@@ -1071,7 +1078,8 @@ class ToolApplication:
                         memory = ProfessionalConversation.adopt(previous=memory,
                             snapshot=store.read_json('memory_snapshot.json') if store.exists('memory_snapshot.json') else None,
                             failure=store.read_json('memory_failure.json') if store.exists('memory_failure.json') else None,
-                            view=store.read_json('memory_input.json'), operations_for_turn=self._memory_operations)
+                            view=store.read_json('memory_input.json'), operations_for_turn=self._memory_operations,
+                            archive=self.state['config'].get('work_method') == 'goal.v1')
                 for path in notes.get(attempt.attempt_id, []):
                     result = self.session.store.read_json(path)
                     data = result.get('data') or {}
@@ -1080,7 +1088,8 @@ class ToolApplication:
                         # Explicit notes replace the understanding, not paid
                         # checkpoint inputs. Coverage still reopens originals.
                         purchases = ({key: memory[key] for key in
-                            ('attempted_records', 'attempted_through_turn') if key in memory}
+                            ('attempted_records', 'attempted_through_turn', 'archived_records') if key in memory
+                                and (key != 'archived_records' or self.state['config'].get('work_method') == 'goal.v1')}
                             if self.state['config'].get('native_supply_policy') in RECEIPT_SUPPLY_POLICIES else {})
                         memory = {'notes':data['notes'], 'through_turn':0,
                             'compacted_records':set(), **purchases}
@@ -1821,6 +1830,7 @@ class ToolApplication:
         if automatic_memory:
             config['memory_protocol'] = 'journal.v1'
             config['context_checkpoint_policy'] = 'economic.v3'
+            config['work_method'] = 'goal.v1'
         return config, reused, limits, attempts
 
     @classmethod
@@ -2111,7 +2121,7 @@ class ToolApplication:
             for field in ('completion_policy', 'tool_contracts', 'report_protocol', 'tool_completions', 'inspection_protocol',
                           'inspection_coverage_policy', 'inspection_finding_policy',
                           'delivery_review_protocol', 'publication_assets', 'professional_operations', 'memory_protocol',
-                          'context_checkpoint_policy', 'native_supply_policy', 'context_authority',
+                          'context_checkpoint_policy', 'work_method', 'native_supply_policy', 'context_authority',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
                     if field in old:
@@ -2481,6 +2491,12 @@ class ToolApplication:
         if self.operations is not None:
             exit_text = (_OPERATION_EXIT_DECISION
                 if self.state['config'].get('completion_policy') == _OPERATION_EXIT else _CLOSING_DECISION)
+            if self.state['config'].get('work_method') == 'goal.v1':
+                exit_text = ('This is the last affordable decision. Use exactly one offered delivery '
+                    'or indispensable question. Do not propose further reads, edits or computations. '
+                    'Reuse an applicable existing review for complete delivery; otherwise deliver '
+                    'useful existing artifacts with the actual unfinished work in unresolved. '
+                    'Research scope limitations alone do not make finished requested work unresolved.')
             return self.operations.system_text() + ('\n\n'+exit_text if closing else '')
         # Do not append delegation advice to the old do-everything solver role:
         # professional owners now hold the complete investigation-to-result unit.
@@ -3656,6 +3672,9 @@ class ToolApplication:
                 working_rows = [*additions, *working_rows]
                 selected_records = list(dict.fromkeys([
                     *selected_records, *(row['record'] for row in related)]))
+            journal_rows = [{'turn':number, 'record':'records/'+path.removeprefix('attempts/')}
+                for number, turn in enumerate(turns) if not turn.get('remaining')
+                for path in ([item['result'] for item in turn['tools']] or [turn['reply']])] if journal else []
             messages, selection = select_working_context(user_requests=self.state['requests'],
                 context_authority=config.get('context_authority'),
                 system_text=prefix[0]['content'],base_context=context,
@@ -3677,11 +3696,9 @@ class ToolApplication:
                     'scoped' if config['context_protocol'] == 'working.v4' else
                     'referenced' if config['context_protocol'] in _REFERENCED_CONTEXT_PROTOCOLS else 'ranked'),
                 operation_history=operation_history,
-                **({'processed_turns':processed_journal_turns([
-                    {'turn':number, 'record':'records/'+path.removeprefix('attempts/')}
-                    for number, turn in enumerate(turns) if not turn.get('remaining')
-                    for path in ([item['result'] for item in turn['tools']] or [turn['reply']])],
-                    memory.get('compacted_records', set()))} if journal else {}))
+                **({'processed_turns':processed_journal_turns(journal_rows, memory.get('compacted_records', ())),
+                    **({'archived_turns':processed_journal_turns(journal_rows, memory.get('archived_records', ()))}
+                       if config.get('work_method') == 'goal.v1' else {})} if journal else {}))
             if working_selection is not None:
                 working_selection.update(selection)
             cost = estimate_tokens(json.dumps(messages,ensure_ascii=False))+schema_cost
@@ -3928,7 +3945,8 @@ class ToolApplication:
                     previous, view = self._working_memory(), context.store.read_json('memory_input.json')
                     if journal:
                         working_memory = ProfessionalConversation.adopt(previous=previous,
-                            snapshot=snapshot, view=view, operations_for_turn=self._memory_operations)
+                            snapshot=snapshot, view=view, operations_for_turn=self._memory_operations,
+                            archive=self.state['config'].get('work_method') == 'goal.v1')
                     else:
                         from simple_ar.app.work_memory import summary_coverage
                         working_memory = {'notes':snapshot['notes'], 'through_turn':summary_coverage(
@@ -4309,7 +4327,7 @@ class ToolApplication:
 
     def _terminal_intent(self, call: dict[str, Any]) -> bool:
         contract = self._completion(call['function']['name'])
-        if contract is None:
+        if contract is None or contract.kind == 'review':
             return False
         if not contract.field:
             return True
@@ -4321,7 +4339,7 @@ class ToolApplication:
 
     def _delivery(self, call: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
         contract = self._completion(call['function']['name'])
-        if contract is None or contract.kind != 'delivery':
+        if contract is None or contract.kind not in {'delivery', 'review'}:
             return None
         data = payload.get('data') or {}
         return data.get(contract.field) if contract.field else data

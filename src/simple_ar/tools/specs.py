@@ -27,15 +27,16 @@ class RiskLevel(str, Enum):
 
 
 class ToolCompletion(BaseModel):
-    """Optional common terminal shape; it grants neither adoption nor authority.
+    """Common result shape; it grants neither adoption nor authority.
 
     A nonempty field holds an optional DeliveryRequest in both arguments and
     result data. An empty field uses the whole object. Questions use the common
-    question shape. Closing offers must be safe without further model work.
+    question shape. Review uses the same claim shape without finishing a task.
+    Closing offers must be safe without further model work.
     """
 
     model_config = ConfigDict(extra='forbid', strict=True)
-    kind: Literal['delivery', 'question'] = 'delivery'
+    kind: Literal['delivery', 'question', 'review'] = 'delivery'
     field: str = Field(default='', max_length=200)
     closing: bool = False
 
@@ -43,6 +44,8 @@ class ToolCompletion(BaseModel):
     def shape(self) -> ToolCompletion:
         if self.kind == 'question' and self.field:
             raise ValueError('Questions use the complete common question object')
+        if self.kind == 'review' and self.closing:
+            raise ValueError('Candidate review cannot close a task')
         return self
 
 

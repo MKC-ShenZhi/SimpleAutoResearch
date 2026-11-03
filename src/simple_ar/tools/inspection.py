@@ -104,6 +104,27 @@ class _InvestigatedDeliveryResponse(_DeliveryResponseLinked):
     investigations: list[_Investigation]
 
 
+class _ScopedInvestigation(_Investigation):
+    necessary: bool = Field(default=True, description='Whether this check is necessary for the '
+        'actual requested outcome. Optional improvements do not block completed requested work.')
+    scope: str = Field(min_length=1, description='What was actually checked: files, ranges, '
+        'population or sample. A checked sample does not establish a claim about all inputs.')
+    basis: Literal['observed', 'derived', 'executed', 'not_checked']
+    execution_records: list[str] = Field(default_factory=list, description='Actual own inspection '
+        'action record locators used for executed checks, as supplied in executed_checks. '
+        'A proposed command, producer run or existing file is not your executed check.')
+
+
+class _ScopedFinding(_DeliveryFinding):
+    investigation: int = Field(ge=0, description='Zero-based investigation establishing this finding. '
+        'Required defects need a contradicted claim, not merely an unfinished check.')
+
+
+class _ScopedDeliveryResponse(_InvestigatedDeliveryResponse):
+    investigations: list[_ScopedInvestigation]
+    findings: list[_ScopedFinding]
+
+
 class _Finding(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     subject: str
@@ -301,6 +322,7 @@ class InspectionToolGateway:
                  finding_policy: str | None = None,
                  native_supply_policy: str | None = None,
                  context_checkpoint_policy: str | None = None,
+                 work_method: str | None = None,
                  execution_protocol: str | None = None,
                  operation_specs: Callable[[], list[CommonToolSpec]] | None = None,
                  operation_call: Callable[[str, dict[str, Any], str], ToolResult] | None = None) -> None:
@@ -320,6 +342,8 @@ class InspectionToolGateway:
             raise ValueError('Unknown inspection checkpoint policy')
         if context_checkpoint_policy and protocol != 'subjects.v3':
             raise ValueError('Inspection checkpoint policy requires journal continuity')
+        if work_method not in (None, 'goal.v1') or work_method and protocol != 'subjects.v3':
+            raise ValueError('Unsupported inspection working method')
         self.root, self.workspace = Path(root), workspace
         self.store, self.client_factory = ArtifactStore(root), client_factory
         self.prior_assessments = prior_assessments
@@ -333,6 +357,7 @@ class InspectionToolGateway:
         self.finding_policy = finding_policy
         self.native_supply_policy = native_supply_policy
         self.context_checkpoint_policy = context_checkpoint_policy
+        self.work_method = work_method
         self.execution_protocol = execution_protocol
         self.operation_specs = operation_specs
         self.operation_call = operation_call
@@ -380,7 +405,21 @@ class InspectionToolGateway:
             contract = contract.replace('through the offered read-only tools;', 'through the offered tools.')
             contract = contract.replace('Use authorized read tools to investigate',
                 'Use authorized tools to investigate')
-            return (contract + ' You may use only operations offered in this decision. '
+            method = ((' Work from the exact goal and consequential claims, not an exhaustive inventory. '
+                'Batch necessary observations and independent calculations into useful checks. '
+                'Do not spend the investigation on repeated catalogues or cosmetic checks while '
+                'important claims remain unchecked. Measure machine-checkable quantities from the '
+                'relevant actual inputs; never estimate them from file length, names or producer '
+                'summaries. For each investigation state its actual scope and basis. Reading one '
+                'sample cannot support a whole-population claim. Separate direct observations, '
+                'derivations, actual own executions and checks not made. Record executed checks '
+                'with the supplied own action locators. An unexecuted plan must remain not_checked. '
+                'Tie each finding to its investigation. Missing verification means unresolved '
+                'investigation, not proof of a defect; required findings need an established '
+                'contradiction with the requested outcome. Optional polish is advisory. '
+                'Do not certify scientific truth from valid record IDs or execution success.')
+                if saved.get('work_method') == 'goal.v1' and self._delivery_scope(saved) else '')
+            return (contract + method + ' You may use only operations offered in this decision. '
                 'Original targets and sources are immutable. Create or change helper files only under '
                 f"workspace/inspection-work/{saved['identity']}/. "
                 'Process execution requires the ordinary explicit approval and is not sandboxed; '
@@ -1870,7 +1909,8 @@ class InspectionToolGateway:
     def _delivery_decision(self, saved: dict, value: dict) -> _DeliveryResponse:
         linked = saved.get('finding_policy') == 'linked.v1'
         investigated = ('applicability' in value or self._investigation_contract(saved))
-        decision = (_InvestigatedDeliveryResponse if investigated else
+        decision = (_ScopedDeliveryResponse if saved.get('work_method') == 'goal.v1' else
+            _InvestigatedDeliveryResponse if investigated else
             _DeliveryResponseLinked if linked else _DeliveryResponse).model_validate(value)
         if investigated:
             if not decision.applicability.strip() or len({row.claim for row in decision.investigations}) != len(decision.investigations):
@@ -1882,9 +1922,31 @@ class InspectionToolGateway:
                     raise ValueError('Investigation must bind its reasoning to selected actual observations')
                 if row.outcome == 'supported' and not row.evidence:
                     raise ValueError('A supported investigation needs actual observed evidence')
-                if row.outcome == 'contradicted' and not any(
-                        finding.severity == 'required' for finding in decision.findings):
+                if (row.outcome == 'contradicted' and getattr(row, 'necessary', True) and not any(
+                        finding.severity == 'required' for finding in decision.findings)):
                     raise ValueError('A contradicted requested claim must retain a required finding')
+        if isinstance(decision, _ScopedDeliveryResponse):
+            executed = None
+            for i, row in enumerate(decision.investigations):
+                if not row.scope.strip() or row.basis == 'not_checked' and row.outcome != 'unresolved':
+                    raise ValueError('Unperformed checks remain unresolved with their actual scope')
+                if row.basis != 'executed' and row.execution_records:
+                    raise ValueError('Only actual executed checks can select execution records')
+                if row.basis == 'executed':
+                    if executed is None:
+                        executed = self._executed_check_records(saved)
+                    if (not row.execution_records or len(set(row.execution_records)) != len(row.execution_records)
+                            or not set(row.execution_records) <= executed):
+                        raise ValueError('Executed investigations require actual own successful action records')
+                findings = [f for f in decision.findings if f.investigation == i]
+                if row.necessary and row.outcome == 'contradicted' and not any(f.severity == 'required' for f in findings):
+                    raise ValueError('Each contradicted requested claim needs its own required finding')
+            for finding in decision.findings:
+                if (finding.investigation >= len(decision.investigations)
+                        or finding.severity == 'required'
+                        and (not decision.investigations[finding.investigation].necessary
+                             or decision.investigations[finding.investigation].outcome != 'contradicted')):
+                    raise ValueError('Required findings must bind an actually contradicted investigation')
         if linked:
             allowed = {row['id'] for row in saved['prior_required']}
             if (len(set(decision.reassessed_prior)) != len(decision.reassessed_prior)
@@ -1903,6 +1965,13 @@ class InspectionToolGateway:
                 for finding in decision.findings):
             raise ValueError('Package findings must name affected bound artifacts and a concrete defect')
         return decision
+
+    def _executed_check_records(self, saved: dict) -> set[str]:
+        """Reuse the common action owner's accepted receipts, never a model claim."""
+        return {row['record'] for row in self._investigation_actions(saved)
+            if row['call']['function']['name'] == 'run_process' and row['result'].get('status') == 'ok'
+                and row['result'].get('data', {}).get('returncode') == 0
+                and not row['result'].get('data', {}).get('stop_reason')}
 
     def _delivery_assessment(self, saved: dict, receipt: dict, identity: str, failure: str,
                              *, check_versions: bool = True) -> tuple[dict, str]:
@@ -1957,10 +2026,12 @@ class InspectionToolGateway:
             and all(covered for covered, _ in scopes) and not pending)
         investigations = getattr(decision, 'investigations', None)
         if investigations is not None:
-            complete = complete and all(row.outcome == 'supported' for row in investigations)
+            complete = complete and all(not getattr(row, 'necessary', True) or row.outcome == 'supported'
+                                        for row in investigations)
         limitations = ([*decision.limitations, *(scope for _, scope in scopes),
             *(['Unfinished independent investigation: ' + row.claim
-                for row in investigations if row.outcome == 'unresolved'] if investigations is not None else []),
+                for row in investigations if row.outcome == 'unresolved' and getattr(row, 'necessary', True)]
+                if investigations is not None else []),
             *(['Selected evidence includes read windows not proven supplied to an inspection request']
                 if any(not covered for covered, _ in scopes) else []),
             *(['Prior required concerns remain to be rechecked: ' + ', '.join(sorted(pending))]
@@ -2471,6 +2542,8 @@ class InspectionToolGateway:
             if remaining is not None:
                 target = min(target, max(0, remaining - (client.effective_output_limit() or 0)))
         base = self._view(saved, request)
+        if saved.get('work_method') == 'goal.v1' and self._delivery_scope(saved):
+            base['executed_checks'] = sorted(self._executed_check_records(saved))
         if saved.get('execution_protocol') == 'shared.v1':
             # A primary target is a current material, not permanently pinned
             # prompt text. Its complete read/version proof stays in the source
@@ -2597,7 +2670,9 @@ class InspectionToolGateway:
                         + (list(saved['delivery_context']['artifacts']) if
                             saved.get('delivery_context', {}).get('schema_version') in
                                 {'delivery_review.v2','delivery_review.v3'} else []))),
-                'processed_turns':processed_journal_turns(journal_rows, memory['compacted_records'])
+                'processed_turns':processed_journal_turns(journal_rows, memory['compacted_records']),
+                **({'archived_turns':processed_journal_turns(journal_rows, memory.get('archived_records', ())) }
+                   if saved.get('work_method') == 'goal.v1' else {})
                 } if continuity else {}),
             history_access=('read_history' if history else 'read_file at the recorded authorized source path and range'),
             trailing_messages=[finish] if finish is not None else [])
@@ -2759,6 +2834,9 @@ class InspectionToolGateway:
         """Expose actual scoped executions, not an opinion that they prove a claim."""
         self._receipt(identity)
         saved = self.store.read_json(self._path(identity, 'input'))
+        return self._investigation_actions(saved)
+
+    def _investigation_actions(self, saved: dict) -> list[dict]:
         actions = []
         for number in range(len(saved.get('source_rounds', []))):
             trace = self._closed_source_round(saved, number)
@@ -2961,7 +3039,8 @@ class InspectionToolGateway:
                 raise ValueError('Inspection checkpoint artifacts exceed their recorded round scope')
             memory = ProfessionalConversation.adopt(previous=memory, view=view, operations_for_turn=operations,
                 snapshot=store.read_json('memory_snapshot.json') if store.exists('memory_snapshot.json') else None,
-                failure=store.read_json('memory_failure.json') if store.exists('memory_failure.json') else None)
+                failure=store.read_json('memory_failure.json') if store.exists('memory_failure.json') else None,
+                archive=saved.get('work_method') == 'goal.v1')
         return memory
 
     def _conversation_material(self, saved: dict) -> tuple[dict, list, list]:
@@ -3599,7 +3678,8 @@ class InspectionToolGateway:
                     'Historical observations grant no current evidence, permission or repeated execution.',
                 'parameters':_InspectionHistory.model_json_schema()}})
         package = self._delivery_scope(saved)
-        response_model = ((_InvestigatedDeliveryResponse if self._investigation_contract(saved, offering=True)
+        response_model = ((_ScopedDeliveryResponse if saved.get('work_method') == 'goal.v1' else
+                           _InvestigatedDeliveryResponse if self._investigation_contract(saved, offering=True)
                            else _DeliveryResponseLinked if saved.get('finding_policy') == 'linked.v1'
                            else _DeliveryResponse) if package else
             (_ReviewResponseV2 if saved.get('coverage_policy') == 'offered.v2' else _ReviewResponse) if self.adaptive
@@ -3640,7 +3720,8 @@ class InspectionToolGateway:
         while True:
             if package:
                 schema = response_model.model_json_schema()
-                artifact_schema = schema['$defs']['_DeliveryFinding']['properties']['artifacts']
+                finding_type = schema['properties']['findings']['items']['$ref'].rsplit('/', 1)[-1]
+                artifact_schema = schema['$defs'][finding_type]['properties']['artifacts']
                 if saved['delivery_context']['artifacts']:
                     artifact_schema['items']['enum'] = sorted(saved['delivery_context']['artifacts'])
                 else:
@@ -4040,6 +4121,8 @@ class InspectionToolGateway:
             # observations have their own owner; an unavailable text input is
             # not a model opinion about the artifact or a required correction.
             saved = {'identity': identity, 'arguments': binding, 'targets': [], 'evidence': []}
+            if self.work_method is not None:
+                saved['work_method'] = self.work_method
             if self.native_supply_policy is not None:
                 saved['native_supply_policy'] = self.native_supply_policy
             if self.coverage_policy is not None:

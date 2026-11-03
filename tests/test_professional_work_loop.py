@@ -458,7 +458,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.app = None
 
     def _create(self, *, report=False, allow_execution=True, delivery_files=None, context_protocol='auto', goal=None,
-                saved_scope=False, delivery_protocol='task.v4'):
+                saved_scope=False, delivery_protocol='task.v4', current_method=False):
         if saved_scope:
             from tests.native_history_fixture import load_prepared_operation_history
             self.app = load_prepared_operation_history(self.root, goal or 'Continue the saved professional work.',
@@ -486,11 +486,14 @@ class OperationsWorkLoopTests(unittest.TestCase):
             max_turns=70, max_tokens=900000, max_attempts=180,
             process_limits={'process_invocations': 48, 'process_wall_seconds': 360}, **options)
         # These operation/failure fixtures retain the saved v4 delivery and
-        # purchase choreography. Current v5 behavior uses delivery_protocol=None
-        # in DemandDrivenDeliveryInspectionTests and the ordinary CLI/UI paths;
+        # purchase choreography. Current v5 delivery uses delivery_protocol=None;
+        # goal.v1 work uses current_method=True and ordinary CLI/UI paths.
         # do not duplicate the entire permission/recovery matrix for a new offer.
+        if not current_method:
+            self.app.state['config'].pop('work_method', None)
         if delivery_protocol is not None and self.app.state['config']['delivery_review_protocol'] != delivery_protocol:
             self.app.state['config']['delivery_review_protocol'] = delivery_protocol
+        if not current_method or delivery_protocol is not None:
             self.app._save()
             self._reload()
         return self.app
@@ -6215,6 +6218,11 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.app = ToolApplication.create(self.root, 'Write a note, verify it and deliver both files.',
             model='fixture', services=self.services, sources={}, allow_execution=True,
             max_turns=1, max_tokens=200000, max_attempts=10, tool_contracts='full')
+        # Saved available_operations.v2 tasks keep their historical final batch.
+        # New goal.v1 tasks exercise executable partial closure separately.
+        self.app.state['config'].pop('work_method', None)
+        self.app._save()
+        self._reload()
         self.assertEqual(self.app.state['config']['completion_policy'], 'available_operations.v2')
         self.decisions.append([
             _action('write_file', path='note.md', content='Useful final work.'),
