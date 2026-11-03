@@ -2446,7 +2446,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     # pressure; default operation discovery is tested separately.
                     self.app.state['config']['work_method'] = 'goal.v1'
                     self.app._save()
-                    self._reload()
+                    self.app = ToolApplication.load(self.root)
                     self.decisions.clear()
                     for index in range(12):
                         name = f'unknown-memory-{index}.txt'
