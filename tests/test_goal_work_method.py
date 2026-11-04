@@ -332,7 +332,7 @@ class GoalWorkTests(unittest.TestCase):
 
     def test_one_submission_checks_then_commits_after_approval_and_reload(self):
         from unittest.mock import patch
-        from simple_ar.tools.inspection import InspectionRequest
+        from simple_ar.tools.inspection import _DeliveryInspectionRequest
         case = self.case
         case._write('claim.md', 'The supplied observations have mean 2.0.\n')
         work = {}
@@ -401,7 +401,7 @@ class GoalWorkTests(unittest.TestCase):
             'archived_records':{row['record'] for row in rows}}
         protected = {name:(case.root/name).read_bytes() for name in
             ('actions.json','session_manifest.json','budget_ledger.json','delivery.json')}
-        request = InspectionRequest.model_validate(saved['arguments'])
+        request = _DeliveryInspectionRequest.model_validate(saved['arguments'])
         with patch.object(owner, '_conversation_memory', return_value=memory):
             messages, projection = owner._working_messages(saved, request, None, [],
                 case.services.llm_client, validate_capacity=False)
