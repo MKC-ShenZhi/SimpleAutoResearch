@@ -967,7 +967,7 @@ class DeliveryReview:
             retained = None
             for observed in reversed(observations):
                 candidate = (observed.get('metadata') or {}).get('delivery_review')
-                if (retained is None and self.inspector.material_policy == 'operations.v3'
+                if (retained is None and getattr(self.inspector, 'material_policy', None) == 'operations.v3'
                         and isinstance(candidate, dict) and isinstance(candidate.get('identity'), str)
                         and isinstance(candidate.get('binding'), dict)
                         and self.inspector.store.exists(self.inspector._path(candidate['identity'], 'result'))):
