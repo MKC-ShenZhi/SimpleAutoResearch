@@ -331,6 +331,8 @@ class GoalWorkTests(unittest.TestCase):
         self.assertFalse(case._process_receipts())
 
     def test_one_submission_checks_then_commits_after_approval_and_reload(self):
+        from unittest.mock import patch
+        from simple_ar.tools.inspection import InspectionRequest
         case = self.case
         case._write('claim.md', 'The supplied observations have mean 2.0.\n')
         work = {}
@@ -342,7 +344,8 @@ class GoalWorkTests(unittest.TestCase):
                 work['path'] = 'workspace/inspection-work/' + scope
                 program = ("import csv,json,sys; from pathlib import Path; "
                     "v=[float(r['value']) for r in csv.DictReader(Path(sys.argv[1]).open())]; "
-                    "Path('checked.json').write_text(json.dumps({'count':len(v),'mean':sum(v)/len(v)}))")
+                    "Path('checked.json').write_text(json.dumps({'count':len(v),'mean':sum(v)/len(v)})); "
+                    "print('RETAINED_OWN_CHECK='+json.dumps({'count':len(v),'mean':sum(v)/len(v)}))")
                 return [_action('run_process', cwd=work['path'], argv=[sys.executable, '-c', program,
                     str(case.inputs / 'observations.csv')], inputs=['measurements/observations.csv'],
                     outputs=[work['path'] + '/checked.json'], timeout_sec=5)]
@@ -350,7 +353,7 @@ class GoalWorkTests(unittest.TestCase):
             sources = case._inspection_sources(view, *paths)
             missing = [_action('read_file', path=path) for path, source in zip(paths, sources) if source is None]
             if missing:
-                return missing
+                return missing[:1]  # Leave the calculation behind several later read turns.
             result = json.loads(''.join(w['text'] for w in sources[1]['text_windows']))
             self.assertEqual(result, {'count': 3, 'mean': 2.0})
             ids = [source['subject'] for source in sources]
@@ -383,6 +386,38 @@ class GoalWorkTests(unittest.TestCase):
         self.assertEqual(case.send.call_count, calls)
         self.assertEqual(case.app.ledger.to_dict(), ledger)
 
+        # A fallible checkpoint can replace native presentation, but cannot be
+        # the only representation of an already executed check. Reopening the
+        # owner's view must supply the original stdout without executing again.
+        owner = case.app.operations.inspection
+        saved = owner.store.read_json(owner._path(proof['identity'], 'input'))
+        rows = owner._conversation_rows(saved)
+        computation = next(row for row in rows if row['result'].get('tool_name') == 'run_process')
+        self.assertLess(computation['turn'], max(row['turn'] for row in rows)-1)
+        memory = {'notes':[{'text':'A fallible checkpoint says the mean may be 9.',
+            'records':[computation['record']], 'source_integrity':'unknown',
+            'observed_versions':{}, 'knowledge_kind':'result', 'handoff_policy':'citations.v1'}],
+            'through_turn':0, 'compacted_records':set(),
+            'archived_records':{row['record'] for row in rows}}
+        protected = {name:(case.root/name).read_bytes() for name in
+            ('actions.json','session_manifest.json','budget_ledger.json','delivery.json')}
+        request = InspectionRequest.model_validate(saved['arguments'])
+        with patch.object(owner, '_conversation_memory', return_value=memory):
+            messages, projection = owner._working_messages(saved, request, None, [],
+                case.services.llm_client, validate_capacity=False)
+            self.assertIn('RETAINED_OWN_CHECK=', json.dumps(messages))
+            supplied = [row for row in projection['selected_records']
+                if row['source'].get('record') == computation['record']]
+            self.assertTrue(supplied)
+            self.assertTrue(all(row['version_status']=='historical' for row in supplied))
+            legacy = {key:value for key,value in saved.items() if key!='inspection_material_policy'}
+            old_messages, _ = owner._working_messages(legacy, request, None, [],
+                case.services.llm_client, validate_capacity=False)
+            self.assertNotIn('RETAINED_OWN_CHECK=', json.dumps(old_messages))
+        self.assertEqual(len(case._process_receipts()), 1)
+        self.assertEqual(case.send.call_count, calls)
+        self.assertEqual(protected, {name:(case.root/name).read_bytes() for name in protected})
+
     def test_default_work_interface_selects_existing_operations_without_changing_permission(self):
         case = self.case
         self.assertEqual(case.app.state['config']['work_method'], 'goal.v2')
@@ -409,6 +444,7 @@ class GoalWorkTests(unittest.TestCase):
         self.assertFalse(case.app.workspace.call('write_file', {'path': 'measurements/observations.csv',
             'content': 'Forbidden source mutation'}, identity='source-write').ok)
         case.app.state['config']['work_method'] = 'goal.v1'
+        case.app.state['config'].pop('inspection_material_policy', None)
         case.app._save()
         case._reload()
         self.assertIn('review_result', {tool['function']['name'] for tool in case.app.schemas})

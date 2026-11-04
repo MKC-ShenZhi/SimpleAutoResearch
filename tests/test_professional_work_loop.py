@@ -491,6 +491,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         # do not duplicate the entire permission/recovery matrix for a new offer.
         if not current_method:
             self.app.state['config'].pop('work_method', None)
+            self.app.state['config'].pop('inspection_material_policy', None)
         if delivery_protocol is not None and self.app.state['config']['delivery_review_protocol'] != delivery_protocol:
             self.app.state['config']['delivery_review_protocol'] = delivery_protocol
         if not current_method or delivery_protocol is not None:

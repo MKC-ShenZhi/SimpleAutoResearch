@@ -213,6 +213,7 @@ class OperationTools:
                 if config.get('context_checkpoint_policy') == 'economic.v3'
                     and config.get('inspection_protocol') == 'subjects.v3' else None),
             work_method=config.get('work_method'),
+            material_policy=config.get('inspection_material_policy'),
             material_observations=material_observations,
             user_requests=user_requests,
             prior_concerns=lambda targets: self.delivery_review.pending_concerns(targets)

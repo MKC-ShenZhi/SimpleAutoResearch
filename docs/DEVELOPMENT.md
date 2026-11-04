@@ -42,6 +42,10 @@ All operations use the same execution records and resource accounting. Task-loca
 scripts can provide a parser, calculation or plot when an existing operation is
 insufficient; they remain subject to the task's permissions.
 
+Independent inspection owns its observations as well as its judgment. File windows
+and original operation outcomes share the bounded working view; compaction notes
+do not replace recorded calculations or certify their applicability to changed work.
+
 | Change | Start here |
 | --- | --- |
 | CLI inputs and configuration | [CLI](../src/simple_ar/cli/), [task intake](../src/simple_ar/app/research_intake.py) |
