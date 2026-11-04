@@ -548,9 +548,8 @@ class GoalWorkTests(unittest.TestCase):
             originals.append(deepcopy(message))
             return response
         case.send.side_effect = text_final
-        case._submit(_action('deliver_result', summary='Useful existing note', artifacts=['note.md'],
-            unresolved=['Independent verification has not finished.']))
-        self.assertEqual(case.app.session.manifest.status, 'partial', case.app.result_snapshot())
+        case._submit(_action('deliver_result', summary='Useful existing note', artifacts=['note.md']))
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
         self.assertEqual(case.send.call_count, 1)
         owner = case.app.operations.inspection
         inputs = list((root/'tools/inspection').glob('*/input.json'))
@@ -590,7 +589,7 @@ class GoalWorkTests(unittest.TestCase):
         before = trace_path.read_bytes()
         case._reload()
         self.assertEqual(trace_path.read_bytes(), before)
-        self.assertEqual(case.app.session.manifest.status, 'partial')
+        self.assertEqual(case.app.session.manifest.status, 'completed')
         self.assertEqual(case.send.call_count, 1)
 
     def test_claimed_execution_or_unfinished_check_cannot_become_required_defect(self):
