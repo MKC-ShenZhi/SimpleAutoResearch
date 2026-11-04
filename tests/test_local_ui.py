@@ -932,7 +932,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                 self.assertEqual({row['function']['name'] for row in kwargs['tools']}, {'select_work'})
                 context = json.loads(messages[1]['content'])
                 request = next(row['content'] for row in reversed(messages) if row['role']=='user')
-                arguments = {'remaining':[{'request_index':context['current_request_index'],
+                arguments = {'decision':'work', 'remaining':[{'request_index':context['current_request_index'],
                     'quote':request, 'missing_outcome':'Perform the requested controlled UI work.'}],
                     'actions':[{'tool_name':tool, 'arguments':arguments}], 'candidate':None}
                 tool = 'select_work'
