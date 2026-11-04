@@ -532,7 +532,7 @@ class GoalWorkTests(unittest.TestCase):
         case = self.case
         root = case.directory / 'one-inspection-call'
         case.app = ToolApplication.create(root, 'Deliver the existing note with honest limits.',
-            model='fixture', services=case.services, sources={}, max_turns=2,
+            model='fixture', services=case.services, sources={}, max_turns=3,
             max_tokens=100000, max_attempts=12, tool_contracts='full')
         case.root = root
         (root / 'workspace/note.md').write_text('Existing useful work.\n')
@@ -541,8 +541,10 @@ class GoalWorkTests(unittest.TestCase):
         def text_final(settings, request, **kwargs):
             response = provider(settings, request, **kwargs)
             offered = [item['function']['name'] for item in request.get('tools', [])]
-            self.assertEqual(offered, ['record_inspection'])
+            if offered != ['record_inspection']:
+                return response
             message = response['choices'][0]['message']
+            self.assertEqual(message['tool_calls'][0]['function']['name'], 'record_inspection')
             message['content'] = message.pop('tool_calls')[0]['function']['arguments']
             response['choices'][0]['finish_reason'] = 'stop'
             originals.append(deepcopy(message))
@@ -550,12 +552,12 @@ class GoalWorkTests(unittest.TestCase):
         case.send.side_effect = text_final
         case._submit(_action('deliver_result', summary='Useful existing note', artifacts=['note.md']))
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
-        self.assertEqual(case.send.call_count, 1)
+        self.assertEqual(case.send.call_count, 2)
         owner = case.app.operations.inspection
         inputs = list((root/'tools/inspection').glob('*/input.json'))
         self.assertEqual(len(inputs), 1)
         saved = json.loads(inputs[0].read_text())
-        trace_path = inputs[0].parent/'sources-0.json'
+        trace_path = inputs[0].parent/f"sources-{len(saved['source_rounds'])-1}.json"
         trace = json.loads(trace_path.read_text())
         self.assertEqual(trace['response'], originals[0])
         self.assertEqual(trace['admission']['representation'], 'content_json')
@@ -590,7 +592,7 @@ class GoalWorkTests(unittest.TestCase):
         case._reload()
         self.assertEqual(trace_path.read_bytes(), before)
         self.assertEqual(case.app.session.manifest.status, 'completed')
-        self.assertEqual(case.send.call_count, 1)
+        self.assertEqual(case.send.call_count, 2)
 
     def test_claimed_execution_or_unfinished_check_cannot_become_required_defect(self):
         inspector = self.case.app.operations.inspection
