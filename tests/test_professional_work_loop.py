@@ -5760,8 +5760,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         def review(view):
             self.assertNotIn(author, json.dumps(self.inspection_requests[-1]['messages']))
             if 'claim' in view.get('proposed_delivery', {}):
-                self.assertIn('Do not invent evidence or impose a report or PDF.',
-                    self.inspection_requests[-1]['messages'][0]['content'])
+                self.assertTrue(any(message.get('role')=='user'
+                    and message.get('content')==self.app.state['requests'][0]
+                    for message in self.inspection_requests[-1]['messages']))
                 return self._review_complete_targets(view)
             if 'proposed_delivery' not in view and len(self.inspection_requests) <= 4:
                 return [_action('read_file', path=f'measurements/source-{len(self.inspection_requests)-1}.txt', max_bytes=24000)]
