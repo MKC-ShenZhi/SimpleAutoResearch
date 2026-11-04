@@ -109,8 +109,17 @@ class WorkSelection:
 
     @staticmethod
     def selectable(operations: list[dict]) -> list[dict]:
-        return [row for row in operations
-            if row['function']['name'] not in WorkSelection.handoff_operations]
+        result = []
+        for original in operations:
+            if original['function']['name'] in WorkSelection.handoff_operations:
+                continue
+            parameters = original['function']['parameters']
+            if 'delivery' in parameters.get('required', []):
+                continue  # An operation requiring its own whole-task claim is not producer work.
+            row = deepcopy(original)
+            row['function']['parameters'].get('properties', {}).pop('delivery', None)
+            result.append(row)
+        return result
 
     @staticmethod
     def retained_candidate(store, turns, request_count):
@@ -169,7 +178,8 @@ class WorkSelection:
                 production: list[str]) -> dict:
         return {'operations':WorkSelection.selectable(operations), 'current_candidate':candidate,
             'required_findings':concerns, 'production_operations':production,
-            'scope':'Original requests and owner-verified required findings determine missing work. '
+            'scope':'Only the displayed work parameters are offered; final delivery belongs in candidate. '
+                'Original requests and owner-verified required findings determine missing work. '
                 'Memory supplies fallible results and knowledge, not an action agenda. '
                 'Hand a usable candidate to the delivery owner before optional investigation. '
                 'It checks the real requested scope and returns necessary revisions. '

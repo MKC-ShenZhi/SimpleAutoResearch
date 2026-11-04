@@ -138,8 +138,11 @@ class GoalWorkTests(unittest.TestCase):
                 self.case.app._selection_context(closing=closing)['operations']}
             self.assertEqual(names, supplied)
             self.assertFalse(names & {'deliver_result','review_result','select_work'})
+            self.assertTrue(all('delivery' not in row['function']['parameters'].get('properties', {})
+                for row in self.case.app._selection_context(closing=closing)['operations']))
             if closing:
                 self.assertEqual(names, {'ask_user'})
+        self.assertIn('delivery', self.case.app.gateway.registry.get('write_file').input_schema['properties'])
         closing_text = self.case.app._system_text(closing=True)
         self.assertIn('candidate.unresolved', closing_text)
         self.assertIn('actions empty', closing_text)
