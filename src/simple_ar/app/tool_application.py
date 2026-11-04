@@ -48,6 +48,7 @@ from simple_ar.tools.writing import BOUND_REPORT_REVISION, DocumentWorkRequest, 
 from simple_ar.tools.implementation import ExactCodeTask, ImplementationWorkRequest, ImplementationToolGateway, implementation_tool_specs
 from simple_ar.tools.analysis import AnalysisToolGateway, analysis_tool_specs
 from simple_ar.research.sources import SearchProviderRegistry
+from simple_ar.app.professional_conversation import RETAINED_PROFESSIONAL_CONTRACTS
 
 
 _CORE_COORDINATION = {'focus_work', 'load_tools', 'read_history'}
@@ -459,7 +460,7 @@ class ToolApplication:
         if config.get('context_checkpoint_policy') and config.get('memory_protocol') != 'journal.v1':
             raise ValueError('Economic checkpointing requires journal continuity')
         if config.get('memory_protocol') and (config.get('context_protocol') != 'working.v4'
-                or config.get('professional_operations') != 'work.v5'):
+                or config.get('professional_operations') not in RETAINED_PROFESSIONAL_CONTRACTS):
             raise ValueError('Journal continuity requires the saved shared native work context')
         if config.get('delivery_review_protocol') not in {None, 'task.v1', 'task.v2', 'task.v3', 'task.v4', 'task.v5'}:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
@@ -1848,7 +1849,7 @@ class ToolApplication:
             config['delivery_review_protocol'] = 'task.v5'
             config['inspection_finding_policy'] = 'linked.v1'
         from simple_ar.app.operation_tools import CURRENT_PROFESSIONAL_CONTRACT
-        config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
+        config['professional_operations'] = 'work.v5'
         if context_protocol is not None:
             config['context_protocol'] = context_protocol
         if context_protocol in _WORKING_CONTEXT_PROTOCOLS:
@@ -1860,6 +1861,7 @@ class ToolApplication:
             config['work_method'] = (CURRENT_WORK_METHOD if not any(config.get(key) for key in
                 ('code_task', 'execution_contract', 'table_analysis', 'source_generation_protocol')) else 'execute.v2')
             if config['work_method'] == GOAL_WORK_METHOD:
+                config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = 'native.v3'
         return config, reused, limits, attempts
@@ -3505,7 +3507,7 @@ class ToolApplication:
                                     if key != 'text'})
                     read_arguments = self._recorded_arguments(call) if receipt_supply else {}
                     read_windows = journal_read_windows(result, read_arguments if isinstance(read_arguments, dict) else {})
-                    retained_inputs = config.get('professional_operations') == 'work.v5'
+                    retained_inputs = config.get('professional_operations') in RETAINED_PROFESSIONAL_CONTRACTS
                     if (working_mode and call['function']['name']!='write_file' and authored is None
                             and (not isinstance(data.get('text'),str) or retained_inputs and not read_windows)):
                         working_rows.append({'turn':position,'record':record,'kind':'operation_result',
@@ -3614,7 +3616,7 @@ class ToolApplication:
             from simple_ar.core.working_context import (
                 current_material_paths, processed_journal_turns, select_working_context)
             current_artifacts = set()
-            if config.get('professional_operations') == 'work.v5' and config['context_protocol'] == 'working.v4':
+            if config.get('professional_operations') in RETAINED_PROFESSIONAL_CONTRACTS and config['context_protocol'] == 'working.v4':
                 retained = self._retained_work(observations=owner_observations)
                 # Owner references remain compact; the complete inventory stays at
                 # its original receipts and in the user snapshot, not mandatory input.
@@ -3719,7 +3721,7 @@ class ToolApplication:
                 and turns[row['turn']].get('request_count', 1) == len(self.state['requests'])
                 and row.get('tool') == 'read_file' and row.get('role') == 'historical_observation'
                 and row.get('record'))]))
-            if (config.get('professional_operations') == 'work.v5'
+            if (config.get('professional_operations') in RETAINED_PROFESSIONAL_CONTRACTS
                     and config['context_protocol'] == 'working.v4' and current_artifacts):
                 # The native owner already has the actual client, schema and
                 # remaining allowance. Related checks compete as whole original
@@ -3761,7 +3763,7 @@ class ToolApplication:
                 selected_records=selected_records,current_artifacts=sorted(current_artifacts),version_resolver=version,
                 block_request_counts=[turn.get('request_count',1) for turn in turns],
                 material_policy=('working' if config.get('context_checkpoint_policy') == 'economic.v3' else
-                    'retained' if config.get('professional_operations') == 'work.v5'
+                    'retained' if config.get('professional_operations') in RETAINED_PROFESSIONAL_CONTRACTS
                     and config['context_protocol'] == 'working.v4' else
                     'scoped' if config['context_protocol'] == 'working.v4' else
                     'referenced' if config['context_protocol'] in _REFERENCED_CONTEXT_PROTOCOLS else 'ranked'),

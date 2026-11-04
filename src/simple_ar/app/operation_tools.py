@@ -20,12 +20,14 @@ from simple_ar.tools.analysis import AnalysisToolGateway, analysis_tool_specs
 from simple_ar.tools.extensions import LocalExtension
 # Compatibility imports for existing callers; the inspection owner owns the wire contract.
 from simple_ar.tools.delivery_review import delivery_requires_review, prepare_delivery_review
+from simple_ar.app.professional_conversation import RETAINED_PROFESSIONAL_CONTRACTS
 
 
 PROTOCOL = 'operations.v1'
 PROFESSIONAL_CONTRACTS = {'work.v1': 'source_owner.v1', 'work.v2': 'source_owner.v2',
-                          'work.v3': None, 'work.v4': None, 'work.v5': None}
-CURRENT_PROFESSIONAL_CONTRACT = 'work.v5'
+                          'work.v3': None, 'work.v4': None, 'work.v5': None,
+                          'work.v6': 'source_owner.v2'}
+CURRENT_PROFESSIONAL_CONTRACT = 'work.v6'
 
 
 _DIRECT_WORK = (
@@ -201,7 +203,7 @@ class OperationTools:
         self.publication = PublicationToolGateway(root, self.workspace, ledger,
             asset_protocol=config.get('publication_assets'), legacy_report_status=legacy_report_status)
         self.registry.register_package(publication_tool_specs(preparation=False), self.publication,
-            request_visible=config.get('professional_operations') == 'work.v5')
+            request_visible=config.get('professional_operations') in RETAINED_PROFESSIONAL_CONTRACTS)
         self.inspection = InspectionToolGateway(root, self.workspace,
             client_factory=lambda identity:client_factory(identity, 'writing'),
             protocol=config.get('inspection_protocol'),
@@ -251,7 +253,7 @@ class OperationTools:
         if preparation not in {None,'prepared.v1','prepared.v2','prepared.v3'}:
             raise ValueError('Unsupported source generation protocol')
         exact = config.get('code_task') is not None
-        self.shared_native = config.get('professional_operations') in {'work.v3', 'work.v4', 'work.v5'} and not exact
+        self.shared_native = config.get('professional_operations') in {'work.v3', 'work.v4', 'work.v5', 'work.v6'} and not exact
         if self.shared_native and preparation is not None:
             raise ValueError('Shared native professional work cannot acquire a historical preparation controller')
         self.methods = self.work = None
@@ -276,7 +278,7 @@ class OperationTools:
                 delivery_protocol=self.delivery_review.protocol if self.delivery_review is not None else None)
         if config.get('work_method') == 'goal.v1':
             self.system = _GOAL_WORK
-        elif config.get('work_method') in EXECUTABLE_WORK_METHODS:
+        elif config.get('work_method') in EXECUTABLE_WORK_METHODS and config.get('professional_operations') != 'work.v6':
             self.system = _EXECUTABLE_WORK
         if exact or (preparation is not None or source_owner) and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
@@ -286,7 +288,8 @@ class OperationTools:
                 source_owner_contract=source_owner,
                 input_contract='bounded_inputs.v2' if not exact and preparation in {'prepared.v2','prepared.v3'} else None,
                 source_edit_contract='bound_content.v1' if not exact and preparation == 'prepared.v3' else None,
-                decision_protocol=config.get('source_decision_protocol') if not exact else None,
+                decision_protocol=('native.v1' if config.get('professional_operations') == 'work.v6'
+                    else config.get('source_decision_protocol')) if not exact else None,
                 execution_observations=execution_observations if not exact else None,
                 work_context=work_context if not exact else None,
                 material_observations=material_observations if not exact else None,
@@ -302,7 +305,7 @@ class OperationTools:
                 source_owner_contract=source_owner),
                 self.implementation,request_visible=True)
         self.document = None
-        if professional and config.get('professional_operations') in {'work.v1', 'work.v2'} and config['model'] is not None:
+        if professional and config.get('professional_operations') in {'work.v1', 'work.v2', 'work.v6'} and config['model'] is not None:
             from simple_ar.tools.document_work import DocumentWorkToolGateway, document_work_tool_specs
             self.document = DocumentWorkToolGateway(root, self.workspace, ledger, session_id,
                 client_factory=lambda identity: client_factory(identity, 'writing'),
@@ -424,6 +427,12 @@ class OperationTools:
                 # their availability when another optional tool is selected.
                 deferred = (not self.registry.request_visible(spec.name)
                     or executable and mode == 'on_demand' and spec.name == 'review_result')
+            if (self.config.get('professional_operations') == 'work.v6'
+                    and spec.domain == 'workspace' and spec.name not in {'ask_user', 'deliver_result'}):
+                # Ordinary intake offers outcome-producing owners. Primitives
+                # remain explicitly loadable and available to independent
+                # investigation; this changes ownership, never permissions.
+                deferred = True
             if mode == 'full' or not deferred or spec.name in selected:
                 active.add(spec.name)
             else:

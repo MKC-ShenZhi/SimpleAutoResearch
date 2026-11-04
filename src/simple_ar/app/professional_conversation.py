@@ -13,6 +13,11 @@ from simple_ar.integrations.llm import check_llm_call_stop, estimate_tokens
 from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES
 
 
+# Both contracts consume the same retained observations and working memory.
+# v6 changes production ownership, not the identity of previously recorded work.
+RETAINED_PROFESSIONAL_CONTRACTS = frozenset({'work.v5', 'work.v6'})
+
+
 def recorded_work_messages(messages: list[dict]) -> list[dict]:
     """Closed operations are observations, not an inherited action agenda."""
     if len(messages) < 2:

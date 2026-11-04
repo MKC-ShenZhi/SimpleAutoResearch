@@ -449,6 +449,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.inspection_messages = []
         self.memory_views = []
         self.document_views = []
+        self.source_views = []
         self.document_decision = None
         self.transport_errors = []
         self.review = self._review_complete_targets
@@ -458,7 +459,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.app = None
 
     def _create(self, *, report=False, allow_execution=True, delivery_files=None, context_protocol='auto', goal=None,
-                saved_scope=False, delivery_protocol='task.v4', current_method=False, selection_policy=None):
+                saved_scope=False, delivery_protocol='task.v4', current_method=False, selection_policy=None,
+                professional_contract='work.v5'):
         if saved_scope:
             from tests.native_history_fixture import load_prepared_operation_history
             self.app = load_prepared_operation_history(self.root, goal or 'Continue the saved professional work.',
@@ -486,6 +488,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
             max_turns=70, max_tokens=900000, max_attempts=180,
             process_limits={'process_invocations': 48, 'process_wall_seconds': 360}, **options)
         saved_config = deepcopy(self.app.state['config'])
+        # Existing operation fixtures exercise their saved flat production
+        # contract; outcome ownership has its own complete-chain scenario.
+        self.app.state['config']['professional_operations'] = professional_contract
         # Existing fixtures retain their saved implicit choice contract; the
         # explicit transition chain is exercised in test_goal_work_method.
         if selection_policy is None:
@@ -806,10 +811,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.state['config']['work_selection_policy'], 'native.v3')
         self.assertIsNone(self.app.operations.selection)
         core = {row['function']['name'] for row in self.app.operation_schemas}
-        self.assertEqual({'read_file','search_files','list_directory','inspect_project',
-            'copy_file','copy_project','edit_file','write_file','run_process','ask_user',
+        self.assertEqual({'prepare_implementation','execute_implementation','work_document','ask_user',
             'deliver_result','load_tools','read_history','export_report','update_work_plan'}, core)
-        self.assertFalse({'select_work_method','prepare_implementation','execute_implementation','work_document',
+        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v6')
+        self.assertFalse({'select_work_method',
             'begin_professional_work','finish_professional_work'} & core)
         optional = {'inspect_table','analyze_table','measure_experiment','analyze_measurements',
             'inspect_artifacts','find_source_passages'}
@@ -1303,6 +1308,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.inspection_messages.append(deepcopy(message))
                 finish = 'tool_calls'
             elif request.get('tools'):
+                if 'submit_candidate' in offered:
+                    source_view, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
+                    self.source_views.append(deepcopy(source_view))
                 self.assertTrue(self.decisions, 'Unexpected model work after the supplied decisions')
                 action = self.decisions.popleft()
                 action = action() if callable(action) else action
@@ -3381,6 +3389,63 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 'source_decision_protocol': None, 'context_protocol': 'working.v2',
                 'delivery_review_protocol': 'task.v1', 'tool_contracts': 'full', 'max_turns': 30},
             limits={'llm_requests': 30, 'total_tokens': 300000}, max_attempts=70, services=self.services)
+        self._document_work_chain()
+
+    def test_goal_document_owner_produces_checked_versions_and_reuses_work_after_reload(self):
+        self._create(goal='Explain the supplied observations in an editable Markdown note, preserving originals.',
+            current_method=True, delivery_protocol=None, selection_policy='native.v3',
+            professional_contract='work.v6')
+        self.assertIsNone(self.app.operations.selection)
+        self.assertIsNotNone(self.app.operations.implementation)
+        self.assertIsNotNone(self.app.operations.document)
+        self._document_work_chain()
+
+    def test_goal_source_owner_returns_candidate_and_approved_execution_on_one_ledger(self):
+        self._create(goal='Compute the supplied observations and deliver a reusable source project and result.',
+            current_method=True, delivery_protocol=None, selection_policy='native.v3',
+            professional_contract='work.v6')
+        original = self._versions(self.inputs)
+        program = ("import csv,sys\nfrom pathlib import Path\n"
+            "rows=list(csv.DictReader(Path(sys.argv[1]).open()))\n"
+            "values=[float(r['value']) for r in rows]\n"
+            "Path('result.txt').write_text(str(sum(values)/len(values)))\n")
+        self.decisions.extend([
+            _action('prepare_implementation', goal='Compute the mean and retain reusable source.',
+                material_roots=['measurements']),
+            _action('write_candidate_file', path='calculate.py', content=program),
+            lambda: _action('submit_candidate', summary='Reusable bounded calculation', unresolved=[],
+                files=self.source_views[-1]['candidate_draft']['files'],
+                execution_plan={'argv':['python','calculate.py',str(self.inputs/'observations.csv')],
+                    'outputs':['result.txt'], 'timeout_sec':3}),
+            lambda: _action('execute_implementation',
+                prepared_result=self._ok('prepare_implementation')['data']['prepared_result']),
+            lambda: _action('deliver_result', summary='Mean of the supplied observations',
+                artifacts=[self._ok('prepare_implementation')['data']['project_dir']]),
+        ])
+        self._run()
+        prepared = self._ok('prepare_implementation')
+        candidate = Path(prepared['data']['project_dir'])
+        self.assertEqual((candidate/'calculate.py').read_text(), program)
+        self.assertFalse((candidate/'result.txt').exists())
+        self.assertFalse((self.root/'delivery.json').exists())
+        self.assertEqual(self.app.state['pending']['kind'], 'tool')
+        token = self.app.approval_token(self.app.state['pending']['call'])
+        prefix = deepcopy(self.app.ledger.to_dict()['entries'])
+        self._reload()
+        self._run(approved_execution=token)
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertEqual((candidate/'result.txt').read_text(), '2.0')
+        self.assertEqual(self._versions(self.inputs), original)
+        self.assertEqual(self.app.ledger.to_dict()['entries'][:len(prefix)], prefix)
+        self.assertEqual(sum(entry.actual.get('process_invocations',0)
+            for entry in self.app.ledger.entries if entry.status=='settled'), 1)
+        ledger, calls = (self.root/'budget_ledger.json').read_bytes(), self.send.call_count
+        self._reload()
+        self._run()
+        self.assertEqual((self.root/'budget_ledger.json').read_bytes(), ledger)
+        self.assertEqual(self.send.call_count, calls)
+
+    def _document_work_chain(self):
         originals = self._versions(self.inputs)
 
         def author(view):
