@@ -15,13 +15,21 @@ class CheckpointStop(BaseException):
     """Interrupt outside the agent's handled provider/runtime failures."""
 
 
-def goal_work_decision(actions, requests):
+def goal_work_decision(actions, requests, *, policy=None):
     """Encode controlled operation fixtures in the current selector contract."""
     if len(actions) == 1 and actions[0]['tool_name'] == 'select_work':
         return actions
     candidate = None
     if actions and actions[-1]['tool_name'] == 'deliver_result':
         actions, candidate = actions[:-1], actions[-1]['arguments']
+    if policy == 'explicit.v2':
+        if candidate and actions:
+            raise ValueError('Current work fixtures must observe production before explicitly delivering')
+        blocked = bool(candidate and candidate.get('unresolved'))
+        return [{'tool_name':'select_work', 'arguments':{
+            'decision':'work' if actions else 'blocked' if blocked else 'deliver',
+            **({'stop_reason':candidate['unresolved'][0]} if blocked else {}),
+            'actions':actions, 'candidate':candidate}}]
     return [{'tool_name':'select_work', 'arguments':{
         'remaining':([{'request_index':len(requests)-1, 'quote':requests[-1],
             'missing_outcome':'Perform this controlled fixture work for the requested outcome.'}] if actions else []),

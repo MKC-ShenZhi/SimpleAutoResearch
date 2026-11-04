@@ -1305,7 +1305,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 actions = action if isinstance(action, list) else [action]
                 if offered == {'select_work'}:
                     from tests.report_review_fixtures import goal_work_decision
-                    actions = goal_work_decision(actions, self.app.state['requests'])
+                    actions = goal_work_decision(actions, self.app.state['requests'],
+                        policy=self.app.state['config'].get('work_selection_policy'))
                 for item in actions:
                     self.assertIn(item['tool_name'], offered)
                 message = {'role': 'assistant', 'content': None, 'tool_calls': [{
@@ -2462,6 +2463,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     # pressure; default operation discovery is tested separately.
                     self.app.state['config']['work_method'] = 'goal.v1'
                     self.app.state['config'].pop('inspection_material_policy', None)
+                    self.app.state['config'].pop('work_selection_policy', None)
                     self.app._save()
                     self.app = ToolApplication.load(self.root)
                     self.decisions.clear()
@@ -6274,6 +6276,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         # New goal.v1 tasks exercise executable partial closure separately.
         self.app.state['config'].pop('work_method', None)
         self.app.state['config'].pop('inspection_material_policy', None)
+        self.app.state['config'].pop('work_selection_policy', None)
         self.app._save()
         self._reload()
         self.assertEqual(self.app.state['config']['completion_policy'], 'available_operations.v2')
