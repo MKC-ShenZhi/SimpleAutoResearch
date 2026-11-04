@@ -19,6 +19,119 @@ from tests.test_working_context import block, observation, select
 _action = fixture._action
 
 
+class ExplicitWorkDecisionTests(unittest.TestCase):
+    def setUp(self):
+        self.case = fixture.OperationsWorkLoopTests()
+        self.case.setUp()
+        self.addCleanup(self.case.doCleanups)
+        self.case._create(delivery_protocol=None, current_method=True, selection_policy='explicit.v2',
+            goal='Prepare a bounded note from the supplied observations; preserve the sources.')
+
+    def choice(self, decision='work', actions=(), **kwargs):
+        return _action('select_work', decision=decision, actions=list(actions), **kwargs)
+
+    def drain(self, **kwargs):
+        case = self.case
+        return case._run(should_stop=lambda: not case.decisions and case.app.state['pending'] is None
+            and not any(turn['remaining'] for turn in case.app.state['turns']), **kwargs)
+
+    def test_work_candidate_never_discards_actions_or_implicitly_delivers_across_reload_feedback(self):
+        case = self.case
+        program = "from pathlib import Path;Path('note.md').write_text('Three supplied observations.\\n')"
+        candidate = {'summary':'Draft awaiting its requested investigation', 'artifacts':['note.md'],
+                     'unresolved':['The requested work is still in progress.']}
+        case.decisions.append(self.choice(actions=[_action('write_file', path='produce.py', content=program)],
+            candidate=candidate))
+        self.drain()
+        self.assertFalse((case.root/'delivery.json').exists())
+        self.assertFalse(case.inspection_requests)
+        self.assertIn('work_selection_policy', case.app.state['config'])
+        self.assertEqual(case.app._selection_context()['current_candidate'], candidate)
+        case.decisions.append(self.choice(actions=[_action('run_process', argv=[sys.executable,'produce.py'],
+            inputs=['produce.py'], outputs=['note.md'])]))
+        self.drain()
+        self.assertEqual(case.app.state['pending']['kind'], 'tool')
+        token = case.app.approval_token(case.app.state['pending']['call'])
+        case._reload()
+        self.drain(approved_execution=token)
+        self.assertEqual(len(case._process_receipts()), 1)
+        self.assertFalse((case.root/'delivery.json').exists())
+        case.decisions.append(self.choice('deliver', candidate={'summary':'Bounded note', 'artifacts':['note.md']}))
+        self.drain()
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        original = (case.root/'delivery.json').read_bytes()
+        reviews = len(case.inspection_requests)
+        feedback = 'Shorten the same note without recomputing unchanged observations.'
+        case.decisions.append(self.choice(actions=[_action('write_file', path='note.md',
+            content='Three observations.\n',
+            expected_sha256=hashlib.sha256((case.root/'workspace/note.md').read_bytes()).hexdigest())]))
+        self.drain(feedback=feedback)
+        self.assertEqual((case.root/'delivery.json').read_bytes(), original)
+        self.assertEqual(len(case.inspection_requests), reviews)
+        self.assertEqual(len(case._process_receipts()), 1)
+        self.assertNotIn(case.app.session.manifest.status, {'completed','partial'})
+        case._reload()
+        case.decisions.append(self.choice('deliver'))
+        self.drain()
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        from simple_ar.tools.delivery_versions import DeliveryVersions
+        self.assertEqual([v['request_count'] for v in DeliveryVersions(case.root).versions()], [1,2])
+
+    def test_explicit_stop_is_separate_from_work_and_preserves_an_honest_resource_exit(self):
+        case = self.case
+        candidate = {'summary':'Partial observations', 'artifacts':['note.md'],
+                     'unresolved':['Independent verification is unfinished.']}
+        case.decisions.extend([
+            self.choice('deliver', actions=[_action('write_file', path='discarded.txt', content='No.')],
+                candidate=candidate),
+            self.choice('blocked', candidate=candidate),
+            self.choice(actions=[_action('write_file', path='note.md', content='Three observations.\n')],
+                candidate=candidate)])
+        self.drain()
+        self.assertFalse((case.root/'workspace/discarded.txt').exists())
+        self.assertFalse((case.root/'delivery.json').exists())
+        self.assertEqual([r['status'] for r in case._observations('select_work')], ['blocked','blocked'])
+        reason = 'The remaining shared allowance cannot fund the necessary independent check.'
+        case.decisions.append(self.choice('blocked', candidate=candidate, stop_reason=reason))
+        self.drain()
+        self.assertEqual(case.app.session.manifest.status, 'partial', case.app.result_snapshot())
+        self.assertIn(reason, case.app.session.store.read_json('delivery.json')['unresolved'])
+        self.assertFalse(case.inspection_requests)
+
+    def test_rejected_delivery_returns_to_explicit_work_without_a_new_scheduler(self):
+        case = self.case
+        def review(view):
+            opinion = case._review_complete_targets(view)
+            if isinstance(opinion, dict) and 'population' in (case.root/'workspace/note.md').read_text():
+                opinion['investigations'] = [{'claim':'The observation generalizes to a population.',
+                    'scope':'Supplied note.', 'basis':'observed', 'necessary':True,
+                    'method':'Read the actual bounded observation.', 'reasoning':'No population sample was supplied.',
+                    'evidence':opinion['evidence'], 'outcome':'contradicted'}]
+                opinion['findings'] = [{'severity':'required', 'message':'Remove the population inference.',
+                    'artifacts':[str(case.root/'workspace/note.md')], 'investigation':0}]
+            elif isinstance(opinion, dict):
+                opinion['reassessed_prior'] = [r['id'] for r in view.get('prior_required', [])]
+            return opinion
+        case.review = review
+        candidate = {'summary':'Bounded observation note', 'artifacts':['note.md']}
+        case.decisions.extend([
+            self.choice(actions=[_action('write_file', path='note.md', content='The population is characterized.\n')],
+                candidate=candidate), self.choice('deliver')])
+        self.drain()
+        self.assertNotIn(case.app.session.manifest.status, {'completed','partial'})
+        self.assertEqual(len(case.app._selection_context()['required_findings']), 1)
+        case._reload()
+        case.decisions.append(self.choice(actions=[_action('write_file', path='note.md',
+            expected_sha256=hashlib.sha256((case.root/'workspace/note.md').read_bytes()).hexdigest(),
+            content='Only the supplied observations are characterized.\n')]))
+        self.drain()
+        self.assertFalse((case.root/'delivery.json').exists())
+        case.decisions.append(self.choice('deliver'))
+        self.drain()
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertFalse(case._process_receipts())
+
+
 class WorkingArchiveTests(unittest.TestCase):
     def test_knowledge_checkpoint_cannot_supply_an_action_agenda_and_old_contract_still_loads(self):
         from simple_ar.app.work_memory import _bound_response

@@ -343,7 +343,7 @@ class OperationTools:
         self.selection = None
         if config.get('work_method') == GOAL_WORK_METHOD:
             from simple_ar.app.work_selection import WorkSelection
-            self.selection = WorkSelection()
+            self.selection = WorkSelection(config.get('work_selection_policy'))
             self.registry.register_package([self.selection.spec()], self.selection, request_visible=True)
             self.system = self.selection.system
         if not legacy_report_status:

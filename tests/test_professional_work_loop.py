@@ -458,7 +458,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.app = None
 
     def _create(self, *, report=False, allow_execution=True, delivery_files=None, context_protocol='auto', goal=None,
-                saved_scope=False, delivery_protocol='task.v4', current_method=False):
+                saved_scope=False, delivery_protocol='task.v4', current_method=False, selection_policy=None):
         if saved_scope:
             from tests.native_history_fixture import load_prepared_operation_history
             self.app = load_prepared_operation_history(self.root, goal or 'Continue the saved professional work.',
@@ -485,6 +485,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
             allow_execution=allow_execution, tool_contracts='full',
             max_turns=70, max_tokens=900000, max_attempts=180,
             process_limits={'process_invocations': 48, 'process_wall_seconds': 360}, **options)
+        # Existing fixtures retain their saved implicit choice contract; the
+        # explicit transition chain is exercised in test_goal_work_method.
+        if selection_policy is None:
+            self.app.state['config'].pop('work_selection_policy', None)
+        else:
+            self.app.state['config']['work_selection_policy'] = selection_policy
         # These operation/failure fixtures retain the saved v4 delivery and
         # purchase choreography. Current v5 delivery uses delivery_protocol=None;
         # goal.v1 work uses current_method=True and ordinary CLI/UI paths.
@@ -494,7 +500,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.app.state['config'].pop('inspection_material_policy', None)
         if delivery_protocol is not None and self.app.state['config']['delivery_review_protocol'] != delivery_protocol:
             self.app.state['config']['delivery_review_protocol'] = delivery_protocol
-        if not current_method or delivery_protocol is not None:
+        if not current_method or delivery_protocol is not None or selection_policy is None:
             self.app._save()
             self._reload()
         return self.app

@@ -9,7 +9,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
-- New ordinary tasks select necessary work from original requests and required findings, then hand usable candidates to independent checking automatically. Common operations retain their permissions and command approvals.
+- New ordinary tasks explicitly distinguish continued work from checked delivery and blocked partial delivery. Work units retain all selected operations; a saved candidate or an empty gap list no longer silently ends work. Common permissions and command approvals are unchanged.
 - Candidate production, checking and eligible same-version delivery use one action queue across feedback and recovery. Working memory retains results, judgments and open questions; it no longer plans subsequent actions.
 - Independent checks keep evidence and findings with the claims they support, test comparisons and interpretations against original evidence, and reuse applicable execution records.
 

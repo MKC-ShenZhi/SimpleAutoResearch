@@ -453,6 +453,9 @@ class ToolApplication:
             raise ValueError('Unsupported saved inspection material policy')
         if config.get('inspection_material_policy') and config.get('work_method') != GOAL_WORK_METHOD:
             raise ValueError('Inspection work observations require the goal working contract')
+        if (config.get('work_selection_policy') not in {None, 'explicit.v2'}
+                or config.get('work_selection_policy') and config.get('work_method') != GOAL_WORK_METHOD):
+            raise ValueError('Unsupported saved work selection policy')
         if config.get('context_checkpoint_policy') and config.get('memory_protocol') != 'journal.v1':
             raise ValueError('Economic checkpointing requires journal continuity')
         if config.get('memory_protocol') and (config.get('context_protocol') != 'working.v4'
@@ -1858,6 +1861,7 @@ class ToolApplication:
                 ('code_task', 'execution_contract', 'table_analysis', 'source_generation_protocol')) else 'execute.v2')
             if config['work_method'] == GOAL_WORK_METHOD:
                 config['inspection_material_policy'] = 'operations.v3'
+                config['work_selection_policy'] = 'explicit.v2'
         return config, reused, limits, attempts
 
     @classmethod
@@ -3279,8 +3283,9 @@ class ToolApplication:
         review = self.operations.delivery_review
         concerns = review.pending_concerns(artifacts) if review is not None else []
         operations = self._closing_operation_schemas() if closing else self.operation_schemas
-        production = [row['function']['name'] for row in operations
-            if self.gateway.registry.get(row['function']['name']).permission_level in {'write_patch', 'execution'}]
+        production = ([] if self.operations.selection.policy else
+            [row['function']['name'] for row in operations
+             if self.gateway.registry.get(row['function']['name']).permission_level in {'write_patch', 'execution'}])
         return self.operations.selection.context(operations, candidate, concerns, production)
 
     def _conversation_messages(self, *, client: LLMClient | None = None, closing: bool = False,

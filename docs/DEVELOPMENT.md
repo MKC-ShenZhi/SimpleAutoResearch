@@ -42,6 +42,11 @@ All operations use the same execution records and resource accounting. Task-loca
 scripts can provide a parser, calculation or plot when an existing operation is
 insufficient; they remain subject to the task's permissions.
 
+Work selection distinguishes an executable work unit from an explicit delivery
+decision. A retained candidate does not stop ongoing work. Delivery independently
+checks the observed version; a partial exit records the actual obstacle and
+unfinished requirements. Saved tasks retain their original selection contract.
+
 Independent inspection owns its observations as well as its judgment. File windows
 and original operation outcomes share the bounded working view; compaction notes
 do not replace recorded calculations or certify their applicability to changed work.
