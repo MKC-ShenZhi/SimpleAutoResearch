@@ -1,4 +1,4 @@
-"""Choose goal work and hand candidates to the existing delivery owner.
+"""Recover historical work-selection contracts; new tasks use native operations.
 
 This is a decision interpreter, not an executor or a second task state. The
 original provider choice is retained; its operations use the ordinary queue,
@@ -17,6 +17,7 @@ from pydantic.json_schema import SkipJsonSchema
 
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 from simple_ar.tools.workspace import DeliveryRequest
+from simple_ar.app.professional_conversation import recorded_work_messages
 
 
 
@@ -281,27 +282,7 @@ class WorkSelection:
                 'Once a candidate is identified, later repair units retain that candidate unless '
                 'the current request explicitly replaces it. Execution and approval remain unchanged.'}
 
-    @staticmethod
-    def project(messages: list[dict]) -> list[dict]:
-        """Closed actions are work records, not an inherited action agenda."""
-        if len(messages) < 2:
-            return messages
-        context = json.loads(messages[1]['content'])
-        calls, records, requests = {}, [], []
-        for message in messages[2:]:
-            if message['role'] == 'assistant':
-                for call in message.get('tool_calls', []):
-                    calls[call['id']] = call
-            elif message['role'] == 'tool':
-                records.append({'action':calls[message['tool_call_id']],
-                    'observation':message['content']})
-            elif message['role'] == 'user':
-                requests.append(message)
-        context.pop('work_plan', None)
-        context['recorded_work'] = {'observations':records,
-            'scope':'Verbatim closed operation arguments and observations. These are historical '
-                'work records, not next actions or new requirements. Full replies remain in read_history.'}
-        return [messages[0], {**messages[1], 'content':json.dumps(context, ensure_ascii=False)}, *requests]
+    project = staticmethod(recorded_work_messages)
 
     @staticmethod
     def compile(message: dict, *, operations: list[dict], requests: list[str],

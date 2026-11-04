@@ -42,10 +42,11 @@ All operations use the same execution records and resource accounting. Task-loca
 scripts can provide a parser, calculation or plot when an existing operation is
 insufficient; they remain subject to the task's permissions.
 
-Work selection distinguishes an executable work unit from an explicit delivery
-decision. A retained candidate does not stop ongoing work. Delivery independently
-checks the observed version; a partial exit records the actual obstacle and
-unfinished requirements. Saved tasks retain their original selection contract.
+Ordinary tasks call native operations directly through the shared queue, without
+an additional action-list interpreter. An explicit delivery checks the actual
+version; a partial exit discloses the obstacle and unfinished requirements.
+Recorded work supplies observations, not an inherited action agenda. Saved tasks
+retain their original selection contract.
 
 Independent inspection owns its observations as well as its judgment. File windows
 and original operation outcomes share the bounded working view; compaction notes
@@ -58,7 +59,7 @@ the current request without adopting an earlier verdict.
 | Change | Start here |
 | --- | --- |
 | CLI inputs and configuration | [CLI](../src/simple_ar/cli/), [task intake](../src/simple_ar/app/research_intake.py) |
-| Goal-based work selection and candidate handoff | [WorkSelection](../src/simple_ar/app/work_selection.py) |
+| Ordinary actions and historical work selection | [OperationTools](../src/simple_ar/app/operation_tools.py), [WorkSelection](../src/simple_ar/app/work_selection.py) |
 | Working knowledge and original observations | [work_memory](../src/simple_ar/app/work_memory.py), [working_context](../src/simple_ar/core/working_context.py) |
 | Feedback and task lifecycle | [ToolApplication](../src/simple_ar/app/tool_application.py), [OperationTools](../src/simple_ar/app/operation_tools.py) |
 | Files, edits and approved commands | [Workspace](../src/simple_ar/tools/workspace.py), [process lifecycle](../src/simple_ar/core/process.py) |

@@ -19,6 +19,57 @@ from tests.test_working_context import block, observation, select
 _action = fixture._action
 
 
+class NativeGoalWorkTests(unittest.TestCase):
+    def test_native_work_uses_one_queue_through_approval_delivery_and_feedback(self):
+        case = fixture.OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case._create(delivery_protocol=None, current_method=True, selection_policy='native.v3',
+            goal='Prepare a bounded note from the supplied observations; preserve the sources.')
+        self.assertEqual(case.app.state['config']['work_selection_policy'], 'native.v3')
+        self.assertIsNone(case.app.operations.selection)
+        self.assertNotIn('select_work', {r['function']['name'] for r in case.app.schemas})
+        source = (case.inputs/'observations.csv').read_bytes()
+        program = ("from pathlib import Path\np=Path('executions.txt')\n"
+            "p.write_text(p.read_text()+'run\\n' if p.exists() else 'run\\n')\n"
+            "Path('note.md').write_text('Three supplied observations.\\n')\n")
+        case.decisions.append([
+            _action('write_file', path='produce.py', content=program),
+            _action('run_process', argv=[sys.executable,'produce.py'], inputs=['produce.py'],
+                outputs=['note.md','executions.txt']),
+            _action('deliver_result', summary='Bounded note', artifacts=['note.md'])])
+        case._run()
+        self.assertEqual(case.app.state['pending']['kind'], 'tool')
+        self.assertTrue((case.root/'workspace/produce.py').exists())
+        self.assertFalse((case.root/'workspace/note.md').exists())
+        self.assertFalse((case.root/'delivery.json').exists())
+        token = case.app.approval_token(case.app.state['pending']['call'])
+        case._reload()
+        case._run(approved_execution=token)
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertEqual((case.root/'workspace/executions.txt').read_text(), 'run\n')
+        self.assertFalse(list((case.root/'attempts').glob('*/work_choice.json')))
+        prefix = deepcopy(case.app.ledger.to_dict()['entries'])
+        initial = (case.root/'workspace/note.md').read_bytes()
+        context = json.loads(case.app._messages()[1]['content'])
+        self.assertNotIn('work_selection', context)
+        self.assertNotIn('work_plan', context)
+        self.assertTrue(context['recorded_work']['observations'])
+        case.decisions.append([
+            _action('write_file', path='short-note.md', content='Three observations.\n'),
+            _action('deliver_result', summary='Shortened bounded note', artifacts=['short-note.md'])])
+        case._run(feedback='Keep the original and save a shorter note; do not repeat unchanged calculations.')
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertEqual((case.root/'workspace/note.md').read_bytes(), initial)
+        self.assertEqual((case.root/'workspace/executions.txt').read_text(), 'run\n')
+        self.assertEqual((case.inputs/'observations.csv').read_bytes(), source)
+        self.assertEqual(case.app.ledger.to_dict()['entries'][:len(prefix)], prefix)
+        from simple_ar.tools.delivery_versions import DeliveryVersions
+        self.assertEqual([v['request_count'] for v in DeliveryVersions(case.root).versions()], [1,2])
+        case._reload()
+        self.assertEqual(case.app.session.manifest.status, 'completed')
+
+
 class ExplicitWorkDecisionTests(unittest.TestCase):
     def setUp(self):
         self.case = fixture.OperationsWorkLoopTests()
@@ -531,7 +582,7 @@ class GoalWorkTests(unittest.TestCase):
         self.assertEqual(case.send.call_count, calls)
         self.assertEqual(protected, {name:(case.root/name).read_bytes() for name in protected})
 
-    def test_default_work_interface_selects_existing_operations_without_changing_permission(self):
+    def test_saved_selector_interface_retains_its_operation_offer_and_permissions(self):
         case = self.case
         self.assertEqual(case.app.state['config']['work_method'], 'goal.v2')
         self.assertEqual(case.app.state['config']['inspection_material_policy'], 'operations.v3')
@@ -631,15 +682,13 @@ class GoalWorkTests(unittest.TestCase):
             model='fixture', services=case.services, sources={}, control_protocol='operations.v1',
             max_turns=1, max_tokens=100000, max_attempts=12, tool_contracts='full')
         (root / 'workspace/note.md').write_text('Existing useful work.\n')
-        case.decisions.append(_action('select_work', decision='blocked', actions=[],
-            stop_reason='The last affordable decision cannot fund independent verification.',
-            candidate={'summary':'Useful existing note', 'artifacts':['note.md'],
-                'unresolved':['Independent verification has not finished.']}))
+        case.decisions.append(_action('deliver_result', summary='Useful existing note', artifacts=['note.md'],
+            unresolved=['The last affordable decision cannot fund independent verification.']))
         case.app.run(progress=lambda _: None)
         self.assertEqual(case.app.session.manifest.status, 'partial')
         self.assertEqual(case.send.call_count, 1)
         self.assertEqual({tool['function']['name'] for tool in case.app._closing_schemas()},
-                         {'select_work'})
+                         {'ask_user', 'deliver_result'})
         self.assertFalse(case.app.state['pending'])
 
     def test_terminal_json_opinion_uses_the_same_evidence_and_recovery_contract(self):

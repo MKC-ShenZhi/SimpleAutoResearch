@@ -37,9 +37,9 @@ flowchart LR
 应用层协调任务，领域模块承担专业操作；各操作共用执行记录和资源记账。
 已有工具不足时，可以在任务授权内生成解析器、分析脚本或绘图代码，再用真实运行结果继续工作。
 
-工作选择区分可执行的工作单元与显式交付决定，保留候选不意味着结束当前工作。
-交付针对已观察的版本独立检查；部分交付说明实际阻塞与未完成要求。
-已保存任务仍沿原工作选择合同恢复。
+普通任务通过共同队列直接调用原生操作，不再经过额外的行动清单解释器。
+显式交付针对实际版本独立检查；部分交付说明阻塞与未完成要求。
+工作记录供给实际观察，不继承旧行动议程；已保存任务仍沿原选择合同恢复。
 
 独立检查同时负责实际观察与专业判断。文件窗口和原始操作结果共用有容量边界的工作视图；
 精简笔记不替代已有计算，也不证明旧结果仍适用于改动后的成果。
@@ -49,7 +49,7 @@ flowchart LR
 | 需要修改 | 从这里开始 |
 | --- | --- |
 | 命令输入与配置 | [CLI](../src/simple_ar/cli/)、[任务输入适配](../src/simple_ar/app/research_intake.py) |
-| 按目标选择工作与候选接力 | [WorkSelection](../src/simple_ar/app/work_selection.py) |
+| 普通行动与历史工作选择 | [OperationTools](../src/simple_ar/app/operation_tools.py)、[WorkSelection](../src/simple_ar/app/work_selection.py) |
 | 工作认识与原始观察 | [work_memory](../src/simple_ar/app/work_memory.py)、[working_context](../src/simple_ar/core/working_context.py) |
 | 反馈与任务生命周期 | [ToolApplication](../src/simple_ar/app/tool_application.py)、[OperationTools](../src/simple_ar/app/operation_tools.py) |
 | 文件、编辑与批准的命令 | [Workspace](../src/simple_ar/tools/workspace.py)、[进程生命周期](../src/simple_ar/core/process.py) |

@@ -453,7 +453,7 @@ class ToolApplication:
             raise ValueError('Unsupported saved inspection material policy')
         if config.get('inspection_material_policy') and config.get('work_method') != GOAL_WORK_METHOD:
             raise ValueError('Inspection work observations require the goal working contract')
-        if (config.get('work_selection_policy') not in {None, 'explicit.v2'}
+        if (config.get('work_selection_policy') not in {None, 'explicit.v2', 'native.v3'}
                 or config.get('work_selection_policy') and config.get('work_method') != GOAL_WORK_METHOD):
             raise ValueError('Unsupported saved work selection policy')
         if config.get('context_checkpoint_policy') and config.get('memory_protocol') != 'journal.v1':
@@ -1861,7 +1861,7 @@ class ToolApplication:
                 ('code_task', 'execution_contract', 'table_analysis', 'source_generation_protocol')) else 'execute.v2')
             if config['work_method'] == GOAL_WORK_METHOD:
                 config['inspection_material_policy'] = 'operations.v3'
-                config['work_selection_policy'] = 'explicit.v2'
+                config['work_selection_policy'] = 'native.v3'
         return config, reused, limits, attempts
 
     @classmethod
@@ -3319,7 +3319,7 @@ class ToolApplication:
             target = min(target, max(0, remaining - output))
         requests = self._request_capacity()
         report = self._report_projection()
-        plan = None if self.operations is not None and self.operations.selection is not None else self._work_plan()
+        plan = None if config.get('work_method') == GOAL_WORK_METHOD else self._work_plan()
         context = {
             'context_protocol': config['context_protocol'], 'requests': self.state['requests'],
             'mounts': config['sources'], 'workspace': str(self.workspace.workspace),
@@ -3746,8 +3746,7 @@ class ToolApplication:
                 for path in ([item['result'] for item in turn['tools']] or [turn['reply']])] if journal else []
             messages, selection = select_working_context(user_requests=self.state['requests'],
                 context_authority=config.get('context_authority'),
-                message_projector=(self.operations.selection.project
-                    if self.operations is not None and self.operations.selection is not None else None),
+                message_projector=(self.operations.work_projection if self.operations is not None else None),
                 system_text=prefix[0]['content'],base_context=context,
                 turn_blocks=[block if position>=boundary else [] for position,block in enumerate(blocks)],
                 observations=working_rows, schema_tokens=schema_cost,context_token_target=target,

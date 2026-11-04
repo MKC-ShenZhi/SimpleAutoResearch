@@ -9,7 +9,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
-- New ordinary tasks explicitly distinguish continued work from checked delivery and blocked partial delivery. Work units retain all selected operations; a saved candidate or an empty gap list no longer silently ends work. Common permissions and command approvals are unchanged.
+- New ordinary tasks use the existing native operation contracts directly, without a nested action-selection protocol. Work retains its queue, command approvals and accounting; explicit delivery still receives independent checks. Saved task contracts remain recoverable.
 - Candidate production, checking and eligible same-version delivery use one action queue across feedback and recovery. Working memory retains results, judgments and open questions; it no longer plans subsequent actions.
 - Independent checks keep evidence and findings with the claims they support, test comparisons and interpretations against original evidence, and reuse applicable execution records.
 

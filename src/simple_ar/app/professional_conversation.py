@@ -13,6 +13,27 @@ from simple_ar.integrations.llm import check_llm_call_stop, estimate_tokens
 from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES
 
 
+def recorded_work_messages(messages: list[dict]) -> list[dict]:
+    """Closed operations are observations, not an inherited action agenda."""
+    if len(messages) < 2:
+        return messages
+    context = json.loads(messages[1]['content'])
+    calls, records, requests = {}, [], []
+    for message in messages[2:]:
+        if message['role'] == 'assistant':
+            for call in message.get('tool_calls', []):
+                calls[call['id']] = call
+        elif message['role'] == 'tool':
+            records.append({'action':calls[message['tool_call_id']], 'observation':message['content']})
+        elif message['role'] == 'user':
+            requests.append(message)
+    context.pop('work_plan', None)
+    context['recorded_work'] = {'observations':records,
+        'scope':'Verbatim closed operation arguments and observations. These are historical '
+            'work records, not next actions or new requirements. Full replies remain in read_history.'}
+    return [messages[0], {**messages[1], 'content':json.dumps(context, ensure_ascii=False)}, *requests]
+
+
 @dataclass
 class ConversationInput:
     messages: list

@@ -800,7 +800,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
             model='fixture', sources={'measurements':self.inputs}, services=self.services,
             allow_execution=True, max_turns=12, max_tokens=200000, max_attempts=30)
         self.assertEqual(self.app.state['config']['tool_contracts'], 'on_demand')
-        self.assertEqual({row['function']['name'] for row in self.app.schemas}, {'select_work'})
+        self.assertEqual({row['function']['name'] for row in self.app.schemas},
+                         {row['function']['name'] for row in self.app.operation_schemas})
+        self.assertEqual(self.app.state['config']['work_selection_policy'], 'native.v3')
+        self.assertIsNone(self.app.operations.selection)
         core = {row['function']['name'] for row in self.app.operation_schemas}
         self.assertEqual({'read_file','search_files','list_directory','inspect_project',
             'copy_file','copy_project','edit_file','write_file','run_process','ask_user',

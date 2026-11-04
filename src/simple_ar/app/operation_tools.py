@@ -341,11 +341,15 @@ class OperationTools:
             self.registry.register_package(extension.specs(),extension,request_visible=True)
         self.registry.register_package(coordination['specs'],coordination['owner'],request_visible=True)
         self.selection = None
+        self.work_projection = None
         if config.get('work_method') == GOAL_WORK_METHOD:
-            from simple_ar.app.work_selection import WorkSelection
-            self.selection = WorkSelection(config.get('work_selection_policy'))
-            self.registry.register_package([self.selection.spec()], self.selection, request_visible=True)
-            self.system = self.selection.system
+            from simple_ar.app.professional_conversation import recorded_work_messages
+            self.work_projection = recorded_work_messages
+            if config.get('work_selection_policy') != 'native.v3':
+                from simple_ar.app.work_selection import WorkSelection
+                self.selection = WorkSelection(config.get('work_selection_policy'))
+                self.registry.register_package([self.selection.spec()], self.selection, request_visible=True)
+                self.system = self.selection.system
         if not legacy_report_status:
             from simple_ar.tools.workspace import prepared_report_delivery_schema
             for spec in self.registry.list_specs():
