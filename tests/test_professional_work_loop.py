@@ -838,8 +838,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual({row['function']['name'] for row in self.app.operation_schemas}, core | {'inspect_table'})
         self.decisions.extend([
             _action('inspect_table', path='measurements/observations.csv'),
-            [_action('write_file', path='note.md', content='The supplied table has been inspected.\n'),
-             _action('deliver_result', summary='Retained table inspection.', artifacts=['note.md'])],
+            _action('write_file', path='note.md', content='The supplied table has been inspected.\n'),
+            _action('deliver_result', summary='Retained table inspection.', artifacts=['note.md']),
         ])
         self._run(should_stop=lambda:False)
         self.assertEqual(self._ok('inspect_table')['data']['row_count'], 3)
@@ -960,8 +960,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         revised = first + '\n后续需要扩大样本并确认采样方式。\n'
         self.decisions.extend([
             _action('read_file',path='说明.md'),
-            [_action('write_file',path='修订说明.md',content=revised),
-             _action('deliver_result',summary='已补充后续建议。',artifacts=['修订说明.md'])],
+            _action('write_file',path='修订说明.md',content=revised),
+            _action('deliver_result',summary='已补充后续建议。',artifacts=['修订说明.md']),
         ])
         self._run(feedback='保留原说明，另存一个版本，加一句后续建议。仍然用中文 Markdown。')
         self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
