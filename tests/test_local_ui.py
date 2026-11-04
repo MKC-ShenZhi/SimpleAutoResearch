@@ -925,6 +925,8 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     entered.set()
                     if not release.wait(10):
                         raise AssertionError('Test did not release model boundary')
+                    tool, arguments = 'load_tools', {'names': ['write_file']}
+                elif len(calls) == 2:
                     tool, arguments = 'write_file', {'path': 'retained-note.md',
                         'content': 'Inspect the authorized evidence for the requested outcome.\n'}
                 else:

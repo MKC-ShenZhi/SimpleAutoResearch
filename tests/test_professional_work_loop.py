@@ -845,6 +845,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(_action('load_tools', names=['inspect_table']))
         self._reload()
         self.assertEqual({row['function']['name'] for row in self.app.operation_schemas}, core | {'inspect_table'})
+        self._submit(_action('load_tools', names=['inspect_table', 'write_file']))
+        self._ok('load_tools')
         self.decisions.extend([
             _action('inspect_table', path='measurements/observations.csv'),
             _action('write_file', path='note.md', content='The supplied table has been inspected.\n'),

@@ -1861,7 +1861,8 @@ class ToolApplication:
             config['work_method'] = (CURRENT_WORK_METHOD if not any(config.get(key) for key in
                 ('code_task', 'execution_contract', 'table_analysis', 'source_generation_protocol')) else 'execute.v2')
             if config['work_method'] == GOAL_WORK_METHOD:
-                config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
+                if config['model'] is not None:
+                    config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = 'native.v3'
         return config, reused, limits, attempts
