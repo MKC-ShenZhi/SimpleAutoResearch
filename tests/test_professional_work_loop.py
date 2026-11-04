@@ -2455,6 +2455,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     # Keep this saved checkpoint-purchase fixture's method and
                     # pressure; default operation discovery is tested separately.
                     self.app.state['config']['work_method'] = 'goal.v1'
+                    self.app.state['config'].pop('inspection_material_policy', None)
                     self.app._save()
                     self.app = ToolApplication.load(self.root)
                     self.decisions.clear()
@@ -6265,6 +6266,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         # Saved available_operations.v2 tasks keep their historical final batch.
         # New goal.v1 tasks exercise executable partial closure separately.
         self.app.state['config'].pop('work_method', None)
+        self.app.state['config'].pop('inspection_material_policy', None)
         self.app._save()
         self._reload()
         self.assertEqual(self.app.state['config']['completion_policy'], 'available_operations.v2')
