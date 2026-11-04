@@ -532,7 +532,7 @@ class GoalWorkTests(unittest.TestCase):
         case = self.case
         root = case.directory / 'one-inspection-call'
         case.app = ToolApplication.create(root, 'Deliver the existing note with honest limits.',
-            model='fixture', services=case.services, sources={}, max_turns=1,
+            model='fixture', services=case.services, sources={}, max_turns=2,
             max_tokens=100000, max_attempts=12, tool_contracts='full')
         case.root = root
         (root / 'workspace/note.md').write_text('Existing useful work.\n')
