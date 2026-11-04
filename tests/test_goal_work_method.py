@@ -183,6 +183,20 @@ class GoalWorkTests(unittest.TestCase):
         self.assertFalse(case.decisions)
         self.assertEqual((case.root/'workspace/note.md').read_text(), 'Only the supplied observations.\n')
 
+    def test_partial_candidate_keeps_necessary_production_and_honest_unfinished_work(self):
+        case = self.case
+        case.decisions.append(self.choice(actions=[_action('write_file', path='note.md',
+            content='Only the supplied observations are retained.\n')],
+            candidate={'summary':'Useful partial note', 'artifacts':['note.md'],
+                'unresolved':['Independent verification has not finished.']}))
+        case._run()
+        self.assertEqual(case.app.session.manifest.status, 'partial', case.app.result_snapshot())
+        self.assertEqual((case.root/'workspace/note.md').read_text(),
+            'Only the supplied observations are retained.\n')
+        self.assertEqual(case.app.session.store.read_json('delivery.json')['unresolved'],
+            ['Independent verification has not finished.'])
+        self.assertFalse(case._process_receipts())
+
     def test_feedback_read_retains_candidate_without_submitting_unrevised_work(self):
         case = self.case
         case.decisions.append(self.choice(actions=[_action('write_file', path='note.md',

@@ -194,7 +194,7 @@ class WorkSelection:
             current = DeliveryRequest.model_validate(current).model_dump(mode='json')
             # No missing user outcome => hand off now, dropping optional actions.
             # A real production/repair unit is followed by that same candidate.
-            if not choice.remaining or current.get('unresolved'):
+            if not choice.remaining:
                 selected = []
             # Reading during feedback must not resubmit the previous version
             # before the requested revision. The registry declares effects;

@@ -831,8 +831,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual({row['function']['name'] for row in self.app.operation_schemas}, core | {'inspect_table'})
         self.decisions.extend([
             _action('inspect_table', path='measurements/observations.csv'),
-            _action('write_file', path='note.md', content='The supplied table has been inspected.\n',
-                delivery={'summary':'Retained table inspection.', 'artifacts':['note.md']}),
+            [_action('write_file', path='note.md', content='The supplied table has been inspected.\n'),
+             _action('deliver_result', summary='Retained table inspection.', artifacts=['note.md'])],
         ])
         self._run(should_stop=lambda:False)
         self.assertEqual(self._ok('inspect_table')['data']['row_count'], 3)
