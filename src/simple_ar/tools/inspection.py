@@ -3385,7 +3385,7 @@ class InspectionToolGateway:
         if saved.get('inspection_material_policy') == 'operations.v3':
             facts = {value['source_record']:record for record,value in self._execution_facts(saved).items()}
             for parent in self._retained_inputs(saved):
-                observations.extend({'record':row['record'], 'turn':None,
+                observations.extend({'record':row['record'],
                     'kind':'operation_result', 'role':'historical_observation',
                     'text':json.dumps({'inspection':parent['identity'], 'result':row['result'],
                         'execution_record':facts.get(row['record']),
