@@ -106,7 +106,7 @@ class WorkSelection:
         selected = binding['input_projection']['work_selection']
         return self.compile(message, operations=selected['operations'],
             requests=requests[:binding['request_count']], candidate=selected['current_candidate'],
-            concerns=selected['required_findings'])
+            concerns=selected['required_findings'], production=selected['production_operations'])
 
     def spec(self) -> CommonToolSpec:
         return CommonToolSpec(name='select_work', domain='work_selection', permission_level='plan',
@@ -126,9 +126,10 @@ class WorkSelection:
             'description':self.spec().description, 'parameters':schema}}]
 
     @staticmethod
-    def context(operations: list[dict], candidate: dict | None, concerns: list[dict]) -> dict:
+    def context(operations: list[dict], candidate: dict | None, concerns: list[dict],
+                production: list[str]) -> dict:
         return {'operations':operations, 'current_candidate':candidate,
-            'required_findings':concerns,
+            'required_findings':concerns, 'production_operations':production,
             'scope':'Original requests and owner-verified required findings determine missing work. '
                 'Memory supplies fallible results and knowledge, not an action agenda. '
                 'Hand a usable candidate to the delivery owner before optional investigation. '
@@ -160,7 +161,7 @@ class WorkSelection:
 
     @staticmethod
     def compile(message: dict, *, operations: list[dict], requests: list[str],
-                candidate: dict | None, concerns: list[dict]) -> dict:
+                candidate: dict | None, concerns: list[dict], production: list[str]) -> dict:
         calls = message.get('tool_calls') or []
         if len(calls) != 1 or calls[0]['function']['name'] != 'select_work':
             raise ValueError('Return one select_work decision with its necessary work and candidate')
@@ -195,9 +196,16 @@ class WorkSelection:
             # A real production/repair unit is followed by that same candidate.
             if not choice.remaining or current.get('unresolved'):
                 selected = []
-            selected.append({'tool_name':'deliver_result', 'arguments':current})
+            # Reading during feedback must not resubmit the previous version
+            # before the requested revision. The registry declares effects;
+            # this interpreter does not infer them from tool or file names.
+            if (choice.candidate is not None or not choice.remaining
+                    or any(row['tool_name'] in production for row in selected)):
+                selected.append({'tool_name':'deliver_result', 'arguments':current})
         elif not choice.remaining or not selected:
             raise ValueError('Without a candidate, identify missing requested work and executable actions')
+        if not selected:
+            raise ValueError('Select necessary work or submit an actual candidate')
         identity = calls[0]['id']
         result = {key:value for key,value in message.items() if key != 'tool_calls'}
         result['tool_calls'] = [{'id':f'{identity}-{i}', 'type':'function', 'function':{

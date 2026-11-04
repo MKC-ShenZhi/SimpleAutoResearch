@@ -929,8 +929,13 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                         'content': 'Inspect the authorized evidence for the requested outcome.\n'}
                 else:
                     tool, arguments = 'ask_user', {'question': 'Inspect this retained result'}
-                self.assertIn(tool, {row['function']['name'] for row in kwargs['tools']},
-                    'UI transport fixture must obey the actual current function contract')
+                self.assertEqual({row['function']['name'] for row in kwargs['tools']}, {'select_work'})
+                context = json.loads(messages[1]['content'])
+                request = next(row['content'] for row in reversed(messages) if row['role']=='user')
+                arguments = {'remaining':[{'request_index':context['current_request_index'],
+                    'quote':request, 'missing_outcome':'Perform the requested controlled UI work.'}],
+                    'actions':[{'tool_name':tool, 'arguments':arguments}], 'candidate':None}
+                tool = 'select_work'
                 return {'role': 'assistant', 'content': None, 'tool_calls': [
                     {'id': 'fake-' + str(len(calls)), 'type': 'function',
                      'function': {'name': tool, 'arguments': json.dumps(arguments)}}]}

@@ -97,7 +97,7 @@ class GoalWorkTests(unittest.TestCase):
             actions=[_action('run_process', argv=[sys.executable, '-c',
                 "from pathlib import Path;Path('unrequested.txt').write_text('extra work')"])],
             candidate={'summary':'Bounded observation note', 'artifacts':['note.md']}))
-        case._run()
+        case.app.run(progress=lambda _:None)
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
         self.assertEqual((case.root/'workspace/note.md').read_bytes(), body)
         self.assertFalse((case.root/'workspace/unrequested.txt').exists())
@@ -119,7 +119,7 @@ class GoalWorkTests(unittest.TestCase):
             argv=[sys.executable, 'produce.py'], cwd='workspace', inputs=['produce.py'],
             outputs=['note.md','executions.txt'])],
             candidate={'summary':'Bounded observation note', 'artifacts':['note.md']}))
-        case._run()
+        case.app.run(progress=lambda _:None)
         self.assertEqual(case.app.state['pending']['kind'], 'tool')
         self.assertFalse((case.root/'workspace/note.md').exists())
         self.assertEqual(case.send.call_count, 1)
@@ -183,11 +183,31 @@ class GoalWorkTests(unittest.TestCase):
         self.assertFalse(case.decisions)
         self.assertEqual((case.root/'workspace/note.md').read_text(), 'Only the supplied observations.\n')
 
+    def test_feedback_read_retains_candidate_without_submitting_unrevised_work(self):
+        case = self.case
+        case.decisions.append(self.choice(actions=[_action('write_file', path='note.md',
+            content='Three supplied observations; no population inference.\n')],
+            candidate={'summary':'Bounded observation note', 'artifacts':['note.md']}))
+        case._run()
+        self.assertEqual(case.app.session.manifest.status, 'completed')
+        prior = (case.root/'delivery.json').read_bytes()
+        reviews = len(case.inspection_requests)
+        case.decisions.append(self.choice(actions=[_action('read_file', path='note.md')]))
+        case.app.run(feedback='Shorten the same note after reading it.', progress=lambda _:None,
+            should_stop=lambda: not case.decisions and case.app.state['pending'] is None
+                and not any(turn['remaining'] for turn in case.app.state['turns']))
+        self.assertEqual((case.root/'delivery.json').read_bytes(), prior)
+        self.assertEqual(len(case.inspection_requests), reviews)
+        self.assertNotIn(case.app.session.manifest.status, {'completed','partial'})
+        self.assertEqual(case.app._selection_context()['current_candidate']['artifacts'], ['note.md'])
+
     def test_required_opinion_drives_only_the_affected_revision_and_candidate_handoff(self):
         case = self.case
         fixed = False
         def review(view):
             response = case._review_complete_targets(view)
+            if isinstance(response, dict) and fixed:
+                response['reassessed_prior'] = [row['id'] for row in view.get('prior_required', [])]
             if isinstance(response, dict) and not fixed:
                 response['investigations'] = [{'claim':'The note describes the supplied observations.',
                     'scope':'Actually supplied note text.', 'basis':'observed', 'necessary':True,
@@ -235,9 +255,7 @@ class GoalWorkTests(unittest.TestCase):
                     'evidence': [], 'outcome': 'unresolved'}]
             return response
         case.review = review
-        case.decisions.append(_action('review_result', **claim))
-        case._run(should_stop=lambda: not case.decisions and case.app.state['pending'] is None
-            and not any(turn['remaining'] for turn in case.app.state['turns']))
+        case._submit(_action('review_result', **claim))
         self.assertNotIn(case.app.session.manifest.status, {'completed', 'partial'})
         self.assertFalse((case.root / 'delivery.json').exists())
         proof = case._last('review_result', reviewed=True)['metadata']['delivery_review']

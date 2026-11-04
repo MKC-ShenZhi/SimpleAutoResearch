@@ -29,7 +29,7 @@ from simple_ar.tools.openai_schema import compact_json_schema, export_openai_too
 from simple_ar.tools.permissions import ToolPermissionPolicy
 from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.extensions import LocalExtension, freeze_extensions
-from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, ToolCompletion, tool_completion, NATIVE_WORK_METHODS, CURRENT_WORK_METHOD
+from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, ToolCompletion, tool_completion, NATIVE_WORK_METHODS, CURRENT_WORK_METHOD, GOAL_WORK_METHOD
 from simple_ar.tools.professional_outcomes import (
     accepted_review_journal, check_professional_stop, stop_decision)
 from simple_ar.tools.workspace import (WorkspaceToolGateway, workspace_tool_specs,
@@ -1095,7 +1095,7 @@ class ToolApplication:
                             view=store.read_json('memory_input.json'), operations_for_turn=self._memory_operations,
                             archive=self.state['config'].get('work_method') in NATIVE_WORK_METHODS)
                 for path in notes.get(attempt.attempt_id, []):
-                    if self.operations.selection is not None:
+                    if self.state['config'].get('work_method') == GOAL_WORK_METHOD:
                         continue  # Manual agendas remain history; only knowledge checkpoints supply notes.
                     result = self.session.store.read_json(path)
                     data = result.get('data') or {}
@@ -1267,7 +1267,7 @@ class ToolApplication:
         from simple_ar.app.work_memory import compact_work
         _, refs = compact_work(store=context.store,client=client,requests=self.state['requests'],
             previous=previous,rows=rows,bind_notes=self.operations.bind_notes,
-            note_contract='knowledge.v1' if self.operations.selection is not None else None,
+            note_contract='knowledge.v1' if self.state['config'].get('work_method') == GOAL_WORK_METHOD else None,
             estimate_tokens=estimate_tokens,attempt_id=context.attempt.attempt_id,
             **({'required_decision_tokens':decision_tokens,
                 'native_supply_policy':self.state['config'].get('native_supply_policy'),
@@ -3268,7 +3268,9 @@ class ToolApplication:
         review = self.operations.delivery_review
         concerns = review.pending_concerns(artifacts) if review is not None else []
         operations = self._closing_operation_schemas() if closing else self.operation_schemas
-        return self.operations.selection.context(operations, candidate, concerns)
+        production = [row['function']['name'] for row in operations
+            if self.gateway.registry.get(row['function']['name']).permission_level in {'write_patch', 'execution'}]
+        return self.operations.selection.context(operations, candidate, concerns, production)
 
     def _conversation_messages(self, *, client: LLMClient | None = None, closing: bool = False,
                                native_history_start_turn: int | None = None,

@@ -793,10 +793,11 @@ class OperationsWorkLoopTests(unittest.TestCase):
             model='fixture', sources={'measurements':self.inputs}, services=self.services,
             allow_execution=True, max_turns=12, max_tokens=200000, max_attempts=30)
         self.assertEqual(self.app.state['config']['tool_contracts'], 'on_demand')
-        core = {row['function']['name'] for row in self.app.schemas}
+        self.assertEqual({row['function']['name'] for row in self.app.schemas}, {'select_work'})
+        core = {row['function']['name'] for row in self.app.operation_schemas}
         self.assertEqual({'read_file','search_files','list_directory','inspect_project',
             'copy_file','copy_project','edit_file','write_file','run_process','ask_user',
-            'deliver_result','load_tools','read_history','update_work_plan','export_report'}, core)
+            'deliver_result','load_tools','read_history','export_report'}, core)
         self.assertFalse({'select_work_method','prepare_implementation','execute_implementation','work_document',
             'begin_professional_work','finish_professional_work'} & core)
         optional = {'inspect_table','analyze_table','measure_experiment','analyze_measurements',
@@ -812,7 +813,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(_action('load_tools', names=sorted(selected)))
         self._ok('load_tools')
         self._reload()
-        self.assertEqual({row['function']['name'] for row in self.app.schemas}, core | selected)
+        self.assertEqual({row['function']['name'] for row in self.app.operation_schemas}, core | selected)
         view = json.loads(self.app._messages()[1]['content'])
         self.assertFalse(selected & view['available_specialists'].keys())
         self.assertIn('analyze_table', view['available_specialists'])
@@ -823,11 +824,11 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(rejected['status'], 'blocked', rejected)
         self.assertIn('unauthorized', rejected['error'])
         self._reload()
-        self.assertEqual({row['function']['name'] for row in self.app.schemas}, core | selected)
+        self.assertEqual({row['function']['name'] for row in self.app.operation_schemas}, core | selected)
         self.send.assert_not_called()
         self._submit(_action('load_tools', names=['inspect_table']))
         self._reload()
-        self.assertEqual({row['function']['name'] for row in self.app.schemas}, core | {'inspect_table'})
+        self.assertEqual({row['function']['name'] for row in self.app.operation_schemas}, core | {'inspect_table'})
         self.decisions.extend([
             _action('inspect_table', path='measurements/observations.csv'),
             _action('write_file', path='note.md', content='The supplied table has been inspected.\n',
@@ -858,7 +859,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     model='fixture', sources={'measurements':self.inputs}, services=self.services,
                     allow_execution=True, max_attempts=30, **contracts)
                 self._reload()
-                offered = {row['function']['name'] for row in self.app.schemas}
+                offered = {row['function']['name'] for row in self.app.operation_schemas}
                 view = json.loads(self.app._messages()[1]['content'])
                 self.assertTrue(required <= offered)
                 self.assertFalse(required & view['available_specialists'].keys())
@@ -952,8 +953,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         revised = first + '\n后续需要扩大样本并确认采样方式。\n'
         self.decisions.extend([
             _action('read_file',path='说明.md'),
-            _action('write_file',path='修订说明.md',content=revised),
-            _action('deliver_result',summary='已补充后续建议。',artifacts=['修订说明.md']),
+            [_action('write_file',path='修订说明.md',content=revised),
+             _action('deliver_result',summary='已补充后续建议。',artifacts=['修订说明.md'])],
         ])
         self._run(feedback='保留原说明，另存一个版本，加一句后续建议。仍然用中文 Markdown。')
         self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
@@ -5729,8 +5730,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         for number in range(4):
             (self.inputs/f'source-{number}.txt').write_text(f'Original source {number}.\n'+'scope '*4000, encoding='utf-8')
         author = 'Author interpretation must not become independent evidence.'
+        self._submit(_action('update_work_plan', notes=[{'text':author, 'records':[]}]))
+        self.assertNotIn(author, json.dumps(self.app._working_memory()['notes']))
         self.decisions.extend([
-            _action('update_work_plan', notes=[{'text':author, 'records':[]}]),
             _action('write_file', path='report.md', content='Only the supplied record scope is described.\n'),
             _action('inspect_artifacts', goal='Check the supplied record scope.', targets=['report.md'], evidence=[]),
             _action('deliver_result', **self._delivery('report.md'))])
@@ -5751,7 +5753,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             prepared.append(conversation.client._budget_ledger)
             return original(conversation, *args, **kwargs)
         with patch.object(ProfessionalConversation, 'prepare', new=prepare):
-            self._run()
+            self.app.run(progress=lambda _:None)
         explicit = self._ok('inspect_artifacts')
         delivery = self._ok('deliver_result', reviewed=True)['metadata']['delivery_review']
         identity = Path(explicit['metadata']['inspection_binding']['assessment_path']).parts[1]
