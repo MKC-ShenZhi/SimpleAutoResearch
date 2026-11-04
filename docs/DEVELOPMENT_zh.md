@@ -40,7 +40,9 @@ flowchart LR
 | 需要修改 | 从这里开始 |
 | --- | --- |
 | 命令输入与配置 | [CLI](../src/simple_ar/cli/)、[任务输入适配](../src/simple_ar/app/research_intake.py) |
-| 行动选择、反馈与任务生命周期 | [ToolApplication](../src/simple_ar/app/tool_application.py)、[OperationTools](../src/simple_ar/app/operation_tools.py) |
+| 按目标选择工作与候选接力 | [WorkSelection](../src/simple_ar/app/work_selection.py) |
+| 工作认识与原始观察 | [work_memory](../src/simple_ar/app/work_memory.py)、[working_context](../src/simple_ar/core/working_context.py) |
+| 反馈与任务生命周期 | [ToolApplication](../src/simple_ar/app/tool_application.py)、[OperationTools](../src/simple_ar/app/operation_tools.py) |
 | 文件、编辑与批准的命令 | [Workspace](../src/simple_ar/tools/workspace.py)、[进程生命周期](../src/simple_ar/core/process.py) |
 | 检索、阅读与来源依据 | [research](../src/simple_ar/research/) |
 | 创建、修复与验证代码 | [code_task](../src/simple_ar/code_task/) |

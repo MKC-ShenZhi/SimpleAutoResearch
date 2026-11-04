@@ -16,7 +16,7 @@ from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.budget import completed_llm_usage_is_accounted
 from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES, TURN_SUPPLY_POLICY
 from simple_ar.integrations.llm import LLMCallStopped, LLMSettings, estimate_tokens
-from simple_ar.tools.specs import CommonToolSpec, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS, tool_result_payload
+from simple_ar.tools.specs import CommonToolSpec, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS, CLAIM_WORK_METHODS, tool_result_payload
 from simple_ar.tools.workspace import FileWindow, workspace_tool_specs
 from simple_ar.tools.delivery_review import applicable_delivery_scope, reassessment_has_subject_support
 
@@ -453,7 +453,7 @@ class InspectionToolGateway:
                     'Do not endorse an inference merely because the producer and generated tables agree. '
                     'Batch useful reads or calculations, finish necessary investigations, and return '
                     'an opinion without adding unrequested statistical or presentation projects.')
-            if saved.get('work_method') == 'execute.v2' and self._delivery_scope(saved):
+            if saved.get('work_method') in CLAIM_WORK_METHODS and self._delivery_scope(saved):
                 method += (' Select the consequential claims before choosing checks. For a comparison, '
                     'identify both quantities, their units and reference conditions, then independently '
                     'test the stated direction or difference. Correct table entries do not establish '
@@ -606,7 +606,7 @@ class InspectionToolGateway:
         target = self.workspace.resolve(value, write=True)
         if target == base or not target.is_relative_to(base):
             detail = (': ' + json.dumps({'path':value, 'resolved':str(target), 'required_parent':str(base)})
-                if saved.get('work_method') == 'execute.v2' else '')
+                if saved.get('work_method') in CLAIM_WORK_METHODS else '')
             raise ValueError('Inspection helper destination must be inside its own work directory' + detail)
         originals = [Path(row['path']).resolve() for row in saved['targets'] if row.get('path')]
         originals.extend(Path(row['path']).resolve() for row in saved['evidence']
@@ -633,7 +633,7 @@ class InspectionToolGateway:
 
     @staticmethod
     def _delivery_evidence(saved: dict, response: dict) -> list[str]:
-        if saved.get('work_method') == 'execute.v2':
+        if saved.get('work_method') in CLAIM_WORK_METHODS:
             return list(dict.fromkeys(key for row in response['investigations'] for key in row['evidence']))
         return response.get('evidence', [])
 
@@ -1960,7 +1960,7 @@ class InspectionToolGateway:
     def _delivery_decision(self, saved: dict, value: dict) -> _DeliveryResponse | _ClaimDeliveryResponse:
         linked = saved.get('finding_policy') == 'linked.v1'
         investigated = ('applicability' in value or self._investigation_contract(saved))
-        decision = (_ClaimDeliveryResponse if saved.get('work_method') == 'execute.v2' else
+        decision = (_ClaimDeliveryResponse if saved.get('work_method') in CLAIM_WORK_METHODS else
             _ScopedDeliveryResponse if saved.get('work_method') in NATIVE_WORK_METHODS else
             _InvestigatedDeliveryResponse if investigated else
             _DeliveryResponseLinked if linked else _DeliveryResponse).model_validate(value)
@@ -2307,7 +2307,7 @@ class InspectionToolGateway:
                     findings = ([finding for check in row.get('investigations', [])
                         if isinstance(check, dict) and isinstance(check.get('findings'), list)
                         for finding in check['findings']]
-                        if package and saved.get('work_method') == 'execute.v2' else row.get('findings', []))
+                        if package and saved.get('work_method') in CLAIM_WORK_METHODS else row.get('findings', []))
                     candidates.append({**({'scope': 'proposed_delivery'} if package else
                         {'subject': str(row.get('subject', '<omitted>'))[:120]}),
                         'candidate_messages': [str(item.get('message', ''))[:320]
@@ -3781,7 +3781,7 @@ class InspectionToolGateway:
                     'Historical observations grant no current evidence, permission or repeated execution.',
                 'parameters':_InspectionHistory.model_json_schema()}})
         package = self._delivery_scope(saved)
-        response_model = ((_ClaimDeliveryResponse if saved.get('work_method') == 'execute.v2' else
+        response_model = ((_ClaimDeliveryResponse if saved.get('work_method') in CLAIM_WORK_METHODS else
                            _ScopedDeliveryResponse if saved.get('work_method') in NATIVE_WORK_METHODS else
                            _InvestigatedDeliveryResponse if self._investigation_contract(saved, offering=True)
                            else _DeliveryResponseLinked if saved.get('finding_policy') == 'linked.v1'

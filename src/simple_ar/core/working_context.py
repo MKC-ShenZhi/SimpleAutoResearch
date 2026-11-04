@@ -110,6 +110,7 @@ def select_working_context(
     sparse_handoffs: bool = False,
     native_observations: Sequence[Mapping[str, Any]] | None = None,
     context_authority: Literal['sources.v1'] | None = None,
+    message_projector: Callable | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -578,6 +579,8 @@ def select_working_context(
                 messages.extend(deepcopy(blocks[i]))
             messages.extend({'role':'user','content':text} for text in user_requests[emitted:])
             messages.extend(deepcopy(tail))
+            if message_projector is not None:
+                messages = message_projector(messages)
             measured = schema_tokens+estimate_tokens(json.dumps(messages,ensure_ascii=False))
             # A boolean/decimal-width change can reduce the serialized size
             # by one token. Keep the conservative bound rather than oscillate.

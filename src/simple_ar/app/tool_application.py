@@ -766,13 +766,21 @@ class ToolApplication:
 
     @property
     def schemas(self) -> list[dict[str, object]]:
+        operations = self.operation_schemas
+        selection = getattr(self.operations, 'selection', None)
+        return selection.offer(operations) if selection else operations
+
+    @property
+    def operation_schemas(self) -> list[dict[str, object]]:
         active, _ = self._contract_presentation()
         # Presentation filtering must never mutate the registry's input contract.
         schemas = json.loads(json.dumps(export_openai_tool_schemas(
             self.gateway.registry, read_only_only=False, policy=self.gateway.policy, names=active)))
         if self.operations is not None:
             return [{**row, 'function': {**row['function'],
-                'parameters': compact_json_schema(row['function']['parameters'])}} for row in schemas]
+                'parameters': compact_json_schema(row['function']['parameters'])}} for row in schemas
+                if not (getattr(self.operations, 'selection', None)
+                    and row['function']['name'] in {'select_work', 'update_work_plan'})]
         obligation = self._report_projection()
         for row in schemas:
             if (row['function']['name'] in {'compose_document', 'review_document'}
@@ -880,6 +888,11 @@ class ToolApplication:
         return schemas
 
     def _closing_schemas(self) -> list[dict[str, Any]]:
+        operations = self._closing_operation_schemas()
+        selection = getattr(self.operations, 'selection', None)
+        return selection.offer(operations) if selection else operations
+
+    def _closing_operation_schemas(self) -> list[dict[str, Any]]:
         """Offer executable closure before paying for the final decision.
 
         Selection is not permission or acceptance. Existing domain validation,
@@ -887,10 +900,10 @@ class ToolApplication:
         """
         if (self.state['config'].get('completion_policy') == _OPERATION_EXIT
                 and self.state['config'].get('work_method') not in NATIVE_WORK_METHODS):
-            return self.schemas
+            return self.operation_schemas
         # Restrict the active contracts rather than loading deferred specialists:
         # expanding an on-demand catalog here can evict original input windows.
-        schemas = [row for row in self.schemas
+        schemas = [row for row in self.operation_schemas
             if (contract := self._completion(row['function']['name'])) is not None and contract.closing
                 and (self.state['config'].get('work_method') not in NATIVE_WORK_METHODS or not contract.field)]
         result = []
@@ -1082,6 +1095,8 @@ class ToolApplication:
                             view=store.read_json('memory_input.json'), operations_for_turn=self._memory_operations,
                             archive=self.state['config'].get('work_method') in NATIVE_WORK_METHODS)
                 for path in notes.get(attempt.attempt_id, []):
+                    if self.operations.selection is not None:
+                        continue  # Manual agendas remain history; only knowledge checkpoints supply notes.
                     result = self.session.store.read_json(path)
                     data = result.get('data') or {}
                     if (result.get('tool_name') == 'update_work_plan' and result.get('status') == 'ok'
@@ -1252,6 +1267,7 @@ class ToolApplication:
         from simple_ar.app.work_memory import compact_work
         _, refs = compact_work(store=context.store,client=client,requests=self.state['requests'],
             previous=previous,rows=rows,bind_notes=self.operations.bind_notes,
+            note_contract='knowledge.v1' if self.operations.selection is not None else None,
             estimate_tokens=estimate_tokens,attempt_id=context.attempt.attempt_id,
             **({'required_decision_tokens':decision_tokens,
                 'native_supply_policy':self.state['config'].get('native_supply_policy'),
@@ -1831,7 +1847,8 @@ class ToolApplication:
         if automatic_memory:
             config['memory_protocol'] = 'journal.v1'
             config['context_checkpoint_policy'] = 'economic.v3'
-            config['work_method'] = CURRENT_WORK_METHOD
+            config['work_method'] = (CURRENT_WORK_METHOD if not any(config.get(key) for key in
+                ('code_task', 'execution_contract', 'table_analysis', 'source_generation_protocol')) else 'execute.v2')
         return config, reused, limits, attempts
 
     @classmethod
@@ -2585,6 +2602,19 @@ class ToolApplication:
             return None
         binding = self.session.store.read_json(path)
         contract = binding.get('tool_admission')
+        if contract == 'work_selection.v1':
+            try:
+                if binding.get('selection_error'):
+                    raise ValueError(binding['selection_error'])
+                raw = self.session.store.read_json(str(Path(turn['reply']).with_name('work_choice.json')))
+                expected = self.operations.selection.interpret(raw, binding, self.state['requests'])
+                if call not in expected['tool_calls']:
+                    raise ValueError('Queued action differs from the retained goal-work decision')
+            except (ValueError, KeyError, TypeError, OSError) as exc:
+                return ToolResult(tool_name=call['function']['name'], status='blocked',
+                    error='Work selection refused: '+str(exc), data={'executed':False},
+                    metadata={'admission':contract, 'dispatched':False})
+            return None
         if contract != 'offered.v1':
             return None
         name, projection = call['function']['name'], binding['input_projection']
@@ -3223,6 +3253,23 @@ class ToolApplication:
                              'a new native session without fabricating or changing saved reasoning')
         return prefix + [message for block in selected for message in block] + feedback
 
+    def _selection_context(self, *, closing: bool = False) -> dict:
+        """Project the last declared candidate, never a separate adoption state."""
+        candidate = self.operations.selection.retained_candidate(
+            self.session.store, self.state['turns'], len(self.state['requests']))
+        if candidate is None and self.session.store.exists('delivery.json'):
+            candidate = self.session.store.read_json('delivery.json')
+        artifacts = []
+        if candidate is not None:
+            try:
+                artifacts = self.workspace.resolve_delivery(DeliveryRequest.model_validate(candidate))['artifacts']
+            except (ValueError, OSError):
+                artifacts = []  # A refused candidate must remain correctable, not break input construction.
+        review = self.operations.delivery_review
+        concerns = review.pending_concerns(artifacts) if review is not None else []
+        operations = self._closing_operation_schemas() if closing else self.operation_schemas
+        return self.operations.selection.context(operations, candidate, concerns)
+
     def _conversation_messages(self, *, client: LLMClient | None = None, closing: bool = False,
                                native_history_start_turn: int | None = None,
                                schemas: list | None = None, working_memory: dict | None = None,
@@ -3254,7 +3301,7 @@ class ToolApplication:
             target = min(target, max(0, remaining - output))
         requests = self._request_capacity()
         report = self._report_projection()
-        plan = self._work_plan()
+        plan = None if self.operations is not None and self.operations.selection is not None else self._work_plan()
         context = {
             'context_protocol': config['context_protocol'], 'requests': self.state['requests'],
             'mounts': config['sources'], 'workspace': str(self.workspace.workspace),
@@ -3328,6 +3375,9 @@ class ToolApplication:
             delivery_feedback = self._delivery_feedback()
             if delivery_feedback:
                 context['last_delivery_check'] = delivery_feedback
+            if self.operations.selection is not None:
+                context.pop('work_plan', None)
+                context['work_selection'] = self._selection_context(closing=closing)
         if config.get('report_protocol') == _REPORT_PROTOCOL and not (declared and closing):
             context['report_protocol']['instruction'] = (
                 'Declare report, original-text conversion or none using update_work_plan.report_intent, '
@@ -3678,6 +3728,8 @@ class ToolApplication:
                 for path in ([item['result'] for item in turn['tools']] or [turn['reply']])] if journal else []
             messages, selection = select_working_context(user_requests=self.state['requests'],
                 context_authority=config.get('context_authority'),
+                message_projector=(self.operations.selection.project
+                    if self.operations is not None and self.operations.selection is not None else None),
                 system_text=prefix[0]['content'],base_context=context,
                 turn_blocks=[block if position>=boundary else [] for position,block in enumerate(blocks)],
                 observations=working_rows, schema_tokens=schema_cost,context_token_target=target,
@@ -3968,7 +4020,24 @@ class ToolApplication:
             if value.closing else value.reserve if operation_exit else self._completion_floor(client, value.messages))
         return conversation, value, memory_refs, floor
 
+    def _selected_reply(self, context: Any, message: dict, binding: dict) -> dict:
+        try:
+            return self.operations.selection.interpret(message, binding, self.state['requests'])
+        except (ValueError, KeyError, TypeError) as exc:
+            binding['selection_error'] = str(exc)
+            context.store.write_json('decision_budget.json', binding)
+            return message  # Original invalid choice becomes a refused observation, never work.
+
     def _model(self, *, context: Any) -> CapabilityResult:
+        if context.store.exists('work_choice.json'):
+            binding = context.store.read_json('decision_budget.json')
+            if binding.get('tool_admission') != 'work_selection.v1' or self.operations.selection is None:
+                raise ValueError('Retained work choice has no matching saved interpreter')
+            message = self._selected_reply(context, context.store.read_json('work_choice.json'), binding)
+            ref = context.store.write_json('native_result.json', message, kind='native_reply')
+            return CapabilityResult(status='completed', artifacts=(
+                *self._memory_artifacts(context.store, context.attempt.attempt_id),
+                context.store.ref('work_choice.json', kind='work_choice'), ref))
         client = self._client(context.attempt.attempt_id)
         conversation = None
         if (self.state['config'].get('memory_protocol') == 'journal.v1'
@@ -3980,11 +4049,12 @@ class ToolApplication:
         # Every new decision records its actual offer, even when no completion
         # reservation applies. Old replies without the marker remain unchanged.
         projection = json.loads(messages[1]['content'])
-        context.store.write_json('decision_budget.json', {
+        binding = {
             'estimated_followup_tokens': (floor['total_tokens'] if floor else
                 self._decision_tokens(client, messages, schemas=schemas)),
             'closing_required': closing,
-            'tool_admission': 'offered.v1',
+            'tool_admission': 'work_selection.v1' if 'work_selection' in projection else 'offered.v1',
+            **({'request_count':len(self.state['requests'])} if 'work_selection' in projection else {}),
             **({'request_owner': _REQUEST_OWNER}
                 if self.state['config'].get('professional_work') == _REQUEST_OWNER else {}),
             **({'document_request': 'work.v2'}
@@ -3999,6 +4069,7 @@ class ToolApplication:
                 **({'professional_outcomes': projection['professional_outcomes']}
                     if 'professional_outcomes' in projection else {}),
                 'tool_names': [row['function']['name'] for row in schemas],
+                **({'work_selection':projection['work_selection']} if 'work_selection' in projection else {}),
                 'material_supply': projection['material_supply'],
                 **({'operation_overview': {key: value for key, value in
                         projection['working_view']['operation_overview'].items() if key != 'entries'}}
@@ -4017,13 +4088,20 @@ class ToolApplication:
                     {'data': {key: value for key, value in row.get('data', {}).items() if key != 'text'}}
                     for row in projection.get('work_inputs', {}).get('windows', [])]},
             'scope': 'Input offer and estimated follow-up cost, not provider usage or guaranteed capacity. '
-                'closing_required binds this decision reply and survives approval/recovery.'})
+                'closing_required binds this decision reply and survives approval/recovery.'}
+        context.store.write_json('decision_budget.json', binding)
         if conversation is not None:
             message = conversation.call(value, native=True, label='native-turn', call_id=context.attempt.attempt_id)
         else:
             with self.ledger.protect_remaining(floor if protect else {}):
                 message = client.chat_turn(messages, tools=schemas,
                     label="native-turn", budget_call_id=context.attempt.attempt_id)
+        if binding['tool_admission'] == 'work_selection.v1':
+            binding['work_choice_sha256'] = hashlib.sha256(json.dumps(message, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            context.store.write_json('decision_budget.json', binding)
+            raw = context.store.write_json('work_choice.json', message, kind='work_choice')
+            memory_refs = (*memory_refs, raw)
+            message = self._selected_reply(context, message, binding)
         ref = context.store.write_json("native_result.json", message, kind="native_reply")
         return CapabilityResult(status="completed", artifacts=(*memory_refs,ref))
 
@@ -4682,6 +4760,8 @@ class ToolApplication:
                     if digest != native_result_digest(store.read_json('native_result.json')):
                         raise ValueError('Accepted native observation changed; no replay')
             check_bound_observation()
+            if capability == 'native_turn' and store.exists('work_choice.json') and not store.exists('native_result.json'):
+                recovered = self._model(context=CapabilityContext(store, existing))
             if capability == 'native_action':
                 header = {key: value for key, value in pending.items() if key != 'result'}
                 if not store.exists('action.json') or store.read_json('action.json') != header:
@@ -4767,7 +4847,7 @@ class ToolApplication:
                     recovered = CapabilityResult(status='completed', artifacts=self._native_artifacts(
                         store, bound, name=pending['call']['function']['name']))
                 elif (capability == 'native_tool'
-                        and store.read_json('native_result.json').get('metadata', {}).get('admission') == 'offered.v1'
+                        and store.read_json('native_result.json').get('metadata', {}).get('admission') in {'offered.v1', 'work_selection.v1'}
                         and store.read_json('native_result.json')['metadata'].get('dispatched') is False):
                     # This is an application refusal, not an owner execution to
                     # reconcile. Re-derive it from the frozen offer before adoption.
@@ -4797,6 +4877,8 @@ class ToolApplication:
                          store.ref('native_result.json', kind='native_observation'))
                     if capability == 'native_action' else
                     (*(self._memory_artifacts(store, identity) if capability == 'native_turn' else ()),
+                     *((store.ref('work_choice.json', kind='work_choice'),)
+                       if capability == 'native_turn' and store.exists('work_choice.json') else ()),
                      *self._native_artifacts(store, store.read_json('native_result.json'),
                         name=pending.get('call', {}).get('function', {}).get('name', ''),
                         kind='native_result' if capability == 'native_turn' else 'native_observation')))

@@ -15,6 +15,19 @@ class CheckpointStop(BaseException):
     """Interrupt outside the agent's handled provider/runtime failures."""
 
 
+def goal_work_decision(actions, requests):
+    """Encode controlled operation fixtures in the current selector contract."""
+    if len(actions) == 1 and actions[0]['tool_name'] == 'select_work':
+        return actions
+    candidate = None
+    if actions and actions[-1]['tool_name'] == 'deliver_result':
+        actions, candidate = actions[:-1], actions[-1]['arguments']
+    return [{'tool_name':'select_work', 'arguments':{
+        'remaining':([{'request_index':len(requests)-1, 'quote':requests[-1],
+            'missing_outcome':'Perform this controlled fixture work for the requested outcome.'}] if actions else []),
+        'actions':actions, 'candidate':candidate}}]
+
+
 def inspection_wire_opinion(response, schema):
     """Translate controlled flat callbacks to the offered claim-owned wire shape."""
     if 'findings' in schema.get('properties', {}) or 'findings' not in response:

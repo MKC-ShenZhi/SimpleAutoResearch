@@ -1295,6 +1295,13 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 action = self.decisions.popleft()
                 action = action() if callable(action) else action
                 actions = action if isinstance(action, list) else [action]
+                if offered == {'select_work'}:
+                    from tests.report_review_fixtures import goal_work_decision
+                    view = json.loads(request['messages'][1]['content'])
+                    available = {row['function']['name'] for row in view['work_selection']['operations']}
+                    for item in actions:
+                        self.assertIn(item['tool_name'], available | {'select_work'})
+                    actions = goal_work_decision(actions, self.app.state['requests'])
                 for item in actions:
                     self.assertIn(item['tool_name'], offered)
                 message = {'role': 'assistant', 'content': None, 'tool_calls': [{
@@ -1316,6 +1323,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     citations.extend(row['id'] for row in view['observations'][:4])
                     message = {'role':'assistant','content':json.dumps({'notes':[{
                         'text':'Earlier observations are saved; continue the requested explanation and retain the source scope.',
+                        **({'kind':'result'} if view.get('note_contract') == 'knowledge.v1' else {}),
                         'observations':citations}]})}
                     return {'choices':[{'message':message,'finish_reason':'stop'}],
                         'usage':{'prompt_tokens':100,'completion_tokens':40,'total_tokens':140}}

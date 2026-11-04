@@ -660,13 +660,16 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     'expected_outcome': 'Observed score, not proof of improvement'}}
                 if measurement_command is not None else None)
         if operation_control:
-            app = ToolApplication.create(run_dir / 'native', goal,
-                model='fixture', sources={'source0': inputs} if mount_inputs else {},
-                allow_execution=allow_execution, allow_network=allow_network,
-                max_turns=max_turns, project_python=interpreter, code_task=code_task,
-                process_limits=process_limits, report_requirement=report_requirement,
-                tool_contracts=tool_contracts or 'on_demand', completion_policy=completion_policy,
-                report_protocol=report_protocol, execution_contract=measurement)
+            # Keep the primitive execution/permission matrix on its saved method.
+            # GoalWorkTests cover current selection, automatic handoff and recovery.
+            with patch('simple_ar.app.tool_application.CURRENT_WORK_METHOD', 'execute.v2'):
+                app = ToolApplication.create(run_dir / 'native', goal,
+                    model='fixture', sources={'source0': inputs} if mount_inputs else {},
+                    allow_execution=allow_execution, allow_network=allow_network,
+                    max_turns=max_turns, project_python=interpreter, code_task=code_task,
+                    process_limits=process_limits, report_requirement=report_requirement,
+                    tool_contracts=tool_contracts or 'on_demand', completion_policy=completion_policy,
+                    report_protocol=report_protocol, execution_contract=measurement)
         else:
             # Only _historical_native_fixture selects this saved wire format.
             # No modern task is created and then relabelled as old history.

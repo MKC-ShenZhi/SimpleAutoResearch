@@ -9,8 +9,8 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
-- New ordinary tasks organize related investigation and implementation into executable work units. Common file operations stay available when optional specialist selections change; command approvals are unchanged.
-- One candidate submission includes independent checking and commits the exact checked version when eligible. Delivery owns claim, inventory and opinion binding across execution, recovery and feedback.
+- New ordinary tasks select necessary work from original requests and required findings, then hand usable candidates to independent checking automatically. Common operations retain their permissions and command approvals.
+- Candidate production, checking and eligible same-version delivery use one action queue across feedback and recovery. Working memory retains results, judgments and open questions; it no longer plans subsequent actions.
 - Independent checks keep evidence and findings with the claims they support, test comparisons and interpretations against original evidence, and reuse applicable execution records.
 
 ### Fixed

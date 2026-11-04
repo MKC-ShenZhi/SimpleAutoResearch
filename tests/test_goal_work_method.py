@@ -6,6 +6,7 @@ are real. These tests do not measure autonomous model quality.
 from copy import deepcopy
 import hashlib
 import json
+from pathlib import Path
 import sys
 import unittest
 
@@ -19,6 +20,21 @@ _action = fixture._action
 
 
 class WorkingArchiveTests(unittest.TestCase):
+    def test_knowledge_checkpoint_cannot_supply_an_action_agenda_and_old_contract_still_loads(self):
+        from simple_ar.app.work_memory import _bound_response
+        from pydantic import ValidationError
+        view = {'note_contract':'knowledge.v1', 'observations':[{'id':'o1','record':'records/result.json'}],
+                'previous_notes':[]}
+        bound = _bound_response({'notes':[{'kind':'result', 'text':'The recorded calculation returned 2.',
+            'observations':['o1']}]}, view, lambda notes:notes)
+        self.assertEqual(bound[0]['knowledge_kind'], 'result')
+        self.assertEqual(bound[0]['records'], ['records/result.json'])
+        with self.assertRaises(ValidationError):
+            _bound_response({'notes':[{'kind':'next_action', 'text':'Repeat optional checks.',
+                'observations':['o1']}]}, view, lambda notes:notes)
+        legacy = {k:v for k,v in view.items() if k!='note_contract'}
+        self.assertEqual(_bound_response({'notes':[{'text':'Old saved understanding.',
+            'observations':['o1']}]}, legacy, lambda notes:notes)[0]['text'], 'Old saved understanding.')
     def test_rewritten_notes_archive_work_without_claiming_evidence_coverage(self):
         memory = {'notes': [], 'through_turn': 0, 'compacted_records': set()}
         for i in range(3):
@@ -65,6 +81,141 @@ class GoalWorkTests(unittest.TestCase):
         self.addCleanup(self.case.doCleanups)
         self.case._create(delivery_protocol=None, current_method=True,
             goal='Prepare a bounded note from the supplied observations; independently check numerical claims.')
+
+    def choice(self, *, actions=(), candidate=None, remaining=None):
+        requests = self.case.app.state['requests']
+        return _action('select_work', remaining=(remaining if remaining is not None else [
+            {'request_index':len(requests)-1, 'quote':requests[-1],
+             'missing_outcome':'Produce the requested bounded note.'}]),
+            actions=list(actions), candidate=candidate)
+
+    def test_usable_candidate_skips_optional_process_and_checks_same_version(self):
+        case = self.case
+        case._write('note.md', 'Three supplied observations; no population inference.\n')
+        body = (case.root/'workspace/note.md').read_bytes()
+        case.decisions.append(self.choice(remaining=[],
+            actions=[_action('run_process', argv=[sys.executable, '-c',
+                "from pathlib import Path;Path('unrequested.txt').write_text('extra work')"])],
+            candidate={'summary':'Bounded observation note', 'artifacts':['note.md']}))
+        case._run()
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertEqual((case.root/'workspace/note.md').read_bytes(), body)
+        self.assertFalse((case.root/'workspace/unrequested.txt').exists())
+        self.assertFalse(case._process_receipts())
+        turn = next(row for row in case.app.state['turns']
+            if case.app.session.store.exists(str(Path(row['reply']).with_name('work_choice.json'))))
+        raw = case.app.session.store.read_json(str(Path(turn['reply']).with_name('work_choice.json')))
+        self.assertEqual(json.loads(raw['tool_calls'][0]['function']['arguments'])['actions'][0]['tool_name'], 'run_process')
+        interpreted = case.app.session.store.read_json(turn['reply'])
+        self.assertEqual([c['function']['name'] for c in interpreted['tool_calls']], ['deliver_result'])
+
+    def test_production_hands_off_candidate_across_approval_reload_and_feedback_without_reexecution(self):
+        case = self.case
+        program = ("from pathlib import Path\np=Path('executions.txt')\n"
+            "p.write_text(p.read_text()+'run\\n' if p.exists() else 'run\\n')\n"
+            "Path('note.md').write_text('Three supplied observations; no population inference.\\n')\n")
+        case._write('produce.py', program)
+        case.decisions.append(self.choice(actions=[_action('run_process',
+            argv=[sys.executable, 'produce.py'], cwd='workspace', inputs=['produce.py'],
+            outputs=['note.md','executions.txt'])],
+            candidate={'summary':'Bounded observation note', 'artifacts':['note.md']}))
+        case._run()
+        self.assertEqual(case.app.state['pending']['kind'], 'tool')
+        self.assertFalse((case.root/'workspace/note.md').exists())
+        self.assertEqual(case.send.call_count, 1)
+        token = case.app.approval_token(case.app.state['pending']['call'])
+        case._reload()
+        case._run(approved_execution=token)
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertEqual((case.root/'workspace/executions.txt').read_text(), 'run\n')
+        calls = case.send.call_count
+        feedback = 'Make the bounded note shorter while keeping the same observations.'
+        case.decisions.append(_action('select_work', remaining=[{'request_index':1, 'quote':feedback,
+            'missing_outcome':'Shorten the requested note.'}], actions=[_action('edit_file', path='note.md',
+                expected_sha256=hashlib.sha256((case.root/'workspace/note.md').read_bytes()).hexdigest(),
+                replacements=[{'old_text':'Three supplied observations; no population inference.',
+                               'new_text':'Three observations only.'}])], candidate=None))
+        case.app.run(feedback=feedback, progress=lambda _:None)
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertGreater(case.send.call_count, calls)
+        self.assertEqual((case.root/'workspace/note.md').read_text(), 'Three observations only.\n')
+        self.assertEqual((case.root/'workspace/executions.txt').read_text(), 'run\n')
+        from simple_ar.tools.delivery_versions import DeliveryVersions
+        self.assertEqual([v['request_count'] for v in DeliveryVersions(case.root).versions()], [1,2])
+
+    def test_generated_agenda_cannot_authorize_work_and_invalid_choice_can_be_corrected(self):
+        case = self.case
+        case.decisions.extend([
+            self.choice(remaining=[{'request_index':0, 'quote':'Run SVG byte checks until deterministic.',
+                'missing_outcome':'Follow an invented agenda.'}],
+                actions=[_action('write_file', path='extra.txt', content='Must not execute.')]),
+            self.choice(actions=[_action('write_file', path='note.md', content='Only three observations.\n')],
+                candidate={'summary':'Bounded note', 'artifacts':['note.md']})])
+        case._run()
+        self.assertFalse((case.root/'workspace/extra.txt').exists())
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        rejected = case._observations()[0]
+        self.assertEqual(rejected['status'], 'blocked')
+        self.assertFalse(rejected['data']['executed'])
+        self.assertIn('exact supplied original request', rejected['error'])
+
+    def test_closed_raw_choice_recovers_without_rebuying_the_decision(self):
+        from simple_ar.core.capabilities import ArtifactStore
+        from tests.report_review_fixtures import CheckpointStop
+        from unittest.mock import patch
+        case = self.case
+        case.decisions.append(self.choice(actions=[_action('write_file', path='note.md',
+            content='Only the supplied observations.\n')],
+            candidate={'summary':'Bounded note', 'artifacts':['note.md']}))
+        write = ArtifactStore.write_json
+        def interrupt(store, path, value, *args, **kwargs):
+            if (path=='native_result.json' and store.root.name.startswith('native-turn-')
+                    and store.exists('work_choice.json')):
+                raise CheckpointStop()
+            return write(store,path,value,*args,**kwargs)
+        with patch.object(ArtifactStore,'write_json',new=interrupt), self.assertRaises(CheckpointStop):
+            case.app.run(progress=lambda _:None)
+        self.assertEqual(case.send.call_count, 1)
+        self.assertFalse((case.root/'workspace/note.md').exists())
+        case._reload()
+        case._run()
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertFalse(case.decisions)
+        self.assertEqual((case.root/'workspace/note.md').read_text(), 'Only the supplied observations.\n')
+
+    def test_required_opinion_drives_only_the_affected_revision_and_candidate_handoff(self):
+        case = self.case
+        fixed = False
+        def review(view):
+            response = case._review_complete_targets(view)
+            if isinstance(response, dict) and not fixed:
+                response['investigations'] = [{'claim':'The note describes the supplied observations.',
+                    'scope':'Actually supplied note text.', 'basis':'observed', 'necessary':True,
+                    'method':'Read the supplied note.', 'reasoning':'The controlled note states a population claim.',
+                    'evidence':response['evidence'], 'outcome':'contradicted'}]
+                response['findings'] = [{'severity':'required', 'message':'Limit the inference to the supplied sample.',
+                    'artifacts':[str(case.root/'workspace/note.md')], 'investigation':0}]
+            return response
+        case.review = review
+        def repair():
+            nonlocal fixed
+            concerns = case.app._selection_context()['required_findings']
+            self.assertEqual(len(concerns), 1)
+            fixed = True
+            return self.choice(remaining=[{'finding_id':concerns[0]['id'],
+                    'missing_outcome':'Resolve the actual inference defect.'}],
+                actions=[_action('edit_file', path='note.md',
+                    expected_sha256=hashlib.sha256((case.root/'workspace/note.md').read_bytes()).hexdigest(),
+                    replacements=[{'old_text':'population', 'new_text':'sample'}])])
+        case.decisions.extend([
+            self.choice(actions=[_action('write_file', path='note.md', content='The population mean is 2.0.\n')],
+                candidate={'summary':'Bounded observation note', 'artifacts':['note.md']}), repair])
+        case._run()
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertEqual((case.root/'workspace/note.md').read_text(), 'The sample mean is 2.0.\n')
+        assessments = [json.loads(p.read_text()) for p in sorted((case.root/'attempts').glob('*/inspection/delivery_assessment.json'))]
+        self.assertEqual([a['verdict'] for a in assessments], ['needs_revision','passed'])
+        self.assertFalse(case._process_receipts())
 
     def test_candidate_check_does_not_finish_and_delivery_reuses_it_after_reload(self):
         case = self.case
@@ -164,11 +315,12 @@ class GoalWorkTests(unittest.TestCase):
 
     def test_default_work_interface_selects_existing_operations_without_changing_permission(self):
         case = self.case
-        self.assertEqual(case.app.state['config']['work_method'], 'execute.v2')
+        self.assertEqual(case.app.state['config']['work_method'], 'goal.v2')
         case.app.state['config']['tool_contracts'] = 'on_demand'
         case.app._save()
         case._reload()
-        offered = {tool['function']['name'] for tool in case.app.schemas}
+        self.assertEqual({tool['function']['name'] for tool in case.app.schemas}, {'select_work'})
+        offered = {tool['function']['name'] for tool in case.app.operation_schemas}
         ordinary = {'read_file', 'search_files', 'list_directory', 'copy_project', 'edit_file',
             'write_file', 'run_process', 'deliver_result', 'load_tools', 'read_history'}
         self.assertTrue(ordinary <= offered)
@@ -177,7 +329,7 @@ class GoalWorkTests(unittest.TestCase):
         case._submit(_action('load_tools', names=['inspect_artifacts']))
         case._submit(_action('read_file', path='measurements/observations.csv'))
         case._reload()
-        self.assertTrue(ordinary <= {tool['function']['name'] for tool in case.app.schemas})
+        self.assertTrue(ordinary <= {tool['function']['name'] for tool in case.app.operation_schemas})
         case._submit(_action('load_tools', names=['review_result']))
         case._submit(_action('read_file', path='measurements/observations.csv'))
         case._ok('read_file')
@@ -264,7 +416,7 @@ class GoalWorkTests(unittest.TestCase):
         self.assertEqual(case.app.session.manifest.status, 'partial')
         self.assertEqual(case.send.call_count, 1)
         self.assertEqual({tool['function']['name'] for tool in case.app._closing_schemas()},
-                         {'deliver_result', 'ask_user'})
+                         {'select_work'})
         self.assertFalse(case.app.state['pending'])
 
     def test_claimed_execution_or_unfinished_check_cannot_become_required_defect(self):

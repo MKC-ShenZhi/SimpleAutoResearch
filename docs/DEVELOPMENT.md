@@ -45,7 +45,9 @@ insufficient; they remain subject to the task's permissions.
 | Change | Start here |
 | --- | --- |
 | CLI inputs and configuration | [CLI](../src/simple_ar/cli/), [task intake](../src/simple_ar/app/research_intake.py) |
-| Decisions, feedback and task lifecycle | [ToolApplication](../src/simple_ar/app/tool_application.py), [OperationTools](../src/simple_ar/app/operation_tools.py) |
+| Goal-based work selection and candidate handoff | [WorkSelection](../src/simple_ar/app/work_selection.py) |
+| Working knowledge and original observations | [work_memory](../src/simple_ar/app/work_memory.py), [working_context](../src/simple_ar/core/working_context.py) |
+| Feedback and task lifecycle | [ToolApplication](../src/simple_ar/app/tool_application.py), [OperationTools](../src/simple_ar/app/operation_tools.py) |
 | Files, edits and approved commands | [Workspace](../src/simple_ar/tools/workspace.py), [process lifecycle](../src/simple_ar/core/process.py) |
 | Retrieval, reading and source evidence | [research](../src/simple_ar/research/) |
 | Code creation, repair and validation | [code_task](../src/simple_ar/code_task/) |

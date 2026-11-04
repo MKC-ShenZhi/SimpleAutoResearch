@@ -12,7 +12,7 @@ from simple_ar.core.assessments import current_assessments
 from simple_ar.tools.gateway import CommonToolGateway
 from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.permissions import ToolPermissionPolicy
-from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS
+from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS, GOAL_WORK_METHOD
 from simple_ar.tools.workspace import WorkspaceToolGateway, workspace_tool_specs
 from simple_ar.tools.sources import SourceToolGateway, source_tool_specs
 from simple_ar.tools.publication import PublicationToolGateway, publication_tool_specs
@@ -339,6 +339,12 @@ class OperationTools:
             extension.verify()
             self.registry.register_package(extension.specs(),extension,request_visible=True)
         self.registry.register_package(coordination['specs'],coordination['owner'],request_visible=True)
+        self.selection = None
+        if config.get('work_method') == GOAL_WORK_METHOD:
+            from simple_ar.app.work_selection import WorkSelection
+            self.selection = WorkSelection()
+            self.registry.register_package([self.selection.spec()], self.selection, request_visible=True)
+            self.system = self.selection.system
         if not legacy_report_status:
             from simple_ar.tools.workspace import prepared_report_delivery_schema
             for spec in self.registry.list_specs():
