@@ -51,6 +51,24 @@ def read_bound_material_bytes(workspace: Any, locator: str, digest: str, *, max_
     return raw
 
 
+def lossless_text_window(data: dict) -> bool:
+    """A literal replacement character is text only when exact bytes prove it.
+
+    Older receipts have no decoding flag. A complete file digest distinguishes
+    valid UTF-8 U+FFFD from replacement decoding without new reads or metadata.
+    Ambiguous partial windows retain the conservative historical rule.
+    """
+    text = data.get('text')
+    if not isinstance(text, str):
+        return False
+    if '\ufffd' not in text:
+        return True
+    raw = text.encode('utf-8')
+    return (data.get('offset_bytes', 0) == 0
+        and data.get('next_offset_bytes') == data.get('size_bytes') == len(raw)
+        and data.get('sha256') == hashlib.sha256(raw).hexdigest())
+
+
 def material_text_view(raw: bytes, *, reject_controls: bool = True) -> dict:
     """Describe actual decoded coverage, without replacing unread bytes."""
     try:
@@ -207,7 +225,7 @@ def journal_read_windows(receipt: dict, request: dict) -> list[dict]:
                         'review_text', 'review_next_offset_bytes', 'read_request', 'source_reference'}}
                     if read_request.get('start_line') is None:
                         data.pop('offset_bytes', None)  # Inspection owns this derived locator.
-                    if not isinstance(data.get('text'), str) or '\ufffd' in data['text']:
+                    if not lossless_text_window(data):
                         continue
                     windows.append({'request': read_request, 'data': data,
                         'input_index': len(windows),
@@ -369,7 +387,7 @@ def admit_text_window(retained: list[dict], observation: dict, *, pinned: Iterab
             and (outer['sha256'] is not None or outer.get('record') == inner.get('record'))
             and outer['offset_bytes'] <= inner['offset_bytes']
             and inner['next_offset_bytes'] <= outer['next_offset_bytes']
-            and '\ufffd' not in outer.get('text', '') and '\ufffd' not in inner.get('text', '')
+            and lossless_text_window(outer) and lossless_text_window(inner)
             and len(outer.get('text', '').encode('utf-8')) == outer['next_offset_bytes'] - outer['offset_bytes']
             and len(inner.get('text', '').encode('utf-8')) == inner['next_offset_bytes'] - inner['offset_bytes']
             and outer['text'].encode('utf-8')[inner['offset_bytes'] - outer['offset_bytes']:
@@ -471,7 +489,7 @@ def _content_source(workspace: Any, reference: dict) -> dict:
     end, size = data.get('next_offset_bytes'), data.get('size_bytes')
     if (not isinstance(digest, str) or len(digest) != 64
             or any(char not in '0123456789abcdef' for char in digest)
-            or not isinstance(text, str) or not text or '\ufffd' in text
+            or not isinstance(text, str) or not text or not lossless_text_window(data)
             or any(type(value) is not int for value in (start, end, size))
             or not 0 <= start < end <= size or end - start > request.max_bytes
             or len(text.encode('utf-8')) != end - start

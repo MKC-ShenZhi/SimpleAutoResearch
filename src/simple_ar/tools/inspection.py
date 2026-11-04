@@ -18,6 +18,7 @@ from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES, TURN_SUPPLY_
 from simple_ar.integrations.llm import LLMCallStopped, LLMSettings, estimate_tokens
 from simple_ar.tools.specs import CommonToolSpec, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS, CLAIM_WORK_METHODS, tool_result_payload
 from simple_ar.tools.workspace import FileWindow, workspace_tool_specs
+from simple_ar.tools.materials import lossless_text_window
 from simple_ar.tools.delivery_review import applicable_delivery_scope, reassessment_has_subject_support
 
 
@@ -1440,7 +1441,7 @@ class InspectionToolGateway:
                         consumed -= trailing
                 row['windows'][-1]['review_text'] = text
                 row['windows'][-1]['review_next_offset_bytes'] = next_offset
-                if (Path(row['path']).suffix.lower() in _BINARY or '\ufffd' in text
+                if (Path(row['path']).suffix.lower() in _BINARY or not lossless_text_window({**data, 'text':text})
                         or any(ord(char) < 32 and char not in '\n\r\t\f' for char in text)):
                     raise ValueError('Binary or undecodable content: text inspection unavailable')
                 if not data['has_more']:
@@ -1541,7 +1542,7 @@ class InspectionToolGateway:
                     except (ValueError, TypeError, KeyError, OSError, RuntimeError):
                         continue  # Unproved history remains in its original receipt.
                 text = data['text']
-                if (not text.strip() or '\ufffd' in text or Path(path).suffix.lower() in _BINARY
+                if (not text.strip() or not lossless_text_window(data) or Path(path).suffix.lower() in _BINARY
                         or any(ord(char) < 32 and char not in '\n\r\t\f' for char in text)):
                     continue
                 start = data.get('offset_bytes', request.get('offset_bytes', 0))

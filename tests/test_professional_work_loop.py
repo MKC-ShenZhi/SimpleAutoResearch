@@ -5340,6 +5340,28 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.assertTrue(all(row['verdict']=='incomplete' and not row['findings']
                     for row in _assessments(result)))
 
+    def test_literal_utf8_replacement_character_is_readable_without_adopting_lossy_bytes(self):
+        from simple_ar.tools.materials import lossless_text_window, journal_read_windows
+        self._create(current_method=True, delivery_protocol=None)
+        body = '这些是三个样本的观察。字面量字符：\ufffd。不能推断总体。\n'
+        self._write('note.md', body)
+        result = self._inspect(['note.md'], [])
+        self.assertEqual(result['status'], 'ok', result)
+        target = result['data']['targets'][0]
+        self.assertTrue(target['readable'])
+        self.assertTrue(target['complete'])
+        self.assertEqual(target['windows'][0]['review_text'], body)
+        self.assertTrue(journal_read_windows(result, {}))
+        for raw in (b'\xff', b'\xf0\x9f\x92'):
+            data = {'text':raw.decode('utf-8', errors='replace'), 'offset_bytes':0,
+                'size_bytes':len(raw), 'next_offset_bytes':len(raw),
+                'sha256':hashlib.sha256(raw).hexdigest()}
+            self.assertFalse(lossless_text_window(data))
+        complete = {'text':body, 'offset_bytes':0, 'size_bytes':len(body.encode()),
+            'next_offset_bytes':len(body.encode()), 'sha256':hashlib.sha256(body.encode()).hexdigest()}
+        self.assertTrue(lossless_text_window(complete))
+        self.assertFalse(lossless_text_window({**complete,'size_bytes':complete['size_bytes']+1}))
+
     def test_binary_evidence_diagnostics_allow_one_fresh_correction_with_omitted_subject(self):
         self._create()
         self._write('report.md', 'A population inference from three observations.\n')

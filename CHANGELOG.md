@@ -15,6 +15,8 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- Complete UTF-8 text containing a literal replacement character remains readable and reusable when its exact file hash matches; invalid or truncated byte windows remain uninspected.
+
 - Independent checks retain their original closed turns when estimating input capacity after compaction, so working notes do not prevent further source investigation.
 - Commands and publication share a filtered task environment with a task-owned home directory, allowing tools to build caches without inheriting the operator's profile.
 
