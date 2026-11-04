@@ -26,8 +26,8 @@ from simple_ar.app.professional_conversation import RETAINED_PROFESSIONAL_CONTRA
 PROTOCOL = 'operations.v1'
 PROFESSIONAL_CONTRACTS = {'work.v1': 'source_owner.v1', 'work.v2': 'source_owner.v2',
                           'work.v3': None, 'work.v4': None, 'work.v5': None,
-                          'work.v6': 'source_owner.v2'}
-CURRENT_PROFESSIONAL_CONTRACT = 'work.v6'
+                          'work.v6': 'source_owner.v2', 'work.v7': 'source_owner.v2'}
+CURRENT_PROFESSIONAL_CONTRACT = 'work.v7'
 
 
 _DIRECT_WORK = (
@@ -169,6 +169,23 @@ _SOURCE_COORDINATION = (
     "semantics, scope, resources or permission. "
 )
 
+_RESULT_COORDINATION = (
+    "Own the user's requested outcome through complete professional work. Delegate coherent source, "
+    "analysis or figure work to prepare_implementation using the goal and authorized project/material "
+    "roots. Delegate manuscript drafting or substantive revision to work_document. These producers "
+    "investigate the actual originals and return editable version-bound candidates and real gaps; "
+    "do not first select their files, transcribe evidence or perform a separate producer self-audit. "
+    "Use execute_implementation for a registered execution proposal after ordinary exact approval. "
+    "Execution failures and required corrections belong with that candidate and its original results, "
+    "not a fresh inventory. Reuse valid supplied calculations and change only work affected by feedback. "
+    "Choose the next useful work from actual results and the original goal; no compulsory sequence "
+    "or format applies. Submit useful candidates to deliver_result for independent investigation of "
+    "the applicable claims and actual artifact versions. Producer gaps and review advice require "
+    "judgment; they neither certify work nor create new user requirements. Source/document production "
+    "and inspection own file-level operations; explicit caller operations retain their normal APIs. "
+    "All work shares the original records, resource ledger and authorization. "
+)
+
 
 class OperationTools:
     """Composition root with narrow runtime ports, not a second controller."""
@@ -253,7 +270,7 @@ class OperationTools:
         if preparation not in {None,'prepared.v1','prepared.v2','prepared.v3'}:
             raise ValueError('Unsupported source generation protocol')
         exact = config.get('code_task') is not None
-        self.shared_native = config.get('professional_operations') in {'work.v3', 'work.v4', 'work.v5', 'work.v6'} and not exact
+        self.shared_native = config.get('professional_operations') in {'work.v3', 'work.v4', 'work.v5', 'work.v6', 'work.v7'} and not exact
         if self.shared_native and preparation is not None:
             raise ValueError('Shared native professional work cannot acquire a historical preparation controller')
         self.methods = self.work = None
@@ -276,9 +293,13 @@ class OperationTools:
             if source_owner or not exact and preparation in {'prepared.v2','prepared.v3'} else _DIRECT_WORK) + _work_principles(
                 self.delivery_review is not None, config.get('memory_protocol') == 'journal.v1',
                 delivery_protocol=self.delivery_review.protocol if self.delivery_review is not None else None)
+        if config.get('professional_operations') == 'work.v7':
+            self.system = _RESULT_COORDINATION + _work_principles(self.delivery_review is not None,
+                config.get('memory_protocol') == 'journal.v1',
+                delivery_protocol=self.delivery_review.protocol if self.delivery_review is not None else None)
         if config.get('work_method') == 'goal.v1':
             self.system = _GOAL_WORK
-        elif config.get('work_method') in EXECUTABLE_WORK_METHODS and config.get('professional_operations') != 'work.v6':
+        elif config.get('work_method') in EXECUTABLE_WORK_METHODS and config.get('professional_operations') not in {'work.v6', 'work.v7'}:
             self.system = _EXECUTABLE_WORK
         if exact or (preparation is not None or source_owner) and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
@@ -288,7 +309,7 @@ class OperationTools:
                 source_owner_contract=source_owner,
                 input_contract='bounded_inputs.v2' if not exact and preparation in {'prepared.v2','prepared.v3'} else None,
                 source_edit_contract='bound_content.v1' if not exact and preparation == 'prepared.v3' else None,
-                decision_protocol=('native.v1' if config.get('professional_operations') == 'work.v6'
+                decision_protocol=('native.v1' if config.get('professional_operations') in {'work.v6', 'work.v7'}
                     else config.get('source_decision_protocol')) if not exact else None,
                 execution_observations=execution_observations if not exact else None,
                 work_context=work_context if not exact else None,
@@ -305,7 +326,7 @@ class OperationTools:
                 source_owner_contract=source_owner),
                 self.implementation,request_visible=True)
         self.document = None
-        if professional and config.get('professional_operations') in {'work.v1', 'work.v2', 'work.v6'} and config['model'] is not None:
+        if professional and config.get('professional_operations') in {'work.v1', 'work.v2', 'work.v6', 'work.v7'} and config['model'] is not None:
             from simple_ar.tools.document_work import DocumentWorkToolGateway, document_work_tool_specs
             self.document = DocumentWorkToolGateway(root, self.workspace, ledger, session_id,
                 client_factory=lambda identity: client_factory(identity, 'writing'),
@@ -407,6 +428,11 @@ class OperationTools:
     def method_context(self) -> dict | None:
         return self.methods.context() if self.methods is not None else None
 
+    def coordinator_eligible(self, spec: CommonToolSpec) -> bool:
+        """Consumer role, not authorization; callers and inspectors keep primitives."""
+        return (self.config.get('professional_operations') != 'work.v7'
+            or spec.domain != 'workspace' or spec.name in {'ask_user', 'deliver_result'})
+
     def presentation(self, selected: set[str], mode: str):
         active, catalog = set(), {}
         # Explicit frozen work keeps the operations required by its domain owner.
@@ -415,6 +441,8 @@ class OperationTools:
             ('code_task', 'execution_contract', 'table_analysis', 'source_generation_protocol')))
         for spec in self.registry.list_specs():
             if not self.gateway.policy.is_allowed(spec)[0]:
+                continue
+            if not self.coordinator_eligible(spec):
                 continue
             # Saved preparation contracts keep their original presentation.
             # Ordinary source work is owned by these common workspace tools.

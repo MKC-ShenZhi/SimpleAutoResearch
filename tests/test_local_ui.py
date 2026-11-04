@@ -925,12 +925,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     entered.set()
                     if not release.wait(10):
                         raise AssertionError('Test did not release model boundary')
-                    tool, arguments = 'load_tools', {'names': ['write_file']}
-                elif len(calls) == 2:
-                    tool, arguments = 'write_file', {'path': 'retained-note.md',
-                        'content': 'Inspect the authorized evidence for the requested outcome.\n'}
-                else:
-                    tool, arguments = 'ask_user', {'question': 'Inspect this retained result'}
+                tool, arguments = 'ask_user', {'question': 'Inspect this retained result'}
                 offered = {row['function']['name'] for row in kwargs['tools']}
                 self.assertIn(tool, offered)
                 self.assertNotIn('select_work', offered)
@@ -1191,8 +1186,11 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     self.assertEqual(request('/api/action', dict(op='resume', task=name))[0], 200)
                     workspace.workers[name][0].join(10)
                     self.assertFalse(workspace.workers[name][0].is_alive())
-                    self.assertEqual((root / 'workspace/retained-note.md').read_text(),
-                        'Inspect the authorized evidence for the requested outcome.\n')
+                    actions = json.loads((root / 'actions.json').read_text())
+                    record = actions['turns'][0]['tools'][0]['result']
+                    self.assertEqual(json.loads((root / record).read_text())['data']['question'],
+                        'Inspect this retained result')
+                    self.assertEqual(len(calls), 1)
                     self.assertEqual(len(json.loads((root / 'actions.json').read_text())['requests']), 1)
                     self.assertEqual(request('/api/task?task=' + name)[1]['manifest']['session_id'], name)
                 finally:

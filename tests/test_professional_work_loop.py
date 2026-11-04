@@ -813,7 +813,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         core = {row['function']['name'] for row in self.app.operation_schemas}
         self.assertEqual({'prepare_implementation','execute_implementation','work_document','ask_user',
             'deliver_result','load_tools','read_history','export_report','update_work_plan'}, core)
-        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v6')
+        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v7')
         self.assertFalse({'select_work_method',
             'begin_professional_work','finish_professional_work'} & core)
         optional = {'inspect_table','analyze_table','measure_experiment','analyze_measurements',
@@ -845,11 +845,16 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(_action('load_tools', names=['inspect_table']))
         self._reload()
         self.assertEqual({row['function']['name'] for row in self.app.operation_schemas}, core | {'inspect_table'})
-        self._submit(_action('load_tools', names=['inspect_table', 'write_file']))
-        self._ok('load_tools')
+        self.assertNotIn('write_file', view['available_specialists'])
+        self._submit(_action('load_tools', names=['write_file']))
+        self.assertEqual(self._last('load_tools')['status'], 'blocked')
+        self.assertIn('professional production', self._last('load_tools')['error'])
+        # Explicit caller work is still authorized; only the coordinating model
+        # delegates file-level work to the professional owner.
+        self._submit(_action('write_file', path='note.md', content='The supplied table has been inspected.\n'))
+        self._ok('write_file')
         self.decisions.extend([
             _action('inspect_table', path='measurements/observations.csv'),
-            _action('write_file', path='note.md', content='The supplied table has been inspected.\n'),
             _action('deliver_result', summary='Retained table inspection.', artifacts=['note.md']),
         ])
         self._run(should_stop=lambda:False)
@@ -3397,16 +3402,31 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def test_goal_document_owner_produces_checked_versions_and_reuses_work_after_reload(self):
         self._create(goal='Explain the supplied observations in an editable Markdown note, preserving originals.',
             current_method=True, delivery_protocol=None, selection_policy='native.v3',
-            professional_contract='work.v6')
+            professional_contract='work.v7')
         self.assertIsNone(self.app.operations.selection)
         self.assertIsNotNone(self.app.operations.implementation)
         self.assertIsNotNone(self.app.operations.document)
         self._document_work_chain()
 
+    def test_saved_v6_keeps_native_production_after_reload(self):
+        self._create(goal='Retain the existing native production contract.', current_method=True,
+            delivery_protocol=None, selection_policy='native.v3', professional_contract='work.v6')
+        self._submit(_action('load_tools', names=['write_file']))
+        self._ok('load_tools')
+        prefix = deepcopy(self.app.ledger.to_dict()['entries'])
+        self._reload()
+        self.decisions.extend([
+            _action('write_file', path='retained.txt', content='Original native contract.\n'),
+            _action('ask_user', question='Which part should be continued?')])
+        self._run()
+        self.assertEqual((self.root/'workspace/retained.txt').read_text(), 'Original native contract.\n')
+        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v6')
+        self.assertEqual(self.app.ledger.to_dict()['entries'][:len(prefix)], prefix)
+
     def test_goal_source_owner_returns_candidate_and_approved_execution_on_one_ledger(self):
         self._create(goal='Compute the supplied observations and deliver a reusable source project and result.',
             current_method=True, delivery_protocol=None, selection_policy='native.v3',
-            professional_contract='work.v6')
+            professional_contract='work.v7')
         original = self._versions(self.inputs)
         program = ("import csv,sys\nfrom pathlib import Path\n"
             "rows=list(csv.DictReader(Path(sys.argv[1]).open()))\n"

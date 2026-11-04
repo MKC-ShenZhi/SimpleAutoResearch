@@ -9,7 +9,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
-- New ordinary tasks offer source and document work as complete production operations that return editable, version-bound candidates. Fine-grained operations remain explicitly loadable; all work shares the native queue, command approvals, accounting and independent delivery checks. Saved task contracts remain recoverable.
+- New ordinary tasks dispatch source and document production through operations that return editable, version-bound candidates. Producers and inspectors own file-level work; explicit caller APIs remain available. All work shares the native queue, command approvals, accounting and independent delivery checks. Saved task contracts remain recoverable.
 - Candidate production, checking and eligible same-version delivery use one action queue across feedback and recovery. Working memory retains results, judgments and open questions; it no longer plans subsequent actions.
 - Independent checks keep evidence and findings with the claims they support, test comparisons and interpretations against original evidence, and reuse applicable execution records.
 
