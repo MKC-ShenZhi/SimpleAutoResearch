@@ -631,8 +631,10 @@ class GoalWorkTests(unittest.TestCase):
             model='fixture', services=case.services, sources={}, control_protocol='operations.v1',
             max_turns=1, max_tokens=100000, max_attempts=12, tool_contracts='full')
         (root / 'workspace/note.md').write_text('Existing useful work.\n')
-        case.decisions.append(_action('deliver_result', summary='Useful existing note', artifacts=['note.md'],
-            unresolved=['Independent verification has not finished.']))
+        case.decisions.append(_action('select_work', decision='blocked', actions=[],
+            stop_reason='The last affordable decision cannot fund independent verification.',
+            candidate={'summary':'Useful existing note', 'artifacts':['note.md'],
+                'unresolved':['Independent verification has not finished.']}))
         case.app.run(progress=lambda _: None)
         self.assertEqual(case.app.session.manifest.status, 'partial')
         self.assertEqual(case.send.call_count, 1)
