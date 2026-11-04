@@ -369,7 +369,7 @@ class InspectionToolGateway:
             raise ValueError('Inspection checkpoint policy requires journal continuity')
         if work_method is not None and work_method not in NATIVE_WORK_METHODS or work_method and protocol != 'subjects.v3':
             raise ValueError('Unsupported inspection working method')
-        if material_policy not in (None, 'operations.v1') or material_policy and work_method != GOAL_WORK_METHOD:
+        if material_policy not in (None, 'operations.v1', 'operations.v2') or material_policy and work_method != GOAL_WORK_METHOD:
             raise ValueError('Unsupported inspection material policy')
         self.root, self.workspace = Path(root), workspace
         self.store, self.client_factory = ArtifactStore(root), client_factory
@@ -419,7 +419,7 @@ class InspectionToolGateway:
         return policy in {'offered.v1', 'offered.v2'}
 
     def _system(self, saved: dict) -> str:
-        if saved.get('inspection_material_policy') == 'operations.v1' and self._delivery_scope(saved):
+        if saved.get('inspection_material_policy') in {'operations.v1', 'operations.v2'} and self._delivery_scope(saved):
             return (
                 'Independently judge the proposed delivery against the actual user requests. '
                 'Choose the consequential claims and the smallest sufficient investigation; '
@@ -2764,7 +2764,7 @@ class InspectionToolGateway:
             material_policy='working' if economic else 'retained' if retained else 'ranked',
             **({'selected_records':[row['record'] for row in journal_rows
                     if row['result'].get('tool_name') in {'run_process', 'inspect_images'}]}
-                if continuity and saved.get('inspection_material_policy') == 'operations.v1' else {}),
+                if continuity and saved.get('inspection_material_policy') in {'operations.v1', 'operations.v2'} else {}),
             native_observations=native_observations,
             version_resolver=version if retained else None,
             **({'work_notes':notes, 'require_work_notes':True, 'fit_work_notes':True,
@@ -3225,7 +3225,7 @@ class InspectionToolGateway:
                 'role':'historical_observation', 'turn':source['turn'] if source else None,
                 'offset_bytes':window['offset_bytes'], 'next_offset_bytes':window['review_next_offset_bytes'],
                 'size_bytes':window['size_bytes'], 'text':text})
-        if saved.get('inspection_material_policy') == 'operations.v1':
+        if saved.get('inspection_material_policy') in {'operations.v1', 'operations.v2'}:
             observations.extend({'record':row['record'], 'turn':row['turn'],
                 'kind':'operation_result', 'role':'historical_observation',
                 'text':json.dumps(row['result'], ensure_ascii=False),
@@ -3702,8 +3702,9 @@ class InspectionToolGateway:
         save_observations()
 
     def _admit_response(self, saved: dict, calls: list, offered: list, response_model: Any,
-                        read_names: set[str], *, shared: bool) -> tuple[list, str, dict | None, list]:
-        """Validate one native batch against the actual offer and final owner contract."""
+                        read_names: set[str], *, shared: bool, content: str | None = None,
+                        closing: bool = False) -> tuple[list, str, dict | None, list]:
+        """Validate the actual response against its offer and final owner contract."""
         parsed, final, owner_bindings = [], None, []
         try:
             schemas = ({item['function']['name']:item['function']['parameters'] for item in offered}
@@ -3728,8 +3729,15 @@ class InspectionToolGateway:
                 raise ValueError('Return record_inspection alone, after source results have been observed')
             if not self.adaptive and len(parsed) > 8:
                 raise ValueError('Inspection allows at most eight source calls in one response')
-            if finals:
-                value = parsed[0][1]
+            content_final = (shared and closing and not calls and isinstance(content, str)
+                and saved.get('inspection_material_policy') == 'operations.v2'
+                and len(offered) == 1 and set(schemas) == {'record_inspection'})
+            if finals or content_final:
+                # A terminal-only offer has no operation to dispatch. Preserve
+                # the original text receipt; never manufacture native call IDs.
+                value = parsed[0][1] if finals else json.loads(content)
+                if not isinstance(value, dict):
+                    raise ValueError('Inspection final opinion must be a JSON object')
                 if not self._delivery_scope(saved) and self.protocol and isinstance(value.get('decisions'), list):
                     rows = value['decisions']
                     missing = [index for index, row in enumerate(rows) if isinstance(row, dict) and 'subject' not in row]
@@ -4051,7 +4059,8 @@ class InspectionToolGateway:
                     admission['final'], admission['owner_bindings'])
             else:
                 parsed, batch_error, final, owner_bindings = self._admit_response(
-                    saved, calls, offered, response_model, read_names, shared=shared)
+                    saved, calls, offered, response_model, read_names, shared=shared,
+                    content=response.get('content'), closing=terminal_only)
                 if shared:
                     dependencies = None
                     if final is not None:
@@ -4061,6 +4070,7 @@ class InspectionToolGateway:
                             batch_error, final, owner_bindings = str(exc), None, []
                     record['admission'] = {'parsed':parsed, 'error':batch_error,
                         'final':final, 'owner_bindings':owner_bindings,
+                        **({'representation':'content_json'} if final is not None and not calls else {}),
                         **({'dependencies':dependencies} if final is not None else {})}
                     if owner_bindings:
                         record['owner_bindings'] = owner_bindings

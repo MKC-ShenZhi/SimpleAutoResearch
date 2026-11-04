@@ -17,6 +17,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 - Complete UTF-8 text containing a literal replacement character remains readable and reusable when its exact file hash matches; invalid or truncated byte windows remain uninspected.
 - New independent checks retain their own execution outputs and diagnostics in the bounded working view after history compaction; notes no longer provide the only account of earlier calculations. Historical task contracts remain unchanged.
+- When a new inspection offers only its final opinion, a strict JSON text response receives the same evidence and version validation as a native opinion call, preserving the original response and usage.
 - Independent checks retain their original closed turns when estimating input capacity after compaction, so working notes do not prevent further source investigation.
 - Commands and publication share a filtered task environment with a task-owned home directory, allowing tools to build caches without inheriting the operator's profile.
 

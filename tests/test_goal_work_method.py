@@ -526,6 +526,73 @@ class GoalWorkTests(unittest.TestCase):
                          {'select_work'})
         self.assertFalse(case.app.state['pending'])
 
+    def test_terminal_json_opinion_uses_the_same_evidence_and_recovery_contract(self):
+        from unittest.mock import patch
+        from simple_ar.tools.inspection import _ClaimDeliveryResponse
+        case = self.case
+        root = case.directory / 'one-inspection-call'
+        case.app = ToolApplication.create(root, 'Deliver the existing note with honest limits.',
+            model='fixture', services=case.services, sources={}, max_turns=1,
+            max_tokens=100000, max_attempts=12, tool_contracts='full')
+        case.root = root
+        (root / 'workspace/note.md').write_text('Existing useful work.\n')
+        provider = case._provider
+        originals = []
+        def text_final(settings, request, **kwargs):
+            response = provider(settings, request, **kwargs)
+            offered = [item['function']['name'] for item in request.get('tools', [])]
+            self.assertEqual(offered, ['record_inspection'])
+            message = response['choices'][0]['message']
+            message['content'] = message.pop('tool_calls')[0]['function']['arguments']
+            response['choices'][0]['finish_reason'] = 'stop'
+            originals.append(deepcopy(message))
+            return response
+        case.send.side_effect = text_final
+        case._submit(_action('deliver_result', summary='Useful existing note', artifacts=['note.md'],
+            unresolved=['Independent verification has not finished.']))
+        self.assertEqual(case.app.session.manifest.status, 'partial', case.app.result_snapshot())
+        self.assertEqual(case.send.call_count, 1)
+        owner = case.app.operations.inspection
+        inputs = list((root/'tools/inspection').glob('*/input.json'))
+        self.assertEqual(len(inputs), 1)
+        saved = json.loads(inputs[0].read_text())
+        trace_path = inputs[0].parent/'sources-0.json'
+        trace = json.loads(trace_path.read_text())
+        self.assertEqual(trace['response'], originals[0])
+        self.assertEqual(trace['admission']['representation'], 'content_json')
+        self.assertEqual(trace['results'], [])
+        self.assertEqual(trace['admission']['parsed'], [])
+        content = trace['response']['content']
+        offered = trace['offer']['tools']
+        with patch.object(owner, '_shared_final_bindings', side_effect=AssertionError('Admission dispatches nothing')):
+            for text in ('```json\n'+content+'\n```', content+' trailing', '[]',
+                         json.dumps({**json.loads(content), 'unknown':True})):
+                with self.subTest(text=text[:40]):
+                    _, error, final, _ = owner._admit_response(saved, [], offered,
+                        _ClaimDeliveryResponse, set(), shared=True, content=text, closing=True)
+                    self.assertTrue(error)
+                    self.assertIsNone(final)
+            for policy, closing, tools in [('operations.v1', True, offered),
+                    (None, True, offered), ('operations.v2', False, offered),
+                    ('operations.v2', True, offered*2)]:
+                previous = {**saved, 'inspection_material_policy':policy}
+                self.assertIsNone(owner._admit_response(previous, [], tools,
+                    _ClaimDeliveryResponse, set(), shared=True, content=content, closing=closing)[2])
+            invalid = json.loads(content)
+            invalid['investigations'] = [{'claim':'The note was independently verified.',
+                'scope':'All results', 'necessary':True, 'basis':'observed', 'execution_records':[],
+                'method':'Read the note', 'reasoning':'Unsupported evidence ID',
+                'evidence':['evidence-missing'], 'outcome':'supported', 'findings':[]}]
+            _, error, final, _ = owner._admit_response(saved, [], offered,
+                _ClaimDeliveryResponse, set(), shared=True, content=json.dumps(invalid), closing=True)
+            self.assertTrue(error)
+            self.assertIsNone(final)
+        before = trace_path.read_bytes()
+        case._reload()
+        self.assertEqual(trace_path.read_bytes(), before)
+        self.assertEqual(case.app.session.manifest.status, 'partial')
+        self.assertEqual(case.send.call_count, 1)
+
     def test_claimed_execution_or_unfinished_check_cannot_become_required_defect(self):
         inspector = self.case.app.operations.inspection
         saved = {'work_method': 'goal.v1', 'source_rounds': [], 'targets': [],
