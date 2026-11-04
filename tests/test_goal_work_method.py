@@ -109,6 +109,28 @@ class GoalWorkTests(unittest.TestCase):
         interpreted = case.app.session.store.read_json(turn['reply'])
         self.assertEqual([c['function']['name'] for c in interpreted['tool_calls']], ['deliver_result'])
 
+    def test_offered_source_variants_require_the_sources_that_admission_checks(self):
+        from simple_ar.app.work_selection import _OfferedChoice, WorkChoice
+        from pydantic import ValidationError
+        schema = self.case.app.schemas[0]['function']['parameters']
+        variants = schema['properties']['remaining']['items']['anyOf']
+        requirements = [set(schema['$defs'][row['$ref'].split('/')[-1]]['required']) for row in variants]
+        self.assertIn({'request_index','quote','missing_outcome'}, requirements)
+        self.assertIn({'finding_id','missing_outcome'}, requirements)
+        self.assertNotIn('candidate', schema['required'])
+        self.assertNotIn('anyOf', schema['properties']['candidate'])
+        for source in ({'request_index':0,'quote':self.case.app.state['requests'][0]},
+                       {'finding_id':'actual-required-finding'}):
+            wire = {'remaining':[{**source,'missing_outcome':'An actual requested outcome.'}], 'actions':[]}
+            self.assertIsNone(_OfferedChoice.model_validate(wire).candidate)
+            self.assertIsNone(WorkChoice.model_validate(wire).candidate)
+        with self.assertRaises(ValidationError):
+            _OfferedChoice.model_validate({'remaining':[{'missing_outcome':'Inventory the project.'}],
+                'actions':[]})
+        legacy = {'remaining':[{'request_index':0,'quote':'Original request','finding_id':'',
+            'missing_outcome':'Old retained choice.'}], 'actions':[], 'candidate':None}
+        self.assertIsNone(WorkChoice.model_validate(legacy).candidate)
+
     def test_production_hands_off_candidate_across_approval_reload_and_feedback_without_reexecution(self):
         case = self.case
         program = ("from pathlib import Path\np=Path('executions.txt')\n"

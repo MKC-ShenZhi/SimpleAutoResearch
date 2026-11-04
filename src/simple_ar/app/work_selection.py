@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 from simple_ar.tools.workspace import DeliveryRequest
@@ -49,9 +50,30 @@ class WorkChoice(BaseModel):
         'findings. Optional polish, old plans and research uncertainty are not missing outcomes.')
     actions: list[WorkOperation] = Field(description='One coherent unit of necessary work using '
         'the supplied operation contracts. No prerequisite producer self-audit.')
-    candidate: DeliveryRequest | None = Field(description='The current usable delivery candidate, '
+    candidate: DeliveryRequest | SkipJsonSchema[None] = Field(default=None,
+        description='The current usable delivery candidate, '
         'including a draft needing independent checks. Identify outputs produced by this unit too. '
-        'The delivery owner checks it automatically after the unit. Null only when no candidate exists.')
+        'The delivery owner checks it automatically after the unit. Omit when no candidate exists.')
+
+
+class _RequestedNeed(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    request_index: int = Field(ge=0, description='Index of an actual supplied original request.')
+    quote: str = Field(min_length=1, description='Exact substring of that original request.')
+    missing_outcome: str = Field(min_length=1)
+
+
+class _RequiredNeed(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    finding_id: str = Field(min_length=1, description='ID of an actually supplied required finding.')
+    missing_outcome: str = Field(min_length=1)
+
+
+class _OfferedChoice(WorkChoice):
+    # Express the source requirement in the actual wire schema. The retained
+    # decoder above also accepts older replies with unused empty source fields.
+    remaining: list[_RequestedNeed | _RequiredNeed] = Field(
+        description=WorkChoice.model_fields['remaining'].description)
 
 
 class WorkSelection:
@@ -117,7 +139,8 @@ class WorkSelection:
             input_schema=WorkChoice.model_json_schema())
 
     def offer(self, operations: list[dict]) -> list[dict]:
-        schema = self.spec().input_schema
+        schema = _OfferedChoice.model_json_schema()
+        schema['properties']['candidate'].pop('default', None)
         from simple_ar.tools.workspace import prepared_report_delivery_schema
         prepared_report_delivery_schema(schema, 'candidate')
         schema['$defs']['WorkOperation']['properties']['tool_name']['enum'] = [
