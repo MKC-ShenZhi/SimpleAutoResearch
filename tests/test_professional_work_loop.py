@@ -485,6 +485,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             allow_execution=allow_execution, tool_contracts='full',
             max_turns=70, max_tokens=900000, max_attempts=180,
             process_limits={'process_invocations': 48, 'process_wall_seconds': 360}, **options)
+        saved_config = deepcopy(self.app.state['config'])
         # Existing fixtures retain their saved implicit choice contract; the
         # explicit transition chain is exercised in test_goal_work_method.
         if selection_policy is None:
@@ -500,7 +501,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.app.state['config'].pop('inspection_material_policy', None)
         if delivery_protocol is not None and self.app.state['config']['delivery_review_protocol'] != delivery_protocol:
             self.app.state['config']['delivery_review_protocol'] = delivery_protocol
-        if not current_method or delivery_protocol is not None or selection_policy is None:
+        if self.app.state['config'] != saved_config:
             self.app._save()
             self._reload()
         return self.app
@@ -807,7 +808,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         core = {row['function']['name'] for row in self.app.operation_schemas}
         self.assertEqual({'read_file','search_files','list_directory','inspect_project',
             'copy_file','copy_project','edit_file','write_file','run_process','ask_user',
-            'deliver_result','load_tools','read_history','export_report'}, core)
+            'deliver_result','load_tools','read_history','export_report','update_work_plan'}, core)
         self.assertFalse({'select_work_method','prepare_implementation','execute_implementation','work_document',
             'begin_professional_work','finish_professional_work'} & core)
         optional = {'inspect_table','analyze_table','measure_experiment','analyze_measurements',
