@@ -653,7 +653,7 @@ class GoalWorkTests(unittest.TestCase):
         inherited = owner._retained_inputs(saved)
         self.assertEqual([row['identity'] for row in inherited], [failed['identity']])
         history = owner._read_history(saved, {'inspection':failed['identity'], 'start_turn':0}, before_turn=0)
-        self.assertIn(failed['identity'], history.data['record'])
+        self.assertIn(failed['identity'], history.data['text'])
         with self.assertRaisesRegex(ValueError, 'not an accessible retained'):
             owner._read_history(saved, {'inspection':'unrelated-owner'}, before_turn=0)
         calls = case.send.call_count
