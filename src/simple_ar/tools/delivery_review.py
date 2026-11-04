@@ -964,8 +964,14 @@ class DeliveryReview:
             observations = prior() if prior is not None else []
             pending = (self.pending_concerns(binding['artifacts'], observations)
                        if self.track_findings else [])
+            retained = None
             for observed in reversed(observations):
                 candidate = (observed.get('metadata') or {}).get('delivery_review')
+                if (retained is None and self.inspector.material_policy == 'operations.v3'
+                        and isinstance(candidate, dict) and isinstance(candidate.get('identity'), str)
+                        and isinstance(candidate.get('binding'), dict)
+                        and self.inspector.store.exists(self.inspector._path(candidate['identity'], 'result'))):
+                    retained = {'identity':candidate['identity'], 'binding':candidate['binding']}
                 if not isinstance(candidate, dict) or candidate.get('binding') != binding:
                     continue
                 try:
@@ -991,6 +997,7 @@ class DeliveryReview:
                 return None
             result = self.inspector.call('inspect_artifacts', self._arguments(binding), identity,
                 delivery_context=deepcopy(binding),
+                **({'retained_from':retained} if retained is not None else {}),
                 **({'prior_required': deepcopy(pending)} if self.track_findings else {}))
             if result.ok and result.data.get('inspection_pending') == identity:
                 return self._envelope(binding, identity, result)

@@ -449,7 +449,7 @@ class ToolApplication:
         if config.get('work_method') and (config.get('memory_protocol') != 'journal.v1'
                 or config.get('context_checkpoint_policy') != 'economic.v3'):
             raise ValueError('Goal working method requires the shared working journal')
-        if config.get('inspection_material_policy') not in (None, 'operations.v1', 'operations.v2'):
+        if config.get('inspection_material_policy') not in (None, 'operations.v1', 'operations.v2', 'operations.v3'):
             raise ValueError('Unsupported saved inspection material policy')
         if config.get('inspection_material_policy') and config.get('work_method') != GOAL_WORK_METHOD:
             raise ValueError('Inspection work observations require the goal working contract')
@@ -1857,7 +1857,7 @@ class ToolApplication:
             config['work_method'] = (CURRENT_WORK_METHOD if not any(config.get(key) for key in
                 ('code_task', 'execution_contract', 'table_analysis', 'source_generation_protocol')) else 'execute.v2')
             if config['work_method'] == GOAL_WORK_METHOD:
-                config['inspection_material_policy'] = 'operations.v2'
+                config['inspection_material_policy'] = 'operations.v3'
         return config, reused, limits, attempts
 
     @classmethod

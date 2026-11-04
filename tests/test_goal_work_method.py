@@ -421,6 +421,7 @@ class GoalWorkTests(unittest.TestCase):
     def test_default_work_interface_selects_existing_operations_without_changing_permission(self):
         case = self.case
         self.assertEqual(case.app.state['config']['work_method'], 'goal.v2')
+        self.assertEqual(case.app.state['config']['inspection_material_policy'], 'operations.v3')
         case.app.state['config']['tool_contracts'] = 'on_demand'
         case.app._save()
         case._reload()
@@ -593,6 +594,99 @@ class GoalWorkTests(unittest.TestCase):
         self.assertEqual(trace_path.read_bytes(), before)
         self.assertEqual(case.app.session.manifest.status, 'completed')
         self.assertEqual(case.send.call_count, 2)
+
+    def test_failed_opinion_retains_investigation_across_retry_feedback_and_input_change(self):
+        case = self.case
+        case._write('claim.md', 'The sample mean is 2.0.\n')
+        reject = True
+        def review(view):
+            if not view.get('executed_checks'):
+                functions = {tool['function']['name']:tool['function']
+                    for tool in case.inspection_requests[-1]['tools']}
+                scope = functions['run_process']['parameters']['properties']['cwd']['description'].split(
+                    'workspace/inspection-work/', 1)[1].split('/', 1)[0]
+                return [_action('run_process', cwd='workspace/inspection-work/'+scope,
+                    argv=[sys.executable, '-c', "import csv,sys; v=[float(r['value']) for r in "
+                        "csv.DictReader(open(sys.argv[1]))]; print('INDEPENDENT_MEAN',sum(v)/len(v))",
+                        str(case.inputs/'observations.csv')], inputs=['measurements/observations.csv'],
+                    timeout_sec=5)]
+            sources = case._inspection_sources(view, 'measurements/observations.csv', 'claim.md')
+            missing = [_action('read_file', path=path) for path,source in
+                zip(('measurements/observations.csv', 'claim.md'), sources) if source is None]
+            if missing:
+                return missing
+            value = {'conclusion':'complete', 'applicability':'Check the note against the complete sample.',
+                'findings':[], 'limitations':[], 'evidence':[row['subject'] for row in sources],
+                'investigations':[{'claim':'The sample mean is 2.0.', 'necessary':True,
+                    'scope':'Three supplied observations, not a population or causal claim.',
+                    'basis':'derived', 'execution_records':view['executed_checks'],
+                    'method':'Read the data and derive its mean; compare the actual independent calculation.',
+                    'reasoning':'The observed values 1,2,3 average to 2.0; the independent run agrees.',
+                    'evidence':[row['subject'] for row in sources], 'outcome':'supported'}]}
+            if reject:
+                value['unknown_field'] = 'Deliberately rejected controlled opinion, not a scientific defect.'
+            return value
+        case.review = review
+        claim = {'summary':'Sample mean', 'artifacts':['claim.md']}
+        case._submit(_action('deliver_result', **claim))
+        token = case.app.approval_token(case.app.state['pending']['action']['call'])
+        case._reload()
+        case._run(approved_execution=token)
+        failed = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        self.assertNotEqual(failed['result']['status'], 'ok')
+        self.assertFalse((case.root/'delivery.json').exists())
+        owner = case.app.operations.inspection
+        protected = {owner._path(failed['identity'], leaf):owner.store.resolve(
+            owner._path(failed['identity'], leaf)).read_bytes() for leaf in ('input','response','result')}
+        prefix = deepcopy(case.app.ledger.to_dict()['entries'])
+        reject = False
+        case._reload()
+        case._submit(_action('deliver_result', **claim))
+        accepted = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        self.assertEqual(case.app.session.manifest.status, 'completed', accepted.get('error'))
+        self.assertNotEqual(accepted['identity'], failed['identity'])
+        self.assertEqual(len(case._process_receipts()), 1)
+        self.assertEqual(case.app.ledger.to_dict()['entries'][:len(prefix)], prefix)
+        owner = case.app.operations.inspection
+        self.assertEqual({path:owner.store.resolve(path).read_bytes() for path in protected}, protected)
+        saved = owner.store.read_json(owner._path(accepted['identity'], 'input'))
+        inherited = owner._retained_inputs(saved)
+        self.assertEqual([row['identity'] for row in inherited], [failed['identity']])
+        history = owner._read_history(saved, {'inspection':failed['identity'], 'start_turn':0}, before_turn=0)
+        self.assertIn(failed['identity'], history.data['record'])
+        with self.assertRaisesRegex(ValueError, 'not an accessible retained'):
+            owner._read_history(saved, {'inspection':'unrelated-owner'}, before_turn=0)
+        calls = case.send.call_count
+        case._reload()
+        self.assertEqual(case.send.call_count, calls)
+        case._submit(_action('edit_file', path='claim.md', replacements=[{
+            'old_text':'The sample mean is 2.0.', 'new_text':'Sample mean: 2.0.'}],
+            expected_sha256=hashlib.sha256((case.root/'workspace/claim.md').read_bytes()).hexdigest()),
+            feedback='Shorten the note, retaining the same sample and its valid calculations.')
+        case._submit(_action('deliver_result', **claim))
+        latest = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        self.assertEqual(case.app.session.manifest.status, 'completed', latest.get('error'))
+        self.assertEqual(len(case._process_receipts()), 1)
+        self.assertEqual(len(case.app.result_snapshot()['delivery_versions']), 2)
+        owner = case.app.operations.inspection
+        saved = owner.store.read_json(owner._path(latest['identity'], 'input'))
+        self.assertTrue(owner._executed_check_records(saved))
+        original = (case.inputs/'observations.csv').read_bytes()
+        try:
+            (case.inputs/'observations.csv').write_text('id,value\n1,10\n2,20\n3,30\n')
+            self.assertFalse(owner._executed_check_records(saved))
+            self.assertTrue(owner._retained_result(latest['identity'], current_inputs=False).ok)
+        finally:
+            (case.inputs/'observations.csv').write_bytes(original)
+        path = owner.store.resolve(next(iter(protected)))
+        original = path.read_bytes()
+        try:
+            path.write_bytes(original+b' ')
+            with self.assertRaisesRegex(ValueError, 'Retained investigation changed'):
+                owner._retained_inputs(saved)
+        finally:
+            path.write_bytes(original)
+        self.assertEqual({path:owner.store.resolve(path).read_bytes() for path in protected}, protected)
 
     def test_claimed_execution_or_unfinished_check_cannot_become_required_defect(self):
         inspector = self.case.app.operations.inspection

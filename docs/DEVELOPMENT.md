@@ -45,6 +45,10 @@ insufficient; they remain subject to the task's permissions.
 Independent inspection owns its observations as well as its judgment. File windows
 and original operation outcomes share the bounded working view; compaction notes
 do not replace recorded calculations or certify their applicability to changed work.
+An invalid opinion does not erase its investigation. A subsequent review can read
+the original independent journal and reuse observations under current permissions
+and input versions. Retained runs remain historical, and the new review judges
+the current request without adopting an earlier verdict.
 
 | Change | Start here |
 | --- | --- |

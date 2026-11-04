@@ -31,6 +31,7 @@ class _InspectionDispatchRaised(BaseException):
 
 _SHARED_OPERATIONS = frozenset({'read_file', 'list_directory', 'search_files',
     'write_file', 'edit_file', 'copy_file', 'copy_project', 'run_process', 'inspect_images'})
+_WORK_MATERIAL_POLICIES = frozenset({'operations.v1', 'operations.v2', 'operations.v3'})
 
 
 class _InspectionHistory(BaseModel):
@@ -46,6 +47,11 @@ class _InspectionHistory(BaseModel):
         description='Omit for a compact index. Select its zero-based action in start_turn for the retained semantic value.')
     field: Literal['result', 'arguments'] = Field(default='result',
         description='Retained result or arguments, projected as canonical JSON. Byte offsets address this projection.')
+
+
+class _RetainedInspectionHistory(_InspectionHistory):
+    inspection: str | None = Field(default=None,
+        description='An explicitly supplied retained inspection ID; omit for this inspection. Read-only original history.')
 
 
 class InspectionRequest(BaseModel):
@@ -369,7 +375,7 @@ class InspectionToolGateway:
             raise ValueError('Inspection checkpoint policy requires journal continuity')
         if work_method is not None and work_method not in NATIVE_WORK_METHODS or work_method and protocol != 'subjects.v3':
             raise ValueError('Unsupported inspection working method')
-        if material_policy not in (None, 'operations.v1', 'operations.v2') or material_policy and work_method != GOAL_WORK_METHOD:
+        if material_policy not in (None, *_WORK_MATERIAL_POLICIES) or material_policy and work_method != GOAL_WORK_METHOD:
             raise ValueError('Unsupported inspection material policy')
         self.root, self.workspace = Path(root), workspace
         self.store, self.client_factory = ArtifactStore(root), client_factory
@@ -419,7 +425,7 @@ class InspectionToolGateway:
         return policy in {'offered.v1', 'offered.v2'}
 
     def _system(self, saved: dict) -> str:
-        if saved.get('inspection_material_policy') in {'operations.v1', 'operations.v2'} and self._delivery_scope(saved):
+        if saved.get('inspection_material_policy') in _WORK_MATERIAL_POLICIES and self._delivery_scope(saved):
             return (
                 'Independently judge the proposed delivery against the actual user requests. '
                 'Choose the consequential claims and the smallest sufficient investigation; '
@@ -1000,6 +1006,16 @@ class InspectionToolGateway:
         if self._delivery_scope(saved):
             selected = [observed[key] for key in self._delivery_evidence(saved, response)]
             bindings = {'delivery':check(selected)}
+            if saved.get('inspection_material_policy') == 'operations.v3':
+                facts = self._execution_facts(saved)
+                for investigation in response['investigations']:
+                    for record in investigation.get('execution_records', []):
+                        if record not in facts:
+                            raise ValueError('Selected independent execution is no longer applicable')
+                        for path, digest in facts[record]['dependencies'].items():
+                            if path in bindings['delivery'] and bindings['delivery'][path] != digest:
+                                raise ValueError('Selected independent executions have conflicting input versions')
+                            bindings['delivery'][path] = digest
             if self._applicable_scope(saved) and response.get('reassessed_prior'):
                 # The package inventory is an acceptance/version obligation,
                 # never a provenance edge from every evidence item to every
@@ -1988,7 +2004,8 @@ class InspectionToolGateway:
                     return 'applicability' in function['parameters'].get('required', [])
         return offering
 
-    def _delivery_decision(self, saved: dict, value: dict) -> _DeliveryResponse | _ClaimDeliveryResponse:
+    def _delivery_decision(self, saved: dict, value: dict, *, current_inputs: bool = True
+                           ) -> _DeliveryResponse | _ClaimDeliveryResponse:
         linked = saved.get('finding_policy') == 'linked.v1'
         investigated = ('applicability' in value or self._investigation_contract(saved))
         decision = (_ClaimDeliveryResponse if saved.get('work_method') in CLAIM_WORK_METHODS else
@@ -2013,11 +2030,13 @@ class InspectionToolGateway:
             for i, row in enumerate(decision.investigations):
                 if not row.scope.strip() or row.basis == 'not_checked' and row.outcome != 'unresolved':
                     raise ValueError('Unperformed checks remain unresolved with their actual scope')
-                if row.basis != 'executed' and row.execution_records:
+                mixed = saved.get('inspection_material_policy') == 'operations.v3'
+                if not mixed and row.basis != 'executed' and row.execution_records:
                     raise ValueError('Only actual executed checks can select execution records')
-                if row.basis == 'executed':
+                if row.basis == 'executed' or mixed and row.execution_records:
                     if executed is None:
-                        executed = self._executed_check_records(saved)
+                        executed = (set(self._execution_facts(saved, current_inputs=current_inputs))
+                            if mixed else self._executed_check_records(saved))
                     if (not row.execution_records or len(set(row.execution_records)) != len(row.execution_records)
                             or not set(row.execution_records) <= executed):
                         raise ValueError('Executed investigations require actual own successful action records')
@@ -2056,10 +2075,119 @@ class InspectionToolGateway:
 
     def _executed_check_records(self, saved: dict) -> set[str]:
         """Reuse the common action owner's accepted receipts, never a model claim."""
+        if saved.get('inspection_material_policy') == 'operations.v3':
+            return set(self._execution_facts(saved))
         return {row['record'] for row in self._investigation_actions(saved)
             if row['call']['function']['name'] == 'run_process' and row['result'].get('status') == 'ok'
                 and row['result'].get('data', {}).get('returncode') == 0
                 and not row['result'].get('data', {}).get('stop_reason')}
+
+    def _retained_inputs(self, saved: dict) -> list[dict]:
+        """Read immutable independent journals, without adopting their opinions."""
+        if saved.get('inspection_material_policy') != 'operations.v3':
+            return []
+        parents, seen = [], {saved['identity']}
+        for reference in saved.get('retained_investigations', []):
+            identity = reference['identity']
+            if identity in seen or set(reference['sha256']) != {'input', 'response', 'result'}:
+                raise ValueError('Retained investigation has a repeated or invalid owner')
+            seen.add(identity)
+            records = {}
+            for leaf, digest in reference['sha256'].items():
+                relative = self._path(identity, leaf)
+                path = self.store.resolve(relative)
+                if any(part.is_symlink() or part.is_junction() for part in (path, *path.parents)
+                        if part.is_relative_to(self.root)):
+                    raise ValueError('Retained investigation cannot traverse links')
+                records[leaf] = self._bound_json(relative, digest, None, 'Retained investigation changed')
+            previous = records['input']
+            if (previous.get('identity') != identity or previous.get('protocol') != self.protocol
+                    or previous.get('work_method') != GOAL_WORK_METHOD
+                    or previous.get('execution_protocol') != 'shared.v1'
+                    or records['response'].get('input_sha256') != reference['sha256']['input']
+                    or records['response'].get('result_sha256') != reference['sha256']['result']
+                    or not self._accounted(self._usage(identity))):
+                raise ValueError('Retained investigation lacks its closed independent owner')
+            try:
+                # Withdrawal of source access also withdraws its cached bodies.
+                for row in [*previous['targets'], *previous['evidence']]:
+                    if row.get('path'):
+                        self.workspace.resolve(row['path'])
+            except (ValueError, OSError):
+                continue
+            for number in range(len(previous.get('source_rounds', []))):
+                if self._closed_source_round(previous, number, allow_final=True, model_only=True) is None:
+                    raise ValueError('Retained investigation has unsettled source work')
+            parents.append(previous)
+        return parents
+
+    def _inherit_investigation(self, saved: dict, reference: dict, remaining: list[int]) -> None:
+        """Bind prior facts to this new review; prior verdicts remain immutable."""
+        if saved.get('inspection_material_policy') != 'operations.v3':
+            raise ValueError('This saved inspection does not support retained investigation')
+        previous = self.store.read_json(self._path(reference['identity'], 'input'))
+        if (previous.get('delivery_context') != reference['binding']
+                or previous.get('arguments') != saved['arguments']):
+            raise ValueError('Retained investigation differs from its delivery owner scope')
+        pinned = {'identity':previous['identity'], 'sha256':{
+            leaf:self._digest(self._path(previous['identity'], leaf)) for leaf in ('input', 'response', 'result')}}
+        saved['retained_investigations'] = [*previous.get('retained_investigations', []), pinned]
+        parents = self._retained_inputs(saved)
+        owners = {(row['path'], row['sha256']):row for row in saved['evidence'] if row.get('sha256')}
+        number = max((int(row['subject'].split('-')[1]) for row in saved['evidence']), default=0)
+        for parent in reversed(parents):
+            for row in [*parent['targets'], *parent['evidence']]:
+                if not row.get('readable') or not row.get('sha256'):
+                    continue
+                try:
+                    if self.workspace.artifact_hashes([row['path']])[row['path']] != row['sha256']:
+                        continue
+                except (ValueError, OSError):
+                    continue
+                key = (row['path'], row['sha256'])
+                if key not in owners:
+                    number += 1
+                    owner = {**deepcopy(row), 'subject':f'evidence-{number}', 'windows':[], 'complete':False,
+                        'retained_from':{'inspection':parent['identity'], 'subject':row['subject']}}
+                    saved['evidence'].append(owner)
+                    owners[key] = owner
+                owner = owners[key]
+                for window in row['windows']:
+                    count = window['review_next_offset_bytes'] - window['offset_bytes']
+                    if window not in owner['windows'] and count <= remaining[0]:
+                        owner['windows'].append(deepcopy(window))
+                        remaining[0] -= count
+
+    def _execution_facts(self, saved: dict, *, current_inputs: bool = True) -> dict[str, dict]:
+        """Qualify real executions against current inputs, separately from judgment."""
+        facts = {}
+        for parent in [saved, *self._retained_inputs(saved)]:
+            for row in self._investigation_actions(parent, receipts=True):
+                result, data = row['result'], row['result'].get('data', {})
+                if (row['call']['function']['name'] != 'run_process' or result.get('status') != 'ok'
+                        or data.get('returncode') != 0 or data.get('stop_reason')):
+                    continue
+                try:
+                    owners = self._shared_owner_receipts('run_process', ToolResult.model_validate(result),
+                        row['receipt'], row['arguments'])
+                    if owners != row['owner_receipts']:
+                        raise ValueError('Independent execution owner records changed')
+                    dependencies = (self._check_bound_process_inputs(row['receipt'], row['arguments'])
+                        if current_inputs else {})
+                    accepted = self._accepted_execution_binding(row['receipt'])
+                    if current_inputs and parent is not saved and not (accepted.get('artifacts') or {}).get('inputs'):
+                        # An undeclared read cannot be assigned a precise input
+                        # dependency after the fact. Reuse only under the full
+                        # unchanged observed scope; otherwise keep it historical.
+                        dependencies.update({item['path']:item['sha256'] for item in
+                            [*parent['targets'], *parent['evidence']] if item.get('sha256')})
+                        if self.workspace.artifact_hashes(dependencies) != dependencies:
+                            continue
+                except (ValueError, OSError, KeyError, TypeError):
+                    continue
+                facts[row['record']] = {'inspection':parent['identity'], 'dependencies':dependencies,
+                    'source_record':row['source_record']}
+        return facts
 
     def _delivery_assessment(self, saved: dict, receipt: dict, identity: str, failure: str,
                              *, check_versions: bool = True) -> tuple[dict, str]:
@@ -2072,7 +2200,7 @@ class InspectionToolGateway:
         try:
             if failure:
                 raise ValueError(failure)
-            decision = self._delivery_decision(saved, receipt['response'])
+            decision = self._delivery_decision(saved, receipt['response'], current_inputs=check_versions)
             if self._offered_coverage(saved):
                 offered = self._offered_text_ranges(saved, validation_records=validation_records)
             if saved.get('execution_protocol') == 'shared.v1':
@@ -2639,6 +2767,14 @@ class InspectionToolGateway:
         base = self._view(saved, request)
         if saved.get('work_method') in NATIVE_WORK_METHODS and self._delivery_scope(saved):
             base['executed_checks'] = sorted(self._executed_check_records(saved))
+        if saved.get('inspection_material_policy') == 'operations.v3':
+            base['retained_investigations'] = [{'inspection':item['identity'],
+                'source_rounds':len(item.get('source_rounds', []))} for item in self._retained_inputs(saved)]
+            base['retained_scope'] = ('Original independent work, including failed opinions. '
+                'Use applicable observations; decide current requests and claims anew. Retained executions '
+                'are historical, not fresh runs. read_history accepts one of these inspection IDs. '
+                'execution_records may support derived as well as executed judgments; only the displayed '
+                'executed_checks have currently eligible input bindings. A failed opinion is not a pass.')
         if saved.get('execution_protocol') == 'shared.v1':
             # A primary target is a current material, not permanently pinned
             # prompt text. Its complete read/version proof stays in the source
@@ -2764,7 +2900,7 @@ class InspectionToolGateway:
             material_policy='working' if economic else 'retained' if retained else 'ranked',
             **({'selected_records':[row['record'] for row in journal_rows
                     if row['result'].get('tool_name') in {'run_process', 'inspect_images'}]}
-                if continuity and saved.get('inspection_material_policy') in {'operations.v1', 'operations.v2'} else {}),
+                if continuity and saved.get('inspection_material_policy') in _WORK_MATERIAL_POLICIES else {}),
             native_observations=native_observations,
             version_resolver=version if retained else None,
             **({'work_notes':notes, 'require_work_notes':True, 'fit_work_notes':True,
@@ -2952,7 +3088,7 @@ class InspectionToolGateway:
         saved = self.store.read_json(self._path(identity, 'input'))
         return self._investigation_actions(saved)
 
-    def _investigation_actions(self, saved: dict) -> list[dict]:
+    def _investigation_actions(self, saved: dict, *, receipts: bool = False) -> list[dict]:
         actions = []
         for number in range(len(saved.get('source_rounds', []))):
             trace = self._closed_source_round(saved, number)
@@ -2966,7 +3102,11 @@ class InspectionToolGateway:
                 # successful native process result behind that diagnosis.
                 if receipt is not None and relation == 'identical':
                     actions.append({'call': trace['response']['tool_calls'][index],
-                        'result': row['result'], 'record': receipt['record']})
+                        'result': row['result'], 'record': receipt['record'],
+                        **({'receipt':receipt, 'arguments':row['arguments'],
+                            'owner_receipts':row.get('owner_receipts', {}),
+                            'source_record':self._path(saved['identity'], f'sources-{number}')+f'#results/{index}'}
+                           if receipts else {})})
         return actions
 
     def _read_history(self, saved: dict, arguments: dict, *, before_turn: int,
@@ -2974,6 +3114,16 @@ class InspectionToolGateway:
         """Project navigation or a selected semantic value from validated own receipts."""
         if not self._history_enabled(saved):
             raise ValueError('Inspection history was not offered by this saved contract')
+        if saved.get('inspection_material_policy') == 'operations.v3':
+            selection = _RetainedInspectionHistory.model_validate(arguments)
+            if selection.inspection is not None and selection.inspection != saved['identity']:
+                prior = {item['identity']:item for item in self._retained_inputs(saved)}
+                if selection.inspection not in prior:
+                    raise ValueError('History owner is not an accessible retained investigation')
+                old = prior[selection.inspection]
+                return self._read_history(old, selection.model_dump(exclude={'inspection'}),
+                    before_turn=len(old.get('source_rounds', [])), read_limit=read_limit)
+            arguments = selection.model_dump(exclude={'inspection'})
         page = _InspectionHistory.model_validate(arguments)
         if read_limit is not None and (type(read_limit) is not int or read_limit <= 0):
             raise ValueError('History read capacity must be a positive integer')
@@ -3225,13 +3375,24 @@ class InspectionToolGateway:
                 'role':'historical_observation', 'turn':source['turn'] if source else None,
                 'offset_bytes':window['offset_bytes'], 'next_offset_bytes':window['review_next_offset_bytes'],
                 'size_bytes':window['size_bytes'], 'text':text})
-        if saved.get('inspection_material_policy') in {'operations.v1', 'operations.v2'}:
+        if saved.get('inspection_material_policy') in _WORK_MATERIAL_POLICIES:
             observations.extend({'record':row['record'], 'turn':row['turn'],
                 'kind':'operation_result', 'role':'historical_observation',
                 'text':json.dumps(row['result'], ensure_ascii=False),
                 'scope':'Original own operation outcome, including failures; historical execution '
                     'or diagnostic, not current file contents or scientific certification.'}
                 for row in rows if row['result'].get('tool_name') not in {'read_file', 'assistant_reply'})
+        if saved.get('inspection_material_policy') == 'operations.v3':
+            facts = {value['source_record']:record for record,value in self._execution_facts(saved).items()}
+            for parent in self._retained_inputs(saved):
+                observations.extend({'record':row['record'], 'turn':None,
+                    'kind':'operation_result', 'role':'historical_observation',
+                    'text':json.dumps({'inspection':parent['identity'], 'result':row['result'],
+                        'execution_record':facts.get(row['record']),
+                        'scope':'Original independent outcome, not an adopted opinion or current file body. '
+                            'A missing execution_record means diagnostic history only.'}, ensure_ascii=False)}
+                    for row in self._conversation_rows(parent)
+                    if row['result'].get('tool_name') not in {'read_file', 'assistant_reply', 'record_inspection'})
         return memory, observations, rows
 
     def _prepare_conversation_round(self, saved, request, messages, tools, terminal, finish,
@@ -3730,7 +3891,7 @@ class InspectionToolGateway:
             if not self.adaptive and len(parsed) > 8:
                 raise ValueError('Inspection allows at most eight source calls in one response')
             content_final = (shared and closing and not calls and isinstance(content, str)
-                and saved.get('inspection_material_policy') == 'operations.v2'
+                and saved.get('inspection_material_policy') in {'operations.v2', 'operations.v3'}
                 and len(offered) == 1 and set(schemas) == {'record_inspection'})
             if finals or content_final:
                 # A terminal-only offer has no operation to dispatch. Preserve
@@ -3839,7 +4000,8 @@ class InspectionToolGateway:
                     'Continue the same selection at next_offset_bytes. Returned text is a canonical JSON projection '
                     'with original round/receipt/action hashes and JSON pointer; no offers are replayed. '
                     'Historical observations grant no current evidence, permission or repeated execution.',
-                'parameters':_InspectionHistory.model_json_schema()}})
+                'parameters':(_RetainedInspectionHistory if saved.get('inspection_material_policy') == 'operations.v3'
+                    else _InspectionHistory).model_json_schema()}})
         package = self._delivery_scope(saved)
         response_model = ((_ClaimDeliveryResponse if saved.get('work_method') in CLAIM_WORK_METHODS else
                            _ScopedDeliveryResponse if saved.get('work_method') in NATIVE_WORK_METHODS else
@@ -4231,7 +4393,8 @@ class InspectionToolGateway:
 
     def call(self, name: str, arguments: dict[str, Any], identity: str, *,
              delivery_context: dict[str, Any] | None = None,
-             prior_required: list[dict[str, Any]] | None = None) -> ToolResult:
+             prior_required: list[dict[str, Any]] | None = None,
+             retained_from: dict[str, Any] | None = None) -> ToolResult:
         try:
             if name != 'inspect_artifacts':
                 raise ValueError('Unknown inspection operation')
@@ -4348,6 +4511,8 @@ class InspectionToolGateway:
                     if self._target_observation(saved, row) is None]
                 if self.adaptive and self.material_observations is not None:
                     self._reuse_observations(saved, remaining)
+                if retained_from is not None:
+                    self._inherit_investigation(saved, retained_from, remaining)
                 saved['initial_subjects'] = [row['subject'] for row in [*saved['targets'],*saved['evidence']]]
             self._mark_evidence(saved)
             saved['prior_required'] = (deepcopy(prior_required) if package and self.finding_policy == 'linked.v1'
