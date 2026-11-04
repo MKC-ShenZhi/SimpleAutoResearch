@@ -2775,6 +2775,11 @@ class InspectionToolGateway:
                 'are historical, not fresh runs. read_history accepts one of these inspection IDs. '
                 'execution_records may support derived as well as executed judgments; only the displayed '
                 'executed_checks have currently eligible input bindings. A failed opinion is not a pass.')
+            if 'source_history' in base:
+                base['source_history']['scope'] = base['source_history']['scope'].replace(
+                    'read_history addresses only this inspection, not the parent task.',
+                    'read_history addresses this inspection and supplied retained inspection IDs; '
+                    'other parent records require ordinary authorized reads.')
         if saved.get('execution_protocol') == 'shared.v1':
             # A primary target is a current material, not permanently pinned
             # prompt text. Its complete read/version proof stays in the source
@@ -2881,6 +2886,9 @@ class InspectionToolGateway:
                     'to page its retained semantic value directly, without replaying offers. Byte offsets address '
                     'a canonical JSON projection, not original formatting. Round/receipt/action hashes and JSON '
                     'pointers identify the immutable originals. Historical output is not current evidence or permission.'}
+            if saved.get('inspection_material_policy') == 'operations.v3':
+                base['history_archive']['scope'] = base['history_archive']['scope'].replace(
+                    'of this inspection only', 'of the selected inspection (default: this inspection)')
         base['reading_scope'] = ('Only the supplied decoded windows were observed. Retired source bodies '
             'remain in the original inspection records; ' + (
                 'use read_history for original observations, including failures and unread tails. Read an '
@@ -3977,6 +3985,16 @@ class InspectionToolGateway:
                 choices(properties['evidence'], sources)
             if nested and 'execution_records' in properties:
                 choices(properties['execution_records'], sorted(self._executed_check_records(saved)))
+                if saved.get('inspection_material_policy') == 'operations.v3':
+                    properties['execution_records']['description'] = (
+                        'Eligible original independent execution records actually used in this judgment, '
+                        'including verified retained runs. Choose only from executed_checks. '
+                        'Retained work remains historical; do not claim it was executed afresh. '
+                        'A derived or observed judgment may also cite relevant actual execution records.')
+                    properties['basis']['description'] = (
+                        'Principal basis of this judgment, not an exclusive category of evidence. '
+                        'State the actual combination of observation, derivation and execution in method '
+                        'and reasoning. An unperformed check remains unresolved.')
         if response_model is _DeliveryResponseLinked or nested:
             choices(schema['properties']['reassessed_prior'], [row['id'] for row in saved['prior_required']])
         return schema

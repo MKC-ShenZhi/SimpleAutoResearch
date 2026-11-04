@@ -667,7 +667,8 @@ class GoalWorkTests(unittest.TestCase):
         latest = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
         self.assertEqual(case.app.session.manifest.status, 'completed', latest.get('error'))
         self.assertEqual(len(case._process_receipts()), 1)
-        self.assertEqual(len(case.app.result_snapshot()['delivery_versions']), 2)
+        self.assertEqual(len([row for row in case.app.result_snapshot()['delivery_versions']
+            if row['status'] == 'retained']), 2)
         owner = case.app.operations.inspection
         saved = owner.store.read_json(owner._path(latest['identity'], 'input'))
         self.assertTrue(owner._executed_check_records(saved))
