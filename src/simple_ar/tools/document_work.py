@@ -55,8 +55,11 @@ class WorkDocumentRequest(BaseModel):
         description='Actual document goal or feedback; the owner investigates the authorized originals.')
     material_roots: list[str] = Field(default_factory=list, max_length=1000,
         description='Additional authorized material roots or current result files. Original task roots supplied by the application remain available.')
-    prior_draft: str = Field(default='', description='Current editable Markdown manuscript to revise.')
-    prior_sha256: str = Field(default='', description='Observed SHA-256 of prior_draft; required for a revision.')
+    prior_draft: str = Field(default='', description='Authorized manuscript FILE LOCATOR, not Markdown content. '
+        'For a supplied draft not yet observed by the caller, omit both prior fields and let the producer '
+        'locate and read the draft in the original task roots.')
+    prior_sha256: str = Field(default='', description='Observed SHA-256 of the prior_draft file locator. '
+        'Use a prior producer result for feedback; do not read or transcribe originals merely to fill this field.')
 
     @model_validator(mode='after')
     def valid_prior(self) -> 'WorkDocumentRequest':

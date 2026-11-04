@@ -554,6 +554,13 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.app = ToolApplication.load(self.root, services=self.services)
         return self.app
 
+    def _retain_flat_fixture(self):
+        """Existing native boundary fixtures keep their production contract."""
+        self.app.state['config']['professional_operations'] = 'work.v5'
+        self.app._save()
+        self.app = ToolApplication.load(self.root, services=self.app.services)
+        return self.app
+
     def test_nonreader_text_does_not_acquire_original_read_provenance(self):
         from simple_ar.core.working_context import select_working_context
         self._create()
@@ -938,6 +945,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             '把已有观察整理成简短的中文 Markdown 说明，保留适用范围即可。',
             model='fixture', sources={'measurements':self.inputs}, services=self.services,
             allow_execution=False, max_turns=12, max_tokens=200000, tool_contracts='full')
+        self._retain_flat_fixture()
         first = '# 结果说明\n\n这些是已提供的观察，尚不支持总体推断。\n'
         self.decisions.extend([
             _action('write_file',path='说明.md',content=first),
@@ -3400,13 +3408,13 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._document_work_chain()
 
     def test_goal_document_owner_produces_checked_versions_and_reuses_work_after_reload(self):
-        self._create(goal='Explain the supplied observations in an editable Markdown note, preserving originals.',
+        self._create(goal='把已有观察整理为中文Markdown说明，保留原材料与适用范围，不需要论文或PDF。',
             current_method=True, delivery_protocol=None, selection_policy='native.v3',
             professional_contract='work.v7')
         self.assertIsNone(self.app.operations.selection)
         self.assertIsNotNone(self.app.operations.implementation)
         self.assertIsNotNone(self.app.operations.document)
-        self._document_work_chain()
+        self._document_work_chain(chinese=True)
 
     def test_saved_v6_keeps_native_production_after_reload(self):
         self._create(goal='Retain the existing native production contract.', current_method=True,
@@ -3418,7 +3426,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.decisions.extend([
             _action('write_file', path='retained.txt', content='Original native contract.\n'),
             _action('ask_user', question='Which part should be continued?')])
-        self._run()
+        self._run(should_stop=lambda: False)
         self.assertEqual((self.root/'workspace/retained.txt').read_text(), 'Original native contract.\n')
         self.assertEqual(self.app.state['config']['professional_operations'], 'work.v6')
         self.assertEqual(self.app.ledger.to_dict()['entries'][:len(prefix)], prefix)
@@ -3468,8 +3476,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual((self.root/'budget_ledger.json').read_bytes(), ledger)
         self.assertEqual(self.send.call_count, calls)
 
-    def _document_work_chain(self):
+    def _document_work_chain(self, *, chinese=False):
         originals = self._versions(self.inputs)
+        scope = ('仅说明已有观察，不支持总体推断。' if chinese else
+                 'This describes the supplied observations only; no population inference is supported.')
 
         def author(view):
             observed = view['observations']
@@ -3478,11 +3488,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     {'path': 'measurements/observations.csv'}, {'path': 'measurements/conditions.txt'}]}
             context = view['work_context']
             prior = view['prior_draft']
-            body = '# Recorded values\n\nThe observed mean is 2.0.\n'
+            body = ('# 观察说明\n\n已有样本均值为2.0。\n' if chinese else
+                    '# Recorded values\n\nThe observed mean is 2.0.\n')
             if prior:
                 self.assertIn('Clarify the scope', context['user_requests'][-1])
                 self.assertTrue(any(row.get('delivery_context') for row in context['professional_findings']))
-                body += '\nThis describes the supplied observations only; no population inference is supported.\n'
+                body += '\n' + scope + '\n'
             return {'action': 'finish', 'manuscript_markdown': body,
                 'selected_observation_ids': [row['id'] for row in observed]}
 
@@ -3506,7 +3517,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(len(self.document_views), 3)  # Reused actual reads, no new investigation request.
         self.assertEqual(self.app.workspace.resolve(manuscript).read_bytes(), initial_bytes)
         self.assertEqual(self._versions(self.inputs), originals)
-        self.assertIn('no population inference', revision['data']['markdown'])
+        self.assertIn(scope, revision['data']['markdown'])
         self._submit(_action('deliver_result', **self._delivery(revision['data']['manuscript'])))
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         ledger, calls = (self.root/'budget_ledger.json').read_bytes(), self.send.call_count
@@ -5205,6 +5216,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.app = ToolApplication.create(self.root, 'Read the supplied CSV and deliver a short Markdown account.',
                 model='profile:offline', sources={'measurements':self.inputs},
                 max_turns=30, max_tokens=900000, max_attempts=100, tool_contracts='full')
+            self._retain_flat_fixture()
             def terminated_decision(*args, **kwargs):
                 raise LLMStreamError('Controlled one-attempt native response loss')
             self.send.side_effect = terminated_decision
@@ -6366,6 +6378,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             max_turns=1, max_tokens=200000, max_attempts=10, tool_contracts='full')
         # Saved available_operations.v2 tasks keep their historical final batch.
         # New goal.v1 tasks exercise executable partial closure separately.
+        self.app.state['config']['professional_operations'] = 'work.v5'
         self.app.state['config'].pop('work_method', None)
         self.app.state['config'].pop('inspection_material_policy', None)
         self.app.state['config'].pop('work_selection_policy', None)
@@ -6455,6 +6468,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.app = ToolApplication.create(self.root,'Prepare a useful note; explain any remaining work.',
             model='fixture',services=self.services,sources={},max_turns=1,max_tokens=100000,
             max_attempts=10,tool_contracts='full',completion_policy='available_operations.v1')
+        self._retain_flat_fixture()
         self.assertEqual(self.app._completion_floor(self.app._client()), {})
         self.decisions.append(_action('write_file',path='note.md',content='Saved work, not a completed task.'))
         result=self._run()
