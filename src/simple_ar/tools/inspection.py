@@ -16,7 +16,7 @@ from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.budget import completed_llm_usage_is_accounted
 from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES, TURN_SUPPLY_POLICY
 from simple_ar.integrations.llm import LLMCallStopped, LLMSettings, estimate_tokens
-from simple_ar.tools.specs import CommonToolSpec, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS, CLAIM_WORK_METHODS, tool_result_payload
+from simple_ar.tools.specs import CommonToolSpec, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS, CLAIM_WORK_METHODS, GOAL_WORK_METHOD, tool_result_payload
 from simple_ar.tools.workspace import FileWindow, workspace_tool_specs
 from simple_ar.tools.materials import lossless_text_window
 from simple_ar.tools.delivery_review import applicable_delivery_scope, reassessment_has_subject_support
@@ -3228,6 +3228,7 @@ class InspectionToolGateway:
                     required_decision_tokens=checkpoint_input['decision_tokens'], additional_protection=True,
                     native_supply_policy=saved.get('native_supply_policy'),
                     economic_floor=checkpoint_input.get('economic_floor'),
+                    note_contract='knowledge.v1' if saved.get('work_method') == GOAL_WORK_METHOD else None,
                     completed_retry=True)
                 return {'snapshot':snapshot, 'artifacts':[ref.to_dict() for ref in refs]}
 
@@ -3253,7 +3254,8 @@ class InspectionToolGateway:
                         requests=saved.get('user_requests', [request.goal]), previous=memory, rows=pending,
                         target=checkpoint_input['context_input_tokens'],
                         estimate_tokens=estimate_tokens, native_supply_policy=saved.get('native_supply_policy'),
-                        economic_floor=checkpoint_input.get('economic_floor'))
+                        economic_floor=checkpoint_input.get('economic_floor'),
+                        note_contract=view.get('note_contract'))
                     if view != expected:
                         raise ValueError('Inspection checkpoint differs from its retained preparation')
                     snapshot = store.read_json('memory_snapshot.json') if store.exists('memory_snapshot.json') else None
@@ -3335,6 +3337,7 @@ class InspectionToolGateway:
                     estimate_tokens=estimate_tokens, attempt_id=saved['identity'],
                     call_id=f"working-memory-{saved['identity']}-sources-{number}",
                     native_supply_policy=saved.get('native_supply_policy'),
+                    note_contract='knowledge.v1' if saved.get('work_method') == GOAL_WORK_METHOD else None,
                     economic_floor=(value.projection['required_input_tokens']
                         if value.projection.get('economical_compaction') else None),
                     required_decision_tokens=decision_tokens, additional_protection=True)

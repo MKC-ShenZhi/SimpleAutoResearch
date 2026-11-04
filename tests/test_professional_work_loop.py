@@ -5821,6 +5821,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         checkpoints = [owner.store.read_json(owner._path(identity, f'sources-{number}')).get('checkpoint', {})
             for number in range(len(saved['source_rounds']))]
         self.assertTrue(any(checkpoints))
+        checkpoint_inputs = [owner.store.read_json(path) for number in range(len(saved['source_rounds']))
+            if owner.store.exists(path := f'tools/inspection/{identity}/sources-{number}/memory_input.json')]
+        self.assertTrue(checkpoint_inputs)
+        self.assertTrue(all(view['note_contract']=='knowledge.v1' for view in checkpoint_inputs))
         memory = owner._conversation_memory(saved, owner._conversation_rows(saved))
         self.assertTrue(memory['notes'])
         self.assertTrue(memory['compacted_records'])
