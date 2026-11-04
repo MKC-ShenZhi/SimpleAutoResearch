@@ -2475,6 +2475,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                         max_turns=70, max_tokens=900000, max_attempts=180)
                     # Keep this saved checkpoint-purchase fixture's method and
                     # pressure; default operation discovery is tested separately.
+                    self.app.state['config']['professional_operations'] = 'work.v5'
                     self.app.state['config']['work_method'] = 'goal.v1'
                     self.app.state['config'].pop('inspection_material_policy', None)
                     self.app.state['config'].pop('work_selection_policy', None)

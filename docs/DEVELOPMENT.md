@@ -42,9 +42,12 @@ All operations use the same execution records and resource accounting. Task-loca
 scripts can provide a parser, calculation or plot when an existing operation is
 insufficient; they remain subject to the task's permissions.
 
-Ordinary tasks call native operations directly through the shared queue, without
-an additional action-list interpreter. An explicit delivery checks the actual
-version; a partial exit discloses the obstacle and unfinished requirements.
+Ordinary tasks dispatch source and document work from the goal and authorized
+materials. Producers investigate and return editable, version-bound candidates;
+the shared native queue owns subsequent work, approved execution and delivery.
+Fine-grained operations remain explicitly loadable for direct work. An explicit
+delivery independently checks the actual version; a partial exit discloses the
+obstacle and unfinished requirements. No additional action-list interpreter is used.
 Recorded work supplies observations, not an inherited action agenda. Saved tasks
 retain their original selection contract.
 
