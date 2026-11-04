@@ -1298,10 +1298,6 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 actions = action if isinstance(action, list) else [action]
                 if offered == {'select_work'}:
                     from tests.report_review_fixtures import goal_work_decision
-                    view = json.loads(request['messages'][1]['content'])
-                    available = {row['function']['name'] for row in view['work_selection']['operations']}
-                    for item in actions:
-                        self.assertIn(item['tool_name'], available | {'select_work'})
                     actions = goal_work_decision(actions, self.app.state['requests'])
                 for item in actions:
                     self.assertIn(item['tool_name'], offered)

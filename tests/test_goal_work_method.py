@@ -130,6 +130,19 @@ class GoalWorkTests(unittest.TestCase):
         legacy = {'remaining':[{'request_index':0,'quote':'Original request','finding_id':'',
             'missing_outcome':'Old retained choice.'}], 'actions':[], 'candidate':None}
         self.assertIsNone(WorkChoice.model_validate(legacy).candidate)
+        for closing in (False, True):
+            offered = self.case.app._closing_schemas() if closing else self.case.app.schemas
+            names = set(offered[0]['function']['parameters']['$defs']['WorkOperation']
+                ['properties']['tool_name']['enum'])
+            supplied = {row['function']['name'] for row in
+                self.case.app._selection_context(closing=closing)['operations']}
+            self.assertEqual(names, supplied)
+            self.assertFalse(names & {'deliver_result','review_result','select_work'})
+            if closing:
+                self.assertEqual(names, {'ask_user'})
+        closing_text = self.case.app._system_text(closing=True)
+        self.assertIn('candidate.unresolved', closing_text)
+        self.assertIn('actions empty', closing_text)
 
     def test_production_hands_off_candidate_across_approval_reload_and_feedback_without_reexecution(self):
         case = self.case
@@ -380,6 +393,7 @@ class GoalWorkTests(unittest.TestCase):
         self.assertTrue(ordinary <= offered)
         self.assertFalse({'review_result', 'inspect_artifacts'} & offered)
         self.assertIn('inspect_artifacts', case.app._specialist_catalog())
+        self.assertNotIn('review_result', case.app._specialist_catalog())
         case._submit(_action('load_tools', names=['inspect_artifacts']))
         case._submit(_action('read_file', path='measurements/observations.csv'))
         case._reload()

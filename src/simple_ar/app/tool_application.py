@@ -926,7 +926,10 @@ class ToolApplication:
         return result
 
     def _specialist_catalog(self) -> dict[str, dict[str, str]]:
-        return self._contract_presentation()[1]
+        catalog = self._contract_presentation()[1]
+        selection = getattr(self.operations, 'selection', None)
+        return {name:row for name,row in catalog.items()
+            if selection is None or name not in selection.handoff_operations}
 
     def _contract_presentation(self) -> tuple[set[str], dict[str, dict[str, str]]]:
         """One partition for active schemas and the existing loadable directory."""
@@ -2509,7 +2512,9 @@ class ToolApplication:
         if self.operations is not None:
             exit_text = (_OPERATION_EXIT_DECISION
                 if self.state['config'].get('completion_policy') == _OPERATION_EXIT else _CLOSING_DECISION)
-            if self.state['config'].get('work_method') in NATIVE_WORK_METHODS:
+            if getattr(self.operations, 'selection', None) is not None:
+                exit_text = self.operations.selection.closing_system
+            elif self.state['config'].get('work_method') in NATIVE_WORK_METHODS:
                 exit_text = ('This is the last affordable decision. Use exactly one offered delivery '
                     'or indispensable question. Do not propose further reads, edits or computations. '
                     'Reuse an applicable existing review for complete delivery; otherwise deliver '
