@@ -462,7 +462,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
 
     def _create(self, *, report=False, allow_execution=True, delivery_files=None, context_protocol='auto', goal=None,
                 saved_scope=False, delivery_protocol='task.v4', current_method=False, selection_policy=None,
-                professional_contract='work.v5'):
+                professional_contract='work.v5', tool_contracts='full'):
         if saved_scope:
             from tests.native_history_fixture import load_prepared_operation_history
             self.app = load_prepared_operation_history(self.root, goal or 'Continue the saved professional work.',
@@ -486,7 +486,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             goal or ('Explain the supplied observations with an editable report, table and figure; '
             'preserve originals and disclose the limits of the evidence.'),
             model='fixture', sources={'measurements': self.inputs}, services=self.services,
-            allow_execution=allow_execution, tool_contracts='full',
+            allow_execution=allow_execution, tool_contracts=tool_contracts,
             max_turns=70, max_tokens=900000, max_attempts=180,
             process_limits={'process_invocations': 48, 'process_wall_seconds': 360}, **options)
         saved_config = deepcopy(self.app.state['config'])
@@ -3577,7 +3577,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
 
     def test_shared_source_batches_interleave_execution_return_and_feedback_on_one_journal(self):
         self._create(goal='Compute the supplied mean, retain reusable files and explain the evidence limits.',
-            current_method=True, delivery_protocol=None, selection_policy='native.v3', professional_contract='work.v10')
+            current_method=True, delivery_protocol=None, selection_policy='native.v3', professional_contract='work.v10',
+            tool_contracts='on_demand')
         (self.inputs/'calculate.py').write_text("import csv\nfrom pathlib import Path\n"
             "rows=list(csv.DictReader(Path('observations.csv').open()))\n"
             "values=[float(r['value']) for r in rows]\n"
@@ -3587,13 +3588,22 @@ class OperationsWorkLoopTests(unittest.TestCase):
         originals = self._versions(self.inputs)
         self.native_source_requests = []
 
+        def discover():
+            request = self.send.call_args.kwargs.get('request') or self.send.call_args.args[1]
+            offered = {row['function']['name'] for row in request['tools']}
+            self.assertTrue({'read_history', 'load_tools', 'return_source_work'} <= offered)
+            self.assertNotIn('inspect_table', offered)
+            return _action('load_tools', names=['inspect_table'])
+
         def read_batch():
             request = self.send.call_args.kwargs.get('request') or self.send.call_args.args[1]
             self.native_source_requests.append(deepcopy(request))
             offered = {row['function']['name'] for row in request['tools']}
             self.assertIn('return_source_work', offered)
+            self.assertTrue({'read_history', 'load_tools', 'inspect_table'} <= offered)
             self.assertFalse({'work_document', 'deliver_result', 'prepare_implementation'} & offered)
-            return [_action('read_file', path='measurements/'+name, full_digest=True) for name in names]
+            return [*[_action('read_file', path='measurements/'+name, full_digest=True) for name in names],
+                _action('inspect_table', path='measurements/observations.csv')]
 
         def copy_batch():
             reads = {Path(row['data']['absolute_path']).name: row['data'] for row in self._observations('read_file')}
@@ -3609,7 +3619,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.decisions.extend([
             _action('prepare_implementation', goal='Calculate and interpret the supplied mean.',
                 material_roots=['measurements'], project_path='measurements'),
-            read_batch, copy_batch,
+            discover, read_batch, copy_batch,
+            _action('read_history', start_turn=1, end_turn=4),
             _action('run_process', argv=['python','calculate.py'], cwd='workspace/working',
                 inputs=['working/calculate.py','working/observations.csv'], outputs=['working/result.txt'], timeout_sec=3),
             _action('read_file', path='working/result.txt'), interpret,
@@ -3625,12 +3636,17 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertEqual(active.get('kind'), 'tool', self.app.result_snapshot())
             self.assertEqual(active['call']['function']['name'], 'run_process')
             self.assertEqual(self.app._coordinator_purpose(), 'code')
+            self._ok('load_tools')
+            self._ok('read_history')
+            self.assertEqual(self._ok('inspect_table')['data']['row_count'], 3)
             self.assertEqual(len(self._observations('copy_file')), 4)
             self.assertFalse((self.root/'workspace/working/result-notes.md').exists())
             self.assertFalse(self._process_receipts())
             prefix = deepcopy(self.app.ledger.to_dict()['entries'])
             token = self.app.approval_token(active['call'])
             self._reload()
+            self.assertTrue({'load_tools', 'read_history', 'inspect_table'} <=
+                {row['function']['name'] for row in self.app.operation_schemas})
             self._run(approved_execution=token)
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         self.assertEqual(self.app._coordinator_purpose(), 'task')
@@ -3682,7 +3698,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG':str(catalog), 'SAR_OFFLINE_TEST_KEY':'offline'}))
         self.app = ToolApplication.create(self.root, 'Prepare reusable source only; preserve useful partial files if interrupted.',
             model='profile:offline', sources={'measurements':self.inputs}, allow_execution=True,
-            max_turns=30, max_tokens=900000, max_attempts=100, tool_contracts='full')
+            max_turns=30, max_tokens=900000, max_attempts=100, tool_contracts='on_demand')
         self._submit(_action('prepare_implementation', goal='Retain the supplied conditions and an editable account.',
             material_roots=['measurements'], execution_requested=False))
         self._read('measurements/conditions.txt')
@@ -3709,6 +3725,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         ledger, calls = self.app.ledger.to_dict(), self.send.call_count
         self.app = ToolApplication.load(self.root)
         self.assertEqual(self.app._coordinator_purpose(), 'code')
+        offered = {row['function']['name'] for row in self.app.operation_schemas}
+        self.assertTrue({'read_history', 'load_tools'} <= offered)
+        self.assertNotIn('run_process', offered)
         self._run()
         self.assertEqual(self.send.call_count, calls)
         self.assertEqual(self.app.ledger.to_dict(), ledger)

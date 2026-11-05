@@ -473,6 +473,8 @@ class OperationTools:
         if contract == 'work.v10':
             active = self.work is not None and self.work.selected() is not None
             if active:
+                if spec.name in {'read_history', 'load_tools'}:
+                    return True  # Shared journal/discovery services do not transfer task control.
                 if spec.name == self.work.return_tool:
                     return True
                 if spec.name in {self.work.entry_tool, 'deliver_result', 'review_result'}:

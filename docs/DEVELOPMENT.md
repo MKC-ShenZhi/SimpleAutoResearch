@@ -72,6 +72,7 @@ Saved bindings retain their original asset behavior.
 Source producers use the common workspace copy and edit operations; copied bytes
 do not count as a content inspection. Their detailed source operations stay in the
 journal while coordination receives the returned versions, interpretation and gaps.
+The shared history reader and optional-tool discovery remain available inside source work.
 Assignments and check recipes are revisable working choices, not new user requirements.
 Saved source generators retain their original execution and recovery behavior.
 Read-only directory navigation remains available for routing work; it is not source
