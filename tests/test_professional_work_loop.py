@@ -3422,8 +3422,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def test_delivery_owns_new_coordination_checks_while_explicit_and_saved_inspection_work(self):
         self._create(goal='Review the supplied observation scope and deliver an opinion.', current_method=True,
             delivery_protocol=None, selection_policy='native.v3', professional_contract='work.v8')
-        view = json.loads(self.app._messages()[1]['content'])
-        self.assertNotIn('inspect_artifacts', view['available_specialists'])
+        offered = {row['function']['name'] for row in self.app.operation_schemas}
+        self.assertNotIn('inspect_artifacts', offered)
         self._submit(_action('load_tools', names=['inspect_artifacts']))
         self.assertEqual(self._last('load_tools')['status'], 'blocked')
         self.assertIn('deliver_result', self._last('load_tools')['error'])
