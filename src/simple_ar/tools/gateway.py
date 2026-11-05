@@ -136,6 +136,17 @@ class CommonToolGateway:
         check = getattr(owner, 'requires_followup', None)
         return bool(check and check(name, arguments))
 
+    def local_continuation(self, name: str | None = None) -> bool:
+        """An explicitly composed owner may sequence only its own operations.
+
+        Historical owners without this port retain the saved application gate.
+        No new dispatcher, authority or durable continuation state is created.
+        """
+        if name is not None:
+            owner = self.domain_owner(name)
+            return name in getattr(owner, 'local_continuations', ())
+        return any(getattr(owner, 'local_continuations', ()) for owner in self._domain_gateways.values())
+
     def professional_action(self, observed: dict, source: str, *, resume: bool,
                             consume_outcome: bool) -> tuple[Any, dict | None]:
         """Ask existing receipt owners; scheduling and authorization stay outside.

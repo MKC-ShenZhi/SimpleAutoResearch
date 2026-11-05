@@ -288,14 +288,17 @@ def registered_project_files(workspace: Any, prior: dict, *, inventory: bool = F
 
 def preserved_file_bytes(workspace: Any, binding: dict) -> bytes:
     """Read an owner-bound, bounded regular dependency without text conversion."""
-    if (not isinstance(binding, dict) or set(binding) != {'path', 'sha256', 'size_bytes'}
-            or type(binding['size_bytes']) is not int or not 0 <= binding['size_bytes'] <= 256000):
+    versioned = isinstance(binding, dict) and binding.get('copy_contract') == 'material_copy.v1'
+    fields = {'path', 'sha256', 'size_bytes'} | ({'copy_contract'} if versioned else set())
+    limit = 12 * 256000 if versioned else 256000
+    if (not isinstance(binding, dict) or set(binding) != fields
+            or type(binding['size_bytes']) is not int or not 0 <= binding['size_bytes'] <= limit):
         raise ValueError('Invalid preserved input binding')
     source = workspace.resolve_material_root(binding['path'])
     if not source.is_file():
         raise ValueError('Preserved input must remain a regular file')
     with source.open('rb') as handle:
-        raw = handle.read(256001)
+        raw = handle.read(limit + 1)
     if len(raw) != binding['size_bytes'] or hashlib.sha256(raw).hexdigest() != binding['sha256']:
         raise ValueError('Preserved input changed; retain the original candidate without replay')
     return raw
@@ -373,13 +376,15 @@ class ImplementationSources:
                  inherited_observations: list[dict] | None = None,
                  inherited_coverage: dict | None = None,
                  source_owner_paths: set[str] | None = None,
-                 input_contract: str | None = None, edit_contract: str | None = None) -> None:
+                 input_contract: str | None = None, edit_contract: str | None = None,
+                 material_copies: bool = False) -> None:
         from simple_ar.tools.materials import material_inventories, material_observation_seed
         preserved_input_limits(input_contract)
         if edit_contract not in (None, 'bound_content.v1'):
             raise ValueError('Unknown source edit contract')
         self.edit_contract = edit_contract
         self.input_contract = input_contract
+        self.material_copies = material_copies
         self.workspace, self.project, self.identity = workspace, project, identity
         if project is not None and registered_project is None and not retained and preserved_files is None:
             registered_project = ordinary_project_snapshot(workspace, project)
@@ -556,6 +561,32 @@ class ImplementationSources:
         self.windows[:] = [row for row in self.windows
             if 'request' not in row or row['observation_ref'] in keep]
 
+    def progress_state(self) -> tuple:
+        """Actual observation history and effective view, not action spelling."""
+        return len(self.observations), tuple(sorted(row['observation_ref'] for row in self.windows
+            if 'request' in row))
+
+    def material_original(self, destination: str, locator: str) -> dict:
+        """Bind a selected authorized text input to a new editable copy.
+
+        Copying bytes is not reading them for evidence. Original-read coverage
+        still governs whole replacements of the staged source.
+        """
+        if not self.material_copies:
+            raise ValueError('This saved source contract cannot stage external materials')
+        # Validate destination conflicts and immutable registered members before
+        # binding another source to it. No candidate or input is written here.
+        originals, _ = self.bind_response({'files': [{'path': destination}]}, commit=False)
+        source = self.workspace.resolve_material_root(locator)
+        if str(source) not in self.visible or not source.is_file():
+            raise ValueError('Editable copy requires an authorized inventory file')
+        digest = self.workspace.artifact_hashes([str(source)])[str(source)]
+        bound = bind_implementation_originals([{'path': destination, 'source_path': str(source),
+            'source_sha256': digest}], resolve_source=self.workspace.resolve)[destination]
+        if destination in originals and originals[destination] != bound:
+            raise ValueError('Staging cannot replace an existing bound source identity')
+        return bound
+
     def context(self) -> dict:
         from simple_ar.tools.materials import material_seed_coverage
         coverage = (material_seed_coverage({'coverage': self.seed_coverage})
@@ -660,14 +691,24 @@ class ImplementationSources:
             source = self.workspace.resolve_material_root(item['source'])
             if str(source) not in self.visible or not source.is_file():
                 raise ValueError('Preserved source is outside the authorized file inventory')
-            if self.visible[str(source)] > 256000:
-                raise ValueError('Preserved dependency exceeds 256000 bytes')
-            observed = self.workspace.call('read_file', {'path': str(source), 'max_bytes': 1,
-                'full_digest': True}, identity=self.identity)
-            if not observed.ok:
-                raise ValueError(f'Preserved source unavailable: {observed.error}')
-            bound = {'path': str(source), 'sha256': observed.data['sha256'],
-                'size_bytes': observed.data['size_bytes']}
+            if self.material_copies:
+                # Binary copies spend the existing total input allowance, not
+                # the editable-text per-file allowance. Old bindings stay frozen.
+                _, limit = preserved_input_limits(self.input_contract)
+                if source.stat().st_size > limit:
+                    raise ValueError('Preserved material exceeds the input copy allowance')
+                bound = {'path': str(source),
+                    'sha256': self.workspace.artifact_hashes([str(source)])[str(source)],
+                    'size_bytes': source.stat().st_size, 'copy_contract': 'material_copy.v1'}
+            else:
+                if self.visible[str(source)] > 256000:
+                    raise ValueError('Preserved dependency exceeds 256000 bytes')
+                observed = self.workspace.call('read_file', {'path': str(source), 'max_bytes': 1,
+                    'full_digest': True}, identity=self.identity)
+                if not observed.ok:
+                    raise ValueError(f'Preserved source unavailable: {observed.error}')
+                bound = {'path': str(source), 'sha256': observed.data['sha256'],
+                    'size_bytes': observed.data['size_bytes']}
             preserved_file_bytes(self.workspace, bound)
             if name in copied and copied[name] != bound:
                 raise ValueError('Immutable preserved dependency cannot be replaced during feedback')

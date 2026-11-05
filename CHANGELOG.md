@@ -12,6 +12,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - Document work retains draft text and original observations through correctable selection errors. Referenced local assets keep their paths and version-bound copies across revisions, and unresolved local links are checked before output. Copy relationships enter shared provenance; exact text measurements support local revision, and coordination receives the actual candidate without a separate viewing inspection. Independent delivery checks and saved receipt recovery remain distinct.
 - Ordinary coordination can use read-only directory navigation to route work without misusing analysis or inspection tools for discovery; file production remains with its existing owners.
 - Ordinary coordination submits candidates to delivery's independent investigation instead of scheduling separate local audits. Standalone inspection APIs and saved task routes remain available.
+- Source work returns a candidate, its approved execution and supported result interpretation through the shared queue. Local failures return to goal coordination. Authorized source copies avoid retransmission, binary copies use the existing total allowance, and useful working-view changes no longer count as stagnant reads. Saved source contracts keep their original behavior.
 
 ### Fixed
 

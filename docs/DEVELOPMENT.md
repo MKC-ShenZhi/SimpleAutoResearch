@@ -45,8 +45,11 @@ POSIX command startup enters process-group supervision before switching to the
 approved working directory and executable; the original argv and environment are preserved.
 
 Ordinary tasks dispatch source and document work from the goal and authorized
-materials. Producers investigate and return editable, version-bound candidates;
-the shared native queue owns subsequent work, approved execution and delivery.
+materials. Source work includes preparation, exact approved execution and a supported
+interpretation of the actual results through the shared native queue. Source-only
+requests remain available. Local failures return their candidate and gaps to the
+goal loop rather than imposing another task-wide stop or repair controller.
+Producers return editable, version-bound candidates; delivery owns independent acceptance.
 File-level operations belong to producers and inspectors; explicit caller APIs
 remain available. Loading a schema cannot transfer that responsibility to the
 coordinating model. Document work can preview literal text measurements and revise
@@ -63,6 +66,10 @@ Revisions retain referenced local files at their bound relative paths, including
 data and source links. CommonMark local references must resolve to planned outputs
 before materialization; missing links return to the same producer with its draft intact.
 Saved bindings retain their original asset behavior.
+Source producers can stage authorized text inputs as editable copies without
+retransmitting them; copying does not count as reading the original. Binary inputs
+use the existing total copy allowance. Source investigation measures changes to
+the effective working view as well as new observations, while bounding repeated views.
 Read-only directory navigation remains available for routing work; it is not source
 evidence or a required preliminary inventory for every producer.
 Ordinary coordination submits actual candidates to delivery for independent

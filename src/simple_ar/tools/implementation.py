@@ -269,9 +269,18 @@ def implementation_tool_specs(*, exact: bool = False,
                 'records, gaps and an execution_plan when execution_requested (default true). Execution '
                 'requires a separate explicitly approved execute_implementation. No automatic continuation '
                 'or scientific/visual certification.')
-            if source_owner_contract == 'source_owner.v2':
+            if source_owner_contract in {'source_owner.v2', 'source_owner.v3'}:
                 specs[0].description += (' Accumulate candidate file edits within this operation; '
                     'final submission references current draft versions rather than retransmitting all source.')
+            if source_owner_contract == 'source_owner.v3':
+                specs[0].description = ('Complete a scoped code, analysis or figure work unit from its goal '
+                    'and authorized project/material roots. The source owner investigates, stages or edits '
+                    'actual source bytes and proposes a candidate. When execution_requested (default true), '
+                    'the existing queue requests exact execution approval, runs that candidate and returns '
+                    'the source owner\'s supported interpretation of its actual results. False requests '
+                    'source only. All phases share the original records and budget. Failures retain their '
+                    'candidate, observations and gaps for a deliberate revision; no physical retry, automatic '
+                    'repair loop, independent acceptance or overall-task completion is implied.')
         return specs
     from simple_ar.tools.implementation_findings import InvestigationRequest
     return [CommonToolSpec(name='investigate_implementation', domain='implementation',
@@ -290,14 +299,21 @@ def implementation_tool_specs(*, exact: bool = False,
 
 
 def _source_owner_options(contract: str | None, *, preparation_only: bool, exact: bool) -> None:
-    if contract not in (None, 'source_owner.v1', 'source_owner.v2'):
+    if contract not in (None, 'source_owner.v1', 'source_owner.v2', 'source_owner.v3'):
         raise ValueError('Unknown source owner contract')
-    if contract and (not preparation_only or exact):
+    if contract and (exact or not preparation_only and contract != 'source_owner.v3'):
         raise ValueError('Source ownership requires ordinary preparation-only composition')
 
 
 class ImplementationToolGateway:
+    @property
+    def local_continuations(self) -> frozenset[str]:
+        return (frozenset({'prepare_implementation', 'execute_implementation', 'investigate_implementation'})
+            if self.source_owner_contract == 'source_owner.v3' else frozenset())
+
     def requires_followup(self, name: str, arguments: dict) -> bool:
+        if self.source_owner_contract == 'source_owner.v3' and name == 'prepare_implementation':
+            return arguments.get('execution_requested', True)
         if self.preparation_only:
             return False
         if name == 'prepare_implementation':
@@ -371,6 +387,8 @@ class ImplementationToolGateway:
             **({'metadata': {'material_observations': observations}} if isinstance(observations, list) else {})}
 
     def continuation_attempts(self, name: str, arguments: dict) -> int:
+        if self.source_owner_contract == 'source_owner.v3':
+            return 3 if name == 'prepare_implementation' and arguments.get('execution_requested', True) else 1
         if self.preparation_only:
             return 1
         # Complete preparation needs a subsequent execution in this same session.
@@ -380,6 +398,8 @@ class ImplementationToolGateway:
 
     def continuation(self, observed: dict[str, Any], attempt_id: str) -> dict[str, Any] | None:
         """Read-only next action from accepted receipts; caller owns scheduling/approval."""
+        if self.source_owner_contract == 'source_owner.v3':
+            return self._source_work_continuation(observed, attempt_id)
         if self.preparation_only:
             return None
         if observed.get('tool_name') == 'investigate_implementation':
@@ -393,8 +413,48 @@ class ImplementationToolGateway:
         from simple_ar.tools.implementation_work import continuation
         return continuation(self, observed, attempt_id)
 
+    def _source_work_continuation(self, observed: dict, attempt_id: str) -> dict | None:
+        """Bind preparation, execution and interpretation in the one common queue.
+
+        A local failure is a work result, never a new global stop/repair policy.
+        Old complete-work callers keep their saved continuation contract.
+        """
+        from simple_ar.tools.professional_outcomes import accepted_native_result
+        from simple_ar.tools.implementation_work import _execution, _request
+        from simple_ar.tools.implementation_run import execution_binding, candidate_source
+        try:
+            accepted_native_result(self.root, self.session_id, observed, attempt_id, ledger=self.ledger)
+            if observed.get('status') != 'ok' or observed.get('error'):
+                return None
+            if observed['tool_name'] == 'prepare_implementation':
+                locator = f'records/{attempt_id}/implementation/result.json'
+                if observed['data'].get('prepared_result') != locator:
+                    return None
+                _, _, binding = candidate_source(self, locator)
+                request, _ = _request(self, locator)
+                if binding.get('source_owner_contract') != 'source_owner.v3' or not request.complete_work:
+                    return None
+                arguments = {'prepared_result': locator}
+                execution_binding(self, arguments, identity=attempt_id)
+                return {'tool_name': 'execute_implementation', 'arguments': arguments}
+            if observed['tool_name'] == 'execute_implementation':
+                locator = f'records/{attempt_id}/candidate_execution.json'
+                record, _ = _execution(self, locator, successful=True)
+                _, _, binding = candidate_source(self, record['prepared_result'])
+                request, _ = _request(self, record['prepared_result'])
+                if (binding.get('source_owner_contract') == 'source_owner.v3'
+                        and request.result_investigation is not None):
+                    return {'tool_name': 'investigate_implementation', 'arguments': {'execution_ref': locator}}
+        except (OSError, ValueError, KeyError, TypeError):
+            # No proven admitted next action: keep the original receipt and let
+            # the common goal loop assess its gaps. Never replay uncertain work.
+            return None
+        return None
+
     def resume_after_budget(self, observed: dict[str, Any], attempt_id: str) -> dict[str, Any] | None:
         """Read-only proposal after the caller's newly saved resource grant."""
+        if self.source_owner_contract == 'source_owner.v3':
+            return None  # New resources do not silently reissue a source-work request.
         if self.preparation_only:
             return None
         if observed.get('tool_name') != 'prepare_implementation':
@@ -404,6 +464,8 @@ class ImplementationToolGateway:
 
     def consume_outcome(self, observed: dict, source: str) -> dict | None:
         """Accept an actual joint-review defect for its unique code producer."""
+        if self.source_owner_contract == 'source_owner.v3':
+            return None  # Coordination deliberately routes the bound finding to a revision.
         if self.preparation_only:
             return None
         if observed.get('tool_name') != 'compose_document':
@@ -489,9 +551,9 @@ class ImplementationToolGateway:
         store = ArtifactStore(self.root / 'attempts' / identity / 'implementation')
         if name == 'prepare_implementation' and store.exists('result.json'):
             return True
-        if name == 'prepare_implementation' and self.source_owner_contract == 'source_owner.v2':
+        if name == 'prepare_implementation' and self.source_owner_contract in {'source_owner.v2', 'source_owner.v3'}:
             try:
-                if store.read_json('request.json').get('source_owner_contract') != 'source_owner.v2':
+                if store.read_json('request.json').get('source_owner_contract') != self.source_owner_contract:
                     return False
                 from simple_ar.code_task.generation.candidate_draft import retained_submission
                 retained_submission(store.root, self.ledger, identity)
@@ -533,14 +595,14 @@ class ImplementationToolGateway:
             raise ValueError('Unknown source edit contract')
         if decision_protocol not in (None, 'native.v1'):
             raise ValueError('Unknown source decision protocol')
-        if decision_protocol is not None and not preparation_only:
+        if decision_protocol is not None and not preparation_only and source_owner_contract != 'source_owner.v3':
             raise ValueError('Native source decisions require ordinary source preparation')
-        if input_contract is not None and not preparation_only:
+        if input_contract is not None and not preparation_only and source_owner_contract != 'source_owner.v3':
             raise ValueError('Independent input admission requires ordinary source preparation')
         self.root, self.workspace, self.ledger = root, workspace, ledger
         self.model, self.session_id = model, session_id
         self.declaration_review = declaration_review
-        self.professional_requests = professional_requests
+        self.professional_requests = professional_requests or source_owner_contract == 'source_owner.v3'
         self.preparation_only = preparation_only
         self.source_owner_contract = source_owner_contract
         self.input_contract = input_contract
@@ -1642,15 +1704,18 @@ class ImplementationToolGateway:
                 return investigate_execution(self, arguments, identity=identity)
             if name != 'prepare_implementation' or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
                 raise ValueError('Invalid implementation invocation')
-            if self.preparation_only:
+            if self.preparation_only or self.source_owner_contract == 'source_owner.v3':
                 # Validate the public boundary before translating to the existing
                 # engine. Even false/default historical controls are forbidden.
                 narrow = ImplementationPreparationRequest.model_validate(arguments)
                 # Freeze current producer semantics internally: author notes are
                 # review leads; actual execution/version/findings checks still apply.
                 request = ImplementationRequest.model_validate({**narrow.model_dump(),
-                    'complete_work': False, 'max_repairs': 0,
+                    'complete_work': self.source_owner_contract == 'source_owner.v3' and narrow.execution_requested,
+                    'max_repairs': 0,
                     'producer_completion': 'goal_findings.v1',
+                    **({'work_contract': 'shared.v2', 'result_investigation': 'execution_findings.v1'}
+                        if self.source_owner_contract == 'source_owner.v3' and narrow.execution_requested else {}),
                     **({'candidate_admission': 'python_candidate_admission.v1'}
                         if self.input_contract else {})})
             else:
@@ -1686,7 +1751,7 @@ class ImplementationToolGateway:
                     raise ValueError('Immutable candidate inputs require registered feedback with files omitted; '
                         'explicit file selection cannot drop or reclassify preserved data')
             if output.exists() and not owner.exists('result.json') and not (
-                    self.source_owner_contract == 'source_owner.v2' and owner.exists('request.json')):
+                    self.source_owner_contract in {'source_owner.v2', 'source_owner.v3'} and owner.exists('request.json')):
                 raise ValueError('Candidate output already exists without a completed receipt; inspect it and use a new identity')
             from simple_ar.tools.implementation_preparation import (
                 PROFESSIONAL_GENERATION, REGISTERED_PROJECT_GENERATION, prepare_work,
@@ -1704,7 +1769,8 @@ class ImplementationToolGateway:
             professional_project = (self.professional_requests and project is not None
                 and not request.files and self.exact is None)
             if method in {PROFESSIONAL_GENERATION, REGISTERED_PROJECT_GENERATION} or (
-                    not historical and (request.complete_work or professional_project or self.preparation_only)):
+                    not historical and (request.complete_work or professional_project or self.preparation_only
+                        or self.source_owner_contract == 'source_owner.v3')):
                 return prepare_work(self, request, owner, output, project, identity, repair_observation)
             retained_request = (owner.read_json('request.json').get('request') if owner.exists('request.json')
                 else owner.read_json('selection-input.json').get('request') if owner.exists('selection-input.json') else None)

@@ -45,6 +45,10 @@ class CandidateDraft:
                 expected = saved['request'].get('expected_sha256', '')
                 if expected != self.files.get(name, ''):
                     raise ValueError('Retained candidate mutation chain changed; no replay')
+                if saved.get('source_binding') is not None:
+                    bound = saved['source_binding']
+                    if self.sources.originals.get(name) != bound:
+                        raise ValueError('Retained staged original differs from the bound source')
                 self.files[name] = result['data']['sha256']
             self.validate()
 
@@ -77,9 +81,12 @@ class CandidateDraft:
         if name == 'stage_candidate_file':
             if relative in self.files:
                 raise ValueError('Source is already staged; read or edit its current draft')
-            originals, _ = self.sources.bind_response(
-                {'files': [{'path': relative, 'replacements': []}]}, commit=False)
-            bound = originals.get(relative)
+            if arguments.get('source_path'):
+                bound = self.sources.material_original(relative, arguments['source_path'])
+            else:
+                originals, _ = self.sources.bind_response(
+                    {'files': [{'path': relative, 'replacements': []}]}, commit=False)
+                bound = originals.get(relative)
             if bound is None:
                 raise ValueError('Stage requires an authorized existing editable source')
             request = {'path': str(path), 'content': bound['text']}
@@ -104,7 +111,8 @@ class CandidateDraft:
         identity = 'draft-' + hashlib.sha256(self.sources.identity.encode()).hexdigest()[:20] + f'-{decision}'
         result = self.workspace.call(operation, request, identity=identity)
         write_json(self.artifact_dir / 'decision-steps' / str(decision) / 'candidate-operation.json',
-            {'action': name, 'identity': identity, 'request': request, 'result': result.model_dump(mode='json')})
+            {'action': name, 'identity': identity, 'request': request, 'result': result.model_dump(mode='json'),
+                **({'source_binding': bound} if bound is not None and self.sources.material_copies else {})})
         if not result.ok:
             raise ValueError(f'Candidate byte operation rejected: {result.error}')
         if operation != 'read_file':
@@ -152,7 +160,7 @@ class CandidateDraft:
         return {**response, 'files': contents}
 
 
-def incremental_actions(tools: list[dict]) -> list[dict]:
+def incremental_actions(tools: list[dict], *, material_copies: bool = False) -> list[dict]:
     """Reuse byte-owner schemas, removing delivery and all external scope."""
     from simple_ar.tools.workspace import workspace_tool_specs
 
@@ -164,7 +172,9 @@ def incremental_actions(tools: list[dict]) -> list[dict]:
         'required': ['path', 'sha256'], 'additionalProperties': False}
     tools.append({'type': 'function', 'function': {'name': 'stage_candidate_file',
         'description': 'Bind and stage one existing editable source byte-for-byte, without retransmitting its contents.',
-        'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}},
+        'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'},
+            **({'source_path': {'type': 'string', 'description': 'Authorized inventory text input '
+                'to copy to this candidate-relative path; original remains unchanged.'}} if material_copies else {})},
             'required': ['path'], 'additionalProperties': False}}})
     for spec in workspace_tool_specs():
         if spec.name not in {'read_file', 'write_file', 'edit_file'}:

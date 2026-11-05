@@ -27,10 +27,10 @@ PROTOCOL = 'operations.v1'
 PROFESSIONAL_CONTRACTS = {'work.v1': 'source_owner.v1', 'work.v2': 'source_owner.v2',
                           'work.v3': None, 'work.v4': None, 'work.v5': None,
                           'work.v6': 'source_owner.v2', 'work.v7': 'source_owner.v2',
-                          'work.v8': 'source_owner.v2'}
-CURRENT_PROFESSIONAL_CONTRACT = 'work.v8'
-PRODUCTION_OWNER_CONTRACTS = frozenset({'work.v6', 'work.v7', 'work.v8'})
-COORDINATED_OWNER_CONTRACTS = frozenset({'work.v7', 'work.v8'})
+                          'work.v8': 'source_owner.v2', 'work.v9': 'source_owner.v3'}
+CURRENT_PROFESSIONAL_CONTRACT = 'work.v9'
+PRODUCTION_OWNER_CONTRACTS = frozenset({'work.v6', 'work.v7', 'work.v8', 'work.v9'})
+COORDINATED_OWNER_CONTRACTS = frozenset({'work.v7', 'work.v8', 'work.v9'})
 
 
 _DIRECT_WORK = (
@@ -308,7 +308,7 @@ class OperationTools:
             self.system = _RESULT_COORDINATION + _work_principles(self.delivery_review is not None,
                 config.get('memory_protocol') == 'journal.v1',
                 delivery_protocol=self.delivery_review.protocol if self.delivery_review is not None else None)
-            if config.get('professional_operations') == 'work.v8':
+            if config.get('professional_operations') in {'work.v8', 'work.v9'}:
                 self.system += (' Independent acceptance belongs to deliver_result and its inspection owner, '
                     'not a separate local audit scheduled by coordination. Producers investigate the originals '
                     'and create the requested work; analysis and authorized execution can establish necessary '
@@ -323,7 +323,7 @@ class OperationTools:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
             self.implementation = ImplementationToolGateway(root,self.workspace,ledger,config['model'],session_id,
                 client_factory=lambda identity:client_factory(identity,'code'), exact=config.get('code_task'),
-                preparation_only=not exact,
+                preparation_only=not exact and source_owner != 'source_owner.v3',
                 source_owner_contract=source_owner,
                 input_contract='bounded_inputs.v2' if not exact and preparation in {'prepared.v2','prepared.v3'} else None,
                 source_edit_contract='bound_content.v1' if not exact and preparation == 'prepared.v3' else None,
@@ -343,6 +343,16 @@ class OperationTools:
             self.registry.register_package(implementation_tool_specs(exact=exact,preparation_only=not exact,
                 source_owner_contract=source_owner),
                 self.implementation,request_visible=True)
+            if source_owner == 'source_owner.v3':
+                # The common queue invokes this primitive for the admitted source
+                # unit. Coordination cannot start another local review loop.
+                self.registry.register_package([spec for spec in implementation_tool_specs()
+                    if spec.name == 'investigate_implementation'], self.implementation, request_visible=False)
+                self.system += (' Source work includes its proposed approved execution and interpretation '
+                    'through the same action queue. Use execution_requested=false for source-only work. '
+                    'The returned findings describe this unit, not independent acceptance of the task. '
+                    'Reuse the candidate and findings for document work or delivery; do not rebuild '
+                    'the unit as a separate coordinator-run verification project.')
         self.document = None
         if professional and config.get('professional_operations') in PRODUCTION_OWNER_CONTRACTS | {'work.v1', 'work.v2'} and config['model'] is not None:
             from simple_ar.tools.document_work import DocumentWorkToolGateway, document_work_tool_specs
@@ -449,8 +459,10 @@ class OperationTools:
     def coordinator_eligible(self, spec: CommonToolSpec) -> bool:
         """Consumer role, not authorization; callers and inspectors keep primitives."""
         contract = self.config.get('professional_operations')
-        if contract == 'work.v8' and spec.domain == 'inspection':
+        if contract in {'work.v8', 'work.v9'} and spec.domain == 'inspection':
             return False  # Delivery owns independent acceptance; the explicit API remains registered.
+        if contract == 'work.v9' and spec.name == 'investigate_implementation':
+            return False  # An admitted source unit owns its post-execution interpretation.
         return (contract not in COORDINATED_OWNER_CONTRACTS
             or spec.domain != 'workspace' or spec.name in {'list_directory', 'ask_user', 'deliver_result'})
 

@@ -275,7 +275,7 @@ def write_implementation_unit(
             'Use relevant original inspection findings without treating them as verified facts '
             'or scientific certification; preserve source, execution and verification boundaries.')
     draft = None
-    if source_owner_contract == 'source_owner.v2':
+    if source_owner_contract in {'source_owner.v2', 'source_owner.v3'}:
         from simple_ar.code_task.generation.candidate_draft import CandidateDraft
 
         draft = CandidateDraft(investigation, artifact_dir,
@@ -310,6 +310,13 @@ def write_implementation_unit(
                 'only, with candidate-relative argv paths for copied sources. Execution still needs '
                 'separate explicit approval.' if execution_requested else
                 'Execution planning is optional; source-only work may be submitted.'))
+        if source_owner_contract == 'source_owner.v3':
+            system += (' stage_candidate_file may specify source_path from the authorized material inventory '
+                'and path as its new candidate-relative destination; this stages exact text bytes without '
+                'claiming an original read. Read necessary original ranges before changing their meaning. '
+                'Immutable preserve_files keep their source roles. Binary copies use the total input-copy '
+                'allowance, not the editable-source per-file bound. Effective focus and restoration of '
+                'retired observations are work-view progress; unchanged/cycling views are not.')
     ledger = getattr(client, '_budget_ledger', None)
     execution_resources = ({name: ledger.remaining(name) for name in
         ('process_invocations', 'process_wall_seconds')} if isinstance(ledger, BudgetLedger) else None)
@@ -510,13 +517,17 @@ def _decode_implementation_response(
     return contents, modes
 
 
-def _implementation_actions(*, working_set: bool) -> list[dict[str, Any]]:
+def _implementation_actions(*, working_set: bool, full_digest: bool = False) -> list[dict[str, Any]]:
     """Describe operation intent; existing owners still admit paths and candidates."""
     from simple_ar.tools.workspace import FileWindow
 
     window = FileWindow.model_json_schema()
     # Digest policy is owned by Investigation.read, never chosen by the model.
-    window['properties'].pop('full_digest', None)
+    if full_digest:
+        window['properties']['full_digest'] = {'type': 'boolean', 'const': True,
+            'description': 'Original source windows always retain the full version digest.'}
+    else:
+        window['properties'].pop('full_digest', None)
     window['additionalProperties'] = False
     read_properties = {'read_windows': {'type': 'array', 'minItems': 1, 'maxItems': 12,
         'items': window}}
@@ -593,7 +604,7 @@ def _parse_implementation_action(message: dict, tools: list[dict]) -> tuple[str,
 
 
 def _validate_source_owner(contract: str | None, investigation: Any, protocol: str | None) -> None:
-    if contract not in (None, 'source_owner.v1', 'source_owner.v2'):
+    if contract not in (None, 'source_owner.v1', 'source_owner.v2', 'source_owner.v3'):
         raise ValueError('Unknown implementation source owner contract')
     if contract and (investigation is None or protocol != 'native.v1'):
         raise ValueError('Source ownership requires authorized investigation and native source actions')
@@ -629,17 +640,18 @@ def _generate_implementation_contents(
 ) -> tuple[dict[str, str], dict[str, Any], dict[str, str]]:
     """Use the selected source contract; historical six-decision limits stay frozen."""
     _validate_source_owner(source_owner_contract, investigation, decision_protocol)
-    if retained_submission is not None and source_owner_contract != 'source_owner.v2':
+    if retained_submission is not None and source_owner_contract not in {'source_owner.v2', 'source_owner.v3'}:
         raise ValueError('Retained submission finalization is only available to incremental source ownership')
     if decision_protocol not in (None, 'native.v1'):
         raise ValueError('Unknown implementation decision protocol')
     native = investigation is not None and decision_protocol == 'native.v1'
-    tools = _implementation_actions(working_set=investigation.working_set) if native else []
-    if source_owner_contract == 'source_owner.v2':
+    tools = _implementation_actions(working_set=investigation.working_set,
+        full_digest=source_owner_contract == 'source_owner.v3') if native else []
+    if source_owner_contract in {'source_owner.v2', 'source_owner.v3'}:
         if candidate_draft is None:
             raise ValueError('Incremental source ownership requires the scoped candidate byte owner')
         from simple_ar.code_task.generation.candidate_draft import incremental_actions
-        tools = incremental_actions(tools)
+        tools = incremental_actions(tools, material_copies=source_owner_contract == 'source_owner.v3')
     history: list[dict[str, Any]] = []
     native_blocks: list[dict[str, Any]] = []
     bounded_context = candidate_draft is not None and retained_submission is None
@@ -660,6 +672,7 @@ def _generate_implementation_contents(
     validation_observations = []
     previous_rejection = None
     unproductive_reads = 0
+    seen_views = set()
     candidate_reads = set()
     from simple_ar.code_task.generation.validation import CandidateAdmissionError, check_candidate_sources
     for attempt in ([retained_submission[0]] if retained_submission else count(1)):
@@ -761,6 +774,8 @@ def _generate_implementation_contents(
                         name == 'read_candidate_file' and read_key not in candidate_reads)
                     if name == 'read_candidate_file':
                         candidate_reads.add(read_key)
+                    if candidate_draft.files != previous_files:
+                        seen_views.clear()  # New authored work can make an earlier view useful again.
                     unproductive_reads = 0 if progress else unproductive_reads + 1
                     if unproductive_reads >= 2:
                         raise _SourceInvestigationStopped('Candidate operations repeated without new '
@@ -798,6 +813,11 @@ def _generate_implementation_contents(
                     if not set(response) <= allowed:
                         raise ValueError('Read necessary windows OR return the candidate, not both')
                     observed_before = len(investigation.observations)
+                    def work_view():
+                        return (investigation.progress_state(),
+                            tuple(sorted(candidate_draft.files.items())) if candidate_draft is not None else ())
+                    if source_owner_contract == 'source_owner.v3':
+                        seen_views.add(work_view())
                     try:
                         if 'focus_observations' in response:
                             investigation.focus(response['focus_observations'])
@@ -809,12 +829,19 @@ def _generate_implementation_contents(
                             # presentation; that is not a new source observation.
                             # Count actual deduplicated reads, not action names
                             # or changing request spellings.
-                            unproductive_reads = (unproductive_reads + 1
-                                if len(investigation.observations) == observed_before else 0)
+                            if source_owner_contract == 'source_owner.v3':
+                                current = work_view()
+                                unproductive_reads = unproductive_reads + 1 if current in seen_views else 0
+                                seen_views.add(current)
+                            else:
+                                unproductive_reads = (unproductive_reads + 1
+                                    if len(investigation.observations) == observed_before else 0)
                             if unproductive_reads >= 2:
-                                raise _SourceInvestigationStopped('Consecutive read/focus decisions added '
-                                    'no distinct original observation; inspect retained reads and produce '
-                                    'the candidate or choose a necessary new range')
+                                raise _SourceInvestigationStopped(
+                                    'Source work repeated an unchanged or previously used observation view; '
+                                    'use retained context or produce the candidate' if source_owner_contract == 'source_owner.v3'
+                                    else 'Consecutive read/focus decisions added no distinct original observation; '
+                                    'inspect retained reads and produce the candidate or choose a necessary new range')
                     write_json(artifact_dir / 'decision-steps' / str(attempt) / 'observations.json', investigation.observations)
                     action_result = {'status': 'observed', 'observations_ref':
                         f'decision-steps/{attempt}/observations.json'}

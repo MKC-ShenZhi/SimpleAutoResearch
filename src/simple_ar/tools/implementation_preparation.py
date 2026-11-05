@@ -10,7 +10,7 @@ from simple_ar.core.capabilities import ArtifactStore
 PROFESSIONAL_GENERATION = 'professional_decision.v1'
 REGISTERED_PROJECT_GENERATION = 'professional_project.v1'
 SOURCE_OWNER_CONTRACT = 'source_owner.v1'
-SOURCE_OWNER_CONTRACTS = (SOURCE_OWNER_CONTRACT, 'source_owner.v2')
+SOURCE_OWNER_CONTRACTS = (SOURCE_OWNER_CONTRACT, 'source_owner.v2', 'source_owner.v3')
 
 
 def material_observation_metadata(binding: dict) -> dict:
@@ -51,7 +51,7 @@ def prepare_work(owner: Any, request: Any, store: ArtifactStore, output: Path,
             raise ValueError('Unknown retained source edit contract')
         if saved['generation_method'] not in {PROFESSIONAL_GENERATION, REGISTERED_PROJECT_GENERATION} or saved['request'] != request_data:
             raise ValueError('Professional generation request changed; preserve the original attempt')
-        if not store.exists('result.json') and saved.get('source_owner_contract') != 'source_owner.v2':
+        if not store.exists('result.json') and saved.get('source_owner_contract') not in {'source_owner.v2', 'source_owner.v3'}:
             raise ValueError('Interrupted professional decision; inspect retained steps and accounting, no blind replay')
         result = store.read_json('result.json') if store.exists('result.json') else None
         if result is not None:
@@ -177,7 +177,7 @@ def prepare_work(owner: Any, request: Any, store: ArtifactStore, output: Path,
         registered_project=retained, diagnostic_context=bounded_reuse,
         inherited_observations=inherited, inherited_coverage=inherited_coverage,
         source_owner_paths=source_owner_paths, input_contract=owner.input_contract,
-        edit_contract=owner.source_edit_contract)
+        edit_contract=owner.source_edit_contract, material_copies=contract == 'source_owner.v3')
     sources.requested_files = [row.model_dump() for row in request.files]
     if owner.work_context is not None and not bounded_reuse:
         # Historical fresh work keeps its original context placement. Cached
@@ -256,7 +256,8 @@ def _finalize_retained_submission(owner: Any, store: ArtifactStore, binding: dic
         editable_project=Path(prior['editable_project']) if prior and prior.get('editable_project') else None,
         preserved_files=(prior.get('preserved_files', {}) if prior else binding.get('preserved_files')),
         diagnostic_context=True, input_contract=binding.get('preserved_input_contract'),
-        edit_contract=binding.get('source_edit_contract'))
+        edit_contract=binding.get('source_edit_contract'),
+        material_copies=binding.get('source_owner_contract') == 'source_owner.v3')
     # The final input supplies its active presentation; guards still cover all
     # retained actual reads, including retired observations. No new feedback,
     # parent-seed choice or source request replaces the interrupted invocation.
@@ -269,7 +270,7 @@ def _finalize_retained_submission(owner: Any, store: ArtifactStore, binding: dic
         execution_observations=binding.get('execution_observations', []),
         candidate_admission=bool(binding.get('candidate_admission')),
         dependency_advice=binding.get('dependency_advice'), command_source_binding=binding,
-        decision_protocol='native.v1', source_owner_contract='source_owner.v2',
+        decision_protocol='native.v1', source_owner_contract=binding['source_owner_contract'],
         retained_submission=(step, message),
         validate_destination=lambda name: owner._feedback_destination(output, name, prior))
     sources.validate()

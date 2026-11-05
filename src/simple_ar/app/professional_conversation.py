@@ -14,7 +14,7 @@ from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES
 
 
 # Production contracts consume the same retained observations and working memory.
-RETAINED_PROFESSIONAL_CONTRACTS = frozenset({'work.v5', 'work.v6', 'work.v7', 'work.v8'})
+RETAINED_PROFESSIONAL_CONTRACTS = frozenset({'work.v5', 'work.v6', 'work.v7', 'work.v8', 'work.v9'})
 
 
 def recorded_work_messages(messages: list[dict]) -> list[dict]:

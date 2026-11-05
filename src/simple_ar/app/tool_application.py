@@ -2445,7 +2445,8 @@ class ToolApplication:
         the ordinary dispatcher. The saved reply identifies the producing receipt,
         rather than pretending another model made a decision.
         """
-        if self.state['config'].get('professional_work') not in _PROFESSIONAL_WORK:
+        legacy_continuation = self.state['config'].get('professional_work') in _PROFESSIONAL_WORK
+        if not legacy_continuation and not self.gateway.local_continuation():
             return False
         turns = self.state['turns']
         if (self.state['pending'] is not None or not turns or turns[-1]['remaining']
@@ -2465,6 +2466,8 @@ class ToolApplication:
             return False
         source = source or turns[-1]['tools'][-1]['result']
         observed = self.session.store.read_json(source)
+        if not legacy_continuation and not self.gateway.local_continuation(observed.get('tool_name', '')):
+            return False
         owner, action = self.gateway.professional_action(observed, source, resume=resumed_stop,
             consume_outcome=self.state['config'].get('professional_work') in _OUTCOME_WORK)
         if owner is None:
@@ -4235,11 +4238,13 @@ class ToolApplication:
                 result = ToolResult(tool_name='focus_work', status='blocked',
                     error='Choose a work focus alone; queued actions must not silently change model ownership.')
             elif (self.state['config'].get('professional_work') not in _PROFESSIONAL_WORK
+                    and not self.gateway.local_continuation(call['function']['name'])
                     and professional_request):
                 result = ToolResult(tool_name=call['function']['name'], status='blocked',
                     error='This historical task retains its original separate-operation contract; complete-work continuation requires a new task.',
                     data={'executed': False})
-            elif (self.state['config'].get('professional_work') in _PROFESSIONAL_WORK
+            elif ((self.state['config'].get('professional_work') in _PROFESSIONAL_WORK
+                    or self.gateway.local_continuation(call['function']['name']))
                     and professional_request
                     and len(self.state['turns'][-1]['remaining']) > 1):
                 result = ToolResult(tool_name=call['function']['name'], status='blocked',

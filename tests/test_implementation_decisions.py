@@ -1209,7 +1209,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         from simple_ar.tools.implementation import ImplementationToolGateway
 
         return ImplementationToolGateway(app.session.store.root, app.workspace, app.ledger,
-            'fixture', app.session.manifest.session_id, preparation_only=True,
+            'fixture', app.session.manifest.session_id, preparation_only=contract != 'source_owner.v3',
             source_owner_contract=contract,
             client_factory=app.implementation.client_factory, **ports)
 
@@ -1239,6 +1239,69 @@ class ImplementationDecisionTests(unittest.TestCase):
     @staticmethod
     def _draft_hash(prompt, path):
         return next(row['sha256'] for row in prompt['candidate_draft']['files'] if row['path'] == path)
+
+    def test_source_material_copies_focus_and_final_reply_recover_without_rereading_or_replay(self):
+        import hashlib
+
+        inputs = self.base/'inputs'
+        inputs.mkdir()
+        (inputs/'a.txt').write_text('a'*50000)
+        (inputs/'b.txt').write_text('b'*40000)
+        source = 'from pathlib import Path\nPath("result.txt").write_text("retained")\n'
+        (inputs/'original.py').write_text(source)
+        binary = b'\x89PNG\r\n\x1a\n' + b'x'*280000
+        (inputs/'reference.png').write_bytes(binary)
+        unmounted = self.base/'unmounted.py'
+        unmounted.write_text(source)
+        app = self._create('material-copy-recovery', sources={'inputs': inputs})
+        owner = self._source_owner(app, contract='source_owner.v3')
+
+        def focus(prompt):
+            ref = next(row['observation']['observation_ref']
+                for row in prompt['working_view']['observations']
+                if row['observation'].get('path', '').endswith('/a.txt'))
+            return {'observation_refs':[ref]}
+
+        self.responses = [
+            self._draft_action('stage_candidate_file', {'path':'calculate.py', 'source_path':str(unmounted)}),
+            self._draft_action('read_source_windows', {'read_windows':[
+                {'path':'inputs/a.txt', 'max_bytes':50000, 'full_digest':True},
+                {'path':'inputs/b.txt', 'max_bytes':40000, 'full_digest':True}]}),
+            self._draft_action('focus_source_observations', focus),
+            self._draft_action('read_source_windows', {'read_windows':[
+                {'path':'inputs/b.txt', 'max_bytes':40000, 'full_digest':True}]}),
+            self._draft_action('stage_candidate_file', {'path':'calculate.py', 'source_path':'inputs/original.py'}),
+            self._draft_action('submit_candidate', lambda prompt: {'summary':'Retain supplied source and binary input',
+                'unresolved':[], 'files':prompt['candidate_draft']['files'],
+                'preserve_files':[{'source':'inputs/reference.png', 'path':'data/reference.png'}]}),
+        ]
+        arguments = {'goal':'Reuse the supplied program and binary input without changing originals.',
+            'material_roots':['inputs'], 'execution_requested':False}
+        with patch.object(owner, '_publish_implementation', side_effect=RuntimeError('Interrupted publication')):
+            stopped = owner.call('prepare_implementation', arguments, identity='copy')
+        self.assertEqual(stopped.status, 'error')
+        self.assertEqual(self.send.call_count, 6)
+        self.assertTrue(owner.can_reconcile('prepare_implementation', 'copy'))
+        ledger = app.ledger.to_dict()
+        recovered = owner.call('prepare_implementation', arguments, identity='copy')
+        self.assertEqual(recovered.status, 'ok', recovered)
+        self.assertEqual(self.send.call_count, 6)
+        self.assertEqual(app.ledger.to_dict(), ledger)
+        candidate = Path(recovered.data['project_dir'])
+        self.assertEqual((candidate/'calculate.py').read_text(), source)
+        self.assertEqual((candidate/'data/reference.png').read_bytes(), binary)
+        self.assertEqual((inputs/'original.py').read_text(), source)
+        self.assertEqual((inputs/'reference.png').read_bytes(), binary)
+        binding = json.loads(Path(recovered.data['source_binding']).read_text())
+        self.assertEqual(binding['original_files']['calculate.py']['sha256'],
+            hashlib.sha256((inputs/'original.py').read_bytes()).hexdigest())
+        self.assertEqual(Path(binding['original_files']['calculate.py']['path']), inputs/'original.py')
+        observed = recovered.metadata['material_observations']
+        self.assertFalse(any(row['request']['path'].endswith('original.py') for row in observed))
+        # Copying does not manufacture source-read coverage or widen authority.
+        self.assertTrue((Path(recovered.data['source_binding']).parent/
+            'decision-steps/1/validation.json').is_file())
+        self.assertFalse((app.session.store.root/'tools/processes').exists())
 
     def test_incremental_context_projects_large_completed_writes_and_reads_within_shared_target(self):
         from dataclasses import replace

@@ -450,6 +450,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.memory_views = []
         self.document_views = []
         self.source_views = []
+        self.source_findings_views = []
+        self.source_findings_decision = None
         self.document_decision = None
         self.transport_errors = []
         self.review = self._review_complete_targets
@@ -820,7 +822,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         core = {row['function']['name'] for row in self.app.operation_schemas}
         self.assertEqual({'prepare_implementation','execute_implementation','work_document','ask_user',
             'deliver_result','load_tools','read_history','list_directory','export_report','update_work_plan'}, core)
-        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v8')
+        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v9')
         self.assertFalse({'select_work_method',
             'begin_professional_work','finish_professional_work'} & core)
         optional = {'inspect_table','analyze_table','measure_experiment','analyze_measurements',
@@ -1346,6 +1348,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 finish = 'tool_calls'
             else:
                 view, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
+                if view.get('execution_ref') and 'findings' in view.get('response_schema', {}).get('properties', {}):
+                    self.assertTrue(callable(self.source_findings_decision), 'Unexpected source outcome investigation')
+                    self.source_findings_views.append(deepcopy(view))
+                    return {'choices': [{'message': {'role': 'assistant',
+                        'content': json.dumps(self.source_findings_decision(view))}, 'finish_reason': 'stop'}],
+                        'usage': {'prompt_tokens': 100, 'completion_tokens': 40, 'total_tokens': 140}}
                 if 'manuscript_markdown' in view.get('response_schema', {}).get('properties', {}):
                     self.assertTrue(callable(self.document_decision), 'Unexpected document work')
                     self.document_views.append(deepcopy(view))
@@ -3566,6 +3574,109 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._run()
         self.assertEqual((self.root/'budget_ledger.json').read_bytes(), ledger)
         self.assertEqual(self.send.call_count, calls)
+
+    def test_source_work_returns_interpreted_execution_and_feedback_without_parent_reassembly(self):
+        self._create(goal='Compute supplied observations and deliver reusable code and a supported result.',
+            current_method=True, delivery_protocol=None, selection_policy='native.v3', professional_contract='work.v9')
+        program = ("import csv\nfrom pathlib import Path\n"
+            "rows=list(csv.DictReader(Path('data.csv').open()))\n"
+            "values=[float(r['value']) for r in rows]\n"
+            "Path('result.txt').write_text(str(sum(values)/len(values)))\n")
+        (self.inputs/'calculate.py').write_text(program)
+        original = self._versions(self.inputs)
+
+        def findings(view):
+            candidate = Path(self._ok('prepare_implementation')['data']['project_dir'])
+            path = str(candidate/'result.txt')
+            rows = [row for row in view.get('observations', [])
+                if self.app.workspace.resolve(row['request']['path']) == Path(path)]
+            if not rows:
+                return {'read_windows': [{'path': path, 'full_digest': True}]}
+            self.assertEqual(rows[-1]['data']['text'], '2.0')
+            evidence = [row['observation_id'] for row in view['evidence_index']
+                if self.app.workspace.resolve(row['path']) == Path(path)]
+            return {'findings': [{'statement': 'The supplied mean is 2.0.', 'evidence': evidence}],
+                'limitations': ['These observations do not support population inference.'], 'remaining_work': []}
+
+        self.source_findings_decision = findings
+        self.decisions.extend([
+            _action('prepare_implementation', goal='Compute the mean from the supplied CSV.', material_roots=['measurements']),
+            _action('stage_candidate_file', path='calculate.py', source_path='measurements/calculate.py'),
+            lambda: _action('submit_candidate', summary='Reusable calculation', unresolved=[],
+                files=self.source_views[-1]['candidate_draft']['files'],
+                preserve_files=[{'source':'measurements/observations.csv', 'path':'data.csv'}],
+                execution_plan={'argv':['python','calculate.py'], 'outputs':['result.txt'], 'timeout_sec':3}),
+            lambda: _action('deliver_result', summary='Bounded mean calculation',
+                artifacts=[self._ok('prepare_implementation')['data']['project_dir']]),
+        ])
+        self._run()
+        prepared = self._ok('prepare_implementation')
+        candidate = Path(prepared['data']['project_dir'])
+        self.assertFalse((candidate/'result.txt').exists())
+        pending = self.app.state['pending']
+        active = pending.get('action') or pending
+        self.assertEqual(active['call']['function']['name'], 'execute_implementation')
+        token = self.app.approval_token(active['call'])
+        prefix = deepcopy(self.app.ledger.to_dict()['entries'])
+        self._reload()
+        self._run(approved_execution=token)
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self._ok('investigate_implementation')
+        self.assertTrue(self.source_findings_views)
+        self.assertEqual((candidate/'result.txt').read_text(), '2.0')
+        self.assertEqual(self._versions(self.inputs), original)
+        self.assertEqual(len(self._process_receipts()), 1)
+        self.assertEqual(self.app.ledger.to_dict()['entries'][:len(prefix)], prefix)
+        # Production result interpretation and independent acceptance are distinct.
+        self.assertTrue(self.inspection_requests)
+        self.assertNotIn('investigate_implementation', {row['function']['name'] for row in self.app.operation_schemas})
+        saved = (self.root/'budget_ledger.json').read_bytes()
+        calls = self.send.call_count
+        self._reload()
+        self._run()
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual((self.root/'budget_ledger.json').read_bytes(), saved)
+
+        def explain(view):
+            if not any(row['observation']['data'].get('text') == '2.0' for row in view['observations']):
+                return {'action':'investigate', 'read_windows':[{'path':str(candidate/'result.txt')}]}
+            return {'action':'finish', 'manuscript_markdown':'# Recorded mean\n\nThe supplied mean is 2.0.\n',
+                'selected_observation_ids':[row['id'] for row in view['observations']]}
+        self.document_decision = explain
+        self.decisions.extend([
+            _action('work_document', goal='Explain the existing result briefly; do not recalculate.',
+                material_roots=[str(candidate)]),
+            lambda: _action('deliver_result', summary='Concise explanation with reusable calculation',
+                artifacts=[self._ok('work_document')['data']['manuscript'], str(candidate)]),
+        ])
+        self._run(feedback='Add a short Markdown explanation of the existing result without rerunning it.')
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertEqual(len(self._process_receipts()), 1)
+        self.assertEqual(self._versions(self.inputs), original)
+
+    def test_source_work_failure_keeps_result_local_and_does_not_take_over_goal_control(self):
+        self._create(goal='Try the authorized calculation; report an actual problem if it fails.',
+            current_method=True, delivery_protocol=None, selection_policy='native.v3', professional_contract='work.v9')
+        self.decisions.extend([
+            _action('prepare_implementation', goal='Run the bounded supplied calculation.'),
+            _action('write_candidate_file', path='calculate.py', content='raise RuntimeError("missing input")\n'),
+            lambda: _action('submit_candidate', summary='Bounded calculation', unresolved=[],
+                files=self.source_views[-1]['candidate_draft']['files'],
+                execution_plan={'argv':['python','calculate.py'], 'outputs':['result.txt'], 'timeout_sec':3}),
+            _action('ask_user', question='The supplied calculation needs its missing input; which input should be used?'),
+        ])
+        self._run()
+        pending = self.app.state['pending']
+        token = self.app.approval_token((pending.get('action') or pending)['call'])
+        self._reload()
+        self._run(approved_execution=token)
+        executed = self._last('execute_implementation')
+        self.assertNotEqual(executed['data']['returncode'], 0)
+        self.assertIn('missing input', executed['data']['stderr'])
+        self._ok('ask_user')  # The common goal loop can choose a next step after a local failure.
+        self.assertFalse(self.source_findings_views)
+        self.assertEqual(len(self._process_receipts()), 1)
+        self.assertFalse((self.root/'delivery.json').exists())
 
     def _document_work_chain(self, *, chinese=False):
         originals = self._versions(self.inputs)
