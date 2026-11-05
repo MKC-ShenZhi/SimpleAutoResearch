@@ -163,8 +163,11 @@ class DocumentWorkTests(unittest.TestCase):
 
     def test_saved_v1_response_recovers_without_new_measurements_or_provider_calls(self):
         root, source, ledger, workspace = self.workspace()
+        asset = source/'legacy.txt'
+        asset.write_text('Original legacy asset.\n')
         owner, clients = self.gateway(root, source, ledger, workspace,
-            lambda *_: {'action': 'finish', 'manuscript_markdown': '# Saved\nOriginal candidate.\n'})
+            lambda *_: {'action': 'finish', 'manuscript_markdown': '# Saved\nOriginal candidate.\n',
+                'attachments': [str(asset)]})
         admit = owner._admit
 
         def legacy(*args):
@@ -183,6 +186,40 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertEqual(len(clients[0].calls), 1)
         self.assertNotIn('measurements', result.data)
         self.assertNotIn('markdown', owner.coordination_result(result)['data'])
+        self.assertEqual(result.data['provenance']['attachments'][0]['source'], str(asset))
+
+    def test_selection_repair_retains_draft_reads_and_inventory_owned_attachment_identity(self):
+        root, source, ledger, workspace = self.workspace()
+        original = source/'observations.txt'
+        original.write_text('Supplied observations only.\n')
+        draft = '# Review\n\nRetain the scope of the supplied observations.\n'
+
+        def decide(view, step):
+            material, = view['candidates']
+            if step == 1:
+                return {'action': 'investigate', 'read_windows': [{'path': material['path']}]}
+            if step == 3:
+                self.assertEqual(view['candidate_preview']['manuscript_markdown'], draft)
+                self.assertEqual(len(view['observations']), 1)
+                self.assertEqual(view['read_results'][0]['status'], 'candidate_selection_rejected')
+                self.assertFalse(list(workspace.workspace.rglob('manuscript.md')))
+            return {'action': 'finish', 'manuscript_markdown': draft,
+                'selected_observation_ids': ['o1'],
+                'attachments': ['unlisted-material'] if step == 2 else [material['delivery_path']]}
+
+        owner, clients = self.gateway(root, source, ledger, workspace, decide)
+        result = owner.call('work_document', {'goal': 'Review the supplied observation scope'}, identity='selection-repair')
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(len(clients[0].calls), 3)
+        self.assertEqual(result.data['markdown'], draft)
+        self.assertEqual(len(result.metadata['material_observations']), 1)
+        asset, = result.data['provenance']['attachments']
+        self.assertEqual(asset['source'], str(original))
+        self.assertEqual(workspace.resolve(asset['path']).read_bytes(), original.read_bytes())
+        prefix = ledger.to_dict()
+        self.assertEqual(owner.call('work_document', {'goal': 'Review the supplied observation scope'},
+            identity='selection-repair'), result)
+        self.assertEqual(ledger.to_dict(), prefix)
 
     def test_original_bundle_is_queried_by_source_owner_and_change_blocks_replay(self):
         root, source, ledger, workspace = self.workspace()
@@ -221,7 +258,7 @@ class DocumentWorkTests(unittest.TestCase):
         asset.write_bytes(b'original figure bytes')
         def decide(view, count):
             row = next(row for row in view['candidates'] if row['path'] == str(asset))
-            return {'action': 'finish', 'attachments': [str(asset)],
+            return {'action': 'finish', 'attachments': [row['delivery_path']],
                 'manuscript_markdown': f"# Result\n![Figure]({row['delivery_path']})\n",
                 'gaps': ['The figure requires independent visual inspection.']}
         gateway, clients = self.gateway(root, source, ledger, workspace, decide)
@@ -331,6 +368,7 @@ class DocumentWorkTests(unittest.TestCase):
         result = gateway.call('work_document', {'goal': 'Draft'}, identity='unobserved')
         self.assertFalse(result.ok)
         self.assertIn('actually observed', result.error)
+        self.assertEqual(len(clients[0].calls), 2)  # Same rejected selection stops, without dropping evidence.
         self.assertFalse((workspace.workspace / 'document-work/unobserved/manuscript.md').exists())
 
 

@@ -61,11 +61,28 @@ Preserve scientific content and valid observations while making local revisions.
 If a requirement cannot be met, disclose it in gaps rather than claiming success.
 """
 
+_MATERIAL_ID_SYSTEM = _CANDIDATE_SYSTEM.replace(
+    'select its listed path in attachments and use\nits listed relative delivery_path in Markdown.',
+    'select its listed delivery_path ID in attachments and in Markdown.') + """
+Attachment selection in this contract uses the inventory's delivery_path values
+as opaque material IDs, also used by Markdown links. They are not file locators:
+the document owner binds each ID to its authorized source, bytes and destination.
+Do not supply source paths or invent IDs. Correctable evidence/attachment
+selection errors return your draft and actual observations in this same work
+unit; correct the selection while preserving useful prose and investigation.
+"""
+
+
+class _CandidateSelectionError(ValueError):
+    """A rejected proposal with no output writes or unresolved side effects."""
+
 
 def _system_for(binding: dict) -> str:
-    if binding['contract'] not in {'document_work_operation.v1', 'document_work_operation.v2'}:
+    systems = {'document_work_operation.v1': _SYSTEM,
+        'document_work_operation.v2': _CANDIDATE_SYSTEM, 'document_work_operation.v3': _MATERIAL_ID_SYSTEM}
+    if binding['contract'] not in systems:
         raise ValueError('Unknown saved document work contract')
-    return _CANDIDATE_SYSTEM if binding['contract'] == 'document_work_operation.v2' else _SYSTEM
+    return systems[binding['contract']]
 
 
 def manuscript_measurements(markdown: str) -> dict:
@@ -117,7 +134,8 @@ class _Decision(BaseModel):
     read_windows: list[FileWindow] = Field(default_factory=list, max_length=12)
     source_queries: list[_SourceQuery] = Field(default_factory=list, max_length=12)
     selected_observation_ids: list[str] = Field(default_factory=list, max_length=128)
-    attachments: list[str] = Field(default_factory=list, max_length=12)
+    attachments: list[str] = Field(default_factory=list, max_length=12,
+        description='Distinct delivery_path IDs from the supplied candidate inventory; not source file locators.')
     manuscript_markdown: str = Field(default='', max_length=256000)
     gaps: list[str] = Field(default_factory=list, max_length=100)
 
@@ -212,6 +230,8 @@ class DocumentWorkToolGateway:
         if not steps:
             return None
         step = max(steps)
+        if store.exists(f'decisions/{step}/selection-error.json'):
+            return None  # An accounted but rejected proposal is not a recoverable final candidate.
         try:
             binding = store.read_json('input.json')
             snapshot = store.read_json(f'decisions/{step}/request.json')
@@ -353,7 +373,7 @@ class DocumentWorkToolGateway:
         seed = material_observation_seed(workspace=self.workspace, inventories=inventories,
             provider=self.material_observations, roots=roots, context=base,
             excluded_paths=source_paths | ({prior_path} if prior_path else set()))
-        binding = {'contract': 'document_work_operation.v2', 'request_sha256': _digest(request.model_dump(mode='json')),
+        binding = {'contract': 'document_work_operation.v3', 'request_sha256': _digest(request.model_dump(mode='json')),
             'context': base, 'inventories': inventories, 'seed': seed}
         store.write_json('input.json', binding)
         return binding
@@ -487,7 +507,26 @@ class DocumentWorkToolGateway:
                 feedback = []
                 continue
             if decision.action == 'finish':
-                candidate = self._candidate(store, binding, observations, decision, step, identity)
+                try:
+                    candidate = self._candidate(store, binding, observations, decision, step, identity)
+                except _CandidateSelectionError as exc:
+                    # No output exists yet. Repair this proposal, not the task,
+                    # without discarding its authored text or original reads.
+                    signature = _digest({'selection': {
+                        'observations': sorted(decision.selected_observation_ids),
+                        'attachments': sorted(decision.attachments)}, 'error': str(exc)})
+                    store.write_json(f'{path}/selection-error.json', {'error': str(exc)})
+                    if signature in no_progress:
+                        raise ValueError(f'Repeated invalid candidate selection: {exc}; inspect the retained draft and observations') from exc
+                    no_progress.add(signature)
+                    preview = {'manuscript_markdown': decision.manuscript_markdown,
+                        'measurements': manuscript_measurements(decision.manuscript_markdown),
+                        'selected_observation_ids': decision.selected_observation_ids,
+                        'attachments': decision.attachments, 'gaps': decision.gaps,
+                        'scope': 'Retained uncommitted draft; selection rejected, not an accepted output or inspection.'}
+                    feedback = [{'status': 'candidate_selection_rejected', 'error': str(exc),
+                        'scope': 'Correct only the rejected selection using supplied observation/material IDs; preserve valid work.'}]
+                    continue
                 store.write_json('candidate.json', candidate)
                 return
             feedback, added = self._investigate(store, decision, observations, visible, source_views,
@@ -556,20 +595,29 @@ class DocumentWorkToolGateway:
         store.write_json(f'decisions/{step}/read-results.json', feedback)
         return feedback, added
 
+    def _selected_sources(self, binding: dict, attachments: list[str]) -> list[str]:
+        if binding['contract'] == 'document_work_operation.v3':
+            inventory = {row['delivery_path']: row['path'] for row in binding['context']['candidates']}
+            if len(attachments) != len(set(attachments)) or any(item not in inventory for item in attachments):
+                raise _CandidateSelectionError('Attachments must be distinct delivery_path IDs from the supplied inventory')
+            return [inventory[item] for item in attachments]
+        # Recorded v1/v2 selections used source locators; never reinterpret them.
+        sources = [str(self.workspace.resolve_material_root(path)) for path in attachments]
+        visible = {row['path'] for row in binding['context']['candidates']}
+        if len(sources) != len(set(sources)) or any(path not in visible for path in sources):
+            raise _CandidateSelectionError('Attachments must be distinct authorized inventory files')
+        return sources
+
     def _candidate(self, store: ArtifactStore, binding: dict, observations: list[dict],
                    decision: _Decision, step: int, identity: str) -> dict:
         by_id = {row['id']: row for row in observations}
         ids = decision.selected_observation_ids
         if len(ids) != len(set(ids)) or any(item not in by_id for item in ids):
-            raise ValueError('Selected evidence must name distinct actually observed IDs')
+            raise _CandidateSelectionError('Selected evidence must name distinct actually observed IDs')
         selected = [by_id[item] for item in ids]
         visible = {row['path']: row for row in binding['context']['candidates']}
-        chosen, assets = set(), []
-        for locator in decision.attachments:
-            source = str(self.workspace.resolve_material_root(locator))
-            if source not in visible or source in chosen:
-                raise ValueError('Attachments must be distinct authorized inventory files')
-            chosen.add(source)
+        assets = []
+        for source in self._selected_sources(binding, decision.attachments):
             observation = read_material_window(self.workspace, {'path': source, 'max_bytes': 1,
                 'full_digest': True}, identity=identity)
             if observation['data']['size_bytes'] != visible[source]['size_bytes']:
@@ -580,7 +628,7 @@ class DocumentWorkToolGateway:
         manuscript = f'workspace/document-work/{identity}/manuscript.md'
         targets = [manuscript, *(row['path'] for row in [*assets, *inherited])]
         if len(targets) != len(set(targets)):
-            raise ValueError('Selected and retained document assets have conflicting paths')
+            raise _CandidateSelectionError('Selected and retained document assets have conflicting paths')
         for target in targets:
             if self.workspace.resolve(target, write=True).exists():
                 raise ValueError('Candidate output already exists before document work; preserve it and use a new attempt')
@@ -637,7 +685,7 @@ class DocumentWorkToolGateway:
         if saved_observations != prompted or any(row not in prompted for row in candidate['selected']):
             raise ValueError('Selected original observation record changed')
         visible = {row['path']: row for row in binding['context']['candidates']}
-        selected_sources = [str(self.workspace.resolve_material_root(path)) for path in decision.attachments]
+        selected_sources = self._selected_sources(binding, decision.attachments)
         if (len(selected_sources) != len(set(selected_sources))
                 or selected_sources != [asset['source'] for asset in candidate['assets']]
                 or any(source not in visible for source in selected_sources)
@@ -702,7 +750,7 @@ class DocumentWorkToolGateway:
             'coverage': {'omitted_files': binding['context']['omitted_files'],
                 'scope': 'Inventory and observed windows are bounded; unread content is not evidence of absence.'},
             'gaps': gaps, 'receipt': f'records/{identity}/document_work/receipt.json'}
-        if binding['contract'] == 'document_work_operation.v2':
+        if binding['contract'] in {'document_work_operation.v2', 'document_work_operation.v3'}:
             data['measurements'] = manuscript_measurements(markdown)
         result = ToolResult(tool_name='work_document', data=data, artifacts=artifacts,
             metadata={'material_observations': self._material_observations(saved_observations)},
