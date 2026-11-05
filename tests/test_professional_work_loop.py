@@ -3651,6 +3651,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.assertIn('return_source_work', offered)
                 self.assertNotIn('deliver_result', offered | catalog.keys())
                 self.assertEqual(history.call_count, 1, 'A tool directory must not replay history per tool')
+                history.reset_mock()
+                self.assertIsNone(self.app.operations.work_projection)
+                self.assertEqual(history.call_count, 1)
             self.assertTrue({'load_tools', 'read_history', 'inspect_table'} <=
                 {row['function']['name'] for row in self.app.operation_schemas})
             self._run(approved_execution=token)
@@ -3662,6 +3665,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertNotIn('return_source_work', offered | catalog.keys())
             self.assertIn('prepare_implementation', offered | catalog.keys())
             self.assertEqual(history.call_count, 1)
+            history.reset_mock()
+            project = self.app.operations.work_projection
+            self.assertIsNotNone(project)
+            for _ in range(10):
+                self.assertEqual(project([]), [])
+            self.assertEqual(history.call_count, 1, 'Capacity probes must not reread the role journal')
         returned = self._ok('return_source_work')
         self.assertTrue(returned['data']['artifact_sha256'])
         self.assertEqual(self._versions(self.inputs), originals)

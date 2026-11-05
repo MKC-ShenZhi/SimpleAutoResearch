@@ -403,11 +403,7 @@ class OperationTools:
             self.registry.register_package(extension.specs(),extension,request_visible=True)
         self.registry.register_package(coordination['specs'],coordination['owner'],request_visible=True)
         self.selection = None
-        self.work_projection = None
         if config.get('work_method') == GOAL_WORK_METHOD:
-            from simple_ar.app.professional_conversation import recorded_work_messages
-            self.work_projection = (lambda messages: messages if self.work.selected() is not None
-                else recorded_work_messages(messages)) if self.work is not None and self.work.source_work else recorded_work_messages
             if config.get('work_selection_policy') != 'native.v3':
                 from simple_ar.app.work_selection import WorkSelection
                 self.selection = WorkSelection(config.get('work_selection_policy'))
@@ -466,6 +462,15 @@ class OperationTools:
 
     def method_context(self) -> dict | None:
         return self.methods.context() if self.methods is not None else None
+
+    @property
+    def work_projection(self):
+        """Select a pure projector once before the capacity selector iterates."""
+        if self.config.get('work_method') != GOAL_WORK_METHOD:
+            return None
+        from simple_ar.app.professional_conversation import recorded_work_messages
+        return (None if self.work is not None and self.work.source_work
+                and self.work.selected() is not None else recorded_work_messages)
 
     def coordinator_eligible(self, spec: CommonToolSpec) -> bool:
         """Consumer role, not authorization; callers and inspectors keep primitives."""
