@@ -1285,6 +1285,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         ledger = app.ledger.to_dict()
         recovered = owner.call('prepare_implementation', arguments, identity='copy')
         self.assertEqual(recovered.status, 'ok', recovered)
+        self.assertNotIn('next_operation', recovered.data)
         self.assertEqual(self.send.call_count, 6)
         self.assertEqual(app.ledger.to_dict(), ledger)
         candidate = Path(recovered.data['project_dir'])

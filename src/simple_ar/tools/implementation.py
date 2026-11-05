@@ -1689,7 +1689,7 @@ class ImplementationToolGateway:
                 'capability_artifacts': [ArtifactStore(owner.root.parent).ref(
                 'implementation/result.json', kind='prepared_implementation',
                 schema='prepared_implementation.v1').to_dict()]}}
-        if self.preparation_only and not executable:
+        if (self.preparation_only or self.source_owner_contract == 'source_owner.v3') and not executable:
             # Code-only preparation is a complete source unit, not a plan obligation.
             data['data'].pop('next_operation', None)
         owner.write_json('result.json', data)
