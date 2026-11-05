@@ -1241,6 +1241,24 @@ class WorkspaceToolGateway:
                         target, source = self.resolve(data['absolute_path']), self.resolve(data['source'])
                         inputs[source] = data['source_sha256']
                         links[target] = (source, data['source_sha256'])
+                    if trusted and name == 'work_document':
+                        from simple_ar.tools.document_work import DocumentWorkToolGateway
+                        try:
+                            copies = [(self.resolve(row['path']), self.resolve(row['source']), row['source_sha256'])
+                                for row in DocumentWorkToolGateway.artifact_copies(observed)]
+                            if (len({target for target, _, _ in copies}) != len(copies)
+                                    or any(target == source or outputs.get(target) != digest
+                                        for target, source, digest in copies)):
+                                raise ValueError('Document copy targets differ from registered output versions')
+                            for target, source, digest in copies:
+                                if source in inputs and inputs[source] != digest:
+                                    raise ValueError('Document copy source has inconsistent versions')
+                                inputs[source] = digest
+                                links[target] = (source, digest)
+                        except (ValueError, OSError, KeyError, TypeError):
+                            # A malformed accepted writer remains a version
+                            # barrier; never fall through to an earlier owner.
+                            trusted, inputs, links = False, {}, {}
                     if trusted and name == 'copy_project' and isinstance(data.get('files'), dict):
                         target, source = self.resolve(data['absolute_path']), self.resolve(data['source'])
                         if not isinstance(call, dict) or not isinstance(call.get('function'), dict):

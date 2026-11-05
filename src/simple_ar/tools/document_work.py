@@ -257,6 +257,36 @@ class DocumentWorkToolGateway:
             for row in rows if row.get('kind') == 'material_window']
 
     @staticmethod
+    def artifact_copies(result: dict) -> list[dict]:
+        """Interpret producer-time copies from an already accepted native result.
+
+        This owner materializes every attachment byte-for-byte. Consumers must
+        verify native acceptance first; prose, source windows and current hashes
+        alone do not establish these edges or certify the copied content.
+        """
+        if result.get('tool_name') != 'work_document' or result.get('status') != 'ok':
+            raise ValueError('Document copies require a successful producer result')
+        data = result.get('data')
+        if (not isinstance(data, dict) or not isinstance(data.get('provenance'), dict)
+                or not isinstance(data.get('artifact_sha256'), dict)
+                or not isinstance(data.get('manuscript'), str) or not isinstance(result.get('artifacts'), list)):
+            raise ValueError('Document copies require their original output binding')
+        copies = data['provenance'].get('attachments')
+        if not isinstance(copies, list):
+            raise ValueError('Document attachment bindings must be a list')
+        seen = set()
+        for row in copies:
+            if (not isinstance(row, dict) or set(row) != {'source', 'source_sha256', 'path'}
+                    or any(not isinstance(row[key], str) or not row[key] for key in row)
+                    or not re.fullmatch(r'[0-9a-f]{64}', row['source_sha256'])
+                    or row['path'] in seen or row['path'] == data['manuscript']
+                    or row['path'] not in result['artifacts']
+                    or data['artifact_sha256'].get(row['path']) != row['source_sha256']):
+                raise ValueError('Document attachment copy differs from its bound output')
+            seen.add(row['path'])
+        return copies
+
+    @staticmethod
     def coordination_result(result: ToolResult, *, receipt_path: str | None = None) -> dict:
         """Keep source reads referenced; expose a new candidate once for coordination.
 

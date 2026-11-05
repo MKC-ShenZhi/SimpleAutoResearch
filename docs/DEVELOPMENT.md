@@ -57,6 +57,8 @@ obstacle and unfinished requirements. No additional action-list interpreter is u
 The document owner resolves attachment selections from its frozen material inventory;
 correctable selection errors retain the draft and observations in the same work unit.
 Authority or input changes still stop that attempt rather than silently changing its binding.
+Attachment copies in accepted receipts enter the shared provenance graph, retaining
+original execution and failure boundaries; current matching bytes do not invent historical sources.
 Read-only directory navigation remains available for routing work; it is not source
 evidence or a required preliminary inventory for every producer.
 Ordinary coordination submits actual candidates to delivery for independent

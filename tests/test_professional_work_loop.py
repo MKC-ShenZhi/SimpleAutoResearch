@@ -6910,6 +6910,68 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._ok('deliver_result')
         self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
 
+    def test_document_attachment_copies_keep_execution_lineage_across_revision_and_failure(self):
+        self._create(current_method=True, delivery_protocol=None, selection_policy='native.v3',
+            professional_contract='work.v8')
+        self._write('make.py', "from pathlib import Path\nPath('values.csv').write_text('value\\n2\\n')\n")
+        self._submit(_action('run_process', argv=['python', 'make.py'], inputs=['make.py'],
+            outputs=['values.csv'], timeout_sec=5), approve=lambda *_: True)
+        process = self._ok('run_process')['data']['receipt']
+        selected = 'values.csv'
+
+        def author(view):
+            candidate = next(row for row in view['candidates']
+                if row['path'] == str(self.app.workspace.resolve(selected)))
+            if not any(row.get('observation', {}).get('data', {}).get('absolute_path') == candidate['path']
+                    for row in view['observations']):
+                return {'action': 'investigate', 'read_windows': [{'path': candidate['path']}]}
+            return {'action': 'finish', 'manuscript_markdown': '# Recorded value\n\n[Data]('
+                + candidate['delivery_path'] + ')\n', 'attachments': [candidate['delivery_path']],
+                'selected_observation_ids': [row['id'] for row in view['observations']]}
+
+        self.document_decision = author
+        def produce():
+            self._submit(_action('work_document', goal='Keep the unchanged measured value and its data.',
+                material_roots=[selected]))
+            result = self._ok('work_document')
+            copy, = result['data']['provenance']['attachments']
+            return copy['path'], copy['source_sha256']
+
+        first, digest = produce()
+        prefix = deepcopy(self.app.ledger.to_dict()['entries'])
+        self._reload()
+        selected = first
+        second, repeated_digest = produce()
+        self.assertEqual(repeated_digest, digest)
+        self.assertEqual(self.app.ledger.to_dict()['entries'][:len(prefix)], prefix)
+        # A later failed writer of the original cannot erase the earlier,
+        # version-bound copy, or make a new copy of the failed output valid.
+        self._submit(_action('run_process', argv=['python', '-c', 'raise SystemExit(1)'],
+            outputs=['values.csv'], timeout_sec=5), approve=lambda *_: True)
+        self.assertEqual(self._last('run_process')['status'], 'error')
+        selected = 'values.csv'
+        failed_copy, failed_digest = produce()
+        self.assertEqual(failed_digest, digest)
+        versions = {first: digest, second: digest, failed_copy: digest}
+        sources = self.app.workspace.artifact_sources(versions)
+        self.assertEqual([sources[p]['status'] for p in versions], ['recorded', 'recorded', 'unknown'])
+        graph = sources[second]['lineage']
+        nodes = {row['id']: row for row in graph['nodes']}
+        current = nodes[graph['root']]
+        for expected in (first, 'values.csv'):
+            edge, = current['edges']
+            self.assertEqual(edge['kind'], 'copy')
+            current = nodes[edge['node']]
+            self.assertEqual(current['path'], self.app.workspace.resolve(expected))
+        self.assertEqual(current['producer']['receipt'], process)
+        self.assertEqual(self.app.workspace.artifact_dependencies({second: sources[second]}),
+            {str(self.app.workspace.resolve('make.py')): _digest(self.app.workspace.resolve('make.py'))})
+        ledger, calls = (self.root/'budget_ledger.json').read_bytes(), self.send.call_count
+        self._reload()
+        self.assertEqual(self.app.workspace.artifact_sources(versions)[second]['status'], 'recorded')
+        self.assertEqual((self.root/'budget_ledger.json').read_bytes(), ledger)
+        self.assertEqual(self.send.call_count, calls)
+
     def test_copy_after_failed_process_does_not_inherit_previous_success(self):
         self._create()
         self._write('make.py', "from pathlib import Path\nPath('result.txt').write_text('observed')\n")
