@@ -691,7 +691,15 @@ def select_working_context(
     if not scoped_records and not retained_records:
         admit_navigation()
 
-    if retained_records:
+    if working_records:
+        # A working set follows actual work, not lexical similarity to the
+        # original request or membership in an old delivery inventory. Only
+        # explicit selections pin originals ahead of more recent observations.
+        # Receipt/field/version identity remains separate from body priority.
+        ordered = sorted(range(len(rows)), key=lambda i: (
+            int(rows[i].get('record') in explicit_references),
+            rows[i].get('turn', -1), *priority(i)), reverse=True)
+    elif retained_records:
         # Explicit references and current objects precede the rest; original
         # text precedes historical operations within each priority group.
         ordered = sorted(range(len(rows)), key=lambda i: (

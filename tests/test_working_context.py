@@ -737,6 +737,34 @@ class WorkingContextTests(unittest.TestCase):
 
 
 class RetainedWorkingContextTests(unittest.TestCase):
+    def test_current_revision_keeps_related_recent_inputs_together_before_old_inventory(self):
+        original = observation(0, 'Compare source measurements. ' * 210,
+            role='historical_observation', path='old/report.md')
+        revision = [observation(i + 1, f'Current revision component {i}. ' * 55,
+            role='historical_observation', path=f'work/component-{i}.txt') for i in range(3)]
+        arguments = dict(observations=[original, *revision],
+            turn_blocks=[[], [], [], [], block(4, 'Apply the current revision')],
+            current_artifacts=[original['path']], version_resolver=lambda _: 'recorded-digest',
+            require_work_notes=True, fit_work_notes=True, sparse_handoffs=True,
+            processed_turns=[], native_observations=[], context_token_target=11000)
+        before = deepcopy(arguments)
+        messages, metadata = select(material_policy='working', **arguments)
+        supplied = json.dumps(messages)
+        self.assertTrue(all(row['text'] in supplied for row in revision))
+        self.assertNotIn(original['text'], supplied)
+        self.assertLessEqual(metadata['estimated_input_tokens'], 11000)
+        # Explicit requests still win, and saved retained policy keeps its
+        # inventory priority. Recency does not certify changed file versions.
+        for policy, references in [('working', [original['record']]), ('retained', [])]:
+            chosen, _ = select(material_policy=policy, selected_records=references, **arguments)
+            self.assertIn(original['text'], json.dumps(chosen))
+        changed, changed_metadata = select(material_policy='working', **{
+            **arguments, 'version_resolver': lambda path: 'changed' if path == revision[1]['path'] else 'recorded-digest'})
+        self.assertNotIn(revision[1]['text'], json.dumps(changed))
+        self.assertTrue(any(row['source']['record'] == revision[1]['record'] and row['status'] == 'stale'
+            for row in changed_metadata['omitted_records']))
+        self.assertEqual(arguments, before)
+
     def test_working_inventory_prioritizes_current_bodies_without_permanently_pinning_them(self):
         original = observation(0, 'Observed original conditions. ' * 400,
             role='historical_observation')

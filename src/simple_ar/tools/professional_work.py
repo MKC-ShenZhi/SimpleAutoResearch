@@ -209,7 +209,11 @@ class ProfessionalWorkTools:
         available, unavailable = self._scope_locations(selected['data'])
         records = list(references)
         diagnostic = ''
-        if available:
+        # Authorized material roots locate work; they are not a selection of
+        # every historical receipt below those roots. Native source work uses
+        # the shared journal selector for bodies and notes, including feedback.
+        # Older private producers still need their explicit material handoff.
+        if available and not self.source_work:
             try:
                 records.extend(row['record'] for row in self.material_observations(available)
                     if isinstance(row.get('record'), str))
@@ -239,7 +243,8 @@ class ProfessionalWorkTools:
             and row.get('sha256') and isinstance(row.get('record'), str))
         scoped = set(records)
         return {'references': records,
-            'notes': [note for note in notes if note.get('records') and set(note['records']).issubset(scoped)],
+            'notes': (notes if self.source_work else
+                [note for note in notes if note.get('records') and set(note['records']).issubset(scoped)]),
             'operation_history': ([row for row in operation_history if row['turn'] >= boundary]
                 if operation_history is not None else None),
             'diagnostic': diagnostic, 'unavailable_locations': unavailable}

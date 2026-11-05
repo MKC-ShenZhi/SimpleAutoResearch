@@ -5,6 +5,12 @@
 User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-11-06
+
+### Improved
+
+- Source work shares the journal's material and note selection instead of treating an authorized directory as a permanent selection of its entire history. Working input favors recent revision material while keeping explicit source selections, file-version checks and original receipts.
+
 ## 2026-11-05
 
 ### Improved

@@ -3642,6 +3642,19 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertEqual(len(self._observations('copy_file')), 4)
             self.assertFalse((self.root/'workspace/working/result-notes.md').exists())
             self.assertFalse(self._process_receipts())
+            # A source root is access to material, not a permanent selection
+            # of every old receipt under it. The shared journal owns notes.
+            reference = next('records/' + item['result'].removeprefix('attempts/')
+                for turn in self.app.state['turns'] for item in turn['tools']
+                if self.app.session.store.read_json(item['result'])['tool_name'] == 'read_file')
+            notes = [{'text': 'Retain the measured conditions and remaining gap.',
+                'records': [reference]}]
+            with patch.object(self.app.operations.work, 'material_observations',
+                    side_effect=AssertionError('Do not pin a whole source-root history')):
+                scope = self.app.operations.work.input_view(rows=[], operation_history=[],
+                    boundary=0, references=[reference], notes=notes)
+            self.assertEqual(scope['references'], [reference])
+            self.assertEqual(scope['notes'], notes)
             prefix = deepcopy(self.app.ledger.to_dict()['entries'])
             token = self.app.approval_token(active['call'])
             self._reload()
