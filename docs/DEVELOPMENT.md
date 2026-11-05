@@ -41,6 +41,8 @@ The application coordinates work; domain modules own their professional operatio
 All operations use the same execution records and resource accounting. Task-local
 scripts can provide a parser, calculation or plot when an existing operation is
 insufficient; they remain subject to the task's permissions.
+POSIX command startup enters process-group supervision before switching to the
+approved working directory and executable; the original argv and environment are preserved.
 
 Ordinary tasks dispatch source and document work from the goal and authorized
 materials. Producers investigate and return editable, version-bound candidates;

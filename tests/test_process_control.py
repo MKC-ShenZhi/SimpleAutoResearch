@@ -6,8 +6,10 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from simple_ar.core.process import ProcessSpec, process_observation, run_process
 from simple_ar.core.process import settle_process_record
@@ -18,6 +20,56 @@ from simple_ar.code_task.execution.runner import _run_command
 
 
 class ProcessControlTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'posix', 'POSIX command startup transport')
+    def test_timeout_and_cancel_cover_startup_before_user_command_executes(self):
+        from simple_ar.core import process as owner
+        for reason in ('timeout', 'cancelled'):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                marker = root / 'unexpected'
+                argv = [sys.executable, '-c', "from pathlib import Path; Path('unexpected').touch()"]
+                ledger = BudgetLedger({'process_invocations': 1, 'process_wall_seconds': 5})
+                cancel = threading.Event()
+                timer = threading.Timer(0.2, cancel.set) if reason == 'cancelled' else None
+                # A real child stalls before chdir/exec of the approved command,
+                # like a blocked shared-filesystem executable lookup. No fake Popen.
+                bootstrap = 'import time; time.sleep(30)\n' + owner._POSIX_EXEC_BOOTSTRAP
+                if timer:
+                    timer.start()
+                try:
+                    with patch.object(owner, '_POSIX_EXEC_BOOTSTRAP', bootstrap):
+                        started = time.monotonic()
+                        result = run_process(ProcessSpec(argv, root, 0.5, output_dir=root/'run'),
+                            budget_ledger=ledger, cancel=cancel)
+                    self.assertLess(time.monotonic()-started, 3)
+                finally:
+                    if timer:
+                        timer.cancel()
+                self.assertEqual(result.stop_reason, reason)
+                self.assertFalse(marker.exists())
+                self.assertEqual(result.record['argv'], argv)
+                self.assertEqual(result.record['cwd'], str(root.resolve()))
+                self.assertEqual(result.record['launch_transport'], 'isolated_python_exec.v1')
+                self.assertEqual(ledger.entries[0].status, 'settled')
+                self.assertEqual(ledger.entries[0].actual['process_wall_seconds'], result.duration_sec)
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX command startup transport')
+    def test_exec_transport_preserves_argv_environment_cwd_and_python_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = ('import json,os,sys; print(json.dumps({"argv":sys.argv[1:], '
+                '"cwd":os.getcwd(), "marker":os.environ["EXEC_MARKER"], "prefix":sys.prefix}))')
+            argv = [sys.executable, '-c', script, 'argument with spaces', '中文', '']
+            result = run_process(ProcessSpec(argv, root, 5, env={**os.environ, 'EXEC_MARKER':'unchanged'}))
+            self.assertEqual(result.returncode, 0)
+            observed = json.loads(result.stdout)
+            self.assertEqual(observed, {'argv':argv[3:], 'cwd':str(root.resolve()),
+                'marker':'unchanged', 'prefix':sys.prefix})
+            self.assertEqual(result.record['argv'], argv)
+            minimal = {'EXEC_MARKER':'literal environment'}
+            plain = run_process(ProcessSpec(['/usr/bin/env'], root, 5, env=minimal))
+            self.assertEqual(plain.stdout.strip(), 'EXEC_MARKER=literal environment')
+
     def test_experiment_and_code_task_share_one_physical_process_budget(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

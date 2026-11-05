@@ -7,11 +7,15 @@ Callers own environment policy, metrics and experiment authorization.
 from __future__ import annotations
 
 import codecs
+from contextlib import ExitStack, contextmanager
+import json
 import math
 import os
 import re
 import signal
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -22,6 +26,60 @@ from uuid import uuid4
 
 from simple_ar.core.artifacts import read_json, write_json
 from simple_ar.core.budget import BudgetConflictError, BudgetLedger
+
+
+# Start a trusted local interpreter before resolving/chdir/exec of user work.
+# Popen itself can block in vfork while execing a FUSE-backed executable; its
+# caller cannot poll a timeout or cancel until it has a child PID. This same-PID
+# exec transport moves those operations under the ordinary process-group watch.
+_POSIX_EXEC_BOOTSTRAP = """import json, os, sys
+fd = int(sys.argv[1])
+os.set_inheritable(fd, False)
+try:
+    with os.fdopen(int(sys.argv[2]), 'r', encoding='utf-8') as source:
+        environment = json.load(source)
+    os.chdir(sys.argv[3])
+    os.execvpe(sys.argv[4], sys.argv[4:], environment)
+except OSError as exc:
+    payload = {'errno': exc.errno, 'message': str(exc.strerror or exc)[:250],
+               'filename': str(exc.filename or sys.argv[4])[:250]}
+    os.write(fd, json.dumps(payload).encode('utf-8'))
+    os._exit(127)
+"""
+
+
+@contextmanager
+def _spawn_process(spec: ProcessSpec):
+    options = dict(env=spec.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    if os.name == 'nt':
+        yield subprocess.Popen(spec.argv, cwd=spec.cwd, **options,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP), lambda: None
+        return
+    # /proc exposes the running binary without traversing a remote venv path.
+    # Other POSIX hosts resolve their interpreter once before launching work.
+    interpreter = os.readlink('/proc/self/exe') if sys.platform.startswith('linux') else str(Path(sys.executable).resolve())
+    reader, writer = os.pipe()
+    try:
+        # An anonymous descriptor preserves the exact approved environment,
+        # including for non-Python commands. Bootstrap Python may otherwise
+        # coerce locale variables. No secrets enter command arguments or logs.
+        try:
+            with tempfile.TemporaryFile() as environment:
+                environment.write(json.dumps(dict(os.environ) if spec.env is None else spec.env).encode('utf-8'))
+                environment.seek(0)
+                process = subprocess.Popen([interpreter, '-I', '-S', '-c', _POSIX_EXEC_BOOTSTRAP,
+                    str(writer), str(environment.fileno()), str(spec.cwd), *spec.argv],
+                    **options, start_new_session=True, pass_fds=(writer, environment.fileno()))
+        finally:
+            os.close(writer)
+
+        def launch_error():
+            raw = os.read(reader, 4096)  # After wait; success closed this fd at exec.
+            return json.loads(raw) if raw else None
+
+        yield process, launch_error
+    finally:
+        os.close(reader)
 
 
 @dataclass(frozen=True)
@@ -260,6 +318,8 @@ def _run_process(
         # The caller owns this authority/source identity; retain it with the
         # actual expanded argv/environment before launch, in the same record.
         record.update(input_binding=spec.input_binding, environment=spec.env)
+    if os.name != 'nt':
+        record['launch_transport'] = 'isolated_python_exec.v1'
 
     def save() -> None:
         if spec.output_dir:
@@ -267,17 +327,21 @@ def _run_process(
 
     save()
     started = time.monotonic()
-    try:
-        process = subprocess.Popen(
-            spec.argv, cwd=spec.cwd, env=spec.env,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
-            start_new_session=os.name != "nt",
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-        )
-    except OSError as exc:
-        record.update(status="launch_failed", error=str(exc))
-        save()
-        raise
+    with ExitStack() as resources:
+        try:
+            process, launch_error = resources.enter_context(_spawn_process(spec))
+        except OSError as exc:
+            record.update(status="launch_failed", error=str(exc))
+            save()
+            raise
+        return _watch_process(spec, process, record, save, started, launch_error,
+            output_callback=output_callback, cancel=cancel,
+            output_complete_callback=output_complete_callback)
+
+
+def _watch_process(spec, process, record, save, started, launch_error, *,
+                   output_callback, cancel, output_complete_callback):
+    """One lifetime/output owner, including actual command startup on POSIX."""
     job = None
     captures = {name: _Capture(spec, name) for name in ("stdout", "stderr")}
     errors: list[Exception] = []
@@ -341,6 +405,12 @@ def _run_process(
                 getattr(process, name).close()
         if any(thread.is_alive() for thread in threads):
             raise RuntimeError("Process descendants retained output pipes after termination")
+    failure = launch_error()
+    if failure is not None:
+        record.update(status='launch_failed', error=failure['message'],
+            finished_at=datetime.now(timezone.utc).isoformat(), duration_sec=time.monotonic() - started)
+        save()
+        raise OSError(failure['errno'], failure['message'], failure['filename'])
     if output_complete_callback is not None:
         output_complete_callback()
     duration = time.monotonic() - started
