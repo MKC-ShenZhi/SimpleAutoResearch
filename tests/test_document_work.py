@@ -173,6 +173,7 @@ class DocumentWorkTests(unittest.TestCase):
         def legacy(*args):
             binding = admit(*args)
             binding['contract'] = 'document_work_operation.v1'
+            binding['context'].pop('prior_asset_links')
             args[0].write_json('input.json', binding)
             return binding
 
@@ -311,6 +312,73 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertEqual((output / 'references.bib').read_bytes(), bibliography.read_bytes())
         self.assertFalse(any('Image is not' in gap for gap in result.data['gaps']))
         self.assertEqual(len(clients[0].calls), 1)
+
+    def test_revision_preserves_commonmark_file_links_and_stable_asset_ids(self):
+        root, source, ledger, workspace = self.workspace()
+        previous = source/'previous'
+        assets = {'assets/测量 结果.csv': b'value\n2\n', 'scripts/parse.py': b'print(2)\n',
+            'figures/chart.svg': b'<svg/>', 'references.bib': b'@article{x}\n'}
+        for name, raw in assets.items():
+            path = previous/name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+        body = ('# Recorded data\n[Data][rows] and [code](scripts/parse.py).\n\n'
+            '[rows]: <assets/测量%20结果.csv#rows> "Observed rows"\n\n'
+            '![Plot](figures/chart.svg)\n[Section](#recorded-data) [Self](manuscript.md#recorded-data) '
+            '[Assets](assets/) '
+            '[External](https://example.org/paper)\n`[example](missing.csv)`\n'
+            '```markdown\n[example](missing.csv)\n```\n')
+        draft = previous/'manuscript.md'
+        draft.write_text(body, encoding='utf-8')
+        def author(view, _count):
+            row = next(row for row in view['candidates']
+                if row['path'] == str(previous/'assets/测量 结果.csv'))
+            self.assertEqual(row['delivery_path'], 'assets/测量 结果.csv')
+            return {'action': 'finish', 'manuscript_markdown': body+'\nScope clarified.\n',
+                'attachments': [row['delivery_path']]}
+        owner, clients = self.gateway(root, source, ledger, workspace, author)
+        args = {'goal': 'Clarify only the prose and retain the referenced work.',
+            'prior_draft': str(draft), 'prior_sha256': sha(draft.read_bytes())}
+        result = owner.call('work_document', args, identity='linked-revision')
+        self.assertTrue(result.ok, result.error)
+        output = workspace.resolve(result.data['manuscript']).parent
+        self.assertEqual(len(result.artifacts), 5)  # One copy, even when selected and inherited.
+        for name, raw in assets.items():
+            self.assertEqual((output/name).read_bytes(), raw)
+            self.assertEqual((previous/name).read_bytes(), raw)
+        self.assertEqual(draft.read_text(encoding='utf-8'), body)
+        self.assertEqual(result.data['markdown'], body+'\nScope clarified.\n')
+        self.assertEqual(owner.call('work_document', args, identity='linked-revision'), result)
+        self.assertEqual(len(clients[0].calls), 1)
+        (previous/'scripts/parse.py').write_bytes(b'changed source')
+        rejected = owner.call('work_document', args, identity='linked-revision')
+        self.assertEqual(rejected.status, 'blocked')
+        self.assertEqual((output/'scripts/parse.py').read_bytes(), assets['scripts/parse.py'])
+
+    def test_local_link_repair_preserves_the_draft_without_reading_unmounted_paths(self):
+        root, source, ledger, workspace = self.workspace()
+        (source/'data.csv').write_text('value\n2\n')
+        unmounted = root/'private.txt'
+        unmounted.write_text('UNMOUNTED_TEST_MATERIAL')
+        bad = ('# Data\n[Data](assets/not-selected.csv) [Outside](../private.txt)\n'
+            '```markdown\n[example](missing.csv)\n```\n')
+        def author(view, count):
+            row = next(row for row in view['candidates'] if row['path'] == str(source/'data.csv'))
+            if count == 1:
+                body = bad
+            else:
+                self.assertEqual(view['candidate_preview']['manuscript_markdown'], bad)
+                self.assertEqual(view['read_results'][0]['status'], 'candidate_selection_rejected')
+                self.assertFalse(list(workspace.workspace.rglob('*.csv')))
+                self.assertNotIn('UNMOUNTED_TEST_MATERIAL', json.dumps(view))
+                body = '# Data\n[Data]('+row['delivery_path']+')\n```markdown\n[example](missing.csv)\n```\n'
+            return {'action': 'finish', 'manuscript_markdown': body, 'attachments': [row['delivery_path']]}
+        owner, clients = self.gateway(root, source, ledger, workspace, author)
+        result = owner.call('work_document', {'goal': 'Keep a usable data link.'}, identity='link-repair')
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(len(clients[0].calls), 2)
+        self.assertEqual(unmounted.read_text(), 'UNMOUNTED_TEST_MATERIAL')
+        self.assertEqual(len(result.artifacts), 2)
 
     def test_complete_final_response_recovers_before_candidate_is_saved(self):
         root, source, ledger, workspace = self.workspace()

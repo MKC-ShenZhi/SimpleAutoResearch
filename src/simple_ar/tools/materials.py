@@ -26,6 +26,31 @@ def relative_image_target(target: str) -> str | None:
     return path.as_posix()
 
 
+def document_local_targets(markdown: str) -> list[dict]:
+    """Actual CommonMark file links/images, excluding code, URLs and anchors.
+
+    A fragment or query does not change the local file being referenced. Unsafe
+    output-relative spellings remain explicit, rather than gaining authority.
+    """
+    from markdown_it import MarkdownIt
+
+    def targets(tokens):
+        for token in tokens:
+            if token.type in {'image', 'link_open'}:
+                yield token.attrGet('src' if token.type == 'image' else 'href')
+            if token.children and token.type != 'image':
+                yield from targets(token.children)
+
+    result, seen = [], set()
+    for target in targets(MarkdownIt().parse(markdown)):
+        url = urlsplit(target)
+        if url.scheme or url.netloc or not url.path or target in seen:
+            continue
+        seen.add(target)
+        result.append({'target': target, 'relative_target': relative_image_target(url.path)})
+    return result
+
+
 _CONTENT_REUSE_MAX_PROBES = 128
 _CONTENT_REUSE_MAX_HASH_BYTES = 64 * 1024 * 1024
 _CONTENT_REUSE_MAX_REFERENCES = 256

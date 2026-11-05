@@ -59,6 +59,10 @@ correctable selection errors retain the draft and observations in the same work 
 Authority or input changes still stop that attempt rather than silently changing its binding.
 Attachment copies in accepted receipts enter the shared provenance graph, retaining
 original execution and failure boundaries; current matching bytes do not invent historical sources.
+Revisions retain referenced local files at their bound relative paths, including
+data and source links. CommonMark local references must resolve to planned outputs
+before materialization; missing links return to the same producer with its draft intact.
+Saved bindings retain their original asset behavior.
 Read-only directory navigation remains available for routing work; it is not source
 evidence or a required preliminary inventory for every producer.
 Ordinary coordination submits actual candidates to delivery for independent

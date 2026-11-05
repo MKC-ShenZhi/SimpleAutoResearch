@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 from typing import Any, Callable, Literal
 
@@ -21,7 +21,7 @@ from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.tools.materials import (
     freeze_work_context, material_inventories, material_observation_seed,
     read_bound_material_bytes, read_material_window, validate_material_observation,
-    window_key, relative_image_target,
+    window_key, relative_image_target, document_local_targets,
 )
 from simple_ar.tools.sources import SourceToolGateway
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
@@ -345,7 +345,7 @@ class DocumentWorkToolGateway:
             raise ValueError('Original material roots provider must return a list of locators')
         roots = list(dict.fromkeys(str(self.workspace.resolve_material_root(path))
             for path in [*supplied, *request.material_roots]))
-        prior = None
+        prior, prior_links = None, []
         if request.prior_draft:
             path = self.workspace.resolve_material_root(request.prior_draft)
             if not path.is_file() or path.stat().st_size > 256000:
@@ -354,13 +354,13 @@ class DocumentWorkToolGateway:
                 request.prior_sha256, max_bytes=256000)
             prior = {'path': request.prior_draft, 'absolute_path': str(path),
                 'sha256': request.prior_sha256, 'size_bytes': len(raw), 'text': raw.decode('utf-8')}
-            self._prior_assets(prior, identity)
+            prior_links = self._prior_assets(prior, identity)
         targets = [*roots, *([request.prior_draft] if prior else [])]
         context = freeze_work_context(self.work_context or (lambda _targets: {}), targets)
         inventories = material_inventories(self.workspace, roots, identity=identity)
         # References in the actual current manuscript are part of that work
         # product, even when its directory is outside the original input roots.
-        prior_files = ([row['source'] for row in prior['images'] if row.get('source')]
+        prior_files = ([row['source'] for row in [*prior['images'], *prior_links] if row.get('source')]
             + ([prior['bibliography']['source']] if prior['bibliography'] else []) if prior else [])
         if prior_files:
             inventories.extend(material_inventories(self.workspace, list(dict.fromkeys(prior_files)), identity=identity))
@@ -386,13 +386,23 @@ class DocumentWorkToolGateway:
             if self.workspace.artifact_hashes([str(original)])[str(original)] != before:
                 raise ValueError('Original source changed during inventory')
             source_views.append({'path': str(original), 'sha256': before, 'view': view})
+        stable_paths = {row['source']: row['relative_target'] for row in prior_links
+            if row.get('source') and row['relative_target']}
+        occupied = set(stable_paths.values())
         candidates = []
         for index, (path, size) in enumerate(sorted(files.items()), 1):
             safe_name = re.sub(r'[^A-Za-z0-9._-]+', '_', Path(path).name).strip('.') or 'material'
+            target = stable_paths.get(path)
+            if target is None:
+                target = f'assets/{index:04d}-{safe_name}'
+                while target in occupied:
+                    target = 'assets/new-' + target.removeprefix('assets/')
+                occupied.add(target)
             candidates.append({'path': path, 'size_bytes': size,
-                'delivery_path': f'assets/{index:04d}-{safe_name}'})
+                'delivery_path': target})
         base = {'goal': request.goal, 'work_context': context['work_context'],
             'work_context_scope': {'role': context['role'], 'usage': context['usage']}, 'prior_draft': prior,
+            'prior_asset_links': prior_links,
             'material_roots': roots, 'candidates': candidates,
             'original_source_bundles': source_views,
             'inventory_scope': [item.get('inventory_scope', '') for item in inventories],
@@ -408,7 +418,7 @@ class DocumentWorkToolGateway:
         store.write_json('input.json', binding)
         return binding
 
-    def _prior_assets(self, prior: dict, identity: str) -> None:
+    def _prior_assets(self, prior: dict, identity: str) -> list[dict]:
         from simple_ar.report.export import _asset_path, report_image_targets
 
         parent = Path(prior['absolute_path']).parent
@@ -442,24 +452,82 @@ class DocumentWorkToolGateway:
         except (ValueError, OSError):
             pass  # No accessible bibliography is not evidence of one elsewhere.
         prior['images'], prior['bibliography'] = images, bibliography
+        links = document_local_targets(prior['text'])
+        bound = {row['relative_target']: {key: row[key] for key in ('source', 'sha256')}
+            for row in images if row.get('source') and row.get('relative_target')}
+        if bibliography:
+            bound['references.bib'] = {key: bibliography[key] for key in ('source', 'sha256')}
+        for row in links:
+            if row['relative_target'] is None:
+                row['gap'] = 'Local reference cannot be preserved inside the document output directory.'
+                continue
+            if row['relative_target'] == 'manuscript.md' and parent/'manuscript.md' == Path(prior['absolute_path']):
+                row['self_reference'] = True
+                continue
+            if row['relative_target'] in bound:
+                row.update(bound[row['relative_target']])
+                continue
+            try:
+                path = self.workspace.resolve_material_root(str(parent / row['relative_target']))
+                observed = read_material_window(self.workspace, {'path': str(path), 'max_bytes': 1,
+                    'full_digest': True}, identity=identity)
+                row.update(source=str(path), sha256=observed['data']['sha256'])
+                bound[row['relative_target']] = {key: row[key] for key in ('source', 'sha256')}
+            except (ValueError, OSError) as exc:
+                row['gap'] = str(exc)
+        return links
 
     @staticmethod
-    def _inherited_assets(binding: dict, markdown: str, identity: str) -> list[dict]:
+    def _inherited_assets(binding: dict, markdown: str, identity: str,
+                          selected: list[dict] | None = None) -> list[dict]:
         from simple_ar.report.export import report_image_targets
 
         prior = binding['context']['prior_draft']
         if not prior:
             return []
-        referenced = set(report_image_targets(markdown))
+        current = 'prior_asset_links' in binding['context']
+        referenced = (set(row['relative_target'] for row in document_local_targets(markdown)) if current
+            else set(report_image_targets(markdown)))
+        rows = binding['context']['prior_asset_links'] if current else prior['images']
         assets = [{'source': row['source'], 'source_sha256': row['sha256'],
             'path': f"workspace/document-work/{identity}/{row['relative_target']}"}
-            for row in prior['images'] if row.get('source') and row.get('relative_target')
-            and row['target'] in referenced]
+            for row in rows if row.get('source') and row.get('relative_target')
+            and (row['relative_target'] if current else row['target']) in referenced]
         if prior['bibliography']:
             assets.append({'source': prior['bibliography']['source'],
                 'source_sha256': prior['bibliography']['sha256'],
                 'path': f'workspace/document-work/{identity}/references.bib'})
-        return assets
+        if not current:
+            return assets  # Saved bindings retain their original image/bibliography contract.
+        planned = {row['path']: row for row in selected or []}
+        inherited = []
+        for row in assets:
+            previous = planned.get(row['path'])
+            if previous:
+                if previous['source_sha256'] != row['source_sha256']:
+                    raise _CandidateSelectionError('Selected and retained document assets have conflicting versions')
+                continue
+            planned[row['path']] = row
+            inherited.append(row)
+        return inherited
+
+    @staticmethod
+    def _check_asset_links(binding: dict, markdown: str, identity: str, targets: list[str]) -> None:
+        if 'prior_asset_links' not in binding['context']:
+            return  # Never retroactively reinterpret saved producer outputs.
+        planned = set(targets)
+        if any(parent.as_posix() in planned for target in planned for parent in PurePosixPath(target).parents):
+            raise _CandidateSelectionError('Document file outputs conflict with an output directory')
+        missing = []
+        for row in document_local_targets(markdown):
+            relative = row['relative_target']
+            target = (PurePosixPath(f'workspace/document-work/{identity}') / relative).as_posix() if relative is not None else None
+            if target is None or not any(path == target or path.startswith(target+'/') for path in planned):
+                missing.append(row['target'])
+        if missing:
+            raise _CandidateSelectionError('Local document links need bound output assets: '
+                + json.dumps(missing, ensure_ascii=False)
+                + '. Use the supplied delivery_path IDs, retain referenced prior assets, or remove the unsupported link.')
 
     def _produce(self, store: ArtifactStore, request: WorkDocumentRequest, identity: str) -> None:
         binding = self._admit(store, request, identity)
@@ -654,11 +722,12 @@ class DocumentWorkToolGateway:
                 raise ValueError('Attachment changed since inventory')
             target = f"workspace/document-work/{identity}/{visible[source]['delivery_path']}"
             assets.append({'source': source, 'source_sha256': observation['data']['sha256'], 'path': target})
-        inherited = self._inherited_assets(binding, decision.manuscript_markdown, identity)
+        inherited = self._inherited_assets(binding, decision.manuscript_markdown, identity, assets)
         manuscript = f'workspace/document-work/{identity}/manuscript.md'
         targets = [manuscript, *(row['path'] for row in [*assets, *inherited])]
         if len(targets) != len(set(targets)):
             raise _CandidateSelectionError('Selected and retained document assets have conflicting paths')
+        self._check_asset_links(binding, decision.manuscript_markdown, identity, targets)
         for target in targets:
             if self.workspace.resolve(target, write=True).exists():
                 raise ValueError('Candidate output already exists before document work; preserve it and use a new attempt')
@@ -721,11 +790,12 @@ class DocumentWorkToolGateway:
                 or any(source not in visible for source in selected_sources)
                 or any(asset['path'] != f"workspace/document-work/{identity}/{visible[asset['source']]['delivery_path']}"
                     for asset in candidate['assets'])
-                or candidate['inherited_assets'] != self._inherited_assets(binding, candidate['markdown'], identity)):
+                or candidate['inherited_assets'] != self._inherited_assets(binding, candidate['markdown'], identity, candidate['assets'])):
             raise ValueError('Document attachment selection or destination changed')
         targets = [candidate['manuscript'], *(row['path'] for row in [*candidate['assets'], *candidate['inherited_assets']])]
         if len(targets) != len(set(targets)):
             raise ValueError('Document asset destinations conflict')
+        self._check_asset_links(binding, candidate['markdown'], identity, targets)
         self._check_inputs(binding, candidate, identity)
         if store.exists('receipt.json'):
             # A completed receipt describes the current bytes, not authority to
