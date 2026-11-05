@@ -16,6 +16,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- Interrupted native model decisions without a saved reply can be explicitly retried in the same task, retaining known work and unknown charges. Saved replies and tool effects keep their existing receipt recovery paths.
 - Tool discovery and context admission resolve the source-work role before iterating over tools or capacity candidates, avoiding repeated history reads; actual action admission still checks the current role.
 - POSIX command supervision now covers changing to the working directory and loading the approved executable, including shared-filesystem startup stalls. Command arguments, environment, process-group cleanup and launch-failure accounting remain bound to the original invocation.
 

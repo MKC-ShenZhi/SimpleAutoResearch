@@ -4935,13 +4935,20 @@ class ToolApplication:
                 else:
                     arguments = {"call": pending["call"]} if capability == "native_tool" else {}
                 result = self.session.execute_attempt(capability, attempt_id=identity, **arguments)
-            except LLMCallStopped:
+            except (LLMCallStopped, KeyboardInterrupt) as exc:
                 # This stack has unwound after an observed caller stop; unlike
                 # a lost process, it is known not to dispatch further work.
-                # Close the attempt through the existing interruption owner so
-                # settled checkpoints remain usable, without replaying tools.
-                self.session.recover_interrupted(identity,
-                    reason='Caller stopped before the next model dispatch; recorded effects retained')
+                # A native decision without a durable reply can be explicitly
+                # retried. Tool interruption still belongs to its effect owner.
+                # Preserve cached replies/choices for ordinary receipt recovery.
+                if isinstance(exc, LLMCallStopped) or capability == 'native_turn':
+                    store = ArtifactStore(self.session.store.root / 'attempts' / identity)
+                    interrupted = next((row for row in self.session.list_attempts()
+                        if row.attempt_id == identity and row.status == 'running'), None)
+                    if interrupted is not None and not any(store.exists(name) for name in
+                            ('native_result.json', 'work_choice.json', 'capability_result.json')):
+                        self.session.recover_interrupted(identity,
+                            reason='Caller interrupted model work; retain recorded effects, checkpoints and physical accounting')
                 raise
             if result.status != "completed":
                 detail = "; ".join(result.diagnostics) or "No diagnostics recorded"

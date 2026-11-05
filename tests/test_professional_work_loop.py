@@ -3735,11 +3735,21 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertIn('source only', self._last('run_process')['error'])
         self.assertFalse(self._process_receipts())
 
+        before, calls = self.app.ledger.to_dict(), self.send.call_count
+        with patch.object(self.app, '_professional_model_input', side_effect=KeyboardInterrupt('Stop during input preparation')):
+            self._run(should_stop=lambda:False)
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), before)
+        self.assertIsNotNone(self.app._failed_model_attempt(self.app.state['pending']))
+        self.app = ToolApplication.load(self.root)
+        self.assertEqual(self.app._coordinator_purpose(), 'code')
+        self.assertEqual((self.root/'workspace/working/conditions.txt').read_bytes(), retained)
+
         def lose_reply():
             raise httpx.ReadTimeout('Controlled response loss after dispatch')
         self.decisions.extend([
             _action('write_file', path='working/note.md', content='Known useful partial work.\n'), lose_reply])
-        self._run(should_stop=lambda:False)
+        self._run(retry_model=True, should_stop=lambda:False)
         self.assertEqual((self.root/'workspace/working/note.md').read_text(), 'Known useful partial work.\n')
         unknown = [row.to_dict() for row in self.app.ledger.entries if row.status=='unknown']
         self.assertEqual(len(unknown), 1)
@@ -3752,6 +3762,15 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._run()
         self.assertEqual(self.send.call_count, calls)
         self.assertEqual(self.app.ledger.to_dict(), ledger)
+        def interrupt_provider():
+            raise KeyboardInterrupt('Stop after provider dispatch')
+        self.decisions.append(interrupt_provider)
+        self._run(retry_model=True, should_stop=lambda:False)
+        interrupted = [row.to_dict() for row in self.app.ledger.entries if row.status=='unknown']
+        self.assertEqual(len(interrupted), 2)
+        self.assertEqual(interrupted[:1], unknown)
+        self.assertIsNotNone(self.app._failed_model_attempt(self.app.state['pending']))
+        unknown = interrupted
         # Public retry resumes the code role with known files, not a new preparation
         # or replay of the lost reply. No caller supplies an interpretation for it.
         self.decisions.extend([
