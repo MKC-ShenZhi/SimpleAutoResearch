@@ -5628,7 +5628,9 @@ class ToolApplication:
                 and spec.permission_level == 'execution' and self.gateway.policy.is_allowed(spec)[0]
                 and (scoped or not self._offered_tool_error(call) and not self._terminal_error(call))):
             try:
-                token = self.approval_token(call)
+                work_blocked = (self.operations is not None and self.operations.work is not None
+                    and self.operations.work.protect_prior(name, json.loads(call['function']['arguments'])))
+                token = None if work_blocked else self.approval_token(call)
             except (ValueError, TypeError, KeyError, OSError):
                 token = None  # The ordinary validator returns the invalid proposal, without execution.
             started = self.gateway.has_started(ToolCall(tool_name=name, trace_id=pending['attempt']))

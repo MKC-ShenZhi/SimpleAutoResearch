@@ -477,6 +477,9 @@ class OperationTools:
                     return True
                 if spec.name in {self.work.entry_tool, 'deliver_result', 'review_result'}:
                     return False
+                if (spec.permission_level == 'execution'
+                        and not self.work.selected()['data']['execution_requested']):
+                    return False
                 return (spec.domain in {'workspace', 'sources', 'analysis', 'scientific'}
                     or spec.domain.startswith('extension:'))
             if spec.name == self.work.return_tool:

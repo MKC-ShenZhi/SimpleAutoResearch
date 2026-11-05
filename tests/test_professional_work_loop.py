@@ -3596,7 +3596,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             return [_action('read_file', path='measurements/'+name, full_digest=True) for name in names]
 
         def copy_batch():
-            reads = {Path(row['data']['path']).name: row['data'] for row in self._observations('read_file')}
+            reads = {Path(row['data']['absolute_path']).name: row['data'] for row in self._observations('read_file')}
             return [_action('copy_file', source='measurements/'+name, path='working/'+name,
                 source_sha256=reads[name]['sha256']) for name in names]
 
@@ -3622,6 +3622,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self._run()
             pending = self.app.state['pending']
             active = pending.get('action') or pending
+            self.assertEqual(active.get('kind'), 'tool', self.app.result_snapshot())
             self.assertEqual(active['call']['function']['name'], 'run_process')
             self.assertEqual(self.app._coordinator_purpose(), 'code')
             self.assertEqual(len(self._observations('copy_file')), 4)
@@ -3672,8 +3673,16 @@ class OperationsWorkLoopTests(unittest.TestCase):
 
     def test_shared_source_partial_batch_and_lost_model_reply_retain_work_without_replay(self):
         import httpx
-        self._create(goal='Prepare reusable source only; preserve useful partial files if interrupted.',
-            current_method=True, delivery_protocol=None, selection_policy='native.v3', professional_contract='work.v10')
+        catalog = self.directory/'source-retry-models.toml'
+        catalog.write_text('version = 1\n[routes]\ndefault = "offline"\n'
+            '[profiles.offline]\napi = "openai_chat"\nbase_url = "https://offline.example/v1"\n'
+            'model = "fixture"\napi_key_env = "SAR_OFFLINE_TEST_KEY"\ncapabilities = ["text", "code"]\n'
+            'retry_attempts = 1\nconnect_retry_attempts = 1\nmax_output_tokens = 2048\n'
+            'context_input_tokens = 100000\n', encoding='utf-8')
+        self.enterContext(patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG':str(catalog), 'SAR_OFFLINE_TEST_KEY':'offline'}))
+        self.app = ToolApplication.create(self.root, 'Prepare reusable source only; preserve useful partial files if interrupted.',
+            model='profile:offline', sources={'measurements':self.inputs}, allow_execution=True,
+            max_turns=30, max_tokens=900000, max_attempts=100, tool_contracts='full')
         self._submit(_action('prepare_implementation', goal='Retain the supplied conditions and an editable account.',
             material_roots=['measurements'], execution_requested=False))
         self._read('measurements/conditions.txt')
@@ -3698,14 +3707,20 @@ class OperationsWorkLoopTests(unittest.TestCase):
         unknown = [row.to_dict() for row in self.app.ledger.entries if row.status=='unknown']
         self.assertEqual(len(unknown), 1)
         ledger, calls = self.app.ledger.to_dict(), self.send.call_count
-        self._reload()
+        self.app = ToolApplication.load(self.root)
         self.assertEqual(self.app._coordinator_purpose(), 'code')
         self._run()
         self.assertEqual(self.send.call_count, calls)
         self.assertEqual(self.app.ledger.to_dict(), ledger)
-        # Explicit caller continuation is a new decision, not replay of the lost reply.
-        self._submit(_action('return_source_work', candidate='working', summary='Known partial files retained.',
-            gaps=['The interrupted model decision produced no received interpretation.']))
+        # Public retry resumes the code role with known files, not a new preparation
+        # or replay of the lost reply. No caller supplies an interpretation for it.
+        self.decisions.extend([
+            _action('read_file', path='working/note.md'),
+            _action('return_source_work', candidate='working', summary='Known partial files retained.',
+                gaps=['The requested account remains incomplete.']),
+            _action('ask_user', question='Useful partial files are retained; what detail should the account cover?'),
+        ])
+        self._run(retry_model=True, should_stop=lambda:False)
         self._ok('return_source_work')
         self.assertEqual(len(self._observations('copy_file')), 2)
         self.assertEqual((self.root/'workspace/working/conditions.txt').read_bytes(), retained)
