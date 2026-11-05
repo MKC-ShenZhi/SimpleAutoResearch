@@ -47,8 +47,10 @@ materials. Producers investigate and return editable, version-bound candidates;
 the shared native queue owns subsequent work, approved execution and delivery.
 File-level operations belong to producers and inspectors; explicit caller APIs
 remain available. Loading a schema cannot transfer that responsibility to the
-coordinating model. An explicit
-delivery independently checks the actual version; a partial exit discloses the
+coordinating model. Document work can preview literal text measurements and revise
+locally on the shared budget. Coordination receives the candidate text and measurements;
+these are neither independent evidence nor an acceptance verdict. Historical receipts
+keep their original recovery contract. An explicit delivery independently checks the actual version; a partial exit discloses the
 obstacle and unfinished requirements. No additional action-list interpreter is used.
 Recorded work supplies observations, not an inherited action agenda. Saved tasks
 retain their original selection contract.

@@ -3431,6 +3431,64 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.state['config']['professional_operations'], 'work.v6')
         self.assertEqual(self.app.ledger.to_dict()['entries'][:len(prefix)], prefix)
 
+    def test_document_candidate_is_visible_and_required_delivery_repair_reuses_originals(self):
+        self._create(goal='Explain the recorded observations, explicitly retaining their limited scope.',
+            current_method=True, delivery_protocol=None, selection_policy='native.v3',
+            professional_contract='work.v7')
+        original = self._versions(self.inputs)
+        finding = 'State that these supplied observations do not establish a population claim.'
+        draft = '# Observations\n\nThe supplied mean is 2.0.\n'
+        revised = draft + '\nNo population inference is supported.\n'
+
+        def author(view):
+            if not view['observations']:
+                return {'action': 'investigate', 'read_windows': [{'path': 'measurements/observations.csv'},
+                    {'path': 'measurements/conditions.txt'}]}
+            body = draft
+            if view['prior_draft']:
+                self.assertIn(finding, json.dumps(view['work_context']))
+                body = revised
+            return {'action': 'finish', 'manuscript_markdown': body,
+                'selected_observation_ids': [row['id'] for row in view['observations']]}
+
+        def review(view):
+            response = self._review_complete_targets(view)
+            if not isinstance(response, dict):
+                return response
+            artifacts = view['proposed_delivery']['artifacts']
+            path, = artifacts
+            if Path(path).read_text() == draft:
+                response['findings'] = [{'severity': 'required', 'message': finding, 'artifacts': [path]}]
+            response['reassessed_prior'] = [row['id'] for row in view.get('prior_required', [])]
+            return response
+
+        self.document_decision, self.review = author, review
+        self._submit(_action('work_document', goal='Explain the supplied observations'))
+        initial = self._ok('work_document')
+        item = self.app.state['turns'][-1]['tools'][-1]
+        presented = self.app._coordination_result(initial, item['result'])
+        self.assertEqual(presented['data']['markdown'], draft)
+        self.assertEqual(presented['data']['measurements']['whitespace_words'], len(draft.split()))
+        self.assertIn('The supplied mean is 2.0.', json.dumps(self.app._messages()))
+        self.assertFalse(self.inspection_requests)  # Seeing a candidate needs no reviewer.
+        self._submit(_action('deliver_result', summary='Explanation of recorded observations',
+            artifacts=[initial['data']['manuscript']]))
+        self.assertFalse((self.root/'delivery.json').exists())
+        prefix = deepcopy(self.app.ledger.to_dict()['entries'])
+        self._reload()
+        self._submit(_action('work_document', goal='Address the bound required finding and retain valid content',
+            prior_draft=initial['data']['manuscript'], prior_sha256=initial['data']['sha256']))
+        fixed = self._ok('work_document')
+        self.assertEqual(len(self.document_views), 3)  # No original re-investigation on repair.
+        self.assertEqual(self.app.workspace.resolve(initial['data']['manuscript']).read_text(), draft)
+        self._submit(_action('deliver_result', summary='Explanation with explicit observation scope',
+            artifacts=[fixed['data']['manuscript']]))
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertEqual(self._versions(self.inputs), original)
+        self.assertEqual(self.app.ledger.to_dict()['entries'][:len(prefix)], prefix)
+        self.assertFalse(self._observations('inspect_artifacts'))
+        self.assertFalse(self._process_receipts())
+
     def test_goal_source_owner_returns_candidate_and_approved_execution_on_one_ledger(self):
         self._create(goal='Compute the supplied observations and deliver a reusable source project and result.',
             current_method=True, delivery_protocol=None, selection_policy='native.v3',

@@ -48,6 +48,35 @@ attachments and gaps. Batch related reads and continue when more evidence is
 needed; use next_offset_bytes for an unread tail. The shared task budget applies.
 """
 
+# Keep the recorded v1 prompt for historical response/receipt recovery.
+_CANDIDATE_SYSTEM = _SYSTEM + """
+You also own submission readiness for the requested work unit. When length,
+headings or other directly measurable presentation requirements matter, use
+preview with your draft to obtain actual byte-bound text measurements, then
+revise within this same work unit before finish. The preview is not written to
+the workspace and is not an independent review. Judge the measurements against
+the exact original requests; no automatic tolerance or extra requirement is
+imposed. Whitespace-delimited words are not a language-independent word count.
+Preserve scientific content and valid observations while making local revisions.
+If a requirement cannot be met, disclose it in gaps rather than claiming success.
+"""
+
+
+def _system_for(binding: dict) -> str:
+    if binding['contract'] not in {'document_work_operation.v1', 'document_work_operation.v2'}:
+        raise ValueError('Unknown saved document work contract')
+    return _CANDIDATE_SYSTEM if binding['contract'] == 'document_work_operation.v2' else _SYSTEM
+
+
+def manuscript_measurements(markdown: str) -> dict:
+    """Facts about exact candidate bytes, never a quality/acceptance verdict."""
+    raw = markdown.encode('utf-8')
+    return {'sha256': hashlib.sha256(raw).hexdigest(), 'size_bytes': len(raw),
+        'whitespace_words': len(markdown.split()), 'unicode_characters': len(markdown),
+        'headings': re.findall(r'^#{1,6}\s+(.+)$', markdown, flags=re.MULTILINE),
+        'scope': 'Entire literal Markdown, including headings, tables, code and references; '
+            'whitespace words are not a universal linguistic count. No content or requirement verdict.'}
+
 
 class WorkDocumentRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
@@ -84,7 +113,7 @@ class _SourceQuery(BaseModel):
 
 class _Decision(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
-    action: Literal['investigate', 'finish']
+    action: Literal['investigate', 'preview', 'finish']
     read_windows: list[FileWindow] = Field(default_factory=list, max_length=12)
     source_queries: list[_SourceQuery] = Field(default_factory=list, max_length=12)
     selected_observation_ids: list[str] = Field(default_factory=list, max_length=128)
@@ -101,7 +130,7 @@ class _Decision(BaseModel):
                 raise ValueError('Investigation and finished manuscript are separate decisions')
         else:
             if self.read_windows or self.source_queries or not self.manuscript_markdown.strip():
-                raise ValueError('Finish requires a complete nonempty manuscript and no pending reads')
+                raise ValueError('Preview/finish requires a complete nonempty manuscript and no pending reads')
             if len(self.manuscript_markdown.encode('utf-8')) > 256000:
                 raise ValueError('Manuscript exceeds the workspace text write limit')
             if any(not gap.strip() for gap in self.gaps):
@@ -117,6 +146,8 @@ def document_work_tool_specs() -> list[CommonToolSpec]:
         description=('Investigate authorized original materials and create or substantively revise an editable '
             'Markdown manuscript. Original task roots, requests, version-bound feedback and reusable reads '
             'are supplied by the application. Return a candidate, current version, provenance and gaps. '
+            'The coordinator receives the actual candidate text and measured size for choosing revision '
+            'or delivery without a separate inspection merely to view the draft. '
             'Use independent operations for inspection, publication and delivery; direct simple edits need '
             'not use this operation. No network or execution.'))]
 
@@ -190,7 +221,7 @@ class DocumentWorkToolGateway:
             if (decision.action != 'finish' or not record['accounting_known']
                     or record['response_sha256'] != _digest(record['response'])
                     or record['request_sha256'] != _digest(snapshot)
-                    or snapshot['system'] != _SYSTEM
+                    or snapshot['system'] != _system_for(binding)
                     or snapshot['budget_call_id'] != f'{identity}:document:{step}'
                     or snapshot['input']['observations'] != observations
                     or any(snapshot['input'].get(key) != value for key, value in binding['context'].items())):
@@ -207,7 +238,12 @@ class DocumentWorkToolGateway:
 
     @staticmethod
     def coordination_result(result: ToolResult, *, receipt_path: str | None = None) -> dict:
-        """Keep large read and manuscript bodies in the original native receipt."""
+        """Keep source reads referenced; expose a new candidate once for coordination.
+
+        Historical v1 receipts retain their compact presentation. Current
+        candidates carry literal text and mechanical measurements, not evidence
+        or an independent content verdict. Never read files to build this view.
+        """
         presented = result.model_dump(mode='json')
         windows = presented['metadata'].pop('material_observations', [])
         record = receipt_path or presented['data'].get('receipt')
@@ -215,7 +251,7 @@ class DocumentWorkToolGateway:
             presented['data']['source_observations'] = {'record': record,
                 'field': 'metadata.material_observations', 'count': len(windows),
                 'scope': 'Original byte-owner reads remain in the native receipt; reuse rechecks access, bytes and ranges.'}
-        if 'markdown' in presented['data']:
+        if 'markdown' in presented['data'] and 'measurements' not in presented['data']:
             presented['data'].pop('markdown')
             presented['data']['manuscript_content'] = {'path': result.data['manuscript'],
                 'sha256': result.data['sha256'], 'record': record}
@@ -317,7 +353,7 @@ class DocumentWorkToolGateway:
         seed = material_observation_seed(workspace=self.workspace, inventories=inventories,
             provider=self.material_observations, roots=roots, context=base,
             excluded_paths=source_paths | ({prior_path} if prior_path else set()))
-        binding = {'contract': 'document_work_operation.v1', 'request_sha256': _digest(request.model_dump(mode='json')),
+        binding = {'contract': 'document_work_operation.v2', 'request_sha256': _digest(request.model_dump(mode='json')),
             'context': base, 'inventories': inventories, 'seed': seed}
         store.write_json('input.json', binding)
         return binding
@@ -393,6 +429,8 @@ class DocumentWorkToolGateway:
         for row in observations:
             seen_reads.add(window_key(self.workspace, FileWindow.model_validate(row['observation']['request'])))
         feedback = []
+        preview = None
+        system = _system_for(binding)
         step = 0
         while True:
             step += 1
@@ -400,15 +438,17 @@ class DocumentWorkToolGateway:
                 'response_schema': _Decision.model_json_schema(),
                 'coverage': ('Only actual observation bodies are evidence; file candidates and '
                     'unread ranges are not. Source passage lookup is not exhaustive.')}
+            if preview is not None:
+                prompt['candidate_preview'] = preview
             serialized = json.dumps(prompt, ensure_ascii=False, allow_nan=False)
             if len(serialized.encode('utf-8')) > 512000:
                 raise ValueError('Document investigation context exceeds 512 KB; preserve the records and narrow the work unit')
             path = f'decisions/{step}'
-            snapshot = {'system': _SYSTEM, 'input': prompt, 'budget_call_id': f'{identity}:document:{step}'}
+            snapshot = {'system': system, 'input': prompt, 'budget_call_id': f'{identity}:document:{step}'}
             store.write_json(f'{path}/request.json', snapshot)
             before = response_accounting_snapshot(client)
             try:
-                response = client.ask_json(_SYSTEM, serialized, label=f'document-work-{step}',
+                response = client.ask_json(system, serialized, label=f'document-work-{step}',
                     budget_call_id=snapshot['budget_call_id'])
             except Exception as exc:
                 store.write_json(f'{path}/failure.json', {'type': type(exc).__name__, 'error': str(exc),
@@ -433,6 +473,18 @@ class DocumentWorkToolGateway:
                 no_progress.add(signature)
                 feedback = [{'status': 'invalid_decision', 'error': str(exc),
                     'scope': 'Correct the decision schema; this prior response is not evidence.'}]
+                continue
+            if decision.action == 'preview':
+                measurements = manuscript_measurements(decision.manuscript_markdown)
+                signature = _digest({'preview': measurements['sha256']})
+                if signature in no_progress:
+                    raise ValueError('Repeated unchanged preview; finish or revise the retained manuscript')
+                no_progress.add(signature)
+                preview = {'manuscript_markdown': decision.manuscript_markdown,
+                    'measurements': measurements, 'gaps': decision.gaps,
+                    'scope': 'Uncommitted producer draft only; no output, inspection or task completion.'}
+                store.write_json(f'{path}/preview.json', preview)
+                feedback = []
                 continue
             if decision.action == 'finish':
                 candidate = self._candidate(store, binding, observations, decision, step, identity)
@@ -572,7 +624,7 @@ class DocumentWorkToolGateway:
                 or candidate['response_sha256'] != _digest(decision.model_dump(mode='json'))
                 or record['request_sha256'] != _digest(snapshot)
                 or record['response_sha256'] != _digest(record['response']) or not record['accounting_known']
-                or snapshot['system'] != _SYSTEM
+                or snapshot['system'] != _system_for(binding)
                 or snapshot['budget_call_id'] != f"{identity}:document:{candidate['decision']}"
                 or any(snapshot['input'].get(key) != value for key, value in binding['context'].items())
                 or decision.action != 'finish' or decision.manuscript_markdown != candidate['markdown']
@@ -650,6 +702,8 @@ class DocumentWorkToolGateway:
             'coverage': {'omitted_files': binding['context']['omitted_files'],
                 'scope': 'Inventory and observed windows are bounded; unread content is not evidence of absence.'},
             'gaps': gaps, 'receipt': f'records/{identity}/document_work/receipt.json'}
+        if binding['contract'] == 'document_work_operation.v2':
+            data['measurements'] = manuscript_measurements(markdown)
         result = ToolResult(tool_name='work_document', data=data, artifacts=artifacts,
             metadata={'material_observations': self._material_observations(saved_observations)},
             summary='Editable document candidate created; independent inspection and any publication remain separate.')

@@ -105,7 +105,8 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertIn('Original condition 7', windows[-1]['data']['text'])
         presented = gateway.coordination_result(result, receipt_path='attempts/revision/result.json')
         self.assertNotIn('material_observations', presented['metadata'])
-        self.assertNotIn('markdown', presented['data'])
+        self.assertEqual(presented['data']['markdown'], result.data['markdown'])
+        self.assertEqual(presented['data']['measurements']['sha256'], result.data['sha256'])
         self.assertEqual(presented['data']['source_observations']['record'], 'attempts/revision/result.json')
         self.assertEqual(presented['data']['source_observations']['count'], 8)
         self.assertIn('material_observations', result.metadata)
@@ -123,6 +124,65 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertEqual(len(clients), 1)
         self.assertEqual(document_work_tool_specs()[0].name, 'work_document')
         self.assertIsNone(document_work_tool_specs()[0].completion)
+
+    def test_preview_repairs_local_requirements_without_writing_or_rereading_sources(self):
+        root, source, ledger, workspace = self.workspace()
+        original = source / 'conditions.txt'
+        original.write_text('Use the supplied observations only.\n', encoding='utf-8')
+        long = '# Observations\n\n' + 'Actual observation. ' * 20
+        revised = '# Observations\n\nThe supplied mean is 2. No population inference.\n'
+
+        def decide(view, step):
+            if step == 1:
+                return {'action': 'investigate', 'read_windows': [{'path': 'source0/conditions.txt'}]}
+            if step == 2:
+                return {'action': 'preview', 'manuscript_markdown': long}
+            preview = view['candidate_preview']
+            self.assertEqual(preview['manuscript_markdown'], long)
+            self.assertEqual(preview['measurements']['whitespace_words'], len(long.split()))
+            self.assertEqual(preview['measurements']['sha256'], sha(long.encode()))
+            self.assertEqual(preview['measurements']['headings'], ['Observations'])
+            self.assertFalse(list(workspace.workspace.rglob('manuscript.md')))
+            self.assertEqual(len(view['observations']), 1)
+            return {'action': 'finish', 'manuscript_markdown': revised, 'selected_observation_ids': ['o1']}
+
+        owner, clients = self.gateway(root, source, ledger, workspace, decide,
+            context={'user_requests': ['Write a short explanation; preserve the observation scope.']})
+        result = owner.call('work_document', {'goal': 'Explain the observations briefly'}, identity='local-revision')
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(len(clients[0].calls), 3)
+        self.assertEqual(result.data['markdown'], revised)
+        self.assertEqual(result.data['measurements']['whitespace_words'], len(revised.split()))
+        self.assertEqual(len(result.metadata['material_observations']), 1)
+        self.assertEqual(original.read_text(), 'Use the supplied observations only.\n')
+        self.assertEqual(len(list(workspace.workspace.rglob('manuscript.md'))), 1)
+        before = ledger.to_dict()
+        self.assertEqual(owner.call('work_document', {'goal': 'Explain the observations briefly'},
+            identity='local-revision'), result)
+        self.assertEqual(ledger.to_dict(), before)
+
+    def test_saved_v1_response_recovers_without_new_measurements_or_provider_calls(self):
+        root, source, ledger, workspace = self.workspace()
+        owner, clients = self.gateway(root, source, ledger, workspace,
+            lambda *_: {'action': 'finish', 'manuscript_markdown': '# Saved\nOriginal candidate.\n'})
+        admit = owner._admit
+
+        def legacy(*args):
+            binding = admit(*args)
+            binding['contract'] = 'document_work_operation.v1'
+            args[0].write_json('input.json', binding)
+            return binding
+
+        # Reproduce the saved v1 boundary, then recover with today's owner.
+        with patch.object(owner, '_admit', side_effect=legacy), patch.object(owner, '_candidate',
+                side_effect=KeyboardInterrupt('final response saved')):
+            with self.assertRaises(KeyboardInterrupt):
+                owner.call('work_document', {'goal': 'Saved work'}, identity='legacy-final')
+        result = owner.call('work_document', {'goal': 'Saved work'}, identity='legacy-final')
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(len(clients[0].calls), 1)
+        self.assertNotIn('measurements', result.data)
+        self.assertNotIn('markdown', owner.coordination_result(result)['data'])
 
     def test_original_bundle_is_queried_by_source_owner_and_change_blocks_replay(self):
         root, source, ledger, workspace = self.workspace()

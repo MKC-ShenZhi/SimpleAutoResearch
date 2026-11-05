@@ -5,6 +5,12 @@
 User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-11-05
+
+### Improved
+
+- Document producers can preview and revise drafts using exact text measurements before submission. Coordination receives the actual candidate text and measurements without a separate inspection just to view it; independent delivery checks remain responsible for acceptance. Saved document receipts retain their original recovery behavior.
+
 ## 2026-11-04
 
 ### Improved
