@@ -619,13 +619,17 @@ def select_working_context(
                     'estimated_tokens': estimate_tokens(dump(note))}
                    for i, note in enumerate(notes)]
     # Explicit refs/current artifacts, recent operations, then lexical sources.
+    def observed_turn(i: int) -> int:
+        turn = rows[i].get('turn')
+        return turn if type(turn) is int else -1
+
     def priority(i: int) -> tuple[int, int, int, int, int]:
         row = rows[i]
         words = set(re.findall(r'\w+', str(row.get('text', '')).casefold()))
         return (int(row.get('record') in references),
                 int(row.get('path') in artifacts or row.get('absolute_path') in artifacts),
                 int(row.get('kind') == 'operation_result'),
-                row.get('turn', -1) if row.get('kind') == 'operation_result' else len(words & terms), -i)
+                observed_turn(i) if row.get('kind') == 'operation_result' else len(words & terms), -i)
 
     represented = {keys[i] for i, state in enumerate(states) if state['status'] == 'native'}
 
@@ -698,7 +702,7 @@ def select_working_context(
         # Receipt/field/version identity remains separate from body priority.
         ordered = sorted(range(len(rows)), key=lambda i: (
             int(rows[i].get('record') in explicit_references),
-            rows[i].get('turn', -1), *priority(i)), reverse=True)
+            observed_turn(i), *priority(i)), reverse=True)
     elif retained_records:
         # Explicit references and current objects precede the rest; original
         # text precedes historical operations within each priority group.

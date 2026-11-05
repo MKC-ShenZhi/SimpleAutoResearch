@@ -742,7 +742,9 @@ class RetainedWorkingContextTests(unittest.TestCase):
             role='historical_observation', path='old/report.md')
         revision = [observation(i + 1, f'Current revision component {i}. ' * 55,
             role='historical_observation', path=f'work/component-{i}.txt') for i in range(3)]
-        arguments = dict(observations=[original, *revision],
+        feedback = {'kind': 'operation_result', 'turn': None, 'record': 'records/related-review.json',
+            'text': 'Historical related opinion without a journal turn.'}
+        arguments = dict(observations=[original, *revision, feedback],
             turn_blocks=[[], [], [], [], block(4, 'Apply the current revision')],
             current_artifacts=[original['path']], version_resolver=lambda _: 'recorded-digest',
             require_work_notes=True, fit_work_notes=True, sparse_handoffs=True,
