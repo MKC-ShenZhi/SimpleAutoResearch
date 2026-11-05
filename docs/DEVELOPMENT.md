@@ -45,10 +45,13 @@ POSIX command startup enters process-group supervision before switching to the
 approved working directory and executable; the original argv and environment are preserved.
 
 Ordinary tasks dispatch source and document work from the goal and authorized
-materials. Source work includes preparation, exact approved execution and a supported
-interpretation of the actual results through the shared native queue. Source-only
-requests remain available. Local failures return their candidate and gaps to the
-goal loop rather than imposing another task-wide stop or repair controller.
+materials. An accepted source assignment runs directly in the shared action loop:
+independent reads and copies can be batched, and investigation, edits, approved
+execution and result interpretation may alternate. It does not wait for a complete
+package before proposing a useful command. Known files and receipts survive a lost
+model reply; unknown charges and physical outcomes remain protected by ordinary
+recovery. Source-only requests prohibit commands. Returning current files and an
+interpretation hands work back to coordination without certifying task completion.
 Producers return editable, version-bound candidates; delivery owns independent acceptance.
 File-level operations belong to producers and inspectors; explicit caller APIs
 remain available. Loading a schema cannot transfer that responsibility to the
@@ -66,10 +69,11 @@ Revisions retain referenced local files at their bound relative paths, including
 data and source links. CommonMark local references must resolve to planned outputs
 before materialization; missing links return to the same producer with its draft intact.
 Saved bindings retain their original asset behavior.
-Source producers can stage authorized text inputs as editable copies without
-retransmitting them; copying does not count as reading the original. Binary inputs
-use the existing total copy allowance. Source investigation measures changes to
-the effective working view as well as new observations, while bounding repeated views.
+Source producers use the common workspace copy and edit operations; copied bytes
+do not count as a content inspection. Their detailed source operations stay in the
+journal while coordination receives the returned versions, interpretation and gaps.
+Assignments and check recipes are revisable working choices, not new user requirements.
+Saved source generators retain their original execution and recovery behavior.
 Read-only directory navigation remains available for routing work; it is not source
 evidence or a required preliminary inventory for every producer.
 Ordinary coordination submits actual candidates to delivery for independent

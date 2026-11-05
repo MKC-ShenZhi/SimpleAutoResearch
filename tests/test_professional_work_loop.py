@@ -820,9 +820,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.state['config']['work_selection_policy'], 'native.v3')
         self.assertIsNone(self.app.operations.selection)
         core = {row['function']['name'] for row in self.app.operation_schemas}
-        self.assertEqual({'prepare_implementation','execute_implementation','work_document','ask_user',
+        self.assertEqual({'prepare_implementation','work_document','ask_user',
             'deliver_result','load_tools','read_history','list_directory','export_report','update_work_plan'}, core)
-        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v9')
+        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v10')
         self.assertFalse({'select_work_method',
             'begin_professional_work','finish_professional_work'} & core)
         optional = {'inspect_table','analyze_table','measure_experiment','analyze_measurements',
@@ -3574,6 +3574,145 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._run()
         self.assertEqual((self.root/'budget_ledger.json').read_bytes(), ledger)
         self.assertEqual(self.send.call_count, calls)
+
+    def test_shared_source_batches_interleave_execution_return_and_feedback_on_one_journal(self):
+        self._create(goal='Compute the supplied mean, retain reusable files and explain the evidence limits.',
+            current_method=True, delivery_protocol=None, selection_policy='native.v3', professional_contract='work.v10')
+        (self.inputs/'calculate.py').write_text("import csv\nfrom pathlib import Path\n"
+            "rows=list(csv.DictReader(Path('observations.csv').open()))\n"
+            "values=[float(r['value']) for r in rows]\n"
+            "Path('result.txt').write_text(str(sum(values)/len(values)))\n")
+        (self.inputs/'requirements.txt').write_text('# Standard library only\n')
+        names = ['observations.csv', 'conditions.txt', 'calculate.py', 'requirements.txt']
+        originals = self._versions(self.inputs)
+        self.native_source_requests = []
+
+        def read_batch():
+            request = self.send.call_args.kwargs.get('request') or self.send.call_args.args[1]
+            self.native_source_requests.append(deepcopy(request))
+            offered = {row['function']['name'] for row in request['tools']}
+            self.assertIn('return_source_work', offered)
+            self.assertFalse({'work_document', 'deliver_result', 'prepare_implementation'} & offered)
+            return [_action('read_file', path='measurements/'+name, full_digest=True) for name in names]
+
+        def copy_batch():
+            reads = {Path(row['data']['path']).name: row['data'] for row in self._observations('read_file')}
+            return [_action('copy_file', source='measurements/'+name, path='working/'+name,
+                source_sha256=reads[name]['sha256']) for name in names]
+
+        def interpret():
+            self.assertEqual(self._ok('read_file')['data']['text'], '2.0')
+            self.assertEqual(len(self._process_receipts()), 1)
+            return _action('write_file', path='working/result-notes.md',
+                content='The supplied mean is 2.0. No population inference is supported.\n')
+
+        self.decisions.extend([
+            _action('prepare_implementation', goal='Calculate and interpret the supplied mean.',
+                material_roots=['measurements'], project_path='measurements'),
+            read_batch, copy_batch,
+            _action('run_process', argv=['python','calculate.py'], cwd='workspace/working',
+                inputs=['working/calculate.py','working/observations.csv'], outputs=['working/result.txt'], timeout_sec=3),
+            _action('read_file', path='working/result.txt'), interpret,
+            _action('return_source_work', candidate='working',
+                summary='Observed mean 2.0 from the recorded execution; the sampling design is unknown.'),
+            _action('deliver_result', summary='Reusable calculation and bounded interpretation', artifacts=['working']),
+        ])
+        with patch('simple_ar.code_task.generation.writer.write_implementation_unit',
+                side_effect=AssertionError('New source work must not enter the private generator')):
+            self._run()
+            pending = self.app.state['pending']
+            active = pending.get('action') or pending
+            self.assertEqual(active['call']['function']['name'], 'run_process')
+            self.assertEqual(self.app._coordinator_purpose(), 'code')
+            self.assertEqual(len(self._observations('copy_file')), 4)
+            self.assertFalse((self.root/'workspace/working/result-notes.md').exists())
+            self.assertFalse(self._process_receipts())
+            prefix = deepcopy(self.app.ledger.to_dict()['entries'])
+            token = self.app.approval_token(active['call'])
+            self._reload()
+            self._run(approved_execution=token)
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertEqual(self.app._coordinator_purpose(), 'task')
+        returned = self._ok('return_source_work')
+        self.assertTrue(returned['data']['artifact_sha256'])
+        self.assertEqual(self._versions(self.inputs), originals)
+        self.assertTrue(self.inspection_requests)  # Independent acceptance still belongs to Delivery.
+        self.assertEqual(self.app.ledger.to_dict()['entries'][:len(prefix)], prefix)
+        self.assertFalse(self.source_views)
+        self.assertFalse(self.source_findings_views)
+        self.assertFalse(self._observations('execute_implementation'))
+        closed = self.app.operations.work.input_view(rows=[], operation_history=[], boundary=0, references=[], notes=[])
+        self.assertTrue(closed['archived_records'])
+        self.assertFalse(set(closed['references']) & set(closed['archived_records']))
+        for record in closed['archived_records']:
+            self.assertTrue(self.app.workspace.resolve(record).is_file())
+
+        def explain(view):
+            if not any(row['observation']['data'].get('text') == '2.0' for row in view['observations']):
+                return {'action':'investigate', 'read_windows':[{'path':'working/result.txt'}]}
+            return {'action':'finish', 'manuscript_markdown':'# Recorded mean\n\nMean: 2.0. '
+                'These observations do not establish a population claim.\n',
+                'selected_observation_ids':[row['id'] for row in view['observations']]}
+        self.document_decision = explain
+        self.decisions.extend([
+            _action('work_document', goal='Explain the existing mean and its limitations without recalculating.',
+                material_roots=['workspace/working']),
+            lambda: _action('deliver_result', summary='Concise explanation and reusable calculation',
+                artifacts=[self._ok('work_document')['data']['manuscript'], 'working']),
+        ])
+        self._run(feedback='Add a short Markdown explanation using the existing calculation; do not rerun it.')
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertEqual(len(self._process_receipts()), 1)
+        self.assertEqual(self._versions(self.inputs), originals)
+        ledger, calls = self.app.ledger.to_dict(), self.send.call_count
+        self._reload()
+        self._run()
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+
+    def test_shared_source_partial_batch_and_lost_model_reply_retain_work_without_replay(self):
+        import httpx
+        self._create(goal='Prepare reusable source only; preserve useful partial files if interrupted.',
+            current_method=True, delivery_protocol=None, selection_policy='native.v3', professional_contract='work.v10')
+        self._submit(_action('prepare_implementation', goal='Retain the supplied conditions and an editable account.',
+            material_roots=['measurements'], execution_requested=False))
+        self._read('measurements/conditions.txt')
+        digest = self._ok('read_file')['data']['sha256']
+        self._submit(
+            _action('copy_file', source='measurements/conditions.txt', path='working/conditions.txt', source_sha256=digest),
+            _action('copy_file', source='measurements/conditions.txt', path='working/stale.txt', source_sha256='0'*64))
+        copies = self._observations('copy_file')
+        self.assertEqual([row['status'] for row in copies], ['ok', 'blocked'])
+        retained = (self.root/'workspace/working/conditions.txt').read_bytes()
+        self._submit(_action('run_process', argv=['python','-c','print(1)'], cwd='workspace', timeout_sec=2))
+        self.assertEqual(self._last('run_process')['status'], 'blocked')
+        self.assertIn('source only', self._last('run_process')['error'])
+        self.assertFalse(self._process_receipts())
+
+        def lose_reply():
+            raise httpx.ReadTimeout('Controlled response loss after dispatch')
+        self.decisions.extend([
+            _action('write_file', path='working/note.md', content='Known useful partial work.\n'), lose_reply])
+        self._run(should_stop=lambda:False)
+        self.assertEqual((self.root/'workspace/working/note.md').read_text(), 'Known useful partial work.\n')
+        unknown = [row.to_dict() for row in self.app.ledger.entries if row.status=='unknown']
+        self.assertEqual(len(unknown), 1)
+        ledger, calls = self.app.ledger.to_dict(), self.send.call_count
+        self._reload()
+        self.assertEqual(self.app._coordinator_purpose(), 'code')
+        self._run()
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        # Explicit caller continuation is a new decision, not replay of the lost reply.
+        self._submit(_action('return_source_work', candidate='working', summary='Known partial files retained.',
+            gaps=['The interrupted model decision produced no received interpretation.']))
+        self._ok('return_source_work')
+        self.assertEqual(len(self._observations('copy_file')), 2)
+        self.assertEqual((self.root/'workspace/working/conditions.txt').read_bytes(), retained)
+        self.assertEqual([row.to_dict() for row in self.app.ledger.entries if row.status=='unknown'], unknown)
+        self.assertEqual(self.app._coordinator_purpose(), 'task')
+        self.assertFalse(self._process_receipts())
+        self.assertFalse((self.root/'delivery.json').exists())
 
     def test_source_work_returns_interpreted_execution_and_feedback_without_parent_reassembly(self):
         self._create(goal='Compute supplied observations and deliver reusable code and a supported result.',

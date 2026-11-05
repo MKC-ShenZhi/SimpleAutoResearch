@@ -910,7 +910,7 @@ class WorkspaceToolGateway:
             if isinstance(inspection, dict) and data.get('record') and inspection.get('assessment_sha256'):
                 versions = {**(versions if isinstance(versions, dict) else {}),
                             data['record']: inspection['assessment_sha256']}
-            if successful and name != 'finish_professional_work' and isinstance(versions, dict):
+            if successful and name not in {'finish_professional_work', 'return_source_work'} and isinstance(versions, dict):
                 try:
                     from simple_ar.tools.professional_outcomes import accepted_native_result
                     session_id = read_json(self.root / 'session_manifest.json')['session_id']
@@ -1221,7 +1221,7 @@ class WorkspaceToolGateway:
                         for declared in arguments['outputs']:
                             output(declared, None)
                     hashes = data.get('artifact_sha256')
-                    if trusted and isinstance(hashes, dict) and name != 'finish_professional_work':
+                    if trusted and isinstance(hashes, dict) and name not in {'finish_professional_work', 'return_source_work'}:
                         for name_, digest in hashes.items():
                             try:
                                 if self.resolve(name_) in outputs:

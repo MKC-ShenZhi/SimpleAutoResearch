@@ -3715,6 +3715,14 @@ class ToolApplication:
                 if scope is not None:
                     selected_records, work_notes = scope['references'], scope['notes']
                     operation_history = scope['operation_history']
+                    archived = set(scope.get('archived_records', ()))
+                    if archived:
+                        def visible(row):
+                            record = row.get('record', '')
+                            record = 'records/' + record.removeprefix('attempts/') if record.startswith('attempts/') else record
+                            return record not in archived
+                        working_rows = [row for row in working_rows if visible(row)]
+                        native_observations = [row for row in native_observations if visible(row)]
                     if scope['diagnostic']:
                         context['professional_work']['material_diagnostic'] = scope['diagnostic']
             # Caller turns are not replayed as native assistant/tool messages.
@@ -4218,7 +4226,7 @@ class ToolApplication:
                 result = ToolResult(tool_name=call['function']['name'], status='blocked',
                     error=terminal_error, data={'executed': False})
             elif (self.operations is not None and self.operations.work is not None
-                    and call['function']['name'] in {'begin_professional_work', 'finish_professional_work'}
+                    and call['function']['name'] in self.operations.work.scope_tools
                     and len(self.session.store.read_json(self.state['turns'][-1]['reply']).get('tool_calls', [])) != 1):
                 result = ToolResult(tool_name=call['function']['name'], status='blocked',
                     error='Begin or return professional work alone so the next native decision uses the correct route.',
@@ -4357,11 +4365,11 @@ class ToolApplication:
             artifacts += (store.ref('implementation.json', kind='implementation_result', schema='research_implementation.v1'),)
         if name in {'prepare_code_task', 'implement_code_task'} and store.exists('execution.json'):
             artifacts += (store.ref('execution.json', kind='prepared_execution', schema='prepared_execution.v1'),)
-        if name in {'begin_professional_work', 'finish_professional_work'} and store.exists('professional_receipt.json'):
+        if name in {'begin_professional_work', 'finish_professional_work', 'prepare_implementation', 'return_source_work'} and store.exists('professional_receipt.json'):
             artifacts += (store.ref('professional_receipt.json', kind='professional_scope_receipt'),)
-        if name == 'begin_professional_work' and store.exists('professional_begin.json'):
+        if name in {'begin_professional_work', 'prepare_implementation'} and store.exists('professional_begin.json'):
             artifacts += (store.ref('professional_begin.json', kind='professional_scope_request'),)
-        if name == 'begin_professional_work' and store.exists('professional_prior.md'):
+        if name in {'begin_professional_work', 'prepare_implementation'} and store.exists('professional_prior.md'):
             artifacts += (store.ref('professional_prior.md', kind='professional_prior'),)
         for row in payload.get('metadata', {}).get('capability_artifacts', []):
             declared = ArtifactRef.from_dict(row)
@@ -4885,7 +4893,7 @@ class ToolApplication:
                         raise ValueError('Saved admission refusal disagrees with the frozen offered contract')
                 elif (capability == 'native_tool' and self.operations is not None and self.operations.work is not None
                         and pending.get('call', {}).get('function', {}).get('name') in
-                            {'begin_professional_work', 'finish_professional_work'}
+                            self.operations.work.scope_tools
                         and store.read_json('native_result.json').get('status') == 'ok'):
                     if not store.exists('professional_receipt.json'):
                         raise ValueError('Professional work receipt is missing; no replay')

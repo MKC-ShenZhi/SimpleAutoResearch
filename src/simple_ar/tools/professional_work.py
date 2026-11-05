@@ -58,6 +58,39 @@ class FinishProfessionalWork(BaseModel):
         return self
 
 
+class SourceWorkResult(FinishProfessionalWork):
+    summary: str = Field(min_length=1, max_length=12000,
+        description='Supported interpretation of actual work and results, with limitations. Not an independent acceptance verdict.')
+
+    @model_validator(mode='after')
+    def supported_summary(self) -> 'SourceWorkResult':
+        if not self.summary.strip():
+            raise ValueError('Return an actual work interpretation or an explicit limitation')
+        return self
+
+
+def source_work_specs() -> list[CommonToolSpec]:
+    from simple_ar.tools.implementation import ImplementationPreparationRequest
+    schema = ImplementationPreparationRequest.model_json_schema()
+    schema['properties']['execution_requested']['description'] = (
+        'Whether this source work may propose approved commands. False requests source only; '
+        'no execution permission is granted by this field.')
+    return [CommonToolSpec(name='prepare_implementation', domain='professional_work',
+        permission_level='plan', risk_level='low', input_schema=schema,
+        description='Perform a coherent source, analysis or figure work unit in the shared task loop. '
+            'Supply its goal and authorized materials/project. The next code decisions investigate, '
+            'copy/edit working files, propose exactly approved commands and interpret actual results. '
+            'Investigation and execution may alternate; no complete-package generation gate or private '
+            'repair loop. Original sources, task budget and records remain shared. '
+            'Use execution_requested=false for source-only work.'),
+        CommonToolSpec(name='return_source_work', domain='professional_work',
+            permission_level='plan', risk_level='low', input_schema=SourceWorkResult.model_json_schema(),
+            description='Return current editable working files and a supported result interpretation '
+                'from source work, or useful partial work with actual gaps. Binds current workspace '
+                'versions and original operation receipts. Does not certify science, independently '
+                'review, deliver the task or turn producer suggestions into user requirements.')]
+
+
 def professional_work_specs() -> list[CommonToolSpec]:
     return [
         CommonToolSpec(name='begin_professional_work', domain='professional_work',
@@ -79,11 +112,15 @@ class ProfessionalWorkTools:
     def __init__(self, *, root: Path, workspace: Any, observations: Callable[[], list[dict]],
                  user_requests: Callable[[], list[str]], work_context: Callable[[list[str]], dict],
                  material_observations: Callable[[list[str]], list[dict]],
-                 route_validator: Callable[[str], None]) -> None:
+                 route_validator: Callable[[str], None], source_work: bool = False) -> None:
         self.root, self.workspace = Path(root), workspace
         self.observations, self.user_requests = observations, user_requests
         self.work_context, self.material_observations = work_context, material_observations
         self.route_validator = route_validator
+        self.source_work = source_work
+        self.entry_tool = 'prepare_implementation' if source_work else 'begin_professional_work'
+        self.return_tool = 'return_source_work' if source_work else 'finish_professional_work'
+        self.scope_tools = frozenset({self.entry_tool, self.return_tool})
 
     def _store(self, identity: str) -> ArtifactStore:
         return ArtifactStore(self.root / 'attempts' / identity)
@@ -98,11 +135,11 @@ class ProfessionalWorkTools:
 
     def can_reconcile(self, name: str, identity: str) -> bool:
         store = self._store(identity)
-        if name not in {'begin_professional_work', 'finish_professional_work'}:
+        if name not in self.scope_tools:
             return False
         if store.exists('professional_receipt.json'):
             return True
-        if name == 'begin_professional_work':
+        if name == self.entry_tool:
             # The frozen request precedes any snapshot. If neither exists,
             # this admission has made no persistent or external change.
             return store.exists('professional_begin.json') or not store.exists('professional_prior.md')
@@ -112,20 +149,20 @@ class ProfessionalWorkTools:
         for row in reversed(self.observations()):
             if row.get('status') != 'ok':
                 continue
-            if row.get('tool_name') == 'finish_professional_work':
+            if row.get('tool_name') == self.return_tool:
                 return None
-            if row.get('tool_name') == 'begin_professional_work':
+            if row.get('tool_name') == self.entry_tool:
                 return row
         return None
 
     def latest_result(self) -> dict | None:
         return next((row for row in reversed(self.observations())
-            if row.get('tool_name') == 'finish_professional_work' and row.get('status') == 'ok'), None)
+            if row.get('tool_name') == self.return_tool and row.get('status') == 'ok'), None)
 
     def transition_record(self) -> str | None:
         return next((row['record'] for row in reversed(self.observations())
             if row.get('status') == 'ok' and row.get('tool_name') in
-                {'begin_professional_work', 'finish_professional_work'}), None)
+                self.scope_tools), None)
 
     def _scope_locations(self, scope: dict, extra: list[str] | None = None) -> tuple[list[str], list[dict]]:
         locations = [*scope['material_roots'], *([scope['project_path']] if scope['project_path'] else []),
@@ -146,7 +183,29 @@ class ProfessionalWorkTools:
         """Locate scoped journal receipts for the one shared input selector."""
         selected = self.selected()
         if selected is None:
-            return None
+            if not self.source_work:
+                return None
+            # Retire closed source detail from coordination, not from the journal.
+            # New source work can request these originals through the usual reader.
+            retired, active = set(), []
+            for row in self.observations():
+                if row.get('status') == 'ok' and row.get('tool_name') == self.entry_tool:
+                    active = [self._journal_record(row['record'])]
+                elif active:
+                    if row.get('status') == 'ok' and row.get('tool_name') == self.return_tool:
+                        retired.update(active)
+                        active = []
+                    else:
+                        active.append(self._journal_record(row['record']))
+            latest = self.latest_result()
+            record = self._journal_record(latest['record']) if latest else None
+            normalize = self._journal_record
+            return {'references': list(dict.fromkeys([*(r for r in references if normalize(r) not in retired),
+                        *([record] if record else [])])),
+                'notes': [n for n in notes if not any(normalize(r) in retired for r in n.get('records', []))],
+                'operation_history': [r for r in operation_history or []
+                    if normalize(r['observation'].get('record', '')) not in retired],
+                'archived_records': sorted(retired), 'diagnostic': '', 'unavailable_locations': []}
         available, unavailable = self._scope_locations(selected['data'])
         records = list(references)
         diagnostic = ''
@@ -191,6 +250,21 @@ class ProfessionalWorkTools:
 
     def instructions(self) -> str:
         selected = self.selected()
+        if self.source_work:
+            return (' Carry out the accepted source work directly with the offered common operations. '
+                'Its assignment is a working approach, not a replacement for the original user requests. '
+                'Read necessary sources, stage/copy existing code rather than retranscribing it, edit, '
+                'propose approved commands and interpret actual results. These activities may alternate; '
+                'do not wait for all packaging or claim audits before a useful bounded execution. '
+                'Independent operations may share a batch; dependent edits use current recorded hashes. '
+                'Keep original inputs and useful results, revise only affected work, and use a separate '
+                'working copy when preserving a prior candidate. Return useful files and interpretation '
+                'with return_source_work, or partial work with actual gaps. Recommendations and derived '
+                'check recipes are revisable; byte equality is not scientific reproducibility. '
+                'The common journal retains each read, edit, command and failed request. No operation '
+                'in an unreceived model reply has executed. A safe new decision retains all unknown '
+                'fees; never repeat an unknown physical command. Source-only work proposes no commands. '
+                'Returning is not independent acceptance or whole-task delivery.')
         if selected is None:
             return (' For coherent implementation, analysis, drafting or substantive revision, '
                 'begin_professional_work can take responsibility for the actual work in this same loop. '
@@ -315,7 +389,7 @@ class ProfessionalWorkTools:
                 paths = [data.get('absolute_path') or data.get('path')]
             elif name == 'run_process' and data.get('returncode') == 0 and not data.get('stop_reason'):
                 paths = arguments.get('outputs') or []
-            elif name not in {'copy_file', 'copy_project', 'begin_professional_work', 'finish_professional_work'}:
+            elif name not in ({'copy_file', 'copy_project'} | self.scope_tools):
                 paths = row.get('artifacts') or []
             for locator in paths:
                 if not isinstance(locator, str):
@@ -418,7 +492,7 @@ class ProfessionalWorkTools:
         attachments = list(dict.fromkeys(attachments))
         versions = self._versions([*([request.candidate] if request.candidate else []), *attachments], identity=identity)
         if candidate is not None:
-            if not versions or not self._produced(candidate, versions, rows):
+            if not versions or (not self.source_work and not self._produced(candidate, versions, rows)):
                 raise ValueError('Candidate needs actual source or document work recorded in this scope; return partial gaps if unavailable')
             if data['kind'] == 'document':
                 if not candidate.is_file() or (prior and candidate == Path(prior['path'])):
@@ -429,8 +503,9 @@ class ProfessionalWorkTools:
                     while stream.read(65536):
                         pass
         records = [{'record': self._journal_record(row['record']), 'tool': row.get('tool_name'), 'status': row.get('status')}
-                   for row in rows if row.get('tool_name') not in {'begin_professional_work', 'finish_professional_work'}]
+                   for row in rows if row.get('tool_name') not in self.scope_tools]
         result = {'kind': data['kind'], 'goal': data['goal'],
+            **({'summary': request.summary} if self.source_work else {}),
             'candidate': request.candidate, 'attachments': attachments,
             'artifact_sha256': versions, 'prior_draft': prior, 'prior_current': prior_current,
             'prior_snapshot_current': snapshot_current, 'gaps': gaps,
@@ -439,12 +514,15 @@ class ProfessionalWorkTools:
             'material_provenance': self._provenance(data, identity=identity,
                 outputs=[*([request.candidate] if request.candidate else []), *attachments], rows=rows),
             'scope': 'Actual workspace versions and task journal receipts; not independent review, scientific verification or task delivery.'}
-        return ToolResult(tool_name='finish_professional_work', data=result,
+        return ToolResult(tool_name=self.return_tool, data=result,
             artifacts=[*([request.candidate] if request.candidate else []), *attachments],
             summary='Professional work returned with actual candidate versions and remaining gaps.')
 
     def protect_prior(self, name: str, arguments: dict) -> str | None:
         selected = self.selected()
+        if (self.source_work and selected and name == 'run_process'
+                and not selected['data']['execution_requested']):
+            return 'This work requests source only; return it before starting work that proposes execution.'
         prior = (selected or {}).get('data', {}).get('prior_draft')
         if not prior:
             return None
@@ -461,7 +539,7 @@ class ProfessionalWorkTools:
 
     def call(self, name: str, arguments: dict, *, identity: str) -> ToolResult:
         try:
-            if name not in {'begin_professional_work', 'finish_professional_work'}:
+            if name not in self.scope_tools:
                 raise ValueError('Unknown professional work operation')
             store = self._store(identity)
             digest = hashlib.sha256(json.dumps(arguments, ensure_ascii=False, sort_keys=True,
@@ -480,11 +558,11 @@ class ProfessionalWorkTools:
                 if prior:
                     if result.data.get('prior_snapshot_current', True):
                         self._verify_prior_snapshot(prior)
-                    if (name == 'finish_professional_work' and result.data.get('prior_current', True)
+                    if (name == self.return_tool and result.data.get('prior_current', True)
                             and self.workspace.artifact_hashes([prior['path']])[prior['path']] != prior['sha256']):
                         raise ValueError('The retained prior manuscript changed; no replay')
                 return result
-            if name == 'begin_professional_work' and store.exists('professional_begin.json'):
+            if name == self.entry_tool and store.exists('professional_begin.json'):
                 retained = store.read_json('professional_begin.json')
                 if retained['tool_name'] != name or retained['arguments_sha256'] != digest:
                     raise ValueError('The retained work request differs; no replay')
@@ -493,8 +571,14 @@ class ProfessionalWorkTools:
                     self._preserve_prior(store, prior)
                 store.write_json('professional_receipt.json', retained)
                 return result
-            if name == 'begin_professional_work':
-                request = BeginProfessionalWork.model_validate(arguments)
+            if name == self.entry_tool:
+                if self.source_work:
+                    from simple_ar.tools.implementation import ImplementationPreparationRequest
+                    source = ImplementationPreparationRequest.model_validate(arguments)
+                    request = BeginProfessionalWork.model_validate({'kind': 'source',
+                        **source.model_dump(exclude={'execution_requested'})})
+                else:
+                    request = BeginProfessionalWork.model_validate(arguments)
                 if self.selected() is not None:
                     raise ValueError('Return the active professional work before beginning another')
                 self.route_validator('writing' if request.kind == 'document' else 'code')
@@ -503,14 +587,17 @@ class ProfessionalWorkTools:
                     prior['snapshot'] = f'records/{identity}/professional_prior.md'
                 result = ToolResult(tool_name=name, data={'kind': request.kind, 'goal': request.goal,
                     'material_roots': roots, 'project_path': project, 'prior_draft': prior,
-                    'request_index': len(self.user_requests()) - 1, 'accepted': True},
+                    'request_index': len(self.user_requests()) - 1, 'accepted': True,
+                    **({'execution_requested': source.execution_requested,
+                        'assignment_scope': 'Working assignment, not new user requirements or execution authority.'}
+                        if self.source_work else {})},
                     summary='Work accepted; no candidate, review, publication or delivery has been produced.')
                 retained = {'tool_name': name, 'arguments_sha256': digest, 'result': result.model_dump(mode='json')}
                 store.write_json('professional_begin.json', retained)
                 if prior:
                     self._preserve_prior(store, prior)
             else:
-                result = self._finish(FinishProfessionalWork.model_validate(arguments), identity)
+                result = self._finish((SourceWorkResult if self.source_work else FinishProfessionalWork).model_validate(arguments), identity)
             store.write_json('professional_receipt.json', {'tool_name': name,
                 'arguments_sha256': digest, 'result': result.model_dump(mode='json')})
             return result
