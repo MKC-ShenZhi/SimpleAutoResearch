@@ -26,8 +26,11 @@ from simple_ar.app.professional_conversation import RETAINED_PROFESSIONAL_CONTRA
 PROTOCOL = 'operations.v1'
 PROFESSIONAL_CONTRACTS = {'work.v1': 'source_owner.v1', 'work.v2': 'source_owner.v2',
                           'work.v3': None, 'work.v4': None, 'work.v5': None,
-                          'work.v6': 'source_owner.v2', 'work.v7': 'source_owner.v2'}
-CURRENT_PROFESSIONAL_CONTRACT = 'work.v7'
+                          'work.v6': 'source_owner.v2', 'work.v7': 'source_owner.v2',
+                          'work.v8': 'source_owner.v2'}
+CURRENT_PROFESSIONAL_CONTRACT = 'work.v8'
+PRODUCTION_OWNER_CONTRACTS = frozenset({'work.v6', 'work.v7', 'work.v8'})
+COORDINATED_OWNER_CONTRACTS = frozenset({'work.v7', 'work.v8'})
 
 
 _DIRECT_WORK = (
@@ -278,7 +281,7 @@ class OperationTools:
         if preparation not in {None,'prepared.v1','prepared.v2','prepared.v3'}:
             raise ValueError('Unsupported source generation protocol')
         exact = config.get('code_task') is not None
-        self.shared_native = config.get('professional_operations') in {'work.v3', 'work.v4', 'work.v5', 'work.v6', 'work.v7'} and not exact
+        self.shared_native = config.get('professional_operations') in RETAINED_PROFESSIONAL_CONTRACTS | {'work.v3', 'work.v4'} and not exact
         if self.shared_native and preparation is not None:
             raise ValueError('Shared native professional work cannot acquire a historical preparation controller')
         self.methods = self.work = None
@@ -301,13 +304,20 @@ class OperationTools:
             if source_owner or not exact and preparation in {'prepared.v2','prepared.v3'} else _DIRECT_WORK) + _work_principles(
                 self.delivery_review is not None, config.get('memory_protocol') == 'journal.v1',
                 delivery_protocol=self.delivery_review.protocol if self.delivery_review is not None else None)
-        if config.get('professional_operations') == 'work.v7':
+        if config.get('professional_operations') in COORDINATED_OWNER_CONTRACTS:
             self.system = _RESULT_COORDINATION + _work_principles(self.delivery_review is not None,
                 config.get('memory_protocol') == 'journal.v1',
                 delivery_protocol=self.delivery_review.protocol if self.delivery_review is not None else None)
+            if config.get('professional_operations') == 'work.v8':
+                self.system += (' Independent acceptance belongs to deliver_result and its inspection owner, '
+                    'not a separate local audit scheduled by coordination. Producers investigate the originals '
+                    'and create the requested work; analysis and authorized execution can establish necessary '
+                    'facts. Submit the actual useful candidate for independent checking, and send bound required '
+                    'findings back to its producer. A review requested by the user is itself work to produce, '
+                    'not authority to certify every claim in historical drafts or to add new obligations.')
         if config.get('work_method') == 'goal.v1':
             self.system = _GOAL_WORK
-        elif config.get('work_method') in EXECUTABLE_WORK_METHODS and config.get('professional_operations') not in {'work.v6', 'work.v7'}:
+        elif config.get('work_method') in EXECUTABLE_WORK_METHODS and config.get('professional_operations') not in PRODUCTION_OWNER_CONTRACTS:
             self.system = _EXECUTABLE_WORK
         if exact or (preparation is not None or source_owner) and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
@@ -317,7 +327,7 @@ class OperationTools:
                 source_owner_contract=source_owner,
                 input_contract='bounded_inputs.v2' if not exact and preparation in {'prepared.v2','prepared.v3'} else None,
                 source_edit_contract='bound_content.v1' if not exact and preparation == 'prepared.v3' else None,
-                decision_protocol=('native.v1' if config.get('professional_operations') in {'work.v6', 'work.v7'}
+                decision_protocol=('native.v1' if config.get('professional_operations') in PRODUCTION_OWNER_CONTRACTS
                     else config.get('source_decision_protocol')) if not exact else None,
                 execution_observations=execution_observations if not exact else None,
                 work_context=work_context if not exact else None,
@@ -334,7 +344,7 @@ class OperationTools:
                 source_owner_contract=source_owner),
                 self.implementation,request_visible=True)
         self.document = None
-        if professional and config.get('professional_operations') in {'work.v1', 'work.v2', 'work.v6', 'work.v7'} and config['model'] is not None:
+        if professional and config.get('professional_operations') in PRODUCTION_OWNER_CONTRACTS | {'work.v1', 'work.v2'} and config['model'] is not None:
             from simple_ar.tools.document_work import DocumentWorkToolGateway, document_work_tool_specs
             self.document = DocumentWorkToolGateway(root, self.workspace, ledger, session_id,
                 client_factory=lambda identity: client_factory(identity, 'writing'),
@@ -438,7 +448,10 @@ class OperationTools:
 
     def coordinator_eligible(self, spec: CommonToolSpec) -> bool:
         """Consumer role, not authorization; callers and inspectors keep primitives."""
-        return (self.config.get('professional_operations') != 'work.v7'
+        contract = self.config.get('professional_operations')
+        if contract == 'work.v8' and spec.domain == 'inspection':
+            return False  # Delivery owns independent acceptance; the explicit API remains registered.
+        return (contract not in COORDINATED_OWNER_CONTRACTS
             or spec.domain != 'workspace' or spec.name in {'list_directory', 'ask_user', 'deliver_result'})
 
     def presentation(self, selected: set[str], mode: str):

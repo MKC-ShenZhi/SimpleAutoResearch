@@ -820,19 +820,20 @@ class OperationsWorkLoopTests(unittest.TestCase):
         core = {row['function']['name'] for row in self.app.operation_schemas}
         self.assertEqual({'prepare_implementation','execute_implementation','work_document','ask_user',
             'deliver_result','load_tools','read_history','list_directory','export_report','update_work_plan'}, core)
-        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v7')
+        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v8')
         self.assertFalse({'select_work_method',
             'begin_professional_work','finish_professional_work'} & core)
         optional = {'inspect_table','analyze_table','measure_experiment','analyze_measurements',
-            'inspect_artifacts','find_source_passages'}
+            'find_source_passages'}
         self.assertFalse(optional & core)
         view = json.loads(self.app._messages()[1]['content'])
         self.assertTrue(optional <= view['available_specialists'].keys())
+        self.assertNotIn('inspect_artifacts', view['available_specialists'])
         self.assertNotIn('search_sources', view['available_specialists'])
         historical, _ = self.app.operations.presentation(set(), 'outcomes')
         self.assertTrue(optional <= historical)
 
-        selected = {'inspect_table','inspect_artifacts','export_report'}
+        selected = {'inspect_table','export_report'}
         self._submit(_action('load_tools', names=sorted(selected)))
         self._ok('load_tools')
         self._reload()
@@ -3412,11 +3413,41 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def test_goal_document_owner_produces_checked_versions_and_reuses_work_after_reload(self):
         self._create(goal='把已有观察整理为中文Markdown说明，保留原材料与适用范围，不需要论文或PDF。',
             current_method=True, delivery_protocol=None, selection_policy='native.v3',
-            professional_contract='work.v7')
+            professional_contract='work.v8')
         self.assertIsNone(self.app.operations.selection)
         self.assertIsNotNone(self.app.operations.implementation)
         self.assertIsNotNone(self.app.operations.document)
         self._document_work_chain(chinese=True)
+
+    def test_delivery_owns_new_coordination_checks_while_explicit_and_saved_inspection_work(self):
+        self._create(goal='Review the supplied observation scope and deliver an opinion.', current_method=True,
+            delivery_protocol=None, selection_policy='native.v3', professional_contract='work.v8')
+        view = json.loads(self.app._messages()[1]['content'])
+        self.assertNotIn('inspect_artifacts', view['available_specialists'])
+        self._submit(_action('load_tools', names=['inspect_artifacts']))
+        self.assertEqual(self._last('load_tools')['status'], 'blocked')
+        self.assertIn('deliver_result', self._last('load_tools')['error'])
+        self.send.assert_not_called()
+        # Removing a coordinator route does not revoke the caller's independent API.
+        self._submit(_action('inspect_artifacts', goal='Check the supplied scope statement',
+            targets=['measurements/conditions.txt']))
+        self._ok('inspect_artifacts')
+        self.assertTrue(self.inspection_requests)
+
+        # A genuinely saved v7 selection remains usable after today's reload.
+        self.root = self.directory/'saved-v7'
+        self._create(goal='Continue the saved local-inspection contract.', current_method=True,
+            delivery_protocol=None, selection_policy='native.v3', professional_contract='work.v7')
+        self._submit(_action('load_tools', names=['inspect_artifacts']))
+        self._ok('load_tools')
+        self._reload()
+        self.decisions.extend([
+            _action('inspect_artifacts', goal='Check the supplied observation scope',
+                targets=['measurements/conditions.txt']),
+            _action('ask_user', question='Which observation should be compared next?')])
+        self._run(should_stop=lambda:False)
+        self._ok('inspect_artifacts')
+        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v7')
 
     def test_saved_v6_keeps_native_production_after_reload(self):
         self._create(goal='Retain the existing native production contract.', current_method=True,
@@ -3436,7 +3467,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def test_document_candidate_is_visible_and_required_delivery_repair_reuses_originals(self):
         self._create(goal='Explain the recorded observations, explicitly retaining their limited scope.',
             current_method=True, delivery_protocol=None, selection_policy='native.v3',
-            professional_contract='work.v7')
+            professional_contract='work.v8')
         original = self._versions(self.inputs)
         finding = 'State that these supplied observations do not establish a population claim.'
         draft = '# Observations\n\nThe supplied mean is 2.0.\n'
@@ -3494,7 +3525,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def test_goal_source_owner_returns_candidate_and_approved_execution_on_one_ledger(self):
         self._create(goal='Compute the supplied observations and deliver a reusable source project and result.',
             current_method=True, delivery_protocol=None, selection_policy='native.v3',
-            professional_contract='work.v7')
+            professional_contract='work.v8')
         original = self._versions(self.inputs)
         program = ("import csv,sys\nfrom pathlib import Path\n"
             "rows=list(csv.DictReader(Path(sys.argv[1]).open()))\n"

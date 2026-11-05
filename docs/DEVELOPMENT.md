@@ -56,6 +56,9 @@ keep their original recovery contract. An explicit delivery independently checks
 obstacle and unfinished requirements. No additional action-list interpreter is used.
 Read-only directory navigation remains available for routing work; it is not source
 evidence or a required preliminary inventory for every producer.
+Ordinary coordination submits actual candidates to delivery for independent
+investigation and acceptance. Standalone inspection remains an explicit caller API
+and a saved-contract capability, rather than another coordinator-owned audit loop.
 Recorded work supplies observations, not an inherited action agenda. Saved tasks
 retain their original selection contract.
 

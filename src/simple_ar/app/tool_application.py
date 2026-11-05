@@ -1540,7 +1540,8 @@ class ToolApplication:
                 raise ValueError(f'Unknown or unauthorized tool: {name}')
             if self.operations is not None and not self.operations.coordinator_eligible(spec):
                 raise ValueError(f'Tool belongs to professional production or inspection: {name}. '
-                    'Delegate the work goal; explicit caller operations retain their normal APIs.')
+                    'Delegate production goals and use deliver_result for independent acceptance; '
+                    'explicit caller operations retain their normal APIs.')
             if (self.state['config'].get('professional_work') == _REQUEST_OWNER
                     and self.state['turns'] and self.state['turns'][-1].get('origin') == 'request_owner'
                     and not self.gateway.registry.request_visible(spec.name)):

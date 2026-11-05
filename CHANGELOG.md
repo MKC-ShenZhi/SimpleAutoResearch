@@ -11,6 +11,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 - Document producers can preview and revise drafts using exact text measurements before submission. Coordination receives the actual candidate text and measurements without a separate inspection just to view it; independent delivery checks remain responsible for acceptance. Saved document receipts retain their original recovery behavior.
 - Ordinary coordination can use read-only directory navigation to route work without misusing analysis or inspection tools for discovery; file production remains with its existing owners.
+- Ordinary coordination submits candidates to delivery's independent investigation instead of scheduling separate local audits. Standalone inspection APIs and saved task routes remain available.
 
 ### Fixed
 
