@@ -469,18 +469,23 @@ class OperationTools:
 
     def coordinator_eligible(self, spec: CommonToolSpec) -> bool:
         """Consumer role, not authorization; callers and inspectors keep primitives."""
+        return self._coordinator_eligible(spec, self._source_scope())
+
+    def _source_scope(self) -> dict | None:
+        return (self.work.selected() if self.config.get('professional_operations') == 'work.v10'
+                and self.work is not None else None)
+
+    def _coordinator_eligible(self, spec: CommonToolSpec, scope: dict | None) -> bool:
         contract = self.config.get('professional_operations')
         if contract == 'work.v10':
-            active = self.work is not None and self.work.selected() is not None
-            if active:
+            if scope is not None:
                 if spec.name in {'read_history', 'load_tools'}:
                     return True  # Shared journal/discovery services do not transfer task control.
                 if spec.name == self.work.return_tool:
                     return True
                 if spec.name in {self.work.entry_tool, 'deliver_result', 'review_result'}:
                     return False
-                if (spec.permission_level == 'execution'
-                        and not self.work.selected()['data']['execution_requested']):
+                if spec.permission_level == 'execution' and not scope['data']['execution_requested']:
                     return False
                 return (spec.domain in {'workspace', 'sources', 'analysis', 'scientific'}
                     or spec.domain.startswith('extension:'))
@@ -495,6 +500,9 @@ class OperationTools:
 
     def presentation(self, selected: set[str], mode: str):
         active, catalog = set(), {}
+        # One role observation per directory, never one history replay per tool.
+        # Execution admission still reads the current role independently.
+        scope = self._source_scope()
         # Explicit frozen work keeps the operations required by its domain owner.
         executable = (self.config.get('work_method') in EXECUTABLE_WORK_METHODS and not any(
             self.config.get(key) for key in
@@ -502,7 +510,7 @@ class OperationTools:
         for spec in self.registry.list_specs():
             if not self.gateway.policy.is_allowed(spec)[0]:
                 continue
-            if not self.coordinator_eligible(spec):
+            if not self._coordinator_eligible(spec, scope):
                 continue
             # Saved preparation contracts keep their original presentation.
             # Ordinary source work is owned by these common workspace tools.

@@ -16,6 +16,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- Tool discovery reads the current source-work role once per directory update instead of replaying task history for every tool; actual action admission still checks the current role.
 - POSIX command supervision now covers changing to the working directory and loading the approved executable, including shared-filesystem startup stalls. Command arguments, environment, process-group cleanup and launch-failure accounting remain bound to the original invocation.
 
 ## 2026-11-04

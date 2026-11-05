@@ -3645,11 +3645,23 @@ class OperationsWorkLoopTests(unittest.TestCase):
             prefix = deepcopy(self.app.ledger.to_dict()['entries'])
             token = self.app.approval_token(active['call'])
             self._reload()
+            with patch.object(self.app.operations.work, 'observations',
+                    wraps=self.app.operations.work.observations) as history:
+                offered, catalog = self.app.operations.presentation({'inspect_table'}, 'on_demand')
+                self.assertIn('return_source_work', offered)
+                self.assertNotIn('deliver_result', offered | catalog.keys())
+                self.assertEqual(history.call_count, 1, 'A tool directory must not replay history per tool')
             self.assertTrue({'load_tools', 'read_history', 'inspect_table'} <=
                 {row['function']['name'] for row in self.app.operation_schemas})
             self._run(approved_execution=token)
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         self.assertEqual(self.app._coordinator_purpose(), 'task')
+        with patch.object(self.app.operations.work, 'observations',
+                wraps=self.app.operations.work.observations) as history:
+            offered, catalog = self.app.operations.presentation(set(), 'on_demand')
+            self.assertNotIn('return_source_work', offered | catalog.keys())
+            self.assertIn('prepare_implementation', offered | catalog.keys())
+            self.assertEqual(history.call_count, 1)
         returned = self._ok('return_source_work')
         self.assertTrue(returned['data']['artifact_sha256'])
         self.assertEqual(self._versions(self.inputs), originals)
