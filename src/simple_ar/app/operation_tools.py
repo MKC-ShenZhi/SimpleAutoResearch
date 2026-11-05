@@ -175,6 +175,8 @@ _RESULT_COORDINATION = (
     "roots. Delegate manuscript drafting or substantive revision to work_document. These producers "
     "investigate the actual originals and return editable version-bound candidates and real gaps; "
     "do not first select their files, transcribe evidence or perform a separate producer self-audit. "
+    "When routing genuinely needs material navigation, list_directory can locate authorized roots; "
+    "it is not evidence or a reason to inventory every file before delegating. "
     "work_document already receives the original task roots and requests. Its returned literal "
     "manuscript and mechanical measurements let you assess readiness without calling inspection "
     "merely to view the text, locate sources or count words. Measurements are not a content verdict. "
@@ -437,7 +439,7 @@ class OperationTools:
     def coordinator_eligible(self, spec: CommonToolSpec) -> bool:
         """Consumer role, not authorization; callers and inspectors keep primitives."""
         return (self.config.get('professional_operations') != 'work.v7'
-            or spec.domain != 'workspace' or spec.name in {'ask_user', 'deliver_result'})
+            or spec.domain != 'workspace' or spec.name in {'list_directory', 'ask_user', 'deliver_result'})
 
     def presentation(self, selected: set[str], mode: str):
         active, catalog = set(), {}

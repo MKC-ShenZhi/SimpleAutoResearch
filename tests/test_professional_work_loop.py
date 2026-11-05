@@ -819,7 +819,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertIsNone(self.app.operations.selection)
         core = {row['function']['name'] for row in self.app.operation_schemas}
         self.assertEqual({'prepare_implementation','execute_implementation','work_document','ask_user',
-            'deliver_result','load_tools','read_history','export_report','update_work_plan'}, core)
+            'deliver_result','load_tools','read_history','list_directory','export_report','update_work_plan'}, core)
         self.assertEqual(self.app.state['config']['professional_operations'], 'work.v7')
         self.assertFalse({'select_work_method',
             'begin_professional_work','finish_professional_work'} & core)
@@ -861,10 +861,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(_action('write_file', path='note.md', content='The supplied table has been inspected.\n'))
         self._ok('write_file')
         self.decisions.extend([
+            _action('list_directory', path='measurements'),
             _action('inspect_table', path='measurements/observations.csv'),
             _action('deliver_result', summary='Retained table inspection.', artifacts=['note.md']),
         ])
         self._run(should_stop=lambda:False)
+        self.assertEqual(self._last('list_directory')['status'], 'ok')
         self.assertEqual(self._ok('inspect_table')['data']['row_count'], 3)
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         self.assertFalse(self._process_receipts())
