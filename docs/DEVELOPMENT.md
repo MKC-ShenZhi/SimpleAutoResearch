@@ -75,7 +75,8 @@ journal while coordination receives the returned versions, interpretation and ga
 The shared history reader and optional-tool discovery remain available inside source work.
 New source roles may use authorized document, publication and visual services, while their
 optional task-delivery fields are excluded from both the offer and action admission.
-Role transitions finish a batch; independent inspection uses its own writable work directory.
+Role transitions finish a batch, and a professional return remains an available resource-boundary
+exit without becoming task delivery. Independent inspection uses its own writable work directory.
 When a received reply cannot be continued as native thinking history, new conversations
 present its closed actions and outcomes as historical observations. They retain the original
 reply and effects without fabricating reasoning or replaying tools; old saved contracts stay unchanged.

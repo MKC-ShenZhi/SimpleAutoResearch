@@ -485,6 +485,10 @@ class OperationTools:
         return (self.work.selected() if self.config.get('professional_operations') in SOURCE_WORK_CONTRACTS
                 and self.work is not None else None)
 
+    def scope_exit_tool(self) -> str | None:
+        return (self.work.return_tool if self.config.get('professional_operations') == 'work.v11'
+                and self._source_scope() is not None else None)
+
     def _coordinator_eligible(self, spec: CommonToolSpec, scope: dict | None) -> bool:
         contract = self.config.get('professional_operations')
         if contract in SOURCE_WORK_CONTRACTS:

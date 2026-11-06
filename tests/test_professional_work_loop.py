@@ -3903,6 +3903,29 @@ class OperationsWorkLoopTests(unittest.TestCase):
         native = [self.app.session.store.read_json(turn['reply']) for turn in self.app.state['turns']]
         self.assertTrue(any(row.get('tool_calls') and 'reasoning_content' not in row for row in native))
 
+    def test_source_return_remains_available_at_the_last_model_slot(self):
+        self._create(current_method=True, delivery_protocol=None, selection_policy='native.v3', professional_contract='work.v11')
+
+        def return_partial():
+            request = self.send.call_args.kwargs.get('request') or self.send.call_args.args[1]
+            offered = {row['function']['name'] for row in request['tools']}
+            self.assertEqual(offered, {'return_source_work', 'ask_user'})
+            return _action('return_source_work', candidate='work', summary='Known partial files retained.',
+                gaps=['Independent checking and final delivery remain unfinished.'])
+
+        self.decisions.extend([
+            _action('prepare_implementation', goal='Retain useful partial files.', material_roots=['measurements']),
+            _action('write_file', path='work/note.md', content='Known partial work.\n'), return_partial,
+        ])
+        with self.app.ledger.protect_remaining({'llm_requests':67}, additional=True):
+            self._run()
+            self.assertEqual(self.app.ledger.remaining('llm_requests'), 0)
+        self._ok('return_source_work')
+        self.assertEqual(self.send.call_count, 3)
+        self.assertEqual(self.app._coordinator_purpose(), 'task')
+        self.assertEqual((self.root/'workspace/work/note.md').read_text(), 'Known partial work.\n')
+        self.assertFalse((self.root/'delivery.json').exists())
+
     def test_source_service_completion_cannot_bypass_return(self):
         self._create(current_method=True, delivery_protocol=None, selection_policy='native.v3', professional_contract='work.v11')
         self.decisions.extend([

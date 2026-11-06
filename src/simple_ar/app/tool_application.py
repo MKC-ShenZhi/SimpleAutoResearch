@@ -915,14 +915,21 @@ class ToolApplication:
             return self.operation_schemas
         # Restrict the active contracts rather than loading deferred specialists:
         # expanding an on-demand catalog here can evict original input windows.
-        schemas = [row for row in self.operation_schemas
+        operations = self.operation_schemas
+        schemas = [row for row in operations
             if (contract := self._completion(row['function']['name'])) is not None and contract.closing
                 and (self.state['config'].get('work_method') not in NATIVE_WORK_METHODS or not contract.field)]
+        scope_exit = self.operations.scope_exit_tool() if self.operations is not None else None
+        if scope_exit is not None:
+            schemas.extend(row for row in operations if row['function']['name'] == scope_exit)
         result = []
         for original in schemas:
             schema = json.loads(json.dumps(original))
             function = schema['function']
             contract = self._completion(function['name'])
+            if function['name'] == scope_exit:
+                result.append(schema)
+                continue
             if contract.field:
                 parameters = function['parameters']
                 delivery = parameters.get('properties', {}).get(contract.field)
@@ -2546,6 +2553,10 @@ class ToolApplication:
                     'Reuse an applicable existing review for complete delivery; otherwise deliver '
                     'useful existing artifacts with the actual unfinished work in unresolved. '
                     'Research scope limitations alone do not make finished requested work unresolved.')
+            if closing and (scope_exit := self.operations.scope_exit_tool()) is not None:
+                exit_text = ('Return the current professional candidate and actual gaps with ' + scope_exit
+                    + ', or ask an indispensable question. Do not propose more work. This returns '
+                    'the scope to coordination; it is not independent acceptance or task delivery.')
             return self.operations.system_text() + ('\n\n'+exit_text if closing else '')
         # Do not append delegation advice to the old do-everything solver role:
         # professional owners now hold the complete investigation-to-result unit.
@@ -2587,7 +2598,7 @@ class ToolApplication:
         return {'llm_requests': 1, 'total_tokens': self._decision_tokens(client, messages)}
 
     def _terminal_batch(self) -> bool:
-        """A fitting explicit terminal queue needs no later model decision."""
+        """A fitting task exit or professional return needs no later decision."""
         queued = self.state['turns'][-1].get('remaining', []) if self.state['turns'] else []
         space = self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts
         if queued:
@@ -2596,8 +2607,11 @@ class ToolApplication:
                     and self.session.store.read_json(path).get('closing_action_contract') == 'single_terminal.v1'
                     and len(queued) != 1):
                 return False
-        return bool(queued and len(queued) <= space and self._terminal_intent(queued[-1])
-            and sum(self._terminal_intent(call) for call in queued) == 1)
+        if not queued or len(queued) > space:
+            return False
+        scope_exit = self.operations.scope_exit_tool() if self.operations is not None else None
+        exits = [self._terminal_intent(call) or call['function']['name'] == scope_exit for call in queued]
+        return exits[-1] and sum(exits) == 1
 
     def _owner_finishes_request(self, call: dict[str, Any]) -> bool:
         """A bounded owner may finish without a later coordinator decision.
