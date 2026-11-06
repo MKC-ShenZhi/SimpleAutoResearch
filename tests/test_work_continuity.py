@@ -11,7 +11,7 @@ from unittest.mock import patch
 from simple_ar.app.reuse import ReuseAccess, select_reuse
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.core.artifacts import read_json, write_json
-from simple_ar.core.working_context import select_working_context
+from simple_ar.core.working_context import material_window_views, select_working_context
 from simple_ar.tools.delivery_versions import DeliveryVersions
 from simple_ar.tools.materials import retained_working_inputs, _recorded_copy_source
 
@@ -40,6 +40,60 @@ class SelectedWorkContinuityTests(unittest.TestCase):
         selection = select_reuse(self.app.session.store.root, ['artifacts'], version=1)
         return ToolApplication.create(self.base / 'fresh', 'Different current goal', model=None,
             sources={}, creation_declarations={'reuse_origin': selection.origin})
+
+    def test_native_read_rows_keep_full_and_partial_offsets_and_needed_sources_after_archiving(self):
+        from simple_ar.integrations.llm import LLMClient, LLMSettings
+        from tests.report_review_fixtures import goal_work_decision
+        client = LLMClient(LLMSettings(api_key='offline-fixture', model='fixture', api_mode='chat',
+            retry_attempts=1, max_output_tokens=1024, context_input_tokens=100000))
+        services = SimpleNamespace(llm_client=client)
+        app = ToolApplication.create(self.base / 'native', 'Use the original source without changing it',
+            model='fixture', sources={'original': self.file}, services=services,
+            max_turns=8, max_tokens=600000, tool_contracts='full')
+        app.state['config']['work_lifecycle'] = 'integrated.v2'
+        calls = []
+        def provider(_mode, request, **_):
+            number = len(calls)
+            calls.append(request)
+            operations = ([action('read_file', path='original', offset_bytes=6, max_bytes=7, full_digest=True),
+                action('read_file', path='original', full_digest=True)] if number == 0 else
+                [action('list_directory', path='workspace')])
+            names = {row['function']['name'] for row in request.get('tools', [])}
+            if 'select_work' in names:
+                operations = goal_work_decision(operations, app.state['requests'],
+                    policy=app.state['config'].get('work_selection_policy'))
+            self.assertTrue(all(item['tool_name'] in names for item in operations))
+            return {'choices': [{'message': {'role': 'assistant', 'content': None,
+                'reasoning_content': 'Use recorded source observations.', 'tool_calls': [
+                    {'id': f'native-{number}-{i}', 'type': 'function', 'function': {
+                        'name': item['tool_name'], 'arguments': json.dumps(item['arguments'])}}
+                    for i, item in enumerate(operations)]}, 'finish_reason': 'tool_calls'}],
+                'usage': {'prompt_tokens': 100, 'completion_tokens': 40, 'total_tokens': 140}}
+        with patch('simple_ar.integrations.llm._call_openai_sdk', side_effect=provider):
+            app.run(progress=lambda _: None,
+                should_stop=lambda: len(app.state['turns']) >= 3 and not app.state['pending'])
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(turn.get('origin') != 'caller' for turn in app.state['turns']))
+        first = app.state['turns'][0]
+        records = ['records/' + row['result'].removeprefix('attempts/') for row in first['tools']]
+        memory = {'notes': [{'text': 'Necessary original scope', 'records': records}], 'through_turn': 1,
+            'compacted_records': set(records), 'archived_records': set(records)}
+        state, ledger = deepcopy(app.state), deepcopy(app.ledger.to_dict())
+        with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select:
+            messages = app._messages(client=client, schemas=[], working_memory=memory)
+        rows = [row for row in select.call_args.kwargs['observations'] if row.get('tool') == 'read_file']
+        self.assertEqual([(row['kind'], row['offset_bytes'], row['next_offset_bytes']) for row in rows],
+            [('source_text', 6, 13), ('source_text', 0, len(self.file.read_bytes()))])
+        originals = [row['observation'] for row in json.loads(messages[1]['content'])['working_view']['observations']
+            if row['observation'].get('kind') == 'source_text']
+        self.assertEqual(sum(len(row['text'].encode()) for row in originals), len(self.file.read_bytes()))
+        self.assertEqual(app.state, state)
+        self.assertEqual(app.ledger.to_dict(), ledger)
+        app.state['config']['work_lifecycle'] = 'integrated.v1'
+        with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as old:
+            app._messages(client=client, schemas=[], working_memory=memory)
+        self.assertTrue(all('kind' not in row for row in old.call_args.kwargs['observations']
+            if row.get('tool') == 'read_file'))
 
     def test_selected_partial_original_observation_reaches_common_working_input(self):
         old = {name: (self.app.session.store.root / name).read_bytes()
@@ -167,6 +221,68 @@ class SelectedWorkContinuityTests(unittest.TestCase):
 
 
 class WorkingSupplyContinuityTests(unittest.TestCase):
+    def test_recent_work_precedes_unneeded_archived_originals_but_note_sources_remain(self):
+        def row(record, text):
+            return {'turn': 0, 'record': record, 'kind': 'source_text', 'role': 'historical_observation',
+                'path': 'workspace/' + record, 'sha256': 'a' * 64, 'offset_bytes': 0,
+                'next_offset_bytes': len(text), 'text': text}
+        unused, needed = row('unused', 'U' * 20000), row('needed', 'NEEDED ORIGINAL')
+        blocks = [[], [{'role': 'assistant', 'content': 'Recent complete reasoning ' * 60}],
+            [{'role': 'assistant', 'content': 'Current decision'}]]
+        arguments = dict(user_requests=['Continue'], system_text='Allowed work', base_context={},
+            turn_blocks=blocks, observations=[unused, needed], native_observations=[], schema_tokens=0,
+            context_token_target=28000, estimate_tokens=len, material_policy='working',
+            require_work_notes=True, fit_work_notes=True, sparse_handoffs=True,
+            processed_turns=[0], archived_turns=[0], work_notes=[{'text': 'Use the original scope',
+                'records': ['needed']}], version_resolver=lambda _: 'a' * 64)
+        before = deepcopy(arguments)
+        messages, selected = select_working_context(**arguments, working_set_policy='recent.v2')
+        self.assertIn(1, selected['selected_turns'])
+        shown = json.loads(messages[1]['content'])['working_view']['observations']
+        self.assertEqual([item['observation']['text'] for item in shown], ['NEEDED ORIGINAL'])
+        self.assertEqual(arguments, before)
+        _, explicit = select_working_context(**arguments, working_set_policy='recent.v2',
+            selected_records=['unused'])
+        self.assertTrue(any(item['source']['record'] == 'unused' for item in explicit['selected_records']))
+
+    def test_overlapping_unicode_windows_show_only_actual_unsupplied_ranges(self):
+        text = 'αβγδε'
+        full = {'record': 'read/full', 'path': 'workspace/a', 'sha256': 'a' * 64,
+            'kind': 'source_text', 'role': 'historical_observation', 'offset_bytes': 0,
+            'next_offset_bytes': len(text.encode()), 'text': text}
+        middle = {**full, 'record': 'read/middle', 'offset_bytes': 2, 'next_offset_bytes': 8, 'text': 'βγδ'}
+        views = material_window_views(full, [middle])
+        self.assertEqual([row['text'] for row in views], ['α', 'ε'])
+        self.assertEqual([(row['supplied_offset_bytes'], row['supplied_next_offset_bytes'])
+            for row in views], [(0, 2), (8, 10)])
+        self.assertEqual([row['offset_bytes'] for row in views], [0, 0])
+        self.assertEqual(material_window_views(full, [middle, *views]), [])
+        self.assertEqual(material_window_views(full, [{**full, 'path': 'workspace/copy'}]), [full])
+        self.assertEqual(material_window_views(full, [{**full, 'sha256': 'b' * 64}]), [full])
+        self.assertEqual(material_window_views(full, [{**middle, 'text': 'XYZ123'}]), [full])
+
+    def test_native_partial_window_and_explicit_full_window_share_body_without_claiming_a_new_read(self):
+        partial = {'turn': 1, 'record': 'read/partial', 'field': 'data.text', 'kind': 'source_text',
+            'role': 'historical_observation', 'path': 'workspace/a', 'sha256': 'a' * 64,
+            'offset_bytes': 2, 'next_offset_bytes': 8, 'text': 'cdefgh'}
+        full = {**partial, 'turn': 0, 'record': 'read/full', 'offset_bytes': 0,
+            'next_offset_bytes': 10, 'text': 'abcdefghij'}
+        message = {'role': 'assistant', 'content': 'Latest original cdefgh'}
+        native = {key: value for key, value in partial.items() if key != 'text'}
+        messages, selection = select_working_context(user_requests=['Continue'], system_text='Allowed work',
+            base_context={}, turn_blocks=[[], [message]], observations=[full, partial],
+            native_observations=[native], schema_tokens=0, context_token_target=100000,
+            estimate_tokens=len, material_policy='working', require_work_notes=True,
+            fit_work_notes=True, sparse_handoffs=True, processed_turns=[], archived_turns=[],
+            selected_records=['read/full'], version_resolver=lambda _: 'a' * 64,
+            working_set_policy='recent.v2')
+        supplied = json.loads(messages[1]['content'])['working_view']['observations']
+        self.assertEqual([row['observation']['text'] for row in supplied], ['ab', 'ij'])
+        slices = [row['source']['record_text_slice'] for row in selection['selected_records']
+            if row['source']['record'] == 'read/full']
+        self.assertEqual([(row['character_start'], row['character_end']) for row in slices], [(0, 2), (8, 10)])
+        self.assertIn(message, messages)
+
     def test_archiving_a_receipt_does_not_remove_its_current_original_material(self):
         row = {'turn': 0, 'record': 'records/read.json', 'kind': 'source_text',
             'role': 'historical_observation', 'path': 'workspace/a.txt', 'sha256': 'a' * 64,

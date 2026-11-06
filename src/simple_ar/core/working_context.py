@@ -13,6 +13,57 @@ TURN_SUPPLY_POLICY = 'turns.v1'
 RECEIPT_SUPPLY_POLICIES = frozenset({'receipts.v1', TURN_SUPPLY_POLICY})
 
 
+def material_window_views(observation: Mapping[str, Any], supplied: Sequence[Mapping[str, Any]]) -> list[dict]:
+    """Show only unsupplied reversible text of one original same-path version.
+
+    These are presentation slices, not new reads. Original receipt/range fields
+    stay intact; record_text_slice and supplied byte bounds describe the actual
+    displayed text. Equal hashes at another path never establish a relationship.
+    """
+    row = deepcopy(dict(observation))
+    path = row.get('absolute_path') or row.get('path')
+    start, end, text = row.get('offset_bytes'), row.get('next_offset_bytes'), row.get('text')
+    if (row.get('kind') != 'source_text' or row.get('role') != 'historical_observation'
+            or not path or not row.get('sha256') or type(start) is not int or type(end) is not int
+            or not isinstance(text, str) or '\ufffd' in text or end <= start):
+        return [row]
+    raw = text.encode('utf-8')
+    if len(raw) != end - start:
+        return [row]  # No reversible byte map: keep its original observation.
+    ranges = [(start, end)]
+    for other in supplied:
+        if ((other.get('absolute_path') or other.get('path')) != path
+                or other.get('sha256') != row['sha256'] or other.get('kind') != 'source_text'
+                or other.get('role') != 'historical_observation'):
+            continue
+        left = other.get('supplied_offset_bytes', other.get('offset_bytes'))
+        right = other.get('supplied_next_offset_bytes', other.get('next_offset_bytes'))
+        body = other.get('text')
+        if (type(left) is not int or type(right) is not int or not isinstance(body, str)
+                or '\ufffd' in body or len(body.encode('utf-8')) != right - left):
+            continue
+        lo, hi = max(start, left), min(end, right)
+        if lo >= hi or raw[lo-start:hi-start] != body.encode('utf-8')[lo-left:hi-left]:
+            continue
+        ranges = [(a, b) for first, last in ranges for a, b in
+            ((first, min(last, left)), (max(first, right), last)) if a < b]
+    if ranges == [(start, end)]:
+        return [row]
+    views = []
+    for left, right in ranges:
+        try:
+            prefix, body = raw[:left-start].decode('utf-8'), raw[left-start:right-start].decode('utf-8')
+        except UnicodeDecodeError:
+            return [row]
+        views.append({**row, 'text': body,
+            'record_text_slice': {'character_start': len(prefix), 'character_end': len(prefix) + len(body),
+                'total_characters': len(text), 'truncated': True},
+            'supplied_offset_bytes': left, 'supplied_next_offset_bytes': right,
+            'coverage': 'Presentation slice of this original read; other displayed same-path version windows '
+                'carry the overlapping text. Original receipt and read coverage are unchanged.'})
+    return views
+
+
 def feedback_observations(context: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Project related feedback as optional guidance, never source reads.
 
@@ -112,6 +163,7 @@ def select_working_context(
     context_authority: Literal['sources.v1'] | None = None,
     message_projector: Callable | None = None,
     preserve_material_observations: bool = False,
+    working_set_policy: Literal['recent.v2'] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -199,6 +251,9 @@ def select_working_context(
     """
     if context_authority is not None and context_authority != 'sources.v1':
         raise ValueError('Unknown context authority policy')
+    if working_set_policy not in (None, 'recent.v2'):
+        raise ValueError('Unknown working set policy')
+    recent_set = working_set_policy == 'recent.v2'
     # None preserves historical consumers. An explicit (possibly empty) supply
     # is derived by the message owner, never inferred from matching prose.
     def source_key(row: Mapping[str, Any]) -> str:
@@ -217,6 +272,8 @@ def select_working_context(
     scoped_records = material_policy == 'scoped'
     retained_records = material_policy in {'retained', 'working'}
     working_records = material_policy == 'working'
+    if recent_set and not working_records:
+        raise ValueError('Recent working set requires the journal working material policy')
     if fit_work_notes and not (retained_records and require_work_notes):
         raise ValueError('Fitted notes require the retained journal working policy')
     owner_records = material_policy in {'referenced', 'scoped'}
@@ -394,7 +451,7 @@ def select_working_context(
         # Identity of a supplied receipt is separate from repeated presentation.
         # Only exact, same-path, same-version observed windows can share a body;
         # this never infers provenance from an equal digest at another path.
-        repeatable = (preserve_material_observations and version == 'matching'
+        repeatable = ((preserve_material_observations or recent_set) and version == 'matching'
             and row.get('kind') == 'source_text' and row.get('role') == 'historical_observation'
             and type(row.get('offset_bytes')) is int and type(row.get('next_offset_bytes')) is int)
         keys.append(dump(['observed_body', path, digest, row.get('offset_bytes'),
@@ -485,6 +542,7 @@ def select_working_context(
                 continue
             if in_native(row, recent):
                 state['status'] = 'native'
+                state.pop('supplied_sources', None)
             elif state['version_status'] == 'stale':
                 state['status'] = 'stale'
             elif state['status'] == 'working_view':
@@ -565,8 +623,9 @@ def select_working_context(
                 entry for record in sorted(reported_references)
                 for entry in ([{'record': record, 'status': states[i]['status'],
                                 'version_status': states[i]['version_status'],
-                                'source': states[i]['source']}
-                               for i in reference_indices.get(record, [])]
+                                'source': source}
+                               for i in reference_indices.get(record, [])
+                               for source in states[i].get('supplied_sources', [states[i]['source']])]
                               or [{'record': record, 'status': 'missing'}])]
         cost = 0
         while True:
@@ -632,6 +691,11 @@ def select_working_context(
         turn = rows[i].get('turn')
         return turn if type(turn) is int else -1
 
+    def observed_width(i: int) -> int:
+        row = rows[i]
+        first, last = row.get('offset_bytes'), row.get('next_offset_bytes')
+        return max(0, last - first) if row.get('kind') == 'source_text' and type(first) is int and type(last) is int else 0
+
     def priority(i: int) -> tuple[int, int, int, int, int]:
         row = rows[i]
         words = set(re.findall(r'\w+', str(row.get('text', '')).casefold()))
@@ -642,9 +706,50 @@ def select_working_context(
 
     represented = {keys[i] for i, state in enumerate(states) if state['status'] == 'native'}
 
+    def supplied_material() -> list[Mapping[str, Any]]:
+        return [row for row, state in zip(rows, states)
+                if state['status'] == 'native' and state['version_status'] == 'matching'] + [
+                    entry['observation'] for entry in view['observations']
+                    if entry['version_status'] == 'matching']
+
+    def refresh_material_views() -> None:
+        """Replace optional display slices when a whole native block is added."""
+        candidates = {source_key(row): i for i, (row, state) in enumerate(zip(rows, states))
+            if state['status'] == 'working_view' and row.get('kind') == 'source_text'
+            and state['version_status'] == 'matching'}
+        ordered_indices = list(dict.fromkeys(candidates[source_key(entry['observation'])]
+            for entry in view['observations'] if source_key(entry['observation']) in candidates))
+        view['observations'] = [entry for entry in view['observations']
+            if source_key(entry['observation']) not in candidates]
+        for i in ordered_indices:
+            windows = material_window_views(rows[i], supplied_material())
+            states[i]['status'] = 'working_view' if windows else 'duplicate'
+            states[i].pop('supplied_sources', None)
+            if windows:
+                states[i]['supplied_sources'] = [locator(window) for window in windows]
+                view['observations'].extend({'observation': window, 'version_status': 'matching'}
+                    for window in windows)
+
     def admit(i: int) -> None:
         state = states[i]
         if state['status'] != ('not_attempted' if scoped_records or retained_records else 'capacity'):
+            return
+        if recent_set and rows[i].get('kind') == 'source_text' and state['version_status'] == 'matching':
+            windows = material_window_views(rows[i], supplied_material())
+            if not windows:
+                state['status'] = 'duplicate'
+                return
+            count = len(view['observations'])
+            view['observations'].extend({'observation': window, 'version_status': 'matching'} for window in windows)
+            state.update(status='working_view', supplied_sources=[locator(window) for window in windows])
+            if project()[1] > material_ceiling:
+                del view['observations'][count:]
+                state.pop('supplied_sources')
+                state['status'] = 'capacity'
+                return
+            state['estimated_tokens'] = sum(estimate_tokens(dump(window)) for window in windows)
+            admissions.append(('material_windows', i))
+            represented.add(keys[i])
             return
         if keys[i] in represented:
             state['status'] = 'duplicate'
@@ -711,7 +816,7 @@ def select_working_context(
         # Receipt/field/version identity remains separate from body priority.
         ordered = sorted(range(len(rows)), key=lambda i: (
             int(rows[i].get('record') in explicit_references),
-            observed_turn(i), *priority(i)), reverse=True)
+            observed_turn(i), *([observed_width(i)] if recent_set else []), *priority(i)), reverse=True)
     elif retained_records:
         # Explicit references and current objects precede the rest; original
         # text precedes historical operations within each priority group.
@@ -778,12 +883,24 @@ def select_working_context(
             if supplied_handoffs:
                 ordered = [i for i in ordered if rows[i].get('turn') not in supplied_handoffs
                     or rows[i].get('record') in explicit_references
-                    or preserve_material_observations and rows[i].get('kind') in {'source_text', 'authored_text'}
+                    or preserve_material_observations and not recent_set and rows[i].get('kind') in {'source_text', 'authored_text'}
+                    or recent_set and (rows[i].get('record') in {
+                        record for note in view['notes'] if active(note) for record in note.get('records', ())}
+                        or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts)
                     or not working_records and (rows[i].get('path') in artifacts
                         or rows[i].get('absolute_path') in artifacts)]
             # Retained originals precede optional native history; otherwise an
             # evicted read can lose its only body to unrelated native blocks.
             preferred = set(ordered)
+            if recent_set:
+                needed = explicit_references | {record for note in view['notes'] if active(note)
+                    for record in note.get('records', ())}
+                ordered = [i for i in ordered if isinstance(rows[i].get('turn'), int) or latest is None
+                    or rows[i].get('record') in needed
+                    or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts]
+                # Explicit originals were admitted above. Recent complete work
+                # now precedes optional supporting original bodies.
+                preferred = {i for i in ordered if rows[i].get('record') in explicit_references}
         for i in ordered:
             if i in preferred:
                 admit(i)
@@ -827,6 +944,8 @@ def select_working_context(
                 # block before measuring. Paying for both creates false pressure.
                 view['observations'] = [entry for entry in view['observations']
                     if not in_native(entry['observation'], recent)]
+                if recent_set:
+                    refresh_material_views()
             if project()[1] > context_token_target:
                 # Restore presentation and admission states together. Calling
                 # mark_native here would turn settled capacity omissions back
@@ -836,6 +955,14 @@ def select_working_context(
                 break
             admissions.append(('native', snapshot))
             represented.update(keys[j] for j, state in enumerate(states) if state['status'] == 'native')
+            if recent_set and i == previous:
+                # Keep the latest complete work together, then protect the
+                # originals supporting supplied notes/current objects before
+                # optional older native history consumes the remaining room.
+                for j in ordered:
+                    if (rows[j].get('record') in needed or rows[j].get('path') in artifacts
+                            or rows[j].get('absolute_path') in artifacts):
+                        admit(j)
         for i in ordered:
             if i not in preferred:
                 admit(i)
@@ -883,6 +1010,9 @@ def select_working_context(
                          if state['status'] in {'native', 'working_view'}}
         for i, state in enumerate(states):
             if state['status'] == 'duplicate' and keys[i] not in supplied_keys:
+                if recent_set and rows[i].get('kind') == 'source_text' and not material_window_views(
+                        rows[i], supplied_material()):
+                    continue
                 state['status'] = 'capacity'
         if journal_selection:
             for state in states:
@@ -907,6 +1037,11 @@ def select_working_context(
                                         'version_status': states[index]['version_status']})
             states[index].update(source=locator(rows[index]), status='capacity',
                                  estimated_tokens=estimate_tokens(dump(rows[index])))
+        elif kind == 'material_windows':
+            view['observations'] = [entry for entry in view['observations']
+                if source_key(entry['observation']) != source_key(rows[value])]
+            states[value].pop('supplied_sources', None)
+            states[value].update(source=locator(rows[value]), status='capacity')
         elif kind == 'native':
             removed = set(recent) - set(value[0])
             restore_native(value)
@@ -933,7 +1068,9 @@ def select_working_context(
     compaction_turns = ([i for i, block in enumerate(blocks)
         if block and i != latest and i not in processed]
         if capacity_omitted - processed else sorted(economical_history - processed))
-    selected = [state for state in states if state['status'] in {'native', 'working_view'}]
+    selected = [{**{key: value for key, value in state.items() if key != 'supplied_sources'}, 'source': source}
+        for state in states if state['status'] in {'native', 'working_view'}
+        for source in state.get('supplied_sources', [state['source']])]
     omitted = [state for state in states if state['status'] not in {'native', 'working_view'}]
     metadata = {
         'input_token_target': context_token_target, 'schema_tokens': schema_tokens,
