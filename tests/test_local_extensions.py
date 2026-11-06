@@ -169,8 +169,10 @@ def count_words(arguments, services):
 class LocalExtensionIntegrationTests(unittest.TestCase):
     def test_declared_extension_completion_survives_supply_and_terminal_recovery(self):
         # The core never knows this domain/tool name or its delivery field.
-        # One integrated check owns registration, completion and retained use.
+        # Preserve the historical generic field-completion offer and its
+        # supply/recovery consumers, independently of outcome work selection.
         from simple_ar.tools.workspace import RetainedDelivery
+        from tests.native_history_fixture import load_prepared_operation_history
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             package = root / 'package'
@@ -198,8 +200,16 @@ type = "object"
             (package / 'notes.py').write_text(
                 'def finish_note(arguments, services):\n    return {"handoff": arguments["handoff"]}\n',
                 encoding='utf-8')
-            app = ToolApplication.create(root / 'task', 'Deliver the explicit note', model=None,
-                sources={}, extensions=[package], tool_contracts='full')
+            frozen_extensions = freeze_extensions([package])
+            specs = LocalExtension(frozen_extensions[0], Mock()).specs()
+            completions = {spec.name: spec.completion.model_dump(mode='json')
+                for spec in specs if spec.completion is not None}
+            app = load_prepared_operation_history(root / 'task', 'Deliver the explicit note',
+                config={'model': None, 'sources': {}, 'extensions': frozen_extensions,
+                    'extension_host_protocol': 'nested_calls.v1', 'tool_contracts': 'full',
+                    'tool_completions': completions, 'professional_operations': 'work.v5',
+                    'source_generation_protocol': None, 'source_decision_protocol': None,
+                    'context_protocol': 'conversation.v1'}, limits={})
             name = 'research_note__finish_note'
             frozen = app.state['config']['tool_completions'].copy()
             self.assertEqual(frozen[name]['field'], 'handoff')

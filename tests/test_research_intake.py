@@ -382,14 +382,16 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertTrue(app.scientific.execution_issues())
             self.assertEqual(app.session.list_attempts(), ())
 
-    def test_json_client_resumes_one_native_task_delivers_and_terminal_load_is_idle(self) -> None:
+    def test_json_client_resumes_one_slot_task_delivers_honest_partial_and_terminal_load_is_idle(self) -> None:
         content = "# Assessment\nCalibration error 0.12 alone cannot establish robustness.\n"
         request = "Assess the observation: calibration error is 0.12."
         # This request asks for an assessment, not a file or formal report.
-        # The common loop can directly deliver this assessment; no compulsory
-        # report-intent declaration or Writer stage is needed.
-        final_reply = _reply("deliver_result", {"summary": content,
-            "artifacts": [], "unresolved": []})
+        # One physical request cannot also fund independent acceptance. Retain
+        # this JSON budget-port boundary with a truthful typed partial exit.
+        obstacle = 'The remaining shared allowance cannot fund independent checking of this assessment.'
+        final_reply = _reply('select_work', {'decision': 'blocked', 'actions': [],
+            'stop_reason': obstacle, 'candidate': {'summary': content,
+                'artifacts': [], 'unresolved': [obstacle]}})
         client = _JSONClient([final_reply])
         services = ResearchApplicationServices(llm_client=client,
             budget_limits={"llm_requests": 1, "total_tokens": 1000000},
@@ -415,7 +417,7 @@ class ResearchIntakeTests(unittest.TestCase):
 
             resumed = ToolApplication.load(root, services=services)
             result = resumed.run(progress=lambda _: None)
-            self.assertEqual(result["status"], "completed", result)
+            self.assertEqual(result["status"], "partial", result)
             observations = [resumed.session.store.read_json(item['result'])
                 for turn in resumed.state['turns'] for item in turn['tools']]
             self.assertEqual([row['tool_name'] for row in observations],
@@ -426,6 +428,7 @@ class ResearchIntakeTests(unittest.TestCase):
             delivery = json.loads((root / "delivery.json").read_text(encoding="utf-8"))
             self.assertEqual(delivery["summary"], content)
             self.assertEqual(delivery["artifacts"], [])
+            self.assertEqual(delivery['unresolved'], [obstacle])
             self.assertFalse(any((root / 'workspace').iterdir()))
             self.assertEqual(len(client.calls), 1)
             entries = resumed.ledger.entries
@@ -446,8 +449,8 @@ class ResearchIntakeTests(unittest.TestCase):
             ledger_before = (root / "budget_ledger.json").read_bytes()
             attempts_before = tuple(attempts)
             terminal = ToolApplication.load(root, services=services)
-            self.assertEqual(terminal.run(progress=lambda _: None)["status"], "completed")
-            self.assertEqual(ToolApplication.load(root).run(progress=lambda _: None)["status"], "completed")
+            self.assertEqual(terminal.run(progress=lambda _: None)["status"], "partial")
+            self.assertEqual(ToolApplication.load(root).run(progress=lambda _: None)["status"], "partial")
             self.assertEqual(len(client.calls), 1)
             self.assertEqual(tuple(a.attempt_id for a in terminal.session.list_attempts()), attempts_before)
             self.assertEqual((root / "budget_ledger.json").read_bytes(), ledger_before)

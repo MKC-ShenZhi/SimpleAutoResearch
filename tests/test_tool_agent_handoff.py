@@ -6230,13 +6230,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             client = LLMClient(LLMSettings(api_key='fixture', model='fixture', api_mode='chat',
                 native_response_corrections=1, max_output_tokens=512, retry_attempts=1))
             services = SimpleNamespace(llm_client=client)
-            app = ToolApplication.create(root, 'Save and deliver the inspected result', model='fixture',
-                sources={}, services=services, max_turns=3, max_tokens=100000)
-            # This retained native response-correction contract predates the
-            # outcome interpreter. Keep its original raw reply and one turn.
-            app.state['config'].update(work_selection_policy='native.v3', work_lifecycle='integrated.v1')
-            app._save()
-            app = ToolApplication.load(root, services=services)
+            from tests.native_history_fixture import load_native_history
+            # Historical native-tools-v1 admits write_file's declared delivery
+            # field and one final decision floor. It has no ordinary goal owner,
+            # inspection floor or outcome interpreter to spend a second request.
+            app = load_native_history(root, 'Save and deliver the inspected result',
+                config={'model': 'fixture', 'sources': {}, 'max_turns': 3,
+                    'context_protocol': 'conversation.v1', 'tool_contracts': 'full'},
+                limits={'llm_requests': 3, 'total_tokens': 100000}, services=services)
             self.assertNotIn('model_catalogs', app.state['config'])
             poison = self._native_message('write_file', {'path': 'poison.txt', 'content': 'never adopt'}, 'cut')
             complete = self._native_message('write_file', {'path': 'result.txt', 'content': 'complete result',

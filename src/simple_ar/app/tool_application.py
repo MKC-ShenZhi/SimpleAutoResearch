@@ -2762,6 +2762,12 @@ class ToolApplication:
                 expected = self.operations.selection.interpret(raw, binding, self.state['requests'])
                 if call not in expected['tool_calls']:
                     raise ValueError('Queued action differs from the retained goal-work decision')
+                if (self.operations.selection.policy == 'outcomes.v1'
+                        and self.operations.selection.decode(raw, 'outcomes.v1').decision == 'work'):
+                    error = self.operations.service_error(self.gateway.registry.get(call['function']['name']),
+                        json.loads(call['function']['arguments']), selected_work=True)
+                    if error:
+                        raise ValueError(error)
             except (ValueError, KeyError, TypeError, OSError) as exc:
                 return ToolResult(tool_name=call['function']['name'], status='blocked',
                     error='Work selection refused: '+str(exc), data={'executed':False},
@@ -4501,6 +4507,19 @@ class ToolApplication:
 
     def _bind_delivery(self, call: dict, payload: dict, store: ArtifactStore, *, start_review: bool = False) -> dict:
         """One delivery projection for normal execution and receipt recovery."""
+        if (payload.get('status') == 'ok' and self.operations is not None and self.state['turns']
+                and self._completion(call['function']['name']) is not None):
+            try:
+                selected_work = self.operations.selected_work_service(call, self.state['turns'][-1],
+                    self.session.store, self.state['requests'])
+                service_error = self.operations.service_result_error(
+                    self.gateway.registry.get(call['function']['name']), payload.get('data') or {},
+                    selected_work=selected_work)
+            except (ValueError, OSError, KeyError, TypeError) as exc:
+                service_error = str(exc)
+            if service_error:
+                payload.update(status='blocked', error=service_error)
+                return payload
         delivery = self._delivery(call, payload)
         if (payload.get('status') == 'ok' and self._terminal_intent(call)
                 and self._completion(call['function']['name']).kind == 'delivery' and delivery is None):

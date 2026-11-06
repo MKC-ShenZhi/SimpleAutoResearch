@@ -530,6 +530,20 @@ class OperationTools:
 
     def service_schemas(self, schemas: list[dict]) -> list[dict]:
         """Project one role snapshot, without rereading the journal per tool."""
+        if self.config.get('work_selection_policy') == 'outcomes.v1':
+            result = []
+            for row in schemas:
+                spec = self.registry.get(row['function']['name'])
+                # These owners supply outer decisions, never inner work actions.
+                if spec.name in self.selection.handoff_operations or (
+                        spec.completion is not None and spec.completion.kind == 'question'):
+                    result.append(row)
+                    continue
+                schema = spec.service_parameters_schema()
+                if schema is not None:
+                    row['function']['parameters'] = schema
+                    result.append(row)
+            return result
         if self.config.get('professional_operations') != 'work.v11' or self._source_scope() is None:
             return schemas
         for row in schemas:
@@ -541,13 +555,44 @@ class OperationTools:
                 row['function']['parameters'] = schema
         return schemas
 
-    def service_error(self, spec: CommonToolSpec, arguments: dict) -> str:
+    def service_error(self, spec: CommonToolSpec, arguments: dict, *, selected_work: bool = False) -> str:
+        if (selected_work and self.config.get('work_selection_policy') == 'outcomes.v1'
+                and spec.completion is not None and spec.completion.kind != 'question'):
+            completion = spec.completion
+            if (spec.service_parameters_schema() is None
+                    or arguments.get(completion.field) is not None):
+                return 'Selected work is a service operation; submit the current claim with an explicit review or delivery decision.'
         if (self.config.get('professional_operations') == 'work.v11'
                 and spec.completion is not None and spec.completion.kind != 'question'
                 and self._source_scope() is not None):
             completion = spec.completion
             if not completion.field or arguments.get(completion.field) is not None:
                 return 'Return professional work before requesting task review or delivery; service operations cannot finish this scope.'
+        return ''
+
+    def selected_work_service(self, call: dict, turn: dict, store: Any, requests: list[str]) -> bool:
+        """Recognize a proved outcome work call, never a caller or owner action."""
+        if (self.config.get('work_selection_policy') != 'outcomes.v1'
+                or turn.get('origin') in {'caller', 'professional'}):
+            return False
+        directory = Path(turn['reply']).parent
+        budget = str(directory / 'decision_budget.json')
+        if not store.exists(budget):
+            return False
+        binding = store.read_json(budget)
+        if binding.get('tool_admission') != 'work_selection.v1':
+            return False
+        raw = store.read_json(str(directory / 'work_choice.json'))
+        expected = self.selection.interpret(raw, binding, requests)
+        if binding.get('selection_error') or call not in expected['tool_calls']:
+            raise ValueError('Work service differs from its admitted original choice')
+        return self.selection.decode(raw, 'outcomes.v1').decision == 'work'
+
+    def service_result_error(self, spec: CommonToolSpec, data: dict, *, selected_work: bool) -> str:
+        completion = spec.completion
+        if (selected_work and completion is not None and completion.kind != 'question'
+                and (not completion.field or data.get(completion.field) is not None)):
+            return 'Selected work returned an unsolicited completion claim; actual output is retained without review or delivery.'
         return ''
 
     def presentation(self, selected: set[str], mode: str):
