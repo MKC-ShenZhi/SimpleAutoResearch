@@ -3742,6 +3742,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.app = ToolApplication.create(self.root, 'Prepare reusable source only; preserve useful partial files if interrupted.',
             model='profile:offline', sources={'measurements':self.inputs}, allow_execution=True,
             max_turns=30, max_tokens=900000, max_attempts=100, tool_contracts='on_demand')
+        # Exercise recovery of the saved source-role contract. New ordinary
+        # intake no longer creates that role or its paired handoff operations.
+        self.app.state['config']['professional_operations'] = 'work.v11'
+        self.app.state['config'].pop('process_artifact_paths', None)
+        self.app._save()
+        self.app = ToolApplication.load(self.root)
         self._submit(_action('prepare_implementation', goal='Retain the supplied conditions and an editable account.',
             material_roots=['measurements'], execution_requested=False))
         self._read('measurements/conditions.txt')
