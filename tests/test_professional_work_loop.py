@@ -3828,6 +3828,18 @@ class OperationsWorkLoopTests(unittest.TestCase):
             return result
 
         self.send.side_effect = omit_reasoning_once
+        review = self.review
+        original_requested = []
+
+        def inspect_original(view):
+            if not original_requested:
+                original_requested.append(True)
+                self.assertIn('copy_project', {row['function']['name']
+                    for row in self.inspection_requests[-1]['tools']})
+                return [_action('read_file', path='measurements/observations.csv')]
+            return review(view)
+
+        self.review = inspect_original
 
         def source_services():
             self.assertEqual(self.app._coordinator_purpose(), 'code')
