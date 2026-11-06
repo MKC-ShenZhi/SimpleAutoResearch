@@ -117,6 +117,7 @@ class OutcomeQueueTests(unittest.TestCase):
         # This suite exercises the saved outcome interpreter, not new defaults.
         case.app.state['config'].update(work_selection_policy='outcomes.v1',
             work_lifecycle='integrated.v2', inspection_execution_protocol='shared.v1')
+        case.app._save()
         case._reload()
         self.assertEqual(case.app.state['config']['work_selection_policy'], 'outcomes.v1')
         self.assertEqual(case.app.state['config']['work_lifecycle'], 'integrated.v2')

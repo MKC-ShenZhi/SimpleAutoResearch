@@ -54,6 +54,7 @@ def rogue(arguments, services):
         # to native work units. Native service consumers have their own chain test.
         self.case.app.state['config'].update(work_selection_policy='outcomes.v1',
             work_lifecycle='integrated.v2', inspection_execution_protocol='shared.v1')
+        self.case.app._save()
         self.case._reload()
         self.assertEqual(self.case.app.state['config']['work_selection_policy'], 'outcomes.v1')
         (self.case.app.workspace.workspace / 'existing.txt').write_text('Retained bounded note.\n', encoding='utf-8')

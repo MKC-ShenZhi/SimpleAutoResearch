@@ -1,5 +1,6 @@
 """Inspection returns on the shared ledger before spending the caller's repair work."""
 from copy import deepcopy
+import hashlib
 import json
 from types import SimpleNamespace
 import unittest
@@ -122,10 +123,17 @@ class RevisionInspectionFlowTests(unittest.TestCase):
         def review(view):
             old_claim = (case.root/'workspace/note.md').read_text().startswith('The population')
             offered = {row['function']['name'] for row in case.inspection_requests[-1]['tools']}
+            opinion = case._review_complete_targets(view)
+            if isinstance(opinion, list):
+                if offered == {'record_inspection'}:
+                    return {'conclusion': 'incomplete', 'findings': [], 'evidence': [],
+                        'limitations': ['Necessary current note bytes remain unread at the opinion boundary.']}
+                # Read the actual current note before making a claim about it;
+                # the source boundary belongs to the same useful observation.
+                return [*opinion, *([_action('read_file', path='measurements/conditions.txt')]
+                    if old_claim else [])]
             if old_claim and offered != {'record_inspection'}:
                 return [_action('read_file', path='measurements/conditions.txt')]
-            opinion = case._review_complete_targets(view)
-            self.assertIsInstance(opinion, dict)
             if old_claim:
                 opinion.update(conclusion='incomplete', investigations=[{
                     'claim': 'These supplied observations characterize the population.',
@@ -149,9 +157,11 @@ class RevisionInspectionFlowTests(unittest.TestCase):
         self.assertGreaterEqual(case.app.ledger.remaining('llm_requests'), 4)
         case._reload()
         case.decisions.append(_action('edit_file', path='note.md',
+            expected_sha256=hashlib.sha256((case.root/'workspace/note.md').read_bytes()).hexdigest(),
             old_text='The population is characterized.', new_text='Only supplied observations are characterized.'))
         case._run(should_stop=lambda: not case.decisions and case.app.state['pending'] is None
             and not any(turn['remaining'] for turn in case.app.state['turns']))
+        case._ok('edit_file')
         remaining = case.app.ledger.remaining('llm_requests')
         self.assertLess(remaining, 4)  # Another candidate cycle cannot fit now.
         case._reload()
@@ -211,9 +221,11 @@ class RevisionInspectionFlowTests(unittest.TestCase):
         self.assertEqual(case.app.ledger.to_dict(), before)
 
         case.decisions.append(_action('edit_file', path='note.md',
+            expected_sha256=hashlib.sha256((case.root/'workspace/note.md').read_bytes()).hexdigest(),
             old_text='The population is characterized.', new_text='Only supplied observations are characterized.'))
         case._run(should_stop=lambda: not case.decisions and case.app.state['pending'] is None
             and not any(turn['remaining'] for turn in case.app.state['turns']))
+        case._ok('edit_file')
         self.assertEqual((case.root/'workspace/note.md').read_text(), 'Only supplied observations are characterized.\n')
         case._submit(_action('deliver_result', summary='Useful revised observations', artifacts=['note.md'],
             unresolved=['Independent acceptance remains unfinished within the remaining resources.']))

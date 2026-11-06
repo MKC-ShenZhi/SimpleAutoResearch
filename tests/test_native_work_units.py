@@ -131,6 +131,7 @@ class NativeServiceTests(unittest.TestCase):
         self.case = self.old.case
         self.case.app.state['config'].update(work_selection_policy='native.v4',
             work_lifecycle='integrated.v3', inspection_execution_protocol='shared.v2')
+        self.case.app._save()
         self.case._reload()
 
     def test_native_schema_and_dispatch_keep_completion_with_task_owner(self):
