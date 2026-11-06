@@ -2,6 +2,7 @@
 from copy import deepcopy
 import hashlib
 import json
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
@@ -132,8 +133,6 @@ class RevisionInspectionFlowTests(unittest.TestCase):
                 # the source boundary belongs to the same useful observation.
                 return [*opinion, *([_action('read_file', path='measurements/conditions.txt')]
                     if old_claim else [])]
-            if old_claim and offered != {'record_inspection'}:
-                return [_action('read_file', path='measurements/conditions.txt')]
             if old_claim:
                 opinion.update(conclusion='incomplete', investigations=[{
                     'claim': 'These supplied observations characterize the population.',
@@ -154,6 +153,10 @@ class RevisionInspectionFlowTests(unittest.TestCase):
         case._not_delivered()
         assessment = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
         self.assertEqual(assessment['verdict'], 'needs_revision')
+        # The checker returns as soon as the actual contradiction is observed;
+        # it has not consumed the investigation until only an opinion fits.
+        self.assertIn('read_file', {row['function']['name']
+            for row in case.inspection_requests[-1]['tools']})
         self.assertGreaterEqual(case.app.ledger.remaining('llm_requests'), 4)
         case._reload()
         case.decisions.append(_action('edit_file', path='note.md',
@@ -162,12 +165,16 @@ class RevisionInspectionFlowTests(unittest.TestCase):
         case._run(should_stop=lambda: not case.decisions and case.app.state['pending'] is None
             and not any(turn['remaining'] for turn in case.app.state['turns']))
         case._ok('edit_file')
-        remaining = case.app.ledger.remaining('llm_requests')
-        self.assertLess(remaining, 4)  # Another candidate cycle cannot fit now.
+        revised_sha = hashlib.sha256((case.root/'workspace/note.md').read_bytes()).hexdigest()
+        self.assertEqual(case._ok('edit_file')['data']['sha256'], revised_sha)
+        initial_checks = len(case.inspection_requests)
         case._reload()
         case.decisions.append(_action('deliver_result', **claim))
         case._run(should_stop=lambda: False)
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertGreater(len(case.inspection_requests), initial_checks)
+        final_review = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+        self.assertEqual(final_review['binding']['artifacts'][str(case.root/'workspace/note.md')], revised_sha)
         self.assertEqual((case.root/'workspace/note.md').read_text(), 'Only supplied observations are characterized.\n')
         self.assertEqual((case.inputs/'conditions.txt').read_bytes(), source)
         self.assertFalse(case._process_receipts())
@@ -175,34 +182,56 @@ class RevisionInspectionFlowTests(unittest.TestCase):
         self.assertEqual(case.app.ledger.limits['llm_requests'], 8)
 
     def test_incomplete_review_returns_capacity_for_an_actual_revision_and_truthful_exit(self):
+        from simple_ar.app.tool_application import ToolApplication
         from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
         case = OperationsWorkLoopTests()
         case.setUp()
         self.addCleanup(case.doCleanups)
-        case._create(delivery_protocol=None, current_method=True, selection_policy='native.v3',
-            professional_contract='work.v12', goal='Prepare a bounded note from the supplied observations.')
+        case.app = ToolApplication.create(case.root, 'Prepare a bounded note from the supplied observations.',
+            model='fixture', sources={'measurements': case.inputs}, services=case.services,
+            allow_execution=True, max_turns=8, max_tokens=900000, tool_contracts='on_demand')
+        self.assertEqual(case.app.state['config']['work_selection_policy'], 'native.v4')
+        self.assertEqual(case.app.state['config']['work_lifecycle'], 'integrated.v3')
         case._write('note.md', 'The population is characterized.\n')
         owner = case.app.operations.inspection
-        owner.execution_protocol, owner.work_lifecycle = 'shared.v2', 'integrated.v3'
-        case.app.ledger.limits['llm_requests'] = 8
         original_ledger = deepcopy(case.app.ledger.to_dict()['entries'])
-        conversation = ProfessionalConversation(case.app._client())
-        decision = conversation.request_resources(ConversationInput(
-            case.app._messages(client=case.app._client()), case.app.schemas, {}))
-        stages = {'revision': decision, 'submission': decision,
-            'reinspection': decision, 'fallback': decision}
-        floor = conversation.resource_floor(stages)
+        probe = {}
 
         def constrained_review(view):
-            offered = {row['function']['name'] for row in case.inspection_requests[-1]['tools']}
+            functions = {row['function']['name']: row['function']
+                for row in case.inspection_requests[-1]['tools']}
+            offered = set(functions)
             if offered != {'record_inspection'}:
+                if not probe:
+                    description = functions['run_process']['parameters']['properties']['cwd']['description']
+                    scope = description.split('workspace/inspection-work/', 1)[1].split('/', 1)[0]
+                    probe['work'] = 'workspace/inspection-work/' + scope
+                    program = "from pathlib import Path\np=Path('count.txt')\np.write_text((p.read_text() if p.exists() else '')+'run\\n')\n"
+                    return [_action('write_file', path=probe['work']+'/probe.py', content=program),
+                        _action('run_process', argv=[sys.executable, 'probe.py'], cwd=probe['work'],
+                            inputs=[probe['work']+'/probe.py'], outputs=[probe['work']+'/count.txt']),
+                        _action('read_file', path='measurements/conditions.txt')]
                 return [_action('read_file', path='measurements/conditions.txt')]
             return {'conclusion': 'incomplete', 'findings': [], 'evidence': [],
                 'limitations': ['Necessary investigation remains; return for production within shared resources.']}
 
         case.review = constrained_review
-        with case.app.ledger.protect_remaining(floor):
-            case._submit(_action('review_result', summary='Bounded note candidate', artifacts=['note.md']))
+        case._submit(_action('review_result', summary='Bounded note candidate', artifacts=['note.md']))
+        pending = deepcopy(case.app.state['pending'])
+        self.assertIn('inspection', pending)
+        self.assertEqual(pending['action']['call']['function']['name'], 'run_process')
+        self.assertFalse(case.app.workspace.resolve(probe['work']+'/count.txt').exists())
+        floor = case.app._review_floor(case.app._client(pending['inspection']), candidate=True)
+        declared = case.app.operations.delivery.review_continuation(
+            case.app._completion_floor(case.app._client(pending['inspection']), dispatch=True))
+        self.assertEqual(floor, ProfessionalConversation.resource_floor(declared))
+        token = case.app.approval_token(pending['action']['call'])
+        before_approval = case.app.ledger.to_dict()
+        case._reload()
+        self.assertEqual(case.app.ledger.to_dict(), before_approval)
+        self.assertEqual(case.app.approval_token(case.app.state['pending']['action']['call']), token)
+        case._run(approved_execution=token)
+        self.assertEqual(case.app.workspace.resolve(probe['work']+'/count.txt').read_text(), 'run\n')
         case._not_delivered()
         self.assertGreaterEqual(case.app.ledger.remaining('llm_requests'), floor['llm_requests'])
         self.assertGreaterEqual(case.app.ledger.remaining('total_tokens'), floor['total_tokens'])
@@ -212,6 +241,8 @@ class RevisionInspectionFlowTests(unittest.TestCase):
         self.assertEqual(saved['execution_protocol'], 'shared.v2')
         offer = owner.store.read_json(owner._path(inspected['identity'], 'sources-0'))['offer']
         self.assertIn('resource_handoff', json.loads(offer['messages'][1]['content']))
+        self.assertEqual({row['function']['name'] for row in case.inspection_requests[-1]['tools']},
+            {'record_inspection'})
         before = case.app.ledger.to_dict()
         case._reload()
         restored_owner = case.app.operations.inspection
@@ -226,8 +257,12 @@ class RevisionInspectionFlowTests(unittest.TestCase):
         case._run(should_stop=lambda: not case.decisions and case.app.state['pending'] is None
             and not any(turn['remaining'] for turn in case.app.state['turns']))
         case._ok('edit_file')
+        self.assertEqual(case._ok('edit_file')['data']['sha256'],
+            hashlib.sha256((case.root/'workspace/note.md').read_bytes()).hexdigest())
         self.assertEqual((case.root/'workspace/note.md').read_text(), 'Only supplied observations are characterized.\n')
         case._submit(_action('deliver_result', summary='Useful revised observations', artifacts=['note.md'],
             unresolved=['Independent acceptance remains unfinished within the remaining resources.']))
         self.assertEqual(case.app.session.manifest.status, 'partial')
+        self.assertEqual(case.app.workspace.resolve(probe['work']+'/count.txt').read_text(), 'run\n')
+        self.assertEqual(case.app.ledger.limits['llm_requests'], 8)
         self.assertEqual(case.app.ledger.to_dict()['entries'][:len(original_ledger)], original_ledger)

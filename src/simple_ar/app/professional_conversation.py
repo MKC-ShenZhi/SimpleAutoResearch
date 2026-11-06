@@ -136,12 +136,9 @@ def work_unit_messages(messages: list[dict]) -> list[dict]:
                 flush()
                 projected.append(row)
 
-    for message in messages[2:]:
-        closed = decoded(message.get('content')) if message['role'] == 'user' else None
-        if isinstance(closed, dict) and 'closed_journal_observations' in closed:
-            retain(closed['closed_journal_observations'])
-        else:
-            retain([message])
+    # Only roles and call identities define work. User text may itself contain
+    # any JSON keys; it must never be mistaken for an owner-created wrapper.
+    retain(messages[2:])
     flush()
     context.pop('work_plan', None)
     context['recorded_work'] = {'unit_count':count,

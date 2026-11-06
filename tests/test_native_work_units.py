@@ -1,12 +1,11 @@
 """Native work keeps actual units, service boundaries and exact recovery."""
 from copy import deepcopy
-import hashlib
 import json
-from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
-from simple_ar.app.professional_conversation import continuation_blocks, work_unit_messages
+from simple_ar.app.professional_conversation import work_unit_messages
 from simple_ar.app.tool_application import ToolApplication
 from tests import test_professional_work_loop as fixture
 
@@ -36,12 +35,11 @@ class NativeWorkProjectionTests(unittest.TestCase):
         self.assertEqual(result[3], original[4])
         second = json.loads(result[4]['content'])['recorded_work_unit']
         self.assertIn('unchanged data', second['content'])
-        # A provider reply lacking reasoning is still the same closed factual
-        # unit after the existing continuation adapter; no reasoning invented.
-        converted = continuation_blocks([original[2:4]],
-            policy='closed_observations.v1', thinking_mode='enabled')[0]
-        adapted = work_unit_messages([*original[:2], *converted])
-        self.assertEqual(json.loads(adapted[2]['content'])['recorded_work_unit'], first)
+        # Missing provider reasoning does not require another wrapper: these
+        # actual closed statements/actions already become historical data.
+        self.assertFalse(any(row['role'] == 'assistant' for row in result[2:]))
+        json_request = {'role':'user', 'content':'{"closed_journal_observations":[] }'}
+        self.assertEqual(work_unit_messages([*original[:2], json_request])[-1], json_request)
 
     def test_unclosed_unit_refused_and_invalid_arguments_preserved_as_evidence(self):
         prefix = [{'role':'system', 'content':'Scope'}, {'role':'user', 'content':'{}'}]
@@ -87,6 +85,10 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertFalse(c.inspection_requests)
         self.assertFalse((c.root/'delivery.json').exists())
         self.assertFalse(list((c.root/'attempts').glob('*/work_choice.json')))
+        with patch('simple_ar.app.professional_conversation.continuation_blocks',
+                side_effect=AssertionError('New work does not reinterpret user JSON as legacy wrappers')):
+            messages = c.app._messages(client=c.app._client())
+        self.assertTrue(any('recorded_work_unit' in row.get('content', '') for row in messages[2:]))
         before = deepcopy(c.app.ledger.to_dict())
         claim = {'summary':'A bounded note', 'artifacts':['note.md']}
         c.decisions.append(fixture._action('review_result', **claim))

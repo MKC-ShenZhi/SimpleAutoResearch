@@ -3787,9 +3787,10 @@ class ToolApplication:
             supplies.append(supplied)
             if turn.get('origin') == 'caller' or not complete:
                 boundary = max(boundary, position + 1)
-        from simple_ar.app.professional_conversation import continuation_blocks
-        blocks = continuation_blocks(blocks, policy=config.get('native_history_policy'),
-            thinking_mode=getattr(client._settings, 'thinking_mode', ''))
+        if config.get('work_selection_policy') != 'native.v4':
+            from simple_ar.app.professional_conversation import continuation_blocks
+            blocks = continuation_blocks(blocks, policy=config.get('native_history_policy'),
+                thinking_mode=getattr(client._settings, 'thinking_mode', ''))
         if self.operations is not None and self._unacted_reply_count():
             blocks[-1].append({'role':'system','content':
                 'The preceding assistant text did not execute an operation or record delivery. '
@@ -5980,7 +5981,8 @@ class ToolApplication:
         try:
             direct = pending['call']['function']['name'] == 'inspect_artifacts'
             floor = ({} if direct and (self._terminal_batch() or self._caller_takeover())
-                else self._completion_floor(self._client(scope), dispatch=True))
+                else self._review_floor(self._client(scope), candidate=not direct
+                    and self._completion(pending['call']['function']['name']).kind == 'review'))
             with self.ledger.protect_remaining(floor):
                 final = self.operations.inspection.advance(scope, dispatch)
             opinion = dispatch('opinion', 'final-opinion', None,
