@@ -33,8 +33,9 @@ class DeliveryVersionTests(unittest.TestCase):
         from simple_ar.app.reuse import select_reuse
         selection = select_reuse(self.root, ['artifacts'], version=1)
         self.assertFalse(selection.materials)
-        from simple_ar.cli.start import native_arguments, migrate_new_start, native_creation_options
-        args = native_arguments()
+        from simple_ar.cli.start import migrate_new_start, native_creation_options
+        from simple_ar.cli.parser import build_parser
+        args = build_parser().parse_args(['start'])
         args.model = ''
         args.request, args.from_session, args.reuse = 'Continue from the retained formal version', self.root, ['artifacts']
         args.reuse_version, args.max_turns, args.max_tokens = 1, 3, 12345
