@@ -1605,8 +1605,8 @@ class StartTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "No current reusable"):
                 self.prepare("--from-session", str(session.store.root), "--reuse", "data_analysis",
                     "--goal", "Explain", "--prepare-only")
-            # Native deliveries use the same mounted path rule, but resume the
-            # saved tool task rather than manufacturing a legacy writing task.
+            # Native portable deliveries freeze the selected retained version;
+            # old source paths and execution authority are not mounted anew.
             from simple_ar.app.tool_application import ToolApplication
             from simple_ar.cli.main import main
             app = ToolApplication.create(root / "native", "Reuse results", model=None, sources={},
@@ -1627,12 +1627,18 @@ class StartTests(unittest.TestCase):
                     main(argv)
                 adapted = run.call_args.args[0]
                 self.assertEqual(adapted.kind, preference)
-                self.assertIn(native.store.root / 'workspace/note.md', adapted.source)
+                self.assertFalse(adapted.source)
                 self.assertEqual(adapted.request,
                     'Use the saved observations to prepare the requested source and explanation')
                 self.assertEqual(adapted._creation_declarations['reuse_origin'], {
-                    'session': str(native.store.root.resolve()), 'results': ['artifacts'], 'prior_drafts': []})
+                    'session': str(native.store.root.resolve()), 'results': ['artifacts'],
+                    'version': 1, 'prior_drafts': []})
                 self.assertFalse(adapted.allow_execution)
+            from simple_ar.tools.delivery_versions import DeliveryVersions
+            selected, inputs = DeliveryVersions(native.store.root).snapshot(1, ['artifacts'],
+                max_bytes=100000, working_context=True)
+            self.assertEqual(dict(inputs)['workspace/note.md'], b'Saved results, not new measurements.')
+            self.assertEqual(selected['results'], ['artifacts'])
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 main(["results", str(native.store.root)])

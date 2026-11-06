@@ -343,7 +343,13 @@ class LocalWorkspaceTests(unittest.TestCase):
             with patch.object(ToolApplication, 'load', side_effect=AssertionError('No executable assembly')):
                 reuse_session_materials(args, native=True,
                     access=ReuseAccess(authorize=workspace.read, preflight=workspace.material_grants))
-            self.assertEqual(set(args.material), {denied, log})
+            self.assertFalse(args.material)
+            self.assertEqual(args._reuse_origin, {'session': str(root), 'results': ['artifacts'], 'version': 1})
+            from simple_ar.tools.delivery_versions import DeliveryVersions
+            selected, inputs = DeliveryVersions(root, authorize=workspace.read).snapshot(1, ['artifacts'],
+                max_bytes=100000, working_context=True)
+            self.assertEqual(dict(inputs), {'workspace/report.txt': denied.read_bytes(),
+                'workspace/execution.log': log.read_bytes()})
             # The actual UI configuration entry wires the same admission into
             # migration, despite missing historical sources and extensions.
             config = tasks / 'reuse.toml'
@@ -357,7 +363,8 @@ class LocalWorkspaceTests(unittest.TestCase):
                     patch.object(workspace, 'validate_sources', side_effect=AssertionError('No old dependencies')), \
                     patch.object(ToolApplication, 'load', side_effect=AssertionError('No executable assembly')):
                 migrated, _ = workspace.creation_inputs({'task_config': str(config)})
-            self.assertEqual(set(migrated.source), {denied, log})
+            self.assertFalse(migrated.source)
+            self.assertEqual(migrated._creation_declarations['reuse_origin']['version'], 1)
             self.assertIsNone(migrated.from_session)
 
     def test_browser_drafts_are_task_scoped_and_dispatch_is_never_replayed(self):
