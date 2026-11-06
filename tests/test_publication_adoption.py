@@ -152,7 +152,10 @@ class PublicationAdoptionTests(unittest.TestCase):
             path='old.pdf'))
         self.case._ok('copy_file')
         source = self.case.app.workspace.resolve('report.md')
-        source.write_text(source.read_text(encoding='utf-8') + '\nCurrent revision.\n', encoding='utf-8')
+        version = self.case._read('report.md')['sha256']
+        self.case._submit(fixture._action('write_file', path='report.md', expected_sha256=version,
+            content=source.read_text(encoding='utf-8') + '\nCurrent revision.\n'))
+        self.case._ok('write_file')
         self.publish()
         self.case._write('attachment.pdf', '%PDF unrelated attachment')
         owner = PublicationToolGateway(self.case.root, self.case.app.workspace, self.case.app.ledger,

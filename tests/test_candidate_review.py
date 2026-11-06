@@ -46,6 +46,11 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertEqual(binding['requests'], self.requests)
         self.assertFalse((self.root/'delivery.json').exists())
         self.observations.append({'tool_name':'review_result','status':'ok',
+            'data':deepcopy(self.claim),'metadata':{}})
+        pending = self.owner.lifecycle_requirements()
+        self.assertIn('export_report', pending['next_tools'])
+        self.assertIn('publication', {row['kind'] for row in pending['conditions']})
+        self.observations.append({'tool_name':'review_result','status':'ok',
             'data':deepcopy(self.claim),'metadata':{'delivery_review':proof}})
         recovered = self.owner.review_delivery(self.claim, 'early', may_start=False, candidate=True)
         self.assertEqual(recovered, proof)
@@ -82,3 +87,45 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertEqual(status['minimum_resources']['llm_requests'],1)
         self.assertIn('review_result',status['next_tools'])
         self.assertFalse((self.root/'delivery.json').exists())
+
+
+class IntegratedCandidateFlowTests(unittest.TestCase):
+    def test_fresh_candidate_revision_final_opinion_reuse_and_feedback_reload(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
+        case = OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.app = ToolApplication.create(case.root,
+            'Explain the supplied observations in editable Markdown, preserving originals.',
+            model='fixture', sources={'measurements':case.inputs}, services=case.services,
+            max_turns=30, max_tokens=900000, max_attempts=100, tool_contracts='on_demand')
+        case._write('note.md', 'Three supplied observations: 1, 2, and 3.\n')
+        candidate = {'summary':'Candidate explanation', 'artifacts':['note.md'],
+            'unresolved':['Interpretation still needs revision.']}
+        case._submit(_action('review_result', **candidate))
+        proof = case._ok('review_result', reviewed=True)['metadata']['delivery_review']
+        self.assertEqual(proof['binding']['purpose'], 'candidate')
+        case._not_delivered()
+        original_input = (case.root/'tools/inspection'/proof['identity']/'input.json').read_bytes()
+        case._reload()
+        case._write('final.md', 'Three supplied observations: 1, 2, and 3. No population inference.\n')
+        final = {'summary':'Explanation with evidence limits', 'artifacts':['final.md']}
+        case._submit(_action('review_result', **final))
+        ready = case._ok('review_result', reviewed=True)['metadata']['delivery_review']
+        self.assertNotIn('purpose', ready['binding'])
+        inspected = len(case.inspection_requests)
+        case._submit(_action('deliver_result', **final))
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertEqual(len(case.inspection_requests), inspected)
+        before = case.app.ledger.to_dict()
+        case._reload()
+        case._run()
+        self.assertEqual(case.app.ledger.to_dict(), before)
+        case.decisions.extend([_action('write_file', path='feedback.md',
+            content='Three supplied observations. No population inference; no sampling design.'),
+            _action('deliver_result', summary='Clarified evidence limits', artifacts=['feedback.md'])])
+        case._run(feedback='Clarify that there was no sampling design; retain the prior explanation.')
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertEqual((case.root/'tools/inspection'/proof['identity']/'input.json').read_bytes(), original_input)
+        self.assertTrue((case.root/'workspace/final.md').exists())

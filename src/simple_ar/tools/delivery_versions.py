@@ -30,6 +30,17 @@ class DeliveryVersions:
         return resolve_mounted_path({'workspace': self.root}, relative, discovery=True,
             authorize=self.reader.admit)
 
+    def _has_record(self, relative: str) -> bool:
+        """Admit optional history before checking whether it actually exists.
+
+        Scoped UI readers can require an existing path during admission. Only
+        absence is optional; access denials and unsafe paths still propagate.
+        """
+        try:
+            return self._path(relative).is_file()
+        except FileNotFoundError:
+            return False
+
     @staticmethod
     def _receipt(record: str) -> str:
         if not _OBSERVATION.fullmatch(record):
@@ -273,8 +284,10 @@ class DeliveryVersions:
                     # Access failures must escape optional proof validation;
                     # otherwise an unscoped later creation could import what
                     # this UI preview was forbidden to inspect.
-                    for name in ('attempt_manifest.json', 'capability_result.json', 'action.json'):
-                        self._path(prefix + '/' + name)
+                    if not all([self._has_record(prefix + '/' + name)
+                            for name in ('attempt_manifest.json', 'capability_result.json')]):
+                        continue  # Unregistered old reads remain ordinary retained bytes.
+                    self._has_record(prefix + '/action.json')
                     try:
                         # Byte equality alone cannot turn an edited journal
                         # result into an original accepted observation.
@@ -283,7 +296,7 @@ class DeliveryVersions:
                                 self.reader.record(prefix + '/' + name)
                             action = prefix + '/action.json'
                             seen = set()
-                            while self._path(action).is_file():
+                            while self._has_record(action):
                                 binding = self.reader.record(action)
                                 previous = binding.get('recovered_from')
                                 if previous is None:
@@ -313,14 +326,16 @@ class DeliveryVersions:
             # Knowledge remains an original model claim. It is not adopted as
             # a checkpoint in the new task or allowed to retire its journal.
             snapshot = str(PurePosixPath(turn['reply']).parent / 'memory_snapshot.json')
-            if self._path(snapshot).is_file():
+            if self._has_record(snapshot):
                 eligible = []
                 prefix = str(PurePosixPath(snapshot).parent)
-                for name in ('attempt_manifest.json', 'capability_result.json',
-                        'memory_input.json', 'memory_response.json'):
-                    self._path(prefix + '/' + name)
-                self.reader.admit(self.root / 'budget_ledger.json')
+                proof_complete = all([self._has_record(prefix + '/' + name)
+                    for name in ('attempt_manifest.json', 'capability_result.json',
+                        'memory_input.json', 'memory_response.json')])
+                proof_complete = self._has_record('budget_ledger.json') and proof_complete
                 try:
+                    if not proof_complete:
+                        raise FileNotFoundError('Optional historical checkpoint proof is incomplete')
                     from simple_ar.app.work_memory import _bound_response, checkpoint_entries
                     from simple_ar.core.budget import BudgetLedger
                     manifest = self.reader.record(prefix + '/attempt_manifest.json')

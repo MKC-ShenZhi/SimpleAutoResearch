@@ -176,7 +176,9 @@ class Delivery:
             conditions.extend({'kind': 'unfinished_work', 'message': text} for text in proposal.unresolved)
             try:
                 resolved = self.workspace.resolve_delivery(proposal)
-                publication = operation_report_publication(proposal, resolved['artifacts'],
+                # Unfinished work can be inspected before publication. It must
+                # not hide the remaining publication owner from planning.
+                publication = operation_report_publication(proposal.model_copy(update={'unresolved': []}), resolved['artifacts'],
                     self.observations(), publication=self.publication)
                 if publication:
                     next_tools.append('export_report')
@@ -276,6 +278,16 @@ class Delivery:
         request = DeliveryRequest.model_validate(delivery)
         if request.unresolved and not candidate:
             return None  # The executor still binds and commits actual partial files.
+        if candidate and not request.unresolved:
+            # A fully eligible claim keeps the normal reusable final binding.
+            # Only unfinished admission needs a distinct early investigation.
+            observations = [*self.observations(), *([current_result] if current_result is not None else [])]
+            try:
+                self.validate_actual(request, observations, current_outputs=current_outputs)
+            except ValueError:
+                pass
+            else:
+                candidate = False
         if not may_start and not candidate and not self.requires_review(request):
             return None  # Historical noncanonical claims had no review binding.
         if may_start:

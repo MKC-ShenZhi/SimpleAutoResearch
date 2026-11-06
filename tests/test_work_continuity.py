@@ -93,6 +93,33 @@ class SelectedWorkContinuityTests(unittest.TestCase):
             select_reuse(root, ['artifacts'], version=1, access=ReuseAccess(authorize=authorize))
         self.assertFalse((self.base / 'fresh').exists())
 
+    def test_scoped_reuse_without_optional_historical_checkpoint_keeps_selected_inputs(self):
+        root = self.app.session.store.root
+        before = {path: path.read_bytes() for path in root.rglob('*.json')}
+        admitted = []
+        def authorize(path):
+            admitted.append(path)
+            return path.resolve(strict=True)
+        selection = select_reuse(root, ['artifacts'], version=1,
+            access=ReuseAccess(authorize=authorize))
+        self.assertEqual(selection.version, 1)
+        self.assertTrue(any(path.name == 'memory_snapshot.json' for path in admitted))
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        fresh = self.fresh()
+        self.assertEqual(fresh._retained_working_inputs()['observations'][0]['text'], 'second\n')
+
+    def test_optional_checkpoint_path_denial_remains_a_grant_failure(self):
+        root = self.app.session.store.root
+        for error in (ValueError, PermissionError):
+            with self.subTest(error=error):
+                def authorize(path):
+                    if path.name == 'memory_snapshot.json':
+                        raise error('Optional checkpoint outside UI grant')
+                    return path
+                with self.assertRaisesRegex(error, 'outside UI grant'):
+                    select_reuse(root, ['artifacts'], version=1, access=ReuseAccess(authorize=authorize))
+        self.assertFalse((self.base / 'fresh').exists())
+
     def test_interrupted_creation_input_is_not_rebuilt_from_the_old_task_on_load(self):
         fresh = self.fresh()
         copied = Path(fresh.state['config']['sources']['retained_delivery']) / 'workspace/selected.txt'
