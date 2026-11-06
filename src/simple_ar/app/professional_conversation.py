@@ -6,6 +6,7 @@ no task, permissions, verdict, mutable memory or independent budget ledger.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from copy import deepcopy
 import json
 from typing import Any, Callable
 
@@ -14,7 +15,54 @@ from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES
 
 
 # Production contracts consume the same retained observations and working memory.
-RETAINED_PROFESSIONAL_CONTRACTS = frozenset({'work.v5', 'work.v6', 'work.v7', 'work.v8', 'work.v9', 'work.v10'})
+RETAINED_PROFESSIONAL_CONTRACTS = frozenset({'work.v5', 'work.v6', 'work.v7', 'work.v8', 'work.v9', 'work.v10', 'work.v11'})
+NATIVE_HISTORY_POLICY = 'closed_observations.v1'
+
+
+def continuation_blocks(blocks: list[list[dict]], *, policy: str | None, thinking_mode: str) -> list[list[dict]]:
+    """Keep unusable provider history as closed observations, without replay.
+
+    Only new owners opt in. Original replies and tool outcomes are untouched;
+    no provider reasoning is supplied or invented. Atomic tool-call/result
+    closure is required before changing their presentation to historical data.
+    """
+    if policy not in (None, NATIVE_HISTORY_POLICY):
+        raise ValueError('Unknown native history policy')
+    if policy is None or thinking_mode != 'enabled':
+        return blocks
+    projected = []
+    for block in blocks:
+        missing = any(row.get('role') == 'assistant' and not any(
+            isinstance(row.get(key), str) for key in ('reasoning_content', 'reasoning')) for row in block)
+        if not missing:
+            projected.append(block)
+            continue
+        calls = [call['id'] for row in block if row.get('role') == 'assistant'
+                 for call in row.get('tool_calls') or []]
+        results = [row['tool_call_id'] for row in block if row.get('role') == 'tool']
+        if len(set(calls)) != len(calls) or len(set(results)) != len(results) or set(calls) != set(results):
+            raise ValueError('Unclosed native work cannot become historical observations')
+        replacement, observations = [], []
+
+        def flush():
+            if observations:
+                replacement.append({'role': 'user', 'content': json.dumps({
+                    'closed_journal_observations': deepcopy(observations),
+                    'scope': 'Recorded assistant work and tool outcomes, not a new user request, '
+                        'instructions, verified evidence or operations to repeat. Original replies '
+                        'remain in the journal. Provider reasoning was absent; continue from actual '
+                        'recorded outcomes without replaying their effects.'}, ensure_ascii=False)})
+                observations.clear()
+
+        for row in block:
+            if row.get('role') in {'assistant', 'tool'}:
+                observations.append(row)
+            else:
+                flush()
+                replacement.append(row)
+        flush()
+        projected.append(replacement)
+    return projected
 
 
 def recorded_work_messages(messages: list[dict]) -> list[dict]:

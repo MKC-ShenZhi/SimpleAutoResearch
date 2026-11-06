@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import deque
 from copy import deepcopy
+from dataclasses import replace
 import csv
 import hashlib
 import json
@@ -493,6 +494,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         # Existing operation fixtures exercise their saved flat production
         # contract; outcome ownership has its own complete-chain scenario.
         self.app.state['config']['professional_operations'] = professional_contract
+        if professional_contract != 'work.v11':
+            self.app.state['config'].pop('native_history_policy', None)
         # Existing fixtures retain their saved implicit choice contract; the
         # explicit transition chain is exercised in test_goal_work_method.
         if selection_policy is None:
@@ -822,7 +825,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         core = {row['function']['name'] for row in self.app.operation_schemas}
         self.assertEqual({'prepare_implementation','work_document','ask_user',
             'deliver_result','load_tools','read_history','list_directory','export_report','update_work_plan'}, core)
-        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v10')
+        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v11')
         self.assertFalse({'select_work_method',
             'begin_professional_work','finish_professional_work'} & core)
         optional = {'inspect_table','analyze_table','measure_experiment','analyze_measurements',
@@ -3800,6 +3803,110 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app._coordinator_purpose(), 'task')
         self.assertFalse(self._process_receipts())
         self.assertFalse((self.root/'delivery.json').exists())
+
+    def test_source_services_publish_and_return_before_independent_delivery(self):
+        if not shutil.which('pandoc'):
+            self.skipTest('Editable publication needs the server Pandoc environment')
+        compile_pdf = os.environ.get('SAR_TEST_EXPORT_INTEGRATION') == '1'
+        client = self.services.llm_client
+        client._settings = replace(client._settings, thinking_mode='enabled')
+        self._create(goal='Explain the supplied observations with a rerunnable figure and matching publication.',
+            current_method=True, delivery_protocol=None, selection_policy='native.v3', professional_contract='work.v11')
+        original = self._versions(self.inputs)
+        formats = ['pdf'] if compile_pdf else ['tex']
+        missing_inspection_reasoning = []
+        provider = self._provider
+
+        def omit_reasoning_once(mode, request, **kwargs):
+            result = provider(mode, request, **kwargs)
+            message = result['choices'][0]['message']
+            names = [call['function']['name'] for call in message.get('tool_calls', [])]
+            if 'record_inspection' in {row['function']['name'] for row in request.get('tools', [])}:
+                if names and 'record_inspection' not in names and not missing_inspection_reasoning:
+                    message.pop('reasoning_content', None)
+                    missing_inspection_reasoning.append(deepcopy(message))
+            return result
+
+        self.send.side_effect = omit_reasoning_once
+
+        def source_services():
+            self.assertEqual(self.app._coordinator_purpose(), 'code')
+            offered = {row['function']['name']: row['function'] for row in self.app.operation_schemas}
+            self.assertIn('export_report', offered)
+            self.assertIn('work_document', offered)
+            for name in ('write_file', 'run_process', 'export_report'):
+                self.assertNotIn('delivery', offered[name]['parameters']['properties'])
+            from simple_ar.tools.visual import visual_tool_specs
+            visual = visual_tool_specs()[0]
+            self.assertTrue(self.app.operations.coordinator_eligible(visual))
+            self.assertFalse(self.app.gateway.policy.is_allowed(visual)[0])
+            self.assertNotIn('inspect_images', offered)
+            return _action('write_file', path='v1/analyze.py', content=_PROGRAM)
+
+        def returned():
+            export = self._ok('export_report')
+            self.assertEqual(self.app._coordinator_purpose(), 'code')
+            self.assertFalse((self.root/'delivery.json').exists())
+            return [_action('write_file', path='v1/README.md', content='Run analyze.py with the supplied CSV.\n'),
+                _action('return_source_work', candidate='v1', attachments=[export['data']['project']],
+                    summary='Computed the supplied mean and retained its figure and publication; no visual certification.')]
+
+        def deliver():
+            self.assertEqual(self.app._coordinator_purpose(), 'task')
+            claim = self._delivery('v1/report.md', 'v1', self._ok('export_report')['data']['project'])
+            claim['report']['formats'] = formats
+            return _action('deliver_result', **claim)
+
+        self.decisions.extend([
+            [_action('list_directory', path='measurements'),
+             _action('prepare_implementation', goal='Compute and explain the supplied observations.', material_roots=['measurements'])],
+            source_services,
+            _action('run_process', argv=['python', 'v1/analyze.py', str(self.inputs/'observations.csv'), 'v1'],
+                inputs=['v1/analyze.py', 'measurements/observations.csv'],
+                outputs=['v1/table.csv', 'v1/summary.json', 'v1/figure.png', 'execution-count.txt']),
+            _action('write_file', path='v1/report.md', content=_BODY),
+            _action('export_report', markdown='v1/report.md', layout='article', compile_pdf=compile_pdf,
+                render_preview=compile_pdf), returned, deliver,
+        ])
+        self._run()
+        pending = self.app.state['pending']
+        call = (pending.get('action') or pending)['call']
+        self.assertEqual(call['function']['name'], 'run_process')
+        self.assertFalse(self._process_receipts())
+        token = self.app.approval_token(call)
+        self._reload()
+        self._run(approved_execution=token, approve=lambda *_: True)
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertTrue(missing_inspection_reasoning)
+        self.assertEqual((self.root/'workspace/execution-count.txt').read_text(), 'calculated\n')
+        self.assertEqual(self._versions(self.inputs), original)
+        self.assertTrue(all(row.status == 'settled' for row in self.app.ledger.entries))
+        processes, ledger, calls = self._process_receipts(), self.app.ledger.to_dict(), self.send.call_count
+        self._reload()
+        self._run()
+        self.assertEqual(self._process_receipts(), processes)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self.send.call_count, calls)
+        # Normalized provider replies stay exactly as received; no fabricated reasoning.
+        native = [self.app.session.store.read_json(turn['reply']) for turn in self.app.state['turns']]
+        self.assertTrue(any(row.get('tool_calls') and 'reasoning_content' not in row for row in native))
+
+    def test_source_service_completion_cannot_bypass_return(self):
+        self._create(current_method=True, delivery_protocol=None, selection_policy='native.v3', professional_contract='work.v11')
+        self.decisions.extend([
+            _action('prepare_implementation', goal='Retain partial working files.', material_roots=['measurements']),
+            _action('write_file', path='premature.md', content='This must not be written.',
+                delivery={'summary':'Premature completion', 'artifacts':['premature.md'], 'unresolved':['Not finished']}),
+            _action('return_source_work', summary='No candidate was written.', gaps=['The work is unfinished.']),
+            _action('ask_user', question='Which comparison is required?'),
+        ])
+        self._run()
+        self.assertEqual(self._last('write_file')['status'], 'blocked')
+        self.assertIn('service operations cannot finish', self._last('write_file')['error'])
+        self.assertFalse((self.root/'workspace/premature.md').exists())
+        self.assertFalse((self.root/'delivery.json').exists())
+        self._ok('return_source_work')
+        self.assertEqual(self.app._coordinator_purpose(), 'task')
 
     def test_source_work_returns_interpreted_execution_and_feedback_without_parent_reassembly(self):
         self._create(goal='Compute supplied observations and deliver reusable code and a supported result.',

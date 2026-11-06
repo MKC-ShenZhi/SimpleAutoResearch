@@ -352,6 +352,7 @@ class InspectionToolGateway:
                  finding_policy: str | None = None,
                  native_supply_policy: str | None = None,
                  context_checkpoint_policy: str | None = None,
+                 native_history_policy: str | None = None,
                  work_method: str | None = None,
                  material_policy: str | None = None,
                  execution_protocol: str | None = None,
@@ -371,6 +372,9 @@ class InspectionToolGateway:
             raise ValueError('Unknown inspection native supply policy')
         if context_checkpoint_policy not in (None, 'economic.v3'):
             raise ValueError('Unknown inspection checkpoint policy')
+        from simple_ar.app.professional_conversation import NATIVE_HISTORY_POLICY
+        if native_history_policy not in (None, NATIVE_HISTORY_POLICY):
+            raise ValueError('Unknown inspection native history policy')
         if context_checkpoint_policy and protocol != 'subjects.v3':
             raise ValueError('Inspection checkpoint policy requires journal continuity')
         if work_method is not None and work_method not in NATIVE_WORK_METHODS or work_method and protocol != 'subjects.v3':
@@ -390,6 +394,7 @@ class InspectionToolGateway:
         self.finding_policy = finding_policy
         self.native_supply_policy = native_supply_policy
         self.context_checkpoint_policy = context_checkpoint_policy
+        self.native_history_policy = native_history_policy
         self.work_method = work_method
         self.material_policy = material_policy
         self.execution_protocol = execution_protocol
@@ -2897,6 +2902,9 @@ class InspectionToolGateway:
             'Full-file hashes are computed by the read owner. Source opinions '
             'and self-reported manifests do not replace actual source versions or scientific reasoning.')
         system = self._system(saved)
+        from simple_ar.app.professional_conversation import continuation_blocks
+        blocks = continuation_blocks(blocks, policy=saved.get('native_history_policy'),
+            thinking_mode=getattr(getattr(client, '_settings', None), 'thinking_mode', ''))
         messages, metadata = select_working_context(
             context_authority=saved.get('context_authority'),
             user_requests=saved.get('user_requests', [request.goal]),system_text=system,
@@ -4453,6 +4461,8 @@ class InspectionToolGateway:
                 saved['inspection_material_policy'] = self.material_policy
             if self.native_supply_policy is not None:
                 saved['native_supply_policy'] = self.native_supply_policy
+            if self.native_history_policy is not None:
+                saved['native_history_policy'] = self.native_history_policy
             if self.coverage_policy is not None:
                 saved['coverage_policy'] = self.coverage_policy
             if self.finding_policy is not None:

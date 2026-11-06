@@ -20,6 +20,26 @@ _action = fixture._action
 
 
 class NativeGoalWorkTests(unittest.TestCase):
+    def test_closed_history_continues_without_replaying_or_forging_provider_reasoning(self):
+        from simple_ar.app.professional_conversation import continuation_blocks, NATIVE_HISTORY_POLICY
+        reply = {'role': 'assistant', 'content': None, 'tool_calls': [{
+            'id': 'known-write', 'type': 'function',
+            'function': {'name': 'write_file', 'arguments': '{"path":"note.md","content":"known"}'}}]}
+        result = {'role': 'tool', 'tool_call_id': 'known-write', 'content': '{"status":"ok","sha256":"bound"}'}
+        feedback = {'role': 'user', 'content': 'Keep the known output and explain its limits.'}
+        valid = {'role': 'assistant', 'content': 'Continue from actual work.', 'reasoning_content': 'Original provider text.'}
+        blocks = [[feedback, reply, result], [valid]]
+        original = deepcopy(blocks)
+        projected = continuation_blocks(blocks, policy=NATIVE_HISTORY_POLICY, thinking_mode='enabled')
+        self.assertEqual(blocks, original)
+        self.assertEqual(projected[0][0], feedback)
+        self.assertEqual(json.loads(projected[0][1]['content'])['closed_journal_observations'], [reply, result])
+        self.assertEqual(projected[1], [valid])
+        self.assertFalse(any(row['role'] in {'assistant', 'tool'} for row in projected[0]))
+        self.assertEqual(continuation_blocks(blocks, policy=None, thinking_mode='enabled'), original)
+        with self.assertRaisesRegex(ValueError, 'Unclosed native work'):
+            continuation_blocks([[reply]], policy=NATIVE_HISTORY_POLICY, thinking_mode='enabled')
+
     def test_native_work_uses_one_queue_through_approval_delivery_and_feedback(self):
         case = fixture.OperationsWorkLoopTests()
         case.setUp()

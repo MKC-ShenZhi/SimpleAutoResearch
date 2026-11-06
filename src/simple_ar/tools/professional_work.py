@@ -69,13 +69,13 @@ class SourceWorkResult(FinishProfessionalWork):
         return self
 
 
-def source_work_specs() -> list[CommonToolSpec]:
+def source_work_specs(*, batch_transition: bool = False) -> list[CommonToolSpec]:
     from simple_ar.tools.implementation import ImplementationPreparationRequest
     schema = ImplementationPreparationRequest.model_json_schema()
     schema['properties']['execution_requested']['description'] = (
         'Whether this source work may propose approved commands. False requests source only; '
         'no execution permission is granted by this field.')
-    return [CommonToolSpec(name='prepare_implementation', domain='professional_work',
+    specs = [CommonToolSpec(name='prepare_implementation', domain='professional_work',
         permission_level='plan', risk_level='low', input_schema=schema,
         description='Perform a coherent source, analysis or figure work unit in the shared task loop. '
             'Supply its goal and authorized materials/project. The next code decisions investigate, '
@@ -89,6 +89,10 @@ def source_work_specs() -> list[CommonToolSpec]:
                 'from source work, or useful partial work with actual gaps. Binds current workspace '
                 'versions and original operation receipts. Does not certify science, independently '
                 'review, deliver the task or turn producer suggestions into user requirements.')]
+    if batch_transition:
+        for spec in specs:
+            spec.description += ' Place this role transition last in its batch; subsequent decisions use the new role.'
+    return specs
 
 
 def professional_work_specs() -> list[CommonToolSpec]:
@@ -112,15 +116,23 @@ class ProfessionalWorkTools:
     def __init__(self, *, root: Path, workspace: Any, observations: Callable[[], list[dict]],
                  user_requests: Callable[[], list[str]], work_context: Callable[[list[str]], dict],
                  material_observations: Callable[[list[str]], list[dict]],
-                 route_validator: Callable[[str], None], source_work: bool = False) -> None:
+                 route_validator: Callable[[str], None], source_work: bool = False,
+                 batch_transition: bool = False) -> None:
         self.root, self.workspace = Path(root), workspace
         self.observations, self.user_requests = observations, user_requests
         self.work_context, self.material_observations = work_context, material_observations
         self.route_validator = route_validator
         self.source_work = source_work
+        self.batch_transition = batch_transition
         self.entry_tool = 'prepare_implementation' if source_work else 'begin_professional_work'
         self.return_tool = 'return_source_work' if source_work else 'finish_professional_work'
         self.scope_tools = frozenset({self.entry_tool, self.return_tool})
+
+    def transition_error(self, call: dict, calls: list[dict]) -> str:
+        if len(calls) == 1 or self.batch_transition and calls[-1]['id'] == call['id']:
+            return ''
+        return ('Place the professional role transition last in its batch.' if self.batch_transition else
+            'Begin or return professional work alone so the next native decision uses the correct route.')
 
     def _store(self, identity: str) -> ArtifactStore:
         return ArtifactStore(self.root / 'attempts' / identity)

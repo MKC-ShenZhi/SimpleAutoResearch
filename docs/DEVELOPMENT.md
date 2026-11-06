@@ -73,6 +73,12 @@ Source producers use the common workspace copy and edit operations; copied bytes
 do not count as a content inspection. Their detailed source operations stay in the
 journal while coordination receives the returned versions, interpretation and gaps.
 The shared history reader and optional-tool discovery remain available inside source work.
+New source roles may use authorized document, publication and visual services, while their
+optional task-delivery fields are excluded from both the offer and action admission.
+Role transitions finish a batch; independent inspection uses its own writable work directory.
+When a received reply cannot be continued as native thinking history, new conversations
+present its closed actions and outcomes as historical observations. They retain the original
+reply and effects without fabricating reasoning or replaying tools; old saved contracts stay unchanged.
 Assignments and check recipes are revisable working choices, not new user requirements.
 Saved source generators retain their original execution and recovery behavior.
 Read-only directory navigation remains available for routing work; it is not source

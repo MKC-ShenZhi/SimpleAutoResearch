@@ -439,6 +439,9 @@ class ToolApplication:
             raise ValueError('Unsupported saved operation context; no silent migration')
         if config.get('context_authority') not in (None, 'sources.v1'):
             raise ValueError('Unsupported saved context authority; no silent migration')
+        from simple_ar.app.professional_conversation import NATIVE_HISTORY_POLICY
+        if config.get('native_history_policy') not in (None, NATIVE_HISTORY_POLICY):
+            raise ValueError('Unsupported saved native history policy')
         if config.get('memory_protocol') not in {None, 'journal.v1'}:
             raise ValueError('Unsupported saved working memory; no silent migration')
         if config.get('native_supply_policy') is not None and config['native_supply_policy'] not in RECEIPT_SUPPLY_POLICIES:
@@ -785,6 +788,7 @@ class ToolApplication:
         schemas = json.loads(json.dumps(export_openai_tool_schemas(
             self.gateway.registry, read_only_only=False, policy=self.gateway.policy, names=active)))
         if self.operations is not None:
+            schemas = self.operations.service_schemas(schemas)
             return [{**row, 'function': {**row['function'],
                 'parameters': compact_json_schema(row['function']['parameters'])}} for row in schemas
                 if not (getattr(self.operations, 'selection', None)
@@ -1867,6 +1871,8 @@ class ToolApplication:
             if config['work_method'] == GOAL_WORK_METHOD:
                 if config['model'] is not None:
                     config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
+                    from simple_ar.app.professional_conversation import NATIVE_HISTORY_POLICY
+                    config['native_history_policy'] = NATIVE_HISTORY_POLICY
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = 'native.v3'
         return config, reused, limits, attempts
@@ -2664,6 +2670,13 @@ class ToolApplication:
                 ImplementationWorkRequest.model_validate_json(call['function']['arguments'])
             except ValueError as exc:
                 error = f'Implementation work accepts an outcome and roots, not an expert input recipe. No operation executed: {exc}'
+        if not error and self.operations is not None:
+            try:
+                arguments = json.loads(call['function']['arguments'])
+                if isinstance(arguments, dict):
+                    error = self.operations.service_error(self.gateway.registry.get(name), arguments)
+            except (ValueError, TypeError):
+                pass  # Ordinary argument admission retains its original diagnostics.
         return (ToolResult(tool_name=call['function']['name'], status='blocked', error=error,
             data={'executed': False}, metadata={'admission': contract, 'dispatched': False})
             if error else None)
@@ -3610,6 +3623,9 @@ class ToolApplication:
             supplies.append(supplied)
             if turn.get('origin') == 'caller' or not complete:
                 boundary = max(boundary, position + 1)
+        from simple_ar.app.professional_conversation import continuation_blocks
+        blocks = continuation_blocks(blocks, policy=config.get('native_history_policy'),
+            thinking_mode=getattr(client._settings, 'thinking_mode', ''))
         if self.operations is not None and self._unacted_reply_count():
             blocks[-1].append({'role':'system','content':
                 'The preceding assistant text did not execute an operation or record delivery. '
@@ -4227,9 +4243,10 @@ class ToolApplication:
                     error=terminal_error, data={'executed': False})
             elif (self.operations is not None and self.operations.work is not None
                     and call['function']['name'] in self.operations.work.scope_tools
-                    and len(self.session.store.read_json(self.state['turns'][-1]['reply']).get('tool_calls', [])) != 1):
+                    and (reason := self.operations.work.transition_error(call,
+                        self.session.store.read_json(self.state['turns'][-1]['reply']).get('tool_calls', [])))):
                 result = ToolResult(tool_name=call['function']['name'], status='blocked',
-                    error='Begin or return professional work alone so the next native decision uses the correct route.',
+                    error=reason,
                     data={'executed': False})
             elif (self.operations is not None and self.operations.work is not None
                     and (reason := self.operations.work.protect_prior(call['function']['name'], arguments))):

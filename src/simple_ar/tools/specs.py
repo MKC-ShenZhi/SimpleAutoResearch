@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from copy import deepcopy
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -111,6 +112,21 @@ class CommonToolSpec(BaseModel):
         if self.input_schema:
             return self.input_schema
         return {"type": "object", "properties": {}, "additionalProperties": False}
+
+    def service_parameters_schema(self) -> dict[str, Any] | None:
+        """Expose an operation without its optional task-completion effect.
+
+        A required or whole-object completion is not a separable service.
+        Owners must also reject completion arguments at dispatch; presentation
+        never grants authority and the registered contract remains unchanged.
+        """
+        schema = deepcopy(self.parameters_schema())
+        completion = self.completion
+        if completion is not None:
+            if not completion.field or completion.field in schema.get('required', []):
+                return None
+            schema.get('properties', {}).pop(completion.field, None)
+        return schema
 
 
 class ToolCall(BaseModel):
