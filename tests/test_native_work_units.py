@@ -143,8 +143,8 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertTrue((project/'main.pdf').read_bytes().startswith(b'%PDF'))
         self.assertFalse(c.inspection_requests)
         self.assertFalse((c.root/'delivery.json').exists())
-        claim = {'summary':'A bounded typeset note', 'artifacts':exported['artifacts'],
-            'report':{'status':'prepared','manuscript':'note.md','formats':['pdf']}}
+        claim = {'summary':'A bounded typeset note', 'artifacts':['note.md', *exported['artifacts']],
+            'report':{'status':'candidate','manuscript':'note.md','formats':['pdf']}}
         c.decisions.append(fixture._action('deliver_result', **claim))
         self.drain()
         self.assertEqual(c.app.session.manifest.status, 'completed', c.app.result_snapshot())
