@@ -504,6 +504,8 @@ class OperationTools:
                 and self._source_scope() is not None else None)
 
     def _coordinator_eligible(self, spec: CommonToolSpec, scope: dict | None) -> bool:
+        if self.config.get('work_selection_policy') == 'native.v4' and spec.name == 'update_work_plan':
+            return False  # New work uses its actual unit and journal, not the saved agenda controller.
         contract = self.config.get('professional_operations')
         if contract in SOURCE_WORK_CONTRACTS:
             if scope is not None:

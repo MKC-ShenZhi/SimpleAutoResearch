@@ -1,6 +1,8 @@
 """Native work keeps actual units, service boundaries and exact recovery."""
 from copy import deepcopy
 import json
+import os
+import shutil
 import sys
 import unittest
 from unittest.mock import patch
@@ -74,6 +76,8 @@ class NativeWorkQueueTests(unittest.TestCase):
         c = self.case
         self.assertIsNone(c.app.operations.selection)
         self.assertNotIn('select_work', {row['function']['name'] for row in c.app.schemas})
+        self.assertNotIn('update_work_plan', {row['function']['name'] for row in c.app.schemas})
+        self.assertNotIn('update_work_plan', c.app._specialist_catalog())
         program = "from pathlib import Path;p=Path('runs.txt');p.write_text((p.read_text() if p.exists() else '')+'run\\n')"
         c.decisions.append([fixture._action('write_file', path='note.md', content='Three observations.\n'),
             fixture._action('run_process', argv=[sys.executable,'-c',program], outputs=['runs.txt'])])
@@ -122,6 +126,35 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.drain()
         self.assertEqual(c.app.session.manifest.status, 'completed', c.app.result_snapshot())
         self.assertEqual(c.app.state['turns'][0]['tools'], receipts)
+
+    @unittest.skipUnless(os.environ.get('SAR_TEST_EXPORT_INTEGRATION') == '1',
+        'Real PDF compilation runs in the server publication integration phase')
+    def test_native_publication_is_a_service_before_checked_same_version_delivery(self):
+        if not all(shutil.which(name) for name in ('pandoc', 'pdflatex', 'bibtex')):
+            self.skipTest('Publication integration needs the server TeX environment')
+        c = self.case
+        c.decisions.append(fixture._action('write_file', path='note.md',
+            content='# Observations\n\nThis bounded note describes the supplied observations.\n'))
+        self.drain()
+        c.decisions.append(fixture._action('export_report', markdown='note.md', compile_pdf=True))
+        self.drain(approve=lambda *_: True)
+        exported = c._ok('export_report')
+        project = c.app.workspace.resolve(exported['data']['project'])
+        self.assertTrue((project/'main.pdf').read_bytes().startswith(b'%PDF'))
+        self.assertFalse(c.inspection_requests)
+        self.assertFalse((c.root/'delivery.json').exists())
+        claim = {'summary':'A bounded typeset note', 'artifacts':exported['artifacts'],
+            'report':{'status':'prepared','manuscript':'note.md','formats':['pdf']}}
+        c.decisions.append(fixture._action('deliver_result', **claim))
+        self.drain()
+        self.assertEqual(c.app.session.manifest.status, 'completed', c.app.result_snapshot())
+        from simple_ar.tools.delivery_versions import DeliveryVersions
+        version = DeliveryVersions(c.root).select(1)
+        self.assertIn(str((project/'main.pdf').relative_to(c.root)), version['files'])
+        before = deepcopy(c.app.ledger.to_dict())
+        c._reload()
+        self.drain()
+        self.assertEqual(c.app.ledger.to_dict(), before)
 
 
 class NativeServiceTests(unittest.TestCase):

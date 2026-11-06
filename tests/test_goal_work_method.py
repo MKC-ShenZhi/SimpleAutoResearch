@@ -719,11 +719,10 @@ class GoalWorkTests(unittest.TestCase):
         self.assertEqual(case.app.session.manifest.status, 'partial')
         self.assertEqual(case.send.call_count, 1)
         self.assertEqual({tool['function']['name'] for tool in case.app._closing_schemas()},
-                         {'select_work'})
+                         {'ask_user', 'deliver_result'})
         context = json.loads(case.app._messages(client=case.app._client(), closing=True,
             schemas=case.app._closing_schemas())[1]['content'])
-        self.assertEqual({tool['function']['name'] for tool in context['work_selection']['operations']},
-            {'ask_user', 'deliver_result'})
+        self.assertNotIn('work_selection', context)
         self.assertFalse(case.app.state['pending'])
 
     def test_terminal_json_opinion_uses_the_same_evidence_and_recovery_contract(self):
