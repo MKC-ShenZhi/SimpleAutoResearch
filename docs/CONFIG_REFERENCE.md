@@ -587,6 +587,8 @@ Fields below belong to the package's extension.toml. Packages may provide instru
 
 Public names are `id__name`; instructions load through `id__instructions`. Optional completion uses `{ kind = "delivery", field = "handoff", closing = false }`: the named schema field contains `summary` and optional `artifacts`/`unresolved`. With an empty field the whole object is the delivery; `kind="question"` uses `{question = "..."}` instead. Completion declarations grant no extra permission or budget.
 
+New ordinary model work uses extension tools as services: optional delivery or review fields are excluded, and tools requiring such a claim or using the whole object for it are not offered as work services. Questions retain their own contract. Candidate review and final delivery are separate decisions. Service results cannot introduce an unsolicited completion claim. Explicit caller operations and saved tasks retain their own completion contracts.
+
 Extension Python runs with host OS privileges despite read_only/plan declarations. Host services check authorized mounted operations but cannot sandbox Python's own file/process/network access. Undeclared dependencies are outside identity checks. See complete [descriptor](../examples/local_extension/extension.toml) and [instructions](../examples/local_extension/SKILL.md).
 
 <a id="saved-task"></a>

@@ -20,7 +20,7 @@ from simple_ar.tools.analysis import AnalysisToolGateway, analysis_tool_specs
 from simple_ar.tools.extensions import LocalExtension
 # Compatibility imports for existing callers; the inspection owner owns the wire contract.
 from simple_ar.tools.delivery_review import delivery_requires_review, prepare_delivery_review
-from simple_ar.app.professional_conversation import RETAINED_PROFESSIONAL_CONTRACTS
+from simple_ar.app.professional_conversation import RETAINED_PROFESSIONAL_CONTRACTS, INTEGRATED_WORK_LIFECYCLES
 
 
 PROTOCOL = 'operations.v1'
@@ -414,7 +414,7 @@ class OperationTools:
         self.registry.register_package(coordination['specs'],coordination['owner'],request_visible=True)
         self.selection = None
         if config.get('work_method') == GOAL_WORK_METHOD:
-            if config.get('work_selection_policy') != 'native.v3':
+            if config.get('work_selection_policy') not in {'native.v3', 'native.v4'}:
                 from simple_ar.app.work_selection import WorkSelection
                 self.selection = WorkSelection(config.get('work_selection_policy'))
                 self.registry.register_package([self.selection.spec()], self.selection, request_visible=True)
@@ -446,7 +446,7 @@ class OperationTools:
         self.gateway = CommonToolGateway(root,registry=self.registry,policy=ToolPermissionPolicy(
             allowed_permissions=permissions,max_risk_level='high',blocked_tools=blocked))
         inspection_execution = config.get('inspection_execution_protocol')
-        if inspection_execution not in {None, 'shared.v1'}:
+        if inspection_execution not in {None, 'shared.v1', 'shared.v2'}:
             raise ValueError('Unsupported saved inspection execution contract')
         self.inspection.execution_protocol = inspection_execution
         self.inspection.operation_specs = lambda: [spec for spec in self.registry.list_specs()
@@ -471,7 +471,7 @@ class OperationTools:
                 'Commands require the existing exact approval. ' + self.work.instructions())
         if self.selection is not None and self.selection.policy == 'outcomes.v1':
             return self.selection.system
-        if self.config.get('work_lifecycle') in {'integrated.v1', 'integrated.v2'}:
+        if self.config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES:
             return _GOAL_WORK + (self.methods.instructions()
                 if self.methods is not None and not getattr(self.methods, 'source_work', False) else '')
         return self.system + (self.methods.instructions() if self.methods is not None and not getattr(self.methods, 'source_work', False) else '')
@@ -484,6 +484,9 @@ class OperationTools:
         """Select a pure projector once before the capacity selector iterates."""
         if self.config.get('work_method') != GOAL_WORK_METHOD:
             return None
+        if self.config.get('work_selection_policy') == 'native.v4':
+            from simple_ar.app.professional_conversation import work_unit_messages
+            return work_unit_messages
         from simple_ar.app.professional_conversation import recorded_work_messages
         return (None if self.work is not None and self.work.source_work
                 and self.work.selected() is not None else recorded_work_messages)
@@ -530,12 +533,12 @@ class OperationTools:
 
     def service_schemas(self, schemas: list[dict]) -> list[dict]:
         """Project one role snapshot, without rereading the journal per tool."""
-        if self.config.get('work_selection_policy') == 'outcomes.v1':
+        if self.config.get('work_selection_policy') in {'outcomes.v1', 'native.v4'}:
             result = []
             for row in schemas:
                 spec = self.registry.get(row['function']['name'])
                 # These owners supply outer decisions, never inner work actions.
-                if spec.name in self.selection.handoff_operations or (
+                if spec.name in {'select_work', 'review_result', 'deliver_result'} or (
                         spec.completion is not None and spec.completion.kind == 'question'):
                     result.append(row)
                     continue
@@ -556,7 +559,9 @@ class OperationTools:
         return schemas
 
     def service_error(self, spec: CommonToolSpec, arguments: dict, *, selected_work: bool = False) -> str:
-        if (selected_work and self.config.get('work_selection_policy') == 'outcomes.v1'
+        if ((selected_work and self.config.get('work_selection_policy') == 'outcomes.v1'
+                or self.config.get('work_selection_policy') == 'native.v4'
+                and spec.name not in {'review_result', 'deliver_result'})
                 and spec.completion is not None and spec.completion.kind != 'question'):
             completion = spec.completion
             if (spec.service_parameters_schema() is None
@@ -572,7 +577,8 @@ class OperationTools:
 
     def selected_work_service(self, call: dict, turn: dict, store: Any, requests: list[str]) -> bool:
         """Recognize a proved outcome work call, never a caller or owner action."""
-        if (self.config.get('work_selection_policy') != 'outcomes.v1'
+        policy = self.config.get('work_selection_policy')
+        if (policy not in {'outcomes.v1', 'native.v4'}
                 or turn.get('origin') in {'caller', 'professional'}):
             return False
         directory = Path(turn['reply']).parent
@@ -580,6 +586,13 @@ class OperationTools:
         if not store.exists(budget):
             return False
         binding = store.read_json(budget)
+        if policy == 'native.v4':
+            if binding.get('tool_admission') != 'offered.v1':
+                return False
+            reply = store.read_json(turn['reply'])
+            if call not in reply.get('tool_calls', []):
+                raise ValueError('Work service differs from its retained native reply')
+            return call['function']['name'] not in {'review_result', 'deliver_result'}
         if binding.get('tool_admission') != 'work_selection.v1':
             return False
         raw = store.read_json(str(directory / 'work_choice.json'))
@@ -620,7 +633,7 @@ class OperationTools:
                 # their availability when another optional tool is selected.
                 deferred = (not self.registry.request_visible(spec.name)
                     or executable and mode == 'on_demand' and spec.name == 'review_result'
-                    and self.config.get('work_lifecycle') not in {'integrated.v1', 'integrated.v2'})
+                    and self.config.get('work_lifecycle') not in INTEGRATED_WORK_LIFECYCLES)
             if (self.config.get('professional_operations') == 'work.v6'
                     and spec.domain == 'workspace' and spec.name not in {'ask_user', 'deliver_result'}):
                 # Ordinary intake offers outcome-producing owners. Primitives

@@ -50,6 +50,11 @@ def rogue(arguments, services):
             'Prepare a bounded note from the supplied observations.', model='fixture',
             sources={'measurements': self.case.inputs}, services=self.case.services,
             extensions=[self.package], max_turns=24, max_tokens=900000, tool_contracts='full')
+        # Keep exercising the original outcome contract after new creation moves
+        # to native work units. Native service consumers have their own chain test.
+        self.case.app.state['config'].update(work_selection_policy='outcomes.v1',
+            work_lifecycle='integrated.v2', inspection_execution_protocol='shared.v1')
+        self.case._reload()
         self.assertEqual(self.case.app.state['config']['work_selection_policy'], 'outcomes.v1')
         (self.case.app.workspace.workspace / 'existing.txt').write_text('Retained bounded note.\n', encoding='utf-8')
 

@@ -52,12 +52,17 @@ exhaustive self-audit first. Optional document, publication and other profession
 services retain their own responsibilities. Loading tools grants no authority.
 Saved source-role tasks keep their original scope, handoff and recovery behavior.
 
-New ordinary tasks explicitly choose work, candidate review, delivery or a blocked
-partial exit. These choices compile into the same action queue; work never silently
-adds a review or delivery. The shared material view prioritizes recent complete work
-and necessary original windows, suppressing only verified overlapping bytes from
-the same file version. Archived observations remain retrievable. Saved task policies
-and receipts stay unchanged on reload and unrelated material supply.
+New ordinary tasks return native tool batches directly to the action queue. There
+is no outer work-selection response or second compilation of the model's actions.
+Working history presents complete units with the original reply, actions and actual
+receipts; independent inspection uses the same unit history. Candidate review and
+final delivery must each be a separate decision after observing production. Other
+tools run as services, with optional completion effects removed and checked again
+at dispatch and result binding. Questions and explicit caller operations retain
+their own contracts. The shared material view prioritizes recent complete work and
+necessary original windows, suppressing only verified overlapping bytes from the
+same file version. Archived observations remain retrievable. Saved selection,
+history and inspection policies stay unchanged on reload and unrelated material supply.
 
 New ordinary tasks can submit an unfinished candidate for independent investigation
 before publication. This binds the actual claim and files; its opinion is not a

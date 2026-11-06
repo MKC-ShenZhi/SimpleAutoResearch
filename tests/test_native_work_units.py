@@ -1,0 +1,161 @@
+"""Native work keeps actual units, service boundaries and exact recovery."""
+from copy import deepcopy
+import hashlib
+import json
+from pathlib import Path
+import sys
+import unittest
+
+from simple_ar.app.professional_conversation import continuation_blocks, work_unit_messages
+from simple_ar.app.tool_application import ToolApplication
+from tests import test_professional_work_loop as fixture
+
+
+class NativeWorkProjectionTests(unittest.TestCase):
+    def test_units_keep_statements_arguments_results_and_feedback_order_without_double_encoding(self):
+        original = [{'role':'system', 'content':'Original permissions'},
+            {'role':'user', 'content':json.dumps({'work_plan':{'old':'fallible'}})},
+            {'role':'assistant', 'content':'The manuscript is note.md; retain the calculation.',
+             'tool_calls':[{'id':'a', 'function':{'name':'write_file',
+                 'arguments':json.dumps({'path':'note.md', 'content':'A line\nAnother line'})}}]},
+            {'role':'tool', 'tool_call_id':'a', 'content':json.dumps({'status':'ok',
+                'record':'records/write/native_result.json', 'data':{'sha256':'original'}})},
+            {'role':'user', 'content':'Shorten only the interpretation.'},
+            {'role':'assistant', 'content':'Reuse the unchanged data; read the current paragraph.',
+             'tool_calls':[{'id':'b', 'function':{'name':'read_file',
+                 'arguments':'{"path":"note.md"}'}}]},
+            {'role':'tool', 'tool_call_id':'b', 'content':'{"status":"ok","data":{"text":"A line"}}'}]
+        frozen = deepcopy(original)
+        result = work_unit_messages(original)
+        self.assertEqual(original, frozen)
+        self.assertNotIn('work_plan', json.loads(result[1]['content']))
+        first = json.loads(result[2]['content'])['recorded_work_unit']
+        self.assertIn('note.md', first['content'])
+        self.assertEqual(first['operations'][0]['arguments']['content'], 'A line\nAnother line')
+        self.assertEqual(first['observations'][0]['result']['data']['sha256'], 'original')
+        self.assertEqual(result[3], original[4])
+        second = json.loads(result[4]['content'])['recorded_work_unit']
+        self.assertIn('unchanged data', second['content'])
+        # A provider reply lacking reasoning is still the same closed factual
+        # unit after the existing continuation adapter; no reasoning invented.
+        converted = continuation_blocks([original[2:4]],
+            policy='closed_observations.v1', thinking_mode='enabled')[0]
+        adapted = work_unit_messages([*original[:2], *converted])
+        self.assertEqual(json.loads(adapted[2]['content'])['recorded_work_unit'], first)
+
+    def test_unclosed_unit_refused_and_invalid_arguments_preserved_as_evidence(self):
+        prefix = [{'role':'system', 'content':'Scope'}, {'role':'user', 'content':'{}'}]
+        choice = {'role':'assistant', 'content':'A failed attempt', 'tool_calls':[
+            {'id':'broken', 'function':{'name':'read_file', 'arguments':'{"path":'}}]}
+        with self.assertRaisesRegex(ValueError, 'Unclosed'):
+            work_unit_messages([*prefix, choice])
+        result = work_unit_messages([*prefix, choice, {'role':'tool',
+            'tool_call_id':'broken', 'content':'{"status":"blocked"}'}])
+        unit = json.loads(result[2]['content'])['recorded_work_unit']
+        self.assertEqual(unit['operations'][0]['arguments'], '{"path":')
+        self.assertEqual(unit['observations'][0]['result']['status'], 'blocked')
+
+
+class NativeWorkQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.case = fixture.OperationsWorkLoopTests()
+        self.case.setUp()
+        self.addCleanup(self.case.doCleanups)
+        c = self.case
+        c.app = ToolApplication.create(c.root, 'Write a bounded note and preserve the measurements.',
+            model='fixture', sources={'measurements':c.inputs}, services=c.services,
+            allow_execution=True, max_turns=24, max_tokens=900000, tool_contracts='full')
+        c._reload()
+
+    def drain(self, **kwargs):
+        c = self.case
+        return c._run(should_stop=lambda: not c.decisions and c.app.state['pending'] is None
+            and not any(turn['remaining'] for turn in c.app.state['turns']), **kwargs)
+
+    def test_real_work_approval_recovery_then_separate_review_and_same_version_delivery(self):
+        c = self.case
+        self.assertIsNone(c.app.operations.selection)
+        self.assertNotIn('select_work', {row['function']['name'] for row in c.app.schemas})
+        program = "from pathlib import Path;p=Path('runs.txt');p.write_text((p.read_text() if p.exists() else '')+'run\\n')"
+        c.decisions.append([fixture._action('write_file', path='note.md', content='Three observations.\n'),
+            fixture._action('run_process', argv=[sys.executable,'-c',program], outputs=['runs.txt'])])
+        self.drain()
+        token = c.app.approval_token(c.app.state['pending']['call'])
+        c._reload()
+        self.drain(approved_execution=token)
+        self.assertEqual((c.root/'workspace/runs.txt').read_text(), 'run\n')
+        self.assertFalse(c.inspection_requests)
+        self.assertFalse((c.root/'delivery.json').exists())
+        self.assertFalse(list((c.root/'attempts').glob('*/work_choice.json')))
+        before = deepcopy(c.app.ledger.to_dict())
+        claim = {'summary':'A bounded note', 'artifacts':['note.md']}
+        c.decisions.append(fixture._action('review_result', **claim))
+        self.drain()
+        checked = len(c.inspection_requests)
+        self.assertGreater(checked, 0)
+        proof = c._last('review_result', reviewed=True)['metadata']['delivery_review']['identity']
+        c._reload()
+        c.decisions.append(fixture._action('deliver_result', **claim))
+        self.drain()
+        self.assertEqual(c.app.session.manifest.status, 'completed', c.app.result_snapshot())
+        self.assertEqual(len(c.inspection_requests), checked)
+        self.assertEqual(c._last('deliver_result', reviewed=True)['metadata']['delivery_review']['identity'], proof)
+        self.assertEqual((c.root/'workspace/runs.txt').read_text(), 'run\n')
+        self.assertEqual(c.app.ledger.to_dict()['entries'][:len(before['entries'])], before['entries'])
+        from simple_ar.tools.delivery_versions import DeliveryVersions
+        self.assertEqual(len(DeliveryVersions(c.root).select(1)['files']), 1)
+
+    def test_mixed_batch_retains_effects_but_cannot_review_unobserved_production(self):
+        c = self.case
+        claim = {'summary':'A bounded note', 'artifacts':['note.md']}
+        c.decisions.append([fixture._action('write_file', path='note.md', content='Actual work.\n'),
+            fixture._action('review_result', **claim)])
+        self.drain()
+        self.assertEqual((c.root/'workspace/note.md').read_text(), 'Actual work.\n')
+        self.assertIn('separate review', c._last('review_result')['error'])
+        self.assertFalse(c.inspection_requests)
+        receipts = deepcopy(c.app.state['turns'][0]['tools'])
+        c._reload()
+        c.decisions.append(fixture._action('deliver_result', **claim))
+        self.drain()
+        self.assertEqual(c.app.session.manifest.status, 'completed', c.app.result_snapshot())
+        self.assertEqual(c.app.state['turns'][0]['tools'], receipts)
+
+
+class NativeServiceTests(unittest.TestCase):
+    def setUp(self):
+        from tests.test_work_service_boundary import WorkServiceBoundaryTests
+        self.old = WorkServiceBoundaryTests()
+        self.old.setUp()
+        self.addCleanup(self.old.doCleanups)
+        self.case = self.old.case
+        self.case.app.state['config'].update(work_selection_policy='native.v4',
+            work_lifecycle='integrated.v3', inspection_execution_protocol='shared.v2')
+        self.case._reload()
+
+    def test_native_schema_and_dispatch_keep_completion_with_task_owner(self):
+        c = self.case
+        available = {row['function']['name']:row['function']['parameters'] for row in c.app.schemas}
+        self.assertNotIn('handoff', available['service_demo__optional']['properties'])
+        self.assertNotIn('service_demo__required', available)
+        self.assertNotIn('service_demo__whole', available)
+        c.decisions.append(fixture._action('service_demo__optional', handoff={
+            'summary':'Hidden completion', 'artifacts':['existing.txt']}))
+        self.old.drain()
+        self.assertIn('service operation', c._last('service_demo__optional')['error'])
+        self.assertFalse(c.app.operations.extensions[0]._modules)
+        self.assertFalse(c.inspection_requests)
+
+    def test_native_service_result_never_acquires_completion(self):
+        c = self.case
+        c.decisions.append(fixture._action('service_demo__rogue'))
+        self.old.drain()
+        result = c._last('service_demo__rogue')
+        self.assertEqual(result['status'], 'blocked')
+        self.assertIn('secret_claim', result['data'])
+        self.assertFalse((c.root/'delivery.json').exists())
+        self.assertFalse(c.inspection_requests)
+
+
+if __name__ == '__main__':
+    unittest.main()

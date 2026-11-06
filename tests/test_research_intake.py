@@ -163,10 +163,9 @@ class ResearchIntakeTests(unittest.TestCase):
         raw = {'write_file', 'edit_file', 'run_process'}
         permitted_raw = raw - {'run_process'}
         case.decisions.extend([
-            _action('select_work', decision='work', actions=[
-                _action('write_file', path='workspace/summary.md', content=content)]),
-            _action('select_work', decision='deliver', actions=[], candidate={
-                'summary': '已交付材料摘要。', 'artifacts': ['workspace/summary.md'], 'unresolved': []}),
+            _action('write_file', path='workspace/summary.md', content=content),
+            _action('deliver_result', summary='已交付材料摘要。',
+                artifacts=['workspace/summary.md'], unresolved=[]),
         ])
         services = ResearchApplicationServices(llm_client=case.services.llm_client,
             config={'research_materials_only': True},
@@ -189,9 +188,10 @@ class ResearchIntakeTests(unittest.TestCase):
             result = app.run(progress=lambda _: None)
             self.assertEqual(result['status'], 'completed', result)
             first_request = case.send.call_args_list[0].args[1]
-            self.assertEqual({row['function']['name'] for row in first_request['tools']}, {'select_work'})
+            first = {row['function']['name'] for row in first_request['tools']}
+            self.assertNotIn('select_work', first)
             first_view = json.loads(first_request['messages'][1]['content'])
-            first = {row['function']['name'] for row in first_view['work_selection']['operations']}
+            self.assertNotIn('work_selection', first_view)
             self.assertTrue({'read_file', 'list_directory',
                 'ask_user', 'deliver_result'} <= first)
             self.assertNotIn('inspect_artifacts', first)
@@ -228,7 +228,8 @@ class ResearchIntakeTests(unittest.TestCase):
                         app.state['config'].pop('tool_contracts')
                         app._save()
                     expected = names(app)
-                    self.assertEqual({row['function']['name'] for row in app.schemas}, {'select_work'})
+                    self.assertEqual({row['function']['name'] for row in app.schemas}, expected)
+                    self.assertIsNone(app.operations.selection)
                     allowed = {spec.name for spec in app.gateway.list_specs()
                         if app.gateway.policy.is_allowed(spec)[0]
                         and app.operations.coordinator_eligible(spec)} - {'select_work', 'update_work_plan'}
@@ -389,9 +390,8 @@ class ResearchIntakeTests(unittest.TestCase):
         # One physical request cannot also fund independent acceptance. Retain
         # this JSON budget-port boundary with a truthful typed partial exit.
         obstacle = 'The remaining shared allowance cannot fund independent checking of this assessment.'
-        final_reply = _reply('select_work', {'decision': 'blocked', 'actions': [],
-            'stop_reason': obstacle, 'candidate': {'summary': content,
-                'artifacts': [], 'unresolved': [obstacle]}})
+        final_reply = _reply('deliver_result', {'summary': content,
+            'artifacts': [], 'unresolved': [obstacle]})
         client = _JSONClient([final_reply])
         services = ResearchApplicationServices(llm_client=client,
             budget_limits={"llm_requests": 1, "total_tokens": 1000000},

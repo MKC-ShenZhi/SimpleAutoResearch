@@ -5,6 +5,10 @@
 User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-11-07
+
+- New ordinary tasks use native tool batches on the shared queue. Complete work units retain the original reply, actions and receipts in working history, without an outer work-selection response or a second action compilation. Candidate review and final delivery use separate decisions after observing production; ordinary services cannot silently introduce either effect. Independent inspection follows the same work-unit history contract. Saved tasks retain their original policies and recovery behavior.
+
 ## 2026-11-06
 
 ### Improved

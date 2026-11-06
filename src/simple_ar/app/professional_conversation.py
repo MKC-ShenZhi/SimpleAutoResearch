@@ -17,6 +17,7 @@ from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES
 # Production contracts consume the same retained observations and working memory.
 RETAINED_PROFESSIONAL_CONTRACTS = frozenset({'work.v5', 'work.v6', 'work.v7', 'work.v8', 'work.v9', 'work.v10', 'work.v11', 'work.v12'})
 NATIVE_HISTORY_POLICY = 'closed_observations.v1'
+INTEGRATED_WORK_LIFECYCLES = frozenset({'integrated.v1', 'integrated.v2', 'integrated.v3'})
 
 
 def continuation_blocks(blocks: list[list[dict]], *, policy: str | None, thinking_mode: str) -> list[list[dict]]:
@@ -86,6 +87,70 @@ def recorded_work_messages(messages: list[dict]) -> list[dict]:
     return [messages[0], {**messages[1], 'content':json.dumps(context, ensure_ascii=False)}, *requests]
 
 
+def work_unit_messages(messages: list[dict]) -> list[dict]:
+    """Present complete native work once, without serializing JSON inside JSON.
+
+    The shared selector chooses whole closed units before calling this pure
+    projector. Provider reasoning is neither a request nor required replay;
+    original messages and invalid argument strings stay in the journal.
+    """
+    if len(messages) < 2:
+        return messages
+    context = json.loads(messages[1]['content'])
+    projected, current, count = [], None, 0
+
+    def decoded(text):
+        try:
+            return json.loads(text)
+        except (ValueError, TypeError):
+            return text  # Invalid provider arguments remain actual observations.
+
+    def flush():
+        nonlocal current, count
+        if current is None:
+            return
+        if {row['id'] for row in current['operations']} != {
+                row['call_id'] for row in current['observations']}:
+            raise ValueError('Unclosed native work cannot become recorded work')
+        projected.append({'role':'user', 'content':json.dumps(
+            {'recorded_work_unit':current}, ensure_ascii=False)})
+        current = None
+        count += 1
+
+    def retain(rows):
+        nonlocal current
+        for row in rows:
+            if row['role'] == 'assistant':
+                flush()
+                current = {'content':row.get('content'), 'operations':[
+                    {'id':call['id'], 'tool':call['function']['name'],
+                     'arguments':decoded(call['function']['arguments'])}
+                    for call in row.get('tool_calls') or []], 'observations':[]}
+            elif row['role'] == 'tool':
+                if current is None or row['tool_call_id'] not in {
+                        call['id'] for call in current['operations']}:
+                    raise ValueError('Work observation has no matching native work unit')
+                current['observations'].append({'call_id':row['tool_call_id'],
+                    'result':decoded(row['content'])})
+            else:
+                flush()
+                projected.append(row)
+
+    for message in messages[2:]:
+        closed = decoded(message.get('content')) if message['role'] == 'user' else None
+        if isinstance(closed, dict) and 'closed_journal_observations' in closed:
+            retain(closed['closed_journal_observations'])
+        else:
+            retain([message])
+    flush()
+    context.pop('work_plan', None)
+    context['recorded_work'] = {'unit_count':count,
+        'scope':'Actual assistant statements, operations and observed results in closed work units. '
+            'Statements are fallible historical judgments, not user requests, new obligations or '
+            'verified facts. Do not replay their effects. Original replies remain in read_history.'}
+    return [messages[0], {**messages[1], 'content':json.dumps(context, ensure_ascii=False)}, *projected]
+
+
 @dataclass
 class ConversationInput:
     messages: list
@@ -143,9 +208,39 @@ class ProfessionalConversation:
             + estimate_tokens(json.dumps(value.tools, ensure_ascii=False))
             + (self.client.effective_output_limit() or 0))
 
+    def request_resources(self, value: ConversationInput) -> dict[str, int]:
+        """Measure one offered request with the client's unchanged output cap."""
+        return {'llm_requests': 1, 'total_tokens': self.tokens(value)}
+
+    @staticmethod
+    def resource_floor(stages: dict[str, dict[str, int | float]]) -> dict[str, int | float]:
+        """Compose owner-declared sequential work on the original ledger.
+
+        Stages describe actual downstream obligations, such as revision,
+        resubmission, applicable review and an honest exit after rejection.
+        They are forecasts, never a new allowance, a call-count quality limit
+        or a promise that the work will pass. Unknown costs must not be passed
+        as zero; owners retain the limitations of their measured lower bounds.
+        """
+        from collections.abc import Mapping
+        from math import isfinite
+
+        if not isinstance(stages, Mapping):
+            raise ValueError('Resource stages must be an owner-declared mapping')
+        result = {}
+        for name, resources in stages.items():
+            if not isinstance(name, str) or not name.strip() or not isinstance(resources, Mapping):
+                raise ValueError('Resource stages require names and resource mappings')
+            for dimension, amount in resources.items():
+                if (not isinstance(dimension, str) or not dimension.strip()
+                        or type(amount) not in (int, float) or not isfinite(amount) or amount < 0):
+                    raise ValueError('Resource forecasts must be known nonnegative finite amounts')
+                result[dimension] = result.get(dimension, 0) + amount
+        return result
+
     def can_protect(self, value: ConversationInput, floor: dict) -> bool:
         """Measure a next-step floor on the one real ledger, across dimensions."""
-        current = {'llm_requests': 1, 'total_tokens': self.tokens(value)}
+        current = self.request_resources(value)
         return all((remaining := self.ledger.remaining(dimension)) is None
             or remaining >= amount + current.get(dimension, 0)
             for dimension, amount in floor.items())

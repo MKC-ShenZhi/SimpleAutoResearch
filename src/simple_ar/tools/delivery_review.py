@@ -864,7 +864,7 @@ class DeliveryReview:
         identity, binding = envelope['identity'], envelope['binding']
         self._validate_scope(binding)
         saved = self.inspector.store.read_json(self.inspector._path(identity, 'input'))
-        if (saved.get('execution_protocol') != 'shared.v1' or saved.get('identity') != identity
+        if (saved.get('execution_protocol') not in {'shared.v1', 'shared.v2'} or saved.get('identity') != identity
                 or saved.get('delivery_context') != binding or saved.get('arguments') != self._arguments(binding)
                 or saved.get('user_requests') != binding['requests']):
             raise ValueError('Pending delivery review differs from its retained inspection scope')
@@ -966,7 +966,7 @@ class DeliveryReview:
             self._validate_scope(binding)
             if self.inspector.has_started(identity):
                 if self.inspector.store.read_json(self.inspector._path(identity, 'input')).get(
-                        'execution_protocol') == 'shared.v1' and not self.inspector.store.exists(
+                        'execution_protocol') in {'shared.v1', 'shared.v2'} and not self.inspector.store.exists(
                             self.inspector._path(identity, 'result')):
                     result = self.inspector.call('inspect_artifacts', self._arguments(binding), identity,
                         delivery_context=deepcopy(binding))

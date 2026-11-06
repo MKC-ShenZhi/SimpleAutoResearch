@@ -963,13 +963,12 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                         raise AssertionError('Test did not release model boundary')
                 tool, arguments = 'ask_user', {'question': 'Inspect this retained result'}
                 offered = {row['function']['name'] for row in kwargs['tools']}
-                self.assertEqual(offered, {'select_work'})
-                view = json.loads(messages[1]['content'])['work_selection']
-                self.assertIn(tool, {row['function']['name'] for row in view['operations']})
+                self.assertIn(tool, offered)
+                self.assertNotIn('select_work', offered)
+                self.assertNotIn('work_selection', json.loads(messages[1]['content']))
                 return {'role': 'assistant', 'content': None, 'tool_calls': [
                     {'id': 'fake-' + str(len(calls)), 'type': 'function',
-                     'function': {'name': 'select_work', 'arguments': json.dumps({
-                         'decision': 'work', 'actions': [{'tool_name': tool, 'arguments': arguments}]})}}]}
+                     'function': {'name': tool, 'arguments': json.dumps(arguments)}}]}
 
             with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(catalog), 'SAR_UI_TEST_KEY': 'fake-ui-credential'}), \
                     patch.object(LLMClient, 'chat_turn', new=fake_turn), \

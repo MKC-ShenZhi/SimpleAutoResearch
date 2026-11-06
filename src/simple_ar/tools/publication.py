@@ -319,7 +319,7 @@ class PublicationToolGateway:
         self.asset_protocol = asset_protocol
         # Internal load-time contract selection; never an ExportRequest option.
         self.legacy_report_status = legacy_report_status
-        if work_lifecycle not in {None, 'integrated.v1', 'integrated.v2'}:
+        if work_lifecycle not in {None, 'integrated.v1', 'integrated.v2', 'integrated.v3'}:
             raise ValueError('Unsupported publication work lifecycle')
         self.work_lifecycle = work_lifecycle
 
@@ -540,7 +540,7 @@ class PublicationToolGateway:
         stronger authoring identity. A proposed export is only a preflight;
         actual outputs are checked again after production.
         """
-        external = (self.work_lifecycle in {'integrated.v1', 'integrated.v2'} and proposed is None
+        external = (self.work_lifecycle in {'integrated.v1', 'integrated.v2', 'integrated.v3'} and proposed is None
                     and 'pdf' in formats and 'tex' not in formats and manuscript is not None
                     and any(self.workspace.resolve(path).suffix.lower() == '.pdf' for path in artifacts))
         if not set(formats) - {'markdown'} and not external:
@@ -687,7 +687,7 @@ class PublicationToolGateway:
                 failures.append(str(exc))
         if failures:
             raise ValueError('; '.join(dict.fromkeys(failures)))
-        if self.work_lifecycle in {'integrated.v1', 'integrated.v2'} and identity is None:
+        if self.work_lifecycle in {'integrated.v1', 'integrated.v2', 'integrated.v3'} and identity is None:
             raise ValueError('Requested report formats need a byte-bound publication of the same manuscript, '
                 'figures and bibliography. Use export_report, or deliver an already executed PDF whose '
                 'accepted process receipts explicitly bind those input versions and the PDF output. '

@@ -29,6 +29,8 @@ class _InspectionDispatchRaised(BaseException):
         self.original = original
 
 
+_SHARED_EXECUTION_PROTOCOLS = frozenset({'shared.v1', 'shared.v2'})
+
 _SHARED_OPERATIONS = frozenset({'read_file', 'list_directory', 'search_files',
     'write_file', 'edit_file', 'copy_file', 'copy_project', 'run_process', 'inspect_images'})
 _WORK_MATERIAL_POLICIES = frozenset({'operations.v1', 'operations.v2', 'operations.v3'})
@@ -213,7 +215,7 @@ class _ReviewResponseV2(BaseModel):
 def inspection_tool_specs(*, progressive: bool = False, adaptive: bool = False,
                           execution_protocol: str | None = None,
                           coverage_policy: str | None = None) -> list[CommonToolSpec]:
-    if execution_protocol not in (None, 'shared.v1'):
+    if execution_protocol not in (None, *_SHARED_EXECUTION_PROTOCOLS):
         raise ValueError('Unknown inspection execution protocol')
     specs = [CommonToolSpec(name='inspect_artifacts', domain='inspection',
         permission_level='read_only', risk_level='low',
@@ -240,7 +242,7 @@ def inspection_tool_specs(*, progressive: bool = False, adaptive: bool = False,
             'file; FileWindow requests exactly that range. Total returned text is bounded at '
             '512000 bytes. Partial/binary targets cannot pass. No edits, execution, delivery, '
             'visual inspection or scientific certification. Same identity never requests again.'))]
-    if execution_protocol == 'shared.v1':
+    if execution_protocol in _SHARED_EXECUTION_PROTOCOLS:
         shared = ('The independent inspector may use offered operations, with helper writes scoped to its '
             'inspection work directory and ordinary process approval and vision routing. Tool observations '
             'do not certify scientific correctness. The same identity resumes its recorded work.')
@@ -363,7 +365,7 @@ class InspectionToolGateway:
             raise ValueError('Unknown inspection protocol')
         if context_authority not in (None, 'sources.v1'):
             raise ValueError('Unknown inspection context authority')
-        if execution_protocol not in (None, 'shared.v1'):
+        if execution_protocol not in (None, *_SHARED_EXECUTION_PROTOCOLS):
             raise ValueError('Unknown inspection execution protocol')
         if coverage_policy not in (None, 'offered.v1', 'offered.v2'):
             raise ValueError('Unknown inspection coverage policy')
@@ -380,7 +382,7 @@ class InspectionToolGateway:
             raise ValueError('Inspection checkpoint policy requires journal continuity')
         if work_method is not None and work_method not in NATIVE_WORK_METHODS or work_method and protocol != 'subjects.v3':
             raise ValueError('Unsupported inspection working method')
-        if work_lifecycle not in (None, 'integrated.v1', 'integrated.v2') or work_lifecycle and protocol != 'subjects.v3':
+        if work_lifecycle not in (None, 'integrated.v1', 'integrated.v2', 'integrated.v3') or work_lifecycle and protocol != 'subjects.v3':
             raise ValueError('Unsupported inspection work lifecycle')
         if material_policy not in (None, *_WORK_MATERIAL_POLICIES) or material_policy and work_method != GOAL_WORK_METHOD:
             raise ValueError('Unsupported inspection material policy')
@@ -434,6 +436,21 @@ class InspectionToolGateway:
         return policy in {'offered.v1', 'offered.v2'}
 
     def _system(self, saved: dict) -> str:
+        if saved.get('execution_protocol') == 'shared.v2':
+            # The saved protocol selects this contract; old offers/recovery use
+            # their original instructions and ordinary shared action receipts.
+            return (self._system({**saved, 'execution_protocol': 'shared.v1'})
+                + ' The caller protects its remaining revision, resubmission and exit work '
+                'on this same ledger. Spendable inspection resources already exclude that '
+                'protection. Choose further checks for their consequence to the current '
+                'claim, not to complete an inventory. Once a required defect is established '
+                'and further investigation would not change the necessary next repair, '
+                'return the evidence and finding promptly so production can revise. '
+                'State necessary unfinished investigation as incomplete; do not claim '
+                'unexamined work passed. A conclusive negative finding does not require '
+                'an exhaustive audit of unaffected work. A passing conclusion still needs '
+                'all applicable necessary checks. When only the opinion can fit, return '
+                'the actual findings and remaining scope without further operations.')
         if saved.get('inspection_material_policy') in _WORK_MATERIAL_POLICIES and self._delivery_scope(saved):
             return (
                 'Independently judge the proposed delivery against the actual user requests. '
@@ -460,7 +477,7 @@ class InspectionToolGateway:
                 'Do not introduce unrequested experiments, formats or presentation work. '
                 'Reassessed_prior contains only supplied required concerns actually rechecked.'
             )
-        if saved.get('execution_protocol') == 'shared.v1':
+        if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS:
             contract = (_DELIVERY_SYSTEM if self._delivery_scope(saved) else
                 _REVIEW_SYSTEM if self.adaptive else _SUBJECT_SYSTEM if self.protocol else _SYSTEM)
             # Keep the original response/evidence contracts while offering actual
@@ -669,7 +686,7 @@ class InspectionToolGateway:
         return str(path) in saved.get('immutable_paths', []) or not path.is_relative_to(work)
 
     def _check_inspection_versions(self, saved: dict, identity: str, *, selected: list[dict] | None = None) -> None:
-        if saved.get('execution_protocol') != 'shared.v1':
+        if saved.get('execution_protocol') not in _SHARED_EXECUTION_PROTOCOLS:
             self._check_versions([*saved['targets'], *saved['evidence']], identity)
             return
         selected_ids = {row['subject'] for row in selected or []}
@@ -762,7 +779,7 @@ class InspectionToolGateway:
                                    visited: set[tuple[str, str]] | None = None,
                                    journal_cache: dict | None = None,
                                    validation_records: dict | None = None) -> dict[str, str]:
-        if saved.get('execution_protocol') != 'shared.v1':
+        if saved.get('execution_protocol') not in _SHARED_EXECUTION_PROTOCOLS:
             return {}
         dependencies: dict[str, str] = {}
         journal_cache = {} if journal_cache is None else journal_cache
@@ -1067,7 +1084,7 @@ class InspectionToolGateway:
         return bindings
 
     def _stored_shared_bindings(self, saved: dict, response: dict) -> dict[str, dict[str, str]]:
-        if saved.get('execution_protocol') != 'shared.v1':
+        if saved.get('execution_protocol') not in _SHARED_EXECUTION_PROTOCOLS:
             return {}
         if not saved.get('source_rounds'):
             raise ValueError('Inspection has no retained final decision')
@@ -1254,7 +1271,7 @@ class InspectionToolGateway:
         path = self._path(identity,'input')
         saved = self.store.read_json(path) if self.store.exists(path) else {}
         invocations = saved.get('source_invocations', [])
-        if saved.get('execution_protocol') == 'shared.v1':
+        if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS:
             entries = list(self.workspace.ledger.entries)
             attempts = {row['attempt'] for row in invocations}
             candidates = {value for entry in entries for value in (entry.attempt_id, entry.logical_call_id)
@@ -1371,7 +1388,7 @@ class InspectionToolGateway:
         # when their authoritative final bindings are reconstructed below.
         # Other outcomes still need the original journal dependency check.
         assessed = current_inputs and self.protocol and result.status == 'ok'
-        if not (assessed and saved.get('execution_protocol') == 'shared.v1'):
+        if not (assessed and saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS):
             self._check_shared_dependencies(saved, current_inputs=current_inputs,
                 selected=self._selected_inspection_rows(saved, receipt['response']) if current_inputs else None)
         if self.protocol and result.status == 'ok':
@@ -1712,7 +1729,7 @@ class InspectionToolGateway:
         """Recover actual supplied source ranges from the existing request projections."""
         if not self._offered_coverage(saved):
             return {}
-        if saved.get('execution_protocol') != 'shared.v1':
+        if saved.get('execution_protocol') not in _SHARED_EXECUTION_PROTOCOLS:
             raise ValueError('Offered coverage requires the shared inspection journal')
         cache = validation_records if validation_records is not None else {}
         cache_key = (saved['identity'], tuple(saved.get('source_rounds', [])))
@@ -2115,7 +2132,7 @@ class InspectionToolGateway:
             previous = records['input']
             if (previous.get('identity') != identity or previous.get('protocol') != self.protocol
                     or previous.get('work_method') != GOAL_WORK_METHOD
-                    or previous.get('execution_protocol') != 'shared.v1'
+                    or previous.get('execution_protocol') not in _SHARED_EXECUTION_PROTOCOLS
                     or records['response'].get('input_sha256') != reference['sha256']['input']
                     or records['response'].get('result_sha256') != reference['sha256']['result']
                     or not self._accounted(self._usage(identity))):
@@ -2142,7 +2159,7 @@ class InspectionToolGateway:
         # to a later final scope. Only its observations transfer; the current
         # reviewer still decides applicability and receives no inherited pass.
         previous_arguments = (reference.get('arguments', saved['arguments'])
-            if saved.get('work_lifecycle') in {'integrated.v1', 'integrated.v2'} else saved['arguments'])
+            if saved.get('work_lifecycle') in {'integrated.v1', 'integrated.v2', 'integrated.v3'} else saved['arguments'])
         if (previous.get('delivery_context') != reference['binding']
                 or previous.get('arguments') != previous_arguments):
             raise ValueError('Retained investigation differs from its delivery owner scope')
@@ -2220,7 +2237,7 @@ class InspectionToolGateway:
             decision = self._delivery_decision(saved, receipt['response'], current_inputs=check_versions)
             if self._offered_coverage(saved):
                 offered = self._offered_text_ranges(saved, validation_records=validation_records)
-            if saved.get('execution_protocol') == 'shared.v1':
+            if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS:
                 bindings = self._stored_shared_bindings(saved, receipt['response'])
                 dependencies = bindings['delivery']
                 if self._applicable_scope(saved) and decision.reassessed_prior:
@@ -2228,7 +2245,7 @@ class InspectionToolGateway:
             if check_versions:
                 selected = self._selected_inspection_rows(saved, receipt['response'])
                 self._check_inspection_versions(saved, identity, selected=selected)
-                if (saved.get('execution_protocol') == 'shared.v1'
+                if (saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS
                         and bindings != self._shared_final_bindings(saved, receipt['response'],
                             validation_records=validation_records)):
                     raise ValueError('Inspection selected producer bindings changed')
@@ -2295,14 +2312,14 @@ class InspectionToolGateway:
             decisions = {row.subject: row for row in self._subject_decisions(saved, receipt['response'])}
             if self._offered_coverage(saved):
                 offered = self._offered_text_ranges(saved, validation_records=validation_records)
-            if saved.get('execution_protocol') == 'shared.v1':
+            if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS:
                 bindings = self._stored_shared_bindings(saved, receipt['response'])
                 if set(bindings) != set(decisions):
                     raise ValueError('Inspection selected producer bindings do not match its subjects')
             if check_versions:
                 selected = self._selected_inspection_rows(saved, receipt['response'])
                 self._check_inspection_versions(saved, identity, selected=selected)
-                if (saved.get('execution_protocol') == 'shared.v1'
+                if (saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS
                         and bindings != self._shared_final_bindings(saved, receipt['response'],
                             validation_records=validation_records)):
                     raise ValueError('Inspection selected producer bindings changed')
@@ -2362,7 +2379,7 @@ class InspectionToolGateway:
                 'verdict': verdict, 'findings': findings,
                 'limitations': [*limitations,
                     'Inspection uses retained text and recorded tool observations; results do not certify scientific correctness'
-                    if saved.get('execution_protocol') == 'shared.v1' else
+                    if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS else
                     'Text inspection only; no visual or scientific certification']})
         return assessments, error
 
@@ -2381,7 +2398,7 @@ class InspectionToolGateway:
             if failure:
                 raise ValueError(failure)
             response = _Response.model_validate(receipt['response'])
-            if saved.get('execution_protocol') == 'shared.v1':
+            if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS:
                 bindings = self._stored_shared_bindings(saved, receipt['response'])
                 dependencies = bindings['group']
             known = {row['subject']: row for row in targets}
@@ -2399,7 +2416,7 @@ class InspectionToolGateway:
             selected = self._selected_inspection_rows(saved, receipt['response'])
             self._check_inspection_versions(saved, identity, selected=selected)
             self._check_shared_dependencies(saved, current_inputs=True, selected=selected)
-            if (saved.get('execution_protocol') == 'shared.v1'
+            if (saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS
                     and bindings != self._shared_final_bindings(saved, receipt['response'])):
                 raise ValueError('Inspection selected producer bindings changed')
             verdict = ('needs_revision' if any(row['severity'] == 'required' for row in findings)
@@ -2417,7 +2434,7 @@ class InspectionToolGateway:
             'verdict': verdict, 'findings': findings,
             'limitations': [*limitations,
                 'Inspection uses retained text and recorded tool observations; results do not certify scientific correctness'
-                if saved.get('execution_protocol') == 'shared.v1' else
+                if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS else
                 'Text inspection only; no visual or scientific certification']}
         return assessment, error
 
@@ -2763,7 +2780,7 @@ class InspectionToolGateway:
         if checkpoint_policy not in (None, 'economic.v3'):
             raise ValueError('Unknown saved inspection checkpoint policy')
         economic = checkpoint_policy == 'economic.v3'
-        if saved.get('work_lifecycle') not in (None, 'integrated.v1', 'integrated.v2'):
+        if saved.get('work_lifecycle') not in (None, 'integrated.v1', 'integrated.v2', 'integrated.v3'):
             raise ValueError('Unknown saved inspection work lifecycle')
         if economic and not continuity:
             raise ValueError('Inspection checkpoint policy requires its saved journal')
@@ -2784,6 +2801,18 @@ class InspectionToolGateway:
             if remaining is not None:
                 target = min(target, max(0, remaining - (client.effective_output_limit() or 0)))
         base = self._view(saved, request)
+        if saved.get('execution_protocol') == 'shared.v2':
+            ledger = client._budget_ledger
+            base['resource_handoff'] = {
+                'spendable_after_caller_protection': {key: ledger.remaining(key)
+                    for key in ledger.limits},
+                'unknown_usage': list(ledger.unknown_dimensions()),
+                'phase': ('opinion_only' if all(row['function']['name'] == 'record_inspection'
+                    for row in offered) else 'investigation'),
+                'scope': 'Shared ledger capacity after the caller has withheld subsequent work. '
+                    'This is neither another allowance nor a promised number of useful checks. '
+                    'Further investigation also protects a measured final opinion. Return '
+                    'established required findings promptly; disclose unfinished necessary scope.'}
         if saved.get('work_method') in NATIVE_WORK_METHODS and self._delivery_scope(saved):
             base['executed_checks'] = sorted(self._executed_check_records(saved))
         if saved.get('inspection_material_policy') == 'operations.v3':
@@ -2799,7 +2828,7 @@ class InspectionToolGateway:
                     'read_history addresses only this inspection, not the parent task.',
                     'read_history addresses this inspection and supplied retained inspection IDs; '
                     'other parent records require ordinary authorized reads.')
-        if saved.get('execution_protocol') == 'shared.v1':
+        if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS:
             # A primary target is a current material, not permanently pinned
             # prompt text. Its complete read/version proof stays in the source
             # journal; the common selector supplies useful original windows.
@@ -2933,7 +2962,7 @@ class InspectionToolGateway:
                 if continuity and saved.get('inspection_material_policy') in _WORK_MATERIAL_POLICIES else {}),
             native_observations=native_observations,
             preserve_material_observations=saved.get('work_lifecycle') == 'integrated.v1',
-            working_set_policy='recent.v2' if saved.get('work_lifecycle') == 'integrated.v2' else None,
+            working_set_policy='recent.v2' if saved.get('work_lifecycle') in {'integrated.v2', 'integrated.v3'} else None,
             version_resolver=version if retained else None,
             **({'work_notes':notes, 'require_work_notes':True, 'fit_work_notes':True,
                 'economical_checkpoint':economic,
@@ -3041,7 +3070,7 @@ class InspectionToolGateway:
         if not trace.get('completed') or not response:
             return None
         call_id = 'inspect-artifacts-'+saved['identity'] + (f'-sources-{number}' if number else '')
-        shared = saved.get('execution_protocol') == 'shared.v1'
+        shared = saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS
         model_receipt = trace.get('model_receipt') if shared else None
         if shared and not isinstance(model_receipt, dict):
             return None
@@ -3305,19 +3334,19 @@ class InspectionToolGateway:
                     raise ValueError('Inspection checkpoint record changed; no replay')
             store = ArtifactStore(self.root/f"tools/inspection/{saved['identity']}/sources-{number}")
             call_id = f"working-memory-{saved['identity']}-sources-{number}"
-            attempt_id = (trace['checkpoint_receipt']['attempt'] if saved.get('execution_protocol') == 'shared.v1'
+            attempt_id = (trace['checkpoint_receipt']['attempt'] if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS
                 else saved['identity'])
             checkpoint_sessions = ({entry.session_id for entry in self.workspace.ledger.entries
                 if entry.attempt_id == attempt_id and entry.status == 'settled'
                 and entry.logical_call_id == call_id}
-                if saved.get('execution_protocol') == 'shared.v1' else sessions)
+                if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS else sessions)
             if len(checkpoint_sessions) != 1:
                 raise ValueError('Inspection checkpoint has no unique original conversation session')
             session_id, = checkpoint_sessions
             try:
                 checkpoint_entries(self.workspace.ledger, attempt_id,
                     session_id, call_id=call_id,
-                    completed_retry=saved.get('execution_protocol') == 'shared.v1')
+                    completed_retry=saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS)
             except ValueError:
                 continue  # Unknown/inflight work is not adopted and its fees remain.
             view = store.read_json('memory_input.json')
@@ -3330,7 +3359,7 @@ class InspectionToolGateway:
                 owner='inspection', before_turn=number)
             refs = checkpoint_artifacts(store=store, ledger=self.workspace.ledger, attempt_id=attempt_id,
                 session_id=session_id, call_id=call_id,
-                completed_retry=saved.get('execution_protocol') == 'shared.v1',
+                completed_retry=saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS,
                 bind_notes=lambda notes:self._bind_conversation_notes(notes, rows))
             expected = {store.resolve(ref.path).relative_to(self.store.root).as_posix() for ref in refs}
             if set(recorded) != expected or view['archive_through_turn'] > number:
@@ -3372,7 +3401,7 @@ class InspectionToolGateway:
         # Shared targets and evidence use the common material selector. Legacy
         # owners keep target text in their required domain input.
         materials = ([*saved['targets'], *saved['evidence']]
-            if saved.get('execution_protocol') == 'shared.v1' else saved['evidence'])
+            if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS else saved['evidence'])
         materials = [row for row in materials if row.get('readable')]
         if self._applicable_scope(saved):
             # Earlier windows of different current objects should have a fair
@@ -3444,7 +3473,7 @@ class InspectionToolGateway:
 
         def followup(value):
             nonlocal last_floor
-            last_floor = {'llm_requests':1, 'total_tokens':conversation.tokens(project(True))}
+            last_floor = conversation.request_resources(project(True))
             return last_floor
 
         def shared_checkpoint(checkpoint_input, *, restore_floor):
@@ -3602,7 +3631,7 @@ class InspectionToolGateway:
             checkpoint=None if checkpoint_input is not None else checkpoint,
             followup=followup,
             force_close=remaining[0] <= 0, additional=True,
-            exit_first=saved.get('execution_protocol') == 'shared.v1')
+            exit_first=saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS)
         return conversation, value
 
     def _legacy_inspection_input(self, saved, request, messages, tools, terminal, client, finish, number, remaining):
@@ -3786,7 +3815,7 @@ class InspectionToolGateway:
         Neither file identity nor a previous opinion supplies a text window.
         """
         def save_observations():
-            if saved.get('execution_protocol') == 'shared.v1':
+            if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS:
                 # This existing field is the allowance before sources-0. Keep
                 # it beside each primed read so interruption cannot renew quota.
                 saved['initial_read_remaining'] = remaining[0]
@@ -4027,7 +4056,7 @@ class InspectionToolGateway:
                  remaining: list[int], client: Any, *, dispatch: Callable | None = None) -> dict:
         """One native conversation; the existing owner binds its final opinion."""
         input_path = self._path(identity,'input')
-        shared = saved.get('execution_protocol') == 'shared.v1'
+        shared = saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS
         if shared and dispatch is None:
             raise ValueError('Shared inspection needs the outer dispatcher')
         read_names = {'read_file','list_directory','search_files'}
@@ -4443,7 +4472,7 @@ class InspectionToolGateway:
             package = (isinstance(delivery_context, dict)
                 and delivery_context.get('schema_version') == 'delivery_review.v3')
             applicable = applicable_delivery_scope(delivery_context or {})
-            if applicable and (not self.adaptive or self.execution_protocol != 'shared.v1'
+            if applicable and (not self.adaptive or self.execution_protocol not in _SHARED_EXECUTION_PROTOCOLS
                     or self.coverage_policy != 'offered.v2' or self.finding_policy != 'linked.v1'):
                 raise ValueError('Applicable inspection requires shared offered coverage and linked findings')
             if package and not self.adaptive:
@@ -4462,7 +4491,7 @@ class InspectionToolGateway:
                 if (prior_required is not None and saved.get('finding_policy') == 'linked.v1'
                         and saved.get('prior_required') != prior_required):
                     raise ValueError('Inspection identity is bound to different prior concerns; no replay')
-                if saved.get('execution_protocol') == 'shared.v1':
+                if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS:
                     if not self.store.exists(self._path(identity, 'result')):
                         return ToolResult(tool_name=name, data={'inspection_pending':identity})
                     return self._resume_shared_result(saved, identity)
@@ -4485,10 +4514,10 @@ class InspectionToolGateway:
                 saved['coverage_policy'] = self.coverage_policy
             if self.finding_policy is not None:
                 saved['finding_policy'] = self.finding_policy
-            if self.execution_protocol == 'shared.v1':
+            if self.execution_protocol in _SHARED_EXECUTION_PROTOCOLS:
                 if self.operation_specs is None or self.operation_call is None:
                     raise ValueError('Shared inspection requires the actual operation specs and operation gateway')
-                saved['execution_protocol'] = 'shared.v1'
+                saved['execution_protocol'] = self.execution_protocol
                 saved['source_priming_policy'] = 'priority.v1'
                 saved['source_provenance'] = 'versions.v2'
             if self.protocol:
@@ -4548,7 +4577,7 @@ class InspectionToolGateway:
                 else:
                     saved['prior_work_opinions'] = (self.feedback_provider(sorted(delivery_context['artifacts']))
                         if self.feedback_provider else [])
-            if saved.get('execution_protocol') != 'shared.v1':
+            if saved.get('execution_protocol') not in _SHARED_EXECUTION_PROTOCOLS:
                 self.store.write_json(input_path, saved)
             saved['evidence'] = [self._observe(value, f'evidence-{i + 1}', identity, remaining)
                                  for i, value in enumerate(request.evidence)]
@@ -4564,12 +4593,12 @@ class InspectionToolGateway:
             saved['prior_required'] = (deepcopy(prior_required) if package and self.finding_policy == 'linked.v1'
                 else self._prior(saved['targets'], current_policy=saved.get('coverage_policy') == 'offered.v2',
                     linked=self.finding_policy == 'linked.v1'))
-            if saved.get('execution_protocol') == 'shared.v1':
+            if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS:
                 saved['initial_read_remaining'] = remaining[0]
                 saved['immutable_paths'] = [row['path'] for row in [*saved['targets'], *saved['evidence']]
                     if row.get('path')]
             self.store.write_json(input_path, saved)
-            if saved.get('execution_protocol') == 'shared.v1':
+            if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS:
                 return ToolResult(tool_name=name, data={'inspection_pending':identity})
             receipt = {'identity': identity, 'completed': False,
                        'input_sha256': self._digest(input_path)}
@@ -4608,7 +4637,7 @@ class InspectionToolGateway:
         """Resume the journal outside the parent attempt; the caller owns child attempts."""
         input_path = self._path(identity, 'input')
         saved = self.store.read_json(input_path)
-        if saved.get('identity') != identity or saved.get('execution_protocol') != 'shared.v1':
+        if saved.get('identity') != identity or saved.get('execution_protocol') not in _SHARED_EXECUTION_PROTOCOLS:
             raise ValueError('Inspection is not bound to the shared execution protocol')
         if saved.get('protocol') != self.protocol:
             raise ValueError('Inspection identity is bound to a different protocol; no replay')

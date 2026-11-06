@@ -113,8 +113,8 @@ class WorkLifecycleTests(unittest.TestCase):
                 {'model': 'fixture'}, [], {}, 100)):
             config, _, _, _ = ToolApplication.preview_creation(Path('unused'), 'Do useful work',
                 model='fixture', sources={})
-        self.assertEqual(config['work_lifecycle'], 'integrated.v2')
-        self.assertEqual(config['work_selection_policy'], 'outcomes.v1')
+        self.assertEqual(config['work_lifecycle'], 'integrated.v3')
+        self.assertEqual(config['work_selection_policy'], 'native.v4')
         app, _ = self.app()
         app.state['turns'] = [{'reply': 'attempts/decision/native_result.json'}]
         app.session.store = SimpleNamespace(exists=lambda _: True, read_json=Mock())
@@ -132,15 +132,15 @@ class WorkLifecycleTests(unittest.TestCase):
         app = ToolApplication.create(case.root, 'Explain the supplied observations in a note.',
             model='fixture', sources={'measurements': case.inputs}, services=case.services,
             max_turns=8, max_tokens=900000, tool_contracts='on_demand')
-        self.assertEqual(app.state['config']['work_lifecycle'], 'integrated.v2')
+        self.assertEqual(app.state['config']['work_lifecycle'], 'integrated.v3')
         app = ToolApplication.load(case.root, services=case.services)
         before = app.ledger.to_dict()
         context = json.loads(app._messages(client=app._client())[1]['content'])
         self.assertIn('candidate_submission',
             {row['kind'] for row in context['delivery_conditions']['conditions']})
-        self.assertEqual({row['function']['name'] for row in app.schemas}, {'select_work'})
-        self.assertIn('review_result', {row['function']['name']
-            for row in context['work_selection']['operations']})
+        self.assertNotIn('work_selection', context)
+        self.assertIn('review_result', {row['function']['name'] for row in app.schemas})
+        self.assertNotIn('select_work', {row['function']['name'] for row in app.schemas})
         self.assertEqual(app.ledger.to_dict(), before)
         case.send.assert_not_called()
 

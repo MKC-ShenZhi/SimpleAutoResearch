@@ -114,6 +114,10 @@ class OutcomeQueueTests(unittest.TestCase):
         case.app = ToolApplication.create(case.root, 'Prepare a bounded note from the supplied observations.',
             model='fixture', sources={'measurements': case.inputs}, services=case.services,
             allow_execution=True, max_turns=24, max_tokens=900000, tool_contracts='on_demand')
+        # This suite exercises the saved outcome interpreter, not new defaults.
+        case.app.state['config'].update(work_selection_policy='outcomes.v1',
+            work_lifecycle='integrated.v2', inspection_execution_protocol='shared.v1')
+        case._reload()
         self.assertEqual(case.app.state['config']['work_selection_policy'], 'outcomes.v1')
         self.assertEqual(case.app.state['config']['work_lifecycle'], 'integrated.v2')
         case._reload()
