@@ -227,6 +227,7 @@ class _ReuseDeclaration(BaseModel):
     session: str
     results: list[str]
     prior_drafts: list[str] = Field(default_factory=list)
+    version: int | None = Field(default=None, ge=1)
 
 
 class _CreationDeclarations(BaseModel):
@@ -442,6 +443,8 @@ class ToolApplication:
         from simple_ar.app.professional_conversation import NATIVE_HISTORY_POLICY
         if config.get('native_history_policy') not in (None, NATIVE_HISTORY_POLICY):
             raise ValueError('Unsupported saved native history policy')
+        if config.get('document_context_policy') not in (None, 'working.v1'):
+            raise ValueError('Unsupported saved document context policy')
         if config.get('memory_protocol') not in {None, 'journal.v1'}:
             raise ValueError('Unsupported saved working memory; no silent migration')
         if config.get('native_supply_policy') is not None and config['native_supply_policy'] not in RECEIPT_SUPPLY_POLICIES:
@@ -481,11 +484,8 @@ class ToolApplication:
             raise ValueError('Offered inspection coverage requires the shared subject inspection contract')
         if config.get('professional_operations') is not None and config['professional_operations'] not in PROFESSIONAL_CONTRACTS:
             raise ValueError('Unsupported saved professional operation contract; no silent migration')
-        for alias, snapshot in config.get('source_snapshots', {}).items():
-            source = Path(config['sources'][alias])
-            if (not source.is_file() or source.stat().st_size != snapshot['size_bytes']
-                    or hashlib.sha256(source.read_bytes()).hexdigest() != snapshot['sha256']):
-                raise ValueError('Retained source snapshot changed: '+alias)
+        from simple_ar.tools.materials import verify_source_snapshots
+        verify_source_snapshots(config['sources'], config.get('source_snapshots', {}))
         if config.get('professional_work') is not None or config.get('result_investigation') is not None:
             raise ValueError('Operation control cannot acquire a historical professional controller')
         coordination = [CommonToolSpec(name='load_tools',domain='coordination',permission_level='plan',
@@ -562,11 +562,8 @@ class ToolApplication:
         if config.get('control_protocol') is not None:
             self._configure_operations()
             return
-        for alias, snapshot in config.get('source_snapshots', {}).items():
-            path = Path(config['sources'][alias])
-            if (not path.is_file() or path.stat().st_size != snapshot['size_bytes']
-                    or hashlib.sha256(path.read_bytes()).hexdigest() != snapshot['sha256']):
-                raise ValueError('Retained source snapshot changed: ' + alias)
+        from simple_ar.tools.materials import verify_source_snapshots
+        verify_source_snapshots(config['sources'], config.get('source_snapshots', {}))
         if (type(config.get('tool_contracts', 'full')) is not str
                 or config.get('tool_contracts', 'full') not in _TOOL_CONTRACT_MODES):
             raise ValueError('Unknown saved tool-contract mode; do not silently change historical tasks')
@@ -1821,6 +1818,23 @@ class ToolApplication:
                 config['sources'][name] = str(Path(root).resolve() / relative)
                 config['source_snapshots'][name] = {'original_path': str(original),
                     'sha256': hashlib.sha256(content).hexdigest(), 'size_bytes': len(content)}
+        origin = config.get('creation_declarations', {}).get('reuse_origin', {})
+        if origin.get('version') is not None and not retained:
+            from simple_ar.tools.delivery_versions import DeliveryVersions
+            alias = 'retained_delivery'
+            if alias in config['sources']:
+                raise ValueError('retained_delivery is reserved for selected historical input')
+            selected, inputs = DeliveryVersions(Path(origin['session'])).snapshot(
+                origin['version'], origin['results'], max_bytes=max_snapshot_bytes)
+            relative = 'evidence/inputs/' + alias
+            if (Path(root) / relative).exists():
+                raise ValueError('Retained input destination already exists')
+            reused_inputs.extend((relative + '/' + path, content) for path, content in inputs)
+            config['sources'][alias] = str(Path(root).resolve() / relative)
+            config.setdefault('source_snapshots', {})[alias] = selected
+            declarations = config['creation_declarations']
+            declarations.setdefault('material_roles', {}).setdefault('material', []).append(alias)
+            origin['prior_drafts'] = [alias + '/' + path for path in selected['groups'].get('report', [])]
         if max_output_tokens is not None:
             config['max_output_tokens'] = max_output_tokens
         limits = {"llm_requests": max_turns, "total_tokens": max_tokens,
@@ -1880,6 +1894,7 @@ class ToolApplication:
                     config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
                     from simple_ar.app.professional_conversation import NATIVE_HISTORY_POLICY
                     config['native_history_policy'] = NATIVE_HISTORY_POLICY
+                    config['document_context_policy'] = 'working.v1'
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = 'native.v3'
         return config, reused, limits, attempts
@@ -1947,6 +1962,14 @@ class ToolApplication:
     @classmethod
     def load(cls, root: Path, *, services: Any | None = None) -> ToolApplication:
         return cls(SessionController.load(root, registry=CapabilityRegistry()), services=services)
+
+    @staticmethod
+    def creation_binding(prepared: tuple) -> tuple:
+        """Stable creation evidence; owned snapshot destinations depend on the new task root."""
+        config, inputs, limits, attempts = deepcopy(prepared)
+        for alias in config.get('source_snapshots', {}):
+            config['sources'][alias] = 'retained-input:' + alias
+        return config, inputs, limits, attempts
 
     def _save(self) -> None:
         self.session.store.write_json("actions.json", self.state)
@@ -2173,6 +2196,7 @@ class ToolApplication:
                           'inspection_coverage_policy', 'inspection_finding_policy',
                           'delivery_review_protocol', 'publication_assets', 'professional_operations', 'memory_protocol',
                           'context_checkpoint_policy', 'work_method', 'native_supply_policy', 'context_authority',
+                          'native_history_policy', 'document_context_policy',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
                     if field in old:

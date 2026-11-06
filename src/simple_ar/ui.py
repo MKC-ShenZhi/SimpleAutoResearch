@@ -190,6 +190,10 @@ class Workspace:
             args.request = data['goal']
             args.model = data['model']
             args.source = [Path(p) for p in data['materials']]
+            if data.get('from_session'):
+                args.from_session = Path(data['from_session'])
+                args.reuse = data.get('reuse', ['artifacts'])
+                args.reuse_version = data.get('reuse_version')
             args.allow_execution = data.get('execution') is True
             args.allow_network = data.get('network') is True
             for field, destination in (('max_turns', 'max_turns'), ('max_tokens', 'max_tokens'),
@@ -262,7 +266,8 @@ class Workspace:
             name, profile = load_model_catalog().select(purpose='image')
             image = {'profile': name, **profile.model_dump(mode='json')}
         frozen = dict(goal=args.request, task_config=str(args.task_config) if args.task_config else None,
-                      config_digest=config_digest, options=options, configuration=result, image=image)
+                      config_digest=config_digest, options=options,
+                      configuration=ToolApplication.creation_binding(result), image=image)
         seal = hmac.new(self.creation_key, json.dumps(frozen, sort_keys=True, default=str,
             allow_nan=False).encode(), hashlib.sha256).hexdigest()
         return seal, image
@@ -316,6 +321,15 @@ class Workspace:
             result = dict(label='历史交付 / 未验证为当前请求成果', current=False,
                           summary=saved.get('summary'), unresolved=saved.get('unresolved', []),
                           limitations=saved.get('limitations', []), files=[])
+            from simple_ar.tools.delivery_versions import DeliveryVersions
+            try:
+                result['versions'] = [dict(number=number, status=row['status'],
+                    summary=row['delivery'].get('summary'), file_count=len(row['files']),
+                    origin=dict(from_session=str(root), reuse_version=number, reuse=['artifacts']))
+                    for number, row in enumerate(DeliveryVersions(root,
+                        authorize=lambda path: bounded(path, root)).versions(), 1)]
+            except (OSError, ValueError, KeyError, TypeError):
+                result['versions'] = []
             worker = self.workers.get(name)
             if (worker and worker[0].is_alive() or state.get('pending')
                     or manifest['status'] not in {'completed', 'partial'} or not state['turns']

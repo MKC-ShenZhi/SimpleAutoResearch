@@ -185,6 +185,7 @@ Place `notes.md` beside the file. All fields below belong to `[task]`; paths use
 | `max_images` | Paid image generation/edit submissions | Integer `0` | New ledger limit |
 | `from_session` | Saved task supplying delivered materials | Optional path string | New work, not resume |
 | `reuse` | Registered result groups, e.g. artifacts | Distinct nonempty string list `[]`; pair with from_session | Byte-checked reuse, no inherited permissions/usage |
+| `reuse_version` | Retained delivery version to use with from_session/reuse | Optional positive integer; omission selects current delivery | Creation snapshots selected bytes and layout; original task state and budget are not inherited |
 | `extensions` | Explicit trusted local packages | Path string list `[]` | New selection; [details](#trusted-local-packages) |
 
 Unknown fields/types fail. The file must contain exactly one `[task]` table, at most 64 KiB. It has no arbitrary keys for model-selected search methods or task strategy.

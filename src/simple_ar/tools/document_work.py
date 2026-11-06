@@ -79,7 +79,8 @@ class _CandidateSelectionError(ValueError):
 
 def _system_for(binding: dict) -> str:
     systems = {'document_work_operation.v1': _SYSTEM,
-        'document_work_operation.v2': _CANDIDATE_SYSTEM, 'document_work_operation.v3': _MATERIAL_ID_SYSTEM}
+        'document_work_operation.v2': _CANDIDATE_SYSTEM, 'document_work_operation.v3': _MATERIAL_ID_SYSTEM,
+        'document_work_operation.v4': _MATERIAL_ID_SYSTEM}
     if binding['contract'] not in systems:
         raise ValueError('Unknown saved document work contract')
     return systems[binding['contract']]
@@ -196,7 +197,10 @@ class DocumentWorkToolGateway:
                  work_context: Callable[[list[str]], dict] | None = None,
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
                  material_roots: Callable[[], list[str]] | None = None,
-                 sources: Any | None = None) -> None:
+                 sources: Any | None = None, context_policy: str | None = None) -> None:
+        if context_policy not in (None, 'working.v1'):
+            raise ValueError('Unknown document context policy')
+        self.context_policy = context_policy
         self.root, self.workspace, self.ledger, self.session_id = Path(root), workspace, ledger, session_id
         self.client_factory, self.work_context = client_factory, work_context
         self.material_observations, self.material_roots, self.sources = material_observations, material_roots, sources
@@ -339,7 +343,8 @@ class DocumentWorkToolGateway:
                 error=str(exc), data={'receipt_directory': f'records/{identity}/document_work'} if store else {},
                 metadata={'material_observations': windows} if windows else {})
 
-    def _admit(self, store: ArtifactStore, request: WorkDocumentRequest, identity: str) -> dict:
+    def _admit(self, store: ArtifactStore, request: WorkDocumentRequest, identity: str,
+               *, context_input_tokens: int | None = None) -> dict:
         supplied = self.material_roots() if self.material_roots is not None else []
         if not isinstance(supplied, list) or any(not isinstance(row, str) for row in supplied):
             raise ValueError('Original material roots provider must return a list of locators')
@@ -407,13 +412,16 @@ class DocumentWorkToolGateway:
             'original_source_bundles': source_views,
             'inventory_scope': [item.get('inventory_scope', '') for item in inventories],
             'omitted_files': [row for item in inventories for row in item.get('omitted_files', [])]}
-        if len(json.dumps(base, ensure_ascii=False).encode('utf-8')) > 256000:
+        if self.context_policy is None and len(json.dumps(base, ensure_ascii=False).encode('utf-8')) > 256000:
             raise ValueError('Document work input exceeds 256 KB; narrow the work unit without dropping feedback')
         source_paths = {row['path'] for row in source_views}
         seed = material_observation_seed(workspace=self.workspace, inventories=inventories,
             provider=self.material_observations, roots=roots, context=base,
-            excluded_paths=source_paths | ({prior_path} if prior_path else set()))
-        binding = {'contract': 'document_work_operation.v3', 'request_sha256': _digest(request.model_dump(mode='json')),
+            excluded_paths=source_paths | ({prior_path} if prior_path else set()),
+            **({'remaining_bytes': context_input_tokens * 4}
+               if self.context_policy else {}))
+        binding = {'contract': 'document_work_operation.v4' if self.context_policy else 'document_work_operation.v3',
+            'request_sha256': _digest(request.model_dump(mode='json')),
             'context': base, 'inventories': inventories, 'seed': seed}
         store.write_json('input.json', binding)
         return binding
@@ -530,7 +538,9 @@ class DocumentWorkToolGateway:
                 + '. Use the supplied delivery_path IDs, retain referenced prior assets, or remove the unsupported link.')
 
     def _produce(self, store: ArtifactStore, request: WorkDocumentRequest, identity: str) -> None:
-        binding = self._admit(store, request, identity)
+        client = self.client_factory(identity) if self.context_policy else None
+        binding = self._admit(store, request, identity,
+            context_input_tokens=client._settings.context_input_tokens if client else None)
         context = binding['context']
         visible = {row['path']: row for row in context['candidates']}
         source_views = {row['path']: row for row in context['original_source_bundles']}
@@ -538,7 +548,7 @@ class DocumentWorkToolGateway:
         for row in (binding['seed'] or {}).get('observations', []):
             observations.append({'id': f'o{len(observations) + 1}', 'kind': 'material_window', 'observation': row})
         store.write_json('observations.json', observations)
-        client = self.client_factory(identity)
+        client = client if client is not None else self.client_factory(identity)
         if (getattr(client, '_budget_ledger', None) is not self.ledger
                 or getattr(client, '_budget_session_id', None) != self.session_id
                 or getattr(client, '_budget_attempt_id', None) != identity):
@@ -558,11 +568,16 @@ class DocumentWorkToolGateway:
                     'unread ranges are not. Source passage lookup is not exhaustive.')}
             if preview is not None:
                 prompt['candidate_preview'] = preview
+            projection = None
+            if binding['contract'] == 'document_work_operation.v4':
+                prompt, projection = self._working_input(prompt, observations, client, identity, system)
             serialized = json.dumps(prompt, ensure_ascii=False, allow_nan=False)
-            if len(serialized.encode('utf-8')) > 512000:
+            if projection is None and len(serialized.encode('utf-8')) > 512000:
                 raise ValueError('Document investigation context exceeds 512 KB; preserve the records and narrow the work unit')
             path = f'decisions/{step}'
             snapshot = {'system': system, 'input': prompt, 'budget_call_id': f'{identity}:document:{step}'}
+            if projection is not None:
+                store.write_json(f'{path}/context-selection.json', projection)
             store.write_json(f'{path}/request.json', snapshot)
             before = response_accounting_snapshot(client)
             try:
@@ -628,16 +643,43 @@ class DocumentWorkToolGateway:
                 store.write_json('candidate.json', candidate)
                 return
             feedback, added = self._investigate(store, decision, observations, visible, source_views,
-                seen_reads, seen_queries, identity, step)
+                seen_reads, seen_queries, identity, step,
+                cumulative_capacity=binding['contract'] != 'document_work_operation.v4')
             signature = _digest({'decision': response, 'feedback': feedback})
             if not added:
                 if signature in no_progress:
                     raise ValueError('Repeated investigation made no progress; inspect retained read failures')
                 no_progress.add(signature)
 
+    @staticmethod
+    def _working_input(prompt: dict, observations: list[dict], client: Any, identity: str, system: str) -> tuple[dict, dict]:
+        """The common selector owns presentation; the complete journal stays intact."""
+        from simple_ar.core.working_context import select_working_context
+        from simple_ar.integrations.llm import estimate_tokens
+        base = {key: value for key, value in prompt.items() if key != 'observations'}
+
+        def present(messages):
+            context = json.loads(messages[1]['content'])
+            view = context.pop('working_view')
+            context['observations'] = [json.loads(row['observation']['text']) for row in view['observations']]
+            return [messages[0], {'role': 'user', 'content': json.dumps(context, ensure_ascii=False)}]
+
+        messages, selection = select_working_context(user_requests=[], system_text=system,
+            base_context=base, turn_blocks=[], observations=[{
+                'record': f'records/{identity}/document_work/observations.json', 'field': str(index),
+                'turn': index, 'kind': 'operation_result', 'role': 'historical_observation',
+                'text': json.dumps(row, ensure_ascii=False)} for index, row in enumerate(observations)],
+            schema_tokens=0, context_token_target=client._settings.context_input_tokens,
+            estimate_tokens=estimate_tokens, material_policy='retained',
+            native_observations=[], message_projector=present,
+            history_access='the saved document observation IDs; request a focused unread window when needed')
+        if selection['context_exceeds_input_target']:
+            raise ValueError('Required document goal, feedback and draft exceed the saved model input capacity; no request sent')
+        return json.loads(messages[1]['content']), selection
+
     def _investigate(self, store: ArtifactStore, decision: _Decision, observations: list[dict],
                      visible: dict, source_views: dict, seen_reads: set, seen_queries: set,
-                     identity: str, step: int) -> tuple[list[dict], bool]:
+                     identity: str, step: int, *, cumulative_capacity: bool = True) -> tuple[list[dict], bool]:
         feedback, added = [], False
         for window in decision.read_windows:
             try:
@@ -655,7 +697,7 @@ class DocumentWorkToolGateway:
                 remaining = 96000 - sum(len(row['observation']['data']['text']) for row in observations
                     if row['kind'] == 'material_window')
                 available = size if window.start_line is not None else max(0, size - window.offset_bytes)
-                if min(window.max_bytes, available) > remaining:
+                if cumulative_capacity and min(window.max_bytes, available) > remaining:
                     raise ValueError('Window exceeds remaining observed-text capacity; request a narrower window')
                 args = window.model_copy(update={'full_digest': True}).model_dump(exclude_unset=True)
                 row = read_material_window(self.workspace, args, identity=identity)
@@ -694,7 +736,7 @@ class DocumentWorkToolGateway:
         return feedback, added
 
     def _selected_sources(self, binding: dict, attachments: list[str]) -> list[str]:
-        if binding['contract'] == 'document_work_operation.v3':
+        if binding['contract'] in {'document_work_operation.v3', 'document_work_operation.v4'}:
             inventory = {row['delivery_path']: row['path'] for row in binding['context']['candidates']}
             if len(attachments) != len(set(attachments)) or any(item not in inventory for item in attachments):
                 raise _CandidateSelectionError('Attachments must be distinct delivery_path IDs from the supplied inventory')
@@ -850,7 +892,7 @@ class DocumentWorkToolGateway:
             'coverage': {'omitted_files': binding['context']['omitted_files'],
                 'scope': 'Inventory and observed windows are bounded; unread content is not evidence of absence.'},
             'gaps': gaps, 'receipt': f'records/{identity}/document_work/receipt.json'}
-        if binding['contract'] in {'document_work_operation.v2', 'document_work_operation.v3'}:
+        if binding['contract'] in {'document_work_operation.v2', 'document_work_operation.v3', 'document_work_operation.v4'}:
             data['measurements'] = manuscript_measurements(markdown)
         result = ToolResult(tool_name='work_document', data=data, artifacts=artifacts,
             metadata={'material_observations': self._material_observations(saved_observations)},

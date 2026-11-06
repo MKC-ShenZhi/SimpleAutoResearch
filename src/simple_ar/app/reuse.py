@@ -27,19 +27,25 @@ class ReuseSelection:
     groups: dict[str, list[Path]]
     project: tuple[Path, dict | None, dict] | None
     package_mounts: tuple[Path, ...]
+    version: int | None = None
 
     @property
     def materials(self) -> list[Path]:
+        if self.version is not None:
+            return []  # The creation owner snapshots the selected retained layout.
         return list(dict.fromkeys(path for name in self.names if name != 'code_project'
                                   for path in self.groups[name]))
 
     @property
     def prior_drafts(self) -> list[str]:
+        if self.version is not None:
+            return []
         return [str(self.groups['report'][0])] if 'report' in self.names else []
 
     @property
     def origin(self) -> dict:
-        return {'session': str(self.root), 'results': list(self.names)}
+        return {'session': str(self.root), 'results': list(self.names),
+            **({'version': self.version} if self.version is not None else {})}
 
 
 def _native_project(reader: RetainedDelivery) -> tuple[Path, dict | None, dict] | None:
@@ -74,7 +80,7 @@ def _native_project(reader: RetainedDelivery) -> tuple[Path, dict | None, dict] 
 
 
 def select_reuse(root: Path, names: list[str] | tuple[str, ...], *,
-                 access: ReuseAccess | None = None) -> ReuseSelection:
+                 access: ReuseAccess | None = None, version: int | None = None) -> ReuseSelection:
     """Select current byte-proved groups; never carry execution authority forward.
 
     Admission callbacks apply before reading proof/material bytes. A directory
@@ -89,6 +95,15 @@ def select_reuse(root: Path, names: list[str] | tuple[str, ...], *,
     selected = tuple(dict.fromkeys(names))
     if not selected:
         raise ValueError('Select registered result names with --reuse; inspect with results SESSION.')
+    if version is not None:
+        from simple_ar.tools.delivery_versions import DeliveryVersions
+        owner = DeliveryVersions(root, authorize=access.authorize)
+        groups = owner.material_paths(version)
+        if any(name not in groups for name in selected):
+            raise ValueError('Selected retained version has no requested portable result group')
+        if access.preflight is not None:
+            access.preflight([path for name in selected for path in groups[name]])
+        return ReuseSelection(root, selected, groups, None, (), version)
     manifest = read_json(root / 'session_manifest.json')
     project = None
     if manifest.get('transition_recipe') == 'native-tools-v1':
@@ -151,11 +166,15 @@ def session_project(session, *, authorize=None) -> tuple[Path, dict | None, dict
     return workspace, manifest, policy
 
 
-def session_materials(root: Path, *, authorize=None, include_project: bool = True) -> dict[str, list[Path]]:
+def session_materials(root: Path, *, authorize=None, include_project: bool = True,
+                      version: int | None = None) -> dict[str, list[Path]]:
     """Resolve current registered deliveries, not arbitrary historical files."""
     if authorize is not None:
         authorize(root)
     root = root.resolve()
+    if version is not None:
+        from simple_ar.tools.delivery_versions import DeliveryVersions
+        return DeliveryVersions(root, authorize=authorize).material_paths(version)
     if authorize is not None:
         authorize(root)
         authorize(root / 'session_manifest.json')

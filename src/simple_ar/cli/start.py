@@ -147,6 +147,7 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--guided", action="store_true", help="Choose an outcome preference for the native task; explicit protocol controls retain structured compatibility.")
     parser.add_argument("--kind", choices=tuple(FUNCTION_LABELS), help="Starting preference for native creation, or explicit structured protocol. Does not grant execution or network access.")
     parser.add_argument("--from-session", type=Path, help="Reuse registered results or a validated project from an existing session.")
+    parser.add_argument("--reuse-version", type=int, help="Explicit retained delivery version from results SESSION; portable inputs for new work.")
     parser.add_argument("--reuse", action="append", default=[],
                         help="Registered result name shown by results SESSION; repeatable. Materials can serve any goal. code_project retains its saved edit scope and checker.")
     parser.add_argument("--chat", action="store_true", help="Opt-in model-assisted technical setup for explicit structured protocols, not the ordinary native preference entry. Requires a terminal and model connection.")
@@ -254,7 +255,7 @@ def migrate_new_start(args: argparse.Namespace, *, reuse_access: ReuseAccess | N
             roles = _native_material_roles(args)
             args.source = list(dict.fromkeys(Path(value) for values in roles.values() for value in values))
             return True
-    reuse_inputs = bool(args.from_session or args.reuse)
+    reuse_inputs = bool(args.from_session or args.reuse or getattr(args, 'reuse_version', None) is not None)
     registered_origin = getattr(args, '_reuse_origin', None)
     if reuse_inputs and "code_project" in args.reuse:
         if args.chat or args.resume_setup or hasattr(args, '_setup_state'):
@@ -262,6 +263,7 @@ def migrate_new_start(args: argparse.Namespace, *, reuse_access: ReuseAccess | N
         registered_origin = {'session': str(args.from_session.resolve()) if args.from_session else None,
                              'results': list(args.reuse)}
         reuse_session_materials(args, native=True, access=reuse_access)
+        registered_origin = args._reuse_origin
         reuse_inputs = False
     if hasattr(args, '_reuse_edit_policy') and args.kind == 'reproduction':
         return False
@@ -324,6 +326,7 @@ def migrate_new_start(args: argparse.Namespace, *, reuse_access: ReuseAccess | N
         reuse_origin = {"session": str(args.from_session.resolve()) if args.from_session else None,
                         "results": list(args.reuse)}
         reuse_session_materials(args, native=True, access=reuse_access)
+        reuse_origin = args._reuse_origin
     if args.goal and args.request:
         raise ValueError("Use either the positional request or --goal, not both.")
     goal = args.request if args.request is not None else args.goal
@@ -874,9 +877,10 @@ def _reproduction_options(args: argparse.Namespace, *, interactive: bool) -> dic
             "process_invocations": invocations, "process_wall_seconds": timeout * invocations}
 
 
-def session_materials(root: Path, *, authorize=None, include_project: bool = True) -> dict[str, list[Path]]:
+def session_materials(root: Path, *, authorize=None, include_project: bool = True,
+                      version: int | None = None) -> dict[str, list[Path]]:
     """Compatibility entry for scripts; retained reading belongs to app.reuse."""
-    return _session_materials(root, authorize=authorize, include_project=include_project)
+    return _session_materials(root, authorize=authorize, include_project=include_project, version=version)
 
 
 def reuse_session_materials(args: argparse.Namespace, *, native: bool = False,
@@ -884,7 +888,7 @@ def reuse_session_materials(args: argparse.Namespace, *, native: bool = False,
     root = getattr(args, "from_session", None)
     selected = getattr(args, "reuse", [])
     if root is None:
-        if selected:
+        if selected or getattr(args, 'reuse_version', None) is not None:
             raise ValueError("--reuse requires --from-session.")
         return
     root = root.resolve()
@@ -892,7 +896,7 @@ def reuse_session_materials(args: argparse.Namespace, *, native: bool = False,
         raise ValueError("Select registered result names with --reuse; inspect with results SESSION.")
     if 'code_project' in selected and (args.project or args.validate or args.allow):
         raise ValueError("Select code_project or an explicit project/scope/checker; do not override the selected project's proof in the same request.")
-    selection = select_reuse(root, selected, access=access)
+    selection = select_reuse(root, selected, access=access, version=getattr(args, 'reuse_version', None))
     args._reuse_origin = selection.origin
     if native:
         args.source = list(dict.fromkeys([*args.source, *selection.package_mounts]))

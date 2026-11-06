@@ -90,6 +90,7 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--kind CHOICE` | Outcome preference; exact protocol options can select structured compatibility. Does not grant access. Choices: `survey`, `bug_fix`, `reproduction`, `writing`, `data_analysis`, `figure`, `code`. | Unset |
 | `--from-session PATH` | Reuse deliveries from this session; pair with --reuse. | Unset |
 | `--reuse NAME` | Registered result name shown by results; repeatable. code_project retains its edit scope/checker. | [] |
+| `--reuse-version N` | Select a retained delivery version with --from-session and --reuse; copy portable inputs into the new task with their original layout. | Unset: current delivery |
 | `--scripted` | With --kind data_analysis, use native code/analysis; commands still need individual approval. | Off |
 | `--goal TEXT` | Goal text, instead of the positional request. | Unset |
 | `--document PATH` | Local reference paper; repeatable. Ordinary native input rejects URLs; reproduction --chat can acquire public HTTPS papers after confirmation. | [] |
@@ -251,12 +252,14 @@ simple-ar results SESSION [OPTIONS]
 | Parameter | Meaning | Default or conditions |
 | --- | --- | --- |
 | `SESSION` | Session directory whose current deliveries are listed. | Required |
+| `--version N` | List portable groups from this retained delivery version, even while later work is paused. | Unset: current delivery and version inventory |
 
 Examples:
 
 ```bash
 simple-ar results SESSION
 simple-ar start --from-session SESSION --reuse code_project --goal "Revise the figure legend"
+simple-ar start --from-session SESSION --reuse artifacts --reuse-version 1 --goal "Continue from the first delivered version"
 ```
 
 

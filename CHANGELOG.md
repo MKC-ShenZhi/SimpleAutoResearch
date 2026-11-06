@@ -9,6 +9,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
+- New document work selects actual observations through the shared model-capacity view while retaining complete source records. Retained delivery versions can become new task inputs through CLI, task configuration or the workspace, preserving file layout and independent permissions and accounting.
 - Source work shares the journal's material and note selection instead of treating an authorized directory as a permanent selection of its entire history. Working input favors recent revision material while keeping explicit source selections, file-version checks and original receipts.
 - Professional source work can use authorized publication, document and visual services without taking over task delivery. Role transitions can finish a batch, a professional return remains available at the resource boundary, and independent inspection can copy a project into its own work directory. Optional delivery effects remain with the task owner.
 

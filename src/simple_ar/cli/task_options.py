@@ -13,7 +13,7 @@ import tomllib
 FIELDS = {
     'request': str, 'model': str, 'source': list, 'output_root': str,
     'kind': str, 'project': str, 'document': list, 'material': list,
-    'extensions': list, 'from_session': str, 'reuse': list,
+    'extensions': list, 'from_session': str, 'reuse': list, 'reuse_version': int,
     'data_file': str, 'data_path': list,
     'project_python': str, 'allow_execution': bool, 'allow_network': bool,
     'allow_vision': bool, 'max_images': int, 'max_turns': int, 'max_tokens': int,
@@ -81,7 +81,7 @@ def validate_resume_options(args: argparse.Namespace) -> None:
     creation = set(getattr(args, '_explicit_start_destinations', ())) & {
         'max_turns', 'max_tokens', 'max_images', 'max_processes',
         'max_process_seconds', 'project_python', 'output_root',
-        'extensions', 'from_session', 'reuse',
+        'extensions', 'from_session', 'reuse', 'reuse_version',
     }
     creation.update(name for name in ('max_processes', 'max_process_seconds')
                     if getattr(args, name, None) is not None)
@@ -161,6 +161,7 @@ def write_task_config(args: argparse.Namespace) -> bool:
         'material': 'Local notes, prior drafts or result packages; not independently verified evidence.',
         'from_session': 'Previous task with current byte-checked delivered materials; creates new work, not a resume or inherited budget.',
         'reuse': 'Named groups from results SESSION, e.g. artifacts or report. Names are not filesystem paths; pair with from_session.',
+        'reuse_version': 'Explicit retained delivery version from results SESSION; portable input bytes for a new task, independent of current completion.',
         'data_file': 'Existing data file. No column assumptions or experiment execution are implied.',
         'data_path': 'Additional read-only data files/directories.',
         'project_python': 'Python entry path, preserving a virtualenv symlink; relative paths use this file location. Saved task environments do not change on resume.',

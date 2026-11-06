@@ -374,7 +374,8 @@ class OperationTools:
                 client_factory=lambda identity: client_factory(identity, 'writing'),
                 work_context=work_context, material_observations=material_observations,
                 material_roots=lambda: [str(path) for alias, path in self.workspace.mounts.items()
-                    if alias not in {'workspace', 'records'}], sources=self.sources)
+                    if alias not in {'workspace', 'records'}], sources=self.sources,
+                context_policy=config.get('document_context_policy'))
             self.registry.register_package(document_work_tool_specs(), self.document, request_visible=True)
             self.system += (' For coherent manuscript drafting or substantive document revision, work_document '
                 'owns investigation of actual original materials and creates an editable candidate. Supply '

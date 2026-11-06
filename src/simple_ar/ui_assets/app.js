@@ -12,6 +12,7 @@ history.replaceState(null, '', location.pathname);
 let selected = '', snapshot = null, metadata = null, folder = '', previewURL = '', listingKey = '', activityKey = '', deliveryKey = '';
 let confirmation = null, confirmationSending = false, actionSending = false, creationPreviewSending = false, viewEpoch = 0, refreshSequence = 0, previewSequence = 0;
 let previewTarget = null;
+let reuseOrigin = null;
 let viewKey = '', view = {selected: '', tasks: {}, create: {}};
 const createFields = ['taskConfig', 'goal', 'materials', 'profile', 'turns', 'tokens', 'processes', 'seconds', 'network', 'execution'];
 function persistView() {
@@ -21,8 +22,8 @@ function persistView() {
 }
 function saveDrafts() {
   if (!viewKey) return;
-  view.create = Object.fromEntries(createFields.map(id => [id,
-    $(id).type === 'checkbox' ? $(id).checked : $(id).value]));
+  view.create = {...Object.fromEntries(createFields.map(id => [id,
+    $(id).type === 'checkbox' ? $(id).checked : $(id).value])), reuseOrigin};
   if (selected) {
     const previous = view.tasks[selected] || {};
     const feedback = $('feedback').value;
@@ -315,6 +316,17 @@ async function refresh() {
     paragraph($('delivery'), delivery.current ? '当前请求交付' : '历史交付 / 未验证为当前请求成果');
     paragraph($('delivery'), delivery.label);
     paragraph($('delivery'), delivery.summary || '尚无交付摘要');
+    for (const version of delivery.versions || []) {
+      if (version.status !== 'retained') continue;
+      const button = document.createElement('button'); button.className = 'secondary';
+      button.textContent = '用第 ' + version.number + ' 版成果新建任务（' + version.file_count + ' 文件）';
+      button.onclick = () => {
+        selectTask(''); reuseOrigin = version.origin; $('taskConfig').value = '';
+        $('reuseSummary').textContent = '已选择历史成果第 ' + version.number + ' 版；新任务复制其原布局，原任务及账本保留。';
+        creationMode(); saveDrafts(); refresh().catch(error => notice(error.message)); $('goal').focus();
+      };
+      $('delivery').append(button);
+    }
     paragraph($('delivery'), '原交付记录的未解决事项（不认证科研质量）：', 'hint');
     if (delivery.unresolved?.length) {
       for (const diagnostic of delivery.unresolved) paragraph($('delivery'), diagnostic, 'receipt');
@@ -417,7 +429,7 @@ async function previewFile(values, row) {
     else { const label = document.createElement('p'); label.textContent = '该格式请下载查看（PDF 不嵌入活动文档）。'; $('preview').append(label); }
   } catch (error) { notice(error.message); }
 }
-$('new').onclick = () => { selectTask(''); refresh().catch(e => notice(e.message)); };
+$('new').onclick = () => { selectTask(''); reuseOrigin = null; $('reuseSummary').textContent = ''; saveDrafts(); refresh().catch(e => notice(e.message)); };
 $('profile').onchange = recipient;
 $('createForm').onsubmit = async event => {
   event.preventDefault();
@@ -427,7 +439,7 @@ $('createForm').onsubmit = async event => {
     model: $('profile').value, binding_id: metadata.profiles.find(p => p.selector === $('profile').value)?.binding_id,
     max_turns: Number($('turns').value), max_tokens: Number($('tokens').value),
     process_invocations: Number($('processes').value), process_wall_seconds: Number($('seconds').value),
-    network: $('network').checked, execution: $('execution').checked};
+    network: $('network').checked, execution: $('execution').checked, ...(reuseOrigin || {})};
   const epoch = viewEpoch;
   creationPreviewSending = true; confirmationControls();
   try {
@@ -515,6 +527,8 @@ async function poll() {
       const saved = JSON.parse(sessionStorage.getItem(viewKey) || 'null');
       if (saved && typeof saved.selected === 'string' && saved.tasks && saved.create) view = saved;
     } catch (_) { /* Unavailable or obsolete browser storage cannot block task recovery. */ }
+    reuseOrigin = view.create.reuseOrigin || null;
+    $('reuseSummary').textContent = reuseOrigin ? '已选择历史成果第 ' + reuseOrigin.reuse_version + ' 版；将在新任务中使用。' : '';
     for (const id of createFields) {
       const value = view.create[id];
       if ($(id).type === 'checkbox' && typeof value === 'boolean') $(id).checked = value;

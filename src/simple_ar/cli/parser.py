@@ -21,6 +21,7 @@ def build_parser(
     add_start_parser(subparsers)
     results = subparsers.add_parser("results", help="List current reusable session deliveries without executing a task.")
     results.add_argument("session", type=Path)
+    results.add_argument("--version", type=int, help="List portable groups from one explicitly selected retained delivery version.")
     image = subparsers.add_parser("image", help="Generate or edit one concept image with a named Images profile; preserve each version separately.")
     image.add_argument("--prompt", required=True)
     image.add_argument("--input", type=Path, help="Existing image to edit; the original is never overwritten.")

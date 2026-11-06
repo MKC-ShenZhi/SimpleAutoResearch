@@ -216,19 +216,27 @@ def main(argv: Sequence[str] | None = None) -> None:
         from simple_ar.core.capabilities import CapabilityRegistry
         try:
             session = SessionController.load(args.session, registry=CapabilityRegistry())
-            deliveries = session_materials(args.session)
+            deliveries = session_materials(args.session, version=args.version)
         except (OSError, ValueError) as exc:
             raise SystemExit(f"Cannot read deliveries: {exc}") from exc
         for name, paths in deliveries.items():
             print_line(f"{name}: " + ", ".join(str(path) for path in paths))
         if not deliveries:
-            print_line("No current reusable delivery. The session may be incomplete.")
+            print_line("No current reusable delivery. The session may be incomplete." if args.version is None
+                else "No portable files in the selected retained delivery.")
         if "code_project" in deliveries:
             print_line("Revise code/figure: simple-ar start --from-session SESSION --reuse code_project --goal 'Your changes'")
         if session.manifest.transition_recipe == ToolApplication.RECIPE:
             print_line(f"Status: {session.manifest.status}")
-            if session.manifest.status in {"completed", "partial"}:
-                delivery = session.store.read_json("delivery.json")
+            for line in _delivery_version_lines(args.session):
+                print_line(line)
+            if args.version is not None or session.manifest.status in {"completed", "partial"}:
+                if args.version is not None:
+                    from simple_ar.tools.delivery_versions import DeliveryVersions
+                    delivery = DeliveryVersions(args.session).select(args.version)['delivery']
+                    print_line(f"Historical delivery version: {args.version}; current request status is unchanged")
+                else:
+                    delivery = session.store.read_json("delivery.json")
                 print_line(delivery["summary"])
                 for limitation in delivery.get("unresolved", []):
                     print_line(f"Unresolved: {limitation}")
@@ -2450,17 +2458,17 @@ def _delivery_version_lines(root: Path) -> list[str]:
     lines = [f'Retained byte versions / 已保留字节版本: {retained}']
     if not retained and (root / 'delivery.json').is_file():
         lines.append('Historical delivery bytes unavailable / 历史交付缺少可还原字节；不会从当前文件补建。')
-    for version in versions:
+    for number, version in enumerate(versions, 1):
         if version['status'] != 'retained':
-            lines.append(f"- request={version['request_count']}; "
+            lines.append(f"- version={number}; request={version['request_count']}; "
                 f"unavailable / 历史字节不可还原; observation={version['observation']}")
             continue
         receipt = version['observation'].rsplit('/', 1)[0] + '/delivery-version/receipt.json'
-        lines.append(f"- request={version['request_count']}; files={len(version['files'])}; "
+        lines.append(f"- version={number}; request={version['request_count']}; files={len(version['files'])}; "
             f"binding={version['binding']}; receipt={receipt}")
     if retained:
-        lines.append('Select receipt.files[original].blob (session-relative exact bytes) and sha256; '
-            'copy to a NEW destination. / 按回执选择原文件对应的字节副本与摘要，复制到新目标。')
+        lines.append('Reuse: simple-ar start --from-session SESSION --reuse artifacts --reuse-version N --goal "Your changes"; '
+            'new work snapshots the selected version. / 新任务按原布局保全所选历史版本，不续行旧任务。')
         lines.append('Retained bytes do not establish current completion or scientific acceptance. / '
             '保留字节不代表当前请求完成或科研验收。')
     return lines

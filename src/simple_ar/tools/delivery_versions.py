@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import tempfile
 
@@ -19,9 +19,9 @@ _OBSERVATION = re.compile(r'attempts/[A-Za-z0-9][A-Za-z0-9_-]{0,100}/native_resu
 
 
 class DeliveryVersions:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, authorize=None):
         from simple_ar.tools.workspace import RetainedDelivery
-        self.reader = RetainedDelivery(root)
+        self.reader = RetainedDelivery(root, authorize=authorize)
         self.root = self.reader.root
 
     def _path(self, relative: str) -> Path:
@@ -118,6 +118,91 @@ class DeliveryVersions:
             rows.append({'observation': record, 'request_count': count, 'delivery': delivery,
                 'files': {}, 'binding': 'unavailable', 'status': 'unavailable', 'reason': reason})
         return rows
+
+    def select(self, version: int) -> dict:
+        """Select an explicit retained delivery, independently of current work."""
+        rows = self.versions()
+        if type(version) is not int or not 1 <= version <= len(rows):
+            raise ValueError('Select an existing retained delivery version number')
+        selected = rows[version - 1]
+        if selected['status'] != 'retained':
+            raise ValueError('Selected delivery has no retained bytes; current files cannot reconstruct it')
+        return selected
+
+    def materials(self, version: int) -> dict[str, dict[str, dict]]:
+        """Portable groups from the selected receipt; no live-output dependency."""
+        selected = self.select(version)
+        files = selected['files']
+        groups = {'artifacts': dict(files)} if files else {}
+        for turn in self.reader.state['turns']:
+            for item in turn['tools']:
+                try:
+                    result = self.reader.record(item['result'])
+                except (OSError, ValueError, KeyError, TypeError):
+                    if item['result'] == selected['observation']:
+                        raise
+                    continue  # An unrelated missing opinion cannot erase captured input bytes.
+                if result.get('status') == 'ok':
+                    hashes = (result.get('data') or {}).get('artifact_sha256', {})
+                    for name, locators in result.get('metadata', {}).get('reusable_materials', {}).items():
+                        if name != 'code_project' and locators and all(
+                                path in files and hashes.get(path) == files[path]['sha256'] for path in locators):
+                            groups[name] = {path: files[path] for path in locators}
+                if item['result'] == selected['observation']:
+                    return groups
+        raise ValueError('Selected delivery no longer belongs to the original journal')
+
+    def snapshot(self, version: int, names: list[str], *, max_bytes: int) -> tuple[dict, list[tuple[str, bytes]]]:
+        """Prepare exact selected input bytes for a NEW task's evidence mount.
+
+        The existing creation transaction writes these bytes. No cache, old-task
+        write, execution permission or current completion is created here.
+        """
+        groups = self.materials(version)
+        if not names or any(name not in groups for name in names):
+            raise ValueError('Selected version does not contain every requested portable result group')
+        files = {path: row for name in names for path, row in groups[name].items()}
+        result, sources, layout, total = [], {}, {}, 0
+        for locator, row in files.items():
+            path = PurePosixPath(locator.replace('\\', '/'))
+            if path.is_absolute():
+                try:
+                    path = path.relative_to(self.root.as_posix())
+                except ValueError:
+                    candidates = []
+                    for alias, mount in self.reader.mounts.items():
+                        original = PurePosixPath(mount.as_posix())
+                        if path == original:
+                            candidates.append(PurePosixPath(alias) / path.name)
+                        elif original in path.parents:
+                            candidates.append(PurePosixPath(alias) / path.relative_to(original))
+                    if not candidates:
+                        raise ValueError('Retained external files have no portable source layout') from None
+                    path = min(candidates, key=lambda value: len(value.parts))
+            if not path.parts or any(part in {'', '.', '..'} for part in path.parts):
+                raise ValueError('Retained delivery has no safe source-relative layout')
+            relative = path.as_posix()
+            layout[locator] = relative
+            blob = self._path(row['blob'])
+            total += row['size_bytes']
+            if total > max_bytes:
+                raise ValueError('Selected retained inputs exceed max_snapshot_bytes; narrow the selected groups')
+            with blob.open('rb') as stream:
+                content = stream.read(row['size_bytes'] + 1)
+            if len(content) != row['size_bytes'] or hashlib.sha256(content).hexdigest() != row['sha256']:
+                raise ValueError('Retained delivery bytes changed; no input snapshot created')
+            if relative in sources:
+                raise ValueError('Retained delivery has conflicting portable paths')
+            sources[relative] = {'sha256': row['sha256'], 'size_bytes': len(content)}
+            result.append((relative, content))
+        if self.reader.record('actions.json') != self.reader.state:
+            raise ValueError('Task changed during retained input selection')
+        return {'session': str(self.root), 'version': version, 'results': list(names), 'files': sources,
+            'groups': {name: [layout[path] for path in groups[name]] for name in names}}, result
+
+    def material_paths(self, version: int) -> dict[str, list[Path]]:
+        return {name: [self._path(row['blob']) for row in files.values()]
+            for name, files in self.materials(version).items()}
 
     def _discard_stage(self, stage: Path, identity: dict) -> None:
         """Validate the entire owned stage before removing only known files.

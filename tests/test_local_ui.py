@@ -32,6 +32,35 @@ def call(name, arguments, identity='test-call'):
 
 
 class LocalWorkspaceTests(unittest.TestCase):
+    def test_historical_version_preview_and_creation_share_the_same_input_binding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            tasks = base/'tasks'
+            old = ToolApplication.create(tasks/'old', 'Retain a useful first version', model=None, sources={})
+            old.run(actions=[call('write_file', {'path': 'note.md', 'content': 'Retained original.',
+                'delivery': {'summary': 'First version', 'artifacts': ['note.md']}})], progress=lambda _: None)
+            old.run(feedback='Revise later', actions=[call('ask_user', {'question': 'Which revision?'})], progress=lambda _: None)
+            records = {p: p.read_bytes() for p in (tasks/'old').rglob('*.json')}
+            catalog = base/'models.toml'
+            catalog.write_text('version = 1\n[routes]\ndefault="offline"\n[profiles.offline]\n'
+                'api="openai_chat"\nbase_url="https://offline.invalid/v1"\nmodel="fixture"\n'
+                'api_key_env="SAR_UI_TEST_KEY"\ncapabilities=["text","code"]\n', encoding='utf-8')
+            with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(catalog), 'SAR_UI_TEST_KEY': 'fixture'}), \
+                    patch.object(LLMClient, '_complete_request', side_effect=AssertionError('No provider traffic')):
+                workspace = Workspace(base, [], tasks)
+                data = dict(goal='Explain this retained version', materials=[], model='profile:offline',
+                    binding_id=workspace.connection('profile:offline')[1], max_turns=4, max_tokens=100000,
+                    process_invocations=0, process_wall_seconds=0, execution=False, network=False,
+                    from_session=str(tasks/'old'), reuse_version=1, reuse=['artifacts'])
+                preview = workspace.preview_creation(data)
+                self.assertEqual(preview['creation_declarations']['reuse_origin']['version'], 1)
+                created = workspace.mutate(dict(data, op='create', confirmed=True, preview_id=preview['preview_id']))
+                fresh = ToolApplication.load(tasks/created['task'])
+                retained = Path(fresh.state['config']['sources']['retained_delivery'])
+                self.assertEqual((retained/'workspace/note.md').read_text(), 'Retained original.')
+                self.assertFalse(fresh.ledger.entries)
+                self.assertEqual({p: p.read_bytes() for p in records}, records)
+
     def _reuse_project(self, root, *, sources=None):
         app = ToolApplication.create(root, 'Deliver a complete editable project', model=None,
             sources=sources or {}, process_limits={'process_invocations': 2, 'process_wall_seconds': 10})

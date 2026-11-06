@@ -21,6 +21,57 @@ def action(name, arguments):
 
 
 class DeliveryVersionTests(unittest.TestCase):
+    def test_paused_task_history_becomes_exact_new_inputs_without_inheriting_task_state(self):
+        first = self.deliver()
+        self.assertEqual(first['status'], 'completed')
+        self.app.run(feedback='Revise later; preserve the first version.', actions=[
+            action('ask_user', {'question': 'Which interpretation should be revised?'})], progress=lambda _: None)
+        self.assertNotEqual(self.app.session.manifest.status, 'completed')
+        self.script.unlink()
+        records = {p: p.read_bytes() for p in (self.root/'actions.json', self.root/'session_manifest.json',
+            self.root/'budget_ledger.json', self.root/'delivery.json')}
+        from simple_ar.app.reuse import select_reuse
+        selection = select_reuse(self.root, ['artifacts'], version=1)
+        self.assertFalse(selection.materials)
+        from simple_ar.cli.start import native_arguments, migrate_new_start, native_creation_options
+        args = native_arguments()
+        args.model = ''
+        args.request, args.from_session, args.reuse = 'Continue from the retained formal version', self.root, ['artifacts']
+        args.reuse_version, args.max_turns, args.max_tokens = 1, 3, 12345
+        with patch('sys.stdin.isatty', return_value=False):
+            self.assertTrue(migrate_new_start(args))
+        options = native_creation_options(args)
+        self.assertEqual(options['creation_declarations']['reuse_origin']['version'], 1)
+        fresh = ToolApplication.create(self.base/'fresh', args.request, **options)
+        copied = Path(fresh.state['config']['sources']['retained_delivery'])
+        self.assertEqual((copied/'workspace/program.py').read_bytes(), b'value = 1\r\n')
+        self.assertEqual((copied/'workspace/figure.bin').read_bytes(), b'\x00first\xff')
+        self.assertEqual(fresh.ledger.limits['llm_requests'], 3)
+        self.assertFalse(fresh.ledger.entries)
+        self.assertFalse((fresh.session.store.root/'delivery.json').exists())
+        self.assertEqual(fresh.state['config']['creation_declarations']['reuse_origin']['version'], 1)
+        self.assertEqual({p: p.read_bytes() for p in records}, records)
+        from simple_ar.ui import Workspace
+        shown = Workspace(self.base, [], self.base).delivery('task')
+        self.assertFalse(shown['current'])
+        self.assertEqual(shown['versions'][0]['origin']['reuse_version'], 1)
+        self.assertEqual(shown['versions'][0]['file_count'], 2)
+        ToolApplication.load(fresh.session.store.root)
+        (copied/'workspace/figure.bin').write_bytes(b'Changed retained input')
+        with self.assertRaisesRegex(ValueError, 'Retained source snapshot changed'):
+            ToolApplication.load(fresh.session.store.root)
+        retained = DeliveryVersions(self.root).select(1)['files']['workspace/program.py']
+        blob = self.root/retained['blob']
+        original = blob.read_bytes()
+        try:
+            blob.write_bytes(b'Wrong history')
+            with self.assertRaisesRegex(ValueError, 'Retained delivery bytes changed'):
+                ToolApplication.create(self.base/'refused', 'Do not reconstruct from changed history', model=None,
+                    sources={}, creation_declarations={'reuse_origin': selection.origin})
+            self.assertFalse((self.base/'refused/session_manifest.json').exists())
+        finally:
+            blob.write_bytes(original)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

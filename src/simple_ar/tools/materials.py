@@ -975,6 +975,27 @@ def observed_window_key(workspace: Any, request: FileWindow, data: dict) -> tupl
         data['next_offset_bytes'], data['sha256'])
 
 
+def verify_source_snapshots(sources: dict, snapshots: dict) -> None:
+    """Validate frozen file/tree input bytes without rebuilding missing history."""
+    for alias, snapshot in snapshots.items():
+        root = Path(sources[alias])
+        files = snapshot.get('files')
+        if files is None:
+            files = {'': snapshot}
+        else:
+            if not root.is_dir() or root.is_symlink() or root.is_junction():
+                raise ValueError('Retained source snapshot changed: ' + alias)
+            paths = list(root.rglob('*'))
+            if (any(p.is_symlink() or p.is_junction() for p in paths)
+                    or {p.relative_to(root).as_posix() for p in paths if p.is_file()} != set(files)):
+                raise ValueError('Retained source snapshot changed: ' + alias)
+        for name, row in files.items():
+            path = root / name if name else root
+            if (not path.is_file() or path.stat().st_size != row['size_bytes']
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != row['sha256']):
+                raise ValueError('Retained source snapshot changed: ' + alias)
+
+
 def read_material_window(workspace: Any, request: dict, *, identity: str,
                          expected: dict | None = None, cache: dict | None = None,
                          on_observation: Callable[[dict], None] | None = None) -> dict:

@@ -55,7 +55,9 @@ interpretation hands work back to coordination without certifying task completio
 Producers return editable, version-bound candidates; delivery owns independent acceptance.
 File-level operations belong to producers and inspectors; explicit caller APIs
 remain available. Loading a schema cannot transfer that responsibility to the
-coordinating model. Document work can preview literal text measurements and revise
+coordinating model. New document work selects whole recorded observations through
+the shared model-capacity selector; the complete journal remains available for
+provenance and recovery. Document work can preview literal text measurements and revise
 locally on the shared budget. Coordination receives the candidate text and measurements;
 these are neither independent evidence nor an acceptance verdict. Historical receipts
 keep their original recovery contract. An explicit delivery independently checks the actual version; a partial exit discloses the

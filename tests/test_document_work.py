@@ -2,6 +2,7 @@
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -26,6 +27,7 @@ class _Client:
         self._budget_attempt_id = identity
         self.decide = decide
         self.calls = []
+        self._settings = SimpleNamespace(context_input_tokens=24000)
 
     def ask_json(self, system, prompt, *, label, budget_call_id):
         view = json.loads(prompt)
@@ -42,6 +44,52 @@ class _Client:
 
 
 class DocumentWorkTests(unittest.TestCase):
+    def test_shared_context_keeps_large_observation_history_without_a_cumulative_read_gate(self):
+        root, source, ledger, workspace = self.workspace()
+        for number in range(1, 6):
+            (source / f'part-{number}.txt').write_text(str(number) * 40000, encoding='utf-8')
+
+        def decide(view, count):
+            self.assertLessEqual(view['working_context']['estimated_input_tokens'], 24000)
+            if count <= 5:
+                return {'action': 'investigate', 'read_windows': [
+                    {'path': f'source0/part-{count}.txt', 'max_bytes': 40000}]}
+            self.assertLess(len(view['observations']), 5)
+            self.assertIn('o5', [row['id'] for row in view['observations']])
+            return {'action': 'finish', 'manuscript_markdown': '# Account\nFive original records retained.\n',
+                'selected_observation_ids': [f'o{i}' for i in range(1, 6)]}
+
+        gateway, clients = self.gateway(root, source, ledger, workspace, decide)
+        gateway.context_policy = 'working.v1'
+        result = gateway.call('work_document', {'goal': 'Account for the five supplied original records'}, identity='large')
+        self.assertTrue(result.ok, result)
+        self.assertEqual(len(clients[0].calls), 6)
+        self.assertEqual(len(result.metadata['material_observations']), 5)
+        retained = json.loads((root/'attempts/large/document_work/observations.json').read_text())
+        self.assertEqual(sum(len(row['observation']['data']['text']) for row in retained), 200000)
+        self.assertEqual(len(result.data['provenance']['evidence']), 5)
+        calls, charges = len(clients[0].calls), ledger.to_dict()
+        self.assertTrue(gateway.call('work_document', {'goal': 'Account for the five supplied original records'}, identity='large').ok)
+        self.assertEqual(len(clients[0].calls), calls)
+        self.assertEqual(ledger.to_dict(), charges)
+
+    def test_required_document_input_is_checked_against_model_capacity_before_purchase(self):
+        root, source, ledger, workspace = self.workspace()
+        gateway, clients = self.gateway(root, source, ledger, workspace,
+            lambda *_: self.fail('An overflowing required input cannot buy a response'))
+        gateway.context_policy = 'working.v1'
+        factory = gateway.client_factory
+        def constrained(identity):
+            client = factory(identity)
+            client._settings.context_input_tokens = 1000
+            return client
+        gateway.client_factory = constrained
+        result = gateway.call('work_document', {'goal': 'Original requested condition. ' * 400}, identity='overflow')
+        self.assertFalse(result.ok)
+        self.assertIn('saved model input capacity', result.error)
+        self.assertFalse(clients[0].calls)
+        self.assertFalse(ledger.entries)
+
     def workspace(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         source = root / 'source'

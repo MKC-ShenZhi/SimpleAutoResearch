@@ -496,6 +496,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.app.state['config']['professional_operations'] = professional_contract
         if professional_contract != 'work.v11':
             self.app.state['config'].pop('native_history_policy', None)
+            self.app.state['config'].pop('document_context_policy', None)
         # Existing fixtures retain their saved implicit choice contract; the
         # explicit transition chain is exercised in test_goal_work_method.
         if selection_policy is None:
