@@ -1071,7 +1071,7 @@ class WorkspaceToolGateway:
         return {'binding': binding,
             'token': self.approval_digest({'call': call, 'inputs': binding})}
 
-    def _process_artifact_path(self, value: str, cwd: str, *, write: bool = False) -> Path:
+    def resolve_process_artifact(self, value: str, cwd: str, *, write: bool = False) -> Path:
         """One coordinate rule for approval, execution and observation provenance."""
         if (self.process_artifact_paths == 'cwd.v1' and not Path(value).is_absolute()
                 and (value.startswith('./') or value.split('/')[0] not in self.mounts)):
@@ -1094,10 +1094,10 @@ class WorkspaceToolGateway:
                 process=request.model_dump(exclude_none=True), identity=identity)
             inputs = {self.locator(path): digest for path, digest in versions.items()}
         else:
-            inputs = list(dict.fromkeys(self.locator(str(self._process_artifact_path(value, request.cwd)))
+            inputs = list(dict.fromkeys(self.locator(str(self.resolve_process_artifact(value, request.cwd)))
                                         for value in request.inputs))
             inputs = self._version_hashes(inputs)
-        outputs = list(dict.fromkeys(self.locator(str(self._process_artifact_path(value, request.cwd, write=True)))
+        outputs = list(dict.fromkeys(self.locator(str(self.resolve_process_artifact(value, request.cwd, write=True)))
                                      for value in request.outputs))
         if any(self.resolve(value).exists() and not self.resolve(value).is_file() for value in outputs):
             raise ValueError('Declared process outputs must be regular files')
@@ -1234,7 +1234,7 @@ class WorkspaceToolGateway:
                         output(artifact, None)
                     if name == 'run_process' and isinstance(arguments.get('outputs'), list):
                         for declared in arguments['outputs']:
-                            output(str(self._process_artifact_path(declared,
+                            output(str(self.resolve_process_artifact(declared,
                                 arguments.get('cwd', 'workspace'), write=True)), None)
                     hashes = data.get('artifact_sha256')
                     if trusted and isinstance(hashes, dict) and name not in {'finish_professional_work', 'return_source_work'}:

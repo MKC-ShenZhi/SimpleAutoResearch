@@ -705,6 +705,9 @@ class InspectionToolGateway:
             else:
                 self._shared_destination(identity, arguments['cwd'], saved)
             for output in arguments.get('outputs', []):
+                if getattr(self.workspace, 'process_artifact_paths', None) == 'cwd.v1':
+                    output = str(self.workspace.resolve_process_artifact(
+                        output, arguments['cwd'], write=True))
                 self._shared_destination(identity, output, saved)
             if 'delivery' in arguments or 'input_snapshot' in arguments:
                 raise ValueError('Inspection processes cannot deliver or acquire another execution owner')

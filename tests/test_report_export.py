@@ -1936,6 +1936,32 @@ class ProcessArtifactBindingTests(unittest.TestCase):
             old = {'argv':['tool'],'cwd':'workspace/project','outputs':['plot.png']}
             self.assertEqual(legacy.process_artifact_binding(old)['outputs'],['workspace/plot.png'])
 
+    def test_inspection_output_admission_uses_saved_process_coordinates(self):
+        from simple_ar.tools.inspection import InspectionToolGateway
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for policy in ('cwd.v1', None):
+                workspace = WorkspaceToolGateway(root, {}, None, process_artifact_paths=policy)
+                inspector = InspectionToolGateway(root,workspace,lambda _:None)
+                work = workspace.resolve('inspection-work/exam')
+                work.mkdir(parents=True,exist_ok=True)
+                saved = {'identity':'exam','targets':[],'evidence':[]}
+                call = {'function':{'name':'run_process'}}
+                args = {'argv':['tool'],'cwd':'workspace/inspection-work/exam','outputs':['result.csv']}
+                if policy is None:
+                    with self.assertRaisesRegex(ValueError,'own work directory'):
+                        inspector._shared_preflight(saved,call,args)
+                else:
+                    inspector._shared_preflight(saved,call,args)
+                    self.assertEqual(workspace.process_artifact_binding(args)['outputs'],
+                        ['workspace/inspection-work/exam/result.csv'])
+                explicit = {**args,'outputs':['workspace/inspection-work/exam/result.csv']}
+                inspector._shared_preflight(saved,call,explicit)
+                with self.assertRaisesRegex(ValueError,'own work directory'):
+                    inspector._shared_preflight(saved,call,{**args,'outputs':['workspace/outside.csv']})
+
     def test_generic_producer_graph_rejects_stale_sources_and_accepts_explicit_new_run(self):
         from simple_ar.tools.workspace import WorkspaceToolGateway
 
