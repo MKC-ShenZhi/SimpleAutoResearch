@@ -126,7 +126,8 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         case.decisions.extend([_action('write_file', path='feedback.md',
             content='Three supplied observations. No population inference; no sampling design.'),
             _action('deliver_result', summary='Clarified evidence limits', artifacts=['feedback.md'])])
-        case._run(feedback='Clarify that there was no sampling design; retain the prior explanation.')
+        case._run(feedback='Clarify that there was no sampling design; retain the prior explanation.',
+            should_stop=lambda: False)  # Continue through the fixture's prior caller boundary.
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
         self.assertEqual((case.root/'tools/inspection'/proof['identity']/'input.json').read_bytes(), original_input)
         self.assertTrue((case.root/'workspace/final.md').exists())
