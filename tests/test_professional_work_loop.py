@@ -866,7 +866,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._reload()
         self.assertEqual({row['function']['name'] for row in self.app.operation_schemas}, core | {'inspect_table'})
         self.assertNotIn('write_file', view['available_specialists'])
-        self._submit(_action('load_tools', names=['write_file']))
+        self._submit(_action('load_tools', names=['inspect_table','write_file']))
         self._ok('load_tools')
         # Ordinary production and submission share one model/queue; optional
         # discovery does not remove everyday operations or add another owner.
