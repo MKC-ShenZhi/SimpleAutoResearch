@@ -11,10 +11,11 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 - New document work selects actual observations through the shared model-capacity view while retaining complete source records. Retained delivery versions can become new task inputs through CLI, task configuration or the workspace, preserving file layout and independent permissions and accounting.
 - Source work shares the journal's material and note selection instead of treating an authorized directory as a permanent selection of its entire history. Working input favors recent revision material while keeping explicit source selections, file-version checks and original receipts.
-- Professional source work can use authorized publication, document and visual services without taking over task delivery. Role transitions can finish a batch, a professional return remains available at the resource boundary, and independent inspection can copy a project into its own work directory. Optional delivery effects remain with the task owner.
+- New ordinary tasks can investigate, edit and run approved commands in the shared loop, then submit useful candidates directly to delivery for independent acceptance. Mandatory source-role handoffs are retired from this path; saved tasks retain their original behavior. Independent inspection can copy projects into its own work directory.
 
 ### Fixed
 
+- New ordinary process artifact declarations resolve plain relative paths against the command working directory consistently across approval, execution and provenance; explicit mount access and historical declarations keep their saved rules.
 - New task and inspection conversations can continue from closed tool outcomes when a provider reply lacks required reasoning history, preserving the original reply, executed effects and charges without replaying operations or inventing reasoning. Saved task contracts keep their original behavior.
 
 ## 2026-11-05

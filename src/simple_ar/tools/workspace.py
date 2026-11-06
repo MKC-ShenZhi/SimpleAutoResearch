@@ -348,7 +348,8 @@ def resolve_mounted_path(mounts: dict[str, Path], value: str, *, write: bool = F
     return candidate
 
 
-def workspace_tool_specs(*, candidate_review: bool = False) -> list[CommonToolSpec]:
+def workspace_tool_specs(*, candidate_review: bool = False,
+                         process_artifact_paths: str | None = None) -> list[CommonToolSpec]:
     specs = []
     for name, (model, description, permission) in _TOOLS.items():
         if name == 'review_result' and not candidate_review:
@@ -358,6 +359,12 @@ def workspace_tool_specs(*, candidate_review: bool = False) -> list[CommonToolSp
             # Professional execution supplies this owner reference internally.
             # Ordinary commands retain their explicit file-list contract.
             schema['properties'].pop('input_snapshot')
+            if process_artifact_paths == 'cwd.v1':
+                for field in ('inputs', 'outputs'):
+                    schema['properties'][field]['description'] += (
+                        ' Plain relative paths are relative to cwd, like command file arguments. '
+                        'Explicit mount aliases (workspace/..., source0/...) and absolute paths '
+                        'keep mount semantics; use ./ for a cwd-relative name that matches an alias.')
         if name == "edit_file":
             # Advertise one spelling; saved calls still use the unchanged
             # _Edit validator, without rewriting queued arguments or receipts.
@@ -762,7 +769,10 @@ class WorkspaceToolGateway:
 
     def __init__(self, root: Path, sources: dict[str, Path], ledger: BudgetLedger,
                  project_python: Path | None = None, record_artifacts: Any | None = None,
-                 create_workspace: bool = True) -> None:
+                 create_workspace: bool = True, process_artifact_paths: str | None = None) -> None:
+        if process_artifact_paths not in (None, 'cwd.v1'):
+            raise ValueError('Unsupported saved process artifact paths')
+        self.process_artifact_paths = process_artifact_paths
         self.root = root.resolve()
         # Keep a venv's entry path, not its resolved system-Python symlink.
         self.python = (project_python or Path(sys.executable)).expanduser().absolute()
@@ -1061,12 +1071,17 @@ class WorkspaceToolGateway:
         return {'binding': binding,
             'token': self.approval_digest({'call': call, 'inputs': binding})}
 
-    def process_artifact_binding(self, arguments: dict[str, Any], *, identity: str | None = None) -> dict[str, Any] | None:
-        """Read-only approval hook. Absent declarations preserve historical tokens.
+    def _process_artifact_path(self, value: str, cwd: str, *, write: bool = False) -> Path:
+        """One coordinate rule for approval, execution and observation provenance."""
+        if (self.process_artifact_paths == 'cwd.v1' and not Path(value).is_absolute()
+                and (value.startswith('./') or value.split('/')[0] not in self.mounts)):
+            if not value or '\\' in value:
+                raise ValueError('Use a nonempty forward-slash artifact path')
+            value = str(self.resolve(cwd, write=True) / value)
+        return resolve_mounted_path(self.mounts, value, write=write, discovery=True)
 
-        Locators use mount semantics, not command cwd semantics. No execution,
-        directory expansion, argv parsing or authority is implied by this binding.
-        """
+    def process_artifact_binding(self, arguments: dict[str, Any], *, identity: str | None = None) -> dict[str, Any] | None:
+        """Read-only approval hook; absent declarations preserve historical tokens."""
         request = _Run.model_validate(arguments)
         if not request.inputs and not request.outputs and request.input_snapshot is None:
             return None
@@ -1079,10 +1094,10 @@ class WorkspaceToolGateway:
                 process=request.model_dump(exclude_none=True), identity=identity)
             inputs = {self.locator(path): digest for path, digest in versions.items()}
         else:
-            inputs = list(dict.fromkeys(self.locator(str(resolve_mounted_path(self.mounts, value, discovery=True)))
+            inputs = list(dict.fromkeys(self.locator(str(self._process_artifact_path(value, request.cwd)))
                                         for value in request.inputs))
             inputs = self._version_hashes(inputs)
-        outputs = list(dict.fromkeys(self.locator(str(resolve_mounted_path(self.mounts, value, write=True, discovery=True)))
+        outputs = list(dict.fromkeys(self.locator(str(self._process_artifact_path(value, request.cwd, write=True)))
                                      for value in request.outputs))
         if any(self.resolve(value).exists() and not self.resolve(value).is_file() for value in outputs):
             raise ValueError('Declared process outputs must be regular files')
@@ -1219,7 +1234,8 @@ class WorkspaceToolGateway:
                         output(artifact, None)
                     if name == 'run_process' and isinstance(arguments.get('outputs'), list):
                         for declared in arguments['outputs']:
-                            output(declared, None)
+                            output(str(self._process_artifact_path(declared,
+                                arguments.get('cwd', 'workspace'), write=True)), None)
                     hashes = data.get('artifact_sha256')
                     if trusted and isinstance(hashes, dict) and name not in {'finish_professional_work', 'return_source_work'}:
                         for name_, digest in hashes.items():

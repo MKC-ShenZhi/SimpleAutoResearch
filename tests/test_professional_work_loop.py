@@ -494,9 +494,11 @@ class OperationsWorkLoopTests(unittest.TestCase):
         # Existing operation fixtures exercise their saved flat production
         # contract; outcome ownership has its own complete-chain scenario.
         self.app.state['config']['professional_operations'] = professional_contract
-        if professional_contract != 'work.v11':
+        if professional_contract not in {'work.v11', 'work.v12'}:
             self.app.state['config'].pop('native_history_policy', None)
             self.app.state['config'].pop('document_context_policy', None)
+        if professional_contract != 'work.v12':
+            self.app.state['config'].pop('process_artifact_paths', None)
         # Existing fixtures retain their saved implicit choice contract; the
         # explicit transition chain is exercised in test_goal_work_method.
         if selection_policy is None:
@@ -824,11 +826,15 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.state['config']['work_selection_policy'], 'native.v3')
         self.assertIsNone(self.app.operations.selection)
         core = {row['function']['name'] for row in self.app.operation_schemas}
-        self.assertEqual({'prepare_implementation','work_document','ask_user',
-            'deliver_result','load_tools','read_history','list_directory','export_report','update_work_plan'}, core)
-        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v11')
+        self.assertEqual({'read_file','search_files','inspect_project','write_file','edit_file',
+            'copy_file','copy_project','run_process','work_document','ask_user','deliver_result',
+            'load_tools','read_history','list_directory','export_report','update_work_plan'}, core)
+        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v12')
+        self.assertIsNone(self.app.operations.work)
+        self.assertIsNone(self.app.implementation)
         self.assertFalse({'select_work_method',
-            'begin_professional_work','finish_professional_work'} & core)
+            'begin_professional_work','finish_professional_work',
+            'prepare_implementation','return_source_work'} & core)
         optional = {'inspect_table','analyze_table','measure_experiment','analyze_measurements',
             'find_source_passages'}
         self.assertFalse(optional & core)
@@ -861,10 +867,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual({row['function']['name'] for row in self.app.operation_schemas}, core | {'inspect_table'})
         self.assertNotIn('write_file', view['available_specialists'])
         self._submit(_action('load_tools', names=['write_file']))
-        self.assertEqual(self._last('load_tools')['status'], 'blocked')
-        self.assertIn('professional production', self._last('load_tools')['error'])
-        # Explicit caller work is still authorized; only the coordinating model
-        # delegates file-level work to the professional owner.
+        self._ok('load_tools')
+        # Ordinary production and submission share one model/queue; optional
+        # discovery does not remove everyday operations or add another owner.
         self._submit(_action('write_file', path='note.md', content='The supplied table has been inspected.\n'))
         self._ok('write_file')
         self.decisions.extend([

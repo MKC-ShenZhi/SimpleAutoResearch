@@ -1886,6 +1886,56 @@ class ProcessArtifactBindingTests(unittest.TestCase):
             self.assertEqual(runner.call_count, 1)
         return result
 
+    def test_cwd_declarations_preserve_mount_authority_producer_versions_and_recovery(self):
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root/'supplied'
+            source.mkdir()
+            (source/'external.csv').write_bytes(b'original data')
+            workspace = WorkspaceToolGateway(root, {'data':source}, None, process_artifact_paths='cwd.v1')
+            project = workspace.resolve('project')
+            (project/'data').mkdir(parents=True)
+            (project/'script.py').write_bytes(b'producer')
+            (project/'data/local.txt').write_bytes(b'local input')
+            workspace.resolve('root-source.txt').write_bytes(b'root input')
+            args = {'argv':['tool'], 'cwd':'workspace/project',
+                'inputs':['script.py','data/external.csv','./data/local.txt','workspace/root-source.txt'],
+                'outputs':['plot.png','workspace/root-result.txt']}
+            binding = workspace.process_artifact_binding(args)
+            self.assertEqual(set(binding['inputs']), {'workspace/project/script.py', 'data/external.csv',
+                'workspace/project/data/local.txt', 'workspace/root-source.txt'})
+            self.assertEqual(binding['outputs'], ['workspace/project/plot.png','workspace/root-result.txt'])
+            self.assertTrue(self._run(workspace,'bound',args,
+                {'project/plot.png':b'image','root-result.txt':b'result'}).ok)
+            workspace.check_artifact_producers(['project/plot.png','root-result.txt'])
+            receipt = root/'tools/processes/bound/invocation.json'
+            before = receipt.read_bytes()
+            restored = WorkspaceToolGateway(root, {'data':source}, None, process_artifact_paths='cwd.v1')
+            with patch('simple_ar.tools.workspace.run_process') as runner, \
+                    patch('simple_ar.tools.workspace.settle_process_record'):
+                self.assertTrue(restored.call('run_process',args,identity='bound').ok)
+                (project/'script.py').write_bytes(b'changed')
+                self.assertFalse(restored.call('run_process',args,identity='bound').ok)
+                with self.assertRaisesRegex(ValueError,'changed'):
+                    restored.check_artifact_producers(['project/plot.png'])
+                for declaration in ('../escape','data/external.csv','./data/../../escape'):
+                    result = restored.call('run_process',{'argv':['tool'],'cwd':'workspace/project',
+                        'outputs':[declaration]},identity='bad')
+                    self.assertFalse(result.ok, declaration)
+                runner.assert_not_called()
+            self.assertEqual(receipt.read_bytes(),before)
+            (project/'script.py').write_bytes(b'producer')
+            self.assertFalse(self._run(restored,'failed',args,returncode=1).ok)
+            with self.assertRaisesRegex(ValueError,'no successful output binding'):
+                restored.check_artifact_producers(['project/plot.png'])
+            # Saved tasks without this policy retain workspace-relative paths,
+            # even with a non-root cwd. No retroactive approval upgrade.
+            legacy = WorkspaceToolGateway(root, {'data':source}, None)
+            old = {'argv':['tool'],'cwd':'workspace/project','outputs':['plot.png']}
+            self.assertEqual(legacy.process_artifact_binding(old)['outputs'],['workspace/plot.png'])
+
     def test_generic_producer_graph_rejects_stale_sources_and_accepts_explicit_new_run(self):
         from simple_ar.tools.workspace import WorkspaceToolGateway
 

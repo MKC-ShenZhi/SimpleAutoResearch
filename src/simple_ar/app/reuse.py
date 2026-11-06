@@ -67,7 +67,8 @@ def _native_project(reader: RetainedDelivery) -> tuple[Path, dict | None, dict] 
         reader.admit(root / 'budget_ledger.json')
         proof = WorkspaceToolGateway(root,
             {name: path for name, path in reader.mounts.items() if name != 'workspace'},
-            BudgetLedger.load(root / 'budget_ledger.json'), create_workspace=False)
+            BudgetLedger.load(root / 'budget_ledger.json'), create_workspace=False,
+            process_artifact_paths=config.get('process_artifact_paths'))
         project = reader.reusable_code_project(check_producers=lambda locators, **options:
             proof.check_artifact_producers(locators, retained_reader=reader, **options))
         return (project, None, {}) if project is not None else None

@@ -45,6 +45,7 @@ class NativeGoalWorkTests(unittest.TestCase):
         case.setUp()
         self.addCleanup(case.doCleanups)
         case._create(delivery_protocol=None, current_method=True, selection_policy='native.v3',
+            professional_contract='work.v12',
             goal='Prepare a bounded note from the supplied observations; preserve the sources.')
         self.assertEqual(case.app.state['config']['work_selection_policy'], 'native.v3')
         self.assertIsNone(case.app.operations.selection)
@@ -54,23 +55,33 @@ class NativeGoalWorkTests(unittest.TestCase):
             "p.write_text(p.read_text()+'run\\n' if p.exists() else 'run\\n')\n"
             "Path('note.md').write_text('Three supplied observations.\\n')\n")
         case.decisions.append([
-            _action('write_file', path='produce.py', content=program),
-            _action('run_process', argv=[sys.executable,'produce.py'], inputs=['produce.py'],
+            _action('write_file', path='project/produce.py', content=program),
+            _action('run_process', argv=[sys.executable,'produce.py'], cwd='workspace/project', inputs=['produce.py'],
                 outputs=['note.md','executions.txt']),
-            _action('deliver_result', summary='Bounded note', artifacts=['note.md'])])
+            _action('deliver_result', summary='Bounded note', artifacts=['project/note.md'])])
         case._run()
         self.assertEqual(case.app.state['pending']['kind'], 'tool')
-        self.assertTrue((case.root/'workspace/produce.py').exists())
-        self.assertFalse((case.root/'workspace/note.md').exists())
+        self.assertTrue((case.root/'workspace/project/produce.py').exists())
+        self.assertFalse((case.root/'workspace/project/note.md').exists())
         self.assertFalse((case.root/'delivery.json').exists())
         token = case.app.approval_token(case.app.state['pending']['call'])
+        from simple_ar.app.task_view import read_task_view
+        view = read_task_view(case.root, read_record=case.app.session.store.read_json,
+            ledger=case.app.ledger, authorize_execution=lambda: None)
+        self.assertEqual(view['approval']['token'], token)
         case._reload()
+        self.assertEqual(case.app.approval_token(case.app.state['pending']['call']), token)
         case._run(approved_execution=token)
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
-        self.assertEqual((case.root/'workspace/executions.txt').read_text(), 'run\n')
+        self.assertEqual((case.root/'workspace/project/executions.txt').read_text(), 'run\n')
+        self.assertIsNone(case.app.operations.work)
+        self.assertIsNone(case.app.implementation)
+        self.assertTrue(case.inspection_requests)
+        versions = case.app.workspace.artifact_hashes(['project/note.md'])
+        self.assertEqual(case.app.workspace.artifact_sources(versions)['project/note.md']['status'], 'recorded')
         self.assertFalse(list((case.root/'attempts').glob('*/work_choice.json')))
         prefix = deepcopy(case.app.ledger.to_dict()['entries'])
-        initial = (case.root/'workspace/note.md').read_bytes()
+        initial = (case.root/'workspace/project/note.md').read_bytes()
         context = json.loads(case.app._messages()[1]['content'])
         self.assertNotIn('work_selection', context)
         self.assertNotIn('work_plan', context)
@@ -80,8 +91,8 @@ class NativeGoalWorkTests(unittest.TestCase):
             _action('deliver_result', summary='Shortened bounded note', artifacts=['short-note.md'])])
         case._run(feedback='Keep the original and save a shorter note; do not repeat unchanged calculations.')
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
-        self.assertEqual((case.root/'workspace/note.md').read_bytes(), initial)
-        self.assertEqual((case.root/'workspace/executions.txt').read_text(), 'run\n')
+        self.assertEqual((case.root/'workspace/project/note.md').read_bytes(), initial)
+        self.assertEqual((case.root/'workspace/project/executions.txt').read_text(), 'run\n')
         self.assertEqual((case.inputs/'observations.csv').read_bytes(), source)
         self.assertEqual(case.app.ledger.to_dict()['entries'][:len(prefix)], prefix)
         from simple_ar.tools.delivery_versions import DeliveryVersions

@@ -44,53 +44,36 @@ insufficient; they remain subject to the task's permissions.
 POSIX command startup enters process-group supervision before switching to the
 approved working directory and executable; the original argv and environment are preserved.
 
-Ordinary tasks dispatch source and document work from the goal and authorized
-materials. An accepted source assignment runs directly in the shared action loop:
-independent reads and copies can be batched, and investigation, edits, approved
-execution and result interpretation may alternate. It does not wait for a complete
-package before proposing a useful command. Known files and receipts survive a lost
-model reply; unknown charges and physical outcomes remain protected by ordinary
-recovery. Source-only requests prohibit commands. Returning current files and an
-interpretation hands work back to coordination without certifying task completion.
-Producers return editable, version-bound candidates; delivery owns independent acceptance.
-File-level operations belong to producers and inspectors; explicit caller APIs
-remain available. Loading a schema cannot transfer that responsibility to the
-coordinating model. New document work selects whole recorded observations through
-the shared model-capacity selector; the complete journal remains available for
-provenance and recovery. Document work can preview literal text measurements and revise
-locally on the shared budget. Coordination receives the candidate text and measurements;
-these are neither independent evidence nor an acceptance verdict. Historical receipts
-keep their original recovery contract. An explicit delivery independently checks the actual version; a partial exit discloses the
-obstacle and unfinished requirements. No additional action-list interpreter is used.
-The document owner resolves attachment selections from its frozen material inventory;
-correctable selection errors retain the draft and observations in the same work unit.
-Authority or input changes still stop that attempt rather than silently changing its binding.
-Attachment copies in accepted receipts enter the shared provenance graph, retaining
-original execution and failure boundaries; current matching bytes do not invent historical sources.
-Revisions retain referenced local files at their bound relative paths, including
-data and source links. CommonMark local references must resolve to planned outputs
-before materialization; missing links return to the same producer with its draft intact.
-Saved bindings retain their original asset behavior.
-Source producers use the common workspace copy and edit operations; copied bytes
-do not count as a content inspection. Their detailed source operations stay in the
-journal while coordination receives the returned versions, interpretation and gaps.
-The shared history reader and optional-tool discovery remain available inside source work.
-New source roles may use authorized document, publication and visual services, while their
-optional task-delivery fields are excluded from both the offer and action admission.
-Role transitions finish a batch, and a professional return remains an available resource-boundary
-exit without becoming task delivery. Independent inspection uses its own writable work directory.
-When a received reply cannot be continued as native thinking history, new conversations
-present its closed actions and outcomes as historical observations. They retain the original
-reply and effects without fabricating reasoning or replaying tools; old saved contracts stay unchanged.
-Assignments and check recipes are revisable working choices, not new user requirements.
-Saved source generators retain their original execution and recovery behavior.
-Read-only directory navigation remains available for routing work; it is not source
-evidence or a required preliminary inventory for every producer.
-Ordinary coordination submits actual candidates to delivery for independent
-investigation and acceptance. Standalone inspection remains an explicit caller API
-and a saved-contract capability, rather than another coordinator-owned audit loop.
-Recorded work supplies observations, not an inherited action agenda. Saved tasks
-retain their original selection contract.
+New ordinary tasks investigate, copy, edit and propose approved commands in the
+existing shared action loop. There is no mandatory source-assignment/return role
+transition before submitting a candidate. Delivery owns independent investigation
+and acceptance of the actual claim and versions; producers need not finish an
+exhaustive self-audit first. Optional document, publication and other professional
+services retain their own responsibilities. Loading tools grants no authority.
+Saved source-role tasks keep their original scope, handoff and recovery behavior.
+
+For new ordinary tasks, run_process inputs/outputs without a mount prefix resolve
+relative to its cwd, like command file arguments. Explicit mount locators and
+absolute paths retain their access rules; ./ disambiguates a local name that
+matches a mount alias. The workspace owner captures these canonical versions for
+approval, execution and provenance without rewriting the original request. Saved
+tasks without this policy retain their original workspace-relative declarations.
+
+New document work selects recorded observations through the shared model-capacity
+selector while retaining the complete original journal. Its measurements and
+editable candidate are work products, not independent evidence or acceptance.
+Correctable attachment-selection errors retain the draft and observations;
+authority or input changes stop the attempt. Revisions retain referenced local
+files at their bound relative paths, including data and source links. CommonMark
+references must resolve to planned outputs before materialization. Accepted copies
+enter shared provenance; matching bytes alone do not invent historical sources.
+
+Known files and receipts survive a lost model reply; unknown charges and physical
+outcomes remain protected by ordinary recovery. Closed actions and outcomes whose
+reply lacks required reasoning history are presented as historical observations,
+retaining the original reply without fabricated reasoning or replay. Model plans
+and check recipes remain revisable choices, not user requirements. Partial delivery
+discloses unfinished work; standalone inspection and saved contracts stay available.
 
 Independent inspection owns its observations as well as its judgment. File windows
 and original operation outcomes share the bounded working view; compaction notes

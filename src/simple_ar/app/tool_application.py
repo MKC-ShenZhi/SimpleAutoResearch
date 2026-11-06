@@ -445,6 +445,8 @@ class ToolApplication:
             raise ValueError('Unsupported saved native history policy')
         if config.get('document_context_policy') not in (None, 'working.v1'):
             raise ValueError('Unsupported saved document context policy')
+        if config.get('process_artifact_paths') not in (None, 'cwd.v1'):
+            raise ValueError('Unsupported saved process artifact paths')
         if config.get('memory_protocol') not in {None, 'journal.v1'}:
             raise ValueError('Unsupported saved working memory; no silent migration')
         if config.get('native_supply_policy') is not None and config['native_supply_policy'] not in RECEIPT_SUPPLY_POLICIES:
@@ -588,7 +590,8 @@ class ToolApplication:
              "evidence": evidence,
              "records": controller.store.root / "attempts"}, self.ledger,
             project_python=Path(config['project_python']) if config.get('project_python') else None,
-            record_artifacts=self._record_artifacts)
+            record_artifacts=self._record_artifacts,
+            process_artifact_paths=config.get('process_artifact_paths'))
         registry = ToolRegistry()
         registry.register_package(workspace_tool_specs(), self.workspace,
             request_visible={'ask_user', 'deliver_result', 'read_file', 'list_directory'})
@@ -1895,6 +1898,7 @@ class ToolApplication:
                     from simple_ar.app.professional_conversation import NATIVE_HISTORY_POLICY
                     config['native_history_policy'] = NATIVE_HISTORY_POLICY
                     config['document_context_policy'] = 'working.v1'
+                    config['process_artifact_paths'] = 'cwd.v1'
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = 'native.v3'
         return config, reused, limits, attempts
@@ -2196,7 +2200,7 @@ class ToolApplication:
                           'inspection_coverage_policy', 'inspection_finding_policy',
                           'delivery_review_protocol', 'publication_assets', 'professional_operations', 'memory_protocol',
                           'context_checkpoint_policy', 'work_method', 'native_supply_policy', 'context_authority',
-                          'native_history_policy', 'document_context_policy',
+                          'native_history_policy', 'document_context_policy', 'process_artifact_paths',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
                     if field in old:

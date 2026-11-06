@@ -27,8 +27,9 @@ PROTOCOL = 'operations.v1'
 PROFESSIONAL_CONTRACTS = {'work.v1': 'source_owner.v1', 'work.v2': 'source_owner.v2',
                           'work.v3': None, 'work.v4': None, 'work.v5': None,
                           'work.v6': 'source_owner.v2', 'work.v7': 'source_owner.v2',
-                          'work.v8': 'source_owner.v2', 'work.v9': 'source_owner.v3', 'work.v10': None, 'work.v11': None}
-CURRENT_PROFESSIONAL_CONTRACT = 'work.v11'
+                          'work.v8': 'source_owner.v2', 'work.v9': 'source_owner.v3', 'work.v10': None, 'work.v11': None,
+                          'work.v12': None}
+CURRENT_PROFESSIONAL_CONTRACT = 'work.v12'
 SOURCE_WORK_CONTRACTS = frozenset({'work.v10', 'work.v11'})
 PRODUCTION_OWNER_CONTRACTS = frozenset({'work.v6', 'work.v7', 'work.v8', 'work.v9', *SOURCE_WORK_CONTRACTS})
 COORDINATED_OWNER_CONTRACTS = frozenset({'work.v7', 'work.v8', 'work.v9', *SOURCE_WORK_CONTRACTS})
@@ -220,9 +221,11 @@ class OperationTools:
             {**{key: Path(value) for key,value in config['sources'].items()},
              'evidence':evidence, 'records':root/'attempts'}, ledger,
             project_python=Path(config['project_python']) if config.get('project_python') else None,
-            record_artifacts=record_artifacts)
+            record_artifacts=record_artifacts,
+            process_artifact_paths=config.get('process_artifact_paths'))
         self.registry = ToolRegistry()
-        self.registry.register_package(workspace_tool_specs(candidate_review=config.get('work_method') in NATIVE_WORK_METHODS),
+        self.registry.register_package(workspace_tool_specs(candidate_review=config.get('work_method') in NATIVE_WORK_METHODS,
+            process_artifact_paths=config.get('process_artifact_paths')),
             self.workspace, request_visible=True)
         self.sources = SourceToolGateway(root, self.workspace, ledger, policy=config.get('research_policy'),
             authority_revision=config.get('authority_revision', 0), execution_contract=config.get('execution_contract'),
@@ -368,7 +371,7 @@ class OperationTools:
                     'Reuse the candidate and findings for document work or delivery; do not rebuild '
                     'the unit as a separate coordinator-run verification project.')
         self.document = None
-        if professional and config.get('professional_operations') in PRODUCTION_OWNER_CONTRACTS | {'work.v1', 'work.v2'} and config['model'] is not None:
+        if professional and config.get('professional_operations') in PRODUCTION_OWNER_CONTRACTS | {'work.v1', 'work.v2', 'work.v12'} and config['model'] is not None:
             from simple_ar.tools.document_work import DocumentWorkToolGateway, document_work_tool_specs
             self.document = DocumentWorkToolGateway(root, self.workspace, ledger, session_id,
                 client_factory=lambda identity: client_factory(identity, 'writing'),
@@ -447,7 +450,7 @@ class OperationTools:
         self.inspection.operation_specs = lambda: [spec for spec in self.registry.list_specs()
             if (spec.domain == 'workspace' and spec.name in
                 {'read_file', 'list_directory', 'search_files', 'write_file', 'edit_file', 'copy_file', 'run_process',
-                 *({'copy_project'} if config.get('professional_operations') == 'work.v11' else set())}
+                 *({'copy_project'} if config.get('professional_operations') in {'work.v11', 'work.v12'} else set())}
                 or spec.name == 'inspect_images') and self.gateway.policy.is_allowed(spec)[0]]
         self.inspection.operation_call = lambda name, arguments, identity: self.gateway.call(
             ToolCall(tool_name=name, arguments=arguments, trace_id=identity))
@@ -511,7 +514,7 @@ class OperationTools:
                     or spec.domain.startswith('extension:'))
             if spec.name == self.work.return_tool:
                 return False
-        if contract in {'work.v8', 'work.v9', *SOURCE_WORK_CONTRACTS} and spec.domain == 'inspection':
+        if contract in {'work.v8', 'work.v9', 'work.v12', *SOURCE_WORK_CONTRACTS} and spec.domain == 'inspection':
             return False  # Delivery owns independent acceptance; the explicit API remains registered.
         if contract == 'work.v9' and spec.name == 'investigate_implementation':
             return False  # An admitted source unit owns its post-execution interpretation.

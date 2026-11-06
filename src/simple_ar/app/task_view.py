@@ -109,7 +109,7 @@ def _execution_projection(root: Path, manifest: dict, state: dict, ledger: Budge
         **{alias: Path(path) for alias, path in config['sources'].items()},
         'evidence': root / 'evidence', 'records': root / 'attempts'}, ledger,
         project_python=Path(config['project_python']) if config.get('project_python') else None,
-        create_workspace=False)
+        create_workspace=False, process_artifact_paths=config.get('process_artifact_paths'))
     owner = (ImplementationToolGateway(root, workspace, ledger, config['model'], manifest['session_id'])
              if name == 'execute_implementation' else None)
     projection = workspace.execution_approval(call, pending=state['pending'], owner=owner)
