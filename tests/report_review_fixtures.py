@@ -19,6 +19,19 @@ def goal_work_decision(actions, requests, *, policy=None):
     """Encode controlled operation fixtures in the current selector contract."""
     if len(actions) == 1 and actions[0]['tool_name'] == 'select_work':
         return actions
+    if policy == 'outcomes.v1':
+        handoffs = [row for row in actions if row['tool_name'] in {'review_result', 'deliver_result'}]
+        if handoffs:
+            if len(actions) != 1:
+                raise ValueError('Outcome fixtures must observe all selected work before explicitly reviewing or delivering')
+            candidate = handoffs[0]['arguments']
+            review = handoffs[0]['tool_name'] == 'review_result'
+            blocked = not review and bool(candidate.get('unresolved'))
+            return [{'tool_name': 'select_work', 'arguments': {
+                'decision': 'review' if review else 'blocked' if blocked else 'deliver',
+                'actions': [], 'candidate': candidate,
+                **({'stop_reason': candidate['unresolved'][0]} if blocked else {})}}]
+        return [{'tool_name': 'select_work', 'arguments': {'decision': 'work', 'actions': actions}}]
     candidate = None
     if actions and actions[-1]['tool_name'] == 'deliver_result':
         actions, candidate = actions[:-1], actions[-1]['arguments']

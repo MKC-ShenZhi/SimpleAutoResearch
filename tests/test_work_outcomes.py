@@ -3,6 +3,7 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
+import sys
 import unittest
 
 from simple_ar.app.tool_application import ToolApplication
@@ -86,6 +87,23 @@ class OutcomeInterpreterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             WorkSelection.decode(message(decision='review', actions=[], candidate=candidate), 'explicit.v2')
 
+    def test_controlled_fixture_adapter_preserves_work_and_requires_separate_handoffs(self):
+        from tests.report_review_fixtures import goal_work_decision
+        actions = [fixture._action('write_file', path='note.md', content='Useful work.'),
+            fixture._action('read_file', path='note.md')]
+        retained = deepcopy(actions)
+        choice = goal_work_decision(actions, ['Write a useful note.'], policy='outcomes.v1')[0]['arguments']
+        self.assertEqual(choice['decision'], 'work')
+        self.assertEqual(choice['actions'], retained)
+        partial = fixture._action('deliver_result', summary='Useful partial note', artifacts=['note.md'],
+            unresolved=['The remaining shared allowance cannot fund necessary checking.'])
+        blocked = goal_work_decision([partial], ['Write a useful note.'], policy='outcomes.v1')[0]['arguments']
+        self.assertEqual(blocked['decision'], 'blocked')
+        self.assertTrue(blocked['stop_reason'])
+        with self.assertRaisesRegex(ValueError, 'observe all selected work'):
+            goal_work_decision([*actions, partial], ['Write a useful note.'], policy='outcomes.v1')
+        self.assertEqual(actions, retained)
+
 
 class OutcomeQueueTests(unittest.TestCase):
     def setUp(self):
@@ -95,24 +113,37 @@ class OutcomeQueueTests(unittest.TestCase):
         case = self.case
         case.app = ToolApplication.create(case.root, 'Prepare a bounded note from the supplied observations.',
             model='fixture', sources={'measurements': case.inputs}, services=case.services,
-            max_turns=12, max_tokens=900000, tool_contracts='on_demand')
-        # A private method-comparison candidate, not a migration of saved work.
-        case.app.state['config'].update(work_selection_policy='outcomes.v1', work_lifecycle='integrated.v2')
-        case.app._save()
+            allow_execution=True, max_turns=24, max_tokens=900000, tool_contracts='on_demand')
+        self.assertEqual(case.app.state['config']['work_selection_policy'], 'outcomes.v1')
+        self.assertEqual(case.app.state['config']['work_lifecycle'], 'integrated.v2')
         case._reload()
 
-    def drain(self):
+    def drain(self, **kwargs):
         case = self.case
         case._run(should_stop=lambda: not case.decisions and case.app.state['pending'] is None
-            and not any(turn['remaining'] for turn in case.app.state['turns']))
+            and not any(turn['remaining'] for turn in case.app.state['turns']), **kwargs)
 
-    def test_work_then_candidate_check_then_same_version_delivery_reuses_opinion(self):
+    def test_approved_work_review_delivery_and_local_feedback_reuse_one_queue_without_replay(self):
         case = self.case
         candidate = {'summary': 'A bounded observed note', 'artifacts': ['note.md']}
+        sources = {path.name: path.read_bytes() for path in case.inputs.iterdir() if path.is_file()}
+        program = ("from pathlib import Path; "
+            "Path('checked.txt').write_bytes(Path('note.md').read_bytes()); "
+            "p=Path('counter.txt'); p.write_text((p.read_text() if p.exists() else '')+'run\\n')")
         case.decisions.append(fixture._action('select_work', decision='work', actions=[
-            fixture._action('write_file', path='note.md', content='Three supplied observations.\n')],
+            fixture._action('write_file', path='note.md', content='Three supplied observations.\n'),
+            fixture._action('run_process', argv=[sys.executable, '-c', program],
+                inputs=['note.md'], outputs=['checked.txt', 'counter.txt'])],
             candidate=candidate))
         self.drain()
+        self.assertEqual(case.app.state['pending']['kind'], 'tool')
+        self.assertFalse((case.root/'workspace/counter.txt').exists())
+        token = case.app.approval_token(case.app.state['pending']['call'])
+        case._reload()
+        self.assertEqual(case.app.approval_token(case.app.state['pending']['call']), token)
+        self.drain(approved_execution=token)
+        self.assertEqual(len(case._process_receipts()), 1)
+        self.assertEqual((case.root/'workspace/counter.txt').read_text(), 'run\n')
         self.assertFalse(case.inspection_requests)
         self.assertFalse((case.root/'delivery.json').exists())
         original = (case.root/'workspace/note.md').read_bytes()
@@ -129,6 +160,45 @@ class OutcomeQueueTests(unittest.TestCase):
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
         self.assertEqual(len(case.inspection_requests), inspected)
         self.assertEqual((case.root/'workspace/note.md').read_bytes(), original)
+        first_delivery = (case.root/'delivery.json').read_bytes()
+        first_ledger = deepcopy(case.app.ledger.to_dict()['entries'])
+        proof = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['identity']
+
+        # Exercise the fixture adapter through real model decisions after user
+        # feedback. The original calculation and its accepted process stay put.
+        feedback = 'Shorten the same note; reuse unchanged observations and do not rerun the calculation.'
+        case.decisions.append(fixture._action('edit_file', path='note.md',
+            expected_sha256=hashlib.sha256(original).hexdigest(),
+            old_text='Three supplied observations.', new_text='Three observations.'))
+        self.drain(feedback=feedback)
+        self.assertEqual((case.root/'delivery.json').read_bytes(), first_delivery)
+        self.assertEqual((case.root/'workspace/note.md').read_text(), 'Three observations.\n')
+        self.assertEqual((case.root/'workspace/checked.txt').read_bytes(), original)
+        self.assertEqual((case.root/'workspace/counter.txt').read_text(), 'run\n')
+        self.assertEqual(len(case._process_receipts()), 1)
+        self.assertEqual(len(case.inspection_requests), inspected)
+        self.assertEqual(case.app.ledger.to_dict()['entries'][:len(first_ledger)], first_ledger)
+
+        revised = {'summary': 'A shorter bounded observed note', 'artifacts': ['note.md']}
+        case._reload()
+        case.decisions.append(fixture._action('review_result', **revised))
+        self.drain()
+        self.assertGreater(len(case.inspection_requests), inspected)
+        current_proof = case._last('review_result', reviewed=True)['metadata']['delivery_review']['identity']
+        self.assertNotEqual(current_proof, proof)
+        checked = len(case.inspection_requests)
+        case._reload()
+        case.decisions.append(fixture._action('deliver_result', **revised))
+        self.drain()
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertEqual(len(case.inspection_requests), checked)
+        self.assertEqual(case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['identity'],
+            current_proof)
+        self.assertEqual((case.root/'workspace/counter.txt').read_text(), 'run\n')
+        self.assertEqual(len(case._process_receipts()), 1)
+        self.assertEqual({path.name: path.read_bytes() for path in case.inputs.iterdir() if path.is_file()}, sources)
+        from simple_ar.tools.delivery_versions import DeliveryVersions
+        self.assertEqual([row['request_count'] for row in DeliveryVersions(case.root).versions()], [1, 2])
 
     def test_retained_choice_is_reinterpreted_without_rebuying_or_accepting_changed_raw_reply(self):
         case = self.case

@@ -1948,9 +1948,10 @@ class ToolApplication:
                     config['native_history_policy'] = NATIVE_HISTORY_POLICY
                     config['document_context_policy'] = 'working.v1'
                     config['process_artifact_paths'] = 'cwd.v1'
-                    config['work_lifecycle'] = 'integrated.v1'
+                    config['work_lifecycle'] = 'integrated.v2'
                 config['inspection_material_policy'] = 'operations.v3'
-                config['work_selection_policy'] = 'native.v3'
+                config['work_selection_policy'] = ('outcomes.v1'
+                    if config.get('work_lifecycle') == 'integrated.v2' else 'native.v3')
         return config, reused, limits, attempts
 
     @classmethod
@@ -2249,7 +2250,7 @@ class ToolApplication:
             for field in ('completion_policy', 'tool_contracts', 'report_protocol', 'tool_completions', 'inspection_protocol',
                           'inspection_coverage_policy', 'inspection_finding_policy',
                           'delivery_review_protocol', 'publication_assets', 'professional_operations', 'memory_protocol',
-                          'context_checkpoint_policy', 'work_method', 'native_supply_policy', 'context_authority',
+                          'context_checkpoint_policy', 'work_method', 'work_selection_policy', 'native_supply_policy', 'context_authority',
                           'native_history_policy', 'document_context_policy', 'process_artifact_paths', 'work_lifecycle',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
