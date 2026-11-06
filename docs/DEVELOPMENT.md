@@ -55,7 +55,8 @@ Saved source-role tasks keep their original scope, handoff and recovery behavior
 New ordinary tasks return native tool batches directly to the action queue. There
 is no outer work-selection response or second compilation of the model's actions.
 Working history presents complete units with the original reply, actions and actual
-receipts; independent inspection uses the same unit history. Candidate review and
+receipts. Independent inspection retains its own native operations and independent
+opinions on the same ledger. Candidate review and
 final delivery must each be a separate decision after observing production. Other
 tools run as services, with optional completion effects removed and checked again
 at dispatch and result binding. Questions and explicit caller operations retain
@@ -68,10 +69,12 @@ New ordinary tasks can submit an unfinished candidate for independent investigat
 before publication. This binds the actual claim and files; its opinion is not a
 complete-delivery certificate. Final acceptance still checks all required outputs,
 publication versions and applicable independent findings. Delivery projects current
-obligations into the shared work view and supplies the lower bound for the next
-independent step. The one ledger protects that work and a real return decision;
-these estimates do not guarantee a complete investigation. Resource exhaustion
-retains the honest partial-delivery exit.
+obligations into the shared work view. Early candidate investigation protects room
+for revision, submission, a final independent check and a truthful fallback on the
+one ledger. Final delivery consumes that checking stage without recursively
+protecting another revision cycle. Resource minima are lower bounds, not guarantees
+of quality or completion. When the remaining work is infeasible, useful actual
+outputs remain available for honest partial delivery.
 
 Explicitly selected retained deliveries can carry original observations covering
 only their selected bytes and related fallible working notes. The creation owner
