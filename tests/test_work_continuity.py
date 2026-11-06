@@ -80,7 +80,7 @@ class SelectedWorkContinuityTests(unittest.TestCase):
             'compacted_records': set(records), 'archived_records': set(records)}
         state, ledger = deepcopy(app.state), deepcopy(app.ledger.to_dict())
         with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select:
-            messages = app._messages(client=client, schemas=[], working_memory=memory)
+            messages = app._messages(client=client, schemas=app.schemas, working_memory=memory)
         rows = [row for row in select.call_args.kwargs['observations'] if row.get('tool') == 'read_file']
         self.assertEqual([(row['kind'], row['offset_bytes'], row['next_offset_bytes']) for row in rows],
             [('source_text', 6, 13), ('source_text', 0, len(self.file.read_bytes()))])
@@ -91,7 +91,7 @@ class SelectedWorkContinuityTests(unittest.TestCase):
         self.assertEqual(app.ledger.to_dict(), ledger)
         app.state['config']['work_lifecycle'] = 'integrated.v1'
         with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as old:
-            app._messages(client=client, schemas=[], working_memory=memory)
+            app._messages(client=client, schemas=app.schemas, working_memory=memory)
         self.assertTrue(all('kind' not in row for row in old.call_args.kwargs['observations']
             if row.get('tool') == 'read_file'))
 
