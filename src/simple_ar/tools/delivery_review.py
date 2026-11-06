@@ -984,7 +984,10 @@ class DeliveryReview:
                         and isinstance(candidate, dict) and isinstance(candidate.get('identity'), str)
                         and isinstance(candidate.get('binding'), dict)
                         and self.inspector.store.exists(self.inspector._path(candidate['identity'], 'result'))):
-                    retained = {'identity':candidate['identity'], 'binding':candidate['binding']}
+                    retained = {'identity':candidate['identity'], 'binding':candidate['binding'],
+                        **({'arguments': self._arguments(candidate['binding'])}
+                           if candidate['binding'].get('purpose') == 'candidate'
+                              or binding.get('purpose') == 'candidate' else {})}
                 if not isinstance(candidate, dict) or candidate.get('binding') != binding:
                     continue
                 try:

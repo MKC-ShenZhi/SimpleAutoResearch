@@ -2138,8 +2138,13 @@ class InspectionToolGateway:
         if saved.get('inspection_material_policy') != 'operations.v3':
             raise ValueError('This saved inspection does not support retained investigation')
         previous = self.store.read_json(self._path(reference['identity'], 'input'))
+        # The delivery owner can bind a distinct early-candidate investigation
+        # to a later final scope. Only its observations transfer; the current
+        # reviewer still decides applicability and receives no inherited pass.
+        previous_arguments = (reference.get('arguments', saved['arguments'])
+            if saved.get('work_lifecycle') == 'integrated.v1' else saved['arguments'])
         if (previous.get('delivery_context') != reference['binding']
-                or previous.get('arguments') != saved['arguments']):
+                or previous.get('arguments') != previous_arguments):
             raise ValueError('Retained investigation differs from its delivery owner scope')
         pinned = {'identity':previous['identity'], 'sha256':{
             leaf:self._digest(self._path(previous['identity'], leaf)) for leaf in ('input', 'response', 'result')}}

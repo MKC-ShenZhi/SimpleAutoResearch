@@ -30,7 +30,8 @@ class CandidateReviewTests(unittest.TestCase):
         self.owner = Delivery(workspace=self.workspace,
             gateway=SimpleNamespace(delivery_issues=lambda *args, **kwargs: []),
             publication=self.publication, review_owner=self.review,
-            config={'delivery_review_protocol':'task.v5'},
+            config={'delivery_review_protocol':'task.v5',
+                'tool_completions':{'review_result':{'kind':'review'}}},
             observations=lambda: self.observations, user_requests=lambda: self.requests)
         self.claim = {'summary':'Current revised argument awaiting PDF', 'artifacts':['draft.md'],
             'report':{'status':'candidate','manuscript':'draft.md','formats':['markdown','pdf']},
