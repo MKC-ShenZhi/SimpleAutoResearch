@@ -2610,7 +2610,8 @@ class ToolApplication:
         if not queued or len(queued) > space:
             return False
         scope_exit = self.operations.scope_exit_tool() if self.operations is not None else None
-        exits = [self._terminal_intent(call) or call['function']['name'] == scope_exit for call in queued]
+        exits = [self._terminal_intent(call) or scope_exit is not None and call['function']['name'] == scope_exit
+                 for call in queued]
         return exits[-1] and sum(exits) == 1
 
     def _owner_finishes_request(self, call: dict[str, Any]) -> bool:

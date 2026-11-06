@@ -2573,6 +2573,7 @@ class CheckpointFailureTests(unittest.TestCase):
 
     def test_saved_terminal_batch_shape_survives_current_policy_changes(self):
         app = ToolApplication.__new__(ToolApplication)
+        app.operations = None
         calls = [{'terminal':False}, {'terminal':True}]
         app.state = {'config':{'completion_policy':'available_operations.v2'},
             'turns':[{'remaining':calls, 'reply':'attempts/native-turn-test/native_result.json'}]}

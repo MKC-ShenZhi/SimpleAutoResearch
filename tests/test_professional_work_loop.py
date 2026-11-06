@@ -3807,7 +3807,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def test_source_services_publish_and_return_before_independent_delivery(self):
         if not shutil.which('pandoc'):
             self.skipTest('Editable publication needs the server Pandoc environment')
-        compile_pdf = os.environ.get('SAR_TEST_EXPORT_INTEGRATION') == '1'
+        compile_pdf = os.environ.get('SAR_TEST_SERVICE_EXPORT_INTEGRATION') == '1'
         client = self.services.llm_client
         client._settings = replace(client._settings, thinking_mode='enabled')
         self._create(goal='Explain the supplied observations with a rerunnable figure and matching publication.',
