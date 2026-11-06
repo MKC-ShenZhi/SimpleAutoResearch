@@ -55,15 +55,28 @@ class DocumentWorkTests(unittest.TestCase):
                 return {'action': 'investigate', 'read_windows': [
                     {'path': f'source0/part-{count}.txt', 'max_bytes': 40000}]}
             self.assertLess(len(view['observations']), 5)
-            self.assertIn('o5', [row['id'] for row in view['observations']])
+            if count == 6:
+                self.assertIn('o5', [row['id'] for row in view['observations']])
+                return {'action': 'investigate', 'read_windows': [{'path': 'source0/part-1.txt', 'max_bytes': 40000}]}
+            self.assertIn('o1', [row['id'] for row in view['observations']])
             return {'action': 'finish', 'manuscript_markdown': '# Account\nFive original records retained.\n',
                 'selected_observation_ids': [f'o{i}' for i in range(1, 6)]}
 
         gateway, clients = self.gateway(root, source, ledger, workspace, decide)
         gateway.context_policy = 'working.v1'
+        from simple_ar.core.capabilities import ArtifactStore
+        write = ArtifactStore.write_json
+        def interrupt_candidate(owner, path, *args, **kwargs):
+            if path == 'candidate.json':
+                raise KeyboardInterrupt('Stop after the complete paid response, before saving the candidate')
+            return write(owner, path, *args, **kwargs)
+        with patch.object(ArtifactStore, 'write_json', interrupt_candidate), self.assertRaises(KeyboardInterrupt):
+            gateway.call('work_document', {'goal': 'Account for the five supplied original records'}, identity='large')
+        charges = ledger.to_dict()
         result = gateway.call('work_document', {'goal': 'Account for the five supplied original records'}, identity='large')
         self.assertTrue(result.ok, result)
-        self.assertEqual(len(clients[0].calls), 6)
+        self.assertEqual(len(clients[0].calls), 7)
+        self.assertEqual(ledger.to_dict(), charges)
         self.assertEqual(len(result.metadata['material_observations']), 5)
         retained = json.loads((root/'attempts/large/document_work/observations.json').read_text())
         self.assertEqual(sum(len(row['observation']['data']['text']) for row in retained), 200000)

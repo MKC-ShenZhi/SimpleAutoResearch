@@ -301,7 +301,7 @@ def migrate_new_start(args: argparse.Namespace, *, reuse_access: ReuseAccess | N
     explicit.update(name for name, value in vars(defaults).items()
                     if not name.startswith("_") and getattr(args, name, value) != value)
     supported = (args._native_start_destinations | args._shared_start_destinations
-                 | {"kind", "guided", "scripted", "project", "data_file", "data_path", "document", "material", "with_report", "from_session", "reuse"}
+                 | {"kind", "guided", "scripted", "project", "data_file", "data_path", "document", "material", "with_report", "from_session", "reuse", "reuse_version"}
                  | args._data_declaration_destinations)
     if exact_code:
         supported |= {'allow', 'validate', 'timeout_sec'}

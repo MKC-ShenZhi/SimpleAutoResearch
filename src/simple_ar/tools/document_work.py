@@ -247,7 +247,9 @@ class DocumentWorkToolGateway:
                     or record['request_sha256'] != _digest(snapshot)
                     or snapshot['system'] != _system_for(binding)
                     or snapshot['budget_call_id'] != f'{identity}:document:{step}'
-                    or snapshot['input']['observations'] != observations
+                    or (snapshot['input']['observations'] != observations
+                        if binding['contract'] != 'document_work_operation.v4' else
+                        any(row not in observations for row in snapshot['input']['observations']))
                     or any(snapshot['input'].get(key) != value for key, value in binding['context'].items())):
                 return None
             return binding, observations, decision, step
@@ -657,6 +659,9 @@ class DocumentWorkToolGateway:
         from simple_ar.core.working_context import select_working_context
         from simple_ar.integrations.llm import estimate_tokens
         base = {key: value for key, value in prompt.items() if key != 'observations'}
+        recalled = {row['id'] for row in prompt.get('read_results', []) if row.get('status') == 'recalled'}
+        base['coverage'] += (' Only the supplied observation bodies are in this input. Repeat an original '
+            'window/query request to recall its recorded observation without repeating the investigation.')
 
         def present(messages):
             context = json.loads(messages[1]['content'])
@@ -667,7 +672,8 @@ class DocumentWorkToolGateway:
         messages, selection = select_working_context(user_requests=[], system_text=system,
             base_context=base, turn_blocks=[], observations=[{
                 'record': f'records/{identity}/document_work/observations.json', 'field': str(index),
-                'turn': index, 'kind': 'operation_result', 'role': 'historical_observation',
+                'turn': index + (len(observations) if row['id'] in recalled else 0),
+                'kind': 'operation_result', 'role': 'historical_observation',
                 'text': json.dumps(row, ensure_ascii=False)} for index, row in enumerate(observations)],
             schema_tokens=0, context_token_target=client._settings.context_input_tokens,
             estimate_tokens=estimate_tokens, material_policy='retained',
@@ -690,6 +696,11 @@ class DocumentWorkToolGateway:
                     raise ValueError('Binary figure/PDF has no text-window reader; preserve it or use an independent reader')
                 key = window_key(self.workspace, window)
                 if key in seen_reads:
+                    if not cumulative_capacity:
+                        row = next(row for row in observations if row['kind'] == 'material_window'
+                            and window_key(self.workspace, FileWindow.model_validate(row['observation']['request'])) == key)
+                        feedback.append({'status': 'recalled', 'id': row['id']})
+                        continue
                     raise ValueError('This exact window was already observed')
                 size = self.workspace.resolve_material_root(window.path).stat().st_size
                 if size != visible[path]['size_bytes']:
@@ -718,6 +729,12 @@ class DocumentWorkToolGateway:
                 arguments = query.model_dump(mode='json')
                 key = _digest({**arguments, 'document_record': path})
                 if key in seen_queries:
+                    if not cumulative_capacity:
+                        row = next(row for row in observations if row['kind'] == 'source_passages'
+                            and _digest({**row['request'], 'document_record':str(
+                                self.workspace.resolve_source_record(row['request']['document_record']))}) == key)
+                        feedback.append({'status': 'recalled', 'id': row['id']})
+                        continue
                     raise ValueError('This exact source query was already observed')
                 result = self.sources.call('find_source_passages', arguments, identity=identity)
                 if result.status != 'ok':
@@ -823,7 +840,21 @@ class DocumentWorkToolGateway:
             raise ValueError('Document candidate or its complete response changed; no replay')
         saved_observations = store.read_json('observations.json')
         prompted = snapshot['input']['observations']
-        if saved_observations != prompted or any(row not in prompted for row in candidate['selected']):
+        supplied = prompted
+        if binding['contract'] == 'document_work_operation.v4':
+            supplied = []
+            for step in range(1, candidate['decision'] + 1):
+                actual = store.read_json(f'decisions/{step}/request.json')
+                reply = store.read_json(f'decisions/{step}/response.json')
+                if (reply.get('request_sha256') != _digest(actual) or not reply.get('accounting_known')
+                        or reply.get('response_sha256') != _digest(reply.get('response'))):
+                    raise ValueError('Document observation supply has no complete accounted request')
+                rows = actual['input']['observations']
+                if any(row not in saved_observations for row in rows):
+                    raise ValueError('Presented document observation differs from its original journal')
+                supplied.extend(rows)
+        if ((binding['contract'] != 'document_work_operation.v4' and saved_observations != prompted)
+                or any(row not in supplied for row in candidate['selected'])):
             raise ValueError('Selected original observation record changed')
         visible = {row['path']: row for row in binding['context']['candidates']}
         selected_sources = self._selected_sources(binding, decision.attachments)
