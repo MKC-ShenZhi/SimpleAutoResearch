@@ -565,6 +565,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
 
     def _retain_flat_fixture(self):
         """Existing native boundary fixtures keep their production contract."""
+        self.app.state['config'].pop('work_lifecycle', None)
         self.app.state['config']['professional_operations'] = 'work.v5'
         self.app._save()
         self.app = ToolApplication.load(self.root, services=self.app.services)
@@ -2510,6 +2511,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                         max_turns=70, max_tokens=900000, max_attempts=180)
                     # Keep this saved checkpoint-purchase fixture's method and
                     # pressure; default operation discovery is tested separately.
+                    self.app.state['config'].pop('work_lifecycle', None)
                     self.app.state['config']['professional_operations'] = 'work.v5'
                     self.app.state['config']['work_method'] = 'goal.v1'
                     self.app.state['config'].pop('inspection_material_policy', None)
@@ -6963,6 +6965,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             max_turns=1, max_tokens=200000, max_attempts=10, tool_contracts='full')
         # Saved available_operations.v2 tasks keep their historical final batch.
         # New goal.v1 tasks exercise executable partial closure separately.
+        self.app.state['config'].pop('work_lifecycle', None)
         self.app.state['config']['professional_operations'] = 'work.v5'
         self.app.state['config'].pop('work_method', None)
         self.app.state['config'].pop('inspection_material_policy', None)
