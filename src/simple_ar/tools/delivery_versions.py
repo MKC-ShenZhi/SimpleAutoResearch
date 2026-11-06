@@ -179,6 +179,8 @@ class DeliveryVersions:
                     if not candidates:
                         raise ValueError('Retained external files have no portable source layout') from None
                     path = min(candidates, key=lambda value: len(value.parts))
+            elif path.parts and path.parts[0] not in self.reader.mounts:
+                path = PurePosixPath('workspace') / path
             if not path.parts or any(part in {'', '.', '..'} for part in path.parts):
                 raise ValueError('Retained delivery has no safe source-relative layout')
             relative = path.as_posix()

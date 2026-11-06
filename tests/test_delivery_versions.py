@@ -65,7 +65,7 @@ class DeliveryVersionTests(unittest.TestCase):
         blob = self.root/retained['blob']
         original = blob.read_bytes()
         try:
-            blob.write_bytes(b'Wrong history')
+            blob.write_bytes(bytes(value ^ 1 for value in original))
             with self.assertRaisesRegex(ValueError, 'Retained delivery bytes changed'):
                 ToolApplication.create(self.base/'refused', 'Do not reconstruct from changed history', model=None,
                     sources={}, creation_declarations={'reuse_origin': selection.origin})
