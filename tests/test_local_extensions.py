@@ -330,7 +330,8 @@ type = "object"
             def message(name, arguments, identity):
                 return {'role': 'assistant', 'content': '', 'reasoning_content': '', 'tool_calls': [
                     {'id': identity, 'type': 'function', 'function': {
-                        'name': name, 'arguments': json.dumps(arguments)}}]}
+                        'name': 'select_work', 'arguments': json.dumps({'decision': 'work',
+                            'actions': [{'tool_name': name, 'arguments': arguments}]})}}]}
 
             fake.chat_turn.side_effect = [
                 message('load_tools', {'names': selected}, 'load'),
@@ -352,7 +353,8 @@ type = "object"
                 self.assertIsNone(app.gateway.registry.get('compose_document'))
                 self.assertTrue(app.gateway.registry.request_visible('write_file'))
                 self.assertIsNone(app.gateway.registry.get('execute_implementation'))
-                self.assertIn(selected[1], {row['function']['name'] for row in app.schemas})
+                self.assertEqual({row['function']['name'] for row in app.schemas}, {'select_work'})
+                self.assertIn(selected[1], {row['function']['name'] for row in app.operation_schemas})
                 # Resume after the result is durable but before controller commit.
                 original = ArtifactStore.write_json
 
@@ -380,9 +382,12 @@ type = "object"
                 calls = fake.chat_turn.call_args_list
                 initial = json.loads(calls[0].args[0][1]['content'])
                 self.assertNotIn('instructions grant no access', json.dumps(initial).lower())
-                self.assertIn(selected[0], {row['function']['name'] for row in calls[0].kwargs['tools']})
-                self.assertIn(selected[1], {row['function']['name'] for row in calls[0].kwargs['tools']})
-                self.assertIn(selected[1], {row['function']['name'] for row in calls[1].kwargs['tools']})
+                self.assertEqual({row['function']['name'] for row in calls[0].kwargs['tools']}, {'select_work'})
+                initial_operations = {row['function']['name'] for row in initial['work_selection']['operations']}
+                self.assertTrue(set(selected) <= initial_operations)
+                after_loading = json.loads(calls[1].args[0][1]['content'])
+                self.assertIn(selected[1], {row['function']['name']
+                    for row in after_loading['work_selection']['operations']})
                 skill_result = restored.session.store.read_json(restored.state['turns'][1]['tools'][0]['result'])
                 self.assertIn('These instructions grant no access', skill_result['data']['instructions'])
                 self.assertIn('These instructions grant no access', json.dumps(calls[2].args[0]))

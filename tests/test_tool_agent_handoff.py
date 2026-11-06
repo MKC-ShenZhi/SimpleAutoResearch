@@ -6232,6 +6232,11 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             services = SimpleNamespace(llm_client=client)
             app = ToolApplication.create(root, 'Save and deliver the inspected result', model='fixture',
                 sources={}, services=services, max_turns=3, max_tokens=100000)
+            # This retained native response-correction contract predates the
+            # outcome interpreter. Keep its original raw reply and one turn.
+            app.state['config'].update(work_selection_policy='native.v3', work_lifecycle='integrated.v1')
+            app._save()
+            app = ToolApplication.load(root, services=services)
             self.assertNotIn('model_catalogs', app.state['config'])
             poison = self._native_message('write_file', {'path': 'poison.txt', 'content': 'never adopt'}, 'cut')
             complete = self._native_message('write_file', {'path': 'result.txt', 'content': 'complete result',

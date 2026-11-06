@@ -566,6 +566,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def _retain_flat_fixture(self):
         """Existing native boundary fixtures keep their production contract."""
         self.app.state['config'].pop('work_lifecycle', None)
+        self.app.state['config']['work_selection_policy'] = 'native.v3'
         self.app.state['config']['professional_operations'] = 'work.v5'
         self.app._save()
         self.app = ToolApplication.load(self.root, services=self.app.services)

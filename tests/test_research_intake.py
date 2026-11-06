@@ -154,16 +154,21 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertFalse(root.exists())
 
     def test_ordinary_outcomes_directly_edits_and_delivers_chinese_markdown(self):
+        from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
+        case = OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
         request = '仅依据所给材料整理 Markdown 摘要，不生成 PDF。'
         content = '# 材料摘要\n单次观察不能证明稳定性。\n'
         raw = {'write_file', 'edit_file', 'run_process'}
         permitted_raw = raw - {'run_process'}
-        client = _JSONClient([
-            _reply('write_file', {'path': 'workspace/summary.md', 'content': content}),
-            _reply('deliver_result', {'summary': '已交付材料摘要。',
-                'artifacts': ['workspace/summary.md'], 'unresolved': []}),
+        case.decisions.extend([
+            _action('select_work', decision='work', actions=[
+                _action('write_file', path='workspace/summary.md', content=content)]),
+            _action('select_work', decision='deliver', actions=[], candidate={
+                'summary': '已交付材料摘要。', 'artifacts': ['workspace/summary.md'], 'unresolved': []}),
         ])
-        services = ResearchApplicationServices(llm_client=client,
+        services = ResearchApplicationServices(llm_client=case.services.llm_client,
             config={'research_materials_only': True},
             budget_limits={'llm_requests': 8, 'total_tokens': 1000000})
         with TemporaryDirectory() as directory:
@@ -174,15 +179,19 @@ class ResearchIntakeTests(unittest.TestCase):
             app = create_research_task(ResearchBrief(request_text=request,
                 requested_outputs=('assessment',), asset_requests=({'locator': str(note)},)),
                 root=base / 'task', services=services)
+            case.app, case.root = app, base / 'task'
             self.assertEqual(app.state['config']['tool_contracts'], 'on_demand')
             permissions = set(app.gateway.policy.allowed_permissions)
-            self.assertIn('inspect_artifacts', app._specialist_catalog())
+            self.assertNotIn('inspect_artifacts', app._specialist_catalog())
             self.assertNotIn('export_report', app._specialist_catalog())
             self.assertIsNone(app.implementation)
             self.assertFalse({'source_generation_protocol', 'source_decision_protocol'} & app.state['config'].keys())
             result = app.run(progress=lambda _: None)
             self.assertEqual(result['status'], 'completed', result)
-            first = {row['function']['name'] for row in client.calls[0][1]['tools']}
+            first_request = case.send.call_args_list[0].args[1]
+            self.assertEqual({row['function']['name'] for row in first_request['tools']}, {'select_work'})
+            first_view = json.loads(first_request['messages'][1]['content'])
+            first = {row['function']['name'] for row in first_view['work_selection']['operations']}
             self.assertTrue({'read_file', 'list_directory',
                 'ask_user', 'deliver_result'} <= first)
             self.assertNotIn('inspect_artifacts', first)
@@ -195,6 +204,7 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual([row['tool_name'] for row in observations],
                 ['write_file', 'deliver_result'])
             self.assertTrue(all(row['status'] == 'ok' for row in observations), observations)
+            self.assertTrue(case.inspection_requests)
             self.assertEqual((base / 'task/workspace/summary.md').read_text(encoding='utf-8'), content)
             self.assertEqual(note.read_bytes(), original)
             self.assertIsNone(app.state['config'].get('report_requirement'))
@@ -202,7 +212,7 @@ class ResearchIntakeTests(unittest.TestCase):
 
     def test_operation_contract_modes_and_saved_defaults_preserve_authority(self):
         raw = {'write_file', 'edit_file', 'run_process'}
-        names = lambda app: {row['function']['name'] for row in app.schemas}
+        names = lambda app: {row['function']['name'] for row in app.operation_schemas}
         with TemporaryDirectory() as directory:
             base = Path(directory)
             preview, _, _, _ = ToolApplication._configuration(base / 'preview', 'Preview',
@@ -218,13 +228,15 @@ class ResearchIntakeTests(unittest.TestCase):
                         app.state['config'].pop('tool_contracts')
                         app._save()
                     expected = names(app)
+                    self.assertEqual({row['function']['name'] for row in app.schemas}, {'select_work'})
                     allowed = {spec.name for spec in app.gateway.list_specs()
-                        if app.gateway.policy.is_allowed(spec)[0]}
+                        if app.gateway.policy.is_allowed(spec)[0]
+                        and app.operations.coordinator_eligible(spec)} - {'select_work', 'update_work_plan'}
                     if mode == 'outcomes':
                         self.assertEqual(expected, allowed)
                         self.assertEqual(set(app._specialist_catalog()), set())
                         self.assertTrue({'write_file', 'edit_file', 'run_process', 'export_report',
-                            'read_file', 'inspect_artifacts'} <= expected)
+                            'read_file', 'review_result'} <= expected)
                     elif mode in ('full', None):
                         self.assertEqual(expected, allowed)
                     else:
