@@ -6,6 +6,7 @@ from current files. No workspace snapshot, quota or history migration.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -152,7 +153,8 @@ class DeliveryVersions:
                     return groups
         raise ValueError('Selected delivery no longer belongs to the original journal')
 
-    def snapshot(self, version: int, names: list[str], *, max_bytes: int) -> tuple[dict, list[tuple[str, bytes]]]:
+    def snapshot(self, version: int, names: list[str], *, max_bytes: int,
+                 working_context: bool = False) -> tuple[dict, list[tuple[str, bytes]]]:
         """Prepare exact selected input bytes for a NEW task's evidence mount.
 
         The existing creation transaction writes these bytes. No cache, old-task
@@ -197,10 +199,166 @@ class DeliveryVersions:
                 raise ValueError('Retained delivery has conflicting portable paths')
             sources[relative] = {'sha256': row['sha256'], 'size_bytes': len(content)}
             result.append((relative, content))
+        handoff = self.working_context(version, files, layout, dict(result)) if working_context else None
+        if handoff is not None and total + len(json.dumps(handoff, ensure_ascii=False).encode('utf-8')) > max_bytes:
+            raise ValueError('Selected retained inputs and work context exceed max_snapshot_bytes; narrow the selected groups')
         if self.reader.record('actions.json') != self.reader.state:
             raise ValueError('Task changed during retained input selection')
         return {'session': str(self.root), 'version': version, 'results': list(names), 'files': sources,
-            'groups': {name: [layout[path] for path in groups[name]] for name in names}}, result
+            'groups': {name: [layout[path] for path in groups[name]] for name in names},
+            **({'working_context': handoff} if handoff is not None else {})}, result
+
+    def working_context(self, version: int, files: dict, layout: dict, contents: dict) -> dict:
+        """Original observations of explicitly selected bytes, not task authority.
+
+        An equal hash at another path never establishes lineage. Only the
+        original call's resolved subject and its measured retained byte range
+        establish a transferable observation. Unrelated receipt fields, model
+        reasoning, requests, execution state and opinions are not exported.
+        """
+        from simple_ar.tools.materials import journal_read_windows, lossless_text_window
+        from simple_ar.tools.professional_outcomes import accepted_native_result
+        selected = self.select(version)
+        subjects = {str(self.reader.resolve(locator)): locator for locator in files}
+        observations, notes, records, accepted = [], [], set(), {}
+        for turn in self.reader.state['turns']:
+            terminal = False
+            try:
+                reply = self.reader.record(turn['reply'])
+            except FileNotFoundError:
+                continue  # Missing unrelated work cannot erase retained bytes.
+            calls = {call['id']: call for call in reply.get('tool_calls', [])}
+            for item in turn['tools']:
+                try:
+                    receipt = self.reader.record(item['result'])
+                except FileNotFoundError:
+                    if item['result'] == selected['observation']:
+                        raise
+                    continue
+                call = calls.get(item['id'])
+                if call is None or receipt.get('tool_name') != call['function']['name']:
+                    continue
+                try:
+                    arguments = json.loads(call['function']['arguments'])
+                except (ValueError, TypeError):
+                    continue
+                for window in journal_read_windows(receipt, arguments):
+                    data, request = window['data'], window['request']
+                    try:
+                        subject = str(self.reader.resolve(request['path']))
+                    except (OSError, ValueError, KeyError):
+                        continue
+                    locator = subjects.get(subject)
+                    if locator is None or data.get('sha256') != files[locator]['sha256']:
+                        continue
+                    # The recorded result must identify the called subject,
+                    # not merely quote selected bytes in an unrelated receipt.
+                    try:
+                        observed_subject = str(self.reader.resolve(data.get('absolute_path') or data['path']))
+                    except (OSError, ValueError, KeyError):
+                        continue
+                    start = data.get('offset_bytes', request.get('offset_bytes', 0))
+                    end = data.get('next_offset_bytes')
+                    raw = contents[layout[locator]]
+                    if (observed_subject != subject or not lossless_text_window(data)
+                            or type(start) is not int or type(end) is not int
+                            or not 0 <= start <= end <= len(raw) or data.get('size_bytes') != len(raw)):
+                        continue
+                    try:
+                        if raw[start:end].decode('utf-8') != data['text']:
+                            continue
+                    except UnicodeDecodeError:
+                        continue
+                    prefix = str(PurePosixPath(item['result']).parent)
+                    # Access failures must escape optional proof validation;
+                    # otherwise an unscoped later creation could import what
+                    # this UI preview was forbidden to inspect.
+                    for name in ('attempt_manifest.json', 'capability_result.json', 'action.json'):
+                        self._path(prefix + '/' + name)
+                    try:
+                        # Byte equality alone cannot turn an edited journal
+                        # result into an original accepted observation.
+                        if item['result'] not in accepted:
+                            for name in ('attempt_manifest.json', 'capability_result.json'):
+                                self.reader.record(prefix + '/' + name)
+                            action = prefix + '/action.json'
+                            seen = set()
+                            while self._path(action).is_file():
+                                binding = self.reader.record(action)
+                                previous = binding.get('recovered_from')
+                                if previous is None:
+                                    break
+                                if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', previous) or previous in seen:
+                                    raise ValueError('Invalid observation recovery chain')
+                                seen.add(previous)
+                                action = 'attempts/' + previous + '/action.json'
+                            accepted_native_result(self.root, self.reader.manifest['session_id'],
+                                receipt, Path(item['result']).parent.name, require_content_binding=True)
+                            accepted[item['result']] = True
+                        if not accepted[item['result']]:
+                            continue
+                    except (OSError, ValueError, KeyError, TypeError):
+                        accepted[item['result']] = False
+                        continue
+                    record = 'records/' + item['result'].removeprefix('attempts/')
+                    records.add(record)
+                    observations.append({'path': layout[locator], 'sha256': data['sha256'],
+                        'size_bytes': len(raw), 'offset_bytes': start, 'next_offset_bytes': end,
+                        'text': data['text'], 'source': {'record': record,
+                            'receipt_sha256': self._digest(item['result']), 'field': window['field'],
+                            'request': request, 'subject': subject}})
+                if item['result'] == selected['observation']:
+                    terminal = True
+                    break
+            # Knowledge remains an original model claim. It is not adopted as
+            # a checkpoint in the new task or allowed to retire its journal.
+            snapshot = str(PurePosixPath(turn['reply']).parent / 'memory_snapshot.json')
+            if self._path(snapshot).is_file():
+                eligible = []
+                prefix = str(PurePosixPath(snapshot).parent)
+                for name in ('attempt_manifest.json', 'capability_result.json',
+                        'memory_input.json', 'memory_response.json'):
+                    self._path(prefix + '/' + name)
+                self.reader.admit(self.root / 'budget_ledger.json')
+                try:
+                    from simple_ar.app.work_memory import _bound_response, checkpoint_entries
+                    from simple_ar.core.budget import BudgetLedger
+                    manifest = self.reader.record(prefix + '/attempt_manifest.json')
+                    capability = self.reader.record(prefix + '/capability_result.json')
+                    required = {'memory_input.json', 'memory_response.json', 'memory_snapshot.json'}
+                    registered = {ref['path'] for ref in manifest.get('outputs', [])
+                        if ref in capability.get('artifacts', []) and ref.get('status') == 'available'}
+                    if (manifest.get('status') != 'completed' or capability.get('status') != 'completed'
+                            or not required <= registered):
+                        raise ValueError('Historical understanding has no closed checkpoint registration')
+                    ledger = BudgetLedger.load(self.reader.admit(self.root / 'budget_ledger.json'))
+                    checkpoint_entries(ledger, Path(prefix).name, self.reader.manifest['session_id'])
+                    view = self.reader.record(prefix + '/memory_input.json')
+                    if self.reader.record(snapshot).get('input_sha256') != hashlib.sha256(
+                            json.dumps(view, ensure_ascii=False).encode()).hexdigest():
+                        raise ValueError('Historical understanding input changed')
+                    # Re-derive text/citations from the original model response;
+                    # no saved adoption/coverage or private version map transfers.
+                    original_notes = _bound_response(self.reader.record(prefix + '/memory_response.json'),
+                        view, lambda values: values)
+                except (OSError, ValueError, KeyError, TypeError):
+                    original_notes = []
+                for note in original_notes:
+                    citations = set(note.get('records', []))
+                    if (citations and citations <= records
+                            and isinstance(note.get('text'), str) and note['text'].strip()):
+                        eligible.append({'text': note['text'], 'records': sorted(citations),
+                            'knowledge_kind': note.get('knowledge_kind', 'judgment'),
+                            **({'source_integrity': note['source_integrity']} if 'source_integrity' in note else {}),
+                            'source': {'record': prefix + '/memory_response.json',
+                                'sha256': self._digest(prefix + '/memory_response.json')}})
+                notes = eligible  # Latest related snapshot, never accumulated private history.
+            if terminal:
+                return {'observations': observations, 'notes': notes,
+                    'scope': 'Selected original byte windows and fallible historical working understanding. '
+                        'Unselected, unbound and unread contents are excluded. No old request, '
+                        'permission, completion, opinion approval, execution proof or ledger is inherited.'}
+        raise ValueError('Selected delivery no longer belongs to the original journal')
 
     def material_paths(self, version: int) -> dict[str, list[Path]]:
         return {name: [self._path(row['blob']) for row in files.values()]

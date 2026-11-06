@@ -111,6 +111,7 @@ def select_working_context(
     native_observations: Sequence[Mapping[str, Any]] | None = None,
     context_authority: Literal['sources.v1'] | None = None,
     message_projector: Callable | None = None,
+    preserve_material_observations: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -390,7 +391,15 @@ def select_working_context(
             if version != 'stale':
                 version = ('unknown' if current is None or digest is None else
                            'matching' if current == digest else 'stale')
-        keys.append(source_key(row) if native_observations is not None else dump([path, digest, row.get('kind'),
+        # Identity of a supplied receipt is separate from repeated presentation.
+        # Only exact, same-path, same-version observed windows can share a body;
+        # this never infers provenance from an equal digest at another path.
+        repeatable = (preserve_material_observations and version == 'matching'
+            and row.get('kind') == 'source_text' and row.get('role') == 'historical_observation'
+            and type(row.get('offset_bytes')) is int and type(row.get('next_offset_bytes')) is int)
+        keys.append(dump(['observed_body', path, digest, row.get('offset_bytes'),
+                          row.get('next_offset_bytes'), text]) if repeatable else
+                    source_key(row) if native_observations is not None else dump([path, digest, row.get('kind'),
                           row.get('record') if not path or row.get('kind') == 'operation_result' else None,
                           row.get('offset_bytes'),
                           row.get('next_offset_bytes'), row.get('chunk_id'), text]))
@@ -769,6 +778,7 @@ def select_working_context(
             if supplied_handoffs:
                 ordered = [i for i in ordered if rows[i].get('turn') not in supplied_handoffs
                     or rows[i].get('record') in explicit_references
+                    or preserve_material_observations and rows[i].get('kind') in {'source_text', 'authored_text'}
                     or not working_records and (rows[i].get('path') in artifacts
                         or rows[i].get('absolute_path') in artifacts)]
             # Retained originals precede optional native history; otherwise an

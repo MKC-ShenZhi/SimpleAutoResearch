@@ -52,6 +52,24 @@ exhaustive self-audit first. Optional document, publication and other profession
 services retain their own responsibilities. Loading tools grants no authority.
 Saved source-role tasks keep their original scope, handoff and recovery behavior.
 
+New ordinary tasks can submit an unfinished candidate for independent investigation
+before publication. This binds the actual claim and files; its opinion is not a
+complete-delivery certificate. Final acceptance still checks all required outputs,
+publication versions and applicable independent findings. Delivery projects current
+obligations into the shared work view and supplies the lower bound for the next
+independent step. The one ledger protects that work and a real return decision;
+these estimates do not guarantee a complete investigation. Resource exhaustion
+retains the honest partial-delivery exit.
+
+Explicitly selected retained deliveries can carry original observations covering
+only their selected bytes and related fallible working notes. The creation owner
+freezes this context with the input snapshot; the shared selector admits it alongside
+current work. Old instructions, permissions, costs and acceptance are not inherited.
+Publication can also verify an externally built PDF through accepted process-version
+lineage binding the current manuscript and referenced assets. This requires explicit
+inputs and outputs, does not discover hidden OS dependencies, and does not certify
+content. Editable TeX delivery retains the complete exporter-project contract.
+
 For new ordinary tasks, run_process inputs/outputs without a mount prefix resolve
 relative to its cwd, like command file arguments. Explicit mount locators and
 absolute paths retain their access rules; ./ disambiguates a local name that

@@ -143,6 +143,13 @@ class ProfessionalConversation:
             + estimate_tokens(json.dumps(value.tools, ensure_ascii=False))
             + (self.client.effective_output_limit() or 0))
 
+    def can_protect(self, value: ConversationInput, floor: dict) -> bool:
+        """Measure a next-step floor on the one real ledger, across dimensions."""
+        current = {'llm_requests': 1, 'total_tokens': self.tokens(value)}
+        return all((remaining := self.ledger.remaining(dimension)) is None
+            or remaining >= amount + current.get(dimension, 0)
+            for dimension, amount in floor.items())
+
     def prepare(self, project: Callable[[bool], ConversationInput], *,
                 followup: Callable[[ConversationInput], dict],
                 checkpoint: Callable[[ConversationInput, int], None] | None = None,
@@ -166,10 +173,8 @@ class ProfessionalConversation:
 
         def admission(value):
             floor = followup(exit_value if exit_value is not None else value)
-            slots, capacity = self.ledger.remaining('llm_requests'), self.ledger.remaining('total_tokens')
             protect = bool(floor and continue_allowed and not force_close
-                and (slots is None or slots >= 1 + floor.get('llm_requests', 0))
-                and (capacity is None or capacity >= self.tokens(value) + floor.get('total_tokens', 0)))
+                and self.can_protect(value, floor))
             return floor, protect
 
         def ordinary_input():

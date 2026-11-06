@@ -148,6 +148,49 @@ def freeze_work_context(provider: Callable[[list[str]], dict], targets: list[str
     return json.loads(serialized)
 
 
+def retained_working_inputs(config: dict, *, resolve: Callable[[str], Path],
+                            targets: list[str] | None = None) -> dict:
+    """Project creation-frozen selected lineage into the common working view.
+
+    This is a view of existing input metadata, never a second memory or an
+    adopted checkpoint. Current file admission remains with the common reader
+    and selector. Original source references stay explicit after path remapping.
+    """
+    observations, notes = [], []
+    roots = [resolve(target) for target in targets] if targets is not None else None
+    for alias, snapshot in config.get('source_snapshots', {}).items():
+        handoff = snapshot.get('working_context')
+        if not isinstance(handoff, dict):
+            continue  # Old input snapshots keep their original contract.
+        mapped = {}
+        for index, row in enumerate(handoff.get('observations', [])):
+            relative = row['path']
+            # The selected creation snapshot proves this exact relative file;
+            # a digest match at another path cannot add a subject.
+            file = snapshot.get('files', {}).get(relative)
+            if not file or file['sha256'] != row['sha256'] or file['size_bytes'] != row['size_bytes']:
+                raise ValueError('Retained working input lost its selected file binding')
+            locator = alias + '/' + relative
+            subject = resolve(locator)
+            if roots is not None and not any(subject == root or subject.is_relative_to(root) for root in roots):
+                continue
+            record = f'creation-input:{alias}:observation:{index}'
+            mapped.setdefault(row['source']['record'], []).append(record)
+            observations.append({key: value for key, value in row.items() if key not in {'path', 'source'}} | {
+                'record': record, 'path': locator, 'absolute_path': str(subject),
+                'kind': 'source_text', 'role': 'historical_observation',
+                'evidence_role': 'Original selected historical read window; no independent evidence or inherited permission.',
+                'source': {'session': snapshot['session'], **row['source']}})
+        for note in handoff.get('notes', []):
+            if set(note['records']) <= mapped.keys():
+                notes.append({key: value for key, value in note.items() if key not in {'records', 'source'}} | {
+                    'records': [record for source in note['records'] for record in mapped[source]],
+                    'source': {'session': snapshot['session'], **note['source']},
+                    'evidence_role': 'Fallible historical working understanding; revise against the current request and observations. '
+                        'Not adopted checkpoint coverage, old requirements, independent evidence, approval or permission.'})
+    return {'observations': observations, 'notes': notes}
+
+
 class MaterialSelection(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     materials: list[str | FileWindow] = Field(default_factory=list, max_length=12)
@@ -325,7 +368,7 @@ def validate_material_observation(workspace: Any, reference: dict, *, identity: 
     """
     if 'content_reuse' in reference:
         reuse = reference['content_reuse']
-        if reuse.get('contract') != 'journal_content.v1':
+        if reuse.get('contract') not in {'journal_content.v1', 'journal_copy.v1'}:
             raise ValueError('Unknown journal content reuse contract')
         source = _content_source(workspace, reuse['source'])
         request = FileWindow.model_validate(reference['request']).model_copy(update={'full_digest': True})
@@ -333,6 +376,9 @@ def validate_material_observation(workspace: Any, reference: dict, *, identity: 
             'path': request.path, 'full_digest': True})
         if request.model_dump() != original.model_dump():
             raise ValueError('Content reuse changed the original window request')
+        if reuse['contract'] == 'journal_copy.v1' and not _recorded_copy_source(
+                workspace, request.path, source['sha256'], reuse['source']['request']['path']):
+            raise ValueError('Reused observation has no recorded copy lineage')
         row = read_material_window(workspace, request.model_dump(exclude_unset=True),
             identity=identity, cache=cache, on_observation=on_observation)
         proof = _content_target(workspace, request, row['data'], source)
@@ -349,7 +395,7 @@ def validate_material_observation(workspace: Any, reference: dict, *, identity: 
     read_material_window(workspace, request.model_dump(exclude_unset=True), identity=identity,
         expected=data, cache=cache, on_observation=on_observation)
     return {'request': request.model_dump(exclude_unset=True), 'data': data,
-        **{key: reference[key] for key in ('record', 'receipt_sha256', 'input_index') if key in reference}}
+        **{key: reference[key] for key in ('record', 'receipt_sha256', 'input_index', 'source_reference') if key in reference}}
 
 
 def current_text_window(workspace: Any, window: dict, *, cache: dict | None = None) -> dict:
@@ -540,6 +586,28 @@ def _content_target(workspace: Any, request: FileWindow, data: dict, source: dic
         'window_sha256': hashlib.sha256(data['text'].encode('utf-8')).hexdigest()}
 
 
+def _recorded_copy_source(workspace: Any, target: str, digest: str, source: str,
+                          *, cache: dict | None = None) -> bool:
+    """Use the existing version owner graph; equal bytes never invent an edge."""
+    graph = workspace.artifact_sources({target: digest}, cache=cache).get(target, {}).get('lineage')
+    if graph is None:
+        return False
+    nodes = {node['id']: node for node in graph['nodes']}
+    pending, visited = [graph['root']], set()
+    origin = workspace.resolve(source)
+    while pending:
+        identity = pending.pop()
+        if identity in visited:
+            continue
+        visited.add(identity)
+        node = nodes[identity]
+        if node['path'] == origin and node['sha256'] == digest:
+            return identity != graph['root']
+        if node['state'] == 'recorded':
+            pending.extend(edge['node'] for edge in node['edges'] if edge['kind'] == 'copy')
+    return False
+
+
 def material_observation_seed(*, workspace: Any, inventories: list[dict] | None = None,
                               provider: Callable[[list[str]], list[dict]] | None,
                               roots: list[str], context: dict,
@@ -648,6 +716,7 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict] | None 
     # 64 MiB of streamed hash work per seed, using the byte owner's read cache.
     # No directory walk, copy-command interpretation or persistent digest index.
     probes, hash_bytes, candidates_checked = 0, 0, 0
+    lineage_cache = {}
     reused = False
     validation_exhausted = False
     for reference in references[:_CONTENT_REUSE_MAX_REFERENCES]:
@@ -681,6 +750,9 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict] | None 
                     validation_exhausted = True
                     raise ValueError('content_validation_capacity')
                 candidates_checked += 1
+                if reference.get('copy_lineage_required') and not _recorded_copy_source(
+                        workspace, locator, source['sha256'], str(origin), cache=lineage_cache):
+                    continue
                 cost = (source['next_offset_bytes'] - source['offset_bytes']
                     if remaining_bytes is not None else len(source['text']))
                 if used + cost > limit:
@@ -704,7 +776,8 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict] | None 
                 proof = _content_target(workspace, request, row['data'], source)
                 # The original journal locator stays nested: it must never be
                 # mistaken for a read receipt or producer of the new path.
-                row['content_reuse'] = {'contract': 'journal_content.v1',
+                row['content_reuse'] = {'contract': ('journal_copy.v1'
+                    if reference.get('copy_lineage_required') else 'journal_content.v1'),
                     'source': coverage, 'target': proof}
                 admit(row, request, {**target_coverage, 'content_reuse': row['content_reuse']})
                 reused = True
@@ -716,7 +789,9 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict] | None 
         'scope': 'Only admitted exact parent read windows initialize observations. Other ranges are not '
             'supplied evidence; capacity refusals may be investigated with smaller windows. No new permission, '
             'exhaustive reading, cross-path equivalence or scientific verification.',
-        **({'content_reuse_contract': 'journal_content.v1', 'content_validation': {
+        **({'content_reuse_contract': ('journal_copy.v1' if any(
+                row.get('content_reuse', {}).get('contract') == 'journal_copy.v1' for row in observations)
+                else 'journal_content.v1'), 'content_validation': {
             'probes': probes, 'candidates_checked': candidates_checked, 'hash_bytes_upper_bound': hash_bytes,
             'max_probes': _CONTENT_REUSE_MAX_PROBES, 'max_hash_bytes': _CONTENT_REUSE_MAX_HASH_BYTES,
             'max_source_references': _CONTENT_REUSE_MAX_REFERENCES}, 'content_scope':

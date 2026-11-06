@@ -310,7 +310,7 @@ class PublicationToolGateway:
                  report_source: Callable[[str], dict | None] | None = None,
                  candidate_source: Callable[[str, str], dict] | None = None,
                  owned_execution: bool = False, asset_protocol: str | None = None,
-                 legacy_report_status: bool = True) -> None:
+                 legacy_report_status: bool = True, work_lifecycle: str | None = None) -> None:
         if asset_protocol not in {None, PUBLICATION_ASSET_PROTOCOL, PUBLICATION_CONSUMER_PROTOCOL}:
             raise ValueError('Unsupported publication asset protocol')
         self.root, self.workspace, self.ledger = root, workspace, ledger
@@ -319,6 +319,9 @@ class PublicationToolGateway:
         self.asset_protocol = asset_protocol
         # Internal load-time contract selection; never an ExportRequest option.
         self.legacy_report_status = legacy_report_status
+        if work_lifecycle not in {None, 'integrated.v1'}:
+            raise ValueError('Unsupported publication work lifecycle')
+        self.work_lifecycle = work_lifecycle
 
     def input_binding(self, source: Path, request: ExportRequest, *, saved: dict | None = None,
                       include_images: bool = True, image_paths: list[str] | None = None) -> dict:
@@ -537,7 +540,10 @@ class PublicationToolGateway:
         stronger authoring identity. A proposed export is only a preflight;
         actual outputs are checked again after production.
         """
-        if not set(formats) - {'markdown'}:
+        external = (self.work_lifecycle == 'integrated.v1' and proposed is None
+                    and 'pdf' in formats and 'tex' not in formats and manuscript is not None
+                    and any(self.workspace.resolve(path).suffix.lower() == '.pdf' for path in artifacts))
+        if not set(formats) - {'markdown'} and not external:
             delivered = {self.workspace.resolve(path) for path in artifacts}
             published = any(row.get('tool_name') == 'export_report' and row.get('status') == 'ok'
                 and row.get('data', {}).get('project')
@@ -545,8 +551,80 @@ class PublicationToolGateway:
                         for path in delivered) for row in observations)
             if not published:
                 return set()
-        return self.check_report_delivery(observations, None, artifacts,
-            formats=formats, manuscript=manuscript, proposed=proposed)
+        try:
+            return self.check_report_delivery(observations, None, artifacts,
+                formats=formats, manuscript=manuscript, proposed=proposed)
+        except ValueError as builtin_error:
+            if not external:
+                raise
+            try:
+                return self._external_pdf_delivery(artifacts, manuscript)
+            except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
+                raise ValueError(f'{builtin_error} External publication: {exc}') from exc
+
+    def _external_pdf_delivery(self, artifacts: list[str], manuscript: str) -> set[Path]:
+        """Consume the process owner's accepted version graph, without adopting content.
+
+        Explicit process inputs are conservative all-inputs-to-all-outputs edges.
+        Neither filenames nor today's hashes manufacture missing historical edges.
+        The independent delivery reviewer still owns scientific/visual correctness.
+        """
+        source = self.workspace.resolve(manuscript)
+        request = ExportRequest(markdown=manuscript)
+        binding = export_input_binding(source, request, image_binding_version=2,
+            workspace=self.workspace, output_root=self.workspace.workspace / 'publications')
+        required = {self.workspace.resolve(os.path.abspath(source.parent / name)): digest
+                    for name, digest in binding['inputs'].items() if digest is not None}
+        pdfs = [path for path in artifacts if self.workspace.resolve(path).suffix.lower() == '.pdf']
+        versions = self.workspace.artifact_hashes(pdfs)
+        sources = self.workspace.artifact_sources(versions)
+        failures, verified = [], set()
+        for name, provenance in sources.items():
+            try:
+                # A filename alone cannot establish even the PDF container role.
+                # This bounded signature check proves neither completeness nor
+                # readable pages, scientific correctness or visual quality.
+                with self.workspace.resolve(name).open('rb') as handle:
+                    if b'%PDF-' not in handle.read(1024):
+                        raise ValueError('External publication has no PDF header in its first 1024 bytes')
+                graph = provenance.get('lineage') or {}
+                nodes = {node['id']: node for node in graph.get('nodes', [])}
+                root = nodes.get(graph.get('root'))
+                if root is None or root['state'] != 'recorded':
+                    raise ValueError('PDF has no accepted, version-bound producer')
+                pending, visited, process = [root['id']], set(), False
+                while pending:
+                    number = pending.pop()
+                    if number in visited:
+                        continue
+                    visited.add(number)
+                    node = nodes[number]
+                    if node['state'] not in {'recorded', 'ordinary'}:
+                        raise ValueError('PDF has failed, unknown or ambiguous consumed ancestry')
+                    if node.get('producer') is not None:
+                        if not node.get('owner', {}).get('trusted'):
+                            raise ValueError('PDF process receipt is not accepted')
+                        process = True
+                    pending.extend(edge['node'] for edge in node['edges'] if edge['kind'] != 'previous')
+                if not process:
+                    raise ValueError('PDF has no actual process producer')
+                dependencies = self.workspace.artifact_dependencies({name: provenance})
+                consumed = {self.workspace.resolve(path): digest for path, digest in dependencies.items()}
+                if any(consumed.get(path) != digest for path, digest in required.items()):
+                    raise ValueError('PDF does not explicitly consume this manuscript, figures and bibliography')
+                # All declared transitive inputs, including scripts and templates,
+                # must remain the same version; superseded edit bytes are excluded.
+                if self.workspace.artifact_hashes(dependencies) != dependencies:
+                    raise ValueError('External publication consumed inputs changed')
+                self.workspace.check_artifact_producers([name])
+                if self.workspace.artifact_hashes([name]) != {name: versions[name]}:
+                    raise ValueError('External publication PDF changed during validation')
+                verified.add(self.workspace.resolve(name))
+            except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
+                failures.append(str(exc))
+        if verified:
+            return verified
+        raise ValueError('; '.join(dict.fromkeys(failures)) or 'No delivered process-bound PDF')
 
     def check_report_delivery(self, observations: list[dict], identity: dict | None, artifacts: list[str], *,
                               formats: list[str], manuscript: str | None, proposed: dict | None = None) -> set[Path]:
@@ -609,6 +687,12 @@ class PublicationToolGateway:
                 failures.append(str(exc))
         if failures:
             raise ValueError('; '.join(dict.fromkeys(failures)))
+        if self.work_lifecycle == 'integrated.v1' and identity is None:
+            raise ValueError('Requested report formats need a byte-bound publication of the same manuscript, '
+                'figures and bibliography. Use export_report, or deliver an already executed PDF whose '
+                'accepted process receipts explicitly bind those input versions and the PDF output. '
+                'An editable TeX project still requires the complete exporter artifact set. '
+                'Publication provenance does not replace independent content and visual review.')
         raise ValueError('Requested report formats need a byte-bound publication of the same manuscript, figures and bibliography. '
             'Use export_report with the current Markdown and required assets; its delivery field can include the other '
             'requested artifacts and finish after actual compilation and independent review. '

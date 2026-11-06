@@ -38,7 +38,8 @@ def delivery_requires_review(request: DeliveryRequest, protocol: str) -> bool:
 
 
 def prepare_delivery_review(workspace: Any, request: DeliveryRequest, artifacts: list[str],
-                            user_requests: Callable[[], list[str]], *, protocol: str) -> dict | None:
+                            user_requests: Callable[[], list[str]], *, protocol: str,
+                            candidate: bool = False) -> dict | None:
     """Bind the acceptance owner's freshly resolved inventory, never cached authority.
 
     The caller resolves delivery eligibility, including registered current outputs.
@@ -46,8 +47,10 @@ def prepare_delivery_review(workspace: Any, request: DeliveryRequest, artifacts:
     freshness checks. This value adds no persisted state or acceptance decision.
     Keep the saved v1/v2/v3 wire representations unchanged.
     """
-    if not delivery_requires_review(request, protocol):
+    if not candidate and not delivery_requires_review(request, protocol):
         return None
+    if candidate and protocol not in {'task.v3', 'task.v4', 'task.v5'}:
+        raise ValueError('Candidate investigation requires the whole-work review contract')
     artifacts = sorted({str(workspace.resolve(path)) for path in artifacts})
     requests = user_requests()
     if not isinstance(requests, list) or any(not isinstance(text, str) for text in requests):
@@ -55,6 +58,7 @@ def prepare_delivery_review(workspace: Any, request: DeliveryRequest, artifacts:
     if protocol in {'task.v3', 'task.v4', 'task.v5'}:
         claim = delivery_claim(request, artifacts, workspace.resolve)
         return {'schema_version': 'delivery_review.v3',
+                **({'purpose': 'candidate', 'unfinished': list(request.unresolved)} if candidate else {}),
                 **({'scope_policy': 'applicable.v2' if protocol == 'task.v5' else 'applicable.v1'}
                    if protocol in {'task.v4', 'task.v5'} else {}),
                 'requests': list(requests),
@@ -774,6 +778,15 @@ class DeliveryReview:
 
     @staticmethod
     def _arguments(binding: dict) -> dict:
+        if binding.get('purpose') == 'candidate':
+            return {'goal': (
+                'Investigate the supplied candidate against the original requirements, checking '
+                'the actual available artifacts and necessary original evidence. This is an early '
+                'candidate investigation, not final delivery acceptance. Requested outputs not yet '
+                'produced are unfinished work, not a reason to defer checks already possible. '
+                'Report consequential defects, evidence gaps and limits for the current versions; '
+                'do not certify missing publication or overall completion. ' + _APPLICABLE_GOAL),
+                'targets': [], 'evidence': []}
         if applicable_delivery_scope(binding):
             return {'goal': _APPLICABLE_GOAL, 'targets': [], 'evidence': []}
         if binding['schema_version'] == 'delivery_review.v3':

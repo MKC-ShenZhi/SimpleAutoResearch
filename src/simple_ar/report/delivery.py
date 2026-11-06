@@ -144,6 +144,56 @@ class Delivery:
         return (self.review_owner is not None
                 and delivery_requires_review(request, self.review_owner.protocol))
 
+    def lifecycle_requirements(self) -> dict:
+        """Derive remaining obligations from original proposals and current bytes.
+
+        This is working guidance, never acceptance or another saved task state.
+        The resource floor is only the first independent decision's lower bound;
+        inspection still admits and accounts its actual investigation itself.
+        """
+        from simple_ar.tools.specs import tool_completion
+
+        conditions = []
+        next_tools = ['review_result', 'deliver_result'] if self.review_owner else ['deliver_result']
+        proposal = None
+        for observed in reversed(self.observations()):
+            completion = tool_completion(observed.get('tool_name', ''), self.config.get('tool_completions'))
+            if completion is None or completion.kind not in {'delivery', 'review'}:
+                continue
+            data = observed.get('data') or {}
+            value = data.get(completion.field) if completion.field else data
+            try:
+                proposal = DeliveryRequest.model_validate(value)
+            except (ValueError, TypeError):
+                continue
+            break
+        needs_review = self.review_owner is not None
+        if proposal is None:
+            conditions.append({'kind': 'candidate_submission',
+                'message': 'No candidate claim has been submitted for independent investigation. '
+                    'Useful work can be submitted before all requested formats are published.'})
+        else:
+            conditions.extend({'kind': 'unfinished_work', 'message': text} for text in proposal.unresolved)
+            try:
+                resolved = self.workspace.resolve_delivery(proposal)
+                publication = operation_report_publication(proposal, resolved['artifacts'],
+                    self.observations(), publication=self.publication)
+                if publication:
+                    next_tools.append('export_report')
+                    conditions.extend({'kind': 'publication', 'message': text} for text in publication)
+                if self.review_owner and not proposal.unresolved:
+                    binding = prepare_delivery_review(self.workspace, proposal, resolved['artifacts'],
+                        self.user_requests, protocol=self.review_owner.protocol)
+                    concerns = self.review_owner.issues(self.observations(), binding)
+                    needs_review = bool(concerns)
+                    conditions.extend({'kind': 'independent_review', 'message': text} for text in concerns)
+            except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
+                conditions.append({'kind': 'candidate_versions', 'message': str(exc)})
+        return {'conditions': conditions, 'next_tools': next_tools,
+            'minimum_resources': {'llm_requests': int(needs_review)},
+            'scope': 'Derived work obligations, not a pass or an exact cost forecast. '
+                'Final acceptance rechecks the actual inventory, publication and applicable opinion.'}
+
     def _actual_issues(self, observations: list[dict], request: DeliveryRequest,
                          resolved: dict, *, proposed=None,
                          include_inspection: bool = True) -> list[str]:
@@ -220,32 +270,33 @@ class Delivery:
 
     def review_delivery(self, delivery: dict, identity: str, *, may_start: bool,
                         current_result: dict | None = None,
-                        current_outputs: tuple[Path, ...] = ()) -> dict | None:
+                        current_outputs: tuple[Path, ...] = (), candidate: bool = False) -> dict | None:
         if self.review_owner is None:
             return None
         request = DeliveryRequest.model_validate(delivery)
-        if request.unresolved:
+        if request.unresolved and not candidate:
             return None  # The executor still binds and commits actual partial files.
-        if not may_start and not self.requires_review(request):
+        if not may_start and not candidate and not self.requires_review(request):
             return None  # Historical noncanonical claims had no review binding.
         if may_start:
             # Reconsider prior opinions only in the independent review. Actual
             # content and publication obligations must hold before paid work.
             observations = [*self.observations(), *([current_result] if current_result is not None else [])]
             try:
-                resolved = self.validate_actual(request, observations, current_outputs=current_outputs)
+                resolved = (self.workspace.resolve_delivery(request, current_outputs=current_outputs)
+                    if candidate else self.validate_actual(request, observations, current_outputs=current_outputs))
             except ValueError as exc:
                 raise ValueError('Delivery review not started: ' + str(exc)) from exc
         else:
             resolved = self.workspace.resolve_delivery(request, current_outputs=current_outputs)
         binding = prepare_delivery_review(self.workspace, request, resolved['artifacts'],
-            self.user_requests, protocol=self.review_owner.protocol)
+            self.user_requests, protocol=self.review_owner.protocol, candidate=candidate)
         return self.review_owner.review(binding, identity, may_start=may_start)
 
     def bind_result(self, request: DeliveryRequest, payload: dict, identity: str, *,
                     current_outputs: tuple[Path, ...], current_result: dict,
                     retain: Callable[[], None], review_capacity: Callable[[], Any],
-                    may_start: bool = False) -> dict:
+                    may_start: bool = False, candidate: bool = False) -> dict:
         """Bind completed production and applicable review to one exact claim.
 
         The executor supplies receipt persistence and physical resource protection;
@@ -267,11 +318,11 @@ class Delivery:
                 metadata['delivery_hashes'] = hashes
                 retain()  # Pin production before paid work; recovery never reruns it.
             review = self.review_delivery(delivery, identity, may_start=False,
-                current_result=current_result, current_outputs=current_outputs)
+                current_result=current_result, current_outputs=current_outputs, candidate=candidate)
             if review is None and may_start:
-                with review_capacity() if self.requires_review(request) else nullcontext():
+                with review_capacity() if candidate or self.requires_review(request) else nullcontext():
                     review = self.review_delivery(delivery, identity, may_start=True,
-                        current_result=current_result, current_outputs=current_outputs)
+                        current_result=current_result, current_outputs=current_outputs, candidate=candidate)
             if review is not None:
                 if metadata.get('delivery_review', review) != review:
                     raise ValueError('Retained delivery review differs from its actual receipt')

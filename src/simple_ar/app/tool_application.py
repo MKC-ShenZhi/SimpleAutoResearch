@@ -447,6 +447,12 @@ class ToolApplication:
             raise ValueError('Unsupported saved document context policy')
         if config.get('process_artifact_paths') not in (None, 'cwd.v1'):
             raise ValueError('Unsupported saved process artifact paths')
+        if config.get('work_lifecycle') not in (None, 'integrated.v1'):
+            raise ValueError('Unsupported saved work lifecycle policy')
+        if config.get('work_lifecycle') == 'integrated.v1' and (
+                config.get('professional_operations') != 'work.v12'
+                or config.get('memory_protocol') != 'journal.v1'):
+            raise ValueError('Integrated work lifecycle requires the shared ordinary work contract')
         if config.get('memory_protocol') not in {None, 'journal.v1'}:
             raise ValueError('Unsupported saved working memory; no silent migration')
         if config.get('native_supply_policy') is not None and config['native_supply_policy'] not in RECEIPT_SUPPLY_POLICIES:
@@ -910,6 +916,16 @@ class ToolApplication:
         Selection is not permission or acceptance. Existing domain validation,
         approval and delivery checks still own every returned action.
         """
+        if self.state['config'].get('work_lifecycle') == 'integrated.v1':
+            lifecycle = self.operations.delivery.lifecycle_requirements()
+            needed = lifecycle['minimum_resources'].get('llm_requests', 0)
+            # Include this decision and a truthful exit after an unsuccessful
+            # owner call. Minimum resources are a lower bound, not a pass.
+            remaining = self.ledger.remaining('llm_requests')
+            owner_tools = (set(lifecycle['next_tools']) if remaining is None
+                or remaining >= 2 + needed else set())
+            return [row for row in self.operation_schemas if row['function']['name']
+                in {'ask_user', 'deliver_result', *owner_tools}]
         if (self.state['config'].get('completion_policy') == _OPERATION_EXIT
                 and self.state['config'].get('work_method') not in NATIVE_WORK_METHODS):
             return self.operation_schemas
@@ -1324,8 +1340,24 @@ class ToolApplication:
             return []
         references = journal_material_references(self.workspace, self.session.store, self.state['turns'], targets,
             include_cross_path=self.state['config'].get('professional_work') in _ADOPTING_OWNER_MODES)
+        # Imported observations already belong to the selected immutable input
+        # snapshot. Re-read only their exact retained ranges through the byte
+        # owner, so professional consumers share normal current admission.
+        for row in self._retained_working_inputs(targets)['observations']:
+            if row['next_offset_bytes'] <= row['offset_bytes']:
+                continue
+            request = {'path': row['path'], 'offset_bytes': row['offset_bytes'],
+                'max_bytes': row['next_offset_bytes'] - row['offset_bytes'], 'full_digest': True}
+            actual = self.workspace.call('read_file', request, identity='retained-work-input')
+            if (actual.status == 'ok' and actual.data.get('sha256') == row['sha256']
+                    and actual.data.get('text') == row['text']
+                    and actual.data.get('next_offset_bytes') == row['next_offset_bytes']):
+                references.append({'request': request, 'data': actual.data,
+                    'source_reference': row['source']})
         findings = self.gateway.professional_inputs(targets, include_observations=True)
-        return [row for finding in findings for row in finding.get('observations', [])] + references
+        references = [row for finding in findings for row in finding.get('observations', [])] + references
+        return ([{**row, 'copy_lineage_required': True} for row in references]
+            if self.state['config'].get('work_lifecycle') == 'integrated.v1' else references)
 
     def _work_context(self, targets: list[str], *, consumer_selects: bool = False) -> dict[str, Any]:
         """Pass related original feedback, not another coordinator summary.
@@ -1368,7 +1400,13 @@ class ToolApplication:
                         subject = self.workspace.resolve(locator)
                     except ValueError:
                         continue  # A retired source mount is not a new grant.
-                    selected = next((path for path, value in selected_hashes.items() if value == digest), None)
+                    if self.state['config'].get('work_lifecycle') == 'integrated.v1':
+                        from simple_ar.tools.materials import _recorded_copy_source
+                        selected = next((path for path, value in selected_hashes.items()
+                            if value == digest and (path == subject or _recorded_copy_source(
+                                self.workspace, str(path), digest, str(subject)))), None)
+                    else:
+                        selected = next((path for path, value in selected_hashes.items() if value == digest), None)
                     if subject not in covered and (selected is not None or any(subject == root or root.is_dir()
                             and subject.is_relative_to(root) for root in roots)):
                         relevant[locator] = (subject, selected or subject, digest)
@@ -1406,9 +1444,20 @@ class ToolApplication:
             context['creation_declarations'] = self.state['config']['creation_declarations']
         if professional:
             context['working_notes'] = self._working_memory()['notes']
+        inherited = self._retained_working_inputs(targets)
+        if inherited['notes']:
+            context['historical_working_understanding'] = inherited['notes']
         if not consumer_selects and len(json.dumps(context, ensure_ascii=False).encode('utf-8')) > 256000:
             raise ValueError('Related work context exceeds 256000 bytes; narrow the work unit instead of silently dropping feedback')
         return context
+
+    def _retained_working_inputs(self, targets: list[str] | None = None) -> dict:
+        """Existing creation inputs, projected without loading an older task."""
+        if not self.gateway.policy.is_allowed(self.gateway.registry.get('read_file'))[0]:
+            return {'observations': [], 'notes': []}
+        from simple_ar.tools.materials import retained_working_inputs
+        return retained_working_inputs(self.state['config'], resolve=self.workspace.resolve_material_root,
+            targets=targets)
 
     def _execution_observations(self) -> list[dict[str, Any]]:
         """Supply original receipts, not coordinator-authored failure summaries.
@@ -1828,7 +1877,7 @@ class ToolApplication:
             if alias in config['sources']:
                 raise ValueError('retained_delivery is reserved for selected historical input')
             selected, inputs = DeliveryVersions(Path(origin['session'])).snapshot(
-                origin['version'], origin['results'], max_bytes=max_snapshot_bytes)
+                origin['version'], origin['results'], max_bytes=max_snapshot_bytes, working_context=True)
             relative = 'evidence/inputs/' + alias
             if (Path(root) / relative).exists():
                 raise ValueError('Retained input destination already exists')
@@ -1899,6 +1948,7 @@ class ToolApplication:
                     config['native_history_policy'] = NATIVE_HISTORY_POLICY
                     config['document_context_policy'] = 'working.v1'
                     config['process_artifact_paths'] = 'cwd.v1'
+                    config['work_lifecycle'] = 'integrated.v1'
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = 'native.v3'
         return config, reused, limits, attempts
@@ -2200,7 +2250,7 @@ class ToolApplication:
                           'inspection_coverage_policy', 'inspection_finding_policy',
                           'delivery_review_protocol', 'publication_assets', 'professional_operations', 'memory_protocol',
                           'context_checkpoint_policy', 'work_method', 'native_supply_policy', 'context_authority',
-                          'native_history_policy', 'document_context_policy', 'process_artifact_paths',
+                          'native_history_policy', 'document_context_policy', 'process_artifact_paths', 'work_lifecycle',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
                     if field in old:
@@ -2581,6 +2631,13 @@ class ToolApplication:
                     'Reuse an applicable existing review for complete delivery; otherwise deliver '
                     'useful existing artifacts with the actual unfinished work in unresolved. '
                     'Research scope limitations alone do not make finished requested work unresolved.')
+            if self.state['config'].get('work_lifecycle') == 'integrated.v1':
+                exit_text = ('Shared resources now constrain further production. Use the offered '
+                    'owner operations to resolve a concrete outstanding delivery condition when feasible; '
+                    'their minimum resource estimates do not guarantee completion. Preserve capacity '
+                    'for a truthful exit. Deliver useful existing work with actual unfinished requirements '
+                    'in unresolved when checking, publication or repair cannot finish. A candidate review '
+                    'is independent evidence, not formal delivery. Final acceptance remains unchanged.')
             if closing and (scope_exit := self.operations.scope_exit_tool()) is not None:
                 exit_text = ('Return the current professional candidate and actual gaps with ' + scope_exit
                     + ', or ask an indispensable question. Do not propose more work. This returns '
@@ -2620,10 +2677,28 @@ class ToolApplication:
                 estimate = self.session.store.read_json(path)['estimated_followup_tokens']
                 if type(estimate) is not int or estimate < 0:
                     raise ValueError('Invalid retained decision reservation estimate')
-                return {'llm_requests': 1, 'total_tokens': estimate}
+                floor = {'llm_requests': 1, 'total_tokens': estimate}
+                return self._lifecycle_floor(floor, dispatch=dispatch)
         # A temporary spending policy, not a fake provider reservation or new
         # allowance. Every nested physical call still uses this same ledger.
-        return {'llm_requests': 1, 'total_tokens': self._decision_tokens(client, messages)}
+        return self._lifecycle_floor(
+            {'llm_requests': 1, 'total_tokens': self._decision_tokens(client, messages)}, dispatch=dispatch)
+
+    def _lifecycle_floor(self, decision: dict[str, int], *, dispatch: bool = False) -> dict[str, int]:
+        """Let owners spend their own floor while ordinary work leaves it available."""
+        if self.state['config'].get('work_lifecycle') != 'integrated.v1':
+            return decision
+        lifecycle = self.operations.delivery.lifecycle_requirements()
+        queued = self.state['turns'][-1].get('remaining', []) if self.state['turns'] else []
+        if dispatch and queued and queued[0]['function']['name'] in lifecycle['next_tools']:
+            return decision
+        resources = lifecycle['minimum_resources']
+        requests = resources.get('llm_requests', 0)
+        # Owner request minima plus the actually measured exit projection are
+        # planning estimates, not reservations or a guarantee of review completion.
+        return {**resources, 'llm_requests': decision['llm_requests'] + requests,
+            'total_tokens': decision['total_tokens'] + resources.get('total_tokens',
+                requests * decision['total_tokens'])}
 
     def _terminal_batch(self) -> bool:
         """A fitting task exit or professional return needs no later decision."""
@@ -2737,8 +2812,11 @@ class ToolApplication:
         if not self.state['turns']:
             return False
         path = str(Path(self.state['turns'][-1]['reply']).with_name('decision_budget.json'))
-        return (self.session.store.exists(path)
-            and self.session.store.read_json(path).get('closing_required') is True)
+        if not self.session.store.exists(path):
+            return False
+        binding = self.session.store.read_json(path)
+        return (binding.get('closing_required') is True
+            and binding.get('closing_action_contract') != 'lifecycle_step.v1')
 
     @staticmethod
     def _history_observation(call: dict, result: dict, record: str, *, navigation: bool = False) -> dict:
@@ -3420,6 +3498,8 @@ class ToolApplication:
                 'scope': 'Original historical observations in native messages, not current file state or verified facts. '
                     'No read text or write payload is replaced. Archived text is not supplied; use read_history for original receipts.'},
         }
+        if config.get('work_lifecycle') == 'integrated.v1':
+            context['delivery_conditions'] = self.operations.delivery.lifecycle_requirements()
         if declared:
             # One operable directory; the resolver still owns exact OS paths
             # and independent file/parent grants. Never broaden a mount here.
@@ -3761,7 +3841,9 @@ class ToolApplication:
                     return None
             journal = config.get('memory_protocol') == 'journal.v1'
             memory = self._working_memory() if working_memory is None else working_memory
-            work_notes = memory['notes']
+            inherited = self._retained_working_inputs()
+            working_rows.extend(inherited['observations'])
+            work_notes = [*memory['notes'], *inherited['notes']]
             selected_records = list((plan or {}).get('evidence_records', []))
             if self.operations is not None and self.operations.work is not None:
                 # Recent work already has its atomic journal presentation.
@@ -3828,6 +3910,7 @@ class ToolApplication:
                 turn_blocks=[block if position>=boundary else [] for position,block in enumerate(blocks)],
                 observations=working_rows, schema_tokens=schema_cost,context_token_target=target,
                 native_observations=native_observations if receipt_supply else None,
+                preserve_material_observations=config.get('work_lifecycle') == 'integrated.v1',
                 estimate_tokens=estimate_tokens,work_notes=work_notes,
                 require_work_notes=config.get('memory_protocol') == 'journal.v1',
                 fit_work_notes=config.get('memory_protocol') == 'journal.v1',
@@ -4060,16 +4143,32 @@ class ToolApplication:
         from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
         conversation = ProfessionalConversation(client)
         operation_exit = self.state['config'].get('completion_policy') == _OPERATION_EXIT
+        integrated = self.state['config'].get('work_lifecycle') == 'integrated.v1'
         journal = self.state['config'].get('memory_protocol') == 'journal.v1'
         working_memory, memory_refs = None, ()
         selection = {}
+        exit_value = None
 
         def project(closing):
+            nonlocal exit_value
             schemas = self._closing_schemas() if closing else self.schemas
             selection.clear()
             messages = self._messages(client=client, working_memory=working_memory,
                 closing=closing, schemas=schemas, working_selection=selection)
-            return ConversationInput(messages, schemas, json.loads(messages[1]['content']))
+            value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
+            if integrated and closing:
+                # A service must leave the caller an exit even if its result is
+                # incomplete. Do not offer it solely because request slots fit.
+                if not conversation.can_protect(value, self._lifecycle_floor(
+                        {'llm_requests':1, 'total_tokens':conversation.tokens(value)})):
+                    schemas = [row for row in schemas
+                        if row['function']['name'] in {'ask_user', 'deliver_result'}]
+                    selection.clear()
+                    messages = self._messages(client=client, working_memory=working_memory,
+                        closing=True, schemas=schemas, working_selection=selection)
+                    value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
+                exit_value = value
+            return value
 
         def checkpoint(value, decision_tokens):
             nonlocal working_memory, memory_refs
@@ -4102,16 +4201,24 @@ class ToolApplication:
                     working_memory['notes'] = self.operations.project_notes(working_memory['notes'])
 
         value = conversation.prepare(project,
-            followup=lambda value:({'llm_requests':1, 'total_tokens':conversation.tokens(value)}
+            followup=lambda value:(self._lifecycle_floor(
+                {'llm_requests':1, 'total_tokens':conversation.tokens(value)}) if integrated else
+                {'llm_requests':1, 'total_tokens':conversation.tokens(value)}
                 if operation_exit else self._completion_floor(client, value.messages)),
             checkpoint=None if ((self.state.get('pending') or {}).get('skip_memory_checkpoint')
                 or not journal and self.state['config'].get('context_protocol') != 'working.v1') else checkpoint,
             closing_enabled=operation_exit or self.state['config'].get('completion_policy') == 'closing_decision.v2',
-            exit_first=operation_exit,
+            exit_first=operation_exit or integrated,
             continue_allowed=self._request_capacity() > 1 and (
                 self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts > 2))
         floor = ({'llm_requests':1, 'total_tokens':conversation.tokens(value)}
             if value.closing else value.reserve if operation_exit else self._completion_floor(client, value.messages))
+        if integrated:
+            # Persist only the measured next-decision estimate. Owner minima
+            # are derived again from current work, never compounded on replay.
+            floor = {'llm_requests':1, 'total_tokens':conversation.tokens(exit_value)}
+            if value.closing and conversation.can_protect(value, floor):
+                value.reserve = floor
         return conversation, value, memory_refs, floor
 
     def _selected_reply(self, context: Any, message: dict, binding: dict) -> dict:
@@ -4155,13 +4262,16 @@ class ToolApplication:
                 if self.state['config'].get('professional_inputs') == 'owner.v3' else {}),
             **({'context_protocol': self.state['config']['context_protocol']}
                 if self.state['config'].get('context_protocol') in _CONVERSATION_CONTEXT_PROTOCOLS else {}),
-            **({'closing_action_contract': ('terminal_batch.v1'
+            **({'closing_action_contract': ('lifecycle_step.v1'
+                if self.state['config'].get('work_lifecycle') == 'integrated.v1' else 'terminal_batch.v1'
                 if self.state['config'].get('completion_policy') == _OPERATION_EXIT else 'single_terminal.v1')}
                 if closing else {}),
             'input_projection': {
                 'resources': projection['resources'],
                 **({'professional_outcomes': projection['professional_outcomes']}
                     if 'professional_outcomes' in projection else {}),
+                **({'delivery_conditions': projection['delivery_conditions']}
+                    if 'delivery_conditions' in projection else {}),
                 'tool_names': [row['function']['name'] for row in schemas],
                 **({'work_selection':projection['work_selection']} if 'work_selection' in projection else {}),
                 'material_supply': projection['material_supply'],
@@ -4391,7 +4501,9 @@ class ToolApplication:
                         retain=lambda: store.write_json('native_result.json', payload, kind='native_observation'),
                         review_capacity=lambda: self.ledger.protect_remaining(
                             self._completion_floor(self._client(store.root.name), dispatch=True)),
-                        may_start=start_review)
+                        may_start=start_review,
+                        **({'candidate': True} if self.state['config'].get('work_lifecycle') == 'integrated.v1'
+                            and self._completion(call['function']['name']).kind == 'review' else {}))
                 except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
                     payload.update(status='blocked', error=str(exc))
                     return payload

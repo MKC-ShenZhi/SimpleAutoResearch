@@ -493,6 +493,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         saved_config = deepcopy(self.app.state['config'])
         # Existing operation fixtures exercise their saved flat production
         # contract; outcome ownership has its own complete-chain scenario.
+        self.app.state['config'].pop('work_lifecycle', None)
         self.app.state['config']['professional_operations'] = professional_contract
         if professional_contract not in {'work.v11', 'work.v12'}:
             self.app.state['config'].pop('native_history_policy', None)
@@ -828,8 +829,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         core = {row['function']['name'] for row in self.app.operation_schemas}
         self.assertEqual({'read_file','search_files','inspect_project','write_file','edit_file',
             'copy_file','copy_project','run_process','work_document','ask_user','deliver_result',
-            'load_tools','read_history','list_directory','export_report','update_work_plan'}, core)
+            'load_tools','read_history','list_directory','export_report','update_work_plan','review_result'}, core)
         self.assertEqual(self.app.state['config']['professional_operations'], 'work.v12')
+        self.assertEqual(self.app.state['config']['work_lifecycle'], 'integrated.v1')
         self.assertIsNone(self.app.operations.work)
         self.assertIsNone(self.app.implementation)
         self.assertFalse({'select_work_method',
@@ -3745,6 +3747,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         # Exercise recovery of the saved source-role contract. New ordinary
         # intake no longer creates that role or its paired handoff operations.
         self.app.state['config']['professional_operations'] = 'work.v11'
+        self.app.state['config'].pop('work_lifecycle', None)
         self.app.state['config'].pop('process_artifact_paths', None)
         self.app._save()
         self.app = ToolApplication.load(self.root)

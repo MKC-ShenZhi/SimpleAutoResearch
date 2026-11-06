@@ -90,7 +90,7 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--kind CHOICE` | 成果偏好；精确协议参数可能选择结构化兼容路径。不授予访问权限。 可选：`survey`, `bug_fix`, `reproduction`, `writing`, `data_analysis`, `figure`, `code`. | 未设置 |
 | `--from-session PATH` | 从此会话复用成果；配合 --reuse。 | 未设置 |
 | `--reuse NAME` | results 列出的登记成果名，可重复；code_project 保留编辑范围／检查器。 | [] |
-| `--reuse-version N` | 与 --from-session、--reuse 配合，按原布局将指定历史交付版的可移植材料复制进新任务。 | 未设置：当前交付 |
+| `--reuse-version N` | 与 --from-session／--reuse 选择历史交付版本，保留原布局及可用的相关原始观察；工作笔记仅为历史判断，权限、记账与验收分别生效。 | 未设置：当前交付 |
 | `--scripted` | 配合 --kind data_analysis 使用原生代码分析；命令仍需逐项批准。 | 关闭 |
 | `--goal TEXT` | 目标文本，与位置参数 request 二选一。 | 未设置 |
 | `--document PATH` | 本地参考论文，可重复。普通原生入口拒绝 URL；复现 --chat 可在确认后获取公开 HTTPS 论文。 | [] |

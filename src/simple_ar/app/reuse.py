@@ -104,6 +104,11 @@ def select_reuse(root: Path, names: list[str] | tuple[str, ...], *,
             raise ValueError('Selected retained version has no requested portable result group')
         if access.preflight is not None:
             access.preflight([path for name in selected for path in groups[name]])
+        if access.authorize is not None:
+            # Admit every original receipt used by the creation handoff now,
+            # under UI grants, before the unscoped creation transaction runs.
+            owner.snapshot(version, list(selected), max_bytes=256 * 1024 * 1024,
+                working_context=True)
         return ReuseSelection(root, selected, groups, None, (), version)
     manifest = read_json(root / 'session_manifest.json')
     project = None
@@ -126,6 +131,21 @@ def select_reuse(root: Path, names: list[str] | tuple[str, ...], *,
             raise ValueError(f'No current reusable {name} delivery in {root}.')
         if access.preflight is not None:
             access.preflight(groups[name])
+    if manifest.get('transition_recipe') == 'native-tools-v1' and project is None:
+        from simple_ar.tools.delivery_versions import DeliveryVersions
+        owner = DeliveryVersions(root, authorize=access.authorize)
+        versions = owner.versions()
+        if versions and versions[-1]['status'] == 'retained':
+            latest = len(versions)
+            captured = owner.materials(latest)
+            if all(name in captured and {owner.reader.resolve(path) for path in captured[name]}
+                    == set(groups[name]) for name in selected):
+                # Current registered results also have an explicit retained
+                # version identity. Snapshot that selection with its lineage.
+                if access.authorize is not None:
+                    owner.snapshot(latest, list(selected), max_bytes=256 * 1024 * 1024,
+                        working_context=True)
+                return ReuseSelection(root, selected, groups, None, (), latest)
     # The unscoped CLI retains its established complete-package directory
     # behavior. Scoped adapters mount selected files only; a proof-read grant is
     # never promoted to a material-directory grant in the new task.

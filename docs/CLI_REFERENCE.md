@@ -90,7 +90,7 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--kind CHOICE` | Outcome preference; exact protocol options can select structured compatibility. Does not grant access. Choices: `survey`, `bug_fix`, `reproduction`, `writing`, `data_analysis`, `figure`, `code`. | Unset |
 | `--from-session PATH` | Reuse deliveries from this session; pair with --reuse. | Unset |
 | `--reuse NAME` | Registered result name shown by results; repeatable. code_project retains its edit scope/checker. | [] |
-| `--reuse-version N` | Select a retained delivery version with --from-session and --reuse; copy portable inputs into the new task with their original layout. | Unset: current delivery |
+| `--reuse-version N` | Select a retained delivery version with --from-session and --reuse; preserve its layout and related original observations when available. Working notes remain historical judgments; permissions, accounting and acceptance are independent. | Unset: current delivery |
 | `--scripted` | With --kind data_analysis, use native code/analysis; commands still need individual approval. | Off |
 | `--goal TEXT` | Goal text, instead of the positional request. | Unset |
 | `--document PATH` | Local reference paper; repeatable. Ordinary native input rejects URLs; reproduction --chat can acquire public HTTPS papers after confirmation. | [] |

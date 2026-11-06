@@ -354,6 +354,7 @@ class InspectionToolGateway:
                  context_checkpoint_policy: str | None = None,
                  native_history_policy: str | None = None,
                  work_method: str | None = None,
+                 work_lifecycle: str | None = None,
                  material_policy: str | None = None,
                  execution_protocol: str | None = None,
                  operation_specs: Callable[[], list[CommonToolSpec]] | None = None,
@@ -379,6 +380,8 @@ class InspectionToolGateway:
             raise ValueError('Inspection checkpoint policy requires journal continuity')
         if work_method is not None and work_method not in NATIVE_WORK_METHODS or work_method and protocol != 'subjects.v3':
             raise ValueError('Unsupported inspection working method')
+        if work_lifecycle not in (None, 'integrated.v1') or work_lifecycle and protocol != 'subjects.v3':
+            raise ValueError('Unsupported inspection work lifecycle')
         if material_policy not in (None, *_WORK_MATERIAL_POLICIES) or material_policy and work_method != GOAL_WORK_METHOD:
             raise ValueError('Unsupported inspection material policy')
         self.root, self.workspace = Path(root), workspace
@@ -396,6 +399,7 @@ class InspectionToolGateway:
         self.context_checkpoint_policy = context_checkpoint_policy
         self.native_history_policy = native_history_policy
         self.work_method = work_method
+        self.work_lifecycle = work_lifecycle
         self.material_policy = material_policy
         self.execution_protocol = execution_protocol
         self.operation_specs = operation_specs
@@ -2754,6 +2758,8 @@ class InspectionToolGateway:
         if checkpoint_policy not in (None, 'economic.v3'):
             raise ValueError('Unknown saved inspection checkpoint policy')
         economic = checkpoint_policy == 'economic.v3'
+        if saved.get('work_lifecycle') not in (None, 'integrated.v1'):
+            raise ValueError('Unknown saved inspection work lifecycle')
         if economic and not continuity:
             raise ValueError('Inspection checkpoint policy requires its saved journal')
 
@@ -2921,6 +2927,7 @@ class InspectionToolGateway:
                     if row['result'].get('tool_name') in {'run_process', 'inspect_images'}]}
                 if continuity and saved.get('inspection_material_policy') in _WORK_MATERIAL_POLICIES else {}),
             native_observations=native_observations,
+            preserve_material_observations=saved.get('work_lifecycle') == 'integrated.v1',
             version_resolver=version if retained else None,
             **({'work_notes':notes, 'require_work_notes':True, 'fit_work_notes':True,
                 'economical_checkpoint':economic,
@@ -4460,6 +4467,8 @@ class InspectionToolGateway:
             saved = {'identity': identity, 'arguments': binding, 'targets': [], 'evidence': []}
             if self.work_method is not None:
                 saved['work_method'] = self.work_method
+            if self.work_lifecycle is not None:
+                saved['work_lifecycle'] = self.work_lifecycle
             if self.material_policy is not None:
                 saved['inspection_material_policy'] = self.material_policy
             if self.native_supply_policy is not None:
