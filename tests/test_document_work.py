@@ -231,8 +231,8 @@ class DocumentWorkTests(unittest.TestCase):
                 'attachments': [str(asset)]})
         admit = owner._admit
 
-        def legacy(*args):
-            binding = admit(*args)
+        def legacy(*args, **kwargs):
+            binding = admit(*args, **kwargs)
             binding['contract'] = 'document_work_operation.v1'
             binding['context'].pop('prior_asset_links')
             args[0].write_json('input.json', binding)
