@@ -119,8 +119,12 @@ class CandidateReviewTests(unittest.TestCase):
         from simple_ar.tools.delivery_versions import DeliveryVersions
         version = DeliveryVersions(c.root).select(1)
         self.assertIn(str((project/'main.pdf').relative_to(c.root)), version['files'])
-        self.assertEqual(version['files']['workspace/note.md']['sha256'],
-            hashlib.sha256((c.root/'workspace/note.md').read_bytes()).hexdigest())
+        note = c.app.workspace.resolve('note.md')
+        retained = [row for locator, row in version['files'].items()
+            if c.app.workspace.resolve(locator) == note]
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0]['sha256'], hashlib.sha256(note.read_bytes()).hexdigest())
+        self.assertEqual((c.root/retained[0]['blob']).read_bytes(), note.read_bytes())
 
 
 if __name__ == '__main__':
