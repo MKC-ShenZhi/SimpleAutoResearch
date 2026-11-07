@@ -489,7 +489,7 @@ class ToolApplication:
             raise ValueError('Unsupported saved working set policy')
         if config.get('action_offer_policy') not in {None, 'observed_edit.v1'}:
             raise ValueError('Unsupported saved action offer policy')
-        if config.get('candidate_handoff_policy') not in {None, 'after_production.v1'}:
+        if config.get('candidate_handoff_policy') not in {None, 'after_production.v1', 'after_production.v2'}:
             raise ValueError('Unsupported saved candidate handoff policy')
         if config.get('inspection_finding_policy') not in {None, 'linked.v1'}:
             raise ValueError('Unsupported saved inspection finding policy; no silent migration')
@@ -1965,7 +1965,7 @@ class ToolApplication:
                     config['candidate_review_protocol'] = 'candidate.v1'
                     config['working_set_policy'] = 'recent.v3'
                     config['action_offer_policy'] = 'observed_edit.v1'
-                    config['candidate_handoff_policy'] = 'after_production.v1'
+                    config['candidate_handoff_policy'] = 'after_production.v2'
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = ('native.v4'
                     if config.get('work_lifecycle') == 'integrated.v3' else 'native.v3')
@@ -2608,6 +2608,10 @@ class ToolApplication:
             self._pause_professional_stop(source, stop_decision(owner, observed, Path(source).parent.name,
                 'shared_budget_exhausted', 'Original task attempt capacity cannot fit the next professional operation'))
             return True
+        return self._queue_professional_action(source, action)
+
+    def _queue_professional_action(self, source: str, action: dict) -> bool:
+        turns = self.state['turns']
         identity = f'professional-{len(turns)}'
         call = {'id': identity, 'type': 'function', 'function': {
             'name': action['tool_name'],
@@ -4241,6 +4245,84 @@ class ToolApplication:
                     and observed_window_covered(window, current)):
                 return window
         return None
+
+    def _queue_candidate_review(self) -> bool:
+        if (self.state['config'].get('candidate_handoff_policy') != 'after_production.v2'
+                or self.state['config'].get('candidate_review_protocol') != 'candidate.v1'
+                or not self.state['turns'] or self._caller_takeover()):
+            return False
+        turns = self.state['turns']
+        request_count = len(self.state['requests'])
+        if turns[-1]['remaining'] or turns[-1].get('request_count', 1) != request_count:
+            return False
+        edits = {}
+        production = []
+        for index, turn in enumerate(reversed(turns)):
+            if turn.get('request_count', 1) != request_count:
+                break
+            for item in reversed(turn['tools']):
+                result = self.session.store.read_json(item['result'])
+                name, data = result.get('tool_name'), result.get('data') or {}
+                if name in {'review_result', 'deliver_result'}:
+                    return False
+                if result.get('status') != 'ok':
+                    continue
+                if index == 0 and name == 'export_report':
+                    production.append((item['result'], {}, result.get('artifacts', [])))
+                if (index == 0 and name == 'run_process' and data.get('returncode') == 0
+                        and not data.get('stop_reason') and not data.get('output_binding_error')
+                        and data.get('receipt')):
+                    receipt = self.session.store.read_json(data['receipt'])
+                    inputs = (receipt.get('input_binding') or {}).get('workspace_artifacts', {}).get('inputs', {})
+                    outputs = (receipt.get('output_binding') or {}).get('outputs', {})
+                    if inputs or outputs:
+                        production.append((item['result'], inputs, outputs))
+                if name == 'edit_file' and production and data.get('path'):
+                    path = self.workspace.locator(data['path'])
+                    edits.setdefault(path, data.get('sha256'))
+            if index == 0 and not production:
+                return False
+        if not edits:
+            return False
+        for source, inputs, outputs in production:
+            if not outputs and not any(inputs.get(path) == digest for path, digest in edits.items()
+                                       if digest and path in inputs):
+                continue
+            artifacts = []
+            for path in dict.fromkeys([*outputs, *edits]):
+                try:
+                    resolved = self.workspace.resolve_delivery(
+                        DeliveryRequest(summary='Independent candidate review', artifacts=[path]))
+                except (ValueError, OSError):
+                    continue
+                artifacts.extend(resolved['artifacts'])
+            if artifacts:
+                break
+        else:
+            return False
+        name = 'review_result'
+        spec = self.gateway.registry.get(name)
+        if spec is None or not self.gateway.policy.is_allowed(spec)[0]:
+            return False
+        arguments = {
+            'summary': 'Investigate whether the current edited and executed candidate addresses the latest '
+                       'user request. Identify any necessary revisions using independent evidence.',
+            'artifacts': list(dict.fromkeys(artifacts)),
+        }
+        remaining_attempts = self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts
+        if remaining_attempts < self.gateway.continuation_attempts(name, arguments) + 4:
+            return False
+        from simple_ar.app.professional_conversation import ProfessionalConversation
+        client = self._client()
+        decision = self._completion_floor(client, dispatch=True)
+        floor = ProfessionalConversation.resource_floor({'investigation': decision,
+            **self.operations.delivery.review_continuation(decision)})
+        if ({'llm_requests', 'total_tokens'}.intersection(
+                self.ledger.unknown_dimensions(current_allowance_only=True))
+                or any((remaining := self.ledger.remaining(key)) is not None and remaining < amount
+                       for key, amount in floor.items())):
+            return False
+        return self._queue_professional_action(source, {'tool_name': name, 'arguments': arguments})
 
     def _candidate_handoff(self) -> dict | None:
         """Offer one early inspection choice based on actual work in this request."""
@@ -6193,7 +6275,8 @@ class ToolApplication:
                 return
             pending = self.state["pending"]
             if pending is None:
-                self._continue_professional_work()
+                if not self._queue_candidate_review():
+                    self._continue_professional_work()
                 if self.session.manifest.status == 'paused':
                     return
                 turns = self.state["turns"]

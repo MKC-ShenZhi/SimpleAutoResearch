@@ -99,7 +99,7 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertNotIn('observed_edit', offer)
         self.assertIn('read_file', offer['tool_names'])
 
-    def test_observed_edit_and_check_offer_candidate_before_more_production(self):
+    def test_observed_edit_and_check_queue_independent_review_before_more_production(self):
         c = self.case
         c.app.state['config']['tool_contracts'] = 'on_demand'
         c.app._save()
@@ -113,15 +113,14 @@ class NativeWorkQueueTests(unittest.TestCase):
             "assert 'Revised note.' in open('note.md').read()"], inputs=['note.md']))
         self.drain()
         token = c.app.approval_token(c.app.state['pending']['call'])
+        c.decisions.append(fixture._action('read_file', path='note.md'))
         self.drain(approved_execution=token)
         c._reload()
-        c.decisions.append(fixture._action('review_result', summary='The revised note is available.',
-            artifacts=['note.md']))
-        self.drain()
-        decision = c.root / c.app.state['turns'][-1]['reply']
-        offer = json.loads(decision.with_name('decision_budget.json').read_text())['input_projection']
-        self.assertEqual(offer['candidate_handoff']['recently_edited'], ['note.md'])
-        self.assertNotIn('run_process', offer['tool_names'])
+        handoff = c.app.state['turns'][-2]
+        self.assertEqual(handoff['origin'], 'professional')
+        reply = json.loads((c.root / handoff['reply']).read_text())
+        self.assertEqual(reply['source_result'], c.app.state['turns'][-3]['tools'][-1]['result'])
+        self.assertEqual(reply['tool_calls'][0]['function']['name'], 'review_result')
         self.assertTrue(c.inspection_requests)
         self.assertFalse((c.root/'delivery.json').exists())
 
