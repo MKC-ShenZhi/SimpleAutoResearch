@@ -221,6 +221,25 @@ class SelectedWorkContinuityTests(unittest.TestCase):
 
 
 class WorkingSupplyContinuityTests(unittest.TestCase):
+    def test_active_read_windows_survive_archiving_without_pinning_unrelated_files(self):
+        def read(turn, name, text, digest='a' * 64):
+            return {'turn': turn, 'record': f'records/{turn}.json', 'kind': 'source_text',
+                'role': 'historical_observation', 'tool': 'read_file', 'path': f'workspace/{name}',
+                'sha256': digest, 'offset_bytes': 0, 'next_offset_bytes': len(text), 'text': text}
+        rows = [read(0, 'old', 'UNRELATED'), read(1, 'draft', 'EARLIER TEXT'),
+                read(2, 'draft', 'STALE TEXT', 'b' * 64), read(3, 'script', 'CURRENT CODE')]
+        common = dict(user_requests=['Revise the work'], system_text='Work', base_context={},
+            turn_blocks=[[], [], [], [], [{'role': 'assistant', 'content': 'Latest decision'}]],
+            observations=rows, native_observations=[], schema_tokens=0, context_token_target=100000,
+            estimate_tokens=len, material_policy='working', require_work_notes=True, fit_work_notes=True,
+            sparse_handoffs=True, processed_turns=[0, 1, 2, 3], archived_turns=[0, 1, 2, 3],
+            work_notes=[{'text': 'Prior work retained in the journal'}], version_resolver=lambda _: 'a' * 64)
+        _, old = select_working_context(**common, working_set_policy='recent.v2')
+        _, new = select_working_context(**common, working_set_policy='recent.v3')
+        self.assertEqual(old['selected_records'], [])
+        self.assertEqual({x['source']['record'] for x in new['selected_records']},
+                         {'records/1.json', 'records/3.json'})
+
     def test_recent_work_precedes_unneeded_archived_originals_but_note_sources_remain(self):
         def row(record, text):
             return {'turn': 0, 'record': record, 'kind': 'source_text', 'role': 'historical_observation',

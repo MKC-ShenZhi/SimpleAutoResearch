@@ -486,6 +486,18 @@ class OperationTools:
                     'Use deliver_result for actual final delivery with its complete claim, inventory and requested '
                     'report formats. Earlier findings remain evidence; an opinion applies only to its bound claim '
                     'and versions. New artifacts or completion claims need the applicable final checks. ')
+            if self.config.get('working_set_policy') == 'recent.v3':
+                instructions = instructions.replace(
+                    'Choose a coherent investigation or implementation that resolves a concrete gap; batch related '
+                    'reads and run a complete useful calculation rather than repeatedly inventorying or rerunning '
+                    'unchanged work.',
+                    'Choose the next concrete gap. When the evidence supports a reversible change, make it now '
+                    'and use its result to decide what needs checking. Batch reads that resolve a named uncertainty. '
+                    'Use supplied original text for exact edits and retrieve only missing ranges.')
+                instructions = instructions.replace(
+                    'Use review_result to investigate the current claim and available candidate files, ',
+                    'As soon as there is a concrete claim and work that can be checked, use review_result '
+                    'with those files, ')
             return instructions + (self.methods.instructions()
                 if self.methods is not None and not getattr(self.methods, 'source_work', False) else '')
         return self.system + (self.methods.instructions() if self.methods is not None and not getattr(self.methods, 'source_work', False) else '')

@@ -485,6 +485,8 @@ class ToolApplication:
             raise ValueError('Unsupported saved candidate review request contract; no silent migration')
         if config.get('inspection_coverage_policy') not in {None, 'offered.v1', 'offered.v2'}:
             raise ValueError('Unsupported saved inspection coverage policy; no silent migration')
+        if config.get('working_set_policy') not in {None, 'recent.v3'}:
+            raise ValueError('Unsupported saved working set policy')
         if config.get('inspection_finding_policy') not in {None, 'linked.v1'}:
             raise ValueError('Unsupported saved inspection finding policy; no silent migration')
         if (config.get('inspection_finding_policy') == 'linked.v1'
@@ -1957,6 +1959,7 @@ class ToolApplication:
                     config['work_lifecycle'] = 'integrated.v3'
                     config['inspection_execution_protocol'] = 'shared.v2'
                     config['candidate_review_protocol'] = 'candidate.v1'
+                    config['working_set_policy'] = 'recent.v3'
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = ('native.v4'
                     if config.get('work_lifecycle') == 'integrated.v3' else 'native.v3')
@@ -3960,7 +3963,8 @@ class ToolApplication:
                 observations=working_rows, schema_tokens=schema_cost,context_token_target=target,
                 native_observations=native_observations if receipt_supply else None,
                 preserve_material_observations=config.get('work_lifecycle') == 'integrated.v1',
-                working_set_policy=('recent.v2' if config.get('work_lifecycle') in {'integrated.v2', 'integrated.v3'} else None),
+                working_set_policy=(config.get('working_set_policy', 'recent.v2')
+                    if config.get('work_lifecycle') in {'integrated.v2', 'integrated.v3'} else None),
                 estimate_tokens=estimate_tokens,work_notes=work_notes,
                 require_work_notes=config.get('memory_protocol') == 'journal.v1',
                 fit_work_notes=config.get('memory_protocol') == 'journal.v1',

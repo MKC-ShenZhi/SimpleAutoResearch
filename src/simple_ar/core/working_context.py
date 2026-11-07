@@ -163,7 +163,7 @@ def select_working_context(
     context_authority: Literal['sources.v1'] | None = None,
     message_projector: Callable | None = None,
     preserve_material_observations: bool = False,
-    working_set_policy: Literal['recent.v2'] | None = None,
+    working_set_policy: Literal['recent.v2', 'recent.v3'] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -251,9 +251,10 @@ def select_working_context(
     """
     if context_authority is not None and context_authority != 'sources.v1':
         raise ValueError('Unknown context authority policy')
-    if working_set_policy not in (None, 'recent.v2'):
+    if working_set_policy not in (None, 'recent.v2', 'recent.v3'):
         raise ValueError('Unknown working set policy')
-    recent_set = working_set_policy == 'recent.v2'
+    recent_set = working_set_policy is not None
+    active_material_policy = working_set_policy == 'recent.v3'
     # None preserves historical consumers. An explicit (possibly empty) supply
     # is derived by the message owner, never inferred from matching prose.
     def source_key(row: Mapping[str, Any]) -> str:
@@ -696,6 +697,22 @@ def select_working_context(
         first, last = row.get('offset_bytes'), row.get('next_offset_bytes')
         return max(0, last - first) if row.get('kind') == 'source_text' and type(first) is int and type(last) is int else 0
 
+    active_material: set[int] = set()
+    if active_material_policy:
+        # The last two read-bearing decisions identify current working files.
+        # Keep matching observations eligible across a note checkpoint, within
+        # the existing input budget and without treating them as explicit pins.
+        current_reads = [i for i, row in enumerate(rows)
+            if row.get('kind') == 'source_text' and row.get('tool') == 'read_file'
+            and states[i]['version_status'] == 'matching'
+            and 0 <= observed_turn(i) < len(counts)
+            and counts[observed_turn(i)] == len(user_requests)]
+        read_turns = sorted({observed_turn(i) for i in current_reads})[-2:]
+        def location(i: int) -> str:
+            return rows[i].get('absolute_path') or rows[i]['path']
+        paths = {location(i) for i in current_reads if observed_turn(i) in read_turns}
+        active_material = {i for i in current_reads if location(i) in paths}
+
     def priority(i: int) -> tuple[int, int, int, int, int]:
         row = rows[i]
         words = set(re.findall(r'\w+', str(row.get('text', '')).casefold()))
@@ -816,6 +833,7 @@ def select_working_context(
         # Receipt/field/version identity remains separate from body priority.
         ordered = sorted(range(len(rows)), key=lambda i: (
             int(rows[i].get('record') in explicit_references),
+            int(i in active_material),
             observed_turn(i), *([observed_width(i)] if recent_set else []), *priority(i)), reverse=True)
     elif retained_records:
         # Explicit references and current objects precede the rest; original
@@ -883,6 +901,7 @@ def select_working_context(
             if supplied_handoffs:
                 ordered = [i for i in ordered if rows[i].get('turn') not in supplied_handoffs
                     or rows[i].get('record') in explicit_references
+                    or i in active_material
                     or preserve_material_observations and not recent_set and rows[i].get('kind') in {'source_text', 'authored_text'}
                     or recent_set and (rows[i].get('record') in {
                         record for note in view['notes'] if active(note) for record in note.get('records', ())}
@@ -900,7 +919,8 @@ def select_working_context(
                     or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts]
                 # Explicit originals were admitted above. Recent complete work
                 # now precedes optional supporting original bodies.
-                preferred = {i for i in ordered if rows[i].get('record') in explicit_references}
+                preferred = {i for i in ordered if rows[i].get('record') in explicit_references
+                             or i in active_material}
         for i in ordered:
             if i in preferred:
                 admit(i)
@@ -1002,7 +1022,16 @@ def select_working_context(
         # a tiny new action must not buy the same failed summary each turn.
         new_work = [i for i in repeated if i >= economical_after_turn]
         replay_cost = estimate_tokens(dump([message for i in new_work for message in blocks[i]]))
-        if repeated and replay_cost > required_cost:
+        made_progress = (not active_material_policy or not economical_after_turn or any(
+            operation.get('turn', -1) >= economical_after_turn
+            and operation['observation'].get('status') == 'ok'
+            and (operation['observation'].get('tool') in {
+                'write_file', 'edit_file', 'copy_file', 'copy_project',
+                'work_document', 'export_report', 'review_result', 'deliver_result', 'inspect_artifacts'}
+                or operation['observation'].get('tool') == 'run_process'
+                and operation['observation'].get('artifacts'))
+            for operation in operations))
+        if repeated and replay_cost > required_cost and made_progress:
             economical_history.update(repeated)
 
     def settle_projection() -> tuple[list[dict[str, Any]], int]:
