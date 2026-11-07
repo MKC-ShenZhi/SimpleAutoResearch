@@ -107,10 +107,11 @@ class CandidateReviewTests(unittest.TestCase):
         self.candidate()
         c.decisions.append(_action('export_report', markdown='note.md', compile_pdf=True))
         self.drain(approve=lambda *_: True)
-        project = c._exported_project()
+        exported = c._ok('export_report')
+        project = c.app.workspace.resolve(exported['data']['project'])
         checks = len(c.inspection_requests)
         c.decisions.append(_action('deliver_result', summary='Final bounded explanation and PDF.',
-            artifacts=['note.md', str(project)],
+            artifacts=['note.md', *exported['artifacts']],
             report={'status': 'candidate', 'manuscript': 'note.md', 'formats': ['markdown', 'pdf']}))
         self.drain()
         self.assertEqual(c.app.session.manifest.status, 'completed', c.app.result_snapshot())
