@@ -72,6 +72,33 @@ class NativeWorkQueueTests(unittest.TestCase):
         return c._run(should_stop=lambda: not c.decisions and c.app.state['pending'] is None
             and not any(turn['remaining'] for turn in c.app.state['turns']), **kwargs)
 
+    def test_repeated_supplied_read_has_one_edit_offer_with_normal_work_return(self):
+        c = self.case
+        c.app.state['config']['tool_contracts'] = 'on_demand'
+        c.app._save()
+        c._reload()
+        for action in [fixture._action('write_file', path='note.md', content='Original note.\n'),
+                       fixture._action('read_file', path='note.md'),
+                       fixture._action('read_file', path='note.md')]:
+            c.decisions.append(action)
+            self.drain()
+        c._reload()
+        c.decisions.append(fixture._action('load_tools', names=['read_file']))
+        self.drain()
+        decision = c.root / c.app.state['turns'][-1]['reply']
+        offer = json.loads(decision.with_name('decision_budget.json').read_text())['input_projection']
+        self.assertEqual(offer['observed_edit']['path'], 'note.md')
+        self.assertIn('edit_file', offer['tool_names'])
+        self.assertNotIn('read_file', offer['tool_names'])
+        self.assertEqual(c._last('load_tools')['status'], 'ok')
+        c._reload()
+        c.decisions.append(fixture._action('read_file', path='note.md'))
+        self.drain()
+        decision = c.root / c.app.state['turns'][-1]['reply']
+        offer = json.loads(decision.with_name('decision_budget.json').read_text())['input_projection']
+        self.assertNotIn('observed_edit', offer)
+        self.assertIn('read_file', offer['tool_names'])
+
     def test_real_work_approval_recovery_then_separate_review_and_same_version_delivery(self):
         c = self.case
         self.assertIsNone(c.app.operations.selection)

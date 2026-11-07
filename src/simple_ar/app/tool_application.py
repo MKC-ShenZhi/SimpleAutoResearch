@@ -487,6 +487,8 @@ class ToolApplication:
             raise ValueError('Unsupported saved inspection coverage policy; no silent migration')
         if config.get('working_set_policy') not in {None, 'recent.v3'}:
             raise ValueError('Unsupported saved working set policy')
+        if config.get('action_offer_policy') not in {None, 'observed_edit.v1'}:
+            raise ValueError('Unsupported saved action offer policy')
         if config.get('inspection_finding_policy') not in {None, 'linked.v1'}:
             raise ValueError('Unsupported saved inspection finding policy; no silent migration')
         if (config.get('inspection_finding_policy') == 'linked.v1'
@@ -1960,6 +1962,7 @@ class ToolApplication:
                     config['inspection_execution_protocol'] = 'shared.v2'
                     config['candidate_review_protocol'] = 'candidate.v1'
                     config['working_set_policy'] = 'recent.v3'
+                    config['action_offer_policy'] = 'observed_edit.v1'
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = ('native.v4'
                     if config.get('work_lifecycle') == 'integrated.v3' else 'native.v3')
@@ -4193,6 +4196,47 @@ class ToolApplication:
             floor = {'llm_requests': 1, 'total_tokens': self._decision_tokens(client, messages, schemas=schemas)}
         return messages, schemas, memory_refs, floor, protect, closing
 
+    def _observed_edit_window(self, selection: dict) -> dict | None:
+        """Recognize redundant investigation from the last closed decision's actual offer."""
+        from simple_ar.app.work_selection import observed_window_covered
+        turns = self.state['turns'][-2:]
+        if (self.state['config'].get('action_offer_policy') != 'observed_edit.v1'
+                or len(turns) != 2):
+            return None
+        for turn in turns:
+            if (turn.get('origin') in {'caller', 'professional'} or turn.get('remaining')
+                    or turn.get('request_count', 1) != len(self.state['requests'])):
+                return None
+            path = str(Path(turn['reply']).with_name('decision_budget.json'))
+            if not self.session.store.exists(path):
+                return None
+            offer = self.session.store.read_json(path)['input_projection']
+            if offer.get('observed_edit'):
+                return None
+        last = turns[-1]
+        records = [(item['id'], self.session.store.read_json(item['result'])) for item in last['tools']]
+        if not records or any(r.get('status') != 'ok' or r.get('tool_name') not in {
+                'read_file', 'search_files', 'list_directory', 'read_history'} for _, r in records):
+            return None
+        reply = self.session.store.read_json(last['reply'])
+        calls = {call['id']: call['function'] for call in reply.get('tool_calls', [])}
+        current = [row['source'] for row in selection['selected_records']
+                   if row['version_status'] == 'matching']
+        for call_id, record in records:
+            if record['tool_name'] != 'read_file':
+                continue
+            arguments = json.loads(calls[call_id]['arguments'])
+            data = record['data']
+            window = {'path': arguments['path'], 'sha256': data.get('sha256'),
+                      'next_offset_bytes': data.get('next_offset_bytes'),
+                      'offset_bytes': data.get('offset_bytes', arguments.get('offset_bytes', 0))}
+            target = Path(data.get('absolute_path') or '.')
+            if (target.is_relative_to(self.workspace.workspace)
+                    and observed_window_covered(window, offer.get('supplied', []))
+                    and observed_window_covered(window, current)):
+                return window
+        return None
+
     def _professional_model_input(self, context: Any, client: Any) -> tuple:
         from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
         conversation = ProfessionalConversation(client)
@@ -4241,6 +4285,30 @@ class ToolApplication:
                         closing=True, schemas=schemas, working_selection=selection)
                     value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
                 exit_value = value
+            if not closing and (window := self._observed_edit_window(selection)) is not None:
+                from simple_ar.app.work_selection import OBSERVED_EDIT_TOOLS
+                names = {row['function']['name'] for row in schemas}
+                if {'edit_file', 'load_tools'} <= names:
+                    focused = [row for row in schemas if row['function']['name'] in OBSERVED_EDIT_TOOLS]
+                    focused_selection = {}
+                    focused_messages = self._messages(client=client, working_memory=working_memory,
+                        schemas=focused, working_selection=focused_selection)
+                    if self._observed_edit_window(focused_selection) == window:
+                        projection = json.loads(focused_messages[1]['content'])
+                        projection['observed_edit'] = {key: window[key] for key in
+                            ('path', 'offset_bytes', 'next_offset_bytes')}
+                        focused_messages[1]['content'] = json.dumps(projection, ensure_ascii=False)
+                        focused_messages[0]['content'] += (
+                            '\nThe latest read repeated an already supplied workspace text range. '
+                            'Take one concrete action supported by the current evidence. When a local '
+                            'change is ready, apply its exact old and new text before broader checks. '
+                            'If necessary evidence is missing, call load_tools with the needed reading '
+                            'or execution tool to return to the ordinary work offer. Do not guess edits.')
+                        proposed = ConversationInput(focused_messages, focused, projection)
+                        input_tokens = conversation.tokens(proposed) - (client.effective_output_limit() or 0)
+                        if input_tokens <= focused_selection['input_token_target']:
+                            selection.update(focused_selection)
+                            value = proposed
             return value
 
         def checkpoint(value, decision_tokens):
@@ -4341,6 +4409,7 @@ class ToolApplication:
                 if closing else {}),
             'input_projection': {
                 'resources': projection['resources'],
+                **({'observed_edit': projection['observed_edit']} if 'observed_edit' in projection else {}),
                 **({'professional_outcomes': projection['professional_outcomes']}
                     if 'professional_outcomes' in projection else {}),
                 **({'delivery_conditions': projection['delivery_conditions']}
@@ -4354,7 +4423,8 @@ class ToolApplication:
                 **({'working_context':projection['working_context']}
                     if 'working_context' in projection else {}),
                 'supplied': [{key: row[key] for key in ('path', 'sha256', 'record', 'role', 'evidence_role',
-                        'offset_bytes', 'next_offset_bytes', 'version_scope', 'overlap_scope') if key in row}
+                        'offset_bytes', 'next_offset_bytes', 'supplied_offset_bytes',
+                        'supplied_next_offset_bytes', 'version_scope', 'overlap_scope') if key in row}
                     | ({'passage_range': {key: row['passage'][key] for key in
                             ('chunk_id', 'character_start', 'character_end') if key in row['passage']}}
                         if 'passage' in row else {})
