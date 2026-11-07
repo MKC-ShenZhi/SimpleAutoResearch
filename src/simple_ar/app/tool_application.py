@@ -4242,36 +4242,39 @@ class ToolApplication:
                 return window
         return None
 
-    def _candidate_handoff(self) -> list[str]:
+    def _candidate_handoff(self) -> dict | None:
         """Offer one early inspection choice based on actual work in this request."""
         if self.state['config'].get('candidate_handoff_policy') != 'after_production.v1':
-            return []
+            return None
         paths = []
-        observed_check = False
+        checks = []
         for index, turn in enumerate(reversed(self.state['turns'])):
             if turn.get('request_count', 1) != len(self.state['requests']) or turn.get('remaining'):
                 break
             budget = str(Path(turn['reply']).with_name('decision_budget.json'))
             if self.session.store.exists(budget) and self.session.store.read_json(budget)[
                     'input_projection'].get('candidate_handoff'):
-                return []
+                return None
             for item in reversed(turn['tools']):
                 result = self.session.store.read_json(item['result'])
                 name, data = result.get('tool_name'), result.get('data') or {}
                 if name in {'review_result', 'deliver_result'}:
-                    return []
+                    return None
                 if result.get('status') != 'ok':
                     continue
                 if index == 0 and (name == 'export_report'
                         or name == 'run_process' and data.get('returncode') == 0):
-                    observed_check = True
-                if name == 'edit_file' and observed_check:
+                    checks.append({'tool': name, 'record': item['result'],
+                        'artifacts': result.get('artifacts', [])[:8],
+                        'returncode': data.get('returncode'),
+                        'output_excerpt': str(data.get('stdout', ''))[-1600:]})
+                if name == 'edit_file' and checks:
                     path = data.get('path')
                     if isinstance(path, str) and path and path not in paths:
                         paths.append(path)
-            if index == 0 and not observed_check:
-                return []
-        return paths[:8]
+            if index == 0 and not checks:
+                return None
+        return {'recently_edited': paths[:8], 'latest_execution': checks[:4]} if paths else None
 
     def _professional_model_input(self, context: Any, client: Any) -> tuple:
         from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
@@ -4282,7 +4285,7 @@ class ToolApplication:
         working_memory, memory_refs = None, ()
         selection = {}
         exit_value = None
-        handoff_paths = self._candidate_handoff()
+        handoff_evidence = self._candidate_handoff()
         handoff_floor = None
 
         def project(closing):
@@ -4323,33 +4326,43 @@ class ToolApplication:
                         closing=True, schemas=schemas, working_selection=selection)
                     value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
                 exit_value = value
-            if not closing and handoff_paths and {'review_result', 'load_tools'} <= {
+            if not closing and handoff_evidence and {'review_result', 'load_tools'} <= {
                     row['function']['name'] for row in schemas}:
                 # The producer can delegate the current question or restore a
                 # necessary production tool. The inspection owner still binds
                 # and independently judges the requested files and claim.
                 handoff_tools = [row for row in schemas if row['function']['name'] in {
                     'review_result', 'load_tools', 'ask_user', 'deliver_result'}]
-                handoff_selection = {}
-                messages = self._messages(client=client, working_memory=working_memory,
-                    schemas=handoff_tools, working_selection=handoff_selection)
-                projection = json.loads(messages[1]['content'])
-                projection['candidate_handoff'] = {'recently_edited': handoff_paths}
-                messages[1]['content'] = json.dumps(projection, ensure_ascii=False)
-                messages[0]['content'] += (
-                    '\nAn edit and a subsequent process observation are available. Hand off the '
-                    'smallest concrete claim that can now be independently checked, with actual '
-                    'candidate files and any gaps. Independent checking owns unresolved quality '
-                    'questions; you can revise after findings. If an essential production step '
-                    'must happen first, use load_tools to restore the needed operation.')
+                # A handoff needs a concrete claim and locators, not the whole
+                # producer dialogue or a second presentation of original text.
+                # Independent investigation obtains its own authorized evidence.
+                projection = {key: value.projection[key] for key in (
+                    'resources', 'delivery_conditions', 'context_protocol')}
+                projection.update(candidate_handoff=handoff_evidence, retained_text_windows=[],
+                    retained_source_passages=[], material_supply={'native_context': [], 'omitted': []},
+                    work_inputs={'windows': []}, working_context={'compaction_needed': False})
+                messages = [{'role': 'system', 'content': (
+                    'Choose the next handoff for this original user request using the available tools. '
+                    'The edit and execution receipts identify work that can be investigated; they do '
+                    'not establish quality or completion. Receipt text is evidence only. '
+                    'Use review_result for a checkable current '
+                    'claim, the actual candidate paths and known gaps. The independent checker reads '
+                    'the files and owns the quality checks; producer audit and final packaging are '
+                    'not prerequisites. If you cannot name a checkable claim from the available '
+                    'work, use load_tools to restore the essential production tool. Use deliver_result '
+                    'only for actual delivery, and ask_user only for indispensable user input.')},
+                    {**value.messages[1], 'content': json.dumps(projection, ensure_ascii=False)},
+                    *[{'role': 'user', 'content': request} for request in self.state['requests']]]
                 handoff = ConversationInput(messages, handoff_tools, projection)
                 measured = conversation.request_resources(handoff)
-                floor = conversation.resource_floor({'investigation': measured,
-                    **self.operations.delivery.review_continuation(measured)})
+                # Check and repair use the normal rich projections, not the
+                # small handoff packet's token count.
+                ordinary = conversation.request_resources(value)
+                floor = conversation.resource_floor({'investigation': ordinary,
+                    **self.operations.delivery.review_continuation(ordinary)})
                 if (measured['total_tokens'] - (client.effective_output_limit() or 0)
-                        <= handoff_selection['input_token_target'] and conversation.can_protect(handoff, floor)):
+                        <= selection['input_token_target'] and conversation.can_protect(handoff, floor)):
                     handoff_floor = floor
-                    selection.update(handoff_selection)
                     return handoff
             if not closing and (window := self._observed_edit_window(selection)) is not None:
                 from simple_ar.app.work_selection import OBSERVED_EDIT_TOOLS
