@@ -4220,6 +4220,8 @@ class ToolApplication:
             return None
         reply = self.session.store.read_json(last['reply'])
         calls = {call['id']: call['function'] for call in reply.get('tool_calls', [])}
+        prior_reads = [row for row in offer.get('supplied', [])
+                       if row.get('role') == 'historical_observation']
         current = [row['source'] for row in selection['selected_records']
                    if row['version_status'] == 'matching']
         for call_id, record in records:
@@ -4232,7 +4234,7 @@ class ToolApplication:
                       'offset_bytes': data.get('offset_bytes', arguments.get('offset_bytes', 0))}
             target = Path(data.get('absolute_path') or '.')
             if (target.is_relative_to(self.workspace.workspace)
-                    and observed_window_covered(window, offer.get('supplied', []))
+                    and observed_window_covered(window, prior_reads)
                     and observed_window_covered(window, current)):
                 return window
         return None
