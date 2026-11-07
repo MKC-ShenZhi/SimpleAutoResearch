@@ -100,6 +100,24 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertEqual(c._last('edit_file')['status'], 'blocked')
         self.assertEqual((c.root/'workspace/note.md').read_text(), 'Concurrent change.\n')
 
+    def test_context_edit_accepts_unique_text_and_retains_the_actual_base_version(self):
+        c = self.case
+        c.decisions.append(_action('write_file', path='note.md', content='Original note.\n'))
+        self.drain()
+        target = c.root / 'workspace/note.md'
+        target.write_text('Unrelated addition.\nOriginal note.\n', encoding='utf-8')
+        base = hashlib.sha256(target.read_bytes()).hexdigest()
+        c.decisions.append(_action('edit_file', path='note.md', old_text='Original note.', new_text='Revised note.'))
+        self.drain()
+        self.assertEqual(c._ok('edit_file')['data']['previous_sha256'], base)
+        self.assertEqual(target.read_text(), 'Unrelated addition.\nRevised note.\n')
+        c._reload()
+        target.write_text('Revised note.\nRevised note.\n', encoding='utf-8')
+        c.decisions.append(_action('edit_file', path='note.md', old_text='Revised note.', new_text='Ambiguous.'))
+        self.drain()
+        self.assertEqual(c._last('edit_file')['status'], 'blocked')
+        self.assertEqual(target.read_text(), 'Revised note.\nRevised note.\n')
+
     @unittest.skipUnless(os.environ.get('SAR_TEST_EXPORT_INTEGRATION') == '1',
         'Real compilation runs in the server publication integration phase')
     def test_early_investigation_then_real_publication_and_final_same_version_delivery(self):

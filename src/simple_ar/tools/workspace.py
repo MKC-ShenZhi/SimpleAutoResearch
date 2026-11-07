@@ -264,6 +264,11 @@ class _Edit(_Path):
     expected_sha256: str = Field(min_length=64, max_length=64, description="Current digest from read_file; stale edits are rejected.")
 
 
+class _ContextEdit(_Edit):
+    expected_sha256: str | None = Field(default=None, min_length=64, max_length=64,
+        description='Optional whole-file version pin. The exact old text is the default edit precondition.')
+
+
 class _Run(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     argv: list[str] = Field(min_length=1, max_length=40)
@@ -377,13 +382,18 @@ def workspace_tool_specs(*, candidate_review: bool = False,
                 'do not prevent checks already possible. Submit this operation alone after observing production. '
                 'It returns independent findings without delivering or certifying overall completion; '
                 'final delivery has its own claim, inventory and acceptance checks.')
+        if candidate_review_protocol == 'candidate.v1' and name == 'edit_file':
+            model = _ContextEdit
+            description = ('Replace exact, unique text in a workspace file. Supply old and new text, '
+                'or batch non-overlapping replacements. The tool checks the current text and commits '
+                'the batch together. A whole-file version pin is optional.')
         schema = model.model_json_schema()
-        if candidate_review_protocol == 'candidate.v1' and name in {'write_file', 'edit_file', 'copy_file'}:
+        if candidate_review_protocol == 'candidate.v1' and name in {'write_file', 'copy_file'}:
             schema['properties']['expected_sha256']['description'] = (
                 'Observed SHA256 of the destination version being changed. Reuse an existing observation '
                 'while that version is unchanged; a new read is not required each turn. '
                 'Execution checks the hash atomically and rejects changed bytes. '
-                + ('Empty for a new destination file.' if name != 'edit_file' else 'Required for an edit.'))
+                'Empty for a new destination file.')
         if name == 'run_process':
             # Professional execution supplies this owner reference internally.
             # Ordinary commands retain their explicit file-list contract.
@@ -417,6 +427,8 @@ def validate_workspace_arguments(name: str, arguments: dict[str, Any], *,
         raise ValueError('Unsupported saved candidate review protocol')
     if name == 'review_result' and candidate_review_protocol == 'candidate.v1':
         return CandidateReviewRequest.model_validate(arguments)
+    if name == 'edit_file' and candidate_review_protocol == 'candidate.v1':
+        return _ContextEdit.model_validate(arguments)
     return _TOOLS[name][0].model_validate(arguments)
 
 
@@ -696,9 +708,10 @@ class RetainedDelivery:
                         and isinstance(data.get('sha256'), str) and data.get('absolute_path')):
                     # Use the primitive's admitted contract, including omitted
                     # defaults. A similar-looking payload is not a write owner.
-                    arguments = _TOOLS[name][0].model_validate(arguments).model_dump()
+                    model = _ContextEdit if name == 'edit_file' else _TOOLS[name][0]
+                    arguments = model.model_validate(arguments).model_dump()
                     path, digest = self.resolve(arguments['path']), data['sha256']
-                    before = arguments['expected_sha256']
+                    before = data.get('previous_sha256', arguments['expected_sha256'])
                     inputs = {path: before} if before else {}
                     links = {path: [(path, digest)]} if before == digest else {}
                     if arguments.get('source_sha256') == digest and 'source' in arguments:
@@ -1284,8 +1297,9 @@ class WorkspaceToolGateway:
                                 continue
                     if trusted and name in {'write_file', 'edit_file', 'copy_file'}:
                         output(data.get('absolute_path'), data.get('sha256'))
-                        admitted = _TOOLS[name][0].model_validate(arguments)
-                        before = admitted.expected_sha256
+                        model = _ContextEdit if name == 'edit_file' else _TOOLS[name][0]
+                        admitted = model.model_validate(arguments)
+                        before = data.get('previous_sha256', admitted.expected_sha256)
                         target = self.resolve(admitted.path)
                         if before:
                             previous[target] = before
@@ -2204,7 +2218,7 @@ class WorkspaceToolGateway:
                         else:
                             raise ValueError("Supply replacements or both old_text and new_text")
                         text = replace_exact_spans(text, replacements)
-                        model = _Write(path=model.path, expected_sha256=model.expected_sha256,
+                        model = _Write(path=model.path, expected_sha256=hashlib.sha256(original).hexdigest(),
                             content=text)
                     encoded = model.content.encode("utf-8")
                     if len(encoded) > 256000:
@@ -2217,6 +2231,8 @@ class WorkspaceToolGateway:
                         # Snapshot precisely the bytes accepted by the atomic
                         # writer, never a later reread or reconstructed patch.
                         data['authored_text'] = encoded.decode('utf-8')
+                        if self.candidate_review_protocol == 'candidate.v1':
+                            data['previous_sha256'] = model.expected_sha256
                     if delivery is not None:
                         data["delivery"] = delivery
             if name in {"read_file", "write_file", "edit_file", "list_directory"}:
@@ -2265,7 +2281,8 @@ class WorkspaceToolGateway:
                 raise ValueError("Existing file exceeds the bounded copy size" if name == 'copy_file' else "Existing file exceeds the editable text bound")
             current = hashlib.sha256(original).hexdigest()
         expected = request.expected_sha256
-        reason = ("missing_expected_sha256" if current is not None and not expected else
+        reason = ("missing_expected_sha256" if current is not None and not expected
+                  and not isinstance(request, _ContextEdit) else
                   "sha256_mismatch" if current is not None and current != expected else
                   "target_missing" if current is None and (expected or name == "edit_file") else "")
         if not reason:
