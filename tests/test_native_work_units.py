@@ -99,6 +99,32 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertNotIn('observed_edit', offer)
         self.assertIn('read_file', offer['tool_names'])
 
+    def test_observed_edit_and_check_offer_candidate_before_more_production(self):
+        c = self.case
+        c.app.state['config']['tool_contracts'] = 'on_demand'
+        c.app._save()
+        c._reload()
+        c.decisions.append(fixture._action('write_file', path='note.md', content='Original note.\n'))
+        self.drain()
+        c.decisions.append(fixture._action('edit_file', path='note.md',
+            old_text='Original note.', new_text='Revised note.'))
+        self.drain()
+        c.decisions.append(fixture._action('run_process', argv=[sys.executable, '-c',
+            "assert 'Revised note.' in open('note.md').read()"], inputs=['note.md']))
+        self.drain()
+        token = c.app.approval_token(c.app.state['pending']['call'])
+        self.drain(approved_execution=token)
+        c._reload()
+        c.decisions.append(fixture._action('review_result', summary='The revised note is available.',
+            artifacts=['note.md']))
+        self.drain()
+        decision = c.root / c.app.state['turns'][-1]['reply']
+        offer = json.loads(decision.with_name('decision_budget.json').read_text())['input_projection']
+        self.assertEqual(offer['candidate_handoff']['recently_edited'], ['note.md'])
+        self.assertNotIn('run_process', offer['tool_names'])
+        self.assertTrue(c.inspection_requests)
+        self.assertFalse((c.root/'delivery.json').exists())
+
     def test_real_work_approval_recovery_then_separate_review_and_same_version_delivery(self):
         c = self.case
         self.assertIsNone(c.app.operations.selection)

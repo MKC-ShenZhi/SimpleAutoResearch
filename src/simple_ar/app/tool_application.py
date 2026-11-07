@@ -489,6 +489,8 @@ class ToolApplication:
             raise ValueError('Unsupported saved working set policy')
         if config.get('action_offer_policy') not in {None, 'observed_edit.v1'}:
             raise ValueError('Unsupported saved action offer policy')
+        if config.get('candidate_handoff_policy') not in {None, 'after_production.v1'}:
+            raise ValueError('Unsupported saved candidate handoff policy')
         if config.get('inspection_finding_policy') not in {None, 'linked.v1'}:
             raise ValueError('Unsupported saved inspection finding policy; no silent migration')
         if (config.get('inspection_finding_policy') == 'linked.v1'
@@ -1963,6 +1965,7 @@ class ToolApplication:
                     config['candidate_review_protocol'] = 'candidate.v1'
                     config['working_set_policy'] = 'recent.v3'
                     config['action_offer_policy'] = 'observed_edit.v1'
+                    config['candidate_handoff_policy'] = 'after_production.v1'
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = ('native.v4'
                     if config.get('work_lifecycle') == 'integrated.v3' else 'native.v3')
@@ -4239,6 +4242,37 @@ class ToolApplication:
                 return window
         return None
 
+    def _candidate_handoff(self) -> list[str]:
+        """Offer one early inspection choice based on actual work in this request."""
+        if self.state['config'].get('candidate_handoff_policy') != 'after_production.v1':
+            return []
+        paths = []
+        observed_check = False
+        for index, turn in enumerate(reversed(self.state['turns'])):
+            if turn.get('request_count', 1) != len(self.state['requests']) or turn.get('remaining'):
+                break
+            budget = str(Path(turn['reply']).with_name('decision_budget.json'))
+            if self.session.store.exists(budget) and self.session.store.read_json(budget)[
+                    'input_projection'].get('candidate_handoff'):
+                return []
+            for item in reversed(turn['tools']):
+                result = self.session.store.read_json(item['result'])
+                name, data = result.get('tool_name'), result.get('data') or {}
+                if name in {'review_result', 'deliver_result'}:
+                    return []
+                if result.get('status') != 'ok':
+                    continue
+                if index == 0 and (name == 'export_report'
+                        or name == 'run_process' and data.get('returncode') == 0):
+                    observed_check = True
+                if name == 'edit_file' and observed_check:
+                    path = data.get('path')
+                    if isinstance(path, str) and path and path not in paths:
+                        paths.append(path)
+            if index == 0 and not observed_check:
+                return []
+        return paths[:8]
+
     def _professional_model_input(self, context: Any, client: Any) -> tuple:
         from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
         conversation = ProfessionalConversation(client)
@@ -4248,9 +4282,11 @@ class ToolApplication:
         working_memory, memory_refs = None, ()
         selection = {}
         exit_value = None
+        handoff_paths = self._candidate_handoff()
+        handoff_floor = None
 
         def project(closing):
-            nonlocal exit_value
+            nonlocal exit_value, handoff_floor
             schemas = self._closing_schemas() if closing else self.schemas
             selection.clear()
             messages = self._messages(client=client, working_memory=working_memory,
@@ -4287,6 +4323,34 @@ class ToolApplication:
                         closing=True, schemas=schemas, working_selection=selection)
                     value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
                 exit_value = value
+            if not closing and handoff_paths and {'review_result', 'load_tools'} <= {
+                    row['function']['name'] for row in schemas}:
+                # The producer can delegate the current question or restore a
+                # necessary production tool. The inspection owner still binds
+                # and independently judges the requested files and claim.
+                handoff_tools = [row for row in schemas if row['function']['name'] in {
+                    'review_result', 'load_tools', 'ask_user', 'deliver_result'}]
+                handoff_selection = {}
+                messages = self._messages(client=client, working_memory=working_memory,
+                    schemas=handoff_tools, working_selection=handoff_selection)
+                projection = json.loads(messages[1]['content'])
+                projection['candidate_handoff'] = {'recently_edited': handoff_paths}
+                messages[1]['content'] = json.dumps(projection, ensure_ascii=False)
+                messages[0]['content'] += (
+                    '\nAn edit and a subsequent process observation are available. Hand off the '
+                    'smallest concrete claim that can now be independently checked, with actual '
+                    'candidate files and any gaps. Independent checking owns unresolved quality '
+                    'questions; you can revise after findings. If an essential production step '
+                    'must happen first, use load_tools to restore the needed operation.')
+                handoff = ConversationInput(messages, handoff_tools, projection)
+                measured = conversation.request_resources(handoff)
+                floor = conversation.resource_floor({'investigation': measured,
+                    **self.operations.delivery.review_continuation(measured)})
+                if (measured['total_tokens'] - (client.effective_output_limit() or 0)
+                        <= handoff_selection['input_token_target'] and conversation.can_protect(handoff, floor)):
+                    handoff_floor = floor
+                    selection.update(handoff_selection)
+                    return handoff
             if not closing and (window := self._observed_edit_window(selection)) is not None:
                 from simple_ar.app.work_selection import OBSERVED_EDIT_TOOLS
                 names = {row['function']['name'] for row in schemas}
@@ -4315,6 +4379,8 @@ class ToolApplication:
 
         def checkpoint(value, decision_tokens):
             nonlocal working_memory, memory_refs
+            if value.projection.get('candidate_handoff'):
+                return  # Spend the next decision on the review choice, not optional compaction.
             omitted = selection.get('compaction_turns') if journal else None
             cutoff = (max(omitted, default=-1)+1 if omitted is not None else
                 value.projection.get('working_context', {}).get('recent_start_turn', 0))
@@ -4362,6 +4428,8 @@ class ToolApplication:
             floor = {'llm_requests':1, 'total_tokens':conversation.tokens(exit_value)}
             if value.closing and conversation.can_protect(value, floor):
                 value.reserve = floor
+        if value.projection.get('candidate_handoff'):
+            value.reserve = handoff_floor
         return conversation, value, memory_refs, floor
 
     def _selected_reply(self, context: Any, message: dict, binding: dict) -> dict:
@@ -4412,6 +4480,7 @@ class ToolApplication:
             'input_projection': {
                 'resources': projection['resources'],
                 **({'observed_edit': projection['observed_edit']} if 'observed_edit' in projection else {}),
+                **({'candidate_handoff': projection['candidate_handoff']} if 'candidate_handoff' in projection else {}),
                 **({'professional_outcomes': projection['professional_outcomes']}
                     if 'professional_outcomes' in projection else {}),
                 **({'delivery_conditions': projection['delivery_conditions']}
