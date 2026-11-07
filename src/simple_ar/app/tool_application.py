@@ -478,6 +478,11 @@ class ToolApplication:
             raise ValueError('Journal continuity requires the saved shared native work context')
         if config.get('delivery_review_protocol') not in {None, 'task.v1', 'task.v2', 'task.v3', 'task.v4', 'task.v5'}:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
+        if (config.get('candidate_review_protocol') not in {None, 'candidate.v1'}
+                or config.get('candidate_review_protocol') is not None and (
+                    config.get('work_method') != GOAL_WORK_METHOD
+                    or config.get('delivery_review_protocol') != 'task.v5')):
+            raise ValueError('Unsupported saved candidate review request contract; no silent migration')
         if config.get('inspection_coverage_policy') not in {None, 'offered.v1', 'offered.v2'}:
             raise ValueError('Unsupported saved inspection coverage policy; no silent migration')
         if config.get('inspection_finding_policy') not in {None, 'linked.v1'}:
@@ -597,7 +602,8 @@ class ToolApplication:
              "records": controller.store.root / "attempts"}, self.ledger,
             project_python=Path(config['project_python']) if config.get('project_python') else None,
             record_artifacts=self._record_artifacts,
-            process_artifact_paths=config.get('process_artifact_paths'))
+            process_artifact_paths=config.get('process_artifact_paths'),
+            candidate_review_protocol=config.get('candidate_review_protocol'))
         registry = ToolRegistry()
         registry.register_package(workspace_tool_specs(), self.workspace,
             request_visible={'ask_user', 'deliver_result', 'read_file', 'list_directory'})
@@ -1950,6 +1956,7 @@ class ToolApplication:
                     config['process_artifact_paths'] = 'cwd.v1'
                     config['work_lifecycle'] = 'integrated.v3'
                     config['inspection_execution_protocol'] = 'shared.v2'
+                    config['candidate_review_protocol'] = 'candidate.v1'
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = ('native.v4'
                     if config.get('work_lifecycle') == 'integrated.v3' else 'native.v3')

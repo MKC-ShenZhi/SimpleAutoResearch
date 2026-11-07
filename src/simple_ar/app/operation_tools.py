@@ -222,10 +222,12 @@ class OperationTools:
              'evidence':evidence, 'records':root/'attempts'}, ledger,
             project_python=Path(config['project_python']) if config.get('project_python') else None,
             record_artifacts=record_artifacts,
-            process_artifact_paths=config.get('process_artifact_paths'))
+            process_artifact_paths=config.get('process_artifact_paths'),
+            candidate_review_protocol=config.get('candidate_review_protocol'))
         self.registry = ToolRegistry()
         self.registry.register_package(workspace_tool_specs(candidate_review=config.get('work_method') in NATIVE_WORK_METHODS,
-            process_artifact_paths=config.get('process_artifact_paths')),
+            process_artifact_paths=config.get('process_artifact_paths'),
+            candidate_review_protocol=config.get('candidate_review_protocol')),
             self.workspace, request_visible=True)
         self.sources = SourceToolGateway(root, self.workspace, ledger, policy=config.get('research_policy'),
             authority_revision=config.get('authority_revision', 0), execution_contract=config.get('execution_contract'),
@@ -472,7 +474,19 @@ class OperationTools:
         if self.selection is not None and self.selection.policy == 'outcomes.v1':
             return self.selection.system
         if self.config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES:
-            return _GOAL_WORK + (self.methods.instructions()
+            instructions = _GOAL_WORK
+            if self.config.get('candidate_review_protocol') == 'candidate.v1':
+                instructions = instructions.replace(
+                    'As soon as a usable candidate exists, use review_result with its real claim and deliverables ',
+                    'Use review_result to investigate the current claim and available candidate files, '
+                    'disclosing known unfinished work without declaring a final report or complete inventory, ')
+                instructions = instructions.replace(
+                    'Use deliver_result for actual delivery with the same claim and inventory to reuse a current '
+                    'opinion. Changing a completion claim or an artifact may require a relevant recheck. ',
+                    'Use deliver_result for actual final delivery with its complete claim, inventory and requested '
+                    'report formats. Earlier findings remain evidence; an opinion applies only to its bound claim '
+                    'and versions. New artifacts or completion claims need the applicable final checks. ')
+            return instructions + (self.methods.instructions()
                 if self.methods is not None and not getattr(self.methods, 'source_work', False) else '')
         return self.system + (self.methods.instructions() if self.methods is not None and not getattr(self.methods, 'source_work', False) else '')
 

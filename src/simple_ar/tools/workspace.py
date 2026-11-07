@@ -173,6 +173,19 @@ class DeliveryRequest(BaseModel):
         return value.model_dump(exclude_unset=True) if value is not None else None
 
 
+class CandidateReviewRequest(BaseModel):
+    """Investigate available work without claiming a completed delivery."""
+    model_config = ConfigDict(extra='forbid', strict=True)
+    summary: str = Field(min_length=1,
+        description='The current claim to investigate in the available candidate, not a declaration that the task is complete.')
+    artifacts: list[str] = Field(min_length=1,
+        description='Select at least one actual existing workspace output or retained task-evidence file to investigate now. Do not list planned or missing files. A complete final inventory, finished publication and producer self-audit are not prerequisites. Existing path permissions and bounded directory expansion still apply.')
+    unresolved: list[str] = Field(default_factory=list,
+        description='Known requested work or required corrections still unfinished. These gaps do not prevent independent investigation of the available candidate.')
+    limitations: list[str] = Field(default_factory=list, exclude_if=lambda value: not value,
+        description='Known evidence limits, scope and uncertainty relevant to the current claim; these do not certify correctness or waive required findings.')
+
+
 def prepared_report_delivery_schema(schema: dict, field: str) -> None:
     """Annotate the declared completion path, without relying on model names.
 
@@ -349,12 +362,28 @@ def resolve_mounted_path(mounts: dict[str, Path], value: str, *, write: bool = F
 
 
 def workspace_tool_specs(*, candidate_review: bool = False,
-                         process_artifact_paths: str | None = None) -> list[CommonToolSpec]:
+                         process_artifact_paths: str | None = None,
+                         candidate_review_protocol: str | None = None) -> list[CommonToolSpec]:
+    if candidate_review_protocol not in (None, 'candidate.v1'):
+        raise ValueError('Unsupported saved candidate review protocol')
     specs = []
     for name, (model, description, permission) in _TOOLS.items():
         if name == 'review_result' and not candidate_review:
             continue  # Historical and standalone owners retain their offered tools.
+        if name == 'review_result' and candidate_review_protocol == 'candidate.v1':
+            model = CandidateReviewRequest
+            description = ('Investigate a current candidate and its actual available files against the original '
+                'request. Known unfinished work, missing requested publication and incomplete final packaging '
+                'do not prevent checks already possible. Submit this operation alone after observing production. '
+                'It returns independent findings without delivering or certifying overall completion; '
+                'final delivery has its own claim, inventory and acceptance checks.')
         schema = model.model_json_schema()
+        if candidate_review_protocol == 'candidate.v1' and name in {'write_file', 'edit_file', 'copy_file'}:
+            schema['properties']['expected_sha256']['description'] = (
+                'Observed SHA256 of the destination version being changed. Reuse an existing observation '
+                'while that version is unchanged; a new read is not required each turn. '
+                'Execution checks the hash atomically and rejects changed bytes. '
+                + ('Empty for a new destination file.' if name != 'edit_file' else 'Required for an edit.'))
         if name == 'run_process':
             # Professional execution supplies this owner reference internally.
             # Ordinary commands retain their explicit file-list contract.
@@ -382,7 +411,12 @@ def workspace_tool_specs(*, candidate_review: bool = False,
     return specs
 
 
-def validate_workspace_arguments(name: str, arguments: dict[str, Any]) -> BaseModel:
+def validate_workspace_arguments(name: str, arguments: dict[str, Any], *,
+                                 candidate_review_protocol: str | None = None) -> BaseModel:
+    if candidate_review_protocol not in (None, 'candidate.v1'):
+        raise ValueError('Unsupported saved candidate review protocol')
+    if name == 'review_result' and candidate_review_protocol == 'candidate.v1':
+        return CandidateReviewRequest.model_validate(arguments)
     return _TOOLS[name][0].model_validate(arguments)
 
 
@@ -769,10 +803,14 @@ class WorkspaceToolGateway:
 
     def __init__(self, root: Path, sources: dict[str, Path], ledger: BudgetLedger,
                  project_python: Path | None = None, record_artifacts: Any | None = None,
-                 create_workspace: bool = True, process_artifact_paths: str | None = None) -> None:
+                 create_workspace: bool = True, process_artifact_paths: str | None = None,
+                 candidate_review_protocol: str | None = None) -> None:
         if process_artifact_paths not in (None, 'cwd.v1'):
             raise ValueError('Unsupported saved process artifact paths')
         self.process_artifact_paths = process_artifact_paths
+        if candidate_review_protocol not in (None, 'candidate.v1'):
+            raise ValueError('Unsupported saved candidate review protocol')
+        self.candidate_review_protocol = candidate_review_protocol
         self.root = root.resolve()
         # Keep a venv's entry path, not its resolved system-Python symlink.
         self.python = (project_python or Path(sys.executable)).expanduser().absolute()
@@ -2033,7 +2071,8 @@ class WorkspaceToolGateway:
         try:
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,100}", identity):
                 raise ValueError("Invalid durable tool invocation identity")
-            model = validate_workspace_arguments(name, arguments)
+            model = validate_workspace_arguments(name, arguments,
+                candidate_review_protocol=self.candidate_review_protocol)
             metadata = {}
             if name == 'copy_project':
                 return self._copy_project(model, identity)
@@ -2055,6 +2094,11 @@ class WorkspaceToolGateway:
                     data={**copied.data, 'source': model.source, 'source_sha256': digest}
                     if copied.ok or 'conflict' in copied.data else copied.data)
             if name in {"deliver_result", "review_result"}:
+                if isinstance(model, CandidateReviewRequest):
+                    # Normalize once at the result boundary. The original
+                    # candidate request stays in its accepted action receipt;
+                    # existing delivery/inspection owners bind these actual bytes.
+                    model = DeliveryRequest.model_validate(model.model_dump())
                 data = self.resolve_delivery(model)
             elif name == "ask_user":
                 data = model.model_dump()

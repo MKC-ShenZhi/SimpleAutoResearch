@@ -494,6 +494,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         # Existing operation fixtures exercise their saved flat production
         # contract; outcome ownership has its own complete-chain scenario.
         self.app.state['config'].pop('work_lifecycle', None)
+        self.app.state['config'].pop('candidate_review_protocol', None)
         self.app.state['config']['inspection_execution_protocol'] = 'shared.v1'
         self.app.state['config']['professional_operations'] = professional_contract
         if professional_contract not in {'work.v11', 'work.v12'}:
@@ -567,6 +568,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def _retain_flat_fixture(self):
         """Existing native boundary fixtures keep their production contract."""
         self.app.state['config'].pop('work_lifecycle', None)
+        self.app.state['config'].pop('candidate_review_protocol', None)
         self.app.state['config']['inspection_execution_protocol'] = 'shared.v1'
         self.app.state['config']['work_selection_policy'] = 'native.v3'
         self.app.state['config']['professional_operations'] = 'work.v5'

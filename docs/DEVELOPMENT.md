@@ -66,8 +66,9 @@ same file version. Archived observations remain retrievable. Saved selection,
 history and inspection policies stay unchanged on reload and unrelated material supply.
 
 New ordinary tasks can submit an unfinished candidate for independent investigation
-before publication. This binds the actual claim and files; its opinion is not a
-complete-delivery certificate. Final acceptance still checks all required outputs,
+before publication. Its dedicated request contains the current claim, existing files
+and known gaps; final report status and requested formats belong to final delivery.
+This binds the actual claim and files; its opinion is not a complete-delivery certificate. Final acceptance still checks all required outputs,
 publication versions and applicable independent findings. Delivery projects current
 obligations into the shared work view. Early candidate investigation protects model capacity
 for revision, submission, a final independent check and a truthful fallback on the
