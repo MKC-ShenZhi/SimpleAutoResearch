@@ -6974,6 +6974,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.app.state['config'].pop('work_lifecycle', None)
         self.app.state['config']['professional_operations'] = 'work.v5'
         self.app.state['config'].pop('work_method', None)
+        self.app.state['config'].pop('candidate_review_protocol', None)
         self.app.state['config'].pop('inspection_material_policy', None)
         self.app.state['config'].pop('work_selection_policy', None)
         self.app._save()
