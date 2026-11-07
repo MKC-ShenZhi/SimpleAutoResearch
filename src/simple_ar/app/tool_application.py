@@ -4333,6 +4333,8 @@ class ToolApplication:
                 # and independently judges the requested files and claim.
                 handoff_tools = [row for row in schemas if row['function']['name'] in {
                     'review_result', 'load_tools', 'ask_user', 'deliver_result'}]
+                restore_tools = [row['function']['name'] for row in schemas
+                                 if row not in handoff_tools]
                 # A handoff needs a concrete claim and locators, not the whole
                 # producer dialogue or a second presentation of original text.
                 # Independent investigation obtains its own authorized evidence.
@@ -4340,7 +4342,8 @@ class ToolApplication:
                     'resources', 'delivery_conditions', 'context_protocol')}
                 projection.update(candidate_handoff=handoff_evidence, retained_text_windows=[],
                     retained_source_passages=[], material_supply={'native_context': [], 'omitted': []},
-                    work_inputs={'windows': []}, working_context={'compaction_needed': False})
+                    work_inputs={'windows': []}, working_context={'compaction_needed': False},
+                    available_specialists={name: 'Available on return to ordinary work.' for name in restore_tools})
                 messages = [{'role': 'system', 'content': (
                     'Choose the next handoff for this original user request using the available tools. '
                     'The edit and execution receipts identify work that can be investigated; they do '
@@ -4349,7 +4352,7 @@ class ToolApplication:
                     'claim, the actual candidate paths and known gaps. The independent checker reads '
                     'the files and owns the quality checks; producer audit and final packaging are '
                     'not prerequisites. If you cannot name a checkable claim from the available '
-                    'work, use load_tools to restore the essential production tool. Use deliver_result '
+                    'work, use load_tools with one exact name from available_specialists. Use deliver_result '
                     'only for actual delivery, and ask_user only for indispensable user input.')},
                     {**value.messages[1], 'content': json.dumps(projection, ensure_ascii=False)},
                     *[{'role': 'user', 'content': request} for request in self.state['requests']]]
