@@ -2283,7 +2283,7 @@ class WorkspaceToolGateway:
         expected = request.expected_sha256
         reason = ("missing_expected_sha256" if current is not None and not expected
                   and not isinstance(request, _ContextEdit) else
-                  "sha256_mismatch" if current is not None and current != expected else
+                  "sha256_mismatch" if current is not None and expected is not None and current != expected else
                   "target_missing" if current is None and (expected or name == "edit_file") else "")
         if not reason:
             return original, None
