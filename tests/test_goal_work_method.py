@@ -448,7 +448,7 @@ class GoalWorkTests(unittest.TestCase):
             check = {'claim': 'The reported value matches the supplied observation.',
                 'scope': 'The current note and the presented prefix of the support.',
                 'basis': 'observed', 'necessary': True, 'method': 'Compare the note with value=2.',
-                'reasoning': 'The observation is 2.', 'evidence': [note, support],
+                'reasoning': 'The observation is 2.', 'evidence': [note, support] if state['revised'] else [note],
                 'outcome': 'supported' if state['revised'] else 'contradicted',
                 'findings': [] if state['revised'] else [{'severity': 'required',
                     'message': 'Correct the reported value.', 'artifacts': [str(case.root / 'workspace/note.md')]}]}
@@ -479,7 +479,9 @@ class GoalWorkTests(unittest.TestCase):
 
         with patch.object(InspectionToolGateway, '_offered_text_ranges', partial_supply):
             case._submit(_action('deliver_result', **claim))
-            incomplete = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+            review_result = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']
+            self.assertIn('delivery_assessment', review_result['metadata'], review_result)
+            incomplete = review_result['metadata']['delivery_assessment']
             self.assertEqual(incomplete['verdict'], 'incomplete')
             self.assertEqual(incomplete['reassessed_prior'], [])
             self.assertTrue(case.app.operations.delivery_review.pending_concerns(claim['artifacts']))
