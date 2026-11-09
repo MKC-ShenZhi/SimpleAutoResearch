@@ -197,18 +197,13 @@ class Delivery:
                 'Final acceptance rechecks the actual inventory, publication and applicable opinion.'}
 
     def review_continuation(self, decision: dict) -> dict[str, dict]:
-        """Candidate investigation leaves a path back to work and final acceptance.
+        """Leave one decision to act on an independent candidate opinion.
 
-        These are resource forecasts for distinct owner responsibilities, not
-        another task phase or a guarantee that a scientific revision will pass.
-        Final delivery spends the final-check stage instead of recursively
-        reserving another whole candidate-investigation cycle.
+        A revision or another check may be necessary, but their cost and even
+        their need are not known before the opinion. Reserve the next decision,
+        not a hypothetical full repair and resubmission cycle.
         """
-        checking = int(self.review_owner is not None)
-        return {'revision':dict(decision), 'submission':dict(decision),
-            'final_check':{'llm_requests':checking,
-                'total_tokens':checking * decision['total_tokens']},
-            'fallback':dict(decision)}
+        return {'followup': dict(decision)}
 
     def _actual_issues(self, observations: list[dict], request: DeliveryRequest,
                          resolved: dict, *, proposed=None,

@@ -510,7 +510,7 @@ class ToolApplication:
             raise ValueError('Operation control cannot acquire a historical professional controller')
         coordination = [CommonToolSpec(name='load_tools',domain='coordination',permission_level='plan',
             input_schema=_ToolSelection.model_json_schema(),
-            description='Load named optional operation contracts for the next decision; does not grant permission.'),
+            description='Select named optional operation contracts. The next offer also depends on remaining resources; selection does not grant permission.'),
             CommonToolSpec(name='read_history',domain='coordination',permission_level='read_only',
                 input_schema=_ReadHistory.model_json_schema(),
                 description='Read original closed native observations from this task, with bounded paging; history is not current file state.')]
@@ -1557,7 +1557,7 @@ class ToolApplication:
             if name == 'load_tools':
                 selection = self._validate_tool_selection(arguments)
                 return ToolResult(tool_name=name, data=selection.model_dump(),
-                    summary='Selected contracts available to the next decision; no professional work or permission change.')
+                    summary='Contracts selected; the next offer reflects remaining resources and permissions. No professional work or permission change.')
             if name == 'update_work_plan':
                 if self.operations is not None:
                     plan = _OperationPlan.model_validate(arguments)
@@ -2812,9 +2812,9 @@ class ToolApplication:
         name, projection = call['function']['name'], binding['input_projection']
         error = ''
         if name not in projection['tool_names']:
-            error = ('This tool contract was not supplied to the decision; no operation executed. '
-                'Use a currently supplied contract, or load the exact optional tool with load_tools '
-                'before a subsequent decision. Loading does not grant permission.')
+            error = 'This tool contract was not supplied to the decision; no operation executed. Use a currently supplied contract.'
+            if 'load_tools' in projection['tool_names']:
+                error += ' To select an optional contract, use load_tools; selection does not grant permission or resources.'
         elif (self.state['config'].get('work_selection_policy') == 'native.v4'
                 and name in {'review_result', 'deliver_result'}
                 and len(self.session.store.read_json(turn['reply']).get('tool_calls', [])) != 1):
@@ -3460,6 +3460,20 @@ class ToolApplication:
                              'a new native session without fabricating or changing saved reasoning')
         return prefix + [message for block in selected for message in block] + feedback
 
+    @staticmethod
+    def _offered_operation_names(schemas: list) -> set[str]:
+        names = {row['function']['name'] for row in schemas}
+        if 'select_work' in names:
+            wrapper = next(row['function']['parameters'] for row in schemas
+                if row['function']['name'] == 'select_work')
+            names.update(wrapper['$defs']['WorkOperation']['properties']['tool_name']['enum'])
+            decisions = wrapper['properties']['decision']['enum']
+            if 'review' in decisions:
+                names.add('review_result')
+            if 'deliver' in decisions or 'blocked' in decisions:
+                names.add('deliver_result')
+        return names
+
     def _selection_context(self, *, closing: bool = False, schemas: list | None = None) -> dict:
         """Project the last declared candidate, never a separate adoption state."""
         candidate = self.operations.selection.retained_candidate(
@@ -3478,14 +3492,7 @@ class ToolApplication:
         if self.operations.selection.policy == 'outcomes.v1' and schemas is not None:
             # The actual measured outer offer owns the inner action/transition
             # admission too, including a token-constrained partial-only exit.
-            wrapper = next(row['function']['parameters'] for row in schemas
-                if row['function']['name'] == 'select_work')
-            names = set(wrapper['$defs']['WorkOperation']['properties']['tool_name']['enum'])
-            decisions = wrapper['properties']['decision']['enum']
-            if 'review' in decisions:
-                names.add('review_result')
-            if 'deliver' in decisions or 'blocked' in decisions:
-                names.add('deliver_result')
+            names = self._offered_operation_names(schemas)
             operations = [row for row in operations if row['function']['name'] in names]
         production = ([] if self.operations.selection.policy else
             [row['function']['name'] for row in operations
@@ -3560,6 +3567,10 @@ class ToolApplication:
         }
         if config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES:
             context['delivery_conditions'] = self.operations.delivery.lifecycle_requirements()
+            if schemas is not None:
+                offered = self._offered_operation_names(schemas)
+                context['delivery_conditions']['next_tools'] = [name for name in
+                    context['delivery_conditions']['next_tools'] if name in offered]
         if declared:
             # One operable directory; the resolver still owns exact OS paths
             # and independent file/parent grants. Never broaden a mount here.
