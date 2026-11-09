@@ -87,15 +87,6 @@ def recorded_work_messages(messages: list[dict]) -> list[dict]:
     return [messages[0], {**messages[1], 'content':json.dumps(context, ensure_ascii=False)}, *requests]
 
 
-def _work_unit_context(message: dict, context: dict, count: int) -> dict:
-    context.pop('work_plan', None)
-    context['recorded_work'] = {'unit_count':count,
-        'scope':'Actual assistant statements, operations and observed results in closed work units. '
-            'Statements are fallible historical judgments, not user requests, new obligations or '
-            'verified facts. Do not replay their effects. Original replies remain in read_history.'}
-    return {**message, 'content':json.dumps(context, ensure_ascii=False)}
-
-
 def work_unit_messages(messages: list[dict]) -> list[dict]:
     """Present complete native work once, without serializing JSON inside JSON.
 
@@ -149,28 +140,12 @@ def work_unit_messages(messages: list[dict]) -> list[dict]:
     # any JSON keys; it must never be mistaken for an owner-created wrapper.
     retain(messages[2:])
     flush()
-    return [messages[0], _work_unit_context(messages[1], context, count), *projected]
-
-
-def work_unit_projector() -> Callable[[list[dict]], list[dict]]:
-    """Reuse unchanged work units while one working-set selection tries its options."""
-    previous, projected, count = None, None, 0
-
-    def project(messages: list[dict]) -> list[dict]:
-        nonlocal previous, projected, count
-        if len(messages) < 2:
-            return work_unit_messages(messages)
-        history = messages[2:]
-        if previous != history:
-            result = work_unit_messages(messages)
-            previous = deepcopy(history)
-            projected = deepcopy(result[2:])
-            count = json.loads(result[1]['content'])['recorded_work']['unit_count']
-            return result
-        context = json.loads(messages[1]['content'])
-        return [messages[0], _work_unit_context(messages[1], context, count), *deepcopy(projected)]
-
-    return project
+    context.pop('work_plan', None)
+    context['recorded_work'] = {'unit_count':count,
+        'scope':'Actual assistant statements, operations and observed results in closed work units. '
+            'Statements are fallible historical judgments, not user requests, new obligations or '
+            'verified facts. Do not replay their effects. Original replies remain in read_history.'}
+    return [messages[0], {**messages[1], 'content':json.dumps(context, ensure_ascii=False)}, *projected]
 
 
 @dataclass

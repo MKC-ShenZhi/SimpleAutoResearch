@@ -515,8 +515,8 @@ class OperationTools:
         if self.config.get('work_method') != GOAL_WORK_METHOD:
             return None
         if self.config.get('work_selection_policy') == 'native.v4':
-            from simple_ar.app.professional_conversation import work_unit_projector
-            return work_unit_projector()
+            from simple_ar.app.professional_conversation import work_unit_messages
+            return work_unit_messages
         from simple_ar.app.professional_conversation import recorded_work_messages
         return (None if self.work is not None and self.work.source_work
                 and self.work.selected() is not None else recorded_work_messages)
