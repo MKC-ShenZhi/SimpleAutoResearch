@@ -835,7 +835,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertNotIn('select_work', core)
         self.assertEqual({'read_file','search_files','inspect_project','write_file','edit_file',
             'copy_file','copy_project','run_process','work_document','ask_user','deliver_result',
-            'load_tools','read_history','list_directory','export_report','review_result'}, core)
+            'load_tools','read_history','list_directory','export_report','review_result','compile_python'}, core)
         self.assertEqual(self.app.state['config']['professional_operations'], 'work.v12')
         self.assertEqual(self.app.state['config']['work_lifecycle'], 'integrated.v3')
         self.assertEqual(self.app.state['config']['inspection_execution_protocol'], 'shared.v2')

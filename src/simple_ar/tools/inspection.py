@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.budget import completed_llm_usage_is_accounted
 from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES, TURN_SUPPLY_POLICY
-from simple_ar.integrations.llm import LLMCallStopped, LLMSettings, estimate_tokens
+from simple_ar.integrations.llm import LLMCallStopped, LLMSettings, estimate_native_input_tokens, estimate_tokens
 from simple_ar.tools.specs import CommonToolSpec, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS, CLAIM_WORK_METHODS, GOAL_WORK_METHOD, tool_result_payload
 from simple_ar.tools.workspace import FileWindow, workspace_tool_specs
 from simple_ar.tools.materials import lossless_text_window
@@ -2851,7 +2851,7 @@ class InspectionToolGateway:
         cannot represent turns already handed off to working notes.
         """
         from simple_ar.core.working_context import (
-            current_material_paths, processed_journal_turns, select_working_context)
+            current_material_paths, fit_working_context, processed_journal_turns)
 
         policy = saved.get('inspection_context_policy')
         if 'inspection_context_policy' in saved and policy != 'retained.v1':
@@ -3040,7 +3040,8 @@ class InspectionToolGateway:
             pending = {path for finding in saved['prior_required'] for path in finding['pending_subjects']}
             selected_records.extend(fact['source_record'] for fact in execution_facts.values()
                 if pending.intersection(fact['dependencies']))
-        messages, metadata = select_working_context(
+        messages, metadata = fit_working_context(
+            measure_input=lambda value: estimate_native_input_tokens(client, value, offered),
             context_authority=saved.get('context_authority'),
             user_requests=saved.get('user_requests', [request.goal]),system_text=system,
             base_context=base,turn_blocks=blocks,observations=observations,
@@ -3822,8 +3823,13 @@ class InspectionToolGateway:
         claim = saved['delivery_context']['claim']
         primary = [path for path in ((claim.get('report') or {}).get('manuscript'),
             (claim.get('summary_source') or {}).get('path')) if path]
-        return primary or [path for path in saved['delivery_context']['artifacts']
-            if Path(path).suffix.lower() not in _BINARY]
+        artifacts = [path for path in saved['delivery_context']['artifacts']
+                     if Path(path).suffix.lower() not in _BINARY]
+        if saved['delivery_context'].get('scope_policy') == 'applicable.v1':
+            # This contract primes the whole delivery, so its other originals
+            # must get a window before a long manuscript consumes the input.
+            return list(dict.fromkeys([*primary, *artifacts]))
+        return primary or artifacts
 
     def _prime_delivery(self, saved: dict, request: InspectionRequest, identity: str,
                         remaining: list[int], client: Any, offered: list) -> None:

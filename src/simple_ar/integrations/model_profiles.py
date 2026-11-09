@@ -27,7 +27,8 @@ def model_connections_compatible(saved: dict, current: dict) -> bool:
     Missing correction authorization means strict zero, never an implicit opt-in.
     """
     operational = {"stream", "request_timeout_sec", "connect_timeout_sec", "max_output_tokens", "retry_attempts", "connect_retry_attempts",
-                   "retry_base_delay_sec", "retry_max_delay_sec", "context_input_tokens"}
+                   "retry_base_delay_sec", "retry_max_delay_sec", "context_input_tokens",
+                   "token_counting", "tokenizer_file"}
 
     def identity(value):
         if isinstance(value, dict):
@@ -54,6 +55,8 @@ class ModelProfile(BaseModel):
         exclude_if=lambda value: value is None)
     max_output_tokens: int | None = Field(default=None, gt=0)
     context_input_tokens: int = Field(default=DEFAULT_CONTEXT_INPUT_TOKENS, gt=0)
+    token_counting: Literal["approximate", "deepseek_v41"] = "approximate"
+    tokenizer_file: str = ""
     retry_attempts: int = Field(default=3, ge=1)
     connect_retry_attempts: int = Field(default=1, ge=1)
     native_response_corrections: int = Field(default=0, strict=True, ge=0, le=1,
@@ -93,6 +96,12 @@ class ModelProfile(BaseModel):
 
     @model_validator(mode="after")
     def compatible(self) -> "ModelProfile":
+        if self.token_counting == "deepseek_v41" and (self.api != "openai_chat" or not self.tokenizer_file):
+            raise ValueError("deepseek_v41 token counting requires an openai_chat profile and tokenizer_file")
+        if self.token_counting == "deepseek_v41" and self.thinking_mode == "auto":
+            raise ValueError("deepseek_v41 token counting requires a resolved thinking mode")
+        if self.token_counting == "approximate" and self.tokenizer_file:
+            raise ValueError("tokenizer_file requires an explicit token_counting method")
         if self.native_response_corrections and self.api != "openai_chat":
             raise ValueError("native_response_corrections=1 requires an openai_chat profile")
         if (self.api == "openai_chat" and self.thinking_mode == "disabled"
@@ -104,7 +113,7 @@ class ModelProfile(BaseModel):
         if self.api in {"openai_images", "cctq_images_async"}:
             if caps - {"image_generate", "image_edit"}:
                 raise ValueError("Images profiles only declare image capabilities")
-            text_options = {"stream", "max_output_tokens", "context_input_tokens", "reasoning_effort", "json_response_format",
+            text_options = {"stream", "max_output_tokens", "context_input_tokens", "token_counting", "tokenizer_file", "reasoning_effort", "json_response_format",
                             "chat_token_limit_param", "thinking_mode", "reasoning_output_tokens",
                             "input_price_per_million", "output_price_per_million", "connect_retry_attempts",
                             "connect_timeout_sec"}

@@ -110,6 +110,7 @@ Fields below belong to `[profiles.NAME]`. **Operational** settings can be retune
 | `connect_timeout_sec` | SDK text TCP/TLS timeout | Optional finite positive number; default connection cap 20 seconds, bounded by request timeout | Operational |
 | `max_output_tokens` | Output cap; provider limits still apply when omitted | Optional positive integer | Operational; explicit call cap can override |
 | `context_input_tokens` | Native input working-set target, including tools and history | Positive integer `64000` | Operational; not provider context size |
+| `token_counting`, `tokenizer_file` | Optional local Chat input counter and model tokenizer file | `approximate` (default) or `deepseek_v41`; file path required for the latter | Operational |
 | `retry_attempts`, `connect_retry_attempts` | Total attempts / pre-dispatch connection ceiling | Integers ≥1; `3`, `1` | Operational; attempts share budget |
 | `retry_base_delay_sec`, `retry_max_delay_sec` | Retry delays | Positive numbers `1`, `12` seconds | Operational |
 | `native_response_corrections` | One settled native Chat truncation correction | Strict integer `0`/`1`, default `0` | Identity; finite output cap/shared budget required |
@@ -125,6 +126,8 @@ Fields below belong to `[profiles.NAME]`. **Operational** settings can be retune
 Fields/types are strict. Image profiles accept image capabilities and reject text-generation settings; text profiles reject image-generation capabilities and size/quality. Chat disabled thinking requires empty effort or `none`. Provider support must match declared settings.
 
 Size capacity for the whole task: `context_input_tokens` includes tools and history without requiring the window to be filled; `max_output_tokens` must leave room for thinking and final content. New working summaries inherit the task output setting. With a finite total token allowance, configure a provider-supported output cap; otherwise optional unbounded summaries are skipped and original work records remain available.
+
+For a DeepSeek V4.1 Chat connection, install `simple-autoresearch[deepseek-tokenizer]`, obtain the matching model's `tokenizer.json`, and set `token_counting = "deepseek_v41"` and `tokenizer_file` to its local path. This counter does not support `thinking_mode = "auto"`. The shared working-set selector calibrates its initial estimate against the complete request; older saved input policies may still select approximately. Reservation uses the published prompt encoding and includes headroom. Provider usage remains authoritative and a gateway can count differently. Without this configuration, text input uses a rough estimate. Neither estimate guarantees a hard provider-side spending limit. Where provider usage is unavailable, the ledger retains an estimate or an unknown charge; a retained text reservation is not a guaranteed upper bound.
 
 Effort names are interpreted by each provider. For example, [DeepSeek maps `medium` to `high`](https://api-docs.deepseek.com/guides/thinking_mode/); request `low` explicitly for its low tier. Changing thinking settings on a saved task requires an explicit named-connection switch.
 

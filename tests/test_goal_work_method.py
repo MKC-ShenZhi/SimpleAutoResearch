@@ -21,6 +21,26 @@ _action = fixture._action
 
 
 class NativeGoalWorkTests(unittest.TestCase):
+    def test_complete_request_count_reselects_optional_history_without_losing_latest_work(self):
+        from simple_ar.core.working_context import fit_working_context, select_working_context
+        from simple_ar.integrations.llm import estimate_tokens
+
+        blocks = [block(number, 'measurement-' * 350) for number in range(5)]
+        original = deepcopy(blocks)
+        target = 9000
+        arguments = {'user_requests':['Analyze the observations.'], 'system_text':'Use supplied records.',
+            'base_context':{}, 'turn_blocks':blocks, 'observations':[], 'schema_tokens':10,
+            'context_token_target':target, 'estimate_tokens':estimate_tokens}
+        measure = lambda messages: len(json.dumps(messages, ensure_ascii=False)) + 10
+        before, previous = select_working_context(**arguments)
+        self.assertGreater(measure(before), target)
+        messages, selection = fit_working_context(measure_input=measure, **arguments)
+        self.assertLessEqual(measure(messages), target)
+        self.assertEqual(selection['estimated_input_tokens'], measure(messages))
+        self.assertLess(len(selection['selected_turns']), len(previous['selected_turns']))
+        self.assertTrue(any(row.get('tool_call_id') == '4' for row in messages))
+        self.assertEqual(blocks, original)
+
     def test_inflight_legacy_review_keeps_its_original_response_contract(self):
         from simple_ar.tools.inspection import InspectionToolGateway
         from simple_ar.tools.specs import GOAL_WORK_METHOD
@@ -317,6 +337,23 @@ class GoalWorkTests(unittest.TestCase):
             {'request_index':len(requests)-1, 'quote':requests[-1],
              'missing_outcome':'Produce the requested bounded note.'}]),
             actions=list(actions), candidate=candidate)
+
+    def test_working_view_uses_the_connection_counter_for_capacity(self):
+        from simple_ar.integrations.llm import estimate_tokens
+
+        case = self.case
+        case._write('note.md', 'A useful retained observation.\n' * 100)
+        client = case.app._client()
+        selection = {}
+        with patch.object(client, 'estimate_native_input_tokens',
+                side_effect=lambda messages, tools: len(json.dumps(messages, ensure_ascii=False))
+                    + len(json.dumps(tools, ensure_ascii=False))):
+            messages = case.app._messages(client=client, working_selection=selection)
+        serialized = json.dumps(messages, ensure_ascii=False)
+        schemas = json.dumps(case.app.schemas, ensure_ascii=False)
+        self.assertGreaterEqual(selection['estimated_input_tokens'], len(serialized) + len(schemas))
+        self.assertGreater(selection['estimated_input_tokens'],
+                           2 * (estimate_tokens(serialized) + estimate_tokens(schemas)))
 
     def test_review_reassesses_each_concern_using_its_supplied_evidence_windows(self):
         from simple_ar.tools.inspection import InspectionToolGateway

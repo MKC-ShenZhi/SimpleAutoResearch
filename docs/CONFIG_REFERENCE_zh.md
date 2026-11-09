@@ -110,6 +110,7 @@ code = "daily"
 | `connect_timeout_sec` | SDK 文本 TCP/TLS 时限 | 可选有限正数；默认连接上限 20 秒，受请求时限约束 | 运行设置 |
 | `max_output_tokens` | 输出上限；省略时仍受提供方限制 | 可选正整数 | 运行设置；显式调用上限可覆盖 |
 | `context_input_tokens` | 每轮输入工作集目标，包含工具与历史 | 正整数 64000 | 运行设置；不是提供方上下文大小 |
+| `token_counting`、`tokenizer_file` | 可选本地 Chat 输入计数方式及模型分词文件 | 默认 approximate，也可选 deepseek_v41；后者须填写文件路径 | 运行设置 |
 | `retry_attempts`、`connect_retry_attempts` | 总尝试／发出前连接故障上限 | 整数 ≥1；3、1 | 运行设置；共用预算 |
 | `retry_base_delay_sec`、`retry_max_delay_sec` | 重试延迟 | 正数 1、12 秒 | 运行设置 |
 | `native_response_corrections` | 一次已结算原生 Chat 截断纠正 | 严格整数 0/1，默认 0 | 更换连接；需有限输出上限与共享预算 |
@@ -125,6 +126,8 @@ code = "daily"
 字段与类型严格校验。图像 profile 只接受图像能力并拒绝文本生成设置；文本 profile 拒绝图像生成能力与尺寸／质量。Chat 禁用思考时 effort 须为空或 none。声明必须符合提供方实际支持。
 
 容量应按整项工作配置：`context_input_tokens`包含工具和历史，不要求填满；`max_output_tokens`须为思考及最终内容留出空间。新的工作摘要继承任务输出设置。使用有限 token 总预算时，建议设置提供方支持的输出上限；未设上限时不额外购买无界摘要，原始工作记录仍保留并可续用。
+
+DeepSeek V4.1 Chat 连接可安装 `simple-autoresearch[deepseek-tokenizer]`，取得对应模型的 `tokenizer.json`，设置 `token_counting = "deepseek_v41"` 和本地 `tokenizer_file` 路径；此计数方式不支持 `thinking_mode = "auto"`。共同工作集选择用完整请求的计数校准初步估算；旧任务的部分输入策略仍可能粗估选材。请求预留按公开的提示编码计数并留有余量。实际用量以提供方记录为准，网关计数可能不同。未配置时文本输入采用粗估。两种估算都不能保证提供方侧的硬费用上限。提供方未返回用量时，账本保留估算或未知费用；保留的文本预留并非保证的上界。
 
 推理档位由提供方解释，同名档位不保证效果相同。例如 [DeepSeek 的参数说明](https://api-docs.deepseek.com/guides/thinking_mode/)将 `medium` 映射为 `high`；希望使用低档时应明确设置 `low`。修改已保存任务的思考设置，应显式更换命名连接。
 

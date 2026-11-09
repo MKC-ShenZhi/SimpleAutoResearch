@@ -474,6 +474,30 @@ class ModelProfileTests(unittest.TestCase):
         with self.assertRaises(LLMError):
             LLMClient.from_env()
 
+    def test_token_counter_retunes_an_existing_connection_without_changing_provider(self):
+        from simple_ar.integrations.model_profiles import ModelProfile
+
+        original = LLMClient.from_env().connection_binding()
+        self._write_catalog('api_key_env = "WRITER_KEY"',
+            'api_key_env = "WRITER_KEY"\ntoken_counting = "deepseek_v41"\n'
+            'tokenizer_file = "/local/model/tokenizer.json"')
+        tuned = LLMClient.from_env()
+        self.assertTrue(model_connections_compatible(original, tuned.connection_binding()))
+        self.assertEqual(tuned._settings.token_counting, 'deepseek_v41')
+        request = tuned._build_request('system', 'user')
+        self.assertNotIn('token_counting', request)
+        self.assertNotIn('tokenizer_file', request)
+        common = {'model': 'example', 'base_url': 'https://provider.example/v1',
+                  'api_key_env': 'EXAMPLE_KEY', 'capabilities': ['text']}
+        with self.assertRaises(ValueError):
+            ModelProfile(api='openai_chat', token_counting='deepseek_v41', **common)
+        with self.assertRaises(ValueError):
+            ModelProfile(api='openai_responses', token_counting='deepseek_v41',
+                         tokenizer_file='/local/tokenizer.json', **common)
+        with self.assertRaises(ValueError):
+            ModelProfile(api='openai_chat', token_counting='deepseek_v41', thinking_mode='auto',
+                         tokenizer_file='/local/tokenizer.json', **common)
+
     def test_binding_excludes_secrets_allows_key_rotation_and_detects_changes(self):
         client = LLMClient.from_env()
         binding = client.connection_binding()

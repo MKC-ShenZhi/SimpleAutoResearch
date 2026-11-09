@@ -141,6 +141,9 @@ class LLMSettings:
         context_input_tokens: Local native action-loop input working-set target,
             including tool schemas and reasoning history. Not a provider context
             limit or request parameter; total task budget still takes precedence.
+        token_counting: Local input counting method. The default is approximate;
+            deepseek_v41 uses the configured tokenizer and prompt encoding.
+        tokenizer_file: Local tokenizer.json for the selected counting method.
         retry_attempts: Total provider attempts for transient transport/server
             failures. Includes the first request.
         connect_retry_attempts: Optional larger attempt ceiling only for typed
@@ -200,6 +203,8 @@ class LLMSettings:
     request_timeout_sec: float | None = None
     max_output_tokens: int | None = None
     context_input_tokens: int = DEFAULT_CONTEXT_INPUT_TOKENS
+    token_counting: str = "approximate"
+    tokenizer_file: str = ""
     retry_attempts: int = 3
     connect_retry_attempts: int = 1
     retry_base_delay_sec: float = 1.0
@@ -330,6 +335,12 @@ class LLMClient:
             raise LLMError("http2 is supported by the OpenAI SDK transport only")
         if type(settings.context_input_tokens) is not int or settings.context_input_tokens <= 0:
             raise LLMError("context_input_tokens must be a positive integer")
+        if settings.token_counting not in {"approximate", "deepseek_v41"}:
+            raise LLMError("Unknown local token counting method")
+        if settings.token_counting == "deepseek_v41" and (settings.api_mode != "chat" or not settings.tokenizer_file):
+            raise LLMError("deepseek_v41 token counting requires Chat and tokenizer_file")
+        if settings.token_counting == "deepseek_v41" and settings.thinking_mode == "auto":
+            raise LLMError("deepseek_v41 token counting requires a resolved thinking mode")
         self.model = settings.model
         self._openai_model = settings.model.strip()
         self._provider_model = _litellm_model(settings)
@@ -635,6 +646,21 @@ class LLMClient:
                 raise LLMError("max_output_tokens must be a positive integer")
         return output_cap
 
+    def estimate_native_input_tokens(self, messages: list[dict[str, Any]],
+                                     tools: list[dict[str, Any]], *,
+                                     response_format: dict[str, Any] | None = None) -> int:
+        """Estimate the offered text Chat input, including its tool contracts."""
+        if self._settings.token_counting == "deepseek_v41":
+            from simple_ar.integrations.token_counting import deepseek_v41_input_tokens
+            try:
+                return deepseek_v41_input_tokens(model=self.model, tokenizer_file=self._settings.tokenizer_file,
+                    messages=messages, tools=tools, thinking_mode=self._settings.thinking_mode,
+                    reasoning_effort=self._settings.reasoning_effort, response_format=response_format)
+            except ValueError as exc:
+                raise LLMError(str(exc)) from exc
+        return (estimate_tokens(json.dumps(messages, ensure_ascii=False))
+                + estimate_tokens(json.dumps(tools, ensure_ascii=False)))
+
     def _complete_request(
         self, request: dict[str, Any], system: str, user: str, *,
         label: str, max_output_tokens: int | None = None,
@@ -660,8 +686,12 @@ class LLMClient:
                 request["response_format"] = response_format
         if image_count and self._budget_ledger is not None and output_cap is None:
             raise LLMError("Budgeted vision requests require an explicit max_output_tokens cap")
-        prompt_tokens = (estimate_tokens(system) + estimate_tokens(user)
-                         + image_count * ESTIMATED_IMAGE_INPUT_TOKENS)
+        if self._settings.token_counting == "deepseek_v41" and not image_count:
+            prompt_tokens = self.estimate_native_input_tokens(request["messages"], request.get("tools", []),
+                response_format=request.get("response_format"))
+        else:
+            prompt_tokens = (estimate_tokens(system) + estimate_tokens(user)
+                             + image_count * ESTIMATED_IMAGE_INPUT_TOKENS)
         logical_call_id = budget_call_id or label or self._next_budget_call_id()
         prior_reservations = ({entry.reservation_id for entry in self._budget_ledger.entries}
                               if require_settled_response and self._budget_ledger is not None else set())
@@ -992,8 +1022,8 @@ class LLMClient:
                         has_output_cap=output_cap is not None,
                         visual=visual,
                     )
-                    # A capped text retry keeps the failed attempt's full
-                    # reservation. Uncapped/visual charges cannot be bounded.
+                    # A capped text retry retains its estimated reservation;
+                    # the provider's eventual charge may still differ.
                     if isinstance(exc, LLMDeadlineError) and (output_cap is None or visual):
                         raise
                     if unbounded_chat_stream and _is_budget_consumption_unknown(exc):
@@ -1100,9 +1130,8 @@ class LLMClient:
                     retain_reservation=has_output_cap,
                 )
             elif _is_transient_llm_error(error):
-                # A retryable server/transport failure is still a physical
-                # provider attempt.  No usage payload is available, so keep a
-                # conservative estimate rather than silently dropping it.
+                # No provider usage is available for this physical attempt.
+                # Preserve the reservation as an estimate, not measured usage.
                 self._budget_ledger.settle(
                     reservation_id,
                     {
@@ -1595,6 +1624,15 @@ def estimate_tokens(text: str) -> int:
     if not stripped:
         return 0
     return max(1, (len(stripped) + 3) // 4)
+
+
+def estimate_native_input_tokens(client: Any, messages: list, tools: list) -> int:
+    """Use the client's request counter; injected legacy clients keep their estimate."""
+    counter = getattr(client, "estimate_native_input_tokens", None)
+    if callable(counter):
+        return counter(messages, tools)
+    return (estimate_tokens(json.dumps(messages, ensure_ascii=False))
+            + estimate_tokens(json.dumps(tools, ensure_ascii=False)))
 
 
 def _usage_from_response(response: object) -> tuple[int, int, int] | None:

@@ -5,6 +5,14 @@
 User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-11-09
+
+### Improved
+
+- Independent delivery review can reassess a specific finding against its supplied evidence while recording other unchecked claims separately. Whole-delivery review gives different originals a chance to enter the working set. Existing inspection records keep their original interpretation.
+- Approved operations can be reused within the same task when explicitly authorized; execution and accounting still use the shared task boundary.
+- DeepSeek V4.1 Chat connections can optionally use the model's tokenizer for input reservation. The provider's usage remains authoritative.
+
 ## 2026-11-07
 
 ### Improved

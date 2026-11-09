@@ -355,6 +355,19 @@ wheels = [
 ]
 
 [[package]]
+name = "deepseek-recipe"
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/86/9d/0b86feb9f32d35ff93f9404fb797a4ab40eb6d9616f87ed5c5b3613e26d3/deepseek_recipe-0.2.0.tar.gz", hash = "sha256:5dfd65dc201004f6382b13c8432a406cd2af7188831944ac5cef22f260111f68", size = 249190, upload-time = "2026-10-20T05:15:50.31Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/67/04/c9c4dda8c4c9a004a356888c68543458237b07b72431edc7e33e0cab740b/deepseek_recipe-0.2.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:624bb4d0fb3ed541b9e34d2ef96ff66057026ded7d6708b0b9088cc6d6723999", size = 9549388, upload-time = "2026-10-20T05:15:05.726Z" },
+    { url = "https://files.pythonhosted.org/packages/05/bb/70c92b4d9672130a52783a0b9b496ff7cedf0360d40bf2a3da1cbf8f7800/deepseek_recipe-0.2.0-cp310-abi3-macosx_11_0_x86_64.whl", hash = "sha256:fb0d02291c43ef1ab10c2abcb7191e8326a71ea3e76cd01c6b2e79b75e6ce73f", size = 10276726, upload-time = "2026-10-20T05:15:20.911Z" },
+    { url = "https://files.pythonhosted.org/packages/13/57/56cbc6d4084460ed5866804c775c9cff7919e2567c71a5e3e0bc8cc2fabd/deepseek_recipe-0.2.0-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:7c31fa6ed6ff8319670fa6efdf682e724f4e78f76218f6d08dfc4c0d6f47a071", size = 11358225, upload-time = "2026-10-20T05:15:39.608Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/50/bfc176a196e438509e5821b9b5e668d866ccc791aefc01fa1119e857d8e9/deepseek_recipe-0.2.0-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:259812bf382bc82668b672707c5922095cc4f5f60a6c514ff89640bb62a746f7", size = 12846711, upload-time = "2026-10-20T05:15:29.717Z" },
+    { url = "https://files.pythonhosted.org/packages/21/e8/5b30c76e4f17ab2bf2c1d8abeff28cf41f62e8bd8571b6eee45c074db251/deepseek_recipe-0.2.0-cp310-abi3-manylinux_2_39_riscv64.whl", hash = "sha256:622e222aa6290be1bea38f021549a05eddb0c84096663e5424acff0a9d528c9d", size = 10567523, upload-time = "2026-10-20T05:15:46.53Z" },
+]
+
+[[package]]
 name = "distro"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2064,6 +2077,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+deepseek-tokenizer = [
+    { name = "deepseek-recipe" },
+]
 examples = [
     { name = "scikit-learn" },
 ]
@@ -2077,6 +2093,7 @@ litellm = [
 [package.metadata]
 requires-dist = [
     { name = "arxiv", specifier = ">=3.0.0" },
+    { name = "deepseek-recipe", marker = "extra == 'deepseek-tokenizer'", specifier = ">=0.2,<0.3" },
     { name = "h2", marker = "extra == 'http2'", specifier = ">=4,<5" },
     { name = "jsonschema", specifier = ">=4.26,<5" },
     { name = "litellm", marker = "extra == 'litellm'", specifier = ">=1.86.2" },
@@ -2093,7 +2110,7 @@ requires-dist = [
     { name = "scikit-learn", marker = "extra == 'examples'", specifier = ">=1.8.0" },
     { name = "tqdm", specifier = ">=4.67.3" },
 ]
-provides-extras = ["litellm", "examples", "http2"]
+provides-extras = ["litellm", "examples", "http2", "deepseek-tokenizer"]
 
 [[package]]
 name = "six"

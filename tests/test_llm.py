@@ -48,6 +48,36 @@ class LLMParsingTests(unittest.TestCase):
         catalog.start()
         self.addCleanup(catalog.stop)
 
+    def test_configured_counter_is_shared_by_planning_and_provider_reservation(self):
+        from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
+
+        messages = [{'role': 'user', 'content': '请核对结果'}]
+        tools = [{'type': 'function', 'function': {'name': 'read_file', 'parameters': {'type': 'object'}}}]
+        response = {'choices': [{'message': {'content': 'ok'}}],
+                    'usage': {'prompt_tokens': 120, 'completion_tokens': 2, 'total_tokens': 122}}
+        settings = LLMSettings(api_key='fixture', model='fixture-v41', api_mode='chat',
+            token_counting='deepseek_v41', tokenizer_file='fixture-tokenizer.json', max_output_tokens=10)
+        ledger = BudgetLedger({'llm_requests': 1, 'total_tokens': 160})
+        client = LLMClient(settings, budget_ledger=ledger)
+        with patch('simple_ar.integrations.token_counting.deepseek_v41_input_tokens', return_value=150) as counter, \
+                patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as provider:
+            self.assertEqual(ProfessionalConversation(client).tokens(ConversationInput(messages, tools, {})), 160)
+            self.assertEqual(client.chat_turn(messages, tools=tools)['content'], 'ok')
+        self.assertEqual(ledger.entries[0].reserved['total_tokens'], 160)
+        self.assertEqual(ledger.entries[0].actual['total_tokens'], 122)
+        self.assertEqual(counter.call_count, 2)
+        self.assertEqual(counter.call_args.kwargs['messages'], messages)
+        self.assertEqual(counter.call_args.kwargs['tools'], tools)
+        provider.assert_called_once()
+
+        insufficient = BudgetLedger({'llm_requests': 1, 'total_tokens': 159})
+        client = LLMClient(settings, budget_ledger=insufficient)
+        with patch('simple_ar.integrations.token_counting.deepseek_v41_input_tokens', return_value=150), \
+                patch('simple_ar.integrations.llm._call_openai_sdk') as provider:
+            with self.assertRaises(LLMError):
+                client.chat_turn(messages, tools=tools)
+            provider.assert_not_called()
+
     def test_call_stop_scopes_inherit_restore_and_cover_injected_professional_clients(self):
         from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
         from simple_ar.app.tool_application import _RuntimeClientPort

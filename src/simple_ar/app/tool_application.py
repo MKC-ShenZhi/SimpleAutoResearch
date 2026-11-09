@@ -22,7 +22,8 @@ from simple_ar.core.working_context import history_view, RECEIPT_SUPPLY_POLICIES
 from simple_ar.core.capabilities import ArtifactRef, ArtifactStore, AttemptManifest, CapabilityContext, CapabilityRegistry, CapabilityResult
 from simple_ar.core.session import BudgetState, SessionController
 from simple_ar.integrations.llm import (
-    LLMCallStopped, LLMClient, LLMError, LLMSettings, check_llm_call_stop, estimate_tokens, llm_call_stop_scope)
+    LLMCallStopped, LLMClient, LLMError, LLMSettings, check_llm_call_stop,
+    estimate_native_input_tokens, estimate_tokens, llm_call_stop_scope)
 from simple_ar.integrations.model_profiles import catalog_path, model_connections_compatible
 from simple_ar.tools.gateway import CommonToolGateway
 from simple_ar.tools.openai_schema import compact_json_schema, export_openai_tool_schemas
@@ -2682,9 +2683,8 @@ class ToolApplication:
 
     def _decision_tokens(self, client: Any, messages: list | None = None, *, schemas: list | None = None) -> int:
         """Same serialized input/output reservation used by explicit retry."""
-        return (estimate_tokens(json.dumps(messages if messages is not None else
-                    self._messages(client=client), ensure_ascii=False))
-                + estimate_tokens(json.dumps(self.schemas if schemas is None else schemas, ensure_ascii=False))
+        return (estimate_native_input_tokens(client, messages if messages is not None else
+                    self._messages(client=client), self.schemas if schemas is None else schemas)
                 + (client.effective_output_limit() or 0))
 
     def _completion_floor(self, client: Any, messages: list | None = None, *,
@@ -3828,7 +3828,7 @@ class ToolApplication:
         schema_cost = estimate_tokens(json.dumps(self.schemas if schemas is None else schemas, ensure_ascii=False))
         if working_mode:
             from simple_ar.core.working_context import (
-                current_material_paths, processed_journal_turns, select_working_context)
+                current_material_paths, fit_working_context, processed_journal_turns)
             current_artifacts = set()
             if config.get('professional_operations') in RETAINED_PROFESSIONAL_CONTRACTS and config['context_protocol'] == 'working.v4':
                 retained = self._retained_work(observations=owner_observations)
@@ -3970,7 +3970,10 @@ class ToolApplication:
             journal_rows = [{'turn':number, 'record':'records/'+path.removeprefix('attempts/')}
                 for number, turn in enumerate(turns) if not turn.get('remaining')
                 for path in ([item['result'] for item in turn['tools']] or [turn['reply']])] if journal else []
-            messages, selection = select_working_context(user_requests=self.state['requests'],
+            selected_schemas = self.schemas if schemas is None else schemas
+            messages, selection = fit_working_context(
+                measure_input=lambda value: estimate_native_input_tokens(client, value, selected_schemas),
+                user_requests=self.state['requests'],
                 context_authority=config.get('context_authority'),
                 message_projector=(self.operations.work_projection if self.operations is not None else None),
                 system_text=prefix[0]['content'],base_context=context,
@@ -4000,7 +4003,7 @@ class ToolApplication:
                        if config.get('work_method') in NATIVE_WORK_METHODS else {})} if journal else {}))
             if working_selection is not None:
                 working_selection.update(selection)
-            cost = estimate_tokens(json.dumps(messages,ensure_ascii=False))+schema_cost
+            cost = estimate_native_input_tokens(client, messages, self.schemas if schemas is None else schemas)
             if remaining is not None and cost+output>remaining:
                 raise ValueError('Current working view exceeds the remaining token allowance; no request sent')
             if getattr(client._settings, 'thinking_mode', '') == 'enabled' and any(

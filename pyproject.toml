@@ -24,6 +24,7 @@ dependencies = [
 litellm = ["litellm>=1.86.2"]
 examples = ["scikit-learn>=1.8.0"]
 http2 = ["h2>=4,<5"]
+deepseek-tokenizer = ["deepseek-recipe>=0.2,<0.3"]
 
 [project.scripts]
 simple-ar = "simple_ar.cli.main:main"

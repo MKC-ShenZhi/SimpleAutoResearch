@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
+from itertools import zip_longest
 import json
+import math
 import re
 from typing import Any, Literal
 
@@ -828,13 +830,17 @@ def select_working_context(
         admit_navigation()
 
     priority_paths = {path: rank for rank, path in enumerate(dict.fromkeys(priority_source_paths))}
-    priority_sources = [
-        (priority_paths[path], -observed_width(i), i)
-        for i, row in enumerate(rows)
-        if row.get('kind') == 'source_text'
-        and (path := row.get('absolute_path') or row.get('path')) in priority_paths]
-    for _, _, i in sorted(priority_sources):
-        admit(i)
+    priority_sources: dict[str, list[int]] = {path: [] for path in priority_paths}
+    for i, row in enumerate(rows):
+        path = row.get('absolute_path') or row.get('path')
+        if row.get('kind') == 'source_text' and path in priority_sources:
+            priority_sources[path].append(i)
+    for indices in priority_sources.values():
+        indices.sort(key=lambda i: (-observed_width(i), i))
+    for group in zip_longest(*priority_sources.values()):
+        for i in group:
+            if i is not None:
+                admit(i)
 
     if working_records:
         # A working set follows actual work, not lexical similarity to the
@@ -1137,4 +1143,40 @@ def select_working_context(
     if operation_history is not None:
         metadata['operation_overview'] = {key: deepcopy(value) for key, value in
             view['operation_overview'].items() if key != 'entries'}
+    return messages, metadata
+
+
+def fit_working_context(*, measure_input: Callable[[list[dict[str, Any]]], int],
+                        **arguments: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Fit the same selector to a complete request without tokenizing every trial.
+
+    The selector uses its cheap fragment estimate during admission. If the
+    completed request exceeds its target, calibrate that estimate against the
+    actual request counter and repeat selection. Required input still remains
+    visible when it cannot fit; no request or journal is modified here.
+    """
+    target = arguments['context_token_target']
+    estimate = arguments['estimate_tokens']
+    schema_cost = arguments['schema_tokens']
+    scale = 1.0
+    for attempt in range(3):
+        options = dict(arguments)
+        if scale != 1.0:
+            options['estimate_tokens'] = lambda text: math.ceil(estimate(text) * scale)
+            options['schema_tokens'] = math.ceil(schema_cost * scale)
+        messages, metadata = select_working_context(**options)
+        actual = measure_input(messages)
+        estimated = metadata['estimated_input_tokens']
+        if (actual <= target or metadata['context_exceeds_input_target']
+                or attempt == 2 or estimated <= 0):
+            break
+        scale *= actual / estimated * 1.01
+    metadata['estimated_input_tokens'] = actual
+    metadata['required_input_tokens'] = min(metadata['required_input_tokens'], actual)
+    metadata['target_overflow_tokens'] = max(0, actual - target)
+    metadata['context_exceeds_input_target'] = actual > target
+    if actual <= target:
+        metadata['overflow_reason'] = None
+    elif not metadata['overflow_reason']:
+        metadata['overflow_reason'] = 'required_or_estimation_overflow'
     return messages, metadata

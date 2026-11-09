@@ -10,7 +10,7 @@ from copy import deepcopy
 import json
 from typing import Any, Callable
 
-from simple_ar.integrations.llm import check_llm_call_stop, estimate_tokens
+from simple_ar.integrations.llm import check_llm_call_stop, estimate_native_input_tokens
 from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES
 
 
@@ -201,8 +201,7 @@ class ProfessionalConversation:
                 view=view, operations_for_turn=operations_for_turn), **attempted, **archived}
 
     def tokens(self, value: ConversationInput) -> int:
-        return (estimate_tokens(json.dumps(value.messages, ensure_ascii=False))
-            + estimate_tokens(json.dumps(value.tools, ensure_ascii=False))
+        return (estimate_native_input_tokens(self.client, value.messages, value.tools)
             + (self.client.effective_output_limit() or 0))
 
     def request_resources(self, value: ConversationInput) -> dict[str, int]:
