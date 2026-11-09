@@ -3580,7 +3580,8 @@ class InspectionToolGateway:
         return memory, observations, rows
 
     def _prepare_conversation_round(self, saved, request, messages, tools, terminal, finish,
-                                    client, number, remaining, *, dispatch=None, record=None, save_round=None):
+                                    client, number, remaining, *, dispatch=None, record=None, save_round=None,
+                                    response_model=None):
         from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
         from simple_ar.app.work_memory import (checkpoint_artifacts, compact_work, prepare_checkpoint_input,
                                                validate_checkpoint_sources)
@@ -3592,6 +3593,18 @@ class InspectionToolGateway:
             offered = [terminal] if closing else [*tools, terminal]
             projected, metadata = self._working_messages(saved, request, messages, offered, client,
                 finish=finish if closing else None)
+            if (response_model is not None and self._delivery_scope(saved)
+                    and saved.get('inspection_evidence_policy') == 'presented.v2'):
+                # A retained source descriptor is navigation, not a body the
+                # reviewer can cite. Advertise only the original windows in
+                # this input; the final owner still checks the saved supply.
+                subjects = {entry['source'].get('subject') for entry in metadata.get('selected_records', [])
+                    if entry.get('status') in {'native', 'working_view'}
+                    and entry.get('version_status') == 'matching'
+                    and entry.get('source', {}).get('kind') == 'source_text'}
+                final = deepcopy(terminal)
+                final['function']['parameters'] = self._delivery_schema(saved, response_model, subjects=subjects)
+                offered = [final] if closing else [*tools, final]
             return ConversationInput(projected, offered, metadata)
 
         def followup(value):
@@ -4093,7 +4106,8 @@ class InspectionToolGateway:
                         or function['name'] not in allowed):
                     raise ValueError('Inspection requested an unoffered tool or non-object arguments')
                 name = function['name']
-                if shared and name != 'record_inspection':
+                if shared and (name != 'record_inspection'
+                        or saved.get('inspection_evidence_policy') == 'presented.v2'):
                     from jsonschema import Draft202012Validator
                     errors = list(Draft202012Validator(schemas[name]).iter_errors(arguments))
                     if errors:
@@ -4167,10 +4181,12 @@ class InspectionToolGateway:
                 'remaining_after':allowance[0]}})
         return result.model_dump(mode='json')
 
-    def _delivery_schema(self, saved: dict, response_model: type[BaseModel]) -> dict:
+    def _delivery_schema(self, saved: dict, response_model: type[BaseModel], *,
+                         subjects: set[str] | None = None) -> dict:
         schema = response_model.model_json_schema()
         sources = [row['subject'] for row in [*saved['targets'], *saved['evidence']]
-            if row.get('readable') and row.get('sha256') and row.get('windows')]
+            if row.get('readable') and row.get('sha256') and row.get('windows')
+            and (subjects is None or row['subject'] in subjects)]
         nested = issubclass(response_model, _ClaimDeliveryResponse)
 
         def choices(field: dict, values: list) -> None:
@@ -4349,7 +4365,8 @@ class InspectionToolGateway:
                     if saved.get('memory_protocol') == 'journal.v1':
                         conversation, value = self._prepare_conversation_round(saved, request, messages,
                             tools, terminal, finish, client, number, remaining,
-                            dispatch=dispatch, record=record, save_round=save_round)
+                            dispatch=dispatch, record=record, save_round=save_round,
+                            response_model=response_model)
                         call_messages, offered, projection, terminal_only = value.messages, value.tools, value.projection, value.closing
                         final_tokens = 0
                         reserve = value.reserve or {}
@@ -4386,7 +4403,7 @@ class InspectionToolGateway:
                 saved.setdefault('source_rounds', []).append(self._digest(trace))
                 self.store.write_json(input_path, saved)
                 conversation, value = self._prepare_conversation_round(saved, request, messages,
-                    tools, terminal, finish, client, number, remaining)
+                    tools, terminal, finish, client, number, remaining, response_model=response_model)
                 call_messages, offered, projection, terminal_only = value.messages, value.tools, value.projection, value.closing
             else:
                 call_messages, offered, projection, terminal_only, final_tokens = self._legacy_inspection_input(

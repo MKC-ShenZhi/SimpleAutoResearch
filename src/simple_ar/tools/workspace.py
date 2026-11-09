@@ -173,9 +173,8 @@ class DeliveryRequest(BaseModel):
         return value.model_dump(exclude_unset=True) if value is not None else None
 
 
-class CandidateReviewRequest(BaseModel):
+class CandidateReviewRequest(DeliveryRequest):
     """Investigate available work without claiming a completed delivery."""
-    model_config = ConfigDict(extra='forbid', strict=True)
     summary: str = Field(min_length=1,
         description='The current claim to investigate in the available candidate, not a declaration that the task is complete.')
     artifacts: list[str] = Field(min_length=1,
@@ -403,8 +402,9 @@ def workspace_tool_specs(*, candidate_review: bool = False,
             description = ('Investigate a current candidate and its actual available files against the original '
                 'request. Known unfinished work, missing requested publication and incomplete final packaging '
                 'do not prevent checks already possible. Submit this operation alone after observing production. '
-                'It returns independent findings without delivering or certifying overall completion; '
-                'final delivery has its own claim, inventory and acceptance checks.')
+                'It returns independent findings without delivering. If the candidate is ready for final '
+                'delivery, provide the intended final claim, report and inventory; an unchanged final claim '
+                'can reuse its opinion. A pending review itself is not unfinished requested work.')
         if candidate_review_protocol == 'candidate.v1' and name == 'edit_file':
             model = _ContextEdit
             description = ('Replace text in a workspace file using exact old text or two short unique anchors. '

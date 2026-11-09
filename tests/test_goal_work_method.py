@@ -496,6 +496,36 @@ class GoalWorkTests(unittest.TestCase):
             case._reload()
             self.assertFalse(case.app.operations.delivery_review.pending_concerns(claim['artifacts']))
 
+    def test_independent_review_offers_only_presented_evidence_identifiers(self):
+        case = self.case
+        case._write('note.md', 'The observed value is 2.\n')
+        case._write('appendix.txt', 'Unrelated context.\n' * 2000)
+        offered = []
+
+        def review(view):
+            terminal = next(tool['function']['parameters'] for tool in case.inspection_requests[-1]['tools']
+                if tool['function']['name'] == 'record_inspection')
+            fields = [definition['properties']['evidence'] for definition in terminal.get('$defs', {}).values()
+                if 'evidence' in definition.get('properties', {})]
+            self.assertEqual(len(fields), 1)
+            offered.append(fields[0])
+            source, = case._inspection_sources(view, 'note.md')
+            if source is None:
+                self.assertEqual(fields[0].get('maxItems'), 0)
+                return [_action('read_file', path='note.md')]
+            subject = source['subject']
+            self.assertEqual(fields[0]['items']['enum'], [subject])
+            return {'conclusion': 'complete', 'applicability': 'The bounded note has the observation.',
+                'investigations': [{'claim': 'The note states the recorded value.', 'scope': 'The note.',
+                    'basis': 'observed', 'necessary': True, 'method': 'Read the note.',
+                    'reasoning': 'The note states 2.', 'evidence': [subject],
+                    'outcome': 'supported', 'findings': []}], 'limitations': [], 'reassessed_prior': []}
+
+        case.review = review
+        case._submit(_action('deliver_result', summary='The observed value.', artifacts=['note.md', 'appendix.txt']))
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertEqual(len(offered), 2)
+
     def test_usable_candidate_skips_optional_process_and_checks_same_version(self):
         case = self.case
         case._write('note.md', 'Three supplied observations; no population inference.\n')
