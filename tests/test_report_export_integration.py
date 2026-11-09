@@ -25,6 +25,48 @@ TECHNICAL_BODY = ('\n`' + INLINE_COMMAND + '`\n\nInline identifier `' + IDENTIFI
     all(shutil.which(name) for name in ("pandoc", "rsvg-convert", "pdflatex", "bibtex")),
     "Opt-in integration requires Pandoc, librsvg and acmart-equipped TeX")
 class PortableExportIntegrationTests(unittest.TestCase):
+    def test_publication_caption_source_follows_explicit_authoring_choice(self):
+        from types import SimpleNamespace
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.tools.publication import PublicationToolGateway, PUBLICATION_ASSET_PROTOCOL
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = BudgetLedger({'process_invocations': 30, 'process_wall_seconds': 600})
+            workspace = WorkspaceToolGateway(root, {}, ledger)
+            draft = workspace.workspace / 'draft.md'
+            original = '# Report\n\n![Short description](plot.png)\n\n*Full figure description.*\n'
+            draft.write_text(original, encoding='utf-8')
+            import base64
+            (draft.parent / 'plot.png').write_bytes(base64.b64decode(
+                'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='))
+            gateway = PublicationToolGateway(root, workspace, ledger, owned_execution=True,
+                asset_protocol=PUBLICATION_ASSET_PROTOCOL)
+            arguments = {'markdown': 'draft.md', 'layout': 'article', 'compile_pdf': False,
+                'caption_source': 'manifest'}
+            missing = gateway.call('export_report', arguments, identity='missing-caption')
+            self.assertIn('caption manifest is not present', missing.error)
+            self.assertFalse((root / 'tools/publications/missing-caption/request.json').exists())
+            figures = draft.parent / 'figures'
+            figures.mkdir()
+            (figures / 'figures_manifest.json').write_text(json.dumps({'figures': [
+                {'path': 'plot.png', 'caption': 'Full figure description.'}]}), encoding='utf-8')
+            for owner in ('markdown', 'manifest'):
+                request = {**arguments, 'caption_source': owner}
+                identity = 'caption-' + owner
+                context = SimpleNamespace(attempt=SimpleNamespace(attempt_id=identity))
+                approval = gateway.approval_binding(request, identity=identity)
+                result = gateway.execute_tool('export_report', context, request, approval={'binding': approval})
+                self.assertTrue(result.ok, result.error)
+                manifest = result.data['manifest']
+                self.assertEqual(manifest['figure_caption_owner'], owner)
+                self.assertEqual(manifest['bound_figure_captions'], ['plot.png'] if owner == 'manifest' else [])
+                rendered = (workspace.resolve(result.data['project']) / 'source.md').read_text(encoding='utf-8')
+                self.assertIn('Full figure description.', rendered)
+                self.assertEqual('Short description' in rendered, owner == 'markdown')
+            self.assertEqual(draft.read_text(encoding='utf-8'), original)
+
     @unittest.skipUnless(all(shutil.which(name) for name in ('pdftotext', 'pdfinfo', 'pdftoppm')),
         'Caption pagination checks require Poppler')
     def test_caption_page_budget_preserves_native_text_and_clean_rebuild(self):

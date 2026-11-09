@@ -395,9 +395,11 @@ simple-ar report-export --report-dir PATH --output PATH [OPTIONS]
 | `--output PATH` | 本命令的输出目录／文件。 | 必填 |
 | `--title TEXT` | 面向读者的出版标题。 | 未设置 |
 | `--citation-style CHOICE` | 数字 natbib 显示或模板默认值；不改变来源引用键。 可选：`numeric`, `template`. | 未设置 |
+| `--caption-source CHOICE` | 使用 Markdown 图片文本或已组装图件清单中的图注：`markdown` 或 `manifest`；不把相邻正文猜作图注。 | 未设置；已组装报告使用清单 |
 | `--latex-template PATH` | 相对 --report-dir 的可信 Pandoc LaTeX 模板；否则使用 ACM。 | 未设置 |
 | `--template-asset NAME` | 模板同目录的平面配套文件名，可重复；要求 --latex-template。 | [] |
 | `--tex-engine CHOICE` | 自定义模板的已安装引擎；要求 --latex-template；使用 BibTeX 文献表。 可选：`pdflatex`, `xelatex`. | 未设置 |
+| `--top-level-division CHOICE` | 自定义模板的正文顶层级别：`section`、`chapter` 或 `part`；要求 --latex-template。 | 未设置 |
 | `--compile` | 用已安装 TeX／BibTeX 编译；失败保留源码／日志。 | 关闭 |
 
 输出必须为新目录。自定义模板需在正文中包含 $body$，在导言区包含 $for(header-includes)$$header-includes$$endfor$。配套文件须为模板同目录的平面文件名。不自动发现依赖，不运行自定义构建命令。编译要求已安装 TeX／BibTeX；失败保留源码／日志并返回失败。

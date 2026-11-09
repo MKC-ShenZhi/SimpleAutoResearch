@@ -396,9 +396,11 @@ simple-ar report-export --report-dir PATH --output PATH [OPTIONS]
 | `--output PATH` | This command's output directory/file. | Required |
 | `--title TEXT` | Reader-facing publication title. | Unset |
 | `--citation-style CHOICE` | Numeric natbib display or template defaults; source citation keys unchanged. Choices: `numeric`, `template`. | Unset |
+| `--caption-source CHOICE` | Use figure captions from Markdown image text or the assembled figure manifest: `markdown` or `manifest`. Adjacent prose is not inferred as a caption. | Unset; manifest for assembled reports |
 | `--latex-template PATH` | Trusted Pandoc LaTeX template relative to --report-dir; otherwise ACM. | Unset |
 | `--template-asset NAME` | Flat companion filename beside template; repeatable; requires --latex-template. | [] |
 | `--tex-engine CHOICE` | Installed engine for custom template; requires --latex-template; BibTeX bibliography. Choices: `pdflatex`, `xelatex`. | Unset |
+| `--top-level-division CHOICE` | Body heading level for the supplied template: `section`, `chapter`, or `part`; requires --latex-template. | Unset |
 | `--compile` | Compile with installed TeX/BibTeX; retain source/logs on failure. | Off |
 
 Output must be new. Custom templates need $body$ in the document and $for(header-includes)$$header-includes$$endfor$ in the preamble. Companions must be flat filenames beside the template. Dependencies are not discovered automatically; custom build commands are not run. Compilation needs installed TeX/BibTeX; failures retain source/logs and return failure.

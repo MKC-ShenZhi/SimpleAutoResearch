@@ -141,14 +141,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "report-export":
         from simple_ar.report.export import export_acm_report
         try:
-            if not args.latex_template and (args.template_asset or args.tex_engine is not None):
-                raise ValueError('--template-asset and --tex-engine require --latex-template')
+            if not args.latex_template and (args.template_asset or args.tex_engine is not None
+                    or args.top_level_division is not None):
+                raise ValueError('--template-asset, --tex-engine and --top-level-division require --latex-template')
             options = {}
             if args.latex_template is not None:
                 options['template'] = {'path': args.latex_template, 'assets': args.template_asset,
                                        'engine': args.tex_engine or 'pdflatex'}
+                if args.top_level_division is not None:
+                    options['template']['top_level_division'] = args.top_level_division
             if args.citation_style is not None:
                 options['citation_style'] = args.citation_style
+            if args.caption_source is not None:
+                if args.caption_source == 'manifest' and not (args.report_dir / 'figures/figures_manifest.json').is_file():
+                    raise ValueError('The selected caption manifest is not present in the report directory')
+                options['caption_owner'] = args.caption_source
             result = export_acm_report(args.report_dir, args.output, title=args.title, compile_pdf=args.compile,
                                        **options)
         except (OSError, ValueError) as exc:

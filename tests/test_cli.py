@@ -36,19 +36,25 @@ class CliTests(unittest.TestCase):
             for style in ('numeric', 'template'):
                 export.reset_mock()
                 main([*argv, '--citation-style', style, '--latex-template', 'layout/article.latex',
-                    '--template-asset', 'local.bst', '--template-asset', 'local.cls', '--tex-engine', 'xelatex'])
+                    '--template-asset', 'local.bst', '--template-asset', 'local.cls', '--tex-engine', 'xelatex',
+                    '--top-level-division', 'chapter', '--caption-source', 'markdown'])
                 export.assert_called_once_with(Path('report'), Path('new-export'), title=None, compile_pdf=False,
-                    citation_style=style, template={'path': 'layout/article.latex',
-                        'assets': ['local.bst', 'local.cls'], 'engine': 'xelatex'})
+                    citation_style=style, caption_owner='markdown', template={'path': 'layout/article.latex',
+                        'assets': ['local.bst', 'local.cls'], 'engine': 'xelatex', 'top_level_division': 'chapter'})
             export.reset_mock()
             with self.assertRaises(SystemExit) as failure:
                 main([*argv, '--citation-style', 'numeric', '--compile'])
             self.assertEqual(failure.exception.code, 1)
             self.assertEqual(export.call_args.kwargs, {'title': None, 'compile_pdf': True, 'citation_style': 'numeric'})
             export.reset_mock()
-            for flags in (['--template-asset', 'local.bst'], ['--tex-engine', 'xelatex']):
+            for flags in (['--template-asset', 'local.bst'], ['--tex-engine', 'xelatex'],
+                          ['--top-level-division', 'chapter']):
                 with self.subTest(flags=flags), self.assertRaisesRegex(SystemExit, 'require --latex-template'):
                     main([*argv, *flags])
+            with tempfile.TemporaryDirectory() as directory, \
+                    self.assertRaisesRegex(SystemExit, 'caption manifest is not present'):
+                main(['report-export', '--report-dir', directory, '--output', 'new-export',
+                      '--caption-source', 'manifest'])
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 main([*argv, '--citation-style', 'author-year'])
             export.assert_not_called()

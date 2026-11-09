@@ -49,11 +49,15 @@ def build_parser(
     export_parser.add_argument("--title", help="Optional reader-facing document title.")
     export_parser.add_argument("--citation-style", choices=("numeric", "template"), default=None,
                                help="Explicit numeric natbib display override, or preserve template citation defaults. Omit for historical behavior; no source keys or bibliography fields are changed.")
+    export_parser.add_argument("--caption-source", choices=("markdown", "manifest"), default=None,
+                               help="Use captions in Markdown image text or the assembled figure manifest; omit for historical manifest ownership.")
     export_parser.add_argument("--latex-template", help="Trusted Pandoc LaTeX template path relative to --report-dir; requires body and preamble header-includes hooks. Omit for ACM.")
     export_parser.add_argument("--template-asset", action="append", default=[],
                                help="Explicit flat companion filename beside --latex-template; repeat as needed.")
     export_parser.add_argument("--tex-engine", choices=("pdflatex", "xelatex"), default=None,
                                help="Installed engine for --latex-template; default pdflatex. BibTeX only.")
+    export_parser.add_argument("--top-level-division", choices=("section", "chapter", "part"), default=None,
+                               help="Body heading level for --latex-template, such as chapter for a report layout.")
     export_parser.add_argument("--compile", action="store_true", help="Also compile with installed TeX/BibTeX; retain source and logs on failure.")
 
 
