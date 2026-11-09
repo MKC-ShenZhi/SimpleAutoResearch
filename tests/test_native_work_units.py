@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from simple_ar.app.professional_conversation import work_unit_messages
@@ -13,6 +14,28 @@ from tests import test_professional_work_loop as fixture
 
 
 class NativeWorkProjectionTests(unittest.TestCase):
+    def test_retained_inspections_do_not_repeat_the_same_source_window(self):
+        from simple_ar.tools.inspection import InspectionToolGateway
+        owner = InspectionToolGateway.__new__(InspectionToolGateway)
+        owner.workspace = SimpleNamespace(artifact_hashes=lambda paths: {path: 'version' for path in paths})
+        previous = {'identity': 'earlier', 'arguments': {}, 'delivery_context': {}}
+        owner.store = SimpleNamespace(read_json=lambda _: previous)
+        owner._path = lambda identity, leaf: identity + '/' + leaf
+        owner._digest = lambda _: 'retained'
+        window = {'offset_bytes': 0, 'review_next_offset_bytes': 20, 'source_reference': 'first'}
+        duplicate = {**window, 'source_reference': 'another valid receipt'}
+        later = {'offset_bytes': 20, 'review_next_offset_bytes': 40, 'source_reference': 'later'}
+        source = {'subject': 'evidence-1', 'path': 'values.txt', 'sha256': 'version',
+            'readable': True, 'windows': [window]}
+        parent = {'identity': 'earlier', 'targets': [], 'evidence': [{**source, 'windows': [duplicate, later]}]}
+        owner._retained_inputs = lambda _: [parent]
+        saved = {'inspection_material_policy': 'operations.v3', 'work_lifecycle': 'integrated.v3',
+            'arguments': {}, 'evidence': [deepcopy(source)]}
+        remaining = [100]
+        owner._inherit_investigation(saved, {'identity': 'earlier', 'binding': {}, 'arguments': {}}, remaining)
+        self.assertEqual(remaining[0], 80)
+        self.assertEqual(saved['evidence'][0]['windows'], [window, later])
+
     def test_units_keep_statements_arguments_results_and_feedback_order_without_double_encoding(self):
         original = [{'role':'system', 'content':'Original permissions'},
             {'role':'user', 'content':json.dumps({'work_plan':{'old':'fallible'}})},
@@ -214,6 +237,24 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.drain()
         self.assertEqual(c.app.session.manifest.status, 'completed', c.app.result_snapshot())
         self.assertEqual(c._last('deliver_result', reviewed=True)['metadata']['delivery_review']['identity'], reviewed)
+
+    def test_current_report_gets_read_when_retained_material_uses_its_allowance(self):
+        c = self.case
+        body = 'The current report contains the revised observation.\n'
+        c._write('report.md', body)
+        claim = {'summary': 'Current report', 'artifacts': ['report.md'],
+            'report': {'status': 'candidate', 'manuscript': 'report.md', 'formats': ['markdown']}}
+
+        def exhaust_reusable_space(saved, remaining):
+            remaining[0] = 0  # Simulate a long retained history, not a missing current report.
+
+        with patch.object(c.app.operations.inspection, '_reuse_observations', side_effect=exhaust_reusable_space):
+            c._submit(fixture._action('review_result', **claim))
+        reviewed = c._last('review_result', reviewed=True)['metadata']['delivery_review']
+        identity = reviewed['identity']
+        saved = c.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+        report = next(row for row in saved['evidence'] if row.get('path', '').endswith('/report.md'))
+        self.assertEqual(''.join(w['review_text'] for w in report['windows']), body)
 
     def test_lifecycle_guidance_uses_the_actual_budget_limited_offer(self):
         c = self.case

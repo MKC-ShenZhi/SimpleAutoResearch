@@ -2225,8 +2225,11 @@ class InspectionToolGateway:
                     owners[key] = owner
                 owner = owners[key]
                 for window in row['windows']:
-                    count = window['review_next_offset_bytes'] - window['offset_bytes']
-                    if window not in owner['windows'] and count <= remaining[0]:
+                    start, end = window['offset_bytes'], window['review_next_offset_bytes']
+                    count = end - start
+                    if (not any(existing['offset_bytes'] <= start
+                            and end <= existing['review_next_offset_bytes'] for existing in owner['windows'])
+                            and count <= remaining[0]):
                         owner['windows'].append(deepcopy(window))
                         remaining[0] -= count
 
@@ -4718,10 +4721,22 @@ class InspectionToolGateway:
             if self.progressive:
                 saved['evidence'] = [row for row in saved['evidence']
                     if self._target_observation(saved, row) is None]
+                reusable = remaining
+                if applicable and saved.get('source_priming_policy') == 'priority.v1':
+                    # Historical reads must not consume the first current
+                    # manuscript/summary windows or the inspector's own read.
+                    window = FileWindow.model_fields['max_bytes'].default
+                    artifacts = saved['delivery_context']['artifacts']
+                    reserve = min(remaining[0], window + sum(min(window, self.workspace.resolve(path).stat().st_size)
+                        for path in self._delivery_source_paths(saved)
+                        if path in artifacts and Path(path).suffix.lower() not in _BINARY))
+                    reusable = [remaining[0] - reserve]
                 if self.adaptive and self.material_observations is not None:
-                    self._reuse_observations(saved, remaining)
+                    self._reuse_observations(saved, reusable)
                 if retained_from is not None:
-                    self._inherit_investigation(saved, retained_from, remaining)
+                    self._inherit_investigation(saved, retained_from, reusable)
+                if reusable is not remaining:
+                    remaining[0] = reserve + reusable[0]
                 saved['initial_subjects'] = [row['subject'] for row in [*saved['targets'],*saved['evidence']]]
             self._mark_evidence(saved)
             saved['prior_required'] = (deepcopy(prior_required) if package and self.finding_policy == 'linked.v1'
