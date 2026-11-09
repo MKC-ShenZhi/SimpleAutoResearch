@@ -73,6 +73,11 @@ class NativeGoalWorkTests(unittest.TestCase):
         self.assertEqual(new['investigations'][0]['evidence_windows'], [])
         self.assertEqual(new['investigations'][0]['reassessed_prior'], [])
         self.assertTrue(admit(saved, new)[1])
+        revised = {**saved, 'inspection_evidence_policy': 'presented.v2'}
+        _, error, newer, _ = admit(revised, opinion)
+        self.assertEqual(error, '')
+        self.assertEqual(newer['investigations'][0]['evidence_windows'], [])
+        self.assertIsNot(owner._claim_response_model(current), owner._claim_response_model(revised))
 
     def test_closed_history_continues_without_replaying_or_forging_provider_reasoning(self):
         from simple_ar.app.professional_conversation import continuation_blocks, NATIVE_HISTORY_POLICY
@@ -421,6 +426,69 @@ class GoalWorkTests(unittest.TestCase):
             case._submit(_action('deliver_result', **claim))
             final = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
             self.assertEqual((final['coverage'], final['verdict']), ('complete', 'passed'))
+            self.assertEqual(case.app.session.manifest.status, 'completed')
+            case._reload()
+            self.assertFalse(case.app.operations.delivery_review.pending_concerns(claim['artifacts']))
+
+    def test_review_uses_presented_source_without_requiring_byte_coordinates(self):
+        from simple_ar.tools.inspection import InspectionToolGateway
+
+        case = self.case
+        case._write('note.md', 'The reported value is wrong.\n')
+        case._write('support.txt', 'value=2\n' + 'background\n' * 20)
+        claim = {'summary': 'A bounded measured note.', 'artifacts': ['note.md', 'support.txt']}
+        state = {'revised': False, 'supply': 'none'}
+
+        def review(view):
+            paths = ['note.md', 'support.txt']
+            sources = case._inspection_sources(view, *paths)
+            if any(row is None for row in sources):
+                return [_action('read_file', path=path) for path, row in zip(paths, sources) if row is None]
+            note, support = (row['subject'] for row in sources)
+            check = {'claim': 'The reported value matches the supplied observation.',
+                'scope': 'The current note and the presented prefix of the support.',
+                'basis': 'observed', 'necessary': True, 'method': 'Compare the note with value=2.',
+                'reasoning': 'The observation is 2.', 'evidence': [note, support],
+                'outcome': 'supported' if state['revised'] else 'contradicted',
+                'findings': [] if state['revised'] else [{'severity': 'required',
+                    'message': 'Correct the reported value.', 'artifacts': [str(case.root / 'workspace/note.md')]}]}
+            if state['revised']:
+                check['reassessed_prior'] = [row['id'] for row in view['prior_required']]
+            return {'conclusion': 'complete', 'applicability': 'The bounded observation is sufficient.',
+                'investigations': [check], 'limitations': ['Only the presented support prefix was checked.'],
+                'reassessed_prior': []}
+
+        case.review = review
+        case._submit(_action('deliver_result', **claim))
+        self.assertEqual(case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+                         ['result']['metadata']['delivery_assessment']['verdict'], 'needs_revision')
+        note = case.root / 'workspace/note.md'
+        case._submit(_action('write_file', path='note.md', content='The reported value is 2.\n',
+            expected_sha256=hashlib.sha256(note.read_bytes()).hexdigest()))
+        state['revised'] = True
+
+        original = InspectionToolGateway._offered_text_ranges
+        support_path = str(case.root / 'workspace/support.txt')
+        def partial_supply(owner, saved, **kwargs):
+            offered = original(owner, saved, **kwargs)
+            for key, ranges in list(offered.items()):
+                if key[0] == support_path:
+                    offered[key] = ([] if state['supply'] == 'none' else
+                        [(start, min(end, 8)) for start, end in ranges if start < 8])
+            return offered
+
+        with patch.object(InspectionToolGateway, '_offered_text_ranges', partial_supply):
+            case._submit(_action('deliver_result', **claim))
+            incomplete = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+            self.assertEqual(incomplete['verdict'], 'incomplete')
+            self.assertEqual(incomplete['reassessed_prior'], [])
+            self.assertTrue(case.app.operations.delivery_review.pending_concerns(claim['artifacts']))
+            state['supply'] = 'prefix'
+            case._submit(_action('deliver_result', **claim))
+            passed = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+            self.assertEqual((passed['coverage'], passed['verdict']), ('complete', 'passed'))
+            self.assertEqual(len(passed['reassessed_prior']), 1)
+            self.assertTrue(any('recorded windows were not supplied' in item for item in passed['limitations']))
             self.assertEqual(case.app.session.manifest.status, 'completed')
             case._reload()
             self.assertFalse(case.app.operations.delivery_review.pending_concerns(claim['artifacts']))

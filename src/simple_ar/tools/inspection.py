@@ -177,6 +177,17 @@ class _PresentedClaimDeliveryResponse(_ClaimDeliveryResponse):
     investigations: list[_PresentedClaimInvestigation]
 
 
+class _PresentedClaimInvestigationV2(_PresentedClaimInvestigation):
+    evidence_windows: list[_EvidenceWindow] = Field(default_factory=list,
+        description='Optional byte ranges used from a selected source. Without explicit ranges, '
+            'the check is limited to the source text actually presented to you, not its entire '
+            'recorded file. Describe any material limits in the check or limitations.')
+
+
+class _PresentedClaimDeliveryResponseV2(_PresentedClaimDeliveryResponse):
+    investigations: list[_PresentedClaimInvestigationV2]
+
+
 class _Finding(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     subject: str
@@ -445,9 +456,9 @@ class InspectionToolGateway:
 
     @staticmethod
     def _claim_response_model(saved: dict) -> type[_ClaimDeliveryResponse]:
-        return (_PresentedClaimDeliveryResponse
-                if saved.get('inspection_evidence_policy') == 'presented.v1'
-                else _ClaimDeliveryResponse)
+        return {'presented.v1': _PresentedClaimDeliveryResponse,
+                'presented.v2': _PresentedClaimDeliveryResponseV2}.get(
+                    saved.get('inspection_evidence_policy'), _ClaimDeliveryResponse)
 
     @staticmethod
     def _observed_sources(saved: dict) -> bool:
@@ -1070,7 +1081,7 @@ class InspectionToolGateway:
                     for record in investigation.get('execution_records', []):
                         if record not in facts:
                             raise ValueError('Selected independent execution is no longer applicable')
-                        if (execution_scopes and saved.get('inspection_evidence_policy') == 'presented.v1'
+                        if (execution_scopes and saved.get('inspection_evidence_policy') in {'presented.v1', 'presented.v2'}
                                 and self._applicable_scope(saved) and reassessed):
                             bindings['execution:' + record] = facts[record]['dependencies']
                         for path, digest in facts[record]['dependencies'].items():
@@ -2306,30 +2317,41 @@ class InspectionToolGateway:
         scopes = ([self._offered_row_scope(observed[key], offered) for key in decision.evidence]
             if decision and self._offered_coverage(saved) else [])
         linked = saved.get('finding_policy') == 'linked.v1'
+        scoped = isinstance(decision, _PresentedClaimDeliveryResponse)
+        full = dict(zip(decision.evidence, (covered for covered, _ in scopes))) if scoped else {}
+
+        def supplied(row: _PresentedClaimInvestigation, key: str) -> bool:
+            windows = [window for window in row.evidence_windows if window.subject == key]
+            source = observed[key]
+            recorded = self._merged_ranges([(window['offset_bytes'], window['review_next_offset_bytes'])
+                for window in source['windows']])
+            actual = offered.get((source.get('path'), source.get('sha256')), [])
+            if windows:
+                return all(self._range_supplied(recorded, window.start, window.end)
+                           and self._range_supplied(actual, window.start, window.end) for window in windows)
+            if saved.get('inspection_evidence_policy') == 'presented.v2':
+                # An unqualified selection means the text actually offered,
+                # not every historical window for this source. Judgment of
+                # whether those bytes answer the claim belongs to the reviewer.
+                return any(max(start, left) < min(end, right)
+                           for start, end in recorded for left, right in actual)
+            return full[key]
+
+        supplied_for_package = (all(supplied(row, key) for row in decision.investigations for key in row.evidence)
+            if scoped and saved.get('inspection_evidence_policy') == 'presented.v2'
+            else all(covered for covered, _ in scopes))
         # A partially completed package can still contain individually rechecked
         # concerns. Keep those only when the selected evidence was actually
         # supplied; this is an independent opinion, not a scientific certificate.
         reassessed = (list(decision.reassessed_prior)
-            if decision and linked and all(covered for covered, _ in scopes)
+            if decision and linked and supplied_for_package
                 and (decision.evidence or not delivery['artifacts']) else [])
         if decision and linked and self._applicable_scope(saved):
             prior = {row['id']:row for row in saved['prior_required']}
             reassessed = [key for key in reassessed
                 if reassessment_has_subject_support(prior[key], delivery['artifacts'], evidence_scopes)]
-        scoped = isinstance(decision, _PresentedClaimDeliveryResponse)
         unsupported_findings = []
         if scoped:
-            full = dict(zip(decision.evidence, (covered for covered, _ in scopes)))
-            def supplied(row: _PresentedClaimInvestigation, key: str) -> bool:
-                windows = [window for window in row.evidence_windows if window.subject == key]
-                if not windows:
-                    return full[key]
-                source = observed[key]
-                recorded = self._merged_ranges([(window['offset_bytes'], window['review_next_offset_bytes'])
-                    for window in source['windows']])
-                actual = offered.get((source.get('path'), source.get('sha256')), [])
-                return all(self._range_supplied(recorded, window.start, window.end)
-                           and self._range_supplied(actual, window.start, window.end) for window in windows)
             findings = []
             for row in decision.investigations:
                 if row.findings and (not row.evidence or not all(supplied(row, key) for key in row.evidence)):
@@ -4179,7 +4201,7 @@ class InspectionToolGateway:
                 choices(properties['reassessed_prior'], [row['id'] for row in saved['prior_required']])
         if response_model is _DeliveryResponseLinked or nested:
             choices(schema['properties']['reassessed_prior'], [row['id'] for row in saved['prior_required']])
-            if nested and saved.get('inspection_evidence_policy') == 'presented.v1':
+            if nested and saved.get('inspection_evidence_policy') in {'presented.v1', 'presented.v2'}:
                 schema['properties']['reassessed_prior']['description'] = (
                     'Legacy package-level reassessments. Prefer placing each concern ID in the '
                     'investigation that actually rechecked it, and leave this list empty.')
@@ -4670,7 +4692,7 @@ class InspectionToolGateway:
                 if applicable and self.work_method in CLAIM_WORK_METHODS and self.finding_policy == 'linked.v1':
                     # New reviews bind each check to the windows actually presented.
                     # Existing inspection work orders keep their saved contract.
-                    saved['inspection_evidence_policy'] = 'presented.v1'
+                    saved['inspection_evidence_policy'] = 'presented.v2'
             remaining = [512000]
             saved['targets'] = [self._observe(value, f'target-{i + 1}', identity, remaining)
                                 for i, value in enumerate(request.targets)]
