@@ -436,19 +436,20 @@ class GoalWorkTests(unittest.TestCase):
         case = self.case
         case._write('note.md', 'The reported value is wrong.\n')
         case._write('support.txt', 'value=2\n' + 'background\n' * 20)
-        claim = {'summary': 'A bounded measured note.', 'artifacts': ['note.md', 'support.txt']}
+        case._write('empty.txt', '')
+        claim = {'summary': 'A bounded measured note.', 'artifacts': ['note.md', 'support.txt', 'empty.txt']}
         state = {'revised': False, 'supply': 'none'}
 
         def review(view):
-            paths = ['note.md', 'support.txt']
+            paths = ['note.md', 'support.txt', 'empty.txt']
             sources = case._inspection_sources(view, *paths)
             if any(row is None for row in sources):
                 return [_action('read_file', path=path) for path, row in zip(paths, sources) if row is None]
-            note, support = (row['subject'] for row in sources)
+            note, support, empty = (row['subject'] for row in sources)
             check = {'claim': 'The reported value matches the supplied observation.',
                 'scope': 'The current note and the presented prefix of the support.',
                 'basis': 'observed', 'necessary': True, 'method': 'Compare the note with value=2.',
-                'reasoning': 'The observation is 2.', 'evidence': [note, support] if state['revised'] else [note],
+                'reasoning': 'The observation is 2.', 'evidence': [note, support, empty] if state['revised'] else [note],
                 'outcome': 'supported' if state['revised'] else 'contradicted',
                 'findings': [] if state['revised'] else [{'severity': 'required',
                     'message': 'Correct the reported value.', 'artifacts': [str(case.root / 'workspace/note.md')]}]}

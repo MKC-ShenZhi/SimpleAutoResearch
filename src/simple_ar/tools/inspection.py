@@ -2333,8 +2333,8 @@ class InspectionToolGateway:
                 # An unqualified selection means the text actually offered,
                 # not every historical window for this source. Judgment of
                 # whether those bytes answer the claim belongs to the reviewer.
-                return any(max(start, left) < min(end, right)
-                           for start, end in recorded for left, right in actual)
+                return full[key] or any(max(start, left) < min(end, right)
+                                        for start, end in recorded for left, right in actual)
             return full[key]
 
         supplied_for_package = (all(supplied(row, key) for row in decision.investigations for key in row.evidence)
