@@ -2725,6 +2725,11 @@ class ToolApplication:
                 requests * decision['total_tokens'])}
 
     def _review_floor(self, client: Any, *, candidate: bool) -> dict:
+        if (not candidate and self.state['turns']
+                and self._terminal_batch()
+                and (self.state['turns'][-1].get('origin') == 'caller'
+                     or self.ledger.remaining('llm_requests') == 1)):
+            return {}  # The accepted terminal submission may use the last request for its review.
         decision = self._completion_floor(client, dispatch=True)
         if self.state['config'].get('work_lifecycle') != 'integrated.v3' or not candidate:
             return decision
@@ -4206,9 +4211,10 @@ class ToolApplication:
     def _observed_edit_window(self, selection: dict) -> dict | None:
         """Recognize redundant investigation from the last closed decision's actual offer."""
         from simple_ar.app.work_selection import observed_window_covered
+        if self.state['config'].get('action_offer_policy') != 'observed_edit.v1':
+            return None
         turns = self.state['turns'][-2:]
-        if (self.state['config'].get('action_offer_policy') != 'observed_edit.v1'
-                or len(turns) != 2):
+        if len(turns) != 2:
             return None
         for turn in turns:
             if (turn.get('origin') in {'caller', 'professional'} or turn.get('remaining')
@@ -4318,7 +4324,7 @@ class ToolApplication:
         floor = ProfessionalConversation.resource_floor({'investigation': decision,
             **self.operations.delivery.review_continuation(decision)})
         if ({'llm_requests', 'total_tokens'}.intersection(
-                self.ledger.unknown_dimensions(current_allowance_only=True))
+                self.ledger.unknown_dimensions(unbounded_only=True, current_allowance_only=True))
                 or any((remaining := self.ledger.remaining(key)) is not None and remaining < amount
                        for key, amount in floor.items())):
             return False
@@ -5231,6 +5237,11 @@ class ToolApplication:
         if terminal_error:
             if self.operations is None or self.session.manifest.status in {'completed','partial'}:
                 raise ValueError(f'Retained terminal observation cannot be committed: {terminal_error}')
+            if turn.get('origin') == 'caller':
+                reason = 'Explicit delivery not accepted; completed work retained: ' + terminal_error
+                self.session.pause(reason)
+                progress(reason)
+                return True
             if self.session.manifest.status == 'paused':
                 self.session.continue_with_revision('Continue after rejected delivery; completed producer work is not replayed')
             progress('Delivery not accepted; completed work retained: '+terminal_error)
@@ -5949,7 +5960,7 @@ class ToolApplication:
         return result
 
     def run(self, *, feedback: str = "", submission_id: str | None = None,
-            approved_execution: str = "",
+            approved_execution: str = "", remember_execution: bool = False,
             actions: list[dict[str, Any]] | None = None,
             retry_model: bool = False, retry_model_selector: str = "",
             read_only_sources: tuple[Path, ...] = (), allow_execution: bool = False,
@@ -5960,6 +5971,8 @@ class ToolApplication:
             approve: Callable[[dict[str, Any], str], bool] | None = None,
             progress: Callable[[str], None] = print,
             should_stop: Callable[[], bool] | None = None) -> dict[str, Any]:
+        if remember_execution and not approved_execution:
+            raise ValueError('Remembering execution requires the exact pending approval token')
         if submission_id is not None:
             if (actions is not None or approved_execution or retry_model or retry_model_selector
                     or read_only_sources or allow_execution or allow_network or allow_vision
@@ -6102,7 +6115,7 @@ class ToolApplication:
                     if active is None or not any(a.attempt_id == active['attempt'] and a.status == 'running' for a in attempts):
                         self.session.continue_with_revision('Resume pending work without resetting its budget')
                 with llm_call_stop_scope(should_stop):
-                    self._run(approved_execution, approve, progress, should_stop)
+                    self._run(approved_execution, approve, progress, should_stop, remember_execution)
             except LLMCallStopped:
                 # Preserve any budget block recorded by the attempt owner.
                 if self.session.manifest.status != 'blocked':
@@ -6117,7 +6130,8 @@ class ToolApplication:
             return self.result_snapshot()
 
     def _approve_action(self, pending: dict, approved_execution: str, approve: Any,
-                        progress: Callable[[str], None], *, scoped: bool = False) -> bool:
+                        progress: Callable[[str], None], *, scoped: bool = False,
+                        remember_execution: bool = False) -> bool:
         """One protocol and exact-approval boundary for accepted process actions."""
         check_llm_call_stop()
         call = pending['call']
@@ -6139,7 +6153,18 @@ class ToolApplication:
             except (ValueError, TypeError, KeyError, OSError):
                 token = None  # The ordinary validator returns the invalid proposal, without execution.
             started = self.gateway.has_started(ToolCall(tool_name=name, trace_id=pending['attempt']))
-            if token is not None and not started and approved_execution != token and not (approve and approve(call, token)):
+            grants = self.state.get('execution_grants', [])
+            reusable = name in {'run_process', 'export_report'}
+            grant = None
+            if token is not None and not started and reusable and (grants or remember_execution):
+                current = self.execution_approval(call)
+                binding = {key: value for key, value in current['binding'].items() if key != 'call'}
+                if current['token'] == token and (name == 'export_report'
+                        or (binding.get('artifacts') or {}).get('inputs')):
+                    grant = self.workspace.approval_digest({
+                        'name': name, 'arguments': json.loads(call['function']['arguments']), 'binding': binding})
+            if (token is not None and not started and approved_execution != token
+                    and grant not in grants and not (approve and approve(call, token))):
                 self.session.pause(f'Process requires explicit approval; token={token}')
                 progress(f"Pending command: {call['function']['arguments']}\nApproval token: {token}")
                 if name in {'prepare_code_task', 'implement_code_task'}:
@@ -6152,6 +6177,8 @@ class ToolApplication:
                     else {'token': self.approval_token(call)})
                 if token != approval['token']:
                     raise ValueError('Execution inputs changed during approval; approve the current identity')
+                if remember_execution and approved_execution == token and grant is not None and grant not in grants:
+                    self.state['execution_grants'] = [*grants, grant]
                 pending['execution_approval'] = approval
                 self._save()
         return True
@@ -6181,7 +6208,8 @@ class ToolApplication:
 
     def _inspection_dispatch(self, scope: str, kind: str, position: str, call: dict | None,
                              perform: Callable[[str], dict], approved_execution: str,
-                             approve: Any, progress: Callable[[str], None]) -> dict:
+                             approve: Any, progress: Callable[[str], None],
+                             remember_execution: bool = False) -> dict:
         """Translate a professional proposal into the common accepted-action path."""
         if self._consume_feedback():
             raise _ActionSuspended()  # Prior child receipts stay with their original owner.
@@ -6207,7 +6235,7 @@ class ToolApplication:
             self._save()
         if not action.get('result'):
             if kind == 'tool' and not self._approve_action(action, approved_execution,
-                    approve, progress, scoped=True):
+                    approve, progress, scoped=True, remember_execution=remember_execution):
                 self._consume_feedback()
                 raise _ActionSuspended()
             if self._consume_feedback():
@@ -6224,10 +6252,11 @@ class ToolApplication:
                 'execution_binding': (action.get('execution_approval') or {}).get('binding')}
 
     def _advance_inspection(self, pending: dict, approved_execution: str,
-                            approve: Any, progress: Callable[[str], None]) -> str | None:
+                            approve: Any, progress: Callable[[str], None],
+                            remember_execution: bool = False) -> str | None:
         scope = pending['inspection']
         dispatch = lambda kind, position, call, perform: self._inspection_dispatch(
-            scope, kind, position, call, perform, approved_execution, approve, progress)
+            scope, kind, position, call, perform, approved_execution, approve, progress, remember_execution)
         try:
             direct = pending['call']['function']['name'] == 'inspect_artifacts'
             floor = ({} if direct and (self._terminal_batch() or self._caller_takeover())
@@ -6261,7 +6290,7 @@ class ToolApplication:
         return direct or (review.get('data') or {}).get('inspection_pending')
 
     def _run(self, approved_execution: str, approve: Any, progress: Callable[[str], None],
-             should_stop: Callable[[], bool] | None = None) -> None:
+             should_stop: Callable[[], bool] | None = None, remember_execution: bool = False) -> None:
         while True:
             self._consume_feedback()
             caller_takeover = self._caller_takeover()
@@ -6367,7 +6396,8 @@ class ToolApplication:
                 continue
             call = pending["call"]
             name = call["function"]["name"]
-            if not pending.get('inspection') and not self._approve_action(pending, approved_execution, approve, progress):
+            if not pending.get('inspection') and not self._approve_action(
+                    pending, approved_execution, approve, progress, remember_execution=remember_execution):
                 if self._consume_feedback():
                     continue
                 return
@@ -6375,7 +6405,7 @@ class ToolApplication:
                 continue  # Input received during approval precedes physical dispatch.
             progress(f"Tool {name} — {pending['attempt']}")
             if pending.get('inspection'):
-                relative = self._advance_inspection(pending, approved_execution, approve, progress)
+                relative = self._advance_inspection(pending, approved_execution, approve, progress, remember_execution)
                 if relative is None:
                     if self.state['pending'] is None:
                         continue  # A received request cancelled only the unstarted scope.

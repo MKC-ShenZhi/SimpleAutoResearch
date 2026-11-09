@@ -114,7 +114,7 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--allow-vision` | Send mounted rendered PNG/JPEG/WebP to the vision route; shares the model budget. | Off |
 | `--max-images N` | Image generation/edit submissions through the image route; separate from visual inspection. | 0 |
 | `--max-turns N` | Cumulative native model-request allowance, including feedback. | 30 |
-| `--max-tokens N` | Cumulative native model-token allowance, including feedback. | 600000 |
+| `--max-tokens N` | Cumulative native model-token allowance, including feedback. Input is estimated before a request; actual settled usage may exceed the allowance. | 600000 |
 
 #### Explicit structured compatibility
 
@@ -162,6 +162,7 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--authorization-id NAME` | Stable idempotency key; identical ID/terms do not replenish spent capacity. | Unset |
 | `--authorization-reason TEXT` | Human-readable reason for remaining-allowance changes. | Unset |
 | `--approve-execution VALUE` | Exact printed token for the pending command; requires --resume-task. | Requires --resume-task and exact token |
+| `--remember-execution` | Reuse an approved process with declared inputs or an export within this task while the operation and bound inputs match; requires --approve-execution. | Disabled |
 | `--decision-id NAME` | Exact pending design/protocol decision ID; native replies require --resume-task. | Unset |
 | `--decision-response CHOICE` | Reply to the pending decision; accepting a design does not approve a process. Choices: `accept`, `reject`, `revise`. | Unset |
 | `--decision-guidance TEXT` | Facts or revised direction with --decision-response revise. | Unset |
@@ -537,7 +538,7 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 
 | Parameter | Meaning | Default or conditions |
 | --- | --- | --- |
-| `--total-tokens N` | Shared API token budget; resume retains accounting. | No cap if omitted on direct CLI; config/resume may set one |
+| `--total-tokens N` | Shared API token budget; input is estimated before a request, so settled usage may exceed the budget. Resume retains accounting. | No cap if omitted on direct CLI; config/resume may set one |
 | `--llm-requests N` | Shared API request budget. | No cap if omitted on direct CLI; config/resume may set one |
 | `--max-output-tokens N` | Per-model-response output cap. | Unset |
 | `--process-invocations N` | Cumulative process invocation allowance; explicit zero is respected. | Owner computes if omitted; zero is respected |
@@ -698,7 +699,7 @@ simple-ar research-brief --topic TEXT [OPTIONS]
 
 | Parameter | Meaning | Default or conditions |
 | --- | --- | --- |
-| `--total-tokens N` | Shared API token budget; resume retains accounting. | No cap if omitted on direct CLI; config/resume may set one |
+| `--total-tokens N` | Shared API token budget; input is estimated before a request, so settled usage may exceed the budget. Resume retains accounting. | No cap if omitted on direct CLI; config/resume may set one |
 | `--llm-requests N` | Shared API request budget. | No cap if omitted on direct CLI; config/resume may set one |
 | `--max-output-tokens N` | Per-model-response output cap. | Unset |
 | `--process-invocations N` | Cumulative process invocation allowance; explicit zero is respected. | Owner computes if omitted; zero is respected |

@@ -60,6 +60,25 @@ class PublicationAdoptionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'explicitly consume'):
             self.check()
 
+    def test_rebuilt_pdf_accepts_unchanged_figure_from_an_earlier_bundled_build(self):
+        self.case._write('bundle.py',
+            "from pathlib import Path\n"
+            "Path('figure.svg').write_text('<svg xmlns=\"http://www.w3.org/2000/svg\"/>')\n"
+            "exec(Path('make.py').read_text())\n")
+        self.case._submit(fixture._action('run_process', argv=[sys.executable, 'bundle.py'],
+            inputs=['bundle.py', 'make.py', 'report.md', 'references.bib'],
+            outputs=['figure.svg', 'paper.pdf']), approve=lambda *_: True)
+        self.case._ok('run_process')
+        for path, content in {
+            'report.md': '# Revised\n\n![Recorded](figure.svg)\n',
+            'make.py': "from pathlib import Path\nPath('paper.pdf').write_bytes(b'%PDF-1.4\\nrevised\\n')\n",
+        }.items():
+            self.case._submit(fixture._action('write_file', path=path, content=content,
+                expected_sha256=self.case._read(path)['sha256']))
+            self.case._ok('write_file')
+        self.publish()
+        self.assertEqual(self.check(), {self.case.app.workspace.resolve('paper.pdf')})
+
     def test_process_bound_plain_text_with_pdf_suffix_is_rejected(self):
         self.case.app.workspace.resolve('make.py').write_text(
             "from pathlib import Path\nPath('paper.pdf').write_text('plain text, no PDF container')\n",

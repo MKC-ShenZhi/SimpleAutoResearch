@@ -114,7 +114,7 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--allow-vision` | 将挂载的 PNG/JPEG/WebP 渲染图发往 vision 路由；共用模型预算。 | 关闭 |
 | `--max-images N` | 通过 image 路由生成／编辑图片的提交额度；与视觉检查分开。 | 0 |
 | `--max-turns N` | 原生任务累计模型请求额度，含反馈。 | 30 |
-| `--max-tokens N` | 原生任务累计模型 token 额度，含反馈。 | 600000 |
+| `--max-tokens N` | 原生任务累计模型 token 额度，含反馈。请求前输入量为估算，实际结算可能超出额度。 | 600000 |
 
 #### 显式结构化兼容
 
@@ -162,6 +162,7 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--authorization-id NAME` | 稳定幂等 ID；相同 ID／条款不会补回已用额度。 | 未设置 |
 | `--authorization-reason TEXT` | 变更剩余额度的人类可读原因。 | 未设置 |
 | `--approve-execution VALUE` | 待执行命令显示的精确令牌；要求 --resume-task。 | 要求 --resume-task 及精确令牌 |
+| `--remember-execution` | 在本任务中复用操作与绑定输入一致、且已声明输入的进程或导出批准；要求 --approve-execution。 | 未启用 |
 | `--decision-id NAME` | 待处理设计／协议决定的精确 ID；原生回复要求 --resume-task。 | 未设置 |
 | `--decision-response CHOICE` | 回复待处理决定；接受设计不等同批准进程。 可选：`accept`, `reject`, `revise`. | 未设置 |
 | `--decision-guidance TEXT` | --decision-response revise 时提供的事实或修订方向。 | 未设置 |
@@ -536,7 +537,7 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 
 | 参数 | 说明 | 默认值或使用条件 |
 | --- | --- | --- |
-| `--total-tokens N` | 共享 API token 预算；恢复保留账目。 | 直接 CLI 省略时不设上限；配置／恢复可能设限 |
+| `--total-tokens N` | 共享 API token 预算；请求前输入量为估算，实际结算可能超出预算。恢复保留账目。 | 直接 CLI 省略时不设上限；配置／恢复可能设限 |
 | `--llm-requests N` | 共享 API 请求预算。 | 直接 CLI 省略时不设上限；配置／恢复可能设限 |
 | `--max-output-tokens N` | 每次模型响应的输出上限。 | 未设置 |
 | `--process-invocations N` | 累计进程调用额度；显式 0 有效。 | 省略时由执行入口计算；0 有效 |
@@ -697,7 +698,7 @@ simple-ar research-brief --topic TEXT [OPTIONS]
 
 | 参数 | 说明 | 默认值或使用条件 |
 | --- | --- | --- |
-| `--total-tokens N` | 共享 API token 预算；恢复保留账目。 | 直接 CLI 省略时不设上限；配置／恢复可能设限 |
+| `--total-tokens N` | 共享 API token 预算；请求前输入量为估算，实际结算可能超出预算。恢复保留账目。 | 直接 CLI 省略时不设上限；配置／恢复可能设限 |
 | `--llm-requests N` | 共享 API 请求预算。 | 直接 CLI 省略时不设上限；配置／恢复可能设限 |
 | `--max-output-tokens N` | 每次模型响应的输出上限。 | 未设置 |
 | `--process-invocations N` | 累计进程调用额度；显式 0 有效。 | 省略时由执行入口计算；0 有效 |

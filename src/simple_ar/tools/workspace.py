@@ -240,6 +240,26 @@ class _Replacement(BaseModel):
     new_text: str = Field(max_length=256000)
 
 
+class _AnchoredReplacement(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    start_anchor: str = Field(min_length=1, max_length=4096, description="Exact unique text immediately before the block. This text is kept.")
+    end_anchor: str = Field(min_length=1, max_length=4096, description="Exact unique text immediately after the block. This text is kept.")
+    new_text: str = Field(max_length=256000, description="Replacement for everything between the anchors, including surrounding whitespace.")
+
+    def exact_replacement(self, text: str) -> tuple[str, str]:
+        def unique_offset(anchor: str) -> int:
+            offset = text.find(anchor)
+            if offset < 0 or text.find(anchor, offset + 1) >= 0:
+                raise ValueError('Both edit anchors must occur exactly once')
+            return offset
+
+        start, end = map(unique_offset, (self.start_anchor, self.end_anchor))
+        if end < start + len(self.start_anchor):
+            raise ValueError('Edit anchors must be in order and not overlap')
+        return (text[start:end + len(self.end_anchor)],
+                self.start_anchor + self.new_text + self.end_anchor)
+
+
 class _Copy(_Path):
     source: str = Field(description='Authorized regular file, text or binary, at most 64 MiB; copied byte-for-byte without putting its contents in a model response.')
     source_sha256: str = Field(min_length=64, max_length=64, description='Observed full source digest; stale candidates are rejected.')
@@ -265,8 +285,10 @@ class _Edit(_Path):
 
 
 class _ContextEdit(_Edit):
+    replacements: list[_Replacement | _AnchoredReplacement] = Field(default_factory=list, max_length=40,
+        description="Related non-overlapping replacements against one original. Use unique anchors for long blocks.")
     expected_sha256: str | None = Field(default=None, min_length=64, max_length=64,
-        description='Optional whole-file version pin. The exact old text is the default edit precondition.')
+        description='Optional whole-file version pin.')
 
 
 class _Run(BaseModel):
@@ -294,6 +316,7 @@ class _Question(BaseModel):
 _TOOLS = {
     "list_directory": (_List, "List mounted entries, or discover files recursively by filename with explicit pagination and traversal limits; no file contents.", "read_only"),
     "read_file": (FileWindow, "Read a bounded file window by byte offset or one-based line; return digest and exact byte continuation.", "read_only"),
+    "compile_python": (_Path, "Check Python syntax in a workspace file without executing it or writing bytecode.", "read_only"),
     "search_files": (_Search, "Search literal text with ripgrep in a bounded mounted file batch; return line locations and explicit coverage limits.", "read_only"),
     "inspect_project": (_Project, "Read project instructions, dependency declarations and Python entry candidates using the existing preparation inspector. Returns a compact overview and a retained full observation. No imports of project code, installation, downloads or execution; metadata describes the inspecting interpreter, not readiness of the task environment. Use its evidence to choose the next necessary preparation or validation action, not to repeat an inventory.", "read_only"),
     "write_file": (_Write, "Create or replace a workspace text file; existing files require the observed digest. If this is the final file, an explicit delivery can complete the task in the same operation.", "write_patch"),
@@ -384,9 +407,10 @@ def workspace_tool_specs(*, candidate_review: bool = False,
                 'final delivery has its own claim, inventory and acceptance checks.')
         if candidate_review_protocol == 'candidate.v1' and name == 'edit_file':
             model = _ContextEdit
-            description = ('Replace exact, unique text in a workspace file. Supply old and new text, '
-                'or batch non-overlapping replacements. The tool checks the current text and commits '
-                'the batch together. A whole-file version pin is optional.')
+            description = ('Replace text in a workspace file using exact old text or two short unique anchors. '
+                'For a long block, supply start_anchor and end_anchor to replace only the text between them. '
+                'The tool checks the current text and commits non-overlapping replacements together. '
+                'A whole-file version pin is optional.')
         schema = model.model_json_schema()
         if candidate_review_protocol == 'candidate.v1' and name in {'write_file', 'copy_file'}:
             schema['properties']['expected_sha256']['description'] = (
@@ -1520,12 +1544,15 @@ class WorkspaceToolGateway:
             raise ValueError('Process inventory changed during provenance lookup')
         return {name: sources[self.resolve(name)] for name in versions}
 
-    def artifact_dependencies(self, sources: dict[str, dict]) -> dict[str, str]:
+    def artifact_dependencies(self, sources: dict[str, dict], *,
+                              stop_at: frozenset[Path] = frozenset()) -> dict[str, str]:
         """Project consumed inputs from version-bound lineage, never display summaries.
 
         Copies preserve the original observation boundary; replacing their old
         source path is not a change to the copy. An edit's prior bytes are an
         authoring precondition, not a computational input of the new text.
+        A consumer may validate a supplied artifact as a versioned input
+        without requiring its historical build inputs to remain current.
         """
         dependencies = {}
         for source in sources.values():
@@ -1551,7 +1578,8 @@ class WorkspaceToolGateway:
                         if path in dependencies and dependencies[path] != digest:
                             raise ValueError('Selected artifacts consume conflicting historical input versions: ' + path)
                         dependencies[path] = digest
-                    pending.append(edge['node'])
+                    if edge['kind'] != 'input' or upstream['path'] not in stop_at:
+                        pending.append(edge['node'])
         return dependencies
 
     def check_artifact_producers(self, locators: Iterable[str], *, cache: dict | None = None,
@@ -2088,6 +2116,17 @@ class WorkspaceToolGateway:
             model = validate_workspace_arguments(name, arguments,
                 candidate_review_protocol=self.candidate_review_protocol)
             metadata = {}
+            if name == "compile_python":
+                target = self.resolve(model.path, write=True)
+                with target.open('rb') as handle:
+                    raw = handle.read(256001)
+                if len(raw) > 256000:
+                    raise ValueError('Python file exceeds the syntax check size limit')
+                try:
+                    compile(raw, str(target), 'exec', dont_inherit=True)
+                except SyntaxError as exc:
+                    return ToolResult(tool_name=name, status='error', error=f'Line {exc.lineno}: {exc.msg}')
+                return ToolResult(tool_name=name, status='ok', data={'path': model.path})
             if name == 'copy_project':
                 return self._copy_project(model, identity)
             if name == "copy_file":
@@ -2211,7 +2250,9 @@ class WorkspaceToolGateway:
                         if model.replacements:
                             if model.old_text is not None or model.new_text is not None:
                                 raise ValueError("Use replacements or old_text/new_text, not both")
-                            replacements = ((change.old_text, change.new_text) for change in model.replacements)
+                            replacements = (
+                                change.exact_replacement(text) if isinstance(change, _AnchoredReplacement)
+                                else (change.old_text, change.new_text) for change in model.replacements)
                         elif model.old_text is not None and model.new_text is not None:
                             # _Edit already validated these exact field bounds.
                             replacements = [(model.old_text, model.new_text)]

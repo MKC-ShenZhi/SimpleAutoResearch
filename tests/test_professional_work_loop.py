@@ -1216,7 +1216,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 scoped = scoped or any(message['role']=='system'
                     and 'workspace/inspection-work/' in message.get('content', '')
                     for message in request['messages'])
-                allowed = {'read_file', 'list_directory', 'search_files', 'record_inspection'}
+                allowed = {'read_file', 'list_directory', 'search_files', 'compile_python', 'record_inspection'}
                 view, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
                 if view.get('history_archive', {}).get('access') == 'read_history':
                     allowed.add('read_history')
@@ -1786,8 +1786,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 return  # Lose only settlement; let the real owner finish binding its outputs.
             return settle(reservation, actual, **kwargs)
         with patch.object(self.app.ledger, 'settle', side_effect=defer_process_settlement):
-            self._run(approved_execution=token)
+            self._run(approved_execution=token, remember_execution=True)
         self.assertEqual(len(interrupted), 1)
+        self.assertEqual(len(self.app.state.get('execution_grants', [])), 1)
         self.assertEqual(deferred, ['process-'+interrupted[0]])
         self.assertEqual(self.app.session.manifest.status, 'paused')
         self.assertEqual(len(self._process_receipts()), 1)
@@ -5706,6 +5707,19 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._reload()
         self.assertEqual(self.app.ledger.to_dict(), ledger)
         self.assertEqual(self.send.call_count, calls)
+
+    def test_terminal_delivery_can_spend_the_last_request_on_review(self):
+        self.app = ToolApplication.create(self.root, 'Explain the supplied observations.',
+            model='fixture', sources={'measurements': self.inputs}, services=self.services,
+            tool_contracts='full', max_turns=2, max_tokens=500000, max_attempts=20)
+        self._write('report.md', 'The sample mean is 2.0 across three supplied observations.\n')
+        self.review = lambda _: {'conclusion': 'incomplete', 'findings': [], 'evidence': [],
+            'limitations': ['The interpretation remains unfinished.']}
+        self.decisions.append(_action('deliver_result', **self._delivery('report.md')))
+        self._run(should_stop=lambda: False)
+        self.assertEqual(len(self.inspection_requests), 1)
+        self.assertEqual(self.app.ledger.remaining('llm_requests'), 0)
+        self._not_delivered()
 
     def test_terminal_delivery_review_preserves_one_native_partial_delivery_decision(self):
         self.app = ToolApplication.create(self.root, 'Explain the supplied observations.',

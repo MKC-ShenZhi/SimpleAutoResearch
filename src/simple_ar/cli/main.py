@@ -2704,6 +2704,8 @@ def _run_native_start(args: argparse.Namespace) -> None:
         continuation = _continuation_parameters(args)
         if args.supply_task and not args.resume_task:
             raise ValueError('--supply-task requires --resume-task and its retained task')
+        if getattr(args, 'remember_execution', False) and not (args.resume_task and args.approve_execution):
+            raise ValueError('--remember-execution requires --resume-task and --approve-execution')
         if args.approve_execution and not args.resume_task:
             raise ValueError("--approve-execution requires --resume-task and its saved pending command")
         allowances = continuation["authorize_remaining"]
@@ -2907,6 +2909,7 @@ def _run_native_start(args: argparse.Namespace) -> None:
 
         def run_initial():
             status = app.run(feedback=feedback, approved_execution=args.approve_execution,
+                remember_execution=getattr(args, 'remember_execution', False),
                 retry_model=args.retry_model,
                 retry_model_selector=replacement_model if args.resume_task else '',
                 read_only_sources=tuple(args.source) if args.resume_task else (),

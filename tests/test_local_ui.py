@@ -32,6 +32,23 @@ def call(name, arguments, identity='test-call'):
 
 
 class LocalWorkspaceTests(unittest.TestCase):
+    def test_approval_forwards_optional_same_task_reuse_choice(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            workspace = Workspace(root, [], root / 'tasks')
+            with patch.object(workspace, 'task', return_value=root), \
+                    patch.object(workspace, 'validate_sources'), \
+                    patch.object(workspace, 'snapshot_unlocked_approval', return_value='current-token'), \
+                    patch.object(workspace, 'dispatch') as dispatch:
+                workspace.mutate({'op': 'approve', 'task': 'one', 'token': 'current-token',
+                                  'remember_execution': True})
+                dispatch.assert_called_once_with('one', root,
+                    {'approved_execution': 'current-token', 'remember_execution': True})
+                with self.assertRaisesRegex(ValueError, 'boolean choice'):
+                    workspace.mutate({'op': 'approve', 'task': 'one', 'token': 'current-token',
+                                      'remember_execution': 'false'})
+                dispatch.assert_called_once()
+
     def test_historical_version_preview_and_creation_share_the_same_input_binding(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -416,7 +433,9 @@ function json(path, data) {
   $('switchReason').value = 'Existing authorization';
   $('mount').value = 'source0'; folder = 'measurements';
   previewTarget = {mount: 'workspace', path: 'figures/plot.png', name: 'plot.png'};
+  $('rememberExecution').checked = true;
   selectTask('beta');
+  assert.equal($('rememberExecution').checked, false);
   assert.equal($('feedback').value, '');
   assert.equal(folder, '');
   $('feedback').value = 'Other project feedback';

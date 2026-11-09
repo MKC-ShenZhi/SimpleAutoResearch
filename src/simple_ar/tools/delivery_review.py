@@ -977,17 +977,8 @@ class DeliveryReview:
             observations = prior() if prior is not None else []
             pending = (self.pending_concerns(binding['artifacts'], observations)
                        if self.track_findings else [])
-            retained = None
             for observed in reversed(observations):
                 candidate = (observed.get('metadata') or {}).get('delivery_review')
-                if (retained is None and getattr(self.inspector, 'material_policy', None) == 'operations.v3'
-                        and isinstance(candidate, dict) and isinstance(candidate.get('identity'), str)
-                        and isinstance(candidate.get('binding'), dict)
-                        and self.inspector.store.exists(self.inspector._path(candidate['identity'], 'result'))):
-                    retained = {'identity':candidate['identity'], 'binding':candidate['binding'],
-                        **({'arguments': self._arguments(candidate['binding'])}
-                           if candidate['binding'].get('purpose') == 'candidate'
-                              or binding.get('purpose') == 'candidate' else {})}
                 if not isinstance(candidate, dict) or candidate.get('binding') != binding:
                     continue
                 try:
@@ -1011,6 +1002,29 @@ class DeliveryReview:
                 break
             if not may_start:
                 return None
+            retained = None
+            if getattr(self.inspector, 'material_policy', None) == 'operations.v3':
+                # A terminal-only opinion must not hide earlier investigation.
+                for observed in reversed(observations):
+                    candidate = (observed.get('metadata') or {}).get('delivery_review')
+                    if not isinstance(candidate, dict) or not isinstance(candidate.get('identity'), str):
+                        continue
+                    old_identity = candidate['identity']
+                    old_binding = candidate.get('binding')
+                    if not isinstance(old_binding, dict) or not self.inspector.store.exists(
+                            self.inspector._path(old_identity, 'result')):
+                        continue
+                    previous = self.inspector.store.read_json(self.inspector._path(old_identity, 'input'))
+                    response = self.inspector.store.read_json(self.inspector._path(old_identity, 'response'))
+                    if not response.get('completed') and not previous.get('source_invocations'):
+                        continue  # A preflight failure has no closed investigation to inherit.
+                    reference = {'identity': old_identity, 'binding': old_binding,
+                        'arguments': self._arguments(old_binding)}
+                    if previous.get('retained_investigations') or len(previous.get('source_rounds', [])) > 1:
+                        retained = reference
+                        break
+                    if retained is None:
+                        retained = reference
             result = self.inspector.call('inspect_artifacts', self._arguments(binding), identity,
                 delivery_context=deepcopy(binding),
                 **({'retained_from':retained} if retained is not None else {}),

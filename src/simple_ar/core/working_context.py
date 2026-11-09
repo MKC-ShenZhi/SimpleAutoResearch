@@ -144,6 +144,7 @@ def select_working_context(
     estimate_tokens: Callable[[str], int],
     work_notes: Sequence[Mapping[str, Any]] = (),
     selected_records: Sequence[str] = (),
+    priority_source_paths: Sequence[str] = (),
     current_artifacts: Sequence[str] = (),
     version_resolver: Callable[[str], str | None] | None = None,
     block_request_counts: Sequence[int] | None = None,
@@ -825,6 +826,15 @@ def select_working_context(
 
     if not scoped_records and not retained_records:
         admit_navigation()
+
+    priority_paths = {path: rank for rank, path in enumerate(dict.fromkeys(priority_source_paths))}
+    priority_sources = [
+        (priority_paths[path], -observed_width(i), i)
+        for i, row in enumerate(rows)
+        if row.get('kind') == 'source_text'
+        and (path := row.get('absolute_path') or row.get('path')) in priority_paths]
+    for _, _, i in sorted(priority_sources):
+        admit(i)
 
     if working_records:
         # A working set follows actual work, not lexical similarity to the

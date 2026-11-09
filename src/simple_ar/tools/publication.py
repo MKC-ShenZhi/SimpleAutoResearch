@@ -608,15 +608,16 @@ class PublicationToolGateway:
                     pending.extend(edge['node'] for edge in node['edges'] if edge['kind'] != 'previous')
                 if not process:
                     raise ValueError('PDF has no actual process producer')
-                dependencies = self.workspace.artifact_dependencies({name: provenance})
+                # The supplied manuscript and assets are publication inputs.
+                # Their ancestry was checked above, at its recorded versions.
+                # Only the build up to those inputs must still be current.
+                dependencies = self.workspace.artifact_dependencies(
+                    {name: provenance}, stop_at=frozenset(required))
                 consumed = {self.workspace.resolve(path): digest for path, digest in dependencies.items()}
                 if any(consumed.get(path) != digest for path, digest in required.items()):
                     raise ValueError('PDF does not explicitly consume this manuscript, figures and bibliography')
-                # All declared transitive inputs, including scripts and templates,
-                # must remain the same version; superseded edit bytes are excluded.
                 if self.workspace.artifact_hashes(dependencies) != dependencies:
                     raise ValueError('External publication consumed inputs changed')
-                self.workspace.check_artifact_producers([name])
                 if self.workspace.artifact_hashes([name]) != {name: versions[name]}:
                     raise ValueError('External publication PDF changed during validation')
                 verified.add(self.workspace.resolve(name))

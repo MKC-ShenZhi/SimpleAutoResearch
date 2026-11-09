@@ -72,6 +72,32 @@ class NativeWorkQueueTests(unittest.TestCase):
         return c._run(should_stop=lambda: not c.decisions and c.app.state['pending'] is None
             and not any(turn['remaining'] for turn in c.app.state['turns']), **kwargs)
 
+    def test_task_execution_grant_only_reuses_matching_inputs(self):
+        c = self.case
+        c.decisions.append(fixture._action('write_file', path='check.py', content='print("first")\n'))
+        self.drain()
+        c.decisions.append(fixture._action('compile_python', path='check.py'))
+        self.drain()
+        self.assertEqual(c._last('compile_python')['status'], 'ok')
+        action = fixture._action('run_process', argv=[sys.executable, 'check.py'], inputs=['check.py'])
+        c.decisions.append(action)
+        self.drain()
+        token = c.app.approval_token(c.app.state['pending']['call'])
+        self.drain(approved_execution=token, remember_execution=True)
+        self.assertEqual(c._last('run_process')['status'], 'ok')
+        c._reload()
+        c.decisions.append(action)
+        self.drain()
+        self.assertEqual(c._last('run_process')['status'], 'ok')
+        self.assertIsNone(c.app.state['pending'])
+        c.decisions.append(fixture._action('edit_file', path='check.py',
+            old_text='print("first")', new_text='print("second")'))
+        self.drain()
+        c.decisions.append(action)
+        self.drain()
+        self.assertEqual(c.app.state['pending']['call']['function']['name'], 'run_process')
+        self.assertIn('explicit approval', c.app.session.manifest.status_reason)
+
     def test_repeated_supplied_read_has_one_edit_offer_with_normal_work_return(self):
         c = self.case
         c.app.state['config']['tool_contracts'] = 'on_demand'
@@ -104,15 +130,22 @@ class NativeWorkQueueTests(unittest.TestCase):
         c.app.state['config']['tool_contracts'] = 'on_demand'
         c.app._save()
         c._reload()
-        c.decisions.append(fixture._action('write_file', path='note.md', content='Original note.\n'))
+        c.decisions.append(fixture._action('write_file', path='note.md', content='Before\nOriginal note.\nAfter\n'))
         self.drain()
-        c.decisions.append(fixture._action('edit_file', path='note.md',
-            old_text='Original note.', new_text='Revised note.'))
+        c.decisions.append(fixture._action('edit_file', path='note.md', replacements=[
+            {'start_anchor':'Before\n', 'end_anchor':'After\n', 'new_text':'Revised note.\n'}]))
         self.drain()
+        self.assertEqual((c.root/'workspace/note.md').read_text(), 'Before\nRevised note.\nAfter\n')
         c.decisions.append(fixture._action('run_process', argv=[sys.executable, '-c',
             "assert 'Revised note.' in open('note.md').read()"], inputs=['note.md']))
         self.drain()
         token = c.app.approval_token(c.app.state['pending']['call'])
+        attempt = (c.root / c.app.state['turns'][-2]['reply']).parent.name
+        c.app.ledger.reserve('prior-provider-interruption', {'llm_requests': 1, 'total_tokens': 1000},
+            session_id=c.app.session.manifest.session_id, attempt_id=attempt, logical_call_id=attempt)
+        c.app.ledger.mark_unknown('prior-provider-interruption',
+            reason='Provider disconnected before returning usage', known_actual={'llm_requests': 1},
+            retain_reservation=True)
         c.decisions.append(fixture._action('read_file', path='note.md'))
         self.drain(approved_execution=token)
         c._reload()
@@ -121,6 +154,7 @@ class NativeWorkQueueTests(unittest.TestCase):
         reply = json.loads((c.root / handoff['reply']).read_text())
         self.assertEqual(reply['source_result'], c.app.state['turns'][-3]['tools'][-1]['result'])
         self.assertEqual(reply['tool_calls'][0]['function']['name'], 'review_result')
+        self.assertEqual(c.app.ledger.unknown_dimensions(), ('total_tokens',))
         self.assertTrue(c.inspection_requests)
         self.assertFalse((c.root/'delivery.json').exists())
 

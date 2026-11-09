@@ -37,6 +37,7 @@ function saveDrafts() {
 }
 function selectTask(task, save = true) {
   if (save) saveDrafts();
+  if (task !== selected) $('rememberExecution').checked = false;
   selected = task; snapshot = null; viewEpoch++; previewSequence++;
   activityKey = ''; deliveryKey = '';
   const draft = view.tasks[task] || {};
@@ -181,6 +182,7 @@ function confirmationControls() {
   const busy = actionSending || !!snapshot?.local_workers?.length || !!snapshot?.worker_live;
   $('createSubmit').disabled = locked || actionSending || creationPreviewSending || !metadata;
   $('approve').disabled = locked || busy || !snapshot?.approval;
+  $('rememberExecution').disabled = locked || busy || !snapshot?.approval;
   $('switch').disabled = locked || busy || snapshot?.task !== selected;
   $('resume').disabled = locked || busy || snapshot?.task !== selected;
   $('feedbackSubmit').disabled = locked || actionSending || snapshot?.task !== selected;
@@ -229,6 +231,7 @@ $('confirmationSubmit').onclick = async () => {
     // Consume the review even on failure/unknown response: no automatic replay
     // and no second submit of the same frozen approval or creation request.
     confirmationSending = false;
+    if (op === 'approve') $('rememberExecution').checked = false;
     closeConfirmation();
   }
 };
@@ -298,9 +301,11 @@ async function refresh() {
     pending: snapshot.pending, approval_unavailable: snapshot.approval_unavailable,
     stop_requested: snapshot.stop_requested, worker_error: snapshot.worker_error});
   $('resources').textContent = pretty(snapshot.resources);
+  const overLimit = Object.entries(snapshot.resources.over_limit || {});
   $('budgetSummary').textContent = Object.entries(snapshot.resources.limits).map(([key, limit]) =>
     key + '：剩余 ' + snapshot.resources.remaining[key] + ' / 当前授权额度 ' + limit).join('\n')
     + '\n未知用量维度：' + (snapshot.resources.unknown_dimensions.join('、') || '无')
+    + (overLimit.length ? '\n已超出当前额度：' + overLimit.map(([key, value]) => key + ' ' + value).join('、') : '')
     + '\n未知预留未被释放。续额后的额度窗口不等于历次累计耗用；全部历史与授权理由保留在原始账本。';
   $('approvalBox').hidden = !snapshot.approval;
   $('proposal').textContent = pretty(snapshot.approval);
@@ -449,7 +454,8 @@ $('createForm').onsubmit = async event => {
       '目标、配置来源与任务目录': {goal: preview.goal, task_config: preview.task_config, task_root: preview.task_root},
       '实际命名连接与接收方': {model: preview.model, binding_id: preview.binding_id, recipients: preview.recipients},
       '只读材料与执行 Python': {sources: preview.sources, project_python: preview.project_python},
-      '实际硬上限': {limits: preview.limits, attempts: preview.attempts},
+      '实际额度': {limits: preview.limits, attempts: preview.attempts,
+        token_note: '输入预留为估算，实际结算可能超过预留或 token 额度。'},
       '生效权限': preview.access,
       '受信任扩展（含代码、资源身份与工具声明）': preview.extensions,
       '信任与审批边界': '扩展 Python 具有宿主机 OS 权限，read_only/plan 声明不是隔离，也不受关闭执行/网络开关的沙箱保护。确认即信任所列扩展代码。原生进程提议仍逐项精确批准；网络许可不授权安装。视觉许可允许向所列视觉连接发送图像；生成图像另受 image_requests 额度限制。',
@@ -462,12 +468,15 @@ $('resume').onclick = () => action('resume');
 $('stop').onclick = () => action('stop');
 $('approve').onclick = () => {
   if (snapshot?.task !== selected || !snapshot.approval || snapshot.worker_live) return;
-  reviewAction('批准本页精确操作', 'approve', {token: snapshot.approval.token}, {
+  const remember = $('rememberExecution').checked;
+  reviewAction('批准本页精确操作', 'approve', {token: snapshot.approval.token, remember_execution: remember}, {
     '任务与当前模型': {task: selected, session_id: snapshot.manifest.session_id, model: snapshot.model},
     '实际执行操作与批准身份': snapshot.approval,
     '当前授权额度（不会新增）': {limits: snapshot.resources.limits, remaining: snapshot.resources.remaining,
       unknown_dimensions: snapshot.resources.unknown_dimensions},
-    '操作范围': '批准本页 token 绑定的操作并继续同一任务；服务器仍核对当前 pending 提案和原执行权限。'
+    '操作范围': remember
+      ? '批准本页操作；绑定输入的进程和导出可在同一任务中复用相同操作及输入版本的批准。'
+      : '批准本页 token 绑定的操作并继续同一任务；服务器仍核对当前 pending 提案和原执行权限。'
   });
 };
 $('feedbackForm').onsubmit = async event => { event.preventDefault(); await action('feedback', {feedback: $('feedback').value}); };

@@ -207,7 +207,8 @@ class OperationTools:
                  record_artifacts, coordination, extension_host, observations, search_registry=None,
                  execution_observations=None, work_context=None, material_observations=None,
                  user_requests=None, native_route_validator=None):
-        from simple_ar.tools.inspection import InspectionToolGateway, inspection_tool_specs
+        from simple_ar.tools.inspection import (
+            InspectionToolGateway, SHARED_INSPECTION_OPERATIONS, inspection_tool_specs)
         self.root, self.config = root, config
         # Compatibility is selected once from the loaded contract, not exposed
         # as a model option or inferred from report status, paths or contents.
@@ -452,10 +453,10 @@ class OperationTools:
             raise ValueError('Unsupported saved inspection execution contract')
         self.inspection.execution_protocol = inspection_execution
         self.inspection.operation_specs = lambda: [spec for spec in self.registry.list_specs()
-            if (spec.domain == 'workspace' and spec.name in
-                {'read_file', 'list_directory', 'search_files', 'write_file', 'edit_file', 'copy_file', 'run_process',
-                 *({'copy_project'} if config.get('professional_operations') in {'work.v11', 'work.v12'} else set())}
-                or spec.name == 'inspect_images') and self.gateway.policy.is_allowed(spec)[0]]
+            if spec.name in SHARED_INSPECTION_OPERATIONS
+                and (spec.domain == 'workspace' or spec.name == 'inspect_images')
+                and (spec.name != 'copy_project' or config.get('professional_operations') in {'work.v11', 'work.v12'})
+                and self.gateway.policy.is_allowed(spec)[0]]
         self.inspection.operation_call = lambda name, arguments, identity: self.gateway.call(
             ToolCall(tool_name=name, arguments=arguments, trace_id=identity))
         from simple_ar.report.delivery import Delivery
@@ -491,9 +492,12 @@ class OperationTools:
                     'Choose a coherent investigation or implementation that resolves a concrete gap; batch related '
                     'reads and run a complete useful calculation rather than repeatedly inventorying or rerunning '
                     'unchanged work.',
-                    'Choose the next concrete gap. When the evidence supports a reversible change, make it now '
-                    'and use its result to decide what needs checking. Batch reads that resolve a named uncertainty. '
-                    'Use supplied original text for exact edits and retrieve only missing ranges.')
+                    'Choose the next concrete change or the missing evidence that blocks it. Use supplied '
+                    'original text for exact edits and retrieve only missing ranges. When a replacement is '
+                    'ready, apply it to the requested artifact, including when it was prepared in a temporary '
+                    'file. Reuse the supplied write and read results. Use the preserved inputs and prior '
+                    'versions as the baseline for checking the changed artifact. Use read_file or search_files '
+                    'for source inspection and compile_python when offered for Python syntax checks.')
                 instructions = instructions.replace(
                     'Use review_result to investigate the current claim and available candidate files, ',
                     'As soon as there is a concrete claim and work that can be checked, use review_result '

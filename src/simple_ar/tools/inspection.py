@@ -31,7 +31,7 @@ class _InspectionDispatchRaised(BaseException):
 
 _SHARED_EXECUTION_PROTOCOLS = frozenset({'shared.v1', 'shared.v2'})
 
-_SHARED_OPERATIONS = frozenset({'read_file', 'list_directory', 'search_files',
+SHARED_INSPECTION_OPERATIONS = frozenset({'read_file', 'list_directory', 'search_files', 'compile_python',
     'write_file', 'edit_file', 'copy_file', 'copy_project', 'run_process', 'inspect_images'})
 _WORK_MATERIAL_POLICIES = frozenset({'operations.v1', 'operations.v2', 'operations.v3'})
 
@@ -134,8 +134,24 @@ class _ScopedDeliveryResponse(_InvestigatedDeliveryResponse):
     findings: list[_ScopedFinding]
 
 
+class _EvidenceWindow(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    subject: str = Field(description='Evidence subject selected by this investigation.')
+    start: int = Field(ge=0, description='First byte of the window actually used.')
+    end: int = Field(ge=0, description='Exclusive end byte of the window actually used.')
+
+
 class _ClaimInvestigation(_ScopedInvestigation):
     findings: list[_DeliveryFinding]
+
+
+class _PresentedClaimInvestigation(_ClaimInvestigation):
+    evidence_windows: list[_EvidenceWindow] = Field(default_factory=list,
+        description='When using only part of a selected source, identify the actual supplied byte '
+            'ranges used. Omit a subject here only when all of its recorded read windows were supplied.')
+    reassessed_prior: list[str] = Field(default_factory=list,
+        description='Prior concern IDs this specific check actually re-examined. '
+            'Leave other concerns for their own checks.')
 
 
 class _ClaimDeliveryResponse(BaseModel):
@@ -155,6 +171,10 @@ class _ClaimDeliveryResponse(BaseModel):
     @property
     def findings(self) -> list[_DeliveryFinding]:
         return [finding for row in self.investigations for finding in row.findings]
+
+
+class _PresentedClaimDeliveryResponse(_ClaimDeliveryResponse):
+    investigations: list[_PresentedClaimInvestigation]
 
 
 class _Finding(BaseModel):
@@ -424,6 +444,12 @@ class InspectionToolGateway:
         return applicable_delivery_scope(saved.get('delivery_context', {}))
 
     @staticmethod
+    def _claim_response_model(saved: dict) -> type[_ClaimDeliveryResponse]:
+        return (_PresentedClaimDeliveryResponse
+                if saved.get('inspection_evidence_policy') == 'presented.v1'
+                else _ClaimDeliveryResponse)
+
+    @staticmethod
     def _observed_sources(saved: dict) -> bool:
         """New reads bind observed bytes, without adopting ancestral computation."""
         return saved.get('source_provenance') == 'versions.v2'
@@ -638,7 +664,7 @@ class InspectionToolGateway:
         if any(not isinstance(spec, CommonToolSpec) for spec in specs):
             raise ValueError('Shared inspection operation specs must be CommonToolSpecs')
         names = [spec.name for spec in specs]
-        if len(set(names)) != len(names) or any(name not in _SHARED_OPERATIONS for name in names):
+        if len(set(names)) != len(names) or any(name not in SHARED_INSPECTION_OPERATIONS for name in names):
             raise ValueError('Shared inspection received duplicate or unsupported operation specs')
         result = []
         for spec in specs:
@@ -1023,7 +1049,8 @@ class InspectionToolGateway:
             seen.remove(key)
 
     def _shared_final_bindings(self, saved: dict, response: dict, *,
-                               validation_records: dict | None = None) -> dict[str, dict[str, str]]:
+                               validation_records: dict | None = None,
+                               execution_scopes: bool = True) -> dict[str, dict[str, str]]:
         observed = {row['subject']:row for row in [*saved['targets'], *saved['evidence']]}
         journal_cache: dict = {}
         validation_records = {} if validation_records is None else validation_records
@@ -1035,17 +1062,22 @@ class InspectionToolGateway:
         if self._delivery_scope(saved):
             selected = [observed[key] for key in self._delivery_evidence(saved, response)]
             bindings = {'delivery':check(selected)}
+            reassessed = bool(response.get('reassessed_prior') or any(
+                row.get('reassessed_prior') for row in response.get('investigations', [])))
             if saved.get('inspection_material_policy') == 'operations.v3':
                 facts = self._execution_facts(saved)
                 for investigation in response['investigations']:
                     for record in investigation.get('execution_records', []):
                         if record not in facts:
                             raise ValueError('Selected independent execution is no longer applicable')
+                        if (execution_scopes and saved.get('inspection_evidence_policy') == 'presented.v1'
+                                and self._applicable_scope(saved) and reassessed):
+                            bindings['execution:' + record] = facts[record]['dependencies']
                         for path, digest in facts[record]['dependencies'].items():
                             if path in bindings['delivery'] and bindings['delivery'][path] != digest:
                                 raise ValueError('Selected independent executions have conflicting input versions')
                             bindings['delivery'][path] = digest
-            if self._applicable_scope(saved) and response.get('reassessed_prior'):
+            if self._applicable_scope(saved) and reassessed:
                 # The package inventory is an acceptance/version obligation,
                 # never a provenance edge from every evidence item to every
                 # deliverable. Reuse the same owner dependency checks without
@@ -2037,7 +2069,7 @@ class InspectionToolGateway:
                            ) -> _DeliveryResponse | _ClaimDeliveryResponse:
         linked = saved.get('finding_policy') == 'linked.v1'
         investigated = ('applicability' in value or self._investigation_contract(saved))
-        decision = (_ClaimDeliveryResponse if saved.get('work_method') in CLAIM_WORK_METHODS else
+        decision = (self._claim_response_model(saved) if saved.get('work_method') in CLAIM_WORK_METHODS else
             _ScopedDeliveryResponse if saved.get('work_method') in NATIVE_WORK_METHODS else
             _InvestigatedDeliveryResponse if investigated else
             _DeliveryResponseLinked if linked else _DeliveryResponse).model_validate(value)
@@ -2076,6 +2108,10 @@ class InspectionToolGateway:
                 if (isinstance(decision, _ClaimDeliveryResponse) and any(f.severity == 'required' for f in findings)
                         and (not row.necessary or row.outcome != 'contradicted')):
                     raise ValueError('Required findings must bind an actually contradicted investigation')
+                if isinstance(decision, _PresentedClaimDeliveryResponse) and any(
+                        window.subject not in row.evidence or window.start >= window.end
+                        for window in row.evidence_windows):
+                    raise ValueError('Investigation windows must identify nonempty selected evidence ranges')
             if isinstance(decision, _ScopedDeliveryResponse):
                 for finding in decision.findings:
                     if (finding.investigation >= len(decision.investigations)
@@ -2085,9 +2121,11 @@ class InspectionToolGateway:
                         raise ValueError('Required findings must bind an actually contradicted investigation')
         if linked:
             allowed = {row['id'] for row in saved['prior_required']}
-            if (len(set(decision.reassessed_prior)) != len(decision.reassessed_prior)
-                    or not set(decision.reassessed_prior) <= allowed):
-                raise ValueError('Reassessed concerns must identify distinct supplied prior findings')
+            lists = [decision.reassessed_prior]
+            if isinstance(decision, _PresentedClaimDeliveryResponse):
+                lists.extend(row.reassessed_prior for row in decision.investigations)
+            if any(len(set(ids)) != len(ids) or not set(ids) <= allowed for ids in lists):
+                raise ValueError('Reassessed concerns must identify supplied prior findings')
         observed = {row['subject']:row for row in [*saved['targets'], *saved['evidence']]
             if row.get('readable') and row.get('sha256') and row.get('windows')}
         invalid = [key for key in decision.evidence if key not in observed]
@@ -2228,7 +2266,7 @@ class InspectionToolGateway:
         """A whole-work opinion, never a representative file's extended pass."""
         delivery = saved['delivery_context']
         observed = {row['subject']:row for row in [*saved['targets'], *saved['evidence']]}
-        error, decision, dependencies, offered = '', None, {}, {}
+        error, decision, dependencies, offered, bindings = '', None, {}, {}, {}
         evidence_scopes = []
         validation_records: dict = {}
         try:
@@ -2240,14 +2278,19 @@ class InspectionToolGateway:
             if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS:
                 bindings = self._stored_shared_bindings(saved, receipt['response'])
                 dependencies = bindings['delivery']
-                if self._applicable_scope(saved) and decision.reassessed_prior:
+                if self._applicable_scope(saved) and (decision.reassessed_prior or
+                        isinstance(decision, _PresentedClaimDeliveryResponse) and any(
+                            row.reassessed_prior for row in decision.investigations)):
                     evidence_scopes = [bindings['evidence:' + key] for key in decision.evidence]
+                    evidence_scopes.extend(scope for key, scope in bindings.items()
+                        if key.startswith('execution:'))
             if check_versions:
                 selected = self._selected_inspection_rows(saved, receipt['response'])
                 self._check_inspection_versions(saved, identity, selected=selected)
                 if (saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS
                         and bindings != self._shared_final_bindings(saved, receipt['response'],
-                            validation_records=validation_records)):
+                            validation_records=validation_records,
+                            execution_scopes=any(key.startswith('execution:') for key in bindings))):
                     raise ValueError('Inspection selected producer bindings changed')
                 if self.workspace.artifact_hashes(delivery['artifacts']) != delivery['artifacts']:
                     raise ValueError('Bound delivery changed during whole-work review')
@@ -2270,19 +2313,57 @@ class InspectionToolGateway:
             prior = {row['id']:row for row in saved['prior_required']}
             reassessed = [key for key in reassessed
                 if reassessment_has_subject_support(prior[key], delivery['artifacts'], evidence_scopes)]
+        scoped = isinstance(decision, _PresentedClaimDeliveryResponse)
+        unsupported_findings = []
+        if scoped:
+            full = dict(zip(decision.evidence, (covered for covered, _ in scopes)))
+            def supplied(row: _PresentedClaimInvestigation, key: str) -> bool:
+                windows = [window for window in row.evidence_windows if window.subject == key]
+                if not windows:
+                    return full[key]
+                source = observed[key]
+                recorded = self._merged_ranges([(window['offset_bytes'], window['review_next_offset_bytes'])
+                    for window in source['windows']])
+                actual = offered.get((source.get('path'), source.get('sha256')), [])
+                return all(self._range_supplied(recorded, window.start, window.end)
+                           and self._range_supplied(actual, window.start, window.end) for window in windows)
+            findings = []
+            for row in decision.investigations:
+                if row.findings and (not row.evidence or not all(supplied(row, key) for key in row.evidence)):
+                    unsupported_findings.append(row.claim)
+                    continue
+                findings.extend({'severity':finding.severity, 'message':finding.message,
+                    'subjects':{path:delivery['artifacts'][path] for path in finding.artifacts}}
+                    for finding in row.findings)
+            linked_ids = list(dict.fromkeys(key for row in decision.investigations for key in row.reassessed_prior))
+            reassessed = [key for key in reassessed if key not in linked_ids]
+            for key in linked_ids:
+                checks = [row for row in decision.investigations if key in row.reassessed_prior]
+                if any(row.outcome != 'supported' or not row.evidence
+                       or not all(supplied(row, subject) for subject in row.evidence) for row in checks):
+                    continue
+                row_scopes = [bindings['evidence:' + subject] for row in checks for subject in row.evidence]
+                row_scopes.extend(bindings['execution:' + record] for row in checks
+                    for record in row.execution_records if 'execution:' + record in bindings)
+                if reassessment_has_subject_support(prior[key], delivery['artifacts'], row_scopes):
+                    reassessed.append(key)
         pending = ({row['id'] for row in saved['prior_required']} - set(reassessed)
             if decision and linked else set())
-        complete = (decision is not None and decision.conclusion == 'complete'
-            and all(covered for covered, _ in scopes) and not pending)
+        complete = (decision is not None and decision.conclusion == 'complete' and not pending
+            and (all(not row.necessary or all(supplied(row, key) for key in row.evidence)
+                     for row in decision.investigations) if scoped else
+                 all(covered for covered, _ in scopes)))
         investigations = getattr(decision, 'investigations', None)
         if investigations is not None:
             complete = complete and all(not getattr(row, 'necessary', True) or row.outcome == 'supported'
                                         for row in investigations)
         limitations = ([*decision.limitations, *(scope for _, scope in scopes),
+            *['A finding lacks its selected supplied evidence: ' + claim for claim in unsupported_findings],
             *(['Unfinished independent investigation: ' + row.claim
                 for row in investigations if row.outcome == 'unresolved' and getattr(row, 'necessary', True)]
                 if investigations is not None else []),
-            *(['Selected evidence includes read windows not proven supplied to an inspection request']
+            *([('Some recorded windows were not supplied; each check covers only its selected supplied ranges'
+                if scoped else 'Selected evidence includes read windows not proven supplied to an inspection request')]
                 if any(not covered for covered, _ in scopes) else []),
             *(['Prior required concerns remain to be rechecked: ' + ', '.join(sorted(pending))]
                 if pending else [])]
@@ -2293,7 +2374,8 @@ class InspectionToolGateway:
                 else 'passed' if complete else 'incomplete',
             'findings':findings,
             **({'applicability': decision.applicability,
-                'investigations': [row.model_dump(mode='json', exclude={'findings'}) for row in investigations]}
+                'investigations': [row.model_dump(mode='json', exclude={'findings'})
+                    for row in investigations]}
                 if investigations is not None else {}),
             **({'reassessed_prior': reassessed} if linked else {}),
             'evidence_sha256':self._evidence_with_dependencies(
@@ -2813,8 +2895,12 @@ class InspectionToolGateway:
                     'This is neither another allowance nor a promised number of useful checks. '
                     'Further investigation also protects a measured final opinion. Return '
                     'established required findings promptly; disclose unfinished necessary scope.'}
+        applicable = self._applicable_scope(saved)
+        execution_facts = (self._execution_facts(saved)
+            if applicable and saved.get('inspection_material_policy') == 'operations.v3' else None)
         if saved.get('work_method') in NATIVE_WORK_METHODS and self._delivery_scope(saved):
-            base['executed_checks'] = sorted(self._executed_check_records(saved))
+            base['executed_checks'] = sorted(execution_facts if execution_facts is not None
+                else self._executed_check_records(saved))
         if saved.get('inspection_material_policy') == 'operations.v3':
             base['retained_investigations'] = [{'inspection':item['identity'],
                 'source_rounds':len(item.get('source_rounds', []))} for item in self._retained_inputs(saved)]
@@ -2879,7 +2965,7 @@ class InspectionToolGateway:
         memory, notes = None, []
         if continuity:
             from simple_ar.app.work_memory import note_currentness
-            memory, observations, journal_rows = self._conversation_material(saved)
+            memory, observations, journal_rows = self._conversation_material(saved, execution_facts=execution_facts)
             for note in memory['notes']:
                 current = note_currentness(note,
                     versions_match=lambda versions: all(version(path) == digest for path, digest in versions.items()))
@@ -2897,7 +2983,6 @@ class InspectionToolGateway:
                 for row in saved['evidence'] if row.get('readable')
                 for index, window in enumerate(row['windows'])
                 if row['subject'] not in saved.get('initial_subjects', []) or window.get('source_reference')]
-        applicable = self._applicable_scope(saved)
         native_observations = (self._native_source_supply(saved, observations, blocks)
             if applicable or saved.get('native_supply_policy') in RECEIPT_SUPPLY_POLICIES else None)
         if applicable:
@@ -2948,6 +3033,13 @@ class InspectionToolGateway:
         from simple_ar.app.professional_conversation import continuation_blocks
         blocks = continuation_blocks(blocks, policy=saved.get('native_history_policy'),
             thinking_mode=getattr(getattr(client, '_settings', None), 'thinking_mode', ''))
+        selected_records = ([row['record'] for row in journal_rows
+            if row['result'].get('tool_name') in {'run_process', 'inspect_images'}]
+            if continuity and saved.get('inspection_material_policy') in _WORK_MATERIAL_POLICIES else [])
+        if execution_facts is not None:
+            pending = {path for finding in saved['prior_required'] for path in finding['pending_subjects']}
+            selected_records.extend(fact['source_record'] for fact in execution_facts.values()
+                if pending.intersection(fact['dependencies']))
         messages, metadata = select_working_context(
             context_authority=saved.get('context_authority'),
             user_requests=saved.get('user_requests', [request.goal]),system_text=system,
@@ -2956,10 +3048,11 @@ class InspectionToolGateway:
                 if 'user_requests' in saved else None),
             schema_tokens=estimate_tokens(json.dumps(offered,ensure_ascii=False)),
             context_token_target=target,estimate_tokens=estimate_tokens,
+            priority_source_paths=(
+                [*self._delivery_source_paths(saved), *saved.get('production_receipts', ())]
+                if applicable else ()),
             material_policy='working' if economic else 'retained' if retained else 'ranked',
-            **({'selected_records':[row['record'] for row in journal_rows
-                    if row['result'].get('tool_name') in {'run_process', 'inspect_images'}]}
-                if continuity and saved.get('inspection_material_policy') in _WORK_MATERIAL_POLICIES else {}),
+            selected_records=selected_records,
             native_observations=native_observations,
             preserve_material_observations=saved.get('work_lifecycle') == 'integrated.v1',
             working_set_policy='recent.v2' if saved.get('work_lifecycle') in {'integrated.v2', 'integrated.v3'} else None,
@@ -3370,7 +3463,8 @@ class InspectionToolGateway:
                 archive=saved.get('work_method') in NATIVE_WORK_METHODS)
         return memory
 
-    def _conversation_material(self, saved: dict) -> tuple[dict, list, list]:
+    def _conversation_material(self, saved: dict, *,
+                               execution_facts: dict | None = None) -> tuple[dict, list, list]:
         """Adapt original reads and operation outcomes, never another role's notes."""
         rows = self._conversation_rows(saved)
         memory = self._conversation_memory(saved, rows)
@@ -3444,7 +3538,9 @@ class InspectionToolGateway:
                     'or diagnostic, not current file contents or scientific certification.'}
                 for row in rows if row['result'].get('tool_name') not in {'read_file', 'assistant_reply'})
         if saved.get('inspection_material_policy') == 'operations.v3':
-            facts = {value['source_record']:record for record,value in self._execution_facts(saved).items()}
+            if execution_facts is None:
+                execution_facts = self._execution_facts(saved)
+            facts = {value['source_record']:record for record,value in execution_facts.items()}
             for parent in self._retained_inputs(saved):
                 observations.extend({'record':row['record'],
                     'kind':'operation_result', 'role':'historical_observation',
@@ -3721,6 +3817,14 @@ class InspectionToolGateway:
             gaps.append((cursor, size))
         return gaps
 
+    @staticmethod
+    def _delivery_source_paths(saved: dict) -> list[str]:
+        claim = saved['delivery_context']['claim']
+        primary = [path for path in ((claim.get('report') or {}).get('manuscript'),
+            (claim.get('summary_source') or {}).get('path')) if path]
+        return primary or [path for path in saved['delivery_context']['artifacts']
+            if Path(path).suffix.lower() not in _BINARY]
+
     def _prime_delivery(self, saved: dict, request: InspectionRequest, identity: str,
                         remaining: list[int], client: Any, offered: list) -> None:
         """Supply authorized originals without an all-or-nothing bundle gate."""
@@ -3729,10 +3833,24 @@ class InspectionToolGateway:
             # Supply actual current deliverables before asking for an opinion.
             # The claim explicitly identifies manuscript/summary sources; neither
             # inventory cardinality nor the supplied bytes decide applicability.
-            claim = delivery['claim']
-            priority = [path for path in ((claim.get('report') or {}).get('manuscript'),
-                (claim.get('summary_source') or {}).get('path')) if path]
+            priority = self._delivery_source_paths(saved)
             originals = []
+            if delivery.get('scope_policy') == 'applicable.v2':
+                receipts = {}
+                for source in self.workspace.artifact_sources(delivery['artifacts']).values():
+                    graph = source.get('lineage')
+                    if graph is None:
+                        continue
+                    node = next(row for row in graph['nodes'] if row['id'] == graph['root'])
+                    producer = node.get('producer')
+                    if node['state'] == 'recorded' and producer:
+                        receipts[str(self.root / producer['receipt'])] = producer['receipt_sha256']
+                saved['production_receipts'] = list(receipts)
+                priority = [*receipts, *priority]
+                for path, digest in receipts.items():
+                    owners = [row for row in saved['evidence'] if row.get('readable')
+                        and row.get('path') == path and row.get('sha256') == digest]
+                    originals.append((path, digest, owners))
             for path, digest in delivery['artifacts'].items():
                 if delivery.get('scope_policy') == 'applicable.v2' and path not in priority:
                     # An explicitly named manuscript/summary is current work;
@@ -4017,7 +4135,7 @@ class InspectionToolGateway:
         schema = response_model.model_json_schema()
         sources = [row['subject'] for row in [*saved['targets'], *saved['evidence']]
             if row.get('readable') and row.get('sha256') and row.get('windows')]
-        nested = response_model is _ClaimDeliveryResponse
+        nested = issubclass(response_model, _ClaimDeliveryResponse)
 
         def choices(field: dict, values: list) -> None:
             field['uniqueItems'] = True
@@ -4048,8 +4166,14 @@ class InspectionToolGateway:
                         'Principal basis of this judgment, not an exclusive category of evidence. '
                         'State the actual combination of observation, derivation and execution in method '
                         'and reasoning. An unperformed check remains unresolved.')
+            if nested and 'reassessed_prior' in properties and definition is not schema:
+                choices(properties['reassessed_prior'], [row['id'] for row in saved['prior_required']])
         if response_model is _DeliveryResponseLinked or nested:
             choices(schema['properties']['reassessed_prior'], [row['id'] for row in saved['prior_required']])
+            if nested and saved.get('inspection_evidence_policy') == 'presented.v1':
+                schema['properties']['reassessed_prior']['description'] = (
+                    'Legacy package-level reassessments. Prefer placing each concern ID in the '
+                    'investigation that actually rechecked it, and leave this list empty.')
         return schema
 
     def _inspect(self, saved: dict[str, Any], request: InspectionRequest, identity: str,
@@ -4074,7 +4198,7 @@ class InspectionToolGateway:
                 'parameters':(_RetainedInspectionHistory if saved.get('inspection_material_policy') == 'operations.v3'
                     else _InspectionHistory).model_json_schema()}})
         package = self._delivery_scope(saved)
-        response_model = ((_ClaimDeliveryResponse if saved.get('work_method') in CLAIM_WORK_METHODS else
+        response_model = ((self._claim_response_model(saved) if saved.get('work_method') in CLAIM_WORK_METHODS else
                            _ScopedDeliveryResponse if saved.get('work_method') in NATIVE_WORK_METHODS else
                            _InvestigatedDeliveryResponse if self._investigation_contract(saved, offering=True)
                            else _DeliveryResponseLinked if saved.get('finding_policy') == 'linked.v1'
@@ -4534,6 +4658,10 @@ class InspectionToolGateway:
                             {'delivery_review.v1', 'delivery_review.v2', 'delivery_review.v3'}):
                     raise ValueError('Delivery inspection requires its owner-bound context')
                 saved['delivery_context'] = deepcopy(delivery_context)
+                if applicable and self.work_method in CLAIM_WORK_METHODS and self.finding_policy == 'linked.v1':
+                    # New reviews bind each check to the windows actually presented.
+                    # Existing inspection work orders keep their saved contract.
+                    saved['inspection_evidence_policy'] = 'presented.v1'
             remaining = [512000]
             saved['targets'] = [self._observe(value, f'target-{i + 1}', identity, remaining)
                                 for i, value in enumerate(request.targets)]

@@ -1582,14 +1582,14 @@ def parse_json_object(text: str) -> dict[str, Any] | None:
 
 
 def estimate_tokens(text: str) -> int:
-    """Estimate token count from text using a conservative character heuristic.
+    """Approximate token count from characters without a provider tokenizer.
 
     Args:
         text: Prompt or response text.
 
     Returns:
-        Estimated token count. This is not model-tokenizer exact, but it is
-        deterministic and dependency-free.
+        A deterministic, dependency-free estimate. It is not an upper bound
+        and can be lower than the provider's actual input-token count.
     """
     stripped = text.strip()
     if not stripped:

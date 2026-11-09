@@ -133,6 +133,8 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     native.add_argument("--allow-vision", action="store_true", help="Native task: authorize sending mounted rendered images to the named TOML vision route, sharing the task model budget.")
     native.add_argument("--max-images", type=int, default=0, help="Native task: authorize this many image generation/edit submissions through the named image route (default: disabled); retained on resume.")
     native.add_argument("--approve-execution", default="", help="Native resume: exact approval token printed for its pending process.")
+    native.add_argument("--remember-execution", action="store_true",
+        help="With --approve-execution, reuse the reviewed process with declared inputs or export in this task while its bound inputs match.")
     native.add_argument("--decision-id", default=None, help="Exact pending research design/protocol decision; requires --resume-task.")
     native.add_argument("--decision-response", choices=("accept", "reject", "revise"), default=None)
     native.add_argument("--decision-guidance", default=None, help="Facts or direction for a revise response; not execution authorization.")

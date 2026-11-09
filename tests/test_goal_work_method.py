@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 from simple_ar.app.professional_conversation import ProfessionalConversation
 from simple_ar.app.tool_application import ToolApplication
@@ -20,6 +21,39 @@ _action = fixture._action
 
 
 class NativeGoalWorkTests(unittest.TestCase):
+    def test_inflight_legacy_review_keeps_its_original_response_contract(self):
+        from simple_ar.tools.inspection import InspectionToolGateway
+        from simple_ar.tools.specs import GOAL_WORK_METHOD
+
+        owner = InspectionToolGateway.__new__(InspectionToolGateway)
+        owner.protocol = 'subjects.v3'
+        saved = {'work_method': GOAL_WORK_METHOD, 'finding_policy': 'linked.v1',
+            'delivery_context': {'schema_version': 'delivery_review.v3', 'artifacts': {}},
+            'prior_required': [], 'targets': [], 'evidence': []}
+        opinion = {'conclusion': 'incomplete', 'applicability': 'Another check is needed.',
+            'investigations': [{'claim': 'The result is correct.', 'scope': 'The current result.',
+                'basis': 'not_checked', 'method': 'Inspect the result.',
+                'reasoning': 'No source was supplied.', 'evidence': [],
+                'outcome': 'unresolved', 'findings': []}],
+            'limitations': ['Missing source.'], 'reassessed_prior': []}
+
+        def admit(contract, response):
+            call = {'id': 'final', 'type': 'function', 'function': {
+                'name': 'record_inspection', 'arguments': json.dumps(response)}}
+            return owner._admit_response(contract, [call], [], owner._claim_response_model(contract),
+                set(), shared=False)
+
+        _, error, legacy, _ = admit(saved, opinion)
+        self.assertEqual(error, '')
+        self.assertNotIn('evidence_windows', legacy['investigations'][0])
+        self.assertNotIn('reassessed_prior', legacy['investigations'][0])
+        current = {**saved, 'inspection_evidence_policy': 'presented.v1'}
+        _, error, new, _ = admit(current, opinion)
+        self.assertEqual(error, '')
+        self.assertEqual(new['investigations'][0]['evidence_windows'], [])
+        self.assertEqual(new['investigations'][0]['reassessed_prior'], [])
+        self.assertTrue(admit(saved, new)[1])
+
     def test_closed_history_continues_without_replaying_or_forging_provider_reasoning(self):
         from simple_ar.app.professional_conversation import continuation_blocks, NATIVE_HISTORY_POLICY
         reply = {'role': 'assistant', 'content': None, 'tool_calls': [{
@@ -283,6 +317,76 @@ class GoalWorkTests(unittest.TestCase):
             {'request_index':len(requests)-1, 'quote':requests[-1],
              'missing_outcome':'Produce the requested bounded note.'}]),
             actions=list(actions), candidate=candidate)
+
+    def test_review_reassesses_each_concern_using_its_supplied_evidence_windows(self):
+        from simple_ar.tools.inspection import InspectionToolGateway
+
+        case = self.case
+        case._write('note.md', 'The measured value is wrong.\n')
+        case._write('support.txt', '0123456789abcdef' * 8)
+        claim = {'summary': 'A measured note.', 'artifacts': ['note.md', 'support.txt']}
+        state = {'revised': False, 'end': 16}
+
+        def review(view):
+            paths = ['note.md', 'support.txt']
+            sources = case._inspection_sources(view, *paths)
+            if any(row is None for row in sources):
+                return [_action('read_file', path=path) for path, row in zip(paths, sources) if row is None]
+            note, support = (row['subject'] for row in sources)
+            first = {'claim': 'The reported value matches the observation.',
+                'scope': 'The current note.', 'basis': 'observed', 'necessary': True,
+                'method': 'Compare the value in the current note.',
+                'reasoning': 'The controlled note was read.', 'evidence': [note],
+                'outcome': 'supported' if state['revised'] else 'contradicted',
+                'findings': [] if state['revised'] else [{'severity': 'required',
+                    'message': 'Correct the measured value.', 'artifacts': [str(case.root / 'workspace/note.md')]}]}
+            checks = [first]
+            if state['revised']:
+                first['reassessed_prior'] = [row['id'] for row in view['prior_required']]
+                checks.append({'claim': 'The supporting record contains the reported observation.',
+                    'scope': 'Only the selected prefix.', 'basis': 'observed', 'necessary': True,
+                    'method': 'Read the selected prefix.', 'reasoning': 'The controlled prefix was read.',
+                    'evidence': [support], 'evidence_windows': [{'subject': support, 'start': 0, 'end': state['end']}],
+                    'outcome': 'contradicted' if state['end'] == 16 else 'supported',
+                    'findings': ([{'severity': 'required', 'message': 'Correct the supporting record.',
+                                   'artifacts': [str(case.root / 'workspace/support.txt')]}]
+                                 if state['end'] == 16 else [])})
+            return {'conclusion': 'complete', 'applicability': 'Check the note and its support.',
+                'investigations': checks, 'limitations': [], 'reassessed_prior': []}
+
+        case.review = review
+        case._submit(_action('deliver_result', **claim))
+        self.assertEqual(case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
+                         ['result']['metadata']['delivery_assessment']['verdict'], 'needs_revision')
+        case._submit(_action('write_file', path='note.md', content='The measured value is correct.\n',
+            expected_sha256=hashlib.sha256((case.root / 'workspace/note.md').read_bytes()).hexdigest()))
+        state['revised'] = True
+
+        original = InspectionToolGateway._offered_text_ranges
+        support_path = str(case.root / 'workspace/support.txt')
+        def partial_supply(owner, saved, **kwargs):
+            offered = original(owner, saved, **kwargs)
+            for key, ranges in list(offered.items()):
+                if key[0] == support_path:
+                    offered[key] = [(start, min(end, 8)) for start, end in ranges if start < 8]
+            return offered
+
+        with patch.object(InspectionToolGateway, '_offered_text_ranges', partial_supply):
+            case._submit(_action('deliver_result', **claim))
+            partial = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+            self.assertEqual((partial['coverage'], partial['verdict']), ('partial', 'incomplete'))
+            self.assertEqual(partial['findings'], [])
+            self.assertEqual(len(partial['reassessed_prior']), 1)
+            self.assertFalse(case.app.operations.delivery_review.pending_concerns(claim['artifacts']))
+            self.assertNotEqual(case.app.session.manifest.status, 'completed')
+
+            state['end'] = 8
+            case._submit(_action('deliver_result', **claim))
+            final = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+            self.assertEqual((final['coverage'], final['verdict']), ('complete', 'passed'))
+            self.assertEqual(case.app.session.manifest.status, 'completed')
+            case._reload()
+            self.assertFalse(case.app.operations.delivery_review.pending_concerns(claim['artifacts']))
 
     def test_usable_candidate_skips_optional_process_and_checks_same_version(self):
         case = self.case
@@ -727,11 +831,10 @@ class GoalWorkTests(unittest.TestCase):
 
     def test_terminal_json_opinion_uses_the_same_evidence_and_recovery_contract(self):
         from unittest.mock import patch
-        from simple_ar.tools.inspection import _ClaimDeliveryResponse
         case = self.case
         root = case.directory / 'one-inspection-call'
         case.app = ToolApplication.create(root, 'Deliver the existing note with honest limits.',
-            model='fixture', services=case.services, sources={}, max_turns=3,
+            model='fixture', services=case.services, sources={}, max_turns=1,
             max_tokens=100000, max_attempts=12, tool_contracts='full')
         case.root = root
         (root / 'workspace/note.md').write_text('Existing useful work.\n')
@@ -751,7 +854,7 @@ class GoalWorkTests(unittest.TestCase):
         case.send.side_effect = text_final
         case._submit(_action('deliver_result', summary='Useful existing note', artifacts=['note.md']))
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
-        self.assertEqual(case.send.call_count, 2)
+        self.assertEqual(case.send.call_count, 1)
         owner = case.app.operations.inspection
         inputs = list((root/'tools/inspection').glob('*/input.json'))
         self.assertEqual(len(inputs), 1)
@@ -764,12 +867,13 @@ class GoalWorkTests(unittest.TestCase):
         self.assertEqual(trace['admission']['parsed'], [])
         content = trace['response']['content']
         offered = trace['offer']['tools']
+        response_model = owner._claim_response_model(saved)
         with patch.object(owner, '_shared_final_bindings', side_effect=AssertionError('Admission dispatches nothing')):
             for text in ('```json\n'+content+'\n```', content+' trailing', '[]',
                          json.dumps({**json.loads(content), 'unknown':True})):
                 with self.subTest(text=text[:40]):
                     _, error, final, _ = owner._admit_response(saved, [], offered,
-                        _ClaimDeliveryResponse, set(), shared=True, content=text, closing=True)
+                        response_model, set(), shared=True, content=text, closing=True)
                     self.assertTrue(error)
                     self.assertIsNone(final)
             for policy, closing, tools in [('operations.v1', True, offered),
@@ -777,21 +881,21 @@ class GoalWorkTests(unittest.TestCase):
                     ('operations.v2', True, offered*2)]:
                 previous = {**saved, 'inspection_material_policy':policy}
                 self.assertIsNone(owner._admit_response(previous, [], tools,
-                    _ClaimDeliveryResponse, set(), shared=True, content=content, closing=closing)[2])
+                    response_model, set(), shared=True, content=content, closing=closing)[2])
             invalid = json.loads(content)
             invalid['investigations'] = [{'claim':'The note was independently verified.',
                 'scope':'All results', 'necessary':True, 'basis':'observed', 'execution_records':[],
                 'method':'Read the note', 'reasoning':'Unsupported evidence ID',
                 'evidence':['evidence-missing'], 'outcome':'supported', 'findings':[]}]
             _, error, final, _ = owner._admit_response(saved, [], offered,
-                _ClaimDeliveryResponse, set(), shared=True, content=json.dumps(invalid), closing=True)
+                response_model, set(), shared=True, content=json.dumps(invalid), closing=True)
             self.assertTrue(error)
             self.assertIsNone(final)
         before = trace_path.read_bytes()
         case._reload()
         self.assertEqual(trace_path.read_bytes(), before)
         self.assertEqual(case.app.session.manifest.status, 'completed')
-        self.assertEqual(case.send.call_count, 2)
+        self.assertEqual(case.send.call_count, 1)
 
     def test_failed_opinion_retains_investigation_across_retry_feedback_and_input_change(self):
         case = self.case

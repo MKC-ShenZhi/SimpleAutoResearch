@@ -524,7 +524,11 @@ class Workspace:
                 approval = self.snapshot_unlocked_approval(root)
                 if not approval or data['token'] != approval:
                     raise ValueError('Approval differs from current pending proposal')
+                remember = data.get('remember_execution', False)
+                if type(remember) is not bool:
+                    raise ValueError('Remembering execution must be a boolean choice')
                 kwargs['approved_execution'] = data['token']
+                kwargs['remember_execution'] = remember
             self.dispatch(name, root, kwargs)
             return {'task': name, 'message': 'Worker dispatched; task outcome remains in original manifest'}
 
