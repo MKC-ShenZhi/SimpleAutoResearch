@@ -8,7 +8,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from simple_ar.app.professional_conversation import work_unit_messages
+from simple_ar.app.professional_conversation import work_unit_messages, work_unit_projector
 from simple_ar.app.tool_application import ToolApplication
 from tests import test_professional_work_loop as fixture
 
@@ -79,6 +79,20 @@ class NativeWorkProjectionTests(unittest.TestCase):
         self.assertFalse(any(row['role'] == 'assistant' for row in result[2:]))
         json_request = {'role':'user', 'content':'{"closed_journal_observations":[] }'}
         self.assertEqual(work_unit_messages([*original[:2], json_request])[-1], json_request)
+
+    def test_repeated_capacity_projections_reuse_only_unchanged_work(self):
+        project = work_unit_projector()
+        context = {'role': 'user', 'content': json.dumps({'work_plan': {'old': True}, 'remaining': 3})}
+        prefix = [{'role': 'system', 'content': 'Permissions'}, context]
+        work = [{'role': 'assistant', 'content': 'Read the source.', 'tool_calls': [{
+            'id': 'a', 'function': {'name': 'read_file', 'arguments': '{"path":"note.md"}'}}]},
+            {'role': 'tool', 'tool_call_id': 'a', 'content': '{"status":"ok","text":"original"}'}]
+        for history in (work, work, [*work, {'role': 'user', 'content': 'Next request.'}], work):
+            for remaining in (3, 2):
+                messages = [prefix[0], {**context, 'content': json.dumps({'remaining': remaining})}, *history]
+                self.assertEqual(project(messages), work_unit_messages(messages))
+        with self.assertRaisesRegex(ValueError, 'Unclosed'):
+            project([*prefix, work[0]])
 
     def test_unclosed_unit_refused_and_invalid_arguments_preserved_as_evidence(self):
         prefix = [{'role':'system', 'content':'Scope'}, {'role':'user', 'content':'{}'}]
