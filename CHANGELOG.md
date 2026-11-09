@@ -13,6 +13,10 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - Approved operations can be reused within the same task when explicitly authorized; execution and accounting still use the shared task boundary.
 - DeepSeek V4.1 Chat connections can optionally use the model's tokenizer for input reservation. The provider's usage remains authoritative.
 
+### Fixed
+
+- Candidate review keeps room to act on an opinion and report the result, without reserving an entire speculative repair cycle. Delivery guidance now reflects the tools actually offered for the remaining resources.
+
 ## 2026-11-07
 
 ### Improved
