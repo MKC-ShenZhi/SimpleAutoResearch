@@ -514,7 +514,9 @@ class GoalWorkTests(unittest.TestCase):
                 self.assertEqual(fields[0].get('maxItems'), 0)
                 return [_action('read_file', path='note.md')]
             subject = source['subject']
-            self.assertEqual(fields[0]['items']['enum'], [subject])
+            self.assertIn(subject, fields[0]['items']['enum'])
+            if len(offered) == 2:
+                return [_action('read_file', path='measurements/conditions.txt')]
             return {'conclusion': 'complete', 'applicability': 'The bounded note has the observation.',
                 'investigations': [{'claim': 'The note states the recorded value.', 'scope': 'The note.',
                     'basis': 'observed', 'necessary': True, 'method': 'Read the note.',
@@ -522,9 +524,21 @@ class GoalWorkTests(unittest.TestCase):
                     'outcome': 'supported', 'findings': []}], 'limitations': [], 'reassessed_prior': []}
 
         case.review = review
-        case._submit(_action('deliver_result', summary='The observed value.', artifacts=['note.md', 'appendix.txt']))
+        owner = case.app.operations.inspection
+        original = owner._working_messages
+
+        def omit_current_note(saved, *args, **kwargs):
+            messages, projection = original(saved, *args, **kwargs)
+            if len(saved.get('source_rounds', [])) >= 3:
+                for row in projection.get('selected_records', []):
+                    if row.get('source', {}).get('path') == str(case.root / 'workspace/note.md'):
+                        row['status'] = 'capacity'
+            return messages, projection
+
+        with patch.object(owner, '_working_messages', side_effect=omit_current_note):
+            case._submit(_action('deliver_result', summary='The observed value.', artifacts=['note.md', 'appendix.txt']))
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
-        self.assertEqual(len(offered), 2)
+        self.assertEqual(len(offered), 3)
 
     def test_usable_candidate_skips_optional_process_and_checks_same_version(self):
         case = self.case

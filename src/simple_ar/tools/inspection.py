@@ -3588,6 +3588,9 @@ class InspectionToolGateway:
         conversation = ProfessionalConversation(client)
         trace = self._path(saved['identity'], f'sources-{number}')
         last_floor = {}
+        previously_supplied = (self._offered_text_ranges(saved)
+            if response_model is not None and self._delivery_scope(saved)
+            and saved.get('inspection_evidence_policy') == 'presented.v2' else {})
 
         def project(closing):
             offered = [terminal] if closing else [*tools, terminal]
@@ -3596,12 +3599,18 @@ class InspectionToolGateway:
             if (response_model is not None and self._delivery_scope(saved)
                     and saved.get('inspection_evidence_policy') == 'presented.v2'):
                 # A retained source descriptor is navigation, not a body the
-                # reviewer can cite. Advertise only the original windows in
-                # this input; the final owner still checks the saved supply.
+                # reviewer can cite. Advertise windows actually presented in
+                # this investigation; the final owner still checks saved supply.
                 subjects = {entry['source'].get('subject') for entry in metadata.get('selected_records', [])
                     if entry.get('status') in {'native', 'working_view'}
                     and entry.get('version_status') == 'matching'
                     and entry.get('source', {}).get('kind') == 'source_text'}
+                for row in [*saved['targets'], *saved['evidence']]:
+                    ranges = previously_supplied.get((row.get('path'), row.get('sha256')), [])
+                    if any(max(window['offset_bytes'], start) < min(window['review_next_offset_bytes'], end)
+                           or window['size_bytes'] == 0 and start == end == 0
+                           for window in row.get('windows', []) for start, end in ranges):
+                        subjects.add(row['subject'])
                 final = deepcopy(terminal)
                 final['function']['parameters'] = self._delivery_schema(saved, response_model, subjects=subjects)
                 offered = [final] if closing else [*tools, final]
