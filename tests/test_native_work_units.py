@@ -14,6 +14,20 @@ from tests import test_professional_work_loop as fixture
 
 
 class NativeWorkProjectionTests(unittest.TestCase):
+    def test_unmarked_multiple_outputs_leave_source_choice_to_the_inspector(self):
+        from simple_ar.tools.inspection import InspectionToolGateway
+
+        context = {'claim': {}, 'scope_policy': 'applicable.v2',
+            'artifacts': {'tool.py': 'a' * 64, 'output.pdf': 'b' * 64}}
+        saved = {'delivery_context': context, 'source_priming_policy': 'priority.v2'}
+        select = InspectionToolGateway._delivery_source_paths
+        self.assertEqual(select(saved), [])
+        self.assertEqual(select({**saved, 'source_priming_policy': 'priority.v1'}), ['tool.py'])
+        one = {**context, 'artifacts': {'tool.py': 'a' * 64}}
+        self.assertEqual(select({**saved, 'delivery_context': one}), ['tool.py'])
+        named = {**context, 'claim': {'report': {'manuscript': 'tool.py'}}}
+        self.assertEqual(select({**saved, 'delivery_context': named}), ['tool.py'])
+
     def test_retained_inspections_do_not_repeat_the_same_source_window(self):
         from simple_ar.tools.inspection import InspectionToolGateway
         owner = InspectionToolGateway.__new__(InspectionToolGateway)

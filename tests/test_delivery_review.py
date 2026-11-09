@@ -1875,8 +1875,7 @@ class DemandDrivenDeliveryInspectionTests(unittest.TestCase):
         def review(view):
             self.assertEqual(view['proposed_delivery']['scope_policy'], 'applicable.v2')
             self.assertEqual(len(view['proposed_delivery']['artifacts']), 2)
-            self.assertNotIn('Bundled context, not a requested behavioral claim.',
-                json.dumps(self.case.inspection_requests[-1]['messages']))
+            self.assertNotIn(unrelated, json.dumps(self.case.inspection_requests[-1]['messages']))
             if not view['evidence']:
                 return [_action('read_file', path='workspace/tool.py')]
             return {'conclusion':'complete', 'findings':[],
@@ -1892,16 +1891,6 @@ class DemandDrivenDeliveryInspectionTests(unittest.TestCase):
         inspector = self.case.app.operations.inspection
         saved = inspector.store.read_json(inspector._path(proof['identity'], 'input'))
         self.assertEqual(saved['context_checkpoint_policy'], 'economic.v3')
-        self.assertEqual(saved['source_priming_policy'], 'priority.v2')
-        self.assertEqual(inspector._delivery_source_paths(saved), [])
-        old = {**saved, 'source_priming_policy': 'priority.v1'}
-        self.assertEqual(set(inspector._delivery_source_paths(old)), set(saved['delivery_context']['artifacts']))
-        text_path = str(self.case.root/'workspace/tool.py')
-        single = {**saved, 'delivery_context': {**saved['delivery_context'], 'artifacts': {text_path: 'a' * 64}}}
-        self.assertEqual(inspector._delivery_source_paths(single), [text_path])
-        mixed = {**single, 'delivery_context': {**single['delivery_context'],
-            'artifacts': {text_path: 'a' * 64, 'output.pdf': 'b' * 64}}}
-        self.assertEqual(inspector._delivery_source_paths(mixed), [])
         self.assertEqual({row['path'] for row in saved['evidence']},
             {str(self.case.root/'workspace/tool.py')})
         calls = self.case.send.call_count
