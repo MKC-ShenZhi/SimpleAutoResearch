@@ -197,18 +197,18 @@ class NativeWorkQueueTests(unittest.TestCase):
         from simple_ar.tools.delivery_versions import DeliveryVersions
         self.assertEqual(len(DeliveryVersions(c.root).select(1)['files']), 1)
 
-    def test_candidate_review_with_three_calls_can_still_reach_delivery(self):
+    def test_candidate_review_with_four_calls_can_still_reach_delivery(self):
         c = self.case
         c.root = c.directory / 'bounded-review'
         c.app = ToolApplication.create(c.root, 'Explain the supplied observations.',
             model='fixture', sources={'measurements': c.inputs}, services=c.services,
-            max_turns=3, max_tokens=300000, tool_contracts='on_demand')
+            max_turns=4, max_tokens=300000, tool_contracts='on_demand')
         c._write('note.md', 'The sample mean is 2.0 across three supplied observations.\n')
         claim = {'summary': 'A bounded note', 'artifacts': ['note.md']}
         c.decisions.append(fixture._action('review_result', **claim))
         self.drain()
         self.assertEqual(c._last('review_result')['status'], 'ok')
-        self.assertEqual(c.app.ledger.remaining('llm_requests'), 1)
+        self.assertEqual(c.app.ledger.remaining('llm_requests'), 2)
         reviewed = c._last('review_result', reviewed=True)['metadata']['delivery_review']['identity']
         c.decisions.append(fixture._action('deliver_result', **claim))
         self.drain()

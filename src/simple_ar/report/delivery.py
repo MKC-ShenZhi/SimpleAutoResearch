@@ -156,9 +156,16 @@ class Delivery:
         conditions = []
         next_tools = ['review_result', 'deliver_result'] if self.review_owner else ['deliver_result']
         proposal = None
-        for observed in reversed(self.observations()):
+        observations = self.observations()
+        work_after_review = False
+        review_followup = False
+        for observed in reversed(observations):
             completion = tool_completion(observed.get('tool_name', ''), self.config.get('tool_completions'))
             if completion is None or completion.kind not in {'delivery', 'review'}:
+                spec = self.gateway.registry.get(observed.get('tool_name', ''))
+                if (observed.get('status') == 'ok' and spec is not None
+                        and spec.permission_level in {'write_patch', 'execution'}):
+                    work_after_review = True
                 continue
             data = observed.get('data') or {}
             value = data.get(completion.field) if completion.field else data
@@ -166,6 +173,8 @@ class Delivery:
                 proposal = DeliveryRequest.model_validate(value)
             except (ValueError, TypeError):
                 continue
+            review_followup = (completion.kind == 'review' and observed.get('status') == 'ok'
+                and observed.get('current_request', True) and not work_after_review)
             break
         needs_review = self.review_owner is not None
         if proposal is None:
@@ -179,31 +188,32 @@ class Delivery:
                 # Unfinished work can be inspected before publication. It must
                 # not hide the remaining publication owner from planning.
                 publication = operation_report_publication(proposal.model_copy(update={'unresolved': []}), resolved['artifacts'],
-                    self.observations(), publication=self.publication)
+                    observations, publication=self.publication)
                 if publication:
                     next_tools.append('export_report')
                     conditions.extend({'kind': 'publication', 'message': text} for text in publication)
                 if self.review_owner and not proposal.unresolved:
                     binding = prepare_delivery_review(self.workspace, proposal, resolved['artifacts'],
                         self.user_requests, protocol=self.review_owner.protocol)
-                    concerns = self.review_owner.issues(self.observations(), binding)
+                    concerns = self.review_owner.issues(observations, binding)
                     needs_review = bool(concerns)
                     conditions.extend({'kind': 'independent_review', 'message': text} for text in concerns)
             except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
                 conditions.append({'kind': 'candidate_versions', 'message': str(exc)})
         return {'conditions': conditions, 'next_tools': next_tools,
             'minimum_resources': {'llm_requests': int(needs_review)},
+            'review_followup': review_followup,
             'scope': 'Derived work obligations, not a pass or an exact cost forecast. '
                 'Final acceptance rechecks the actual inventory, publication and applicable opinion.'}
 
     def review_continuation(self, decision: dict) -> dict[str, dict]:
-        """Leave one decision to act on an independent candidate opinion.
+        """Leave room to act on an opinion and report the resulting status.
 
         A revision or another check may be necessary, but their cost and even
-        their need are not known before the opinion. Reserve the next decision,
-        not a hypothetical full repair and resubmission cycle.
+        their need are not known before the opinion. Reserve a decision to act
+        and one to report the result, not a hypothetical full repair cycle.
         """
-        return {'followup': dict(decision)}
+        return {'followup': dict(decision), 'exit': dict(decision)}
 
     def _actual_issues(self, observations: list[dict], request: DeliveryRequest,
                          resolved: dict, *, proposed=None,

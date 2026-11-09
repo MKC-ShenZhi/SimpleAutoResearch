@@ -2713,6 +2713,9 @@ class ToolApplication:
         if self.state['config'].get('work_lifecycle') not in INTEGRATED_WORK_LIFECYCLES:
             return decision
         lifecycle = self.operations.delivery.lifecycle_requirements()
+        if (self.state['config'].get('work_lifecycle') == 'integrated.v3'
+                and lifecycle.get('review_followup')):
+            return decision  # Act on the completed opinion before reserving a later check.
         queued = self.state['turns'][-1].get('remaining', []) if self.state['turns'] else []
         if dispatch and queued and queued[0]['function']['name'] in lifecycle['next_tools']:
             return decision
@@ -3567,6 +3570,7 @@ class ToolApplication:
         }
         if config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES:
             context['delivery_conditions'] = self.operations.delivery.lifecycle_requirements()
+            context['delivery_conditions'].pop('review_followup', None)
             if schemas is not None:
                 offered = self._offered_operation_names(schemas)
                 context['delivery_conditions']['next_tools'] = [name for name in
