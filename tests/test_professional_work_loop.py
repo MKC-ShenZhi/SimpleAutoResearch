@@ -5400,7 +5400,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(len(seen), 2)
         identity = Path(result['data']['record']).parts[1]
         saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
-        self.assertEqual(saved['source_priming_policy'], 'priority.v1')
+        self.assertEqual(saved['source_priming_policy'], 'priority.v2')
         self.assertTrue(any(window.get('source_reference')
             for row in [*saved['targets'], *saved['evidence']] for window in row['windows']))
         self.assertFalse(any(Path(row['path']).name.startswith('prior-') for row in saved['evidence']))

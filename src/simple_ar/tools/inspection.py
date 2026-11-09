@@ -30,6 +30,7 @@ class _InspectionDispatchRaised(BaseException):
 
 
 _SHARED_EXECUTION_PROTOCOLS = frozenset({'shared.v1', 'shared.v2'})
+_PRIORITY_SOURCE_POLICIES = frozenset({'priority.v1', 'priority.v2'})
 
 SHARED_INSPECTION_OPERATIONS = frozenset({'read_file', 'list_directory', 'search_files', 'compile_python',
     'write_file', 'edit_file', 'copy_file', 'copy_project', 'run_process', 'inspect_images'})
@@ -886,7 +887,7 @@ class InspectionToolGateway:
             path = self._path(saved['identity'], f'sources-{number}')
             trace = self._bound_json(path, digest, validation_records,
                 'Inspection source investigation record changed; no replay')
-            if (saved.get('source_priming_policy') == 'priority.v1'
+            if (saved.get('source_priming_policy') in _PRIORITY_SOURCE_POLICIES
                     and not self._offered_coverage(saved)):
                 cached_views = validation_records.setdefault('supplied', {}) if validation_records is not None else {}
                 if path not in cached_views:
@@ -956,7 +957,7 @@ class InspectionToolGateway:
                 for locator, digest in self._check_bound_process_inputs(receipt, row['arguments']).items():
                     bind(locator, digest)
         source_rows = list(selected or [])
-        if (include_delivery and saved.get('source_priming_policy') == 'priority.v1'
+        if (include_delivery and saved.get('source_priming_policy') in _PRIORITY_SOURCE_POLICIES
                 and not self._offered_coverage(saved)):
             source_rows.extend(row for row in [*saved['targets'], *saved['evidence']] if row not in source_rows)
         for row in source_rows:
@@ -965,7 +966,7 @@ class InspectionToolGateway:
                 exposed = ((row.get('path'), row.get('sha256'), window.get('offset_bytes'),
                     window.get('review_next_offset_bytes')) in supplied)
                 if reference and (row in (selected or []) or exposed) and (
-                        saved.get('source_priming_policy') == 'priority.v1' or not include_delivery):
+                        saved.get('source_priming_policy') in _PRIORITY_SOURCE_POLICIES or not include_delivery):
                     if self._observed_sources(saved):
                         from simple_ar.tools.materials import validate_material_observation
                         observed = validate_material_observation(self.workspace, reference,
@@ -1631,7 +1632,7 @@ class InspectionToolGateway:
                     'inspection, not the parent task. Historical bytes never prove current claims '
                     'by themselves; reading a parent receipt supplies that record, not its '
                     'embedded original sources or a renewed computation.'}
-        current = saved.get('source_priming_policy') == 'priority.v1'
+        current = saved.get('source_priming_policy') in _PRIORITY_SOURCE_POLICIES
         if applicable and not current:
             return  # Historical/navigation-only inputs retain their supply contract.
         from simple_ar.tools.materials import material_observation_seed
@@ -3788,7 +3789,7 @@ class InspectionToolGateway:
         """
         if not self.progressive:
             return
-        if saved.get('source_priming_policy') == 'priority.v1':
+        if saved.get('source_priming_policy') in _PRIORITY_SOURCE_POLICIES:
             originals = [(row['path'], row['sha256'], [row])
                 for value, row in zip(request.targets, saved['targets'])
                 if isinstance(value, str) and row.get('readable') and not row.get('complete')]
@@ -3854,6 +3855,10 @@ class InspectionToolGateway:
             # This contract primes the whole delivery, so its other originals
             # must get a window before a long manuscript consumes the input.
             return list(dict.fromkeys([*primary, *artifacts]))
+        if saved.get('source_priming_policy') == 'priority.v2' and len(artifacts) > 1:
+            # A multi-file inventory does not identify which sources answer
+            # the claim. The inspector can select other files when needed.
+            return primary
         return primary or artifacts
 
     def _prime_delivery(self, saved: dict, request: InspectionRequest, identity: str,
@@ -3899,7 +3904,7 @@ class InspectionToolGateway:
         if not self.adaptive or delivery.get('schema_version') not in {'delivery_review.v2','delivery_review.v3'}:
             return
         targets = {row['path'] for row in saved['targets']}
-        if saved.get('source_priming_policy') != 'priority.v1':
+        if saved.get('source_priming_policy') not in _PRIORITY_SOURCE_POLICIES:
             # Historical inspections keep their saved all-or-nothing contract.
             pending = []
             for path, digest in delivery['artifacts'].items():
@@ -3983,7 +3988,7 @@ class InspectionToolGateway:
         # Leave one ordinary source window for the inspector to investigate;
         # saved legacy tasks retain their original priming behaviour.
         reserve = (FileWindow.model_fields['max_bytes'].default
-            if saved.get('source_priming_policy') == 'priority.v1' else 0)
+            if saved.get('source_priming_policy') in _PRIORITY_SOURCE_POLICIES else 0)
         while pending and remaining[0] > reserve:
             _, projection = self._working_messages(saved, request, None, offered, client,
                 validate_capacity=False)
@@ -4241,10 +4246,10 @@ class InspectionToolGateway:
                 'Return this alone after reading evidence; it executes no external operation.',
             'parameters':response_model.model_json_schema()}}
         if not shared or not saved.get('source_rounds'):
-            if saved.get('source_priming_policy') == 'priority.v1':
+            if saved.get('source_priming_policy') in _PRIORITY_SOURCE_POLICIES:
                 self._prime_targets(saved, request, identity, remaining, client, [*tools, terminal])
             self._prime_delivery(saved, request, identity, remaining, client, [*tools, terminal])
-            if saved.get('source_priming_policy') != 'priority.v1':
+            if saved.get('source_priming_policy') not in _PRIORITY_SOURCE_POLICIES:
                 self._prime_targets(saved, request, identity, remaining, client, [*tools, terminal])
             if shared:
                 trace = self._path(identity, 'sources-0')
@@ -4673,7 +4678,7 @@ class InspectionToolGateway:
                 if self.operation_specs is None or self.operation_call is None:
                     raise ValueError('Shared inspection requires the actual operation specs and operation gateway')
                 saved['execution_protocol'] = self.execution_protocol
-                saved['source_priming_policy'] = 'priority.v1'
+                saved['source_priming_policy'] = 'priority.v2'
                 saved['source_provenance'] = 'versions.v2'
             if self.protocol:
                 saved['protocol'] = self.protocol
@@ -4744,7 +4749,7 @@ class InspectionToolGateway:
                 saved['evidence'] = [row for row in saved['evidence']
                     if self._target_observation(saved, row) is None]
                 reusable = remaining
-                if saved.get('source_priming_policy') == 'priority.v1':
+                if saved.get('source_priming_policy') in _PRIORITY_SOURCE_POLICIES:
                     # Prior reads must not consume the current requested target,
                     # manuscript or summary windows, or the inspector's own read.
                     window = FileWindow.model_fields['max_bytes'].default
@@ -4760,7 +4765,7 @@ class InspectionToolGateway:
                             if path in artifacts and Path(path).suffix.lower() not in _BINARY:
                                 size = self.workspace.resolve(path).stat().st_size
                                 priority[path] = max(priority.get(path, 0), min(window, size))
-                    if priority:
+                    if priority or saved.get('source_priming_policy') == 'priority.v2':
                         reserve = min(remaining[0], window + sum(priority.values()))
                         reusable = [remaining[0] - reserve]
                 if self.adaptive and self.material_observations is not None:
