@@ -16,6 +16,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Fixed
 
 - Candidate review keeps room to act on an opinion and report the result, without reserving an entire speculative repair cycle. Delivery guidance now reflects the tools actually offered for the remaining resources.
+- Independent review avoids repeating retained windows of the same source version and keeps space for current targets, manuscripts and summaries.
 
 ## 2026-11-07
 
