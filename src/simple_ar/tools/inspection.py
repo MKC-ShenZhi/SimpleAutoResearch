@@ -4115,6 +4115,9 @@ class InspectionToolGateway:
                         or function['name'] not in allowed):
                     raise ValueError('Inspection requested an unoffered tool or non-object arguments')
                 name = function['name']
+                # Retain the original offered call for rejection diagnostics;
+                # a schema error still prevents the batch from being executed.
+                parsed.append((name, arguments))
                 if shared and (name != 'record_inspection'
                         or saved.get('inspection_evidence_policy') == 'presented.v2'):
                     from jsonschema import Draft202012Validator
@@ -4122,7 +4125,6 @@ class InspectionToolGateway:
                     if errors:
                         raise ValueError('Inspection operation arguments do not match the offered schema: '
                             + errors[0].message)
-                parsed.append((name, arguments))
             finals = sum(name == 'record_inspection' for name, _ in parsed)
             if finals and len(parsed) != 1:
                 raise ValueError('Return record_inspection alone, after source results have been observed')
