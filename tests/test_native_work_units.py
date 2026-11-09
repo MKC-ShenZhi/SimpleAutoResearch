@@ -243,13 +243,15 @@ class NativeWorkQueueTests(unittest.TestCase):
         c.app = ToolApplication.create(c.root, 'Explain the supplied observations.',
             model='fixture', sources={'measurements': c.inputs}, services=c.services,
             max_turns=5, max_tokens=300000, tool_contracts='on_demand')
-        c._write('note.md', 'The sample mean is 2.0 across three supplied observations.\n')
+        written = c._write('note.md', 'The sample mean is 2.0 across three supplied observations.\n')
         claim = {'summary': 'A bounded note', 'artifacts': ['note.md']}
         c.decisions.append(fixture._action('review_result', **claim))
         self.drain()
         c.decisions.append(fixture._action('write_file', path='note.md',
-            content='The sample mean is 2.0 for these observations only.\n'))
+            content='The sample mean is 2.0 for these observations only.\n',
+            expected_sha256=written['data']['sha256']))
         self.drain()
+        self.assertEqual(c._last('write_file')['status'], 'ok')
 
         def choose():
             request = c.send.call_args.kwargs.get('request') or c.send.call_args.args[1]
