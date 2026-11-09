@@ -10,11 +10,13 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Improved
 
 - Independent delivery review can reassess a specific finding against its supplied evidence while recording other unchecked claims separately. Whole-delivery review gives different originals a chance to enter the working set. Existing inspection records keep their original interpretation.
+- A delivery-ready candidate can include its final report and summary source, so an applicable independent opinion can be reused for the same delivery.
 - Approved operations can be reused within the same task when explicitly authorized; execution and accounting still use the shared task boundary.
 - DeepSeek V4.1 Chat connections can optionally use the model's tokenizer for input reservation. The provider's usage remains authoritative.
 
 ### Fixed
 
+- Independent review offers evidence identifiers for sources actually presented during that review; rejected opinions retain their original diagnostics.
 - Candidate review keeps room to act on an opinion and report the result, without reserving an entire speculative repair cycle. Delivery guidance now reflects the tools actually offered for the remaining resources.
 - Independent review avoids repeating retained windows of the same source version and keeps space for current targets, manuscripts and summaries.
 
