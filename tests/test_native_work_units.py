@@ -249,8 +249,8 @@ class NativeWorkQueueTests(unittest.TestCase):
             remaining[0] = 0  # Simulate a long retained history, not a missing current report.
 
         with patch.object(c.app.operations.inspection, '_reuse_observations', side_effect=exhaust_reusable_space):
-            c._submit(fixture._action('review_result', **claim))
-        reviewed = c._last('review_result', reviewed=True)['metadata']['delivery_review']
+            c._submit(fixture._action('deliver_result', **claim))
+        reviewed = c._last('deliver_result', reviewed=True)['metadata']['delivery_review']
         identity = reviewed['identity']
         saved = c.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
         report = next(row for row in saved['evidence'] if row.get('path', '').endswith('/report.md'))
