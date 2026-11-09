@@ -1896,6 +1896,12 @@ class DemandDrivenDeliveryInspectionTests(unittest.TestCase):
         self.assertEqual(inspector._delivery_source_paths(saved), [])
         old = {**saved, 'source_priming_policy': 'priority.v1'}
         self.assertEqual(set(inspector._delivery_source_paths(old)), set(saved['delivery_context']['artifacts']))
+        text_path = str(self.case.root/'workspace/tool.py')
+        single = {**saved, 'delivery_context': {**saved['delivery_context'], 'artifacts': {text_path: 'a' * 64}}}
+        self.assertEqual(inspector._delivery_source_paths(single), [text_path])
+        mixed = {**single, 'delivery_context': {**single['delivery_context'],
+            'artifacts': {text_path: 'a' * 64, 'output.pdf': 'b' * 64}}}
+        self.assertEqual(inspector._delivery_source_paths(mixed), [])
         self.assertEqual({row['path'] for row in saved['evidence']},
             {str(self.case.root/'workspace/tool.py')})
         calls = self.case.send.call_count

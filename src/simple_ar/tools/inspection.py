@@ -3855,7 +3855,7 @@ class InspectionToolGateway:
             # This contract primes the whole delivery, so its other originals
             # must get a window before a long manuscript consumes the input.
             return list(dict.fromkeys([*primary, *artifacts]))
-        if saved.get('source_priming_policy') == 'priority.v2' and len(artifacts) > 1:
+        if saved.get('source_priming_policy') == 'priority.v2' and len(saved['delivery_context']['artifacts']) > 1:
             # A multi-file inventory does not identify which sources answer
             # the claim. The inspector can select other files when needed.
             return primary
