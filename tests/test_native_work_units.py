@@ -237,6 +237,32 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.drain()
         self.assertEqual(c.app.session.manifest.status, 'partial')
 
+    def test_a_new_write_after_review_is_not_treated_as_the_reviewed_version(self):
+        c = self.case
+        c.root = c.directory / 'write-after-review'
+        c.app = ToolApplication.create(c.root, 'Explain the supplied observations.',
+            model='fixture', sources={'measurements': c.inputs}, services=c.services,
+            max_turns=5, max_tokens=300000, tool_contracts='on_demand')
+        c._write('note.md', 'The sample mean is 2.0 across three supplied observations.\n')
+        claim = {'summary': 'A bounded note', 'artifacts': ['note.md']}
+        c.decisions.append(fixture._action('review_result', **claim))
+        self.drain()
+        c.decisions.append(fixture._action('write_file', path='note.md',
+            content='The sample mean is 2.0 for these observations only.\n'))
+        self.drain()
+
+        def choose():
+            request = c.send.call_args.kwargs.get('request') or c.send.call_args.args[1]
+            offered = {row['function']['name'] for row in request['tools']}
+            self.assertNotIn('write_file', offered)
+            self.assertIn('deliver_result', offered)
+            return fixture._action('deliver_result', **claim,
+                unresolved=['The revised note still needs independent review.'])
+
+        c.decisions.append(choose)
+        self.drain()
+        self.assertEqual(c.app.session.manifest.status, 'partial')
+
     def test_mixed_batch_retains_effects_but_cannot_review_unobserved_production(self):
         c = self.case
         claim = {'summary':'A bounded note', 'artifacts':['note.md']}

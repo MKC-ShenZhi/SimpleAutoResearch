@@ -160,18 +160,20 @@ class Delivery:
         work_after_review = False
         review_followup = False
         for observed in reversed(observations):
-            completion = tool_completion(observed.get('tool_name', ''), self.config.get('tool_completions'))
+            name = observed.get('tool_name', '')
+            completion = tool_completion(name, self.config.get('tool_completions'))
+            spec = self.gateway.registry.get(name)
+            changed = (observed.get('status') == 'ok' and spec is not None
+                and spec.permission_level in {'write_patch', 'execution'})
             if completion is None or completion.kind not in {'delivery', 'review'}:
-                spec = self.gateway.registry.get(observed.get('tool_name', ''))
-                if (observed.get('status') == 'ok' and spec is not None
-                        and spec.permission_level in {'write_patch', 'execution'}):
-                    work_after_review = True
+                work_after_review |= changed
                 continue
             data = observed.get('data') or {}
             value = data.get(completion.field) if completion.field else data
             try:
                 proposal = DeliveryRequest.model_validate(value)
             except (ValueError, TypeError):
+                work_after_review |= changed
                 continue
             review_followup = (completion.kind == 'review' and observed.get('status') == 'ok'
                 and observed.get('current_request', True) and not work_after_review)
