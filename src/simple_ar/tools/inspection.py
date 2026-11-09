@@ -4722,15 +4722,25 @@ class InspectionToolGateway:
                 saved['evidence'] = [row for row in saved['evidence']
                     if self._target_observation(saved, row) is None]
                 reusable = remaining
-                if applicable and saved.get('source_priming_policy') == 'priority.v1':
-                    # Historical reads must not consume the first current
-                    # manuscript/summary windows or the inspector's own read.
+                if saved.get('source_priming_policy') == 'priority.v1':
+                    # Prior reads must not consume the current requested target,
+                    # manuscript or summary windows, or the inspector's own read.
                     window = FileWindow.model_fields['max_bytes'].default
-                    artifacts = saved['delivery_context']['artifacts']
-                    reserve = min(remaining[0], window + sum(min(window, self.workspace.resolve(path).stat().st_size)
-                        for path in self._delivery_source_paths(saved)
-                        if path in artifacts and Path(path).suffix.lower() not in _BINARY))
-                    reusable = [remaining[0] - reserve]
+                    priority = {}
+                    for value, row in zip(request.targets, saved['targets']):
+                        if isinstance(value, str) and row.get('readable') and not row.get('complete'):
+                            size = row['windows'][0]['size_bytes']
+                            gaps = self._missing_original_ranges(size, [row])
+                            priority[row['path']] = min(window, sum(end - start for start, end in gaps))
+                    if applicable:
+                        artifacts = saved['delivery_context']['artifacts']
+                        for path in self._delivery_source_paths(saved):
+                            if path in artifacts and Path(path).suffix.lower() not in _BINARY:
+                                size = self.workspace.resolve(path).stat().st_size
+                                priority[path] = max(priority.get(path, 0), min(window, size))
+                    if priority:
+                        reserve = min(remaining[0], window + sum(priority.values()))
+                        reusable = [remaining[0] - reserve]
                 if self.adaptive and self.material_observations is not None:
                     self._reuse_observations(saved, reusable)
                 if retained_from is not None:

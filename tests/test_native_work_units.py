@@ -248,6 +248,7 @@ class NativeWorkQueueTests(unittest.TestCase):
         def exhaust_reusable_space(saved, remaining):
             remaining[0] = 0  # Simulate a long retained history, not a missing current report.
 
+        before = len(c.inspection_requests)
         with patch.object(c.app.operations.inspection, '_reuse_observations', side_effect=exhaust_reusable_space):
             c._submit(fixture._action('deliver_result', **claim))
         reviewed = c._last('deliver_result', reviewed=True)['metadata']['delivery_review']
@@ -255,6 +256,21 @@ class NativeWorkQueueTests(unittest.TestCase):
         saved = c.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
         report = next(row for row in saved['evidence'] if row.get('path', '').endswith('/report.md'))
         self.assertEqual(''.join(w['review_text'] for w in report['windows']), body)
+        self.assertIn(body.strip(), json.dumps(c.inspection_requests[before]['messages'], ensure_ascii=False))
+
+    def test_current_inspection_target_gets_a_window_before_retained_history(self):
+        c = self.case
+        body = 'Observed source material.\n' * 100 + 'CURRENT_TARGET_END\n'
+        c._write('target.md', body)
+        before = len(c.inspection_requests)
+
+        def exhaust_reusable_space(saved, remaining):
+            remaining[0] = 0
+
+        with patch.object(c.app.operations.inspection, '_reuse_observations', side_effect=exhaust_reusable_space):
+            c._inspect(['target.md'], [])
+        supplied = json.dumps(c.inspection_requests[before]['messages'], ensure_ascii=False)
+        self.assertIn('CURRENT_TARGET_END', supplied)
 
     def test_lifecycle_guidance_uses_the_actual_budget_limited_offer(self):
         c = self.case
