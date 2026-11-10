@@ -28,7 +28,8 @@ class CandidateReviewTests(unittest.TestCase):
         self.publication = SimpleNamespace(check_requested_delivery=Mock(
             side_effect=ValueError('No current manuscript/PDF publication binding')))
         self.owner = Delivery(workspace=self.workspace,
-            gateway=SimpleNamespace(delivery_issues=lambda *args, **kwargs: []),
+            gateway=SimpleNamespace(delivery_issues=lambda *args, **kwargs: [],
+                registry=SimpleNamespace(get=lambda _: None)),
             publication=self.publication, review_owner=self.review,
             config={'delivery_review_protocol':'task.v5',
                 'tool_completions':{'review_result':{'kind':'review'}}},
@@ -90,7 +91,6 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertFalse((self.root/'delivery.json').exists())
 
     def test_one_working_view_shares_review_but_later_views_recheck(self):
-        self.owner.gateway.registry = SimpleNamespace(get=lambda _: None)
         self.owner.config['tool_completions']['deliver_result'] = {'kind': 'delivery'}
         claim = {'summary': 'Revised explanation', 'artifacts': ['draft.md']}
         self.observations.append({'tool_name': 'deliver_result', 'status': 'ok', 'data': claim,
