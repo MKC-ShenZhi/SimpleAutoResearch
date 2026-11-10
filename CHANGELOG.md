@@ -12,6 +12,10 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - Project inspection lists indexed `SKILL.md` methods for the task to read and assess before reuse.
 - Report export lets users choose the figure-caption source and set the top-level division of supplied templates.
 
+### Fixed
+
+- Current source observations remain eligible for the working view after a memory checkpoint when context permits, including during independent inspection.
+
 ## 2026-11-09
 
 ### Improved
