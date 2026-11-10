@@ -378,6 +378,7 @@ class InspectionToolGateway:
                  *, prior_assessments: Callable[[], list[dict]] | None = None,
                  prior_concerns: Callable[[list[str]], list[dict]] | None = None,
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
+                 execution_observations: Callable[[], list[dict]] | None = None,
                  user_requests: Callable[[], list[str]] | None = None,
                  feedback_provider: Callable[[list[str]], list[dict]] | None = None,
                  protocol: str | None = None,
@@ -426,6 +427,7 @@ class InspectionToolGateway:
         self.prior_assessments = prior_assessments
         self.prior_concerns = prior_concerns
         self.material_observations = material_observations
+        self.execution_observations = execution_observations
         self.user_requests = user_requests
         self.feedback_provider = feedback_provider
         self.protocol = protocol
@@ -2817,6 +2819,12 @@ class InspectionToolGateway:
                         'are supplied. indexed_paths counts the retained index, not supplied or current '
                         'sources. Capacity omissions and access withdrawal can hide descriptors; '
                         'the projection selected_records records each considered descriptor status.'}
+                if saved.get('parent_process_receipts'):
+                    view['parent_process_receipts'] = {
+                        'paths': list(saved['parent_process_receipts']),
+                        'scope': 'Previously recorded parent executions, not independent checks or proof '
+                            'of current inputs. Only the receipt text actually supplied in working_view '
+                            'is observed; inspect its command, result and input declarations before use.'}
         source_cache: dict = {}
         for role in ('targets','evidence'):
             view[role] = [{'subject':row['subject'], 'path':row.get('path'), 'complete':row['complete'],
@@ -3908,6 +3916,11 @@ class InspectionToolGateway:
                     producer = node.get('producer')
                     if node['state'] == 'recorded' and producer:
                         receipts[str(self.root / producer['receipt'])] = producer['receipt_sha256']
+                # A useful execution need not produce a deliverable. Reuse the
+                # existing parent execution projection as historical evidence,
+                # never as an independent check or a proof of undeclared inputs.
+                for path, digest in saved.get('parent_process_receipts', {}).items():
+                    receipts.setdefault(path, digest)
                 saved['production_receipts'] = list(receipts)
                 priority = [*receipts, *priority]
                 for path, digest in receipts.items():
@@ -4733,6 +4746,20 @@ class InspectionToolGateway:
                     # New reviews bind each check to the windows actually presented.
                     # Existing inspection work orders keep their saved contract.
                     saved['inspection_evidence_policy'] = 'presented.v2'
+                if applicable and self.material_policy == 'operations.v3' and self.execution_observations:
+                    receipts = {}
+                    for row in self.execution_observations():
+                        data = (row.get('result') or {}).get('data') or {}
+                        locator, digest = data.get('receipt'), data.get('receipt_sha256')
+                        if not isinstance(locator, str) or not isinstance(digest, str):
+                            continue
+                        try:
+                            path = str(self.workspace.resolve(str(self.root / locator)))
+                        except (OSError, ValueError):
+                            continue  # A missing diagnostic supplies no evidence.
+                        receipts[path] = digest
+                    if receipts:
+                        saved['parent_process_receipts'] = receipts
             remaining = [512000]
             saved['targets'] = [self._observe(value, f'target-{i + 1}', identity, remaining)
                                 for i, value in enumerate(request.targets)]

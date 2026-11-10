@@ -118,6 +118,56 @@ class CandidateReviewTests(unittest.TestCase):
 
 
 class IntegratedCandidateFlowTests(unittest.TestCase):
+    def test_review_can_observe_parent_execution_without_certifying_changed_inputs(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from tests.test_professional_work_loop import OperationsWorkLoopTests, _action, _assessments, _digest
+
+        case = OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.app = ToolApplication.create(case.root,
+            'Deliver the checked analysis script and explain any unfinished verification.',
+            model='fixture', sources={'measurements': case.inputs}, services=case.services,
+            allow_execution=True, max_turns=10, max_tokens=900000, max_attempts=100)
+        case._write('analysis.py', 'print("first version ran")\n')
+        case._submit(_action('run_process', argv=['python', 'analysis.py'], cwd='workspace',
+            timeout_sec=10), approve=lambda call, token: True)
+        process = case._ok('run_process')
+        receipt = case.root / process['data']['receipt']
+        original = receipt.read_bytes()
+        script = case.root / 'workspace/analysis.py'
+        case._submit(_action('write_file', path='analysis.py',
+            content='print("changed version")\n', expected_sha256=_digest(script)))
+
+        # Only a terminal opinion fits. The existing recorded execution should
+        # still be inspectable without an extra model turn or new execution.
+        case.app.ledger.limits['llm_requests'] = 1
+        case.app.ledger.save()
+        def review(view):
+            offered = {tool['function']['name'] for tool in case.inspection_requests[-1]['tools']}
+            self.assertEqual(offered, {'record_inspection'})
+            self.assertEqual(view['executed_checks'], [])
+            self.assertIn('not independent checks', view['parent_process_receipts']['scope'])
+            observed = next(row for row in view['evidence'] if row.get('path') == str(receipt))
+            text = ''.join(window['text'] for window in observed['text_windows'])
+            self.assertIn('first version ran', text)
+            self.assertIn('analysis.py', text)
+            return {'conclusion': 'incomplete', 'findings': [], 'evidence': [observed['subject']],
+                'limitations': ['The recorded execution predates the changed script and did not declare inputs.']}
+
+        case.review = review
+        case._submit(_action('deliver_result', summary='Analysis script awaiting verification',
+            artifacts=['analysis.py']))
+        result = case._ok('deliver_result', reviewed=True)
+        self.assertEqual(_assessments(result)[0]['verdict'], 'incomplete')
+        case._not_delivered()
+        self.assertEqual(len(case.inspection_requests), 1)
+        self.assertEqual(receipt.read_bytes(), original)
+        self.assertFalse(case.app.ledger.over_limit())
+        before = case.app.ledger.to_dict()
+        case._reload()
+        self.assertEqual(case.app.ledger.to_dict(), before)
+
     def test_fresh_candidate_revision_final_opinion_reuse_and_feedback_reload(self):
         from simple_ar.app.tool_application import ToolApplication
         from tests.test_professional_work_loop import OperationsWorkLoopTests, _action

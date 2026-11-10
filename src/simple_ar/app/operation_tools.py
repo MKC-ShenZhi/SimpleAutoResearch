@@ -256,6 +256,7 @@ class OperationTools:
             material_policy=config.get('inspection_material_policy'),
             native_history_policy=config.get('native_history_policy'),
             material_observations=material_observations,
+            execution_observations=execution_observations,
             user_requests=user_requests,
             prior_concerns=lambda targets: self.delivery_review.pending_concerns(targets)
                 if self.delivery_review is not None else [],
