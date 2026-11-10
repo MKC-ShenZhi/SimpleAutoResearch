@@ -528,8 +528,17 @@ class GoalWorkTests(unittest.TestCase):
                                                    receipt, identity, '', check_versions=False)
         self.assertEqual(error, '')
         self.assertEqual(legacy['verdict'], 'incomplete')
+        with patch.object(owner, '_read_retained_result', wraps=owner._read_retained_result) as read:
+            with owner.presentation_scope():
+                first = owner._cached(identity)
+                second = owner._cached(identity)
+                self.assertEqual(first, second)
+                self.assertEqual(read.call_count, 1)
         case._submit(_action('deliver_result', **final))
         self.assertEqual(case.app.session.manifest.status, 'completed')
+        case._write('report.md', 'The report changed after the inspection.\n')
+        with self.assertRaises(ValueError):
+            owner._cached(identity)
 
     def test_independent_review_can_find_the_original_edit_and_its_result(self):
         case = self.case

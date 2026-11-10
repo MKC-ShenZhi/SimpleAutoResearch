@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 import hashlib
 import json
@@ -21,6 +23,8 @@ from simple_ar.tools.specs import CommonToolSpec, ToolResult, NATIVE_WORK_METHOD
 from simple_ar.tools.workspace import FileWindow, workspace_tool_specs
 from simple_ar.tools.materials import lossless_text_window
 from simple_ar.tools.delivery_review import applicable_delivery_scope, reassessment_has_subject_support
+
+_PRESENTATION_RESULTS: ContextVar[dict | None] = ContextVar('inspection_presentation_results', default=None)
 
 
 class _InspectionDispatchRaised(BaseException):
@@ -1433,7 +1437,25 @@ class InspectionToolGateway:
     def _cached(self, identity: str) -> ToolResult:
         return self._retained_result(identity, current_inputs=True)
 
+    @contextmanager
+    def presentation_scope(self):
+        """Share validated opinions only while preparing one model input."""
+        token = _PRESENTATION_RESULTS.set({})
+        try:
+            yield
+        finally:
+            _PRESENTATION_RESULTS.reset(token)
+
     def _retained_result(self, identity: str, *, current_inputs: bool) -> ToolResult:
+        results = _PRESENTATION_RESULTS.get()
+        if results is None:
+            return self._read_retained_result(identity, current_inputs=current_inputs)
+        key = (self, identity, current_inputs)
+        if key not in results:
+            results[key] = self._read_retained_result(identity, current_inputs=current_inputs)
+        return results[key].model_copy(deep=True)
+
+    def _read_retained_result(self, identity: str, *, current_inputs: bool) -> ToolResult:
         """Verify saved opinions separately from their applicability to current bytes.
 
         Acceptance always uses _cached. Revision may read an intact old opinion

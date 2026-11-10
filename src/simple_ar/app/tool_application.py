@@ -2912,9 +2912,14 @@ class ToolApplication:
                   working_memory: dict | None = None, working_selection: dict | None = None) -> list[dict[str, Any]]:
         protocol = self.state['config'].get('context_protocol')
         if protocol in _CONVERSATION_CONTEXT_PROTOCOLS:
-            return self._conversation_messages(client=client, closing=closing,
-                native_history_start_turn=native_history_start_turn, schemas=schemas,working_memory=working_memory,
-                working_selection=working_selection)
+            def conversation():
+                return self._conversation_messages(client=client, closing=closing,
+                    native_history_start_turn=native_history_start_turn, schemas=schemas, working_memory=working_memory,
+                    working_selection=working_selection)
+            if self.operations is not None:
+                with self.operations.inspection.presentation_scope():
+                    return conversation()
+            return conversation()
         if protocol is not None:
             raise ValueError('Unknown saved context protocol; no projection migration')
         config = self.state["config"]
