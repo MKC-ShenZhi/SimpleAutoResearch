@@ -16,6 +16,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- Repeated reading no longer restricts the next decision to editing; saved tasks retain their records and can continue with authorized checks or other work.
 - The workspace starts file browsing in accessible task work and marks saved sources that are unavailable under the current read grants.
 - Independent delivery review can find recorded task executions and copy the task workspace into its own area for checks; historical execution remains distinct from an independent result.
 - Current source observations remain eligible for the working view after a memory checkpoint when context permits, including during independent inspection.
@@ -39,7 +40,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
-- New ordinary tasks use native tool batches on the shared queue. Complete work units retain the original reply, actions and receipts in working history, without an outer work-selection response or a second action compilation. Candidate review and final delivery use separate decisions after observing production; ordinary services cannot silently introduce either effect. Independent inspection retains its native operations and independent opinions on the same ledger. Saved tasks retain their original policies and recovery behavior. Early candidate checks now accept the current claim, existing files and known gaps through a dedicated request, without final report or publication declarations. Final delivery keeps its full acceptance checks; unchanged observed file hashes remain reusable for guarded edits.
+- New ordinary tasks use native tool batches on the shared queue. Complete work units retain the original reply, actions and receipts in working history, without an outer work-selection response or a second action compilation. Candidate review and final delivery use separate decisions after observing production; ordinary services cannot silently introduce either effect. Independent inspection retains its native operations and independent opinions on the same ledger. Saved task history and recovery remain available. Early candidate checks now accept the current claim, existing files and known gaps through a dedicated request, without final report or publication declarations. Final delivery keeps its full acceptance checks; unchanged observed file hashes remain reusable for guarded edits.
 
 ## 2026-11-06
 

@@ -20,33 +20,6 @@ from simple_ar.tools.workspace import DeliveryRequest
 from simple_ar.app.professional_conversation import recorded_work_messages
 
 
-OBSERVED_EDIT_TOOLS = frozenset({'edit_file', 'write_file', 'review_result', 'deliver_result',
-                                'load_tools', 'ask_user'})
-
-
-def observed_window_covered(window: dict, supplied: list[dict]) -> bool:
-    """Only count exact byte coverage on the same locator and recorded version."""
-    start, end = window.get('offset_bytes'), window.get('next_offset_bytes')
-    if (not window.get('path') or not window.get('sha256') or type(start) is not int
-            or type(end) is not int or start >= end):
-        return False
-    spans = []
-    for row in supplied:
-        if row.get('path') != window['path'] or row.get('sha256') != window['sha256']:
-            continue
-        left = row.get('supplied_offset_bytes', row.get('offset_bytes'))
-        right = row.get('supplied_next_offset_bytes', row.get('next_offset_bytes'))
-        if type(left) is int and type(right) is int:
-            spans.append((left, right))
-    for left, right in sorted(spans):
-        if left > start:
-            break
-        start = max(start, right)
-        if start >= end:
-            return True
-    return False
-
-
 class WorkNeed(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     request_index: int | None = None

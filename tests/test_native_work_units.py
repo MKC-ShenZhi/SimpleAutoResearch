@@ -135,34 +135,36 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertEqual(c.app.state['pending']['call']['function']['name'], 'run_process')
         self.assertIn('explicit approval', c.app.session.manifest.status_reason)
 
-    def test_repeated_supplied_read_has_one_edit_offer_with_normal_work_return(self):
+    def test_repeated_read_keeps_authorized_work_available_for_saved_sessions(self):
         c = self.case
         c.app.state['config']['tool_contracts'] = 'on_demand'
+        # Older sessions retain this recorded policy, without restricting future choices.
+        c.app.state['config']['action_offer_policy'] = 'observed_edit.v1'
         c.app._save()
         c._reload()
-        for action in [fixture._action('write_file', path='note.md', content='Original note.\n'),
-                       fixture._action('read_file', path='note.md'),
-                       fixture._action('read_file', path='note.md')]:
+        for action in [fixture._action('write_file', path='note.md', content='First line.\nSecond line.\n'),
+                       fixture._action('read_file', path='note.md', start_line=1, max_lines=1),
+                       [fixture._action('read_file', path='note.md', start_line=1, max_lines=1),
+                        fixture._action('read_file', path='note.md', start_line=2, max_lines=1)]]:
             c.decisions.append(action)
             self.drain()
         c._reload()
-        c.decisions.append(fixture._action('load_tools', names=['read_file']))
-        self.drain()
-        decision = c.root / c.app.state['turns'][-1]['reply']
-        offer = json.loads(decision.with_name('decision_budget.json').read_text())['input_projection']
-        self.assertEqual(offer['observed_edit']['path'], 'note.md')
-        self.assertIn('edit_file', offer['tool_names'])
-        self.assertNotIn('read_file', offer['tool_names'])
-        self.assertEqual(c._last('load_tools')['status'], 'ok')
-        c._reload()
-        c.decisions.append(fixture._action('read_file', path='note.md'))
+        c.decisions.append(fixture._action('run_process', argv=[sys.executable, '-c',
+            "from pathlib import Path; assert 'Second line.' in Path('note.md').read_text()"],
+            inputs=['note.md']))
         self.drain()
         decision = c.root / c.app.state['turns'][-1]['reply']
         offer = json.loads(decision.with_name('decision_budget.json').read_text())['input_projection']
         self.assertNotIn('observed_edit', offer)
+        self.assertIn('edit_file', offer['tool_names'])
         self.assertIn('read_file', offer['tool_names'])
+        self.assertIn('run_process', offer['tool_names'])
+        self.assertEqual(c.app.state['pending']['call']['function']['name'], 'run_process')
+        token = c.app.approval_token(c.app.state['pending']['call'])
+        self.drain(approved_execution=token)
+        self.assertEqual(c._last('run_process')['status'], 'ok')
 
-    def test_observed_edit_and_check_queue_independent_review_before_more_production(self):
+    def test_edit_and_check_queue_independent_review_before_more_production(self):
         c = self.case
         c.app.state['config']['tool_contracts'] = 'on_demand'
         c.app._save()
