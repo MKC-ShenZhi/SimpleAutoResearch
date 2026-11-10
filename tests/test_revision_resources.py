@@ -108,6 +108,30 @@ class RevisionResourceTests(unittest.TestCase):
 
 
 class RevisionInspectionFlowTests(unittest.TestCase):
+    def test_candidate_review_is_available_with_one_real_followup(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
+        case = OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.app = ToolApplication.create(case.root, 'Explain the supplied observations in an editable note.',
+            model='fixture', sources={'measurements': case.inputs}, services=case.services,
+            max_turns=3, max_tokens=900000, tool_contracts='full')
+        case._write('note.md', 'The supplied observations are 1, 2 and 3.\n')
+        claim = {'summary': 'The supplied observations are 1, 2 and 3.', 'artifacts': ['note.md']}
+        case.decisions.append(_action('review_result', **claim))
+        case._run(should_stop=lambda: bool(case._observations('review_result', reviewed=True)))
+        review = case._ok('review_result', reviewed=True)
+        self.assertTrue(case.inspection_requests)
+        self.assertGreaterEqual(case.app.ledger.remaining('llm_requests'), 1)
+        self.assertNotEqual(case.app.session.manifest.status, 'completed')
+        self.assertIn('delivery_review', review['metadata'])
+        # Any further work depends on the actual opinion. In particular, the
+        # remaining decision can deliver an accepted candidate, while a finding
+        # can instead be addressed or disclosed without claiming completion.
+        self.assertIn(review['metadata']['delivery_review']['result']['metadata']
+            ['delivery_assessment']['verdict'], {'passed', 'incomplete', 'needs_revision'})
+
     def test_candidate_repair_and_final_acceptance_spend_the_reserved_stages_once(self):
         from simple_ar.app.tool_application import ToolApplication
         from tests.test_professional_work_loop import OperationsWorkLoopTests, _action

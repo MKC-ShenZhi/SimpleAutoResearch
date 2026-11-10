@@ -17,6 +17,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- Candidate review keeps one decision available for its actual result without reserving an additional hypothetical exit in advance.
 - Independent delivery review distinguishes delivered files from accessible evidence and checks requested outcomes against the actual delivery. Complete reviews can reassess an earlier concern using that check's supplied evidence; historical records retain their original scope.
 - Independent review can locate the recorded edit call behind a current artifact and inspect it alongside the result.
 - A prior candidate's unresolved statements remain visible as prior claims instead of becoming automatic current obligations after further work.
