@@ -13,7 +13,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - Project inspection lists indexed `SKILL.md` methods for the task to read and assess before reuse.
 - Report export lets users choose the figure-caption source and set the top-level division of supplied templates.
 - Command-line report export can use a compact general article layout; ACM and custom templates remain available.
-- A working view reuses applicable delivery-review results and prepares unchanged recorded work once per selected history.
+- A decision reuses applicable delivery-review results across its working views and prepares unchanged recorded work once per selected history.
 
 ### Fixed
 

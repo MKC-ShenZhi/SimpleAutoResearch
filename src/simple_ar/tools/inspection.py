@@ -1460,12 +1460,22 @@ class InspectionToolGateway:
 
     @contextmanager
     def presentation_scope(self):
-        """Share validated opinions only while preparing one model input."""
+        """Share validated opinions while preparing one decision's inputs."""
+        if _PRESENTATION_RESULTS.get() is not None:
+            yield
+            return
         token = _PRESENTATION_RESULTS.set({})
         try:
             yield
         finally:
             _PRESENTATION_RESULTS.reset(token)
+
+    @staticmethod
+    def clear_presentation_scope() -> None:
+        """Revalidate after a checkpoint may have changed the working state."""
+        results = _PRESENTATION_RESULTS.get()
+        if results is not None:
+            results.clear()
 
     def _retained_result(self, identity: str, *, current_inputs: bool) -> ToolResult:
         results = _PRESENTATION_RESULTS.get()

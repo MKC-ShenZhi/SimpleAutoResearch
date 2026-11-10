@@ -4489,6 +4489,7 @@ class ToolApplication:
                     **({'economic_floor':selection['required_input_tokens']}
                        if self.state['config'].get('context_checkpoint_policy') in {'economic.v2', 'economic.v3'}
                           and selection.get('economical_compaction', False) else {}))
+            self.operations.inspection.clear_presentation_scope()
             if memory_refs:
                 memory_refs = self._memory_artifacts(context.store, context.attempt.attempt_id)
                 if context.store.exists('memory_snapshot.json'):
@@ -4505,17 +4506,18 @@ class ToolApplication:
                             operations_for_turn=self._memory_operations)}
                     working_memory['notes'] = self.operations.project_notes(working_memory['notes'])
 
-        value = conversation.prepare(project,
-            followup=lambda value:(self._lifecycle_floor(
-                {'llm_requests':1, 'total_tokens':conversation.tokens(value)}) if integrated else
-                {'llm_requests':1, 'total_tokens':conversation.tokens(value)}
-                if operation_exit else self._completion_floor(client, value.messages)),
-            checkpoint=None if ((self.state.get('pending') or {}).get('skip_memory_checkpoint')
-                or not journal and self.state['config'].get('context_protocol') != 'working.v1') else checkpoint,
-            closing_enabled=operation_exit or self.state['config'].get('completion_policy') == 'closing_decision.v2',
-            exit_first=operation_exit or integrated,
-            continue_allowed=self._request_capacity() > 1 and (
-                self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts > 2))
+        with self.operations.inspection.presentation_scope():
+            value = conversation.prepare(project,
+                followup=lambda value:(self._lifecycle_floor(
+                    {'llm_requests':1, 'total_tokens':conversation.tokens(value)}) if integrated else
+                    {'llm_requests':1, 'total_tokens':conversation.tokens(value)}
+                    if operation_exit else self._completion_floor(client, value.messages)),
+                checkpoint=None if ((self.state.get('pending') or {}).get('skip_memory_checkpoint')
+                    or not journal and self.state['config'].get('context_protocol') != 'working.v1') else checkpoint,
+                closing_enabled=operation_exit or self.state['config'].get('completion_policy') == 'closing_decision.v2',
+                exit_first=operation_exit or integrated,
+                continue_allowed=self._request_capacity() > 1 and (
+                    self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts > 2))
         floor = ({'llm_requests':1, 'total_tokens':conversation.tokens(value)}
             if value.closing else value.reserve if operation_exit else self._completion_floor(client, value.messages))
         if integrated:

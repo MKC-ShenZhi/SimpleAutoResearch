@@ -539,9 +539,13 @@ class GoalWorkTests(unittest.TestCase):
         with patch.object(owner, '_read_retained_result', wraps=owner._read_retained_result) as read:
             with owner.presentation_scope():
                 first = owner._cached(identity)
-                second = owner._cached(identity)
+                with owner.presentation_scope():
+                    second = owner._cached(identity)
                 self.assertEqual(first, second)
                 self.assertEqual(read.call_count, 1)
+                owner.clear_presentation_scope()
+                self.assertEqual(owner._cached(identity), first)
+                self.assertEqual(read.call_count, 2)
         case._submit(_action('deliver_result', **final))
         self.assertEqual(case.app.session.manifest.status, 'completed')
         (case.root / 'workspace' / 'report.md').write_text(
