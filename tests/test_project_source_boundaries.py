@@ -23,6 +23,66 @@ from simple_ar.research.preparation import inspect_execution_entry, inspect_proj
 
 
 class ProjectSourceBoundaryTests(unittest.TestCase):
+    def test_project_method_can_be_discovered_and_reused_with_new_data(self):
+        from simple_ar.app.reuse import select_reuse
+        from simple_ar.app.tool_application import ToolApplication
+
+        with tempfile.TemporaryDirectory() as folder:
+            first = ToolApplication.create(Path(folder) / 'first', 'Build a reusable sample method',
+                model=None, sources={}, allow_execution=True,
+                process_limits={'process_invocations': 2, 'process_wall_seconds': 20})
+            method = ('# Mean method\n\nRun the companion script on whitespace-separated numbers.\n')
+            script = ('import pathlib, sys\n'
+                'values = [float(value) for value in pathlib.Path(sys.argv[1]).read_text().split()]\n'
+                'pathlib.Path(sys.argv[2]).write_text(str(sum(values) / len(values)))\n')
+            first_actions = [
+                {'tool_name': 'write_file', 'arguments': {'path': 'project/skills/mean/SKILL.md', 'content': method}},
+                {'tool_name': 'write_file', 'arguments': {'path': 'project/skills/mean/mean.py', 'content': script}},
+                {'tool_name': 'write_file', 'arguments': {'path': 'project/first.txt', 'content': '1 3\n'}},
+                {'tool_name': 'run_process', 'arguments': {'cwd': 'project',
+                    'argv': ['python', 'skills/mean/mean.py', 'first.txt', 'first-result.txt'],
+                    'inputs': ['workspace/project/skills/mean/mean.py', 'workspace/project/first.txt'],
+                    'outputs': ['workspace/project/first-result.txt'], 'timeout_sec': 10}},
+                {'tool_name': 'copy_project', 'arguments': {'source': 'project', 'path': 'published'}},
+                {'tool_name': 'deliver_result', 'arguments': {'summary': 'Reusable method and result',
+                    'artifacts': ['published']}},
+            ]
+            outcome = first.run(actions=first_actions, approve=lambda *_: True, progress=lambda _: None)
+            self.assertEqual(outcome['status'], 'completed', outcome)
+            selected = select_reuse(first.session.store.root, ['code_project'])
+            project = selected.project[0]
+            self.assertEqual((project / 'first-result.txt').read_text(), '2.0')
+
+            second = ToolApplication.create(Path(folder) / 'second', 'Apply the retained method to new data',
+                model=None, sources={'source0': project}, allow_execution=True,
+                process_limits={'process_invocations': 2, 'process_wall_seconds': 20})
+            denied = second.workspace.call('write_file', {'path': 'source0/skills/mean/SKILL.md',
+                'content': 'unapproved'}, identity='source-write')
+            self.assertEqual(denied.status, 'blocked')
+            second_actions = [
+                {'tool_name': 'inspect_project', 'arguments': {'path': 'source0'}},
+                {'tool_name': 'read_file', 'arguments': {'path': 'source0/skills/mean/SKILL.md'}},
+                {'tool_name': 'copy_project', 'arguments': {'source': 'source0', 'path': 'work'}},
+                {'tool_name': 'write_file', 'arguments': {'path': 'work/second.txt', 'content': '2 4 9\n'}},
+                {'tool_name': 'run_process', 'arguments': {'cwd': 'work',
+                    'argv': ['python', 'skills/mean/mean.py', 'second.txt', 'second-result.txt'],
+                    'inputs': ['workspace/work/skills/mean/mean.py', 'workspace/work/second.txt'],
+                    'outputs': ['workspace/work/second-result.txt'], 'timeout_sec': 10}},
+                {'tool_name': 'deliver_result', 'arguments': {'summary': 'Result from new observations',
+                    'artifacts': ['work/second-result.txt']}},
+            ]
+            outcome = second.run(actions=second_actions, approve=lambda *_: True, progress=lambda _: None)
+            self.assertEqual(outcome['status'], 'completed', outcome)
+            results = [second.session.store.read_json(item['result']) for turn in second.state['turns']
+                       for item in turn['tools']]
+            inspected = next(row for row in results if row['tool_name'] == 'inspect_project')
+            self.assertEqual(inspected['data']['project_skills'], ['skills/mean/SKILL.md'])
+            self.assertNotIn(method, json.dumps(inspected['data']))  # Discovery does not silently adopt instructions.
+            observed = next(row for row in results if row['tool_name'] == 'read_file')
+            self.assertEqual(observed['data']['text'], method)
+            self.assertEqual((second.workspace.workspace / 'work/second-result.txt').read_text(), '5.0')
+            self.assertEqual((project / 'skills/mean/SKILL.md').read_text(), method)
+
     def test_workspace_keeps_dotenv_private_while_code_task_keeps_examples(self):
         from simple_ar.tools.workspace import WorkspaceToolGateway, resolve_source_mount
         from simple_ar.core.budget import BudgetLedger

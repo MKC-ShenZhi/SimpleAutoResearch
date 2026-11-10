@@ -165,6 +165,7 @@ def inspect_project_preparation(
     allowed = code_task_access_filter(root, boundary=boundary)
     index = authorized_review_index(root, index, access_boundary=boundary)
     available_paths = {row['path'] for row in index['files']}
+    project_skills = sorted(path for path in available_paths if Path(path).name.casefold() == 'skill.md')
     documents = []
     # Generated lock files are intentionally absent from the code-review
     # text index. Their top-level names still belong in preparation inventory.
@@ -289,6 +290,7 @@ def inspect_project_preparation(
         "file_count": index.get("file_count", 0), "entrypoint_candidates": entrypoints,
         "declared_entrypoints": declared_entries,
         "notebook_candidates": list(index.get("notebooks", [])),
+        "project_skills": project_skills,
         "source_file_paths": sorted(available_paths)[:2000],
         "source_paths_omitted": max(0, len(available_paths) - 2000),
         "reading_coverage": reading_coverage,
@@ -321,6 +323,8 @@ def project_preparation_markdown(facts: Mapping[str, Any]) -> str:
              "", "## Entry candidates (not executed)", *[f"- {path}" for path in facts["entrypoint_candidates"]],
              "", "## Notebook candidates (cells and saved outputs unread)",
              *[f"- {row['path']}: {row['size_bytes']} bytes; not a confirmed command" for row in facts.get("notebook_candidates", [])],
+             *(["", "## Project method candidates (read and assess applicability before use)",
+                *[f"- {path}" for path in facts['project_skills']]] if facts.get("project_skills") else []),
              "", "## Data locations", *[f"- {row['path']}: {'present' if row['available'] else 'missing'}; {row.get('size_bytes', 'size not inspected')}" for row in facts["data_paths"]],
              "", "## Decisions still needed", *[f"- {text}" for text in facts["open_questions"]],
              "", "## Inspection limits", *[f"- {text}" for text in [*facts["limitations"], *facts["notes"]]],

@@ -361,7 +361,7 @@ simple-ar image-review --input figure.png --goal "Check labels and hierarchy" --
 
 ### `simple-ar project-info`
 
-Read project instructions, dependencies, entry candidates and named data locations without installation or execution.
+Read project instructions, dependencies, entry candidates, indexed project `SKILL.md` paths and named data locations without installation or execution. Read a relevant method and assess its applicability before use.
 
 ```text
 simple-ar project-info --project PATH --output PATH [OPTIONS]

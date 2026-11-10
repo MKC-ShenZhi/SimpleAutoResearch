@@ -360,7 +360,7 @@ simple-ar image-review --input figure.png --goal "检查标签和视觉层次" -
 
 ### `simple-ar project-info`
 
-读取项目说明、依赖、候选入口及命名数据位置，不安装或执行。
+读取项目说明、依赖、候选入口、已索引的项目 `SKILL.md` 路径及命名数据位置，不安装或执行。使用前需读取相关方法并判断是否适用。
 
 ```text
 simple-ar project-info --project PATH --output PATH [OPTIONS]
