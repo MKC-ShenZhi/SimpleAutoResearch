@@ -403,6 +403,56 @@ class GoalWorkTests(unittest.TestCase):
         self.assertGreater(selection['estimated_input_tokens'],
                            2 * (estimate_tokens(serialized) + estimate_tokens(schemas)))
 
+    def test_reassessment_uses_supplied_support_from_the_same_independent_opinion(self):
+        case = self.case
+        case._write('a.md', 'First current result.\n')
+        case._write('b.md', 'Second current result.\n')
+        claim = {'summary': 'A paired result.', 'artifacts': ['a.md', 'b.md']}
+        phase = {'revision': False, 'second_checked': False}
+
+        def review(view):
+            paths = ['a.md', 'b.md']
+            sources = case._inspection_sources(view, *paths)
+            if any(row is None for row in sources):
+                return [_action('read_file', path=path) for path, row in zip(paths, sources) if row is None]
+            first, second = (row['subject'] for row in sources)
+            base = {'scope': 'The requested result.', 'necessary': True, 'method': 'Read the result.',
+                    'reasoning': 'The current observations were read.', 'basis': 'observed'}
+            if not phase['revision']:
+                checks = [{**base, 'claim': 'The pair is complete.', 'evidence': [first, second],
+                    'outcome': 'contradicted', 'findings': [{'severity': 'required',
+                        'message': 'Revise the paired result.', 'artifacts': [
+                            str(case.root/'workspace/a.md'), str(case.root/'workspace/b.md')]}]}]
+            else:
+                checks = [{**base, 'claim': 'The earlier issue is resolved.', 'evidence': [first],
+                    'outcome': 'supported', 'findings': [],
+                    'reassessed_prior': [row['id'] for row in view['prior_required']]},
+                    {**base, 'claim': 'The second result was checked.',
+                     'evidence': [second] if phase['second_checked'] else [],
+                     'basis': 'observed' if phase['second_checked'] else 'not_checked',
+                     'outcome': 'supported' if phase['second_checked'] else 'unresolved', 'findings': []}]
+            return {'conclusion': 'complete' if phase['second_checked'] else 'incomplete',
+                    'applicability': 'Check the actual paired result.', 'investigations': checks,
+                    'limitations': [], 'reassessed_prior': []}
+
+        case.review = review
+        case._submit(_action('review_result', **claim))
+        first = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+        self.assertEqual(first['verdict'], 'needs_revision')
+        case._write('a.md', 'First revised result.\n')
+        phase['revision'] = True
+        case._submit(_action('review_result', **claim))
+        incomplete = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+        self.assertEqual(incomplete['reassessed_prior'], [])
+        self.assertEqual(incomplete['verdict'], 'incomplete')
+        phase['second_checked'] = True
+        case._submit(_action('review_result', **claim))
+        checked = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+        self.assertEqual(len(checked['reassessed_prior']), 1)
+        self.assertEqual(checked['verdict'], 'passed')
+        case._submit(_action('deliver_result', **claim))
+        self.assertEqual(case.app.session.manifest.status, 'completed')
+
     def test_review_reassesses_each_concern_using_its_supplied_evidence_windows(self):
         from simple_ar.tools.inspection import InspectionToolGateway, _PresentedClaimDeliveryResponseV2
 

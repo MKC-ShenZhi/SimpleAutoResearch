@@ -2439,8 +2439,11 @@ class InspectionToolGateway:
                 if any(row.outcome != 'supported' or not row.evidence
                        or not all(supplied(row, subject) for subject in row.evidence) for row in checks):
                     continue
-                row_scopes = [bindings['evidence:' + subject] for row in checks for subject in row.evidence]
-                row_scopes.extend(bindings['execution:' + record] for row in checks
+                supporting = (checks if saved.get('inspection_evidence_policy') != 'presented.v3' else
+                    [row for row in decision.investigations if row.outcome == 'supported' and row.evidence
+                     and all(supplied(row, subject) for subject in row.evidence)])
+                row_scopes = [bindings['evidence:' + subject] for row in supporting for subject in row.evidence]
+                row_scopes.extend(bindings['execution:' + record] for row in supporting
                     for record in row.execution_records if 'execution:' + record in bindings)
                 if reassessment_has_subject_support(prior[key], delivery['artifacts'], row_scopes):
                     reassessed.append(key)
