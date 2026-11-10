@@ -5,6 +5,13 @@
 User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-11-10
+
+### Improved
+
+- Project inspection lists indexed `SKILL.md` methods for the task to read and assess before reuse.
+- Report export lets users choose the figure-caption source and set the top-level division of supplied templates.
+
 ## 2026-11-09
 
 ### Improved
