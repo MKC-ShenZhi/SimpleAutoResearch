@@ -221,6 +221,36 @@ class SelectedWorkContinuityTests(unittest.TestCase):
 
 
 class WorkingSupplyContinuityTests(unittest.TestCase):
+    def test_current_observations_remain_eligible_after_multiple_read_turns(self):
+        def read(turn, name, text, digest='a' * 64):
+            return {'turn': turn, 'record': f'records/{turn}.json', 'kind': 'source_text',
+                'role': 'historical_observation', 'tool': 'read_file', 'path': f'workspace/{name}',
+                'sha256': digest, 'offset_bytes': 0, 'next_offset_bytes': len(text), 'text': text}
+        rows = [read(0, 'old', 'PREVIOUS REQUEST'), read(1, 'report', 'REPORT'),
+                read(2, 'script', 'SCRIPT'), read(3, 'metrics', 'METRICS'),
+                read(4, 'stale', 'STALE', 'b' * 64)]
+        common = dict(user_requests=['Previous task', 'Continue the study'], system_text='Work', base_context={},
+            turn_blocks=[[], [], [], [], [], [{'role': 'assistant', 'content': 'Latest decision'}]],
+            block_request_counts=[1, 2, 2, 2, 2, 2], observations=rows, native_observations=[],
+            schema_tokens=0, context_token_target=100000, estimate_tokens=len,
+            material_policy='working', require_work_notes=True, fit_work_notes=True,
+            sparse_handoffs=True, processed_turns=[0, 1, 2, 3, 4], archived_turns=[0, 1, 2, 3, 4],
+            work_notes=[{'text': 'Prior work retained in the journal'}], version_resolver=lambda _: 'a' * 64)
+        _, previous = select_working_context(**common, working_set_policy='recent.v3')
+        self.assertNotIn('records/1.json', {x['source']['record'] for x in previous['selected_records']})
+        for inspection_observations in (False, True):
+            with self.subTest(inspection_observations=inspection_observations):
+                observations = deepcopy(rows)
+                if inspection_observations:
+                    # Independent inspection supplies actual read windows with
+                    # their source rounds, without the workspace tool label.
+                    for row in observations:
+                        row.pop('tool')
+                _, selected = select_working_context(**{**common, 'observations': observations},
+                    working_set_policy='recent.v4')
+                self.assertEqual({x['source']['record'] for x in selected['selected_records']},
+                    {'records/1.json', 'records/2.json', 'records/3.json'})
+
     def test_active_read_windows_survive_archiving_without_pinning_unrelated_files(self):
         def read(turn, name, text, digest='a' * 64):
             return {'turn': turn, 'record': f'records/{turn}.json', 'kind': 'source_text',

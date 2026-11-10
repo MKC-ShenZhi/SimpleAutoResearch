@@ -166,7 +166,7 @@ def select_working_context(
     context_authority: Literal['sources.v1'] | None = None,
     message_projector: Callable | None = None,
     preserve_material_observations: bool = False,
-    working_set_policy: Literal['recent.v2', 'recent.v3'] | None = None,
+    working_set_policy: Literal['recent.v2', 'recent.v3', 'recent.v4'] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -254,10 +254,10 @@ def select_working_context(
     """
     if context_authority is not None and context_authority != 'sources.v1':
         raise ValueError('Unknown context authority policy')
-    if working_set_policy not in (None, 'recent.v2', 'recent.v3'):
+    if working_set_policy not in (None, 'recent.v2', 'recent.v3', 'recent.v4'):
         raise ValueError('Unknown working set policy')
     recent_set = working_set_policy is not None
-    active_material_policy = working_set_policy == 'recent.v3'
+    active_material_policy = working_set_policy in {'recent.v3', 'recent.v4'}
     # None preserves historical consumers. An explicit (possibly empty) supply
     # is derived by the message owner, never inferred from matching prose.
     def source_key(row: Mapping[str, Any]) -> str:
@@ -701,6 +701,7 @@ def select_working_context(
         return max(0, last - first) if row.get('kind') == 'source_text' and type(first) is int and type(last) is int else 0
 
     active_material: set[int] = set()
+    reusable_material: set[int] = set()
     if active_material_policy:
         # The last two read-bearing decisions identify current working files.
         # Keep matching observations eligible across a note checkpoint, within
@@ -715,6 +716,15 @@ def select_working_context(
             return rows[i].get('absolute_path') or rows[i]['path']
         paths = {location(i) for i in current_reads if observed_turn(i) in read_turns}
         active_material = {i for i in current_reads if location(i) in paths}
+        reusable_material = active_material
+        if working_set_policy == 'recent.v4':
+            # A checkpoint is a summary, not proof that earlier originals are
+            # no longer useful. Let this request's observed, current sources
+            # compete for remaining capacity after recent work.
+            reusable_material = {i for i, row in enumerate(rows)
+                if row.get('kind') == 'source_text' and states[i]['version_status'] == 'matching'
+                and 0 <= observed_turn(i) < len(counts)
+                and counts[observed_turn(i)] == len(user_requests)}
 
     def priority(i: int) -> tuple[int, int, int, int, int]:
         row = rows[i]
@@ -917,7 +927,7 @@ def select_working_context(
             if supplied_handoffs:
                 ordered = [i for i in ordered if rows[i].get('turn') not in supplied_handoffs
                     or rows[i].get('record') in explicit_references
-                    or i in active_material
+                    or i in reusable_material
                     or preserve_material_observations and not recent_set and rows[i].get('kind') in {'source_text', 'authored_text'}
                     or recent_set and (rows[i].get('record') in {
                         record for note in view['notes'] if active(note) for record in note.get('records', ())}

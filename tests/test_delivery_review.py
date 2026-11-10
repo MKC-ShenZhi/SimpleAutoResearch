@@ -1777,6 +1777,7 @@ class ApplicableDeliveryInspectionTests(unittest.TestCase):
         identity = Path(result['data']['record']).parts[1]
         saved = inspector.store.read_json(inspector._path(identity, 'input'))
         self.assertEqual(saved['native_supply_policy'], 'turns.v1')
+        self.assertEqual(saved['working_set_policy'], 'recent.v4')
         trace = inspector._closed_source_round(saved, 0)
         history = [{'role':'system', 'content':'unused'}, {'role':'user', 'content':'unused'},
             trace['response'], *[{'role':'tool', 'tool_call_id':row['call_id'],

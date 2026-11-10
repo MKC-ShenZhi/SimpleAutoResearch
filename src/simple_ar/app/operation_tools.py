@@ -252,6 +252,7 @@ class OperationTools:
                     and config.get('inspection_protocol') == 'subjects.v3' else None),
             work_method=config.get('work_method'),
             work_lifecycle=config.get('work_lifecycle'),
+            working_set_policy=('recent.v4' if config.get('working_set_policy') == 'recent.v4' else None),
             material_policy=config.get('inspection_material_policy'),
             native_history_policy=config.get('native_history_policy'),
             material_observations=material_observations,
@@ -487,7 +488,7 @@ class OperationTools:
                     'Use deliver_result for actual final delivery with its complete claim, inventory and requested '
                     'report formats. Earlier findings remain evidence; an opinion applies only to its bound claim '
                     'and versions. New artifacts or completion claims need the applicable final checks. ')
-            if self.config.get('working_set_policy') == 'recent.v3':
+            if self.config.get('working_set_policy') in {'recent.v3', 'recent.v4'}:
                 instructions = instructions.replace(
                     'Choose a coherent investigation or implementation that resolves a concrete gap; batch related '
                     'reads and run a complete useful calculation rather than repeatedly inventorying or rerunning '
