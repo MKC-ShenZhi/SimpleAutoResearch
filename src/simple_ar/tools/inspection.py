@@ -32,7 +32,7 @@ class _InspectionDispatchRaised(BaseException):
 
 _SHARED_EXECUTION_PROTOCOLS = frozenset({'shared.v1', 'shared.v2'})
 _PRIORITY_SOURCE_POLICIES = frozenset({'priority.v1', 'priority.v2'})
-_PRESENTED_EVIDENCE_POLICIES = frozenset({'presented.v2', 'presented.v3'})
+_PRESENTED_EVIDENCE_POLICIES = frozenset({'presented.v2', 'presented.v3', 'presented.v4'})
 
 SHARED_INSPECTION_OPERATIONS = frozenset({'read_file', 'list_directory', 'search_files', 'compile_python',
     'write_file', 'edit_file', 'copy_file', 'copy_project', 'run_process', 'inspect_images'})
@@ -479,7 +479,8 @@ class InspectionToolGateway:
     def _claim_response_model(saved: dict) -> type[_ClaimDeliveryResponse]:
         return {'presented.v1': _PresentedClaimDeliveryResponse,
                 'presented.v2': _PresentedClaimDeliveryResponseV2,
-                'presented.v3': _PresentedClaimDeliveryResponseV3}.get(
+                'presented.v3': _PresentedClaimDeliveryResponseV3,
+                'presented.v4': _PresentedClaimDeliveryResponseV3}.get(
                     saved.get('inspection_evidence_policy'), _ClaimDeliveryResponse)
 
     @staticmethod
@@ -2439,7 +2440,7 @@ class InspectionToolGateway:
                 if any(row.outcome != 'supported' or not row.evidence
                        or not all(supplied(row, subject) for subject in row.evidence) for row in checks):
                     continue
-                supporting = (checks if saved.get('inspection_evidence_policy') != 'presented.v3' else
+                supporting = (checks if saved.get('inspection_evidence_policy') != 'presented.v4' else
                     [row for row in decision.investigations if row.outcome == 'supported' and row.evidence
                      and all(supplied(row, subject) for subject in row.evidence)])
                 row_scopes = [bindings['evidence:' + subject] for row in supporting for subject in row.evidence]
@@ -4249,7 +4250,7 @@ class InspectionToolGateway:
                         owner_bindings.append({'decision_index': missing[0], 'subject': subject})
                 final = response_model.model_validate(value).model_dump(mode='json')
                 if self._delivery_scope(saved):
-                    if saved.get('inspection_evidence_policy') == 'presented.v3':
+                    if saved.get('inspection_evidence_policy') in {'presented.v3', 'presented.v4'}:
                         final, resolutions = self._retain_valid_investigations(saved, final)
                         owner_bindings.extend(resolutions)
                     self._delivery_decision(saved, final)
@@ -4830,7 +4831,7 @@ class InspectionToolGateway:
                 if applicable and self.work_method in CLAIM_WORK_METHODS and self.finding_policy == 'linked.v1':
                     # New reviews bind each check to the windows actually presented.
                     # Existing inspection work orders keep their saved contract.
-                    saved['inspection_evidence_policy'] = 'presented.v3'
+                    saved['inspection_evidence_policy'] = 'presented.v4'
                 if applicable and self.material_policy == 'operations.v3' and self.execution_observations:
                     recent = self.execution_observations()
                     recent_records = {row['record'] for row in recent}

@@ -452,6 +452,16 @@ class GoalWorkTests(unittest.TestCase):
         checked = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
         self.assertEqual(len(checked['reassessed_prior']), 1)
         self.assertEqual(checked['verdict'], 'passed')
+        identity = case._last('review_result', reviewed=True)['metadata']['delivery_review']['identity']
+        owner = case.app.operations.inspection
+        saved = owner.store.read_json(owner._path(identity, 'input'))
+        receipt = owner.store.read_json(owner._path(identity, 'response'))
+        self.assertEqual(saved['inspection_evidence_policy'], 'presented.v4')
+        legacy, error = owner._delivery_assessment({**saved, 'inspection_evidence_policy': 'presented.v3'},
+                                                   receipt, identity, '', check_versions=False)
+        self.assertEqual(error, '')
+        self.assertEqual(legacy['verdict'], 'incomplete')
+        self.assertEqual(legacy['reassessed_prior'], [])
         case._submit(_action('deliver_result', **claim))
         self.assertEqual(case.app.session.manifest.status, 'completed')
 
