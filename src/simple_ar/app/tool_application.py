@@ -526,7 +526,9 @@ class ToolApplication:
             observations=self._operation_observations,
             record_artifacts=self._record_artifacts,
             coordination={'specs':coordination,'owner':self},extension_host=self._extension_host_call,
-            execution_observations=self._execution_observations, work_context=self._work_context,
+            execution_observations=self._execution_observations,
+            execution_history=lambda: self._execution_observations(all_records=True),
+            work_context=self._work_context,
             material_observations=self._material_observations,
             user_requests=self._inspection_requests,
             native_route_validator=self._validate_professional_route,
@@ -1472,7 +1474,7 @@ class ToolApplication:
         return retained_working_inputs(self.state['config'], resolve=self.workspace.resolve_material_root,
             targets=targets)
 
-    def _execution_observations(self) -> list[dict[str, Any]]:
+    def _execution_observations(self, *, all_records: bool = False) -> list[dict[str, Any]]:
         """Supply original receipts, not coordinator-authored failure summaries.
 
         Latest nonzero execution and latest execution have distinct meanings:
@@ -1482,6 +1484,7 @@ class ToolApplication:
         locator. This is a projection, not persisted diagnosis or retry state.
         """
         latest = failure = None
+        history = []
         for turn in reversed(self._evidence_turns('implementation')):
             reply = self.session.store.read_json(turn['reply'])
             calls = {call['id']: call for call in reply.get('tool_calls', [])}
@@ -1495,6 +1498,9 @@ class ToolApplication:
                     continue
                 observation = {'record': 'records/' + item['result'].removeprefix('attempts/'),
                     'arguments': json.loads(call['function']['arguments']), 'result': result}
+                if all_records:
+                    history.append(observation)
+                    continue
                 if latest is None:
                     latest = observation
                 if result['data']['returncode'] != 0:
@@ -1502,6 +1508,8 @@ class ToolApplication:
                     break
             if failure is not None:
                 break
+        if all_records:
+            return list(reversed(history))
         return ([failure] if failure is not None and failure is not latest else []) + (
             [latest] if latest is not None else [])
 

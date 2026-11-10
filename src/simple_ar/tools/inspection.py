@@ -379,6 +379,7 @@ class InspectionToolGateway:
                  prior_concerns: Callable[[list[str]], list[dict]] | None = None,
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
                  execution_observations: Callable[[], list[dict]] | None = None,
+                 execution_history: Callable[[], list[dict]] | None = None,
                  user_requests: Callable[[], list[str]] | None = None,
                  feedback_provider: Callable[[list[str]], list[dict]] | None = None,
                  protocol: str | None = None,
@@ -428,6 +429,7 @@ class InspectionToolGateway:
         self.prior_concerns = prior_concerns
         self.material_observations = material_observations
         self.execution_observations = execution_observations
+        self.execution_history = execution_history
         self.user_requests = user_requests
         self.feedback_provider = feedback_provider
         self.protocol = protocol
@@ -674,7 +676,7 @@ class InspectionToolGateway:
             raise ValueError('Inspection common owner returned an invalid execution binding')
         return binding
 
-    def _shared_tools(self, identity: str) -> list[dict]:
+    def _shared_tools(self, identity: str, *, relative_destinations: bool = False) -> list[dict]:
         from simple_ar.tools.openai_schema import compact_json_schema
         if self.operation_specs is None or self.operation_call is None:
             raise ValueError('Shared inspection requires the actual operation specs and operation gateway')
@@ -695,7 +697,11 @@ class InspectionToolGateway:
                 schema['required'] = list(dict.fromkeys([*schema.get('required', []), 'cwd']))
             if spec.name in {'write_file', 'edit_file', 'copy_file', 'copy_project'} and 'path' in properties:
                 properties['path']['description'] = (
-                    f'Destination inside workspace/inspection-work/{identity}/; original files remain unchanged.')
+                    (f'Relative destination inside workspace/inspection-work/{identity}/; '
+                     'the returned absolute path can be used for later operations. '
+                     if relative_destinations else
+                     f'Destination inside workspace/inspection-work/{identity}/; ')
+                    + 'Original files remain unchanged.')
             if spec.name == 'run_process' and 'cwd' in properties:
                 properties['cwd']['description'] = (
                     f'Working directory inside workspace/inspection-work/{identity}/. '
@@ -703,6 +709,20 @@ class InspectionToolGateway:
             result.append({'type':'function', 'function':{'name':spec.name,
                 'description':spec.description, 'parameters':compact_json_schema(schema)}})
         return result
+
+    @staticmethod
+    def _shared_write_arguments(saved: dict, name: str, arguments: dict) -> dict:
+        """Resolve a new inspection's relative destinations in its own work area."""
+        if (saved.get('inspection_destinations') != 'work-relative.v1'
+                or name not in {'write_file', 'edit_file', 'copy_file', 'copy_project'}):
+            return arguments
+        value = arguments.get('path')
+        if not isinstance(value, str):
+            return arguments  # The common operation validates the actual schema.
+        path = Path(value)
+        if path.is_absolute() or path.parts[:1] == ('workspace',):
+            return arguments
+        return {**arguments, 'path':str(Path('workspace') / 'inspection-work' / saved['identity'] / path)}
 
     def _shared_destination(self, identity: str, value: str, saved: dict) -> Path:
         base = self.workspace.workspace.resolve() / 'inspection-work' / identity
@@ -2825,6 +2845,11 @@ class InspectionToolGateway:
                         'scope': 'Previously recorded parent executions, not independent checks or proof '
                             'of current inputs. Only the receipt text actually supplied in working_view '
                             'is observed; inspect its command, result and input declarations before use.'}
+                if saved.get('parent_process_history'):
+                    view['parent_process_history'] = {
+                        'indexed_executions': len(saved['parent_process_history']),
+                        'scope': 'Selected working_view entries navigate recorded parent executions. '
+                            'Read a receipt to inspect its actual result; the index is not an independent check.'}
         source_cache: dict = {}
         for role in ('targets','evidence'):
             view[role] = [{'subject':row['subject'], 'path':row.get('path'), 'complete':row['complete'],
@@ -3043,6 +3068,11 @@ class InspectionToolGateway:
                         ensure_ascii=False)})
             base['source_history'].update(accessible_paths=accessible,
                 inaccessible_paths=base['source_history']['indexed_paths'] - accessible)
+            for entry in saved.get('parent_process_history', []):
+                observations.append({'record':self._path(saved['identity'], 'input'),
+                    'field':'parent_process_history', 'chunk_id':'parent-process:' + entry['receipt'],
+                    'kind':'operation_result', 'role':'source_navigation',
+                    'text':json.dumps(entry, ensure_ascii=False)})
         if 'user_requests' in saved:
             # The shared projector pins exact user text; the coordinator's local
             # inspection goal stays a separately labelled scope in base context.
@@ -4265,7 +4295,8 @@ class InspectionToolGateway:
         if shared and dispatch is None:
             raise ValueError('Shared inspection needs the outer dispatcher')
         read_names = {'read_file','list_directory','search_files'}
-        tools = self._shared_tools(identity) if shared else [{'type':'function','function':{'name':spec.name,
+        tools = self._shared_tools(identity, relative_destinations=
+            saved.get('inspection_destinations') == 'work-relative.v1') if shared else [{'type':'function','function':{'name':spec.name,
             'description':spec.description,'parameters':spec.parameters_schema()}}
             for spec in workspace_tool_specs() if spec.name in read_names]
         if self._history_enabled(saved):
@@ -4559,14 +4590,15 @@ class InspectionToolGateway:
                     continue
                 if shared:
                     receipt, owner_receipts = None, {}
+                    effective = self._shared_write_arguments(saved, name, arguments)
                     try:
                         if batch_error:
                             raise ValueError(batch_error)
-                        self._shared_preflight(saved, call, arguments)
+                        self._shared_preflight(saved, call, effective)
 
                         def operation(actual_id):
                             try:
-                                self._shared_preflight(saved, call, arguments)
+                                self._shared_preflight(saved, call, effective)
                                 if name == 'read_history':
                                     return self._read_history(saved, arguments, before_turn=number,
                                         read_limit=read_limit).model_dump(mode='json')
@@ -4574,7 +4606,7 @@ class InspectionToolGateway:
                                     return self._shared_read(saved, request, arguments, actual_id, remaining[0], read_limit)
                                 if name == 'run_process':
                                     self.workspace.resolve(arguments['cwd'], write=True).mkdir(parents=True, exist_ok=True)
-                                result = self.operation_call(name, arguments, actual_id)
+                                result = self.operation_call(name, effective, actual_id)
                                 if not isinstance(result, ToolResult):
                                     raise ValueError('Inspection operation gateway returned a malformed result')
                                 return result.model_dump(mode='json')
@@ -4728,6 +4760,8 @@ class InspectionToolGateway:
                 saved['execution_protocol'] = self.execution_protocol
                 saved['source_priming_policy'] = 'priority.v2'
                 saved['source_provenance'] = 'versions.v2'
+                if self.material_policy == 'operations.v3':
+                    saved['inspection_destinations'] = 'work-relative.v1'
             if self.protocol:
                 saved['protocol'] = self.protocol
             if self.adaptive:
@@ -4747,8 +4781,12 @@ class InspectionToolGateway:
                     # Existing inspection work orders keep their saved contract.
                     saved['inspection_evidence_policy'] = 'presented.v2'
                 if applicable and self.material_policy == 'operations.v3' and self.execution_observations:
-                    receipts = {}
-                    for row in self.execution_observations():
+                    recent = self.execution_observations()
+                    recent_records = {row['record'] for row in recent}
+                    history = self.execution_history() if self.execution_history else recent
+                    claim = str(delivery_context.get('claim', {}).get('summary', ''))
+                    receipts, referenced, navigation = {}, {}, []
+                    for row in history:
                         data = (row.get('result') or {}).get('data') or {}
                         locator, digest = data.get('receipt'), data.get('receipt_sha256')
                         if not isinstance(locator, str) or not isinstance(digest, str):
@@ -4757,7 +4795,19 @@ class InspectionToolGateway:
                             path = str(self.workspace.resolve(str(self.root / locator)))
                         except (OSError, ValueError):
                             continue  # A missing diagnostic supplies no evidence.
-                        receipts[path] = digest
+                        arguments = row.get('arguments') or {}
+                        argv = arguments.get('argv') or []
+                        navigation.append({'receipt':path, 'argv':argv, 'cwd':arguments.get('cwd'),
+                            'returncode':data.get('returncode')})
+                        if row['record'] in recent_records:
+                            receipts[path] = digest
+                        if argv and all(isinstance(part, str) for part in argv):
+                            command = ' '.join(argv)
+                            if command in claim:
+                                referenced[command] = (path, digest)
+                    receipts.update(referenced.values())
+                    if navigation:
+                        saved['parent_process_history'] = navigation
                     if receipts:
                         saved['parent_process_receipts'] = receipts
             remaining = [512000]

@@ -1,5 +1,6 @@
 """Candidate investigation cannot acquire final-delivery authority."""
 from copy import deepcopy
+import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -135,6 +136,8 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         process = case._ok('run_process')
         receipt = case.root / process['data']['receipt']
         original = receipt.read_bytes()
+        case._submit(_action('run_process', argv=['python', '-c', 'print("unrelated")'],
+            cwd='workspace', timeout_sec=10), approve=lambda call, token: True)
         script = case.root / 'workspace/analysis.py'
         case._submit(_action('write_file', path='analysis.py',
             content='print("changed version")\n', expected_sha256=_digest(script)))
@@ -148,6 +151,7 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
             self.assertEqual(offered, {'record_inspection'})
             self.assertEqual(view['executed_checks'], [])
             self.assertIn('not independent checks', view['parent_process_receipts']['scope'])
+            self.assertEqual(view['parent_process_history']['indexed_executions'], 2)
             observed = next(row for row in view['evidence'] if row.get('path') == str(receipt))
             text = ''.join(window['text'] for window in observed['text_windows'])
             self.assertIn('first version ran', text)
@@ -156,7 +160,7 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
                 'limitations': ['The recorded execution predates the changed script and did not declare inputs.']}
 
         case.review = review
-        case._submit(_action('deliver_result', summary='Analysis script awaiting verification',
+        case._submit(_action('deliver_result', summary='Analysis script awaiting verification; python analysis.py was run',
             artifacts=['analysis.py']))
         result = case._ok('deliver_result', reviewed=True)
         self.assertEqual(_assessments(result)[0]['verdict'], 'incomplete')
@@ -167,6 +171,54 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         before = case.app.ledger.to_dict()
         case._reload()
         self.assertEqual(case.app.ledger.to_dict(), before)
+
+    def test_inspector_can_copy_and_run_a_workspace_project_in_its_own_area(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
+
+        case = OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.app = ToolApplication.create(case.root, 'Review the editable analysis project.',
+            model='fixture', sources={'measurements':case.inputs}, services=case.services,
+            allow_execution=True, max_turns=12, max_tokens=900000, max_attempts=120)
+        case._write('analysis.py', 'print("independent check")\n')
+        case._write('note.md', 'This project contains an executable analysis.\n')
+        original = (case.root/'workspace/analysis.py').read_bytes()
+        observed = {}
+
+        def review(view):
+            messages = case.inspection_requests[-1]['messages']
+            results = [json.loads(row['content']) for row in messages if row['role'] == 'tool']
+            copies = [row for row in results if row.get('tool_name') == 'copy_project']
+            runs = [row for row in results if row.get('tool_name') == 'run_process']
+            if not copies:
+                return [_action('copy_project', source='workspace', path='../outside')]
+            if len(copies) == 1:
+                self.assertEqual(copies[0]['status'], 'blocked')
+                return [_action('copy_project', source='workspace', path='proj')]
+            copy = copies[-1]
+            self.assertEqual(copy['status'], 'ok', copy)
+            target = Path(copy['data']['absolute_path'])
+            self.assertEqual((target/'analysis.py').read_bytes(), original)
+            self.assertNotIn('inspection-work', copy['data']['files'])
+            observed['target'] = target
+            if not runs:
+                return [_action('run_process', argv=['python', 'analysis.py'], cwd=str(target),
+                    inputs=['analysis.py'], timeout_sec=10)]
+            self.assertEqual(runs[-1]['status'], 'ok', runs[-1])
+            self.assertEqual(runs[-1]['data']['returncode'], 0)
+            return {'conclusion':'incomplete', 'findings':[], 'evidence':[],
+                'limitations':['The independent execution is recorded without claiming full review.']}
+
+        case.review = review
+        case._submit(_action('deliver_result', summary='Analysis project', artifacts=['note.md', 'analysis.py']),
+            approve=lambda call, token: True)
+        self.assertIn('target', observed)
+        self.assertTrue(observed['target'].is_relative_to(case.root/'workspace/inspection-work'))
+        self.assertEqual((case.root/'workspace/analysis.py').read_bytes(), original)
+        self.assertFalse((case.root/'workspace/inspection-work/outside').exists())
+        case._not_delivered()
 
     def test_fresh_candidate_revision_final_opinion_reuse_and_feedback_reload(self):
         from simple_ar.app.tool_application import ToolApplication
