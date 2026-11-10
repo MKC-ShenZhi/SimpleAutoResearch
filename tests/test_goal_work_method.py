@@ -456,13 +456,65 @@ class GoalWorkTests(unittest.TestCase):
         owner = case.app.operations.inspection
         saved = owner.store.read_json(owner._path(identity, 'input'))
         receipt = owner.store.read_json(owner._path(identity, 'response'))
-        self.assertEqual(saved['inspection_evidence_policy'], 'presented.v4')
+        self.assertEqual(saved['inspection_evidence_policy'], 'presented.v5')
         legacy, error = owner._delivery_assessment({**saved, 'inspection_evidence_policy': 'presented.v3'},
                                                    receipt, identity, '', check_versions=False)
         self.assertEqual(error, '')
         self.assertEqual(legacy['verdict'], 'incomplete')
         self.assertEqual(legacy['reassessed_prior'], [])
         case._submit(_action('deliver_result', **claim))
+        self.assertEqual(case.app.session.manifest.status, 'completed')
+
+    def test_complete_review_can_resolve_missing_report_using_the_current_deliverable(self):
+        case = self.case
+        case._write('metrics.md', 'Recorded measurements.\n')
+        case._write('metrics.json', '{"value": 2}\n')
+        initial = {'summary': 'Measured results.', 'artifacts': ['metrics.md', 'metrics.json']}
+        final = {'summary': 'Measured results and explanation.',
+                 'artifacts': ['metrics.md', 'metrics.json', 'report.md']}
+        phase = {'value': 0}
+
+        def review(view):
+            paths = (['metrics.md', 'metrics.json'] if phase['value'] == 0 else
+                     ['measurements/conditions.txt'] if phase['value'] == 1 else ['report.md', 'metrics.md'])
+            sources = case._inspection_sources(view, *paths)
+            if any(row is None for row in sources):
+                return [_action('read_file', path=path) for path, row in zip(paths, sources) if row is None]
+            check = {'claim': 'The requested explanation exists.', 'scope': 'The current delivery.',
+                'necessary': True, 'method': 'Read the requested result.', 'reasoning': 'The selected sources were read.',
+                'basis': 'observed', 'evidence': [row['subject'] for row in sources],
+                'outcome': 'contradicted' if phase['value'] == 0 else 'supported',
+                'findings': ([{'severity': 'required', 'message': 'Add an editable report.',
+                    'artifacts': [str(case.root/'workspace/metrics.md'), str(case.root/'workspace/metrics.json')]}]
+                    if phase['value'] == 0 else []),
+                'reassessed_prior': ([row['id'] for row in view['prior_required']] if phase['value'] else [])}
+            return {'conclusion': 'complete', 'applicability': 'Check the requested delivery.',
+                    'investigations': [check], 'limitations': [], 'reassessed_prior': []}
+
+        case.review = review
+        case._submit(_action('review_result', **initial))
+        first = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+        self.assertEqual(first['verdict'], 'needs_revision')
+        case._write('report.md', 'The measured result is 2; conditions are limited.\n')
+        phase['value'] = 1
+        case._submit(_action('review_result', **final))
+        unrelated = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+        self.assertEqual(unrelated['verdict'], 'incomplete')
+        self.assertEqual(unrelated['reassessed_prior'], [])
+        phase['value'] = 2
+        case._submit(_action('review_result', **final))
+        checked = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+        self.assertEqual(checked['verdict'], 'passed')
+        self.assertEqual(len(checked['reassessed_prior']), 1)
+        identity = case._last('review_result', reviewed=True)['metadata']['delivery_review']['identity']
+        owner = case.app.operations.inspection
+        saved = owner.store.read_json(owner._path(identity, 'input'))
+        receipt = owner.store.read_json(owner._path(identity, 'response'))
+        legacy, error = owner._delivery_assessment({**saved, 'inspection_evidence_policy': 'presented.v4'},
+                                                   receipt, identity, '', check_versions=False)
+        self.assertEqual(error, '')
+        self.assertEqual(legacy['verdict'], 'incomplete')
+        case._submit(_action('deliver_result', **final))
         self.assertEqual(case.app.session.manifest.status, 'completed')
 
     def test_independent_review_can_find_the_original_edit_and_its_result(self):

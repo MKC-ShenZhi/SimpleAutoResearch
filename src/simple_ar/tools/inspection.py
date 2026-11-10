@@ -32,7 +32,7 @@ class _InspectionDispatchRaised(BaseException):
 
 _SHARED_EXECUTION_PROTOCOLS = frozenset({'shared.v1', 'shared.v2'})
 _PRIORITY_SOURCE_POLICIES = frozenset({'priority.v1', 'priority.v2'})
-_PRESENTED_EVIDENCE_POLICIES = frozenset({'presented.v2', 'presented.v3', 'presented.v4'})
+_PRESENTED_EVIDENCE_POLICIES = frozenset({'presented.v2', 'presented.v3', 'presented.v4', 'presented.v5'})
 
 SHARED_INSPECTION_OPERATIONS = frozenset({'read_file', 'list_directory', 'search_files', 'compile_python',
     'write_file', 'edit_file', 'copy_file', 'copy_project', 'run_process', 'inspect_images'})
@@ -482,7 +482,8 @@ class InspectionToolGateway:
         return {'presented.v1': _PresentedClaimDeliveryResponse,
                 'presented.v2': _PresentedClaimDeliveryResponseV2,
                 'presented.v3': _PresentedClaimDeliveryResponseV3,
-                'presented.v4': _PresentedClaimDeliveryResponseV3}.get(
+                'presented.v4': _PresentedClaimDeliveryResponseV3,
+                'presented.v5': _PresentedClaimDeliveryResponseV3}.get(
                     saved.get('inspection_evidence_policy'), _ClaimDeliveryResponse)
 
     @staticmethod
@@ -2415,6 +2416,21 @@ class InspectionToolGateway:
         supplied_for_package = (all(supplied(row, key) for row in decision.investigations for key in row.evidence)
             if scoped and saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES
             else all(covered for covered, _ in scopes))
+        complete_opinion = (scoped and saved.get('inspection_evidence_policy') == 'presented.v5'
+            and decision.conclusion == 'complete' and supplied_for_package
+            and all(not row.necessary or row.outcome == 'supported' for row in decision.investigations))
+
+        def supports_reassessment(prior: dict, sources: list[dict[str, str]]) -> bool:
+            if complete_opinion:
+                # The independent reviewer owns the meaning of a complete
+                # finding, including missing deliverables added since the
+                # original finding. At least one current deliverable must
+                # actually have been supplied; the old subjects were the
+                # observation scope, not necessarily the missing outcome.
+                return not delivery['artifacts'] or any(scope.get(path) == digest
+                    for scope in sources for path, digest in delivery['artifacts'].items())
+            return reassessment_has_subject_support(prior, delivery['artifacts'], sources)
+
         # A partially completed package can still contain individually rechecked
         # concerns. Keep those only when the selected evidence was actually
         # supplied; this is an independent opinion, not a scientific certificate.
@@ -2424,7 +2440,7 @@ class InspectionToolGateway:
         if decision and linked and self._applicable_scope(saved):
             prior = {row['id']:row for row in saved['prior_required']}
             reassessed = [key for key in reassessed
-                if reassessment_has_subject_support(prior[key], delivery['artifacts'], evidence_scopes)]
+                if supports_reassessment(prior[key], evidence_scopes)]
         unsupported_findings = []
         if scoped:
             findings = []
@@ -2442,13 +2458,13 @@ class InspectionToolGateway:
                 if any(row.outcome != 'supported' or not row.evidence
                        or not all(supplied(row, subject) for subject in row.evidence) for row in checks):
                     continue
-                supporting = (checks if saved.get('inspection_evidence_policy') != 'presented.v4' else
+                supporting = (checks if saved.get('inspection_evidence_policy') not in {'presented.v4', 'presented.v5'} else
                     [row for row in decision.investigations if row.outcome == 'supported' and row.evidence
                      and all(supplied(row, subject) for subject in row.evidence)])
                 row_scopes = [bindings['evidence:' + subject] for row in supporting for subject in row.evidence]
                 row_scopes.extend(bindings['execution:' + record] for row in supporting
                     for record in row.execution_records if 'execution:' + record in bindings)
-                if reassessment_has_subject_support(prior[key], delivery['artifacts'], row_scopes):
+                if supports_reassessment(prior[key], row_scopes):
                     reassessed.append(key)
         pending = ({row['id'] for row in saved['prior_required']} - set(reassessed)
             if decision and linked else set())
@@ -4259,7 +4275,7 @@ class InspectionToolGateway:
                         owner_bindings.append({'decision_index': missing[0], 'subject': subject})
                 final = response_model.model_validate(value).model_dump(mode='json')
                 if self._delivery_scope(saved):
-                    if saved.get('inspection_evidence_policy') in {'presented.v3', 'presented.v4'}:
+                    if saved.get('inspection_evidence_policy') in {'presented.v3', 'presented.v4', 'presented.v5'}:
                         final, resolutions = self._retain_valid_investigations(saved, final)
                         owner_bindings.extend(resolutions)
                     self._delivery_decision(saved, final)
@@ -4840,7 +4856,7 @@ class InspectionToolGateway:
                 if applicable and self.work_method in CLAIM_WORK_METHODS and self.finding_policy == 'linked.v1':
                     # New reviews bind each check to the windows actually presented.
                     # Existing inspection work orders keep their saved contract.
-                    saved['inspection_evidence_policy'] = 'presented.v4'
+                    saved['inspection_evidence_policy'] = 'presented.v5'
                     if self.artifact_changes:
                         saved['parent_artifact_changes'] = self.artifact_changes(list(delivery_context['artifacts']))
                 if applicable and self.material_policy == 'operations.v3' and self.execution_observations:
