@@ -439,7 +439,9 @@ class GoalWorkTests(unittest.TestCase):
         case._submit(_action('review_result', **claim))
         first = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
         self.assertEqual(first['verdict'], 'needs_revision')
-        case._write('a.md', 'First revised result.\n')
+        case._submit(_action('write_file', path='a.md', content='First revised result.\n',
+            expected_sha256=hashlib.sha256((case.root/'workspace/a.md').read_bytes()).hexdigest()))
+        case._ok('write_file')
         phase['revision'] = True
         case._submit(_action('review_result', **claim))
         incomplete = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
