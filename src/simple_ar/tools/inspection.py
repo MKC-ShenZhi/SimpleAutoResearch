@@ -11,6 +11,7 @@ import re
 from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic.json_schema import SkipJsonSchema
 
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.budget import completed_llm_usage_is_accounted
@@ -31,6 +32,7 @@ class _InspectionDispatchRaised(BaseException):
 
 _SHARED_EXECUTION_PROTOCOLS = frozenset({'shared.v1', 'shared.v2'})
 _PRIORITY_SOURCE_POLICIES = frozenset({'priority.v1', 'priority.v2'})
+_PRESENTED_EVIDENCE_POLICIES = frozenset({'presented.v2', 'presented.v3'})
 
 SHARED_INSPECTION_OPERATIONS = frozenset({'read_file', 'list_directory', 'search_files', 'compile_python',
     'write_file', 'edit_file', 'copy_file', 'copy_project', 'run_process', 'inspect_images'})
@@ -187,6 +189,16 @@ class _PresentedClaimInvestigationV2(_PresentedClaimInvestigation):
 
 class _PresentedClaimDeliveryResponseV2(_PresentedClaimDeliveryResponse):
     investigations: list[_PresentedClaimInvestigationV2]
+
+
+class _PresentedClaimInvestigationV3(_PresentedClaimInvestigationV2):
+    # The inspection owner already records the actual supplied ranges. Older
+    # responses can still be decoded, but a new reviewer need not transcribe them.
+    evidence_windows: SkipJsonSchema[list[_EvidenceWindow]] = Field(default_factory=list)
+
+
+class _PresentedClaimDeliveryResponseV3(_PresentedClaimDeliveryResponseV2):
+    investigations: list[_PresentedClaimInvestigationV3]
 
 
 class _Finding(BaseModel):
@@ -466,7 +478,8 @@ class InspectionToolGateway:
     @staticmethod
     def _claim_response_model(saved: dict) -> type[_ClaimDeliveryResponse]:
         return {'presented.v1': _PresentedClaimDeliveryResponse,
-                'presented.v2': _PresentedClaimDeliveryResponseV2}.get(
+                'presented.v2': _PresentedClaimDeliveryResponseV2,
+                'presented.v3': _PresentedClaimDeliveryResponseV3}.get(
                     saved.get('inspection_evidence_policy'), _ClaimDeliveryResponse)
 
     @staticmethod
@@ -1108,7 +1121,7 @@ class InspectionToolGateway:
                     for record in investigation.get('execution_records', []):
                         if record not in facts:
                             raise ValueError('Selected independent execution is no longer applicable')
-                        if (execution_scopes and saved.get('inspection_evidence_policy') in {'presented.v1', 'presented.v2'}
+                        if (execution_scopes and saved.get('inspection_evidence_policy') in {'presented.v1', *_PRESENTED_EVIDENCE_POLICIES}
                                 and self._applicable_scope(saved) and reassessed):
                             bindings['execution:' + record] = facts[record]['dependencies']
                         for path, digest in facts[record]['dependencies'].items():
@@ -2178,6 +2191,37 @@ class InspectionToolGateway:
             raise ValueError('Package findings must name affected bound artifacts and a concrete defect')
         return decision
 
+    def _retain_valid_investigations(self, saved: dict, value: dict) -> tuple[dict, list[dict]]:
+        """Keep independently supported checks when another check cannot be bound."""
+        try:
+            self._delivery_decision(saved, value)
+            return value, []
+        except ValueError as original:
+            original_error = original
+        result = deepcopy(value)
+        resolutions = []
+        for index, row in enumerate(result['investigations']):
+            single = {**result, 'conclusion': 'incomplete', 'investigations': [row],
+                      'reassessed_prior': []}
+            try:
+                self._delivery_decision(saved, single)
+            except ValueError as exc:
+                resolutions.append({'investigation_index': index, 'resolution': 'unresolved',
+                                    'reason': str(exc)})
+                if row['necessary']:
+                    result['conclusion'] = 'incomplete'
+                result['limitations'].append(
+                    f"Investigation '{row['claim']}' could not be bound to its submitted evidence: {exc}")
+                row.update(outcome='unresolved', basis='not_checked', evidence=[], evidence_windows=[],
+                    execution_records=[], reassessed_prior=[], findings=[],
+                    scope='Not established by the accepted records.',
+                    method='The independent response could not be validated for this investigation.',
+                    reasoning='The original opinion remains in the inspection record.')
+        if not resolutions:
+            raise original_error
+        self._delivery_decision(saved, result)
+        return result, resolutions
+
     def _executed_check_records(self, saved: dict) -> set[str]:
         """Reuse the common action owner's accepted receipts, never a model claim."""
         if saved.get('inspection_material_policy') == 'operations.v3':
@@ -2356,7 +2400,7 @@ class InspectionToolGateway:
             if windows:
                 return all(self._range_supplied(recorded, window.start, window.end)
                            and self._range_supplied(actual, window.start, window.end) for window in windows)
-            if saved.get('inspection_evidence_policy') == 'presented.v2':
+            if saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES:
                 # An unqualified selection means the text actually offered,
                 # not every historical window for this source. Judgment of
                 # whether those bytes answer the claim belongs to the reviewer.
@@ -2365,7 +2409,7 @@ class InspectionToolGateway:
             return full[key]
 
         supplied_for_package = (all(supplied(row, key) for row in decision.investigations for key in row.evidence)
-            if scoped and saved.get('inspection_evidence_policy') == 'presented.v2'
+            if scoped and saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES
             else all(covered for covered, _ in scopes))
         # A partially completed package can still contain individually rechecked
         # concerns. Keep those only when the selected evidence was actually
@@ -3633,14 +3677,14 @@ class InspectionToolGateway:
         last_floor = {}
         previously_supplied = (self._offered_text_ranges(saved)
             if response_model is not None and self._delivery_scope(saved)
-            and saved.get('inspection_evidence_policy') == 'presented.v2' else {})
+            and saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES else {})
 
         def project(closing):
             offered = [terminal] if closing else [*tools, terminal]
             projected, metadata = self._working_messages(saved, request, messages, offered, client,
                 finish=finish if closing else None)
             if (response_model is not None and self._delivery_scope(saved)
-                    and saved.get('inspection_evidence_policy') == 'presented.v2'):
+                    and saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES):
                 # A retained source descriptor is navigation, not a body the
                 # reviewer can cite. Advertise windows actually presented in
                 # this investigation; the final owner still checks saved supply.
@@ -4167,7 +4211,7 @@ class InspectionToolGateway:
                 # a schema error still prevents the batch from being executed.
                 parsed.append((name, arguments))
                 if shared and (name != 'record_inspection'
-                        or saved.get('inspection_evidence_policy') == 'presented.v2'):
+                        or saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES):
                     from jsonschema import Draft202012Validator
                     errors = list(Draft202012Validator(schemas[name]).iter_errors(arguments))
                     if errors:
@@ -4201,6 +4245,9 @@ class InspectionToolGateway:
                         owner_bindings.append({'decision_index': missing[0], 'subject': subject})
                 final = response_model.model_validate(value).model_dump(mode='json')
                 if self._delivery_scope(saved):
+                    if saved.get('inspection_evidence_policy') == 'presented.v3':
+                        final, resolutions = self._retain_valid_investigations(saved, final)
+                        owner_bindings.extend(resolutions)
                     self._delivery_decision(saved, final)
                 elif self.protocol:
                     self._subject_decisions(saved, final)
@@ -4281,7 +4328,7 @@ class InspectionToolGateway:
                 choices(properties['reassessed_prior'], [row['id'] for row in saved['prior_required']])
         if response_model is _DeliveryResponseLinked or nested:
             choices(schema['properties']['reassessed_prior'], [row['id'] for row in saved['prior_required']])
-            if nested and saved.get('inspection_evidence_policy') in {'presented.v1', 'presented.v2'}:
+            if nested and saved.get('inspection_evidence_policy') in {'presented.v1', *_PRESENTED_EVIDENCE_POLICIES}:
                 schema['properties']['reassessed_prior']['description'] = (
                     'Legacy package-level reassessments. Prefer placing each concern ID in the '
                     'investigation that actually rechecked it, and leave this list empty.')
@@ -4779,7 +4826,7 @@ class InspectionToolGateway:
                 if applicable and self.work_method in CLAIM_WORK_METHODS and self.finding_policy == 'linked.v1':
                     # New reviews bind each check to the windows actually presented.
                     # Existing inspection work orders keep their saved contract.
-                    saved['inspection_evidence_policy'] = 'presented.v2'
+                    saved['inspection_evidence_policy'] = 'presented.v3'
                 if applicable and self.material_policy == 'operations.v3' and self.execution_observations:
                     recent = self.execution_observations()
                     recent_records = {row['record'] for row in recent}

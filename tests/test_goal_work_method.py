@@ -79,6 +79,49 @@ class NativeGoalWorkTests(unittest.TestCase):
         self.assertEqual(newer['investigations'][0]['evidence_windows'], [])
         self.assertIsNot(owner._claim_response_model(current), owner._claim_response_model(revised))
 
+    def test_review_keeps_supported_finding_when_another_check_has_no_execution_receipt(self):
+        from simple_ar.tools.inspection import InspectionToolGateway
+        from simple_ar.tools.specs import GOAL_WORK_METHOD
+
+        owner = InspectionToolGateway.__new__(InspectionToolGateway)
+        owner.protocol = 'subjects.v3'
+        owner._execution_facts = lambda *args, **kwargs: {}
+        owner._selected_inspection_rows = lambda *args: []
+        owner._check_inspection_versions = lambda *args, **kwargs: None
+        saved = {'identity': 'review', 'work_method': GOAL_WORK_METHOD,
+            'finding_policy': 'linked.v1', 'inspection_material_policy': 'operations.v3',
+            'inspection_evidence_policy': 'presented.v3', 'coverage_policy': 'offered.v2',
+            'delivery_context': {'schema_version': 'delivery_review.v3', 'artifacts': {'report.md': 'version'}},
+            'prior_required': [], 'evidence': [], 'targets': [
+                {'subject': 'evidence-1', 'readable': True, 'sha256': 'version', 'windows': [{}]}]}
+        model = owner._claim_response_model(saved)
+        schema = owner._delivery_schema(saved, model)
+        investigations = schema['$defs']['_PresentedClaimInvestigationV3']['properties']
+        self.assertNotIn('evidence_windows', investigations)
+        response = {'conclusion': 'incomplete', 'applicability': 'Check the report and its calculations.',
+            'investigations': [
+                {'claim': 'The split matches the code.', 'method': 'Compare the report with the code.',
+                 'reasoning': 'The reported rows disagree.', 'scope': 'The split table.', 'basis': 'derived',
+                 'evidence': ['evidence-1'], 'outcome': 'contradicted',
+                 'findings': [{'severity': 'required', 'message': 'Correct the split.', 'artifacts': ['report.md']}]},
+                {'claim': 'The metrics were independently executed.', 'method': 'Run the check.',
+                 'reasoning': 'The script was run.', 'scope': 'The metrics.', 'basis': 'executed',
+                 'execution_records': [], 'evidence': ['evidence-1'], 'outcome': 'supported', 'findings': []}],
+            'limitations': [], 'reassessed_prior': []}
+        original = deepcopy(response)
+        call = {'id': 'final', 'type': 'function', 'function': {
+            'name': 'record_inspection', 'arguments': json.dumps(response)}}
+        offered = [{'type': 'function', 'function': {'name': 'record_inspection', 'parameters': schema}}]
+        _, error, final, bindings = owner._admit_response(saved, [call], offered, model, set(), shared=True)
+        self.assertEqual(error, '')
+        self.assertEqual(response, original)
+        self.assertEqual(final['investigations'][0]['findings'][0]['message'], 'Correct the split.')
+        self.assertEqual(final['investigations'][1]['outcome'], 'unresolved')
+        self.assertEqual(final['investigations'][1]['evidence'], [])
+        self.assertEqual(final['conclusion'], 'incomplete')
+        self.assertEqual(bindings[0]['investigation_index'], 1)
+        self.assertIn('successful action records', bindings[0]['reason'])
+
     def test_closed_history_continues_without_replaying_or_forging_provider_reasoning(self):
         from simple_ar.app.professional_conversation import continuation_blocks, NATIVE_HISTORY_POLICY
         reply = {'role': 'assistant', 'content': None, 'tool_calls': [{
@@ -361,7 +404,13 @@ class GoalWorkTests(unittest.TestCase):
                            2 * (estimate_tokens(serialized) + estimate_tokens(schemas)))
 
     def test_review_reassesses_each_concern_using_its_supplied_evidence_windows(self):
-        from simple_ar.tools.inspection import InspectionToolGateway
+        from simple_ar.tools.inspection import InspectionToolGateway, _PresentedClaimDeliveryResponseV2
+
+        # Historical reviews may still provide explicit windows.
+        contract = patch.object(InspectionToolGateway, '_claim_response_model',
+                                return_value=_PresentedClaimDeliveryResponseV2)
+        contract.start()
+        self.addCleanup(contract.stop)
 
         case = self.case
         case._write('note.md', 'The measured value is wrong.\n')
