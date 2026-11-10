@@ -248,7 +248,7 @@ class DataDeliveryTests(unittest.TestCase):
         from simple_ar.report.data_delivery import supplied_data_delivery
         additions = supplied_data_delivery(context, config=config, plan=memory.document_plan, section_ids=[section.section_id])
         draft = ReportSectionDraft(section_id=section.section_id, heading=section.heading, draft_markdown="Two observed values.")
-        client = Mock()
+        client = Mock(spec=['ask_json'])
         client.ask_json.return_value = {"section_reviews": []}
         review_document(client=client, template=load_report_template_bundle(report_mode=context.report_mode, config=config), memory=memory,
             sections=[draft], config=config, execution_summary={}, metric_summary={}, assembly_owned_content=additions)
@@ -315,7 +315,7 @@ class DataDeliveryTests(unittest.TestCase):
 
     def test_addition_text_is_not_silently_truncated_for_full_review(self):
         context, memory, section, config = self.objects()
-        client = Mock()
+        client = Mock(spec=['ask_json'])
         with self.assertRaisesRegex(ValueError, "bounded source window"):
             review_document(client=client, template=load_report_template_bundle(report_mode=context.report_mode, config=config), memory=memory,
                 sections=[ReportSectionDraft(section_id=section.section_id, heading=section.heading, draft_markdown="Short.")],
@@ -451,7 +451,7 @@ class DataDeliveryTests(unittest.TestCase):
     def test_full_review_uses_canonical_count_or_unknown_not_competing_partial_sum(self):
         context, memory, section, config = self.objects()
         draft = ReportSectionDraft(section_id=section.section_id, heading=section.heading, draft_markdown="Two supplied values.")
-        client = Mock()
+        client = Mock(spec=['ask_json'])
         client.ask_json.return_value = {"section_reviews": []}
         for observation in ({"preview_status": "pre_render_text_preview", "markdown_token_count": 125, "counting_rule": "Canonical text."},
                             {"preview_status": "unavailable", "markdown_token_count": None, "counting_rule": "Unknown text."}):
@@ -505,7 +505,7 @@ class DataDeliveryTests(unittest.TestCase):
         draft = ReportSectionDraft(section_id=section.section_id, heading=section.heading,
             draft_markdown="Known source [@P1].")
         observed = delivery_text_observation(context, memory, [draft], config)
-        client = Mock()
+        client = Mock(spec=['ask_json'])
         client.ask_json.return_value = {"section_reviews": []}
         review_document(client=client, template=load_report_template_bundle(report_mode=context.report_mode, config=config),
             memory=memory, sections=[draft], config=config, execution_summary={}, metric_summary={},

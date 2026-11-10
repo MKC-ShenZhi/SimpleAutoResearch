@@ -1571,6 +1571,10 @@ code = "daily"
                 'settings': {'model': 'fixture', 'api_mode': 'chat'}}
             fake.effective_output_limit.return_value = None
             fake.with_output_limit.return_value = fake
+            fake.estimate_native_input_tokens.return_value = 1200
+            def bind_fake(*_args, budget_ledger=None, **_kwargs):
+                fake._budget_ledger = budget_ledger
+                return fake
             fake.chat_turn.return_value = {'role': 'assistant', 'content': '', 'tool_calls': [{
                 'id': 'clarify', 'type': 'function', 'function': {'name': 'ask_user',
                 'arguments': json.dumps({'question': 'Confirm the declared preparation before execution.'})}}]}
@@ -1586,7 +1590,7 @@ code = "daily"
                 with self.subTest(policy=policy, conditions=expected), \
                         patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
                         patch('simple_ar.app.tool_application.ToolApplication.create', wraps=ToolApplication.create) as create, \
-                        patch('simple_ar.app.tool_application.LLMClient.from_env', return_value=fake), \
+                        patch('simple_ar.app.tool_application.LLMClient.from_env', side_effect=bind_fake), \
                         patch('subprocess.run') as process, \
                         patch('sys.stdin.isatty', return_value=False), \
                         patch('simple_ar.app.research_application.create_session') as old, \
