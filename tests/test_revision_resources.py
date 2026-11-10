@@ -5,7 +5,7 @@ import json
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
 from simple_ar.core.budget import BudgetExceededError, BudgetLedger
@@ -116,14 +116,19 @@ class RevisionInspectionFlowTests(unittest.TestCase):
         self.addCleanup(case.doCleanups)
         case.app = ToolApplication.create(case.root, 'Explain the supplied observations in an editable note.',
             model='fixture', sources={'measurements': case.inputs}, services=case.services,
-            max_turns=3, max_tokens=900000, tool_contracts='full')
+            max_turns=4, max_tokens=725585, tool_contracts='full')
         case._write('note.md', 'The supplied observations are 1, 2 and 3.\n')
         claim = {'summary': 'The supplied observations are 1, 2 and 3.', 'artifacts': ['note.md']}
         case.decisions.append(_action('review_result', **claim))
-        case._run(should_stop=lambda: bool(case._observations('review_result', reviewed=True)))
+        # In a long session the offered decision was measured at 193423
+        # tokens. Four speculative full contexts exceed the allowance, but
+        # the current decision, investigation and actionable follow-up fit.
+        with patch.object(ProfessionalConversation, 'request_resources',
+                return_value={'llm_requests': 1, 'total_tokens': 193423}):
+            case._run(should_stop=lambda: bool(case._observations('review_result', reviewed=True)))
         review = case._ok('review_result', reviewed=True)
         self.assertTrue(case.inspection_requests)
-        self.assertGreaterEqual(case.app.ledger.remaining('llm_requests'), 1)
+        self.assertGreaterEqual(case.app.ledger.remaining('llm_requests'), 2)
         self.assertNotEqual(case.app.session.manifest.status, 'completed')
         self.assertIn('delivery_review', review['metadata'])
         # Any further work depends on the actual opinion. In particular, the

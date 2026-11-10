@@ -229,14 +229,15 @@ class Delivery:
                 'Final acceptance rechecks the actual inventory, publication and applicable opinion.'}
 
     def review_continuation(self, decision: dict) -> dict[str, dict]:
-        """Leave one decision to act on an opinion or report the outcome.
+        """Leave a decision to act on an opinion and a request for its exit.
 
         A revision or another check may be necessary, but their cost and even
         their need are not known before the opinion. The follow-up can deliver
-        an accepted candidate or choose the next action for a finding; do not
-        reserve a second full decision before there is a result to act on.
+        an accepted candidate or choose the next action for a finding. Keep a
+        request slot to report a revision, but assess its token cost when that
+        request is prepared instead of forecasting a second full context now.
         """
-        return {'followup': dict(decision)}
+        return {'followup': dict(decision), 'exit': {'llm_requests': 1}}
 
     def _actual_issues(self, observations: list[dict], request: DeliveryRequest,
                          resolved: dict, *, proposed=None,
