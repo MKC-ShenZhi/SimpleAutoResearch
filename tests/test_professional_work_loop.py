@@ -3703,7 +3703,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             project = self.app.operations.work_projection
             self.assertIsNotNone(project)
             for _ in range(10):
-                self.assertEqual(project([]), [])
+                self.assertEqual(project([])({}), [])
             self.assertEqual(history.call_count, 1, 'Capacity probes must not reread the role journal')
         returned = self._ok('return_source_work')
         self.assertTrue(returned['data']['artifact_sha256'])

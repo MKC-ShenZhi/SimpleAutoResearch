@@ -66,11 +66,10 @@ def continuation_blocks(blocks: list[list[dict]], *, policy: str | None, thinkin
     return projected
 
 
-def recorded_work_messages(messages: list[dict]) -> list[dict]:
-    """Closed operations are observations, not an inherited action agenda."""
+def prepare_recorded_work_messages(messages: list[dict]) -> Callable[[dict], list[dict]]:
+    """Prepare the native history once for this selected set of work units."""
     if len(messages) < 2:
-        return messages
-    context = json.loads(messages[1]['content'])
+        return lambda context: messages
     calls, records, requests = {}, [], []
     for message in messages[2:]:
         if message['role'] == 'assistant':
@@ -80,23 +79,32 @@ def recorded_work_messages(messages: list[dict]) -> list[dict]:
             records.append({'action':calls[message['tool_call_id']], 'observation':message['content']})
         elif message['role'] == 'user':
             requests.append(message)
-    context.pop('work_plan', None)
-    context['recorded_work'] = {'observations':records,
-        'scope':'Verbatim closed operation arguments and observations. These are historical '
-            'work records, not next actions or new requirements. Full replies remain in read_history.'}
-    return [messages[0], {**messages[1], 'content':json.dumps(context, ensure_ascii=False)}, *requests]
+    def present(context: dict) -> list[dict]:
+        context = dict(context)
+        context.pop('work_plan', None)
+        context['recorded_work'] = {'observations':records,
+            'scope':'Verbatim closed operation arguments and observations. These are historical '
+                'work records, not next actions or new requirements. Full replies remain in read_history.'}
+        return [messages[0], {**messages[1], 'content':json.dumps(context, ensure_ascii=False)}, *requests]
+    return present
 
 
-def work_unit_messages(messages: list[dict]) -> list[dict]:
-    """Present complete native work once, without serializing JSON inside JSON.
+def recorded_work_messages(messages: list[dict]) -> list[dict]:
+    """Closed operations are observations, not an inherited action agenda."""
+    if len(messages) < 2:
+        return messages
+    return prepare_recorded_work_messages(messages)(json.loads(messages[1]['content']))
+
+
+def prepare_work_unit_messages(messages: list[dict]) -> Callable[[dict], list[dict]]:
+    """Prepare complete native work once, without serializing JSON inside JSON.
 
     The shared selector chooses whole closed units before calling this pure
     projector. Provider reasoning is neither a request nor required replay;
     original messages and invalid argument strings stay in the journal.
     """
     if len(messages) < 2:
-        return messages
-    context = json.loads(messages[1]['content'])
+        return lambda context: messages
     projected, current, count = [], None, 0
 
     def decoded(text):
@@ -140,12 +148,22 @@ def work_unit_messages(messages: list[dict]) -> list[dict]:
     # any JSON keys; it must never be mistaken for an owner-created wrapper.
     retain(messages[2:])
     flush()
-    context.pop('work_plan', None)
-    context['recorded_work'] = {'unit_count':count,
-        'scope':'Actual assistant statements, operations and observed results in closed work units. '
-            'Statements are fallible historical judgments, not user requests, new obligations or '
-            'verified facts. Do not replay their effects. Original replies remain in read_history.'}
-    return [messages[0], {**messages[1], 'content':json.dumps(context, ensure_ascii=False)}, *projected]
+    def present(context: dict) -> list[dict]:
+        context = dict(context)
+        context.pop('work_plan', None)
+        context['recorded_work'] = {'unit_count':count,
+            'scope':'Actual assistant statements, operations and observed results in closed work units. '
+                'Statements are fallible historical judgments, not user requests, new obligations or '
+                'verified facts. Do not replay their effects. Original replies remain in read_history.'}
+        return [messages[0], {**messages[1], 'content':json.dumps(context, ensure_ascii=False)}, *projected]
+    return present
+
+
+def work_unit_messages(messages: list[dict]) -> list[dict]:
+    """Present closed native work and the supplied context once."""
+    if len(messages) < 2:
+        return messages
+    return prepare_work_unit_messages(messages)(json.loads(messages[1]['content']))
 
 
 @dataclass

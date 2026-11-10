@@ -520,11 +520,11 @@ class OperationTools:
         if self.config.get('work_method') != GOAL_WORK_METHOD:
             return None
         if self.config.get('work_selection_policy') == 'native.v4':
-            from simple_ar.app.professional_conversation import work_unit_messages
-            return work_unit_messages
-        from simple_ar.app.professional_conversation import recorded_work_messages
+            from simple_ar.app.professional_conversation import prepare_work_unit_messages
+            return prepare_work_unit_messages
+        from simple_ar.app.professional_conversation import prepare_recorded_work_messages
         return (None if self.work is not None and self.work.source_work
-                and self.work.selected() is not None else recorded_work_messages)
+                and self.work.selected() is not None else prepare_recorded_work_messages)
 
     def coordinator_eligible(self, spec: CommonToolSpec) -> bool:
         """Consumer role, not authorization; callers and inspectors keep primitives."""

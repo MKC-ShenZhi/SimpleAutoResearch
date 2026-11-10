@@ -13,11 +13,11 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - Project inspection lists indexed `SKILL.md` methods for the task to read and assess before reuse.
 - Report export lets users choose the figure-caption source and set the top-level division of supplied templates.
 - Command-line report export can use a compact general article layout; ACM and custom templates remain available.
-- A working view reuses applicable delivery-review results within the same turn to avoid duplicate checks.
+- A working view reuses applicable delivery-review results and prepares unchanged recorded work once per selected history.
 
 ### Fixed
 
-- Complete independent reviews can reassess an earlier concern against the current deliverable; partial reviews and historical records retain their original scope.
+- Complete independent reviews can reassess an earlier concern against the current deliverable using that check's supplied evidence; partial reviews and historical records retain their original scope.
 - Independent review can locate the recorded edit call behind a current artifact and inspect it alongside the result.
 - A prior candidate's unresolved statements remain visible as prior claims instead of becoming automatic current obligations after further work.
 - Independent review retains supported findings when another check lacks a valid receipt; the unverified check remains incomplete, and source ranges come from the presented material.

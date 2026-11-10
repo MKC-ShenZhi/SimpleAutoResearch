@@ -579,7 +579,11 @@ def select_working_context(
                           'recent_start_turn': start, 'archive_end_turn': start,
                           'archived_turn_ranges': ranges}
 
+    prepared_turns = None
+    prepared_projector = None
+
     def project() -> tuple[list[dict[str, Any]], int]:
+        nonlocal prepared_turns, prepared_projector
         # Selection and model-visible bookkeeping share one admission cost.
         # Callers must not append a second unbudgeted description afterwards.
         if context_authority == 'sources.v1':
@@ -641,18 +645,26 @@ def select_working_context(
             if 'resources' in context:
                 context['resources'].update(approximate_next_input_tokens=cost,
                     context_exceeds_input_target=cost>context_token_target)
-            messages = [{'role':'system','content':system_text}, {'role':'user','content':dump(context)}]
+            # A projector consumes the in-memory context and serializes its
+            # final presentation. Avoid encoding and immediately decoding the
+            # entire working view on every admission trial.
+            messages = [{'role':'system','content':system_text},
+                        {'role':'user','content':dump(context) if message_projector is None else ''}]
             if context_authority == 'sources.v1':
                 messages[1].update(role='assistant', reasoning_content='')
             emitted = 0
             for i in recent:
                 messages.extend({'role':'user','content':text} for text in user_requests[emitted:counts[i]])
                 emitted = counts[i]
-                messages.extend(deepcopy(blocks[i]))
+                messages.extend(blocks[i])
             messages.extend({'role':'user','content':text} for text in user_requests[emitted:])
-            messages.extend(deepcopy(tail))
+            messages.extend(tail)
             if message_projector is not None:
-                messages = message_projector(messages)
+                selection = tuple(recent)
+                if selection != prepared_turns:
+                    prepared_projector = message_projector(messages)
+                    prepared_turns = selection
+                messages = prepared_projector(context)
             measured = schema_tokens+estimate_tokens(json.dumps(messages,ensure_ascii=False))
             # A boolean/decimal-width change can reduce the serialized size
             # by one token. Keep the conservative bound rather than oscillate.

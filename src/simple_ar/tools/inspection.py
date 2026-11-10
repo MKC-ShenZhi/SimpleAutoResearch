@@ -2458,7 +2458,7 @@ class InspectionToolGateway:
                 if any(row.outcome != 'supported' or not row.evidence
                        or not all(supplied(row, subject) for subject in row.evidence) for row in checks):
                     continue
-                supporting = (checks if saved.get('inspection_evidence_policy') not in {'presented.v4', 'presented.v5'} else
+                supporting = (checks if saved.get('inspection_evidence_policy') != 'presented.v4' else
                     [row for row in decision.investigations if row.outcome == 'supported' and row.evidence
                      and all(supplied(row, subject) for subject in row.evidence)])
                 row_scopes = [bindings['evidence:' + subject] for row in supporting for subject in row.evidence]

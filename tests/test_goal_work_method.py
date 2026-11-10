@@ -476,20 +476,29 @@ class GoalWorkTests(unittest.TestCase):
 
         def review(view):
             paths = (['metrics.md', 'metrics.json'] if phase['value'] == 0 else
-                     ['measurements/conditions.txt'] if phase['value'] == 1 else ['report.md', 'metrics.md'])
+                     ['measurements/conditions.txt'] if phase['value'] == 1 else
+                     ['measurements/conditions.txt', 'report.md'] if phase['value'] == 2 else
+                     ['report.md', 'metrics.md'])
             sources = case._inspection_sources(view, *paths)
             if any(row is None for row in sources):
                 return [_action('read_file', path=path) for path, row in zip(paths, sources) if row is None]
             check = {'claim': 'The requested explanation exists.', 'scope': 'The current delivery.',
                 'necessary': True, 'method': 'Read the requested result.', 'reasoning': 'The selected sources were read.',
-                'basis': 'observed', 'evidence': [row['subject'] for row in sources],
+                'basis': 'observed', 'evidence': [row['subject'] for row in
+                    (sources[:1] if phase['value'] == 2 else sources)],
                 'outcome': 'contradicted' if phase['value'] == 0 else 'supported',
                 'findings': ([{'severity': 'required', 'message': 'Add an editable report.',
                     'artifacts': [str(case.root/'workspace/metrics.md'), str(case.root/'workspace/metrics.json')]}]
                     if phase['value'] == 0 else []),
                 'reassessed_prior': ([row['id'] for row in view['prior_required']] if phase['value'] else [])}
+            checks = [check]
+            if phase['value'] == 2:
+                checks.append({'claim': 'A report file is available.', 'scope': 'A separate check.',
+                    'necessary': True, 'method': 'Read the file.', 'reasoning': 'The file was read.',
+                    'basis': 'observed', 'evidence': [sources[1]['subject']],
+                    'outcome': 'supported', 'findings': []})
             return {'conclusion': 'complete', 'applicability': 'Check the requested delivery.',
-                    'investigations': [check], 'limitations': [], 'reassessed_prior': []}
+                    'investigations': checks, 'limitations': [], 'reassessed_prior': []}
 
         case.review = review
         case._submit(_action('review_result', **initial))
@@ -502,6 +511,11 @@ class GoalWorkTests(unittest.TestCase):
         self.assertEqual(unrelated['verdict'], 'incomplete')
         self.assertEqual(unrelated['reassessed_prior'], [])
         phase['value'] = 2
+        case._submit(_action('review_result', **final))
+        unrelated_check = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+        self.assertEqual(unrelated_check['verdict'], 'incomplete')
+        self.assertEqual(unrelated_check['reassessed_prior'], [])
+        phase['value'] = 3
         case._submit(_action('review_result', **final))
         checked = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
         self.assertEqual(checked['verdict'], 'passed')

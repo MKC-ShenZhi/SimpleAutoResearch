@@ -664,10 +664,12 @@ class DocumentWorkToolGateway:
             'window/query request to recall its recorded observation without repeating the investigation.')
 
         def present(messages):
-            context = json.loads(messages[1]['content'])
-            view = context.pop('working_view')
-            context['observations'] = [json.loads(row['observation']['text']) for row in view['observations']]
-            return [messages[0], {'role': 'user', 'content': json.dumps(context, ensure_ascii=False)}]
+            def project(context):
+                context = dict(context)
+                view = context.pop('working_view')
+                context['observations'] = [json.loads(row['observation']['text']) for row in view['observations']]
+                return [messages[0], {'role': 'user', 'content': json.dumps(context, ensure_ascii=False)}]
+            return project
 
         messages, selection = select_working_context(user_requests=[], system_text=system,
             base_context=base, turn_blocks=[], observations=[{
