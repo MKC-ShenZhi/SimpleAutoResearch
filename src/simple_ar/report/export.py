@@ -500,7 +500,7 @@ def _figure_pagination_preamble() -> str:
 """
 
 
-def _article_table_widths(table: dict) -> list[float]:
+def _natural_table_widths(table: dict) -> list[float]:
     """Allocate ordinary table columns from their rendered text, not equally."""
     fields = table['c']
     count = len(fields[2])
@@ -526,7 +526,7 @@ def _article_table_widths(table: dict) -> list[float]:
     return [weight / total for weight in weights]
 
 
-def _article_breakable_text(text: str) -> str:
+def _breakable_technical_text(text: str) -> str:
     """Break technical text at natural separators before splitting long tokens."""
     result = []
     for part in re.split(r'([/_.\-\s])', text):
@@ -541,7 +541,7 @@ def _article_breakable_text(text: str) -> str:
     return ''.join(result)
 
 
-def _prepare_technical_content(fragments: Any, output: Path, *, article_v3: bool = False) -> list[str]:
+def _prepare_technical_content(fragments: Any, output: Path, *, natural_layout: bool = False) -> list[str]:
     """Prepare only the TeX AST; canonical code and display text stay intact."""
     # A technical compound can overflow a table cell below the ordinary
     # 32-character identifier boundary (operators and mixed letter/digit IDs
@@ -566,14 +566,14 @@ def _prepare_technical_content(fragments: Any, output: Path, *, article_v3: bool
             columns = node['c'][2]
             if len(node['c']) == 5:
                 if columns and (all(width == 0 for width in columns)
-                        or article_v3 and len(set(columns)) == 1):
-                    node['c'][2] = _article_table_widths(node) if article_v3 else [1 / len(columns)] * len(columns)
+                        or natural_layout and len(set(columns)) == 1):
+                    node['c'][2] = _natural_table_widths(node) if natural_layout else [1 / len(columns)] * len(columns)
             elif len(node['c']) == 6:
                 widths = [width for _, width in columns]
                 default = all(width['t'] == 'ColWidthDefault' for width in widths)
                 equal = all(width['t'] == 'ColWidth' for width in widths) and len({width['c'] for width in widths}) == 1
-                if columns and (default or article_v3 and equal):
-                    values = _article_table_widths(node) if article_v3 else [1 / len(columns)] * len(columns)
+                if columns and (default or natural_layout and equal):
+                    values = _natural_table_widths(node) if natural_layout else [1 / len(columns)] * len(columns)
                     for column, value in zip(columns, values, strict=True):
                         column[1] = {'t': 'ColWidth', 'c': value}
             else:
@@ -590,14 +590,14 @@ def _prepare_technical_content(fragments: Any, output: Path, *, article_v3: bool
                 r"\VerbatimInput[breaklines=true,breakanywhere=true,breaksymbolleft={},breaksymbolright={},breakanywheresymbolpre={},breakanywheresymbolpost={}]{" + path.relative_to(output).as_posix() + "}"])
         elif node.get("t") == "Code":
             text = node['c'][1]
-            node.update(t="RawInline", c=["latex", r'\texttt{' + _article_breakable_text(text) + '}'
-                if article_v3 else _breakable_code(text)])
+            node.update(t="RawInline", c=["latex", r'\texttt{' + _breakable_technical_text(text) + '}'
+                if natural_layout else _breakable_code(text)])
         elif (node.get("t") == "Str" and not any(char.isspace() for char in node["c"])
                 and (id(node) in table_words or "/" in node["c"] or len(node["c"]) >= 32)):
             # Long prose tokens also occur as checksums/identifiers. Keep
             # their surrounding font; math and link targets are separate nodes.
             text = node['c']
-            node.update(t="RawInline", c=["latex", _article_breakable_text(text) if article_v3
+            node.update(t="RawInline", c=["latex", _breakable_technical_text(text) if natural_layout
                 else r"\seqsplit{" + _tex_literal(text) + "}"])
     return code_files
 
@@ -707,6 +707,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                       template: dict[str, Any] | None = None,
                       layout: Literal['article', 'acm'] | None = None,
                       article_rendering: dict[str, Any] | None = None,
+                      technical_rendering: Literal['legacy', 'natural'] | None = None,
                       citation_style: Literal['numeric', 'template'] | None = None,
                       checks: dict[str, Any] | None = None,
                       preflight: Callable[[dict[str, int]], None] | None = None) -> dict[str, Any]:
@@ -737,6 +738,11 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     engine = template.get('engine', 'pdflatex') if template_files else 'pdflatex'
     if article_rendering is not None and not article:
         raise ReportExportError('article_rendering requires layout=article')
+    if technical_rendering is not None and (article or template_files
+            or technical_rendering not in {'legacy', 'natural'}):
+        raise ReportExportError('Unsupported ACM technical rendering policy')
+    natural_acm = not article and not template_files and (
+        technical_rendering == 'natural' or layout == 'acm' and technical_rendering is None)
     if article_rendering is not None and article_rendering not in (
             {'schema_version': version} for version in ARTICLE_RENDERING_VERSIONS):
         raise ReportExportError('Unsupported article rendering policy; retain the saved publication')
@@ -885,6 +891,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                                                     "source.md", "template.latex", "README.txt", "export.json"]}
     if layout is not None:
         manifest['layout'] = layout
+    if natural_acm:
+        manifest['technical_rendering'] = 'natural'
     if adjacent_captions:
         manifest['figure_caption_source'] = 'adjacent'
     if article:
@@ -974,7 +982,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         for image in publication_view['image_mapping'].values():
             manifest['public_artifacts'].extend(image['files'])
         manifest['public_artifacts'].extend(_prepare_technical_content([title_inlines, blocks, abstract], output,
-            article_v3=article and article_rendering['schema_version'] == 'article-rendering.v3'))
+            natural_layout=(article and article_rendering['schema_version'] == 'article-rendering.v3')
+                or natural_acm))
 
         division = template.get('top_level_division') if template_files else None
         body_tex = run([pandoc, "--from=json", "--to=latex", "--natbib", "--no-highlight",

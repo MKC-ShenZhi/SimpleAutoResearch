@@ -149,6 +149,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             options = {}
             if args.layout is not None:
                 options['layout'] = args.layout
+            elif args.latex_template is None:
+                options['technical_rendering'] = 'natural'
             if args.latex_template is not None:
                 options['template'] = {'path': args.latex_template, 'assets': args.template_asset,
                                        'engine': args.tex_engine or 'pdflatex'}

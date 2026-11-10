@@ -9,7 +9,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
-- Report export can use complete captions written directly after figures, keeping authored labels without duplication.
+- Report export can use complete captions written directly after figures, keeping authored labels without duplication; ACM output uses readable technical wrapping and table widths.
 - General article export preserves authored heading numbers and improves technical-table wrapping and mixed-language font support.
 - Project inspection lists indexed `SKILL.md` methods for the task to read and assess before reuse.
 - Report export lets users choose the figure-caption source and set the top-level division of supplied templates.

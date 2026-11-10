@@ -32,7 +32,8 @@ class CliTests(unittest.TestCase):
                 return_value={'status': 'exported', 'compiled': False}) as export, \
                 contextlib.redirect_stdout(io.StringIO()):
             main(argv)
-            export.assert_called_once_with(Path('report'), Path('new-export'), title=None, compile_pdf=False)
+            export.assert_called_once_with(Path('report'), Path('new-export'), title=None,
+                compile_pdf=False, technical_rendering='natural')
             for layout in ('article', 'acm'):
                 export.reset_mock()
                 main([*argv, '--layout', layout])
@@ -41,7 +42,8 @@ class CliTests(unittest.TestCase):
             export.reset_mock()
             main([*argv, '--caption-source', 'adjacent'])
             export.assert_called_once_with(Path('report'), Path('new-export'), title=None,
-                compile_pdf=False, caption_owner='markdown', adjacent_captions=True)
+                compile_pdf=False, caption_owner='markdown', adjacent_captions=True,
+                technical_rendering='natural')
             for style in ('numeric', 'template'):
                 export.reset_mock()
                 main([*argv, '--citation-style', style, '--latex-template', 'layout/article.latex',

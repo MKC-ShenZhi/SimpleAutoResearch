@@ -154,6 +154,12 @@ def export_input_binding(source: Path, request: ExportRequest, *, output_root: P
         if policy not in ({'schema_version': version} for version in ARTICLE_RENDERING_VERSIONS):
             raise ValueError('Unsupported article rendering policy; retain the saved publication')
         fields['article_rendering'] = policy
+    if (request.layout in {None, 'acm'} and request.template is None
+            and (saved is None or 'technical_rendering' in saved)):
+        policy = saved['technical_rendering'] if saved is not None else 'natural'
+        if policy != 'natural':
+            raise ValueError('Unsupported ACM technical rendering policy; retain the saved publication')
+        fields['technical_rendering'] = policy
     if request.template is not None:
         for path in publication_template_inputs(root, request.template.model_dump()).values():
             authorized = resolve_mounted_path({'workspace': root}, str(path))
@@ -395,7 +401,8 @@ class PublicationToolGateway:
         owner = ArtifactStore(self.root/'tools/publications'/relative.parts[0])
         saved, result = owner.read_json('request.json'), owner.read_json('result.json')
         request = {key: value for key, value in saved.items()
-            if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity', 'article_rendering', 'consumer_contract'}}
+            if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity',
+                           'article_rendering', 'technical_rendering', 'consumer_contract'}}
         manifest = ArtifactStore(self.workspace.resolve(data['project'])).read_json('export.json')
         binding = self.approval_binding(request, identity=relative.parts[0],
             saved=saved,
@@ -448,7 +455,7 @@ class PublicationToolGateway:
             raise ValueError('Publication project or owner evidence changed')
         request = ExportRequest.model_validate({key: value for key, value in saved.items()
             if key not in {'inputs', 'image_binding_version', 'output_binding_version',
-                           'report_identity', 'article_rendering', 'consumer_contract'}})
+                           'report_identity', 'article_rendering', 'technical_rendering', 'consumer_contract'}})
         source = self.workspace.resolve(saved['markdown'])
         manifest = data['manifest']
         current = self.input_binding(source, request, saved=saved,
@@ -896,6 +903,8 @@ class PublicationToolGateway:
                         **({'layout': request.layout} if request.layout is not None else {}),
                         **({'article_rendering': binding.get('article_rendering',
                             {'schema_version': 'article-rendering.v1'})} if request.layout == 'article' else {}),
+                        **({'technical_rendering': binding.get('technical_rendering', 'legacy')}
+                           if request.layout in {None, 'acm'} and request.template is None else {}),
                         **({'citation_style': request.citation_style} if request.citation_style is not None else {}),
                         **({'checks': request.checks.model_dump(exclude_none=True)} if request.checks is not None else {}),
                         **({'template': request.template.model_dump()} if request.template is not None else {}))

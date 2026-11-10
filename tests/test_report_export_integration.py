@@ -111,7 +111,9 @@ class PortableExportIntegrationTests(unittest.TestCase):
             root = Path(tmp)
             source = root / 'input'
             source.mkdir()
-            original = ('# Report\n\n![Short description](plot.png)\n\n'
+            original = ('# Report\n\n| quantity (test split, n = 2,000; 407 churn) | mean ± SD | range |\n'
+                '| --- | ---: | ---: |\n| churn precision | 0.7801 ± 0.0079 | 0.7682-0.7972 |\n\n'
+                '![Short description](plot.png)\n\n'
                 '*Figure 1. A complete caption describing the observation.*\n\n'
                 'This separate paragraph explains the implication.\n')
             (source / 'report_body.md').write_text(original, encoding='utf-8')
@@ -129,6 +131,14 @@ class PortableExportIntegrationTests(unittest.TestCase):
                     self.assertIn('A complete caption describing the observation.', text)
                     self.assertIn('This separate paragraph explains the implication.', text)
                     self.assertNotIn('Short description', text)
+                    self.assertIn('407 churn)', text)
+                    if layout == 'acm':
+                        self.assertEqual(result['technical_rendering'], 'natural')
+                        self.assertNotIn(r'\seqsplit{churn)}', (output / 'body.tex').read_text(encoding='utf-8'))
+            old = export_acm_report(source, root / 'legacy-acm', layout='acm',
+                technical_rendering='legacy', caption_owner='markdown', adjacent_captions=True)
+            self.assertNotIn('technical_rendering', old)
+            self.assertIn(r'\seqsplit{churn)}', (root / 'legacy-acm/body.tex').read_text(encoding='utf-8'))
             self.assertEqual((source / 'report_body.md').read_text(encoding='utf-8'), original)
 
     @unittest.skipUnless(all(shutil.which(name) for name in ('pdftotext', 'pdfinfo', 'pdftoppm')),

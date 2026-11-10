@@ -845,6 +845,22 @@ class ReportExportTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'Unsupported article rendering policy'):
                     export_input_binding(manuscript, request, saved=unknown, include_images=False)
 
+    def test_acm_rendering_is_bound_for_new_exports_and_preserves_saved_requests(self):
+        from simple_ar.tools.publication import ExportRequest, export_input_binding
+        with tempfile.TemporaryDirectory() as tmp:
+            manuscript = self._source(Path(tmp)) / 'report_body.md'
+            for layout in (None, 'acm'):
+                with self.subTest(layout=layout):
+                    request = ExportRequest(markdown='report_body.md', layout=layout, compile_pdf=False)
+                    current = export_input_binding(manuscript, request, include_images=False)
+                    self.assertEqual(current['technical_rendering'], 'natural')
+                    self.assertEqual(export_input_binding(manuscript, request, saved=current, include_images=False), current)
+                    old = {key: value for key, value in current.items() if key != 'technical_rendering'}
+                    self.assertEqual(export_input_binding(manuscript, request, saved=old, include_images=False), old)
+                    with self.assertRaisesRegex(ValueError, 'Unsupported ACM technical rendering policy'):
+                        export_input_binding(manuscript, request,
+                            saved={**current, 'technical_rendering': 'unknown'}, include_images=False)
+
     def test_article_compile_dependency_diagnostics_keep_original_tex_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
