@@ -177,6 +177,7 @@ class _DeliveryAssessment(BaseModel):
     limitations: list[str]
     applicability: str | None = Field(default=None, exclude_if=lambda value: value is None)
     investigations: list[dict] | None = Field(default=None, exclude_if=lambda value: value is None)
+    requested_outcomes: list[dict] | None = Field(default=None, exclude_if=lambda value: value is None)
     reassessed_prior: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode='after')
@@ -305,6 +306,7 @@ def recorded_delivery_review(reader: Any) -> dict | None:
         'limitations': assessment.limitations,
         **({'applicability': assessment.applicability} if assessment.applicability is not None else {}),
         **({'investigations': assessment.investigations} if assessment.investigations is not None else {}),
+        **({'requested_outcomes': assessment.requested_outcomes} if assessment.requested_outcomes is not None else {}),
         'findings': [{'severity': row.severity, 'message': row.message} for row in assessment.findings],
         'record': journal['record'],
         'scope': 'Recorded model opinion at delivery time; not proof of current sources or scientific correctness.'}
@@ -808,6 +810,8 @@ class DeliveryReview:
             assessment = self._package_assessment(result, binding)
             issues = ['Delivery retains a required finding: ' + row.message
                       for row in assessment.findings if row.severity == 'required']
+            issues.extend('Requested outcome ' + row['status'] + ': ' + row['outcome'] + '. ' + row['explanation']
+                          for row in assessment.requested_outcomes or [] if row['status'] != 'delivered')
             if assessment.coverage != 'complete' or assessment.verdict != 'passed':
                 issues.append('Current completion claim lacks a complete passed whole-delivery review')
             return issues

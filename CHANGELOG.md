@@ -17,7 +17,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
-- Complete independent reviews can reassess an earlier concern against the current deliverable using that check's supplied evidence; partial reviews and historical records retain their original scope.
+- Independent delivery review distinguishes delivered files from accessible evidence and checks requested outcomes against the actual delivery. Complete reviews can reassess an earlier concern using that check's supplied evidence; historical records retain their original scope.
 - Independent review can locate the recorded edit call behind a current artifact and inspect it alongside the result.
 - A prior candidate's unresolved statements remain visible as prior claims instead of becoming automatic current obligations after further work.
 - Independent review retains supported findings when another check lacks a valid receipt; the unverified check remains incomplete, and source ranges come from the presented material.

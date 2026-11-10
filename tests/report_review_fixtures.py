@@ -51,6 +51,12 @@ def goal_work_decision(actions, requests, *, policy=None):
 
 def inspection_wire_opinion(response, schema):
     """Translate controlled flat callbacks to the offered claim-owned wire shape."""
+    if ('requested_outcomes' in schema.get('properties', {}) and 'requested_outcomes' not in response
+            and 'conclusion' in response):
+        response = {**response, 'requested_outcomes': [{
+            'outcome': 'Controlled fixture outcome',
+            'status': 'delivered' if response['conclusion'] == 'complete' else 'uncertain',
+            'artifacts': [], 'explanation': 'Controlled fixture judgment, not autonomous review.'}]}
     if 'findings' in schema.get('properties', {}) or 'findings' not in response:
         return response
     response = copy.deepcopy(response)

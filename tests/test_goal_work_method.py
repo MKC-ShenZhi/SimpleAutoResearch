@@ -456,9 +456,11 @@ class GoalWorkTests(unittest.TestCase):
         owner = case.app.operations.inspection
         saved = owner.store.read_json(owner._path(identity, 'input'))
         receipt = owner.store.read_json(owner._path(identity, 'response'))
-        self.assertEqual(saved['inspection_evidence_policy'], 'presented.v5')
+        self.assertEqual(saved['inspection_evidence_policy'], 'presented.v6')
+        legacy_receipt = deepcopy(receipt)
+        legacy_receipt['response'].pop('requested_outcomes', None)
         legacy, error = owner._delivery_assessment({**saved, 'inspection_evidence_policy': 'presented.v3'},
-                                                   receipt, identity, '', check_versions=False)
+                                                   legacy_receipt, identity, '', check_versions=False)
         self.assertEqual(error, '')
         self.assertEqual(legacy['verdict'], 'incomplete')
         self.assertEqual(legacy['reassessed_prior'], [])
@@ -524,8 +526,10 @@ class GoalWorkTests(unittest.TestCase):
         owner = case.app.operations.inspection
         saved = owner.store.read_json(owner._path(identity, 'input'))
         receipt = owner.store.read_json(owner._path(identity, 'response'))
+        legacy_receipt = deepcopy(receipt)
+        legacy_receipt['response'].pop('requested_outcomes', None)
         legacy, error = owner._delivery_assessment({**saved, 'inspection_evidence_policy': 'presented.v4'},
-                                                   receipt, identity, '', check_versions=False)
+                                                   legacy_receipt, identity, '', check_versions=False)
         self.assertEqual(error, '')
         self.assertEqual(legacy['verdict'], 'incomplete')
         with patch.object(owner, '_read_retained_result', wraps=owner._read_retained_result) as read:
@@ -540,6 +544,51 @@ class GoalWorkTests(unittest.TestCase):
             'The report changed after the inspection.\n', encoding='utf-8')
         with self.assertRaises(ValueError):
             owner._cached(identity)
+
+    def test_accessible_support_is_not_a_delivered_requested_output(self):
+        case = self.case
+        case._write('note.md', 'The measured result is 2.\n')
+        case._write('main.py', 'from helper import value\nprint(value)\n')
+        case._write('helper.py', 'value = 2\n')
+        note = str(case.root / 'workspace/note.md')
+        main = str(case.root / 'workspace/main.py')
+        helper = str(case.root / 'workspace/helper.py')
+
+        def review(view):
+            paths = ['note.md', 'main.py', 'helper.py']
+            sources = case._inspection_sources(view, *paths)
+            if any(row is None for row in sources):
+                return [_action('read_file', path=path) for path, row in zip(paths, sources) if row is None]
+            included = set(view['proposed_delivery']['artifacts'])
+            self.assertEqual(sources[2]['delivery_role'],
+                             'delivered' if helper in included else 'supporting_source_only')
+            return {'conclusion': 'complete', 'applicability': 'Compare requested outcomes with the delivery.',
+                'investigations': [{'claim': 'The note reports the observed value.', 'scope': 'The note.',
+                    'necessary': True, 'basis': 'observed', 'method': 'Read the note.',
+                    'reasoning': 'The supplied note was read.', 'evidence': [sources[0]['subject']],
+                    'outcome': 'supported', 'findings': []}],
+                'requested_outcomes': [
+                    {'outcome': 'Editable report', 'status': 'delivered', 'artifacts': [note],
+                     'explanation': 'The report is in the delivery.'},
+                    {'outcome': 'Reusable code', 'status': 'delivered' if helper in included else 'missing',
+                     'artifacts': [main, helper] if helper in included else [main],
+                     'explanation': 'The main module needs its helper.'}],
+                'limitations': [], 'reassessed_prior': []}
+
+        case.review = review
+        initial = {'summary': 'Report and reusable code.', 'artifacts': ['note.md', 'main.py']}
+        case._submit(_action('review_result', **initial), feedback='Also deliver the reusable code and its dependencies.')
+        first = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+        self.assertEqual((first['coverage'], first['verdict']), ('partial', 'incomplete'))
+        self.assertIn('Reusable code', ' '.join(first['limitations']))
+        self.assertNotEqual(case.app.session.manifest.status, 'completed')
+
+        final = {**initial, 'artifacts': ['note.md', 'main.py', 'helper.py']}
+        case._submit(_action('review_result', **final))
+        checked = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+        self.assertEqual((checked['coverage'], checked['verdict']), ('complete', 'passed'))
+        case._submit(_action('deliver_result', **final))
+        self.assertEqual(case.app.session.manifest.status, 'completed')
 
     def test_independent_review_can_find_the_original_edit_and_its_result(self):
         case = self.case

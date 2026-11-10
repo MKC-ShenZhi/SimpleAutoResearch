@@ -36,7 +36,7 @@ class _InspectionDispatchRaised(BaseException):
 
 _SHARED_EXECUTION_PROTOCOLS = frozenset({'shared.v1', 'shared.v2'})
 _PRIORITY_SOURCE_POLICIES = frozenset({'priority.v1', 'priority.v2'})
-_PRESENTED_EVIDENCE_POLICIES = frozenset({'presented.v2', 'presented.v3', 'presented.v4', 'presented.v5'})
+_PRESENTED_EVIDENCE_POLICIES = frozenset({'presented.v2', 'presented.v3', 'presented.v4', 'presented.v5', 'presented.v6'})
 
 SHARED_INSPECTION_OPERATIONS = frozenset({'read_file', 'list_directory', 'search_files', 'compile_python',
     'write_file', 'edit_file', 'copy_file', 'copy_project', 'run_process', 'inspect_images'})
@@ -203,6 +203,24 @@ class _PresentedClaimInvestigationV3(_PresentedClaimInvestigationV2):
 
 class _PresentedClaimDeliveryResponseV3(_PresentedClaimDeliveryResponseV2):
     investigations: list[_PresentedClaimInvestigationV3]
+
+
+class _RequestedOutcome(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    outcome: str = Field(min_length=1, description='One distinct outcome requested by the user.')
+    status: Literal['delivered', 'missing', 'uncertain'] = Field(description=
+        'Whether this outcome is actually included in the proposed delivery. '
+        'Accessible supporting evidence is not automatically delivered.')
+    artifacts: list[str] = Field(description='Included delivery artifacts that fulfill this outcome; '
+        'empty is valid for an outcome answered directly in the delivery text.')
+    explanation: str = Field(min_length=1, description='Why the included work does or does not fulfill this outcome.')
+
+
+class _PresentedClaimDeliveryResponseV4(_PresentedClaimDeliveryResponseV3):
+    requested_outcomes: list[_RequestedOutcome] = Field(min_length=1, description=
+        'Assess each distinct requested outcome against the exact proposed delivery inventory and text. '
+        'For requested code or supporting files, name the included artifacts needed to use the result. '
+        'Do not count workspace files or evidence that are not in the delivery inventory.')
 
 
 class _Finding(BaseModel):
@@ -487,7 +505,8 @@ class InspectionToolGateway:
                 'presented.v2': _PresentedClaimDeliveryResponseV2,
                 'presented.v3': _PresentedClaimDeliveryResponseV3,
                 'presented.v4': _PresentedClaimDeliveryResponseV3,
-                'presented.v5': _PresentedClaimDeliveryResponseV3}.get(
+                'presented.v5': _PresentedClaimDeliveryResponseV3,
+                'presented.v6': _PresentedClaimDeliveryResponseV4}.get(
                     saved.get('inspection_evidence_policy'), _ClaimDeliveryResponse)
 
     @staticmethod
@@ -1262,6 +1281,8 @@ class InspectionToolGateway:
                        if 'reassessed_prior' in package else {}),
                     **({'investigations': deepcopy(package['investigations'])}
                        if 'investigations' in package else {}),
+                    **({'requested_outcomes': deepcopy(package['requested_outcomes'])}
+                       if 'requested_outcomes' in package else {}),
                     **({'applicability': package['applicability']}
                        if 'applicability' in package else {}),
                     'limitations': package['limitations'],
@@ -2215,6 +2236,9 @@ class InspectionToolGateway:
         if any(not finding.message.strip() or any(path not in artifacts for path in finding.artifacts)
                 for finding in decision.findings):
             raise ValueError('Package findings must name affected bound artifacts and a concrete defect')
+        if isinstance(decision, _PresentedClaimDeliveryResponseV4) and any(
+                path not in artifacts for row in decision.requested_outcomes for path in row.artifacts):
+            raise ValueError('Requested outcomes may name only artifacts in the proposed delivery')
         return decision
 
     def _retain_valid_investigations(self, saved: dict, value: dict) -> tuple[dict, list[dict]]:
@@ -2438,7 +2462,7 @@ class InspectionToolGateway:
         supplied_for_package = (all(supplied(row, key) for row in decision.investigations for key in row.evidence)
             if scoped and saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES
             else all(covered for covered, _ in scopes))
-        complete_opinion = (scoped and saved.get('inspection_evidence_policy') == 'presented.v5'
+        complete_opinion = (scoped and saved.get('inspection_evidence_policy') in {'presented.v5', 'presented.v6'}
             and decision.conclusion == 'complete' and supplied_for_package
             and all(not row.necessary or row.outcome == 'supported' for row in decision.investigations))
 
@@ -2498,7 +2522,12 @@ class InspectionToolGateway:
         if investigations is not None:
             complete = complete and all(not getattr(row, 'necessary', True) or row.outcome == 'supported'
                                         for row in investigations)
+        outcomes = getattr(decision, 'requested_outcomes', None)
+        if outcomes is not None:
+            complete = complete and all(row.status == 'delivered' for row in outcomes)
         limitations = ([*decision.limitations, *(scope for _, scope in scopes),
+            *([f'Requested outcome {row.status}: {row.outcome}. {row.explanation}'
+                for row in outcomes if row.status != 'delivered'] if outcomes is not None else []),
             *['A finding lacks its selected supplied evidence: ' + claim for claim in unsupported_findings],
             *(['Unfinished independent investigation: ' + row.claim
                 for row in investigations if row.outcome == 'unresolved' and getattr(row, 'necessary', True)]
@@ -2518,6 +2547,8 @@ class InspectionToolGateway:
                 'investigations': [row.model_dump(mode='json', exclude={'findings'})
                     for row in investigations]}
                 if investigations is not None else {}),
+            **({'requested_outcomes': [row.model_dump(mode='json') for row in outcomes]}
+                if outcomes is not None else {}),
             **({'reassessed_prior': reassessed} if linked else {}),
             'evidence_sha256':self._evidence_with_dependencies(
                 {observed[key]['path']:observed[key]['sha256'] for key in decision.evidence}, dependencies)
@@ -2916,6 +2947,10 @@ class InspectionToolGateway:
                     'supporting source/code/results and interpretations. Generated files agreeing '
                     'with one another do not establish correctness. Locate and read original '
                     'evidence as needed; disclose unsupported conclusions or unfinished checks.'}
+            if saved.get('inspection_evidence_policy') == 'presented.v6':
+                view['proposed_delivery']['scope'] += (
+                    ' Only these inventory files are delivered; other accessible files are supporting '
+                    'material. Judge each requested outcome against this inventory and the delivery text.')
             if self._delivery_scope(saved) and saved.get('finding_policy') != 'linked.v1':
                 view['prior_work_opinions'] = [self.feedback_view(row)
                     for row in saved.get('prior_work_opinions', [])]
@@ -2950,6 +2985,11 @@ class InspectionToolGateway:
                     if row.get('readable') and (self.protocol or role=='targets' or row['independent'])
                         and (source_result or role == 'targets' or saved.get('memory_protocol') != 'journal.v1') else []}
                 for row in saved[role]]
+            if saved.get('inspection_evidence_policy') == 'presented.v6' and 'delivery_context' in saved:
+                delivered = saved['delivery_context']['artifacts']
+                for original, visible in zip(saved[role], view[role]):
+                    visible['delivery_role'] = ('delivered' if original.get('path') in delivered
+                                                else 'supporting_source_only')
             if saved.get('source_provenance') in {'versions.v1', 'versions.v2'}:
                 versions = {row['path']: row['sha256'] for row in saved[role]
                             if row.get('readable') and row.get('path') and row.get('sha256')}
@@ -3241,8 +3281,9 @@ class InspectionToolGateway:
             history_access=('read_history' if history else 'read_file at the recorded authorized source path and range'),
             trailing_messages=[finish] if finish is not None else [])
         if validate_capacity and metadata['estimated_input_tokens'] > target:
-            raise ValueError('Inspection working view cannot fit its model input target; '
-                'retain observations and narrow the requested inspection scope')
+            raise ValueError('Inspection working view cannot fit the available model input budget; '
+                'retain the requested delivery and observations, then continue with sufficient resources '
+                'or return an honest partial result')
         return messages, metadata
 
     def _accessible_history_record(self, row: dict) -> bool:
@@ -4297,7 +4338,7 @@ class InspectionToolGateway:
                         owner_bindings.append({'decision_index': missing[0], 'subject': subject})
                 final = response_model.model_validate(value).model_dump(mode='json')
                 if self._delivery_scope(saved):
-                    if saved.get('inspection_evidence_policy') in {'presented.v3', 'presented.v4', 'presented.v5'}:
+                    if saved.get('inspection_evidence_policy') in {'presented.v3', 'presented.v4', 'presented.v5', 'presented.v6'}:
                         final, resolutions = self._retain_valid_investigations(saved, final)
                         owner_bindings.extend(resolutions)
                     self._delivery_decision(saved, final)
@@ -4878,7 +4919,7 @@ class InspectionToolGateway:
                 if applicable and self.work_method in CLAIM_WORK_METHODS and self.finding_policy == 'linked.v1':
                     # New reviews bind each check to the windows actually presented.
                     # Existing inspection work orders keep their saved contract.
-                    saved['inspection_evidence_policy'] = 'presented.v5'
+                    saved['inspection_evidence_policy'] = 'presented.v6'
                     if self.artifact_changes:
                         saved['parent_artifact_changes'] = self.artifact_changes(list(delivery_context['artifacts']))
                 if applicable and self.material_policy == 'operations.v3' and self.execution_observations:
