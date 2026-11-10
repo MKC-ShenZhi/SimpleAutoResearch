@@ -56,7 +56,8 @@ class CliTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as failure:
                 main([*argv, '--citation-style', 'numeric', '--compile'])
             self.assertEqual(failure.exception.code, 1)
-            self.assertEqual(export.call_args.kwargs, {'title': None, 'compile_pdf': True, 'citation_style': 'numeric'})
+            self.assertEqual(export.call_args.kwargs, {'title': None, 'compile_pdf': True,
+                'citation_style': 'numeric', 'technical_rendering': 'natural'})
             export.reset_mock()
             for flags in (['--template-asset', 'local.bst'], ['--tex-engine', 'xelatex'],
                           ['--top-level-division', 'chapter']):

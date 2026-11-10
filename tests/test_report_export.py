@@ -1292,7 +1292,8 @@ class ReportExportTests(unittest.TestCase):
                 # never gain present-byte certification or an automatic delivery.
                 saved = json.loads((owner / 'request.json').read_text())
                 saved.pop('output_binding_version')
-                input_only = {key: value for key, value in saved.items() if key != 'image_binding_version'}
+                input_only = {key: value for key, value in saved.items()
+                    if key not in {'image_binding_version', 'technical_rendering'}}
                 input_only['inputs'] = {key: value for key, value in saved['inputs'].items()
                     if key in {'draft.md', 'references.bib', 'figures/figures_manifest.json'}}
                 markdown_only = {key: value for key, value in input_only.items() if key != 'inputs'}
@@ -1300,7 +1301,7 @@ class ReportExportTests(unittest.TestCase):
                 # Older terminal manifests have no caption-owner field. Reading
                 # them must neither migrate their bytes nor infer a new policy.
                 manifest = {key: value for key, value in manifest.items()
-                    if key not in {'figure_caption_owner', 'consumed_inputs', 'public_artifacts'}}
+                    if key not in {'figure_caption_owner', 'consumed_inputs', 'public_artifacts', 'technical_rendering'}}
                 historical_bytes = json.dumps(manifest).encode('utf-8')
                 (output / 'export.json').write_bytes(historical_bytes)
                 for historic in (saved, input_only, markdown_only):
