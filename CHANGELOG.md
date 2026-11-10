@@ -16,6 +16,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- A prior candidate's unresolved statements remain visible as prior claims instead of becoming automatic current obligations after further work.
 - Independent review retains supported findings when another check lacks a valid receipt; the unverified check remains incomplete, and source ranges come from the presented material.
 - Repeated reading no longer restricts the next decision to editing; saved tasks retain their records and can continue with authorized checks or other work.
 - The workspace starts file browsing in accessible task work and marks saved sources that are unavailable under the current read grants.

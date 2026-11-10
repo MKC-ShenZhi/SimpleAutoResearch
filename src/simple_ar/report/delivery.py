@@ -171,6 +171,7 @@ class Delivery:
         from simple_ar.tools.specs import tool_completion
 
         conditions = []
+        prior_unresolved = []
         next_tools = ['review_result', 'deliver_result'] if self.review_owner else ['deliver_result']
         proposal = None
         observations = self.observations() if observations is None else observations
@@ -201,7 +202,7 @@ class Delivery:
                 'message': 'No candidate claim has been submitted for independent investigation. '
                     'Useful work can be submitted before all requested formats are published.'})
         else:
-            conditions.extend({'kind': 'unfinished_work', 'message': text} for text in proposal.unresolved)
+            prior_unresolved = list(proposal.unresolved)
             try:
                 resolved = self.workspace.resolve_delivery(proposal)
                 # Unfinished work can be inspected before publication. It must
@@ -219,10 +220,12 @@ class Delivery:
                     conditions.extend({'kind': 'independent_review', 'message': text} for text in concerns)
             except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
                 conditions.append({'kind': 'candidate_versions', 'message': str(exc)})
-        return {'conditions': conditions, 'next_tools': next_tools,
+        return {'conditions': conditions, 'prior_unresolved': prior_unresolved, 'next_tools': next_tools,
             'minimum_resources': {'llm_requests': int(needs_review)},
             'review_followup': review_followup,
-            'scope': 'Derived work obligations, not a pass or an exact cost forecast. '
+            'scope': 'Conditions are current owner checks; prior_unresolved is the previous producer\'s '
+                'statement, not a current obligation. Reconsider it against the request and actual work. '
+                'This is not a pass or an exact cost forecast. '
                 'Final acceptance rechecks the actual inventory, publication and applicable opinion.'}
 
     def review_continuation(self, decision: dict) -> dict[str, dict]:

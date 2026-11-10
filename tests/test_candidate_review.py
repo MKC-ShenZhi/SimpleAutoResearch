@@ -51,6 +51,8 @@ class CandidateReviewTests(unittest.TestCase):
         self.observations.append({'tool_name':'review_result','status':'ok',
             'data':deepcopy(self.claim),'metadata':{}})
         pending = self.owner.lifecycle_requirements()
+        self.assertEqual(pending['prior_unresolved'], self.claim['unresolved'])
+        self.assertNotIn('unfinished_work', {row['kind'] for row in pending['conditions']})
         self.assertIn('export_report', pending['next_tools'])
         self.assertIn('publication', {row['kind'] for row in pending['conditions']})
         self.observations.append({'tool_name':'review_result','status':'ok',
