@@ -395,9 +395,10 @@ simple-ar report-export --report-dir PATH --output PATH [OPTIONS]
 | `--report-dir PATH` | Assembled report with report_body.md and bibliography for citations. | Required |
 | `--output PATH` | This command's output directory/file. | Required |
 | `--title TEXT` | Reader-facing publication title. | Unset |
+| `--layout CHOICE` | Built-in `article` or `acm` layout; cannot be combined with --latex-template. | ACM when unset |
 | `--citation-style CHOICE` | Numeric natbib display or template defaults; source citation keys unchanged. Choices: `numeric`, `template`. | Unset |
 | `--caption-source CHOICE` | Use figure captions from Markdown image text or the assembled figure manifest: `markdown` or `manifest`. Adjacent prose is not inferred as a caption. | Unset; manifest for assembled reports |
-| `--latex-template PATH` | Trusted Pandoc LaTeX template relative to --report-dir; otherwise ACM. | Unset |
+| `--latex-template PATH` | Trusted Pandoc LaTeX template relative to --report-dir; an alternative to --layout. | Unset |
 | `--template-asset NAME` | Flat companion filename beside template; repeatable; requires --latex-template. | [] |
 | `--tex-engine CHOICE` | Installed engine for custom template; requires --latex-template; BibTeX bibliography. Choices: `pdflatex`, `xelatex`. | Unset |
 | `--top-level-division CHOICE` | Body heading level for the supplied template: `section`, `chapter`, or `part`; requires --latex-template. | Unset |
@@ -409,6 +410,7 @@ Examples:
 
 ```bash
 simple-ar report-export --report-dir REPORT_DIR --output publication/v1 --compile
+simple-ar report-export --report-dir REPORT_DIR --output publication/article --layout article --compile
 simple-ar report-export --report-dir REPORT_DIR --output publication/v2 --latex-template layout/article.latex --citation-style numeric --compile
 ```
 

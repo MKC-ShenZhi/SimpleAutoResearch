@@ -141,10 +141,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "report-export":
         from simple_ar.report.export import export_acm_report
         try:
+            if args.layout is not None and args.latex_template is not None:
+                raise ValueError('--layout and --latex-template are alternatives')
             if not args.latex_template and (args.template_asset or args.tex_engine is not None
                     or args.top_level_division is not None):
                 raise ValueError('--template-asset, --tex-engine and --top-level-division require --latex-template')
             options = {}
+            if args.layout is not None:
+                options['layout'] = args.layout
             if args.latex_template is not None:
                 options['template'] = {'path': args.latex_template, 'assets': args.template_asset,
                                        'engine': args.tex_engine or 'pdflatex'}
@@ -160,7 +164,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                                        **options)
         except (OSError, ValueError) as exc:
             raise SystemExit(f"Report export failed: {exc}") from exc
-        label = 'Publication project' if args.latex_template else 'ACM project'
+        label = 'Publication project' if args.latex_template else 'Article project' if args.layout == 'article' else 'ACM project'
         print_line(f"{label}: {args.output.resolve()}; status: {result['status']}")
         if result.get("compile_note"):
             print_line(result["compile_note"])

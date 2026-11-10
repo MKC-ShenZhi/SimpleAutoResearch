@@ -567,7 +567,8 @@ def _scientific_unicode_preamble(*fragments: str) -> str:
                    for char in sorted(present))
 
 
-ARTICLE_RENDERING_VERSION = 'article-rendering.v1'
+ARTICLE_RENDERING_VERSION = 'article-rendering.v2'
+ARTICLE_RENDERING_VERSIONS = frozenset({'article-rendering.v1', ARTICLE_RENDERING_VERSION})
 
 
 def article_rendering_plan(*fragments: str, version: str = ARTICLE_RENDERING_VERSION) -> dict:
@@ -577,7 +578,7 @@ def article_rendering_plan(*fragments: str, version: str = ARTICLE_RENDERING_VER
     Other characters require XeLaTeX. This is not a font-coverage assertion: the
     actual compile must reject missing glyphs, including unsupported scripts.
     """
-    if version != ARTICLE_RENDERING_VERSION:
+    if version not in ARTICLE_RENDERING_VERSIONS:
         raise ReportExportError('Unsupported article rendering version; retain the saved publication')
     symbols = _scientific_unicode_symbols()
     unsupported = set()
@@ -591,10 +592,12 @@ def article_rendering_plan(*fragments: str, version: str = ARTICLE_RENDERING_VER
         'unicode_samples': [f'U+{code:04X}' for code in sorted(unsupported)[:16]]}
 
 
-def _article_template(engine: str) -> str:
+def _article_template(engine: str, *, version: str) -> str:
     """Bundled presentation only; the shared converter owns content and processes."""
     fonts = (r"\usepackage[T1]{fontenc}\usepackage[utf8]{inputenc}\usepackage{textcomp}" if engine == 'pdflatex'
         else r"\usepackage[UTF8,scheme=plain,fontset=fandol]{ctex}")
+    title = (r"\maketitle" if version == 'article-rendering.v1' else
+        r"\makeatletter\begin{center}{\LARGE\bfseries \@title\par}\end{center}\makeatother")
     return (r"""% General article; no venue or author metadata is inferred.
 \documentclass[11pt,a4paper]{article}
 """ + fonts + r"""
@@ -611,7 +614,7 @@ $endfor$
 \author{}
 \date{}
 \begin{document}
-\maketitle
+""" + title + r"""
 $body$
 $if(bibliography)$
 \bibliographystyle{$biblio-style$}
@@ -659,7 +662,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     engine = template.get('engine', 'pdflatex') if template_files else 'pdflatex'
     if article_rendering is not None and not article:
         raise ReportExportError('article_rendering requires layout=article')
-    if article_rendering is not None and article_rendering != {'schema_version': ARTICLE_RENDERING_VERSION}:
+    if article_rendering is not None and article_rendering not in (
+            {'schema_version': version} for version in ARTICLE_RENDERING_VERSIONS):
         raise ReportExportError('Unsupported article rendering policy; retain the saved publication')
     numeric_citations = citation_style == 'numeric' or article and citation_style is None
     if caption_owner not in {'manifest', 'markdown'}:
@@ -756,7 +760,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         raise ReportExportError("Bibliography escapes the report directory")
     bibliography = bibliography_path.read_text(encoding="utf-8") if bibliography_path.is_file() else ""
     if article:
-        policy = {'schema_version': ARTICLE_RENDERING_VERSION}
+        policy = article_rendering or {'schema_version': ARTICLE_RENDERING_VERSION}
         # Consume the existing, authorized Pandoc AST after caption binding.
         # Ignore locator strings, discarded YAML and non-rendered attributes;
         # include literal code/math which the technical preamble later rewrites.
@@ -900,7 +904,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                         cwd=output, text=json.dumps(source_ast))
         (output / "source.md").write_text(markdown, encoding="utf-8")
         publication_view['source_markdown_sha256'] = hashlib.sha256((output / 'source.md').read_bytes()).hexdigest()
-        main = _article_template(engine) if article else (
+        main = _article_template(engine, version=article_rendering['schema_version']) if article else (
             "% acmart manuscript demonstration; no conference submission metadata is inferred.\n"
             "\\documentclass[manuscript,screen,nonacm]{acmart}\n"
             "\\usepackage{longtable,booktabs,array,calc}\n"
@@ -1051,7 +1055,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                 'not Markdown locators or discarded YAML, and never an installed-tool fallback. Windows-1252 text and the fixed '
                 'scientific Unicode map use pdfLaTeX; other characters select XeLaTeX with CTeX/Fandol. '
                 'pdfLaTeX uses fontenc/inputenc/textcomp. Unsupported scripts/fonts require a trusted supplied template.\n'
-                f"Selected engine: {engine}; policy: {ARTICLE_RENDERING_VERSION}. See export.json article_rendering.\n"
+                f"Selected engine: {engine}; policy: {article_rendering['schema_version']}. See export.json article_rendering.\n"
                 'Missing dependencies or glyphs fail publication; no substitution, source edits or engine retry.\n'
                 'Citations are numeric by default; bibliography records and missing metadata are not rewritten.\n'
                 f'Rebuild here: {engine} -no-shell-escape -halt-on-error main.tex; '

@@ -14,7 +14,8 @@ from simple_ar.core.budget import BudgetError
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.process import ProcessSpec, run_process
 from simple_ar.report.export import (ReportExportError, ReportExportResourceError, export_acm_report,
-    _asset_path, ARTICLE_RENDERING_VERSION, publication_template_inputs, report_image_targets, validate_publication_checks)
+    _asset_path, ARTICLE_RENDERING_VERSION, ARTICLE_RENDERING_VERSIONS,
+    publication_template_inputs, report_image_targets, validate_publication_checks)
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 from simple_ar.tools.workspace import DeliveryRequest, _private_name, resolve_mounted_path
 
@@ -150,7 +151,7 @@ def export_input_binding(source: Path, request: ExportRequest, *, output_root: P
         # authorized Pandoc pass, not another parser, owns visible-text selection.
         # Unversioned article receipts retain their historical binding.
         policy = saved['article_rendering'] if saved is not None else {'schema_version': ARTICLE_RENDERING_VERSION}
-        if policy != {'schema_version': ARTICLE_RENDERING_VERSION}:
+        if policy not in ({'schema_version': version} for version in ARTICLE_RENDERING_VERSIONS):
             raise ValueError('Unsupported article rendering policy; retain the saved publication')
         fields['article_rendering'] = policy
     if request.template is not None:
@@ -890,7 +891,8 @@ class PublicationToolGateway:
                            if binding.get('image_binding_version') == 2 else {}),
                         caption_owner=caption_owner,
                         **({'layout': request.layout} if request.layout is not None else {}),
-                        **({'article_rendering': binding['article_rendering']} if 'article_rendering' in binding else {}),
+                        **({'article_rendering': binding.get('article_rendering',
+                            {'schema_version': 'article-rendering.v1'})} if request.layout == 'article' else {}),
                         **({'citation_style': request.citation_style} if request.citation_style is not None else {}),
                         **({'checks': request.checks.model_dump(exclude_none=True)} if request.checks is not None else {}),
                         **({'template': request.template.model_dump()} if request.template is not None else {}))

@@ -33,6 +33,11 @@ class CliTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             main(argv)
             export.assert_called_once_with(Path('report'), Path('new-export'), title=None, compile_pdf=False)
+            for layout in ('article', 'acm'):
+                export.reset_mock()
+                main([*argv, '--layout', layout])
+                export.assert_called_once_with(Path('report'), Path('new-export'), title=None,
+                    compile_pdf=False, layout=layout)
             for style in ('numeric', 'template'):
                 export.reset_mock()
                 main([*argv, '--citation-style', style, '--latex-template', 'layout/article.latex',
@@ -51,6 +56,8 @@ class CliTests(unittest.TestCase):
                           ['--top-level-division', 'chapter']):
                 with self.subTest(flags=flags), self.assertRaisesRegex(SystemExit, 'require --latex-template'):
                     main([*argv, *flags])
+            with self.assertRaisesRegex(SystemExit, 'alternatives'):
+                main([*argv, '--layout', 'article', '--latex-template', 'layout/article.latex'])
             with tempfile.TemporaryDirectory() as directory, \
                     self.assertRaisesRegex(SystemExit, 'caption manifest is not present'):
                 main(['report-export', '--report-dir', directory, '--output', 'new-export',

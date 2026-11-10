@@ -47,6 +47,8 @@ def build_parser(
                                help="Directory containing report_body.md and references.bib.")
     export_parser.add_argument("--output", type=Path, required=True, help="New export directory.")
     export_parser.add_argument("--title", help="Optional reader-facing document title.")
+    export_parser.add_argument("--layout", choices=("article", "acm"), default=None,
+                               help="Choose the built-in article or ACM layout; omit for historical ACM. Cannot be combined with --latex-template.")
     export_parser.add_argument("--citation-style", choices=("numeric", "template"), default=None,
                                help="Explicit numeric natbib display override, or preserve template citation defaults. Omit for historical behavior; no source keys or bibliography fields are changed.")
     export_parser.add_argument("--caption-source", choices=("markdown", "manifest"), default=None,

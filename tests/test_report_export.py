@@ -815,6 +815,9 @@ class ReportExportTests(unittest.TestCase):
                 legacy = {key: value for key, value in original.items() if key != 'article_rendering'}
                 self.assertEqual(export_input_binding(manuscript, request, saved=legacy,
                     include_images=False), legacy)  # No new policy on an unversioned receipt.
+                old_article = {**original, 'article_rendering': {'schema_version': 'article-rendering.v1'}}
+                self.assertEqual(export_input_binding(manuscript, request, saved=old_article,
+                    include_images=False), old_article)
                 unknown = {**original, 'article_rendering': {'schema_version': 'future'}}
                 with self.assertRaisesRegex(ValueError, 'Unsupported article rendering policy'):
                     export_input_binding(manuscript, request, saved=unknown, include_images=False)
@@ -849,11 +852,16 @@ class ReportExportTests(unittest.TestCase):
             with patch('simple_ar.report.export.shutil.which', return_value='pandoc'), \
                     patch('simple_ar.report.export._run', side_effect=convert):
                 result = export_acm_report(source, root / 'article', layout='article')
+                old = export_acm_report(source, root / 'old-article', layout='article',
+                    article_rendering={'schema_version': 'article-rendering.v1'})
             output = root / 'article'
             self.assertEqual((result['format'], result['layout']), ('article', 'article'))
             self.assertFalse(result['compiled'])
             main = (output / 'main.tex').read_text(encoding='utf-8')
             self.assertIn(r'\documentclass[11pt,a4paper]{article}', main)
+            self.assertNotIn(r'\maketitle', main)
+            self.assertIn(r'\maketitle', (root / 'old-article/main.tex').read_text(encoding='utf-8'))
+            self.assertEqual(old['article_rendering']['schema_version'], 'article-rendering.v1')
             self.assertIn(r'\usepackage[T1]{fontenc}', main)
             self.assertNotIn('ctex', main)
             self.assertIn(r'\bibliographystyle{plainurl}', main)
