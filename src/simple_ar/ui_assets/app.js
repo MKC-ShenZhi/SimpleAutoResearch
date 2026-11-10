@@ -355,16 +355,19 @@ async function refresh() {
     }
   }
   const mounts = ['workspace', 'evidence', ...snapshot.sources];
-  if (pretty([...$('mount').options].map(o => o.value)) === pretty(mounts)) return;
+  const available = mount => snapshot.source_access?.[mount] !== false;
+  if (pretty([...$('mount').options].map(o => [o.value, !o.disabled])) ===
+      pretty(mounts.map(mount => [mount, available(mount)]))) return;
   const oldMount = $('mount').value || view.tasks[task]?.mount;
   $('mount').replaceChildren();
   for (const mount of mounts) {
     const option = document.createElement('option'); option.value = mount;
     option.textContent = mount + (mount === 'evidence' ? ' · 已留存来源' : mount === 'workspace' ? ' · 工作文件' : ' · 只读材料');
+    if (!available(mount)) { option.disabled = true; option.textContent += '（当前不可访问）'; }
     $('mount').append(option);
   }
-  if ([...$('mount').options].some(o => o.value === oldMount)) $('mount').value = oldMount;
-  else { $('mount').value = snapshot.sources[0] || 'evidence'; folder = ''; }
+  if ([...$('mount').options].some(o => o.value === oldMount && !o.disabled)) $('mount').value = oldMount;
+  else { $('mount').value = 'workspace'; folder = ''; }
 }
 async function files() {
   if (!selected || snapshot?.task !== selected) return;

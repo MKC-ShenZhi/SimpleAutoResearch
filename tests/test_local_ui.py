@@ -32,6 +32,26 @@ def call(name, arguments, identity='test-call'):
 
 
 class LocalWorkspaceTests(unittest.TestCase):
+    def test_snapshot_exposes_only_currently_accessible_saved_sources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            tasks, source = base/'tasks', base/'input-data'
+            source.mkdir()
+            (source/'input.txt').write_text('Original material', encoding='utf-8')
+            app = ToolApplication.create(tasks/'saved', 'Read the retained material.',
+                model=None, sources={'old':source})
+            (app.workspace.workspace/'note.md').write_text('Saved work', encoding='utf-8')
+            records = {name:(tasks/'saved'/name).read_bytes()
+                for name in ('actions.json', 'session_manifest.json', 'budget_ledger.json')}
+
+            limited = Workspace(tasks, [], tasks)
+            self.assertEqual(limited.snapshot('saved')['source_access'], {'old':False})
+            self.assertEqual(limited.file('saved', 'workspace', 'note.md').read_text(), 'Saved work')
+            granted = Workspace(tasks, [source], tasks)
+            self.assertEqual(granted.snapshot('saved')['source_access'], {'old':True})
+            self.assertEqual(granted.file('saved', 'old', 'input.txt').read_text(), 'Original material')
+            self.assertEqual({name:(tasks/'saved'/name).read_bytes() for name in records}, records)
+
     def test_approval_forwards_optional_same_task_reuse_choice(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

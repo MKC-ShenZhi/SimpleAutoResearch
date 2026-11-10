@@ -390,13 +390,21 @@ class Workspace:
 
     def snapshot(self, name: str) -> dict:
         view = self.task_view(self.task(name))
+        source_access = {}
+        for mount in view.get('sources', []):
+            try:
+                self.file(name, mount, '')
+                source_access[mount] = True
+            except (OSError, ValueError, KeyError):
+                source_access[mount] = False
         with self.lock:
             worker = self.workers.get(name)
             live = bool(worker and worker[0].is_alive())
             stopping = bool(live and worker[1].is_set())
             error = self.errors.get(name)
             local_workers = [task for task, (thread, _) in self.workers.items() if thread.is_alive()]
-        return dict(view, task=name, mode='live execution' if live else 'saved results browser',
+        return dict(view, task=name, source_access=source_access,
+            mode='live execution' if live else 'saved results browser',
             worker_live=live, stop_requested=stopping, worker_error=error,
             local_workers=local_workers)
 
