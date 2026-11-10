@@ -459,8 +459,10 @@ class GoalWorkTests(unittest.TestCase):
         self.assertEqual(saved['inspection_evidence_policy'], 'presented.v6')
         legacy_receipt = deepcopy(receipt)
         legacy_receipt['response'].pop('requested_outcomes', None)
-        legacy, error = owner._delivery_assessment({**saved, 'inspection_evidence_policy': 'presented.v3'},
-                                                   legacy_receipt, identity, '', check_versions=False)
+        bindings = owner._stored_shared_bindings(saved, receipt['response'])
+        with patch.object(owner, '_stored_shared_bindings', return_value=bindings):
+            legacy, error = owner._delivery_assessment({**saved, 'inspection_evidence_policy': 'presented.v3'},
+                                                       legacy_receipt, identity, '', check_versions=False)
         self.assertEqual(error, '')
         self.assertEqual(legacy['verdict'], 'incomplete')
         self.assertEqual(legacy['reassessed_prior'], [])
@@ -528,8 +530,10 @@ class GoalWorkTests(unittest.TestCase):
         receipt = owner.store.read_json(owner._path(identity, 'response'))
         legacy_receipt = deepcopy(receipt)
         legacy_receipt['response'].pop('requested_outcomes', None)
-        legacy, error = owner._delivery_assessment({**saved, 'inspection_evidence_policy': 'presented.v4'},
-                                                   legacy_receipt, identity, '', check_versions=False)
+        bindings = owner._stored_shared_bindings(saved, receipt['response'])
+        with patch.object(owner, '_stored_shared_bindings', return_value=bindings):
+            legacy, error = owner._delivery_assessment({**saved, 'inspection_evidence_policy': 'presented.v4'},
+                                                       legacy_receipt, identity, '', check_versions=False)
         self.assertEqual(error, '')
         self.assertEqual(legacy['verdict'], 'incomplete')
         with patch.object(owner, '_read_retained_result', wraps=owner._read_retained_result) as read:
