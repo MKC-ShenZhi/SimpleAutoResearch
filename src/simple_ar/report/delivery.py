@@ -99,7 +99,24 @@ class Delivery:
         self.config, self.observations, self.user_requests = config, observations, user_requests
         self.legacy_report_status = config.get('delivery_review_protocol') not in {'task.v4', 'task.v5'}
 
-    def feedback(self, observations: list[dict], accepted_delivery: dict | None) -> dict | None:
+    def working_guidance(self, accepted_delivery: dict | None, *, include_lifecycle: bool) -> tuple[dict | None, dict | None]:
+        """Project one decision's guidance from the same observations and review."""
+        observations = self.observations()
+        reviewed: list[tuple[dict, list[str]]] = []
+
+        def review_issues(rows: list[dict], binding: dict) -> list[str]:
+            for previous, issues in reviewed:
+                if binding == previous:
+                    return issues
+            issues = self.review_owner.issues(rows, binding)
+            reviewed.append((binding, issues))
+            return issues
+
+        lifecycle = (self.lifecycle_requirements(observations=observations, review_issues=review_issues)
+                     if include_lifecycle else None)
+        return lifecycle, self.feedback(observations, accepted_delivery, review_issues=review_issues)
+
+    def feedback(self, observations: list[dict], accepted_delivery: dict | None, *, review_issues=None) -> dict | None:
         """Reconsider the latest actual proposal through the same eligibility rules."""
         for row in reversed(observations):
             contract = tool_completion(row.get('tool_name', ''), self.config.get('tool_completions'))
@@ -112,7 +129,7 @@ class Delivery:
             if not row.get('current_request', True) and delivery == accepted_delivery:
                 return None
             try:
-                issues = self.issues(observations, delivery)
+                issues = self.issues(observations, delivery, review_issues=review_issues)
             except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
                 issues = [str(exc)]
             return {'record': 'records/' + row['record'].removeprefix('attempts/'),
@@ -123,7 +140,7 @@ class Delivery:
                     'This grants no permission and does not add requirements to a new goal.'}
         return None
 
-    def issues(self, observations: list[dict], delivery: dict, *, proposed=None):
+    def issues(self, observations: list[dict], delivery: dict, *, proposed=None, review_issues=None):
         request = DeliveryRequest.model_validate(delivery)
         if request.unresolved:
             return []  # Existing terminal binding still proves actual partial files.
@@ -138,13 +155,13 @@ class Delivery:
         if producing:
             return []
         resolved = self.workspace.resolve_delivery(request)
-        return self._actual_issues(observations, request, resolved, proposed=proposed)
+        return self._actual_issues(observations, request, resolved, proposed=proposed, review_issues=review_issues)
 
     def requires_review(self, request: DeliveryRequest) -> bool:
         return (self.review_owner is not None
                 and delivery_requires_review(request, self.review_owner.protocol))
 
-    def lifecycle_requirements(self) -> dict:
+    def lifecycle_requirements(self, *, observations: list[dict] | None = None, review_issues=None) -> dict:
         """Derive remaining obligations from original proposals and current bytes.
 
         This is working guidance, never acceptance or another saved task state.
@@ -156,7 +173,7 @@ class Delivery:
         conditions = []
         next_tools = ['review_result', 'deliver_result'] if self.review_owner else ['deliver_result']
         proposal = None
-        observations = self.observations()
+        observations = self.observations() if observations is None else observations
         work_after_review = False
         review_followup = False
         for observed in reversed(observations):
@@ -197,7 +214,7 @@ class Delivery:
                 if self.review_owner and not proposal.unresolved:
                     binding = prepare_delivery_review(self.workspace, proposal, resolved['artifacts'],
                         self.user_requests, protocol=self.review_owner.protocol)
-                    concerns = self.review_owner.issues(observations, binding)
+                    concerns = (review_issues or self.review_owner.issues)(observations, binding)
                     needs_review = bool(concerns)
                     conditions.extend({'kind': 'independent_review', 'message': text} for text in concerns)
             except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
@@ -219,7 +236,7 @@ class Delivery:
 
     def _actual_issues(self, observations: list[dict], request: DeliveryRequest,
                          resolved: dict, *, proposed=None,
-                         include_inspection: bool = True) -> list[str]:
+                         include_inspection: bool = True, review_issues=None) -> list[str]:
         """Judge actual production using this call's authorized resolved inventory."""
 
         issues = self.gateway.delivery_issues(observations, proposed=proposed,
@@ -260,7 +277,7 @@ class Delivery:
             try:
                 binding = prepare_delivery_review(self.workspace, request, resolved['artifacts'],
                     self.user_requests, protocol=self.review_owner.protocol)
-                issues.extend(self.review_owner.issues(observations, binding))
+                issues.extend((review_issues or self.review_owner.issues)(observations, binding))
             except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
                 issues.append('Delivery review cannot be verified: ' + str(exc))
         issues.extend(operation_report_publication(request, resolved['artifacts'], observations,

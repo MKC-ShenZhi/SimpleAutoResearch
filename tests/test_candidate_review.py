@@ -89,6 +89,33 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertIn('review_result',status['next_tools'])
         self.assertFalse((self.root/'delivery.json').exists())
 
+    def test_one_working_view_shares_review_but_later_views_recheck(self):
+        self.owner.gateway.registry = SimpleNamespace(get=lambda _: None)
+        self.owner.config['tool_completions']['deliver_result'] = {'kind': 'delivery'}
+        claim = {'summary': 'Revised explanation', 'artifacts': ['draft.md']}
+        self.observations.append({'tool_name': 'deliver_result', 'status': 'ok', 'data': claim,
+            'record': 'attempts/delivery/native_result.json', 'current_request': True})
+        self.review.issues = Mock(return_value=['Independent check required'])
+
+        lifecycle, feedback = self.owner.working_guidance(None, include_lifecycle=True)
+        self.assertEqual(self.review.issues.call_count, 1)
+        self.assertIn('Independent check required', feedback['issues'])
+        self.assertIn('Independent check required', [row['message'] for row in lifecycle['conditions']])
+        first_binding = deepcopy(self.review.issues.call_args.args[1])
+
+        self.workspace.resolve('draft.md').write_text('# Changed finding\n', encoding='utf-8')
+        self.owner.working_guidance(None, include_lifecycle=True)
+        self.assertEqual(self.review.issues.call_count, 2)
+        self.assertNotEqual(first_binding['artifacts'], self.review.issues.call_args.args[1]['artifacts'])
+
+        self.observations.append({'tool_name': 'deliver_result', 'status': 'error',
+            'data': {**claim, 'summary': 'A different proposal'},
+            'record': 'attempts/rejected/native_result.json', 'current_request': True})
+        self.review.issues.reset_mock()
+        self.owner.working_guidance(None, include_lifecycle=True)
+        self.assertEqual(self.review.issues.call_count, 2)
+        self.assertNotEqual(self.review.issues.call_args_list[0].args[1], self.review.issues.call_args_list[1].args[1])
+
 
 class IntegratedCandidateFlowTests(unittest.TestCase):
     def test_fresh_candidate_revision_final_opinion_reuse_and_feedback_reload(self):

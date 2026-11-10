@@ -3568,8 +3568,14 @@ class ToolApplication:
                 'scope': 'Original historical observations in native messages, not current file state or verified facts. '
                     'No read text or write payload is replaced. Archived text is not supplied; use read_history for original receipts.'},
         }
+        delivery_guidance = None
+        if self.operations is not None:
+            accepted_delivery = (self.session.store.read_json('delivery.json')
+                if self.session.store.exists('delivery.json') else None)
+            delivery_guidance = self.operations.delivery.working_guidance(accepted_delivery,
+                include_lifecycle=config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES)
         if config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES:
-            context['delivery_conditions'] = self.operations.delivery.lifecycle_requirements()
+            context['delivery_conditions'] = delivery_guidance[0]
             context['delivery_conditions'].pop('review_followup', None)
             if schemas is not None:
                 offered = self._offered_operation_names(schemas)
@@ -3611,7 +3617,7 @@ class ToolApplication:
             method = self.operations.method_context()
             if method is not None:
                 context['professional_work' if self.operations.work is not None else 'professional_method'] = method
-            delivery_feedback = self._delivery_feedback()
+            delivery_feedback = delivery_guidance[1]
             if delivery_feedback:
                 context['last_delivery_check'] = delivery_feedback
             if self.operations.selection is not None:
