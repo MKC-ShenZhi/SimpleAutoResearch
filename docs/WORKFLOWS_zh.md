@@ -162,7 +162,7 @@ uv run simple-ar start --resume-task "SESSION" "保留初稿，将结构改为�
 应核对本轮改动是否同时反映到正文和图表。反馈沿用原会话的材料、权限和剩余额度。
 
 只需说明时可以交付 Markdown；需要 PDF 时，可在任务中要求普通单栏文章版式，
-同时保留可编辑的 LaTeX 工程。该版式需要 Pandoc、BibTeX 和 LaTeX 引擎；中文编译需 XeLaTeX、CTeX 与 Fandol 字体。
+同时保留可编辑的 LaTeX 工程。该版式需要 Pandoc、BibTeX 和 LaTeX 引擎；中文编译需 XeLaTeX、CTeX、Fandol 及 DejaVu Sans 和 Sans Mono 字体。
 
 ### 导出 ACM LaTeX 与 PDF
 

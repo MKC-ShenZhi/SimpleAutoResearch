@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import unicodedata
 from typing import Any, Callable, Literal
 from urllib.parse import unquote, urlsplit
 
@@ -480,7 +481,48 @@ def _figure_pagination_preamble() -> str:
 """
 
 
-def _prepare_technical_content(fragments: Any, output: Path) -> list[str]:
+def _article_table_widths(table: dict) -> list[float]:
+    """Allocate ordinary table columns from their rendered text, not equally."""
+    fields = table['c']
+    count = len(fields[2])
+    if len(fields) == 5:
+        rows = [fields[3], *fields[4]]
+        blocks = lambda cell: cell
+    else:
+        rows = [*fields[3][1], *(row for body in fields[4] for row in [*body[2], *body[3]]),
+                *fields[5][1]]
+        rows = [row[1] for row in rows]
+        if any(len(row) != count or any(cell[2] != 1 or cell[3] != 1 for cell in row) for row in rows):
+            return [1 / count] * count
+        blocks = lambda cell: cell[-1]
+    weights = [6] * count
+    for row in rows:
+        for column, cell in enumerate(row[:count]):
+            pieces = [node['c'] if node['t'] == 'Str' else node['c'][-1]
+                for node in _nodes(blocks(cell)) if node.get('t') in {'Str', 'Code', 'Math'}]
+            text = ' '.join(pieces)
+            width = sum(2 if unicodedata.east_asian_width(char) in {'F', 'W'} else 1 for char in text)
+            weights[column] = max(weights[column], min(width, 32))
+    total = sum(weights)
+    return [weight / total for weight in weights]
+
+
+def _article_breakable_text(text: str) -> str:
+    """Break technical text at natural separators before splitting long tokens."""
+    result = []
+    for part in re.split(r'([/_.\-\s])', text):
+        if not part:
+            continue
+        if len(part) == 1 and (part in '/_.-' or part.isspace()):
+            result.append(_tex_literal(part) + r'\allowbreak{}')
+        elif len(part) > 24:
+            result.append(r'\seqsplit{' + _tex_literal(part) + '}')
+        else:
+            result.append(_tex_literal(part))
+    return ''.join(result)
+
+
+def _prepare_technical_content(fragments: Any, output: Path, *, article_v3: bool = False) -> list[str]:
     """Prepare only the TeX AST; canonical code and display text stay intact."""
     # A technical compound can overflow a table cell below the ordinary
     # 32-character identifier boundary (operators and mixed letter/digit IDs
@@ -504,12 +546,17 @@ def _prepare_technical_content(fragments: Any, output: Path) -> list[str]:
             # type or losing longtable paging. Any authored width is preserved.
             columns = node['c'][2]
             if len(node['c']) == 5:
-                if columns and all(width == 0 for width in columns):
-                    node['c'][2] = [1 / len(columns)] * len(columns)
+                if columns and (all(width == 0 for width in columns)
+                        or article_v3 and len(set(columns)) == 1):
+                    node['c'][2] = _article_table_widths(node) if article_v3 else [1 / len(columns)] * len(columns)
             elif len(node['c']) == 6:
-                if columns and all(width['t'] == 'ColWidthDefault' for _, width in columns):
-                    for column in columns:
-                        column[1] = {'t': 'ColWidth', 'c': 1 / len(columns)}
+                widths = [width for _, width in columns]
+                default = all(width['t'] == 'ColWidthDefault' for width in widths)
+                equal = all(width['t'] == 'ColWidth' for width in widths) and len({width['c'] for width in widths}) == 1
+                if columns and (default or article_v3 and equal):
+                    values = _article_table_widths(node) if article_v3 else [1 / len(columns)] * len(columns)
+                    for column, value in zip(columns, values, strict=True):
+                        column[1] = {'t': 'ColWidth', 'c': value}
             else:
                 raise ReportExportError('Unsupported Pandoc Table protocol; preserve the source and renderer version')
         elif node.get("t") == "CodeBlock":
@@ -523,12 +570,16 @@ def _prepare_technical_content(fragments: Any, output: Path) -> list[str]:
             node.update(t="RawBlock", c=["latex",
                 r"\VerbatimInput[breaklines=true,breakanywhere=true,breaksymbolleft={},breaksymbolright={},breakanywheresymbolpre={},breakanywheresymbolpost={}]{" + path.relative_to(output).as_posix() + "}"])
         elif node.get("t") == "Code":
-            node.update(t="RawInline", c=["latex", _breakable_code(node["c"][1])])
+            text = node['c'][1]
+            node.update(t="RawInline", c=["latex", r'\texttt{' + _article_breakable_text(text) + '}'
+                if article_v3 else _breakable_code(text)])
         elif (node.get("t") == "Str" and not any(char.isspace() for char in node["c"])
                 and (id(node) in table_words or "/" in node["c"] or len(node["c"]) >= 32)):
             # Long prose tokens also occur as checksums/identifiers. Keep
             # their surrounding font; math and link targets are separate nodes.
-            node.update(t="RawInline", c=["latex", r"\seqsplit{" + _tex_literal(node["c"]) + "}"])
+            text = node['c']
+            node.update(t="RawInline", c=["latex", _article_breakable_text(text) if article_v3
+                else r"\seqsplit{" + _tex_literal(text) + "}"])
     return code_files
 
 
@@ -567,8 +618,8 @@ def _scientific_unicode_preamble(*fragments: str) -> str:
                    for char in sorted(present))
 
 
-ARTICLE_RENDERING_VERSION = 'article-rendering.v2'
-ARTICLE_RENDERING_VERSIONS = frozenset({'article-rendering.v1', ARTICLE_RENDERING_VERSION})
+ARTICLE_RENDERING_VERSION = 'article-rendering.v3'
+ARTICLE_RENDERING_VERSIONS = frozenset({'article-rendering.v1', 'article-rendering.v2', ARTICLE_RENDERING_VERSION})
 
 
 def article_rendering_plan(*fragments: str, version: str = ARTICLE_RENDERING_VERSION) -> dict:
@@ -596,6 +647,9 @@ def _article_template(engine: str, *, version: str) -> str:
     """Bundled presentation only; the shared converter owns content and processes."""
     fonts = (r"\usepackage[T1]{fontenc}\usepackage[utf8]{inputenc}\usepackage{textcomp}" if engine == 'pdflatex'
         else r"\usepackage[UTF8,scheme=plain,fontset=fandol]{ctex}")
+    if engine == 'xelatex' and version == 'article-rendering.v3':
+        fonts += (r"\setmainfont{DejaVu Sans}\setsansfont{DejaVu Sans}"
+                  r"\setmonofont{DejaVu Sans Mono}")
     title = (r"\maketitle" if version == 'article-rendering.v1' else
         r"\makeatletter\begin{center}{\LARGE\bfseries \@title\par}\end{center}\makeatother")
     return (r"""% General article; no venue or author metadata is inferred.
@@ -613,6 +667,7 @@ $endfor$
 \title{$title$}
 \author{}
 \date{}
+""" + (r"\setcounter{secnumdepth}{0}" + '\n' if version == 'article-rendering.v3' else '') + r"""
 \begin{document}
 """ + title + r"""
 $body$
@@ -891,7 +946,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         manifest['public_artifacts'].extend(copied_records)
         for image in publication_view['image_mapping'].values():
             manifest['public_artifacts'].extend(image['files'])
-        manifest['public_artifacts'].extend(_prepare_technical_content([title_inlines, blocks, abstract], output))
+        manifest['public_artifacts'].extend(_prepare_technical_content([title_inlines, blocks, abstract], output,
+            article_v3=article and article_rendering['schema_version'] == 'article-rendering.v3'))
 
         division = template.get('top_level_division') if template_files else None
         body_tex = run([pandoc, "--from=json", "--to=latex", "--natbib", "--no-highlight",
@@ -1054,6 +1110,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                 'Engine selection uses the existing Pandoc visible text (including code/math/captions) and bibliography, '
                 'not Markdown locators or discarded YAML, and never an installed-tool fallback. Windows-1252 text and the fixed '
                 'scientific Unicode map use pdfLaTeX; other characters select XeLaTeX with CTeX/Fandol. '
+                + ('XeLaTeX also requires DejaVu Sans and DejaVu Sans Mono. '
+                   if article_rendering['schema_version'] == 'article-rendering.v3' else '') +
                 'pdfLaTeX uses fontenc/inputenc/textcomp. Unsupported scripts/fonts require a trusted supplied template.\n'
                 f"Selected engine: {engine}; policy: {article_rendering['schema_version']}. See export.json article_rendering.\n"
                 'Missing dependencies or glyphs fail publication; no substitution, source edits or engine retry.\n'
@@ -1317,7 +1375,7 @@ def _compile(output: Path, has_citations: bool, *, runner: Callable | None = Non
             if missing:
                 note = 'Required glyphs are missing: ' + '; '.join(missing)
             note = (f'Article {engine} compilation failed; '
-                + ('required Unicode support is CTeX with Fandol fonts. ' if engine == 'xelatex' else '')
+                + ('install the required Unicode packages and fonts listed in README.txt. ' if engine == 'xelatex' else '')
                 + 'No engine fallback or content substitution. ' + note)
         return {"status": "compile_failed", "compiled": False, "compile_note": note}
     finally:

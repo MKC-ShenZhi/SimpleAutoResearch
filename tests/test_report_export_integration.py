@@ -25,6 +25,32 @@ TECHNICAL_BODY = ('\n`' + INLINE_COMMAND + '`\n\nInline identifier `' + IDENTIFI
     all(shutil.which(name) for name in ("pandoc", "rsvg-convert", "pdflatex", "bibtex")),
     "Opt-in integration requires Pandoc, librsvg and acmart-equipped TeX")
 class PortableExportIntegrationTests(unittest.TestCase):
+    @unittest.skipUnless(all(shutil.which(name) for name in ('xelatex', 'pdftotext')),
+        'The mixed-language article check requires XeLaTeX and Poppler')
+    def test_article_keeps_authored_numbering_and_readable_technical_tables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'input'
+            source.mkdir()
+            body = ('# Forecast report\n\n## 1. Findings\n\n'
+                '中文结果: λ = 0.3, ρ = −0.15, error ≪ baseline → improved.\n\n'
+                '| Model | MAE | RMSE | Bias |\n| --- | --- | --- | --- |\n'
+                '| `B_same_slot_1d` | 53.679 | 112.177 | −1.274 |\n'
+                '| `M1_ex_ante` | 24.693 | 61.264 | −9.166 |\n')
+            (source / 'report_body.md').write_text(body, encoding='utf-8')
+            result = export_acm_report(source, root / 'export', layout='article', compile_pdf=True)
+            self.assertTrue(result['compiled'], result)
+            self.assertEqual(result['article_rendering']['schema_version'], 'article-rendering.v3')
+            text = subprocess.check_output(['pdftotext', '-layout', str(root / 'export/main.pdf'), '-'], text=True)
+            self.assertIn('1. Findings', text)
+            self.assertNotRegex(text, r'\b1\s+1\.\s+Findings')
+            self.assertIn('B_same_slot_1d', text)
+            self.assertIn('M1_ex_ante', text)
+            self.assertIn('53.679', text)
+            self.assertIn('中文结果', text)
+            self.assertIn('≪', text)
+            self.assertEqual((source / 'report_body.md').read_text(encoding='utf-8'), body)
+
     def test_publication_caption_source_follows_explicit_authoring_choice(self):
         from types import SimpleNamespace
         from simple_ar.core.budget import BudgetLedger

@@ -854,6 +854,8 @@ class ReportExportTests(unittest.TestCase):
                 result = export_acm_report(source, root / 'article', layout='article')
                 old = export_acm_report(source, root / 'old-article', layout='article',
                     article_rendering={'schema_version': 'article-rendering.v1'})
+                prior = export_acm_report(source, root / 'prior-article', layout='article',
+                    article_rendering={'schema_version': 'article-rendering.v2'})
             output = root / 'article'
             self.assertEqual((result['format'], result['layout']), ('article', 'article'))
             self.assertFalse(result['compiled'])
@@ -862,6 +864,9 @@ class ReportExportTests(unittest.TestCase):
             self.assertNotIn(r'\maketitle', main)
             self.assertIn(r'\maketitle', (root / 'old-article/main.tex').read_text(encoding='utf-8'))
             self.assertEqual(old['article_rendering']['schema_version'], 'article-rendering.v1')
+            self.assertEqual(prior['article_rendering']['schema_version'], 'article-rendering.v2')
+            self.assertNotIn(r'\setcounter{secnumdepth}{0}', (root / 'prior-article/main.tex').read_text(encoding='utf-8'))
+            self.assertIn(r'\setcounter{secnumdepth}{0}', main)
             self.assertIn(r'\usepackage[T1]{fontenc}', main)
             self.assertNotIn('ctex', main)
             self.assertIn(r'\bibliographystyle{plainurl}', main)

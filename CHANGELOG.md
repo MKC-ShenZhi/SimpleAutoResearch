@@ -9,6 +9,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
+- General article export preserves authored heading numbers and improves technical-table wrapping and mixed-language font support.
 - Project inspection lists indexed `SKILL.md` methods for the task to read and assess before reuse.
 - Report export lets users choose the figure-caption source and set the top-level division of supplied templates.
 - Command-line report export can use a compact general article layout; ACM and custom templates remain available.
