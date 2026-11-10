@@ -2217,7 +2217,8 @@ class InspectionToolGateway:
                     scope='Not established by the accepted records.',
                     method='The independent response could not be validated for this investigation.',
                     reasoning='The original opinion remains in the inspection record.')
-        if not resolutions:
+        if not resolutions or not any(row['outcome'] != 'unresolved' and row['evidence']
+                                      for row in result['investigations']):
             raise original_error
         self._delivery_decision(saved, result)
         return result, resolutions
