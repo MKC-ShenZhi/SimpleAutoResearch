@@ -392,6 +392,7 @@ class InspectionToolGateway:
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
                  execution_observations: Callable[[], list[dict]] | None = None,
                  execution_history: Callable[[], list[dict]] | None = None,
+                 artifact_changes: Callable[[list[str]], list[dict]] | None = None,
                  user_requests: Callable[[], list[str]] | None = None,
                  feedback_provider: Callable[[list[str]], list[dict]] | None = None,
                  protocol: str | None = None,
@@ -442,6 +443,7 @@ class InspectionToolGateway:
         self.material_observations = material_observations
         self.execution_observations = execution_observations
         self.execution_history = execution_history
+        self.artifact_changes = artifact_changes
         self.user_requests = user_requests
         self.feedback_provider = feedback_provider
         self.protocol = protocol
@@ -2931,6 +2933,13 @@ class InspectionToolGateway:
                         'scope': ('Only this exact output version is associated with the recorded operation; '
                                   'a copy inherits an association only through a recorded copy. '
                                   'Unknown content is ordinary material, not a prior inspection result.')}
+                    change = next((item for item in saved.get('parent_artifact_changes', [])
+                                   if item['result'] == source.get('record')), None)
+                    if change is not None:
+                        visible['provenance'].update(call_record=change['call_record'], call_id=change['call_id'])
+                        visible['provenance']['scope'] += (
+                            ' Read the call record and result record for the original operation; '
+                            'neither is an independent check.')
             if self.progressive:
                 all_rows = [*saved['targets'], *saved['evidence']]
                 for index, (original, visible) in enumerate(zip(saved[role], view[role])):
@@ -4832,6 +4841,8 @@ class InspectionToolGateway:
                     # New reviews bind each check to the windows actually presented.
                     # Existing inspection work orders keep their saved contract.
                     saved['inspection_evidence_policy'] = 'presented.v4'
+                    if self.artifact_changes:
+                        saved['parent_artifact_changes'] = self.artifact_changes(list(delivery_context['artifacts']))
                 if applicable and self.material_policy == 'operations.v3' and self.execution_observations:
                     recent = self.execution_observations()
                     recent_records = {row['record'] for row in recent}

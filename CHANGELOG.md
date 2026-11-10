@@ -18,6 +18,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Fixed
 
 - New reassessments can use independently supplied evidence across supported checks in the same opinion; historical reviews retain their original interpretation.
+- Independent review can locate the recorded edit call behind a current artifact and inspect it alongside the result.
 - A prior candidate's unresolved statements remain visible as prior claims instead of becoming automatic current obligations after further work.
 - Independent review retains supported findings when another check lacks a valid receipt; the unverified check remains incomplete, and source ranges come from the presented material.
 - Repeated reading no longer restricts the next decision to editing; saved tasks retain their records and can continue with authorized checks or other work.

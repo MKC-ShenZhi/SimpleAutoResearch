@@ -205,7 +205,8 @@ class OperationTools:
 
     def __init__(self, *, root, config, ledger, session_id, client_factory,
                  record_artifacts, coordination, extension_host, observations, search_registry=None,
-                 execution_observations=None, execution_history=None, work_context=None, material_observations=None,
+                 execution_observations=None, execution_history=None, artifact_changes=None,
+                 work_context=None, material_observations=None,
                  user_requests=None, native_route_validator=None):
         from simple_ar.tools.inspection import (
             InspectionToolGateway, SHARED_INSPECTION_OPERATIONS, inspection_tool_specs)
@@ -258,6 +259,7 @@ class OperationTools:
             material_observations=material_observations,
             execution_observations=execution_observations,
             execution_history=execution_history,
+            artifact_changes=artifact_changes,
             user_requests=user_requests,
             prior_concerns=lambda targets: self.delivery_review.pending_concerns(targets)
                 if self.delivery_review is not None else [],

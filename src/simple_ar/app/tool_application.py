@@ -528,6 +528,7 @@ class ToolApplication:
             coordination={'specs':coordination,'owner':self},extension_host=self._extension_host_call,
             execution_observations=self._execution_observations,
             execution_history=lambda: self._execution_observations(all_records=True),
+            artifact_changes=self._artifact_changes,
             work_context=self._work_context,
             material_observations=self._material_observations,
             user_requests=self._inspection_requests,
@@ -1473,6 +1474,29 @@ class ToolApplication:
         from simple_ar.tools.materials import retained_working_inputs
         return retained_working_inputs(self.state['config'], resolve=self.workspace.resolve_material_root,
             targets=targets)
+
+    def _artifact_changes(self, artifacts: list[str]) -> list[dict[str, str]]:
+        """Locate original calls and results for recorded writes to delivered files."""
+        targets = set(artifacts)
+        changes = []
+        for turn in self.state['turns']:
+            try:
+                call_record = str(self.workspace.resolve(str(self.session.store.root / turn['reply'])))
+            except ValueError:
+                continue  # Some caller submissions are outside the existing records grant.
+            reply = self.session.store.read_json(turn['reply'])
+            calls = {call['id']: call for call in reply.get('tool_calls', [])}
+            for item in turn['tools']:
+                call = calls[item['id']]
+                spec = self.gateway.registry.get(call['function']['name'])
+                if spec is None or spec.permission_level != 'write_patch':
+                    continue
+                observed = self.session.store.read_json(item['result'])
+                path = (observed.get('data') or {}).get('absolute_path')
+                if observed.get('status') == 'ok' and path in targets:
+                    changes.append({'path': path, 'result': str(self.session.store.root / item['result']),
+                        'call_record': call_record, 'call_id': call['id']})
+        return changes
 
     def _execution_observations(self, *, all_records: bool = False) -> list[dict[str, Any]]:
         """Supply original receipts, not coordinator-authored failure summaries.

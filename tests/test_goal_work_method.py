@@ -465,6 +465,40 @@ class GoalWorkTests(unittest.TestCase):
         case._submit(_action('deliver_result', **claim))
         self.assertEqual(case.app.session.manifest.status, 'completed')
 
+    def test_independent_review_can_find_the_original_edit_and_its_result(self):
+        case = self.case
+        case._write('note.md', 'A preliminary description.\n')
+        case.decisions.append(self.choice(actions=[_action('edit_file', path='note.md',
+            expected_sha256=hashlib.sha256((case.root/'workspace/note.md').read_bytes()).hexdigest(),
+            replacements=[{'old_text': 'preliminary', 'new_text': 'corrected'}])]))
+        case._run(should_stop=lambda: bool(case._observations('edit_file')))
+        case._ok('edit_file')
+
+        def review(view):
+            note = next(row for row in view['evidence'] if row['path'] == str(case.root/'workspace/note.md'))
+            provenance = note['provenance']
+            self.assertEqual(provenance['status'], 'recorded')
+            self.assertIn('call_record', provenance)
+            paths = [note['path'], provenance['call_record'], provenance['record']]
+            sources = case._inspection_sources(view, *paths)
+            if any(row is None for row in sources):
+                return [_action('read_file', path=path) for path, row in zip(paths, sources) if row is None]
+            call_text = ''.join(window['text'] for window in sources[1]['text_windows'])
+            self.assertIn(provenance['call_id'], call_text)
+            self.assertIn('preliminary', call_text)
+            self.assertIn('corrected', call_text)
+            return {'conclusion': 'complete', 'applicability': 'Check the recorded edit and current note.',
+                'investigations': [{'claim': 'The original edit is available.', 'scope': 'The current note.',
+                    'necessary': True, 'method': 'Read the call, result and current note.',
+                    'reasoning': 'The source records and note were read.', 'basis': 'observed',
+                    'evidence': [row['subject'] for row in sources], 'outcome': 'supported', 'findings': []}],
+                'limitations': [], 'reassessed_prior': []}
+
+        case.review = review
+        case._submit(_action('review_result', summary='A corrected note.', artifacts=['note.md']))
+        assessed = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
+        self.assertEqual(assessed['verdict'], 'passed')
+
     def test_review_reassesses_each_concern_using_its_supplied_evidence_windows(self):
         from simple_ar.tools.inspection import InspectionToolGateway, _PresentedClaimDeliveryResponseV2
 
