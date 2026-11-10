@@ -536,7 +536,8 @@ class GoalWorkTests(unittest.TestCase):
                 self.assertEqual(read.call_count, 1)
         case._submit(_action('deliver_result', **final))
         self.assertEqual(case.app.session.manifest.status, 'completed')
-        case._write('report.md', 'The report changed after the inspection.\n')
+        (case.root / 'workspace' / 'report.md').write_text(
+            'The report changed after the inspection.\n', encoding='utf-8')
         with self.assertRaises(ValueError):
             owner._cached(identity)
 
