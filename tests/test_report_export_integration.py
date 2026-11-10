@@ -115,23 +115,33 @@ class PortableExportIntegrationTests(unittest.TestCase):
                 '| --- | ---: | ---: |\n| churn precision | 0.7801 ± 0.0079 | 0.7682-0.7972 |\n\n'
                 '![Short description](plot.png)\n\n'
                 '*Figure 1. A complete caption describing the observation.*\n\n'
-                'This separate paragraph explains the implication.\n')
+                'This separate paragraph explains the implication.\n\n'
+                '![Another image](plot.png)\n\n'
+                '*Figure 2. A second caption with its own label.*\n')
             (source / 'report_body.md').write_text(original, encoding='utf-8')
+            (source / 'custom.latex').write_text(
+                '\\documentclass{article}\n$for(header-includes)$\n$header-includes$\n$endfor$\n'
+                '\\usepackage[font=small]{caption}\n\\begin{document}\n$body$\n\\end{document}\n',
+                encoding='utf-8')
             (source / 'plot.png').write_bytes(base64.b64decode(
                 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='))
-            for layout in ('article', 'acm'):
+            for layout in ('article', 'acm', 'custom'):
                 with self.subTest(layout=layout):
                     output = root / layout
-                    result = export_acm_report(source, output, layout=layout, compile_pdf=True,
-                        caption_owner='markdown', adjacent_captions=True)
+                    options = {'template': {'path': 'custom.latex'}} if layout == 'custom' else {'layout': layout}
+                    result = export_acm_report(source, output, compile_pdf=True,
+                        caption_owner='markdown', adjacent_captions=True, **options)
                     self.assertTrue(result['compiled'], result)
                     text = subprocess.check_output(['pdftotext', str(output / 'main.pdf'), '-'], text=True)
                     text = ' '.join(text.split())
                     self.assertEqual(text.count('Figure 1.'), 1)
+                    self.assertEqual(text.count('Figure 2.'), 1)
                     self.assertIn('A complete caption describing the observation.', text)
+                    self.assertIn('A second caption with its own label.', text)
                     self.assertIn('This separate paragraph explains the implication.', text)
                     self.assertNotIn('Short description', text)
-                    self.assertIn('407 churn)', text)
+                    if layout != 'custom':
+                        self.assertIn('407 churn)', text)
                     if layout == 'acm':
                         self.assertEqual(result['technical_rendering'], 'natural')
                         self.assertNotIn(r'\seqsplit{churn)}', (output / 'body.tex').read_text(encoding='utf-8'))

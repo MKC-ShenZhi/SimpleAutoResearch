@@ -1046,10 +1046,13 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         preamble += _figure_pagination_preamble()
         if adjacent_captions:
             # The author supplies the complete caption, including any label.
+            # Let a supplied template load caption with its own options first.
             # Keep TeX's figure counter/references, but do not print a second label.
             preamble += ("\\makeatletter\n"
-                "\\@ifpackageloaded{caption}{}{\\usepackage{caption}}\n"
-                "\\makeatother\n\\captionsetup[figure]{labelformat=empty}\n")
+                "\\AtEndPreamble{%\n"
+                "  \\@ifpackageloaded{caption}{}{\\RequirePackage{caption}}%\n"
+                "  \\captionsetup[figure]{labelformat=empty}%\n"
+                "}\n\\makeatother\n")
         if numeric_citations and citations:
             # Templates/classes may already load natbib (even before this
             # header hook). Configure after preamble setup but before the aux
