@@ -89,9 +89,9 @@ class PublicationRequest(BaseModel):
     citation_style: Literal['numeric', 'template'] | None = Field(default=None,
         exclude_if=lambda value: value is None,
         description='Optional publication presentation choice. Select numeric for readable bracketed numbers, including narrative citations and authorless sources; supplied templates must load natbib and the default bibliography style becomes plainurl (TeX urlbst package, retaining URL/DOI; a literal template style still owns its choice). Select template to explicitly honor template citation defaults (built-in ACM stays numeric). May be chosen from the ordinary publication goal; no hashes or source metadata edits needed. Omit/null preserves historical rendering, request bindings and manifest shape. Exact citekeys, BibTeX records and template class/body remain unchanged.')
-    caption_source: Literal['markdown', 'manifest'] | None = Field(default=None,
+    caption_source: Literal['markdown', 'manifest', 'adjacent'] | None = Field(default=None,
         exclude_if=lambda value: value is None,
-        description='Choose the figure captions in the Markdown image text or in figures/figures_manifest.json. Omit for the existing authoring owner (Markdown for an ordinary file). Adjacent prose is not inferred to be a caption.')
+        description='Choose figure captions in the Markdown image text, in figures/figures_manifest.json, or in the paragraph immediately following each image (adjacent). Adjacent paragraphs are complete captions, including any authored labels; their labels are not duplicated. Omit for the existing authoring owner (Markdown for an ordinary file); ordinary prose is never inferred to be a caption.')
     checks: PublicationChecks | None = Field(default=None, exclude_if=lambda value: value is None,
         description='Optional finite rules explicitly supplied by the user. Requires compile_pdf=true and installed Poppler tools. Missing tools, bounded-output failure or rule failure retain diagnostics and prevent final delivery. No automatic edits or recompile; absence of literals never certifies anonymity.')
     template: PublicationTemplate | None = Field(default=None,
@@ -354,7 +354,8 @@ class PublicationToolGateway:
             source = self.report_source(request.markdown) if self.report_source else None
         if source is not None and request.caption_source is not None:
             caption_owner = source.get('figure_caption_owner', 'markdown' if request.candidate_result else None)
-            if caption_owner is not None and request.caption_source != caption_owner:
+            selected_owner = 'markdown' if request.caption_source == 'adjacent' else request.caption_source
+            if caption_owner is not None and selected_owner != caption_owner:
                 raise ValueError('Choose the caption source bound by the writing owner')
         if source is not None and 'publication_options' in source:
             excluded = {'markdown', 'delivery', 'candidate_result'}
@@ -882,7 +883,8 @@ class PublicationToolGateway:
                     return _authorized_image(self.workspace, path)
 
                 try:
-                    caption_owner = request.caption_source or (report_identity or {}).get('figure_caption_owner', 'markdown')
+                    caption_owner = ('markdown' if request.caption_source == 'adjacent' else
+                        request.caption_source or (report_identity or {}).get('figure_caption_owner', 'markdown'))
                     manifest = export_acm_report(render_source.parent, output, title=request.title or None,
                         body_name=source.name, compile_pdf=request.compile_pdf, render_preview=request.render_preview, runner=render,
                         preflight=preflight,
@@ -890,6 +892,7 @@ class PublicationToolGateway:
                         **({'resolve_image': resolve_image}
                            if binding.get('image_binding_version') == 2 else {}),
                         caption_owner=caption_owner,
+                        **({'adjacent_captions': True} if request.caption_source == 'adjacent' else {}),
                         **({'layout': request.layout} if request.layout is not None else {}),
                         **({'article_rendering': binding.get('article_rendering',
                             {'schema_version': 'article-rendering.v1'})} if request.layout == 'article' else {}),

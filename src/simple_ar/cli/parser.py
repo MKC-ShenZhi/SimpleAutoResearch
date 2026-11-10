@@ -51,8 +51,8 @@ def build_parser(
                                help="Choose the built-in article or ACM layout; omit for historical ACM. Cannot be combined with --latex-template.")
     export_parser.add_argument("--citation-style", choices=("numeric", "template"), default=None,
                                help="Explicit numeric natbib display override, or preserve template citation defaults. Omit for historical behavior; no source keys or bibliography fields are changed.")
-    export_parser.add_argument("--caption-source", choices=("markdown", "manifest"), default=None,
-                               help="Use captions in Markdown image text or the assembled figure manifest; omit for historical manifest ownership.")
+    export_parser.add_argument("--caption-source", choices=("markdown", "manifest", "adjacent"), default=None,
+                               help="Use captions in Markdown image text, the assembled figure manifest, or the paragraph following each image; omit for historical manifest ownership.")
     export_parser.add_argument("--latex-template", help="Trusted Pandoc LaTeX template path relative to --report-dir; requires body and preamble header-includes hooks. Omit for ACM.")
     export_parser.add_argument("--template-asset", action="append", default=[],
                                help="Explicit flat companion filename beside --latex-template; repeat as needed.")

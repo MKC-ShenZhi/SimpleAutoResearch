@@ -159,7 +159,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             if args.caption_source is not None:
                 if args.caption_source == 'manifest' and not (args.report_dir / 'figures/figures_manifest.json').is_file():
                     raise ValueError('The selected caption manifest is not present in the report directory')
-                options['caption_owner'] = args.caption_source
+                options['caption_owner'] = 'markdown' if args.caption_source == 'adjacent' else args.caption_source
+                if args.caption_source == 'adjacent':
+                    options['adjacent_captions'] = True
             result = export_acm_report(args.report_dir, args.output, title=args.title, compile_pdf=args.compile,
                                        **options)
         except (OSError, ValueError) as exc:

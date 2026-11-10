@@ -38,6 +38,10 @@ class CliTests(unittest.TestCase):
                 main([*argv, '--layout', layout])
                 export.assert_called_once_with(Path('report'), Path('new-export'), title=None,
                     compile_pdf=False, layout=layout)
+            export.reset_mock()
+            main([*argv, '--caption-source', 'adjacent'])
+            export.assert_called_once_with(Path('report'), Path('new-export'), title=None,
+                compile_pdf=False, caption_owner='markdown', adjacent_captions=True)
             for style in ('numeric', 'template'):
                 export.reset_mock()
                 main([*argv, '--citation-style', style, '--latex-template', 'layout/article.latex',

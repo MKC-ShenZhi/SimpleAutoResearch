@@ -397,7 +397,7 @@ simple-ar report-export --report-dir PATH --output PATH [OPTIONS]
 | `--title TEXT` | Reader-facing publication title. | Unset |
 | `--layout CHOICE` | Built-in `article` or `acm` layout; cannot be combined with --latex-template. | ACM when unset |
 | `--citation-style CHOICE` | Numeric natbib display or template defaults; source citation keys unchanged. Choices: `numeric`, `template`. | Unset |
-| `--caption-source CHOICE` | Use figure captions from Markdown image text or the assembled figure manifest: `markdown` or `manifest`. Adjacent prose is not inferred as a caption. | Unset; manifest for assembled reports |
+| `--caption-source CHOICE` | Use captions from Markdown image text (`markdown`), the assembled figure manifest (`manifest`), or the immediately following paragraph for each image (`adjacent`). Following paragraphs contain the complete caption, including any label; other prose is not inferred as a caption. | Unset; manifest for assembled reports |
 | `--latex-template PATH` | Trusted Pandoc LaTeX template relative to --report-dir; an alternative to --layout. | Unset |
 | `--template-asset NAME` | Flat companion filename beside template; repeatable; requires --latex-template. | [] |
 | `--tex-engine CHOICE` | Installed engine for custom template; requires --latex-template; BibTeX bibliography. Choices: `pdflatex`, `xelatex`. | Unset |

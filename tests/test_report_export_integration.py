@@ -91,7 +91,45 @@ class PortableExportIntegrationTests(unittest.TestCase):
                 rendered = (workspace.resolve(result.data['project']) / 'source.md').read_text(encoding='utf-8')
                 self.assertIn('Full figure description.', rendered)
                 self.assertEqual('Short description' in rendered, owner == 'markdown')
+            request = {**arguments, 'caption_source': 'adjacent'}
+            identity = 'caption-adjacent'
+            context = SimpleNamespace(attempt=SimpleNamespace(attempt_id=identity))
+            approval = gateway.approval_binding(request, identity=identity)
+            result = gateway.execute_tool('export_report', context, request, approval={'binding': approval})
+            self.assertTrue(result.ok, result.error)
+            self.assertEqual(result.data['manifest']['figure_caption_owner'], 'markdown')
+            self.assertEqual(result.data['manifest']['figure_caption_source'], 'adjacent')
+            project = workspace.resolve(result.data['project'])
+            self.assertEqual(json.loads((project / 'publication_view.json').read_text())['caption_source'], 'adjacent')
+            self.assertIn('Full figure description.', (project / 'source.md').read_text(encoding='utf-8'))
             self.assertEqual(draft.read_text(encoding='utf-8'), original)
+
+    @unittest.skipUnless(shutil.which('pdftotext'), 'Caption output requires Poppler')
+    def test_following_captions_compile_once_in_article_and_acm(self):
+        import base64
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'input'
+            source.mkdir()
+            original = ('# Report\n\n![Short description](plot.png)\n\n'
+                '*Figure 1. A complete caption describing the observation.*\n\n'
+                'This separate paragraph explains the implication.\n')
+            (source / 'report_body.md').write_text(original, encoding='utf-8')
+            (source / 'plot.png').write_bytes(base64.b64decode(
+                'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='))
+            for layout in ('article', 'acm'):
+                with self.subTest(layout=layout):
+                    output = root / layout
+                    result = export_acm_report(source, output, layout=layout, compile_pdf=True,
+                        caption_owner='markdown', adjacent_captions=True)
+                    self.assertTrue(result['compiled'], result)
+                    text = subprocess.check_output(['pdftotext', str(output / 'main.pdf'), '-'], text=True)
+                    text = ' '.join(text.split())
+                    self.assertEqual(text.count('Figure 1.'), 1)
+                    self.assertIn('A complete caption describing the observation.', text)
+                    self.assertIn('This separate paragraph explains the implication.', text)
+                    self.assertNotIn('Short description', text)
+            self.assertEqual((source / 'report_body.md').read_text(encoding='utf-8'), original)
 
     @unittest.skipUnless(all(shutil.which(name) for name in ('pdftotext', 'pdfinfo', 'pdftoppm')),
         'Caption pagination checks require Poppler')

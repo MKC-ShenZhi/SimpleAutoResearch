@@ -589,6 +589,29 @@ class ReportExportTests(unittest.TestCase):
                 caption_owner='markdown'), [])
             self.assertEqual(ast, before)
 
+    def test_explicit_following_paragraph_captions_preserve_content_and_other_prose(self):
+        from copy import deepcopy
+        from simple_ar.report.export import _bind_figure_captions
+        image = {'t': 'Image', 'c': [['', [], []], [{'t': 'Str', 'c': 'Short alt'}], ['plot.png', 'fig:']]}
+        caption = [{'t': 'Emph', 'c': [{'t': 'Str', 'c': 'Figure'}, {'t': 'Space'},
+            {'t': 'Str', 'c': '1.'}, {'t': 'Space'}, {'t': 'Str', 'c': 'Measured results.'}]}]
+        discussion = {'t': 'Para', 'c': [{'t': 'Str', 'c': 'Separate interpretation.'}]}
+        for modern in (False, True):
+            with self.subTest(modern=modern):
+                paragraph = {'t': 'Para', 'c': [deepcopy(image)]}
+                figure = {'t': 'Figure', 'c': [['', [], []], [None, []], [paragraph]]} if modern else paragraph
+                ast = {'blocks': [figure, {'t': 'Para', 'c': deepcopy(caption)}, deepcopy(discussion)]}
+                self.assertEqual(_bind_figure_captions(ast, {}, caption_owner='adjacent'), ['plot.png'])
+                self.assertEqual(ast['blocks'], [figure, discussion])
+                if modern:
+                    self.assertEqual(figure['c'][1], [None, [{'t': 'Plain', 'c': caption}]])
+                    self.assertEqual(figure['c'][2][0]['c'][0]['c'][1], image['c'][1])
+                else:
+                    self.assertEqual(figure['c'][0]['c'][1], caption)
+                    self.assertEqual(figure['c'][0]['c'][-1][1], 'fig:')
+                with self.assertRaisesRegex(ReportExportError, 'immediately following caption'):
+                    _bind_figure_captions({'blocks': [deepcopy(figure)]}, {}, caption_owner='adjacent')
+
     def test_scientific_unicode_support_is_fixed_and_only_for_present_symbols(self):
         from simple_ar.report.export import _scientific_unicode_preamble
 

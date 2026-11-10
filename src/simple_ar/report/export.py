@@ -236,20 +236,35 @@ def _plain_inlines(inlines: list[dict]) -> str:
 
 
 def _bind_figure_captions(ast: dict, captions: dict[str, list[dict]], *,
-                          caption_owner: Literal['manifest', 'markdown'] = 'manifest') -> list[str]:
+                          caption_owner: Literal['manifest', 'markdown', 'adjacent'] = 'manifest') -> list[str]:
     """Bind recorded figure captions, for both legacy and modern Pandoc ASTs.
 
     Managed exports retain manifest precedence; canonical Markdown exports use
     recorded captions only when Pandoc has no authored caption. Only an
-    AST-identical adjacent paragraph
-    (optionally wrapped in emphasis) is redundant; never infer caption prose.
+    AST-identical adjacent paragraph (optionally wrapped in emphasis) is
+    redundant. Adjacent ownership explicitly binds the following paragraph;
+    otherwise the converter never infers caption prose.
     Walk block containers too, without rebinding a modern Figure's inner image.
     """
-    if caption_owner not in {'manifest', 'markdown'}:
+    if caption_owner not in {'manifest', 'markdown', 'adjacent'}:
         raise ReportExportError('Unknown figure caption owner')
     bound, blocks = [], []
     pending_caption = None
+    adjacent_figure = None
     for block in ast["blocks"]:
+        if adjacent_figure is not None:
+            if block.get('t') not in {'Para', 'Plain'}:
+                raise ReportExportError('Each figure needs an immediately following caption paragraph')
+            figure, image, path = adjacent_figure
+            caption = deepcopy(block['c'])
+            if figure['t'] == 'Figure':
+                figure['c'][1] = [None, [{'t': 'Plain', 'c': caption}]]
+            else:
+                image['c'][1] = caption
+                image['c'][-1][1] = 'fig:'
+            bound.append(path)
+            adjacent_figure = None
+            continue
         if pending_caption is not None and block.get("t") in {"Para", "Plain"}:
             inlines = block["c"]
             if len(inlines) == 1 and inlines[0].get("t") == "Emph":
@@ -273,7 +288,9 @@ def _bind_figure_captions(ast: dict, captions: dict[str, list[dict]], *,
                 authored = bool(short_caption) or any(row.get('c') for row in long_caption)
                 caption = (long_caption[0]['c'] if len(long_caption) == 1
                            and long_caption[0].get('t') in {'Para', 'Plain'} else [])
-            if path in captions and (caption_owner == 'manifest' or not authored):
+            if caption_owner == 'adjacent':
+                adjacent_figure = (block, image, path)
+            elif path in captions and (caption_owner == 'manifest' or not authored):
                 caption = deepcopy(captions[path])
                 image["c"][1] = caption
                 if block["t"] == "Figure":
@@ -281,7 +298,7 @@ def _bind_figure_captions(ast: dict, captions: dict[str, list[dict]], *,
                 else:
                     image["c"][-1][1] = "fig:"  # legacy implicit-figure marker
                 bound.append(path)
-            pending_caption = caption or None
+            pending_caption = None if caption_owner == 'adjacent' else (caption or None)
         if not standalone:
             def visit(value: Any) -> None:
                 if isinstance(value, list):
@@ -296,6 +313,8 @@ def _bind_figure_captions(ast: dict, captions: dict[str, list[dict]], *,
                     visit(value.get('c'))
             visit(block.get('c'))
         blocks.append(block)
+    if adjacent_figure is not None:
+        raise ReportExportError('Each figure needs an immediately following caption paragraph')
     ast["blocks"] = blocks
     return bound
 
@@ -684,6 +703,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                       runner: Callable | None = None, validate_asset: Callable[[Path], str | None] | None = None,
                       resolve_image: Callable[[Path], Path] | None = None,
                       caption_owner: Literal['manifest', 'markdown'] = 'manifest',
+                      adjacent_captions: bool = False,
                       template: dict[str, Any] | None = None,
                       layout: Literal['article', 'acm'] | None = None,
                       article_rendering: dict[str, Any] | None = None,
@@ -723,6 +743,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     numeric_citations = citation_style == 'numeric' or article and citation_style is None
     if caption_owner not in {'manifest', 'markdown'}:
         raise ReportExportError('Unknown figure caption owner')
+    if adjacent_captions and caption_owner != 'markdown':
+        raise ReportExportError('Following-paragraph captions require Markdown ownership')
     if render_preview and not compile_pdf:
         raise ReportExportError("render_preview requires compile_pdf=true")
     if checks is not None:
@@ -771,7 +793,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             if row['path'] in captions and captions[row['path']] != parsed[0]['c']:
                 raise ReportExportError("Conflicting recorded captions for the same figure path.")
             captions[row["path"]] = parsed[0]["c"]
-    bound_captions = _bind_figure_captions(ast, captions, caption_owner=caption_owner)
+    bound_captions = _bind_figure_captions(ast, captions,
+        caption_owner='adjacent' if adjacent_captions else caption_owner)
     source_ast = deepcopy(ast)
     blocks = ast["blocks"]
     # Explicit titles are literal prose, not one unbreakable identifier.
@@ -862,6 +885,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                                                     "source.md", "template.latex", "README.txt", "export.json"]}
     if layout is not None:
         manifest['layout'] = layout
+    if adjacent_captions:
+        manifest['figure_caption_source'] = 'adjacent'
     if article:
         manifest['format'] = 'article'
         manifest['article_rendering'] = article_rendering
@@ -940,6 +965,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                 for index, (url, path) in enumerate(image_sources.items(), start=1)},
             'logical_document': source_ast,
         }
+        if adjacent_captions:
+            publication_view['caption_source'] = 'adjacent'
         # The producer knows which copied/generated assets make the editable
         # project portable. Diagnostic ASTs, checks, previews and build products
         # remain on disk and byte-bound; they are not project deliverables.
@@ -1008,6 +1035,12 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             "\\providecommand{\\passthrough}[1]{#1}\n"
             "\\setlength{\\emergencystretch}{1em}\n") if template_files or article else ''
         preamble += _figure_pagination_preamble()
+        if adjacent_captions:
+            # The author supplies the complete caption, including any label.
+            # Keep TeX's figure counter/references, but do not print a second label.
+            preamble += ("\\makeatletter\n"
+                "\\@ifpackageloaded{caption}{}{\\usepackage{caption}}\n"
+                "\\makeatother\n\\captionsetup[figure]{labelformat=empty}\n")
         if numeric_citations and citations:
             # Templates/classes may already load natbib (even before this
             # header hook). Configure after preamble setup but before the aux

@@ -396,7 +396,7 @@ simple-ar report-export --report-dir PATH --output PATH [OPTIONS]
 | `--title TEXT` | 面向读者的出版标题。 | 未设置 |
 | `--layout CHOICE` | 内置 `article` 或 `acm` 版式；不能与 --latex-template 同用。 | 未设置时为 ACM |
 | `--citation-style CHOICE` | 数字 natbib 显示或模板默认值；不改变来源引用键。 可选：`numeric`, `template`. | 未设置 |
-| `--caption-source CHOICE` | 使用 Markdown 图片文本或已组装图件清单中的图注：`markdown` 或 `manifest`；不把相邻正文猜作图注。 | 未设置；已组装报告使用清单 |
+| `--caption-source CHOICE` | 使用 Markdown 图片文本（`markdown`）、已组装图件清单（`manifest`）或每张图片紧随的段落（`adjacent`）作为图注。相邻段落须包含完整图注及所需编号；不将其他正文猜作图注。 | 未设置；已组装报告使用清单 |
 | `--latex-template PATH` | 相对 --report-dir 的可信 Pandoc LaTeX 模板，与 --layout 二选一。 | 未设置 |
 | `--template-asset NAME` | 模板同目录的平面配套文件名，可重复；要求 --latex-template。 | [] |
 | `--tex-engine CHOICE` | 自定义模板的已安装引擎；要求 --latex-template；使用 BibTeX 文献表。 可选：`pdflatex`, `xelatex`. | 未设置 |
