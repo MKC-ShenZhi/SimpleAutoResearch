@@ -6,6 +6,7 @@ stage selection for the migrated entry, rather than calling ResearchApplication.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from copy import deepcopy
 import hashlib
 import json
@@ -4386,6 +4387,7 @@ class ToolApplication:
         operation_exit = self.state['config'].get('completion_policy') == _OPERATION_EXIT
         integrated = self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES
         journal = self.state['config'].get('memory_protocol') == 'journal.v1'
+        inspection = self.operations.inspection if self.state['config'].get('control_protocol') else None
         working_memory, memory_refs = None, ()
         selection = {}
         exit_value = None
@@ -4489,7 +4491,8 @@ class ToolApplication:
                     **({'economic_floor':selection['required_input_tokens']}
                        if self.state['config'].get('context_checkpoint_policy') in {'economic.v2', 'economic.v3'}
                           and selection.get('economical_compaction', False) else {}))
-            self.operations.inspection.clear_presentation_scope()
+            if inspection is not None:
+                inspection.clear_presentation_scope()
             if memory_refs:
                 memory_refs = self._memory_artifacts(context.store, context.attempt.attempt_id)
                 if context.store.exists('memory_snapshot.json'):
@@ -4506,7 +4509,7 @@ class ToolApplication:
                             operations_for_turn=self._memory_operations)}
                     working_memory['notes'] = self.operations.project_notes(working_memory['notes'])
 
-        with self.operations.inspection.presentation_scope():
+        with inspection.presentation_scope() if inspection is not None else nullcontext():
             value = conversation.prepare(project,
                 followup=lambda value:(self._lifecycle_floor(
                     {'llm_requests':1, 'total_tokens':conversation.tokens(value)}) if integrated else
