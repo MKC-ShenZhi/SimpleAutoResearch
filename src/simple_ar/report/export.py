@@ -717,6 +717,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     model is called and no upstream evidence or session state is changed.
     Managed report consumers keep manifest captions by default; direct canonical
     workspace publication explicitly selects Markdown ownership.
+    Adjacent captions are explicitly selected complete paragraphs, including
+    authored labels; ordinary following prose is not guessed to be a caption.
     Only an explicit image resolver can extend image authority; validate_asset
     verifies bytes and never relaxes the default report-directory boundary.
     Templates retain their separate manuscript-directory trust contract. Explicit

@@ -121,7 +121,8 @@ class PortableExportIntegrationTests(unittest.TestCase):
             (source / 'report_body.md').write_text(original, encoding='utf-8')
             (source / 'custom.latex').write_text(
                 '\\documentclass{article}\n$for(header-includes)$\n$header-includes$\n$endfor$\n'
-                '\\usepackage[font=small]{caption}\n\\begin{document}\n$body$\n\\end{document}\n',
+                '\\usepackage{hyperref}\n\\usepackage[font=small]{caption}\n'
+                '\\begin{document}\n$body$\n\\end{document}\n',
                 encoding='utf-8')
             (source / 'plot.png').write_bytes(base64.b64decode(
                 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='))
