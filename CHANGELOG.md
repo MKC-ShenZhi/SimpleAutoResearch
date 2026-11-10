@@ -16,6 +16,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- Independent delivery review can find recorded task executions and copy the task workspace into its own area for checks; historical execution remains distinct from an independent result.
 - Current source observations remain eligible for the working view after a memory checkpoint when context permits, including during independent inspection.
 
 ## 2026-11-09
