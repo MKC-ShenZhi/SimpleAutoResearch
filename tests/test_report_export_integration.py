@@ -102,6 +102,15 @@ class PortableExportIntegrationTests(unittest.TestCase):
             project = workspace.resolve(result.data['project'])
             self.assertEqual(json.loads((project / 'publication_view.json').read_text())['caption_source'], 'adjacent')
             self.assertIn('Full figure description.', (project / 'source.md').read_text(encoding='utf-8'))
+            request.pop('layout')  # The ordinary publication entrance defaults to ACM.
+            identity = 'caption-adjacent-default'
+            context = SimpleNamespace(attempt=SimpleNamespace(attempt_id=identity))
+            approval = gateway.approval_binding(request, identity=identity)
+            result = gateway.execute_tool('export_report', context, request, approval={'binding': approval})
+            self.assertTrue(result.ok, result.error)
+            self.assertEqual(result.data['manifest']['technical_rendering'], 'natural')
+            self.assertEqual(result.data['manifest']['figure_caption_source'], 'adjacent')
+            self.assertEqual(gateway.call('export_report', request, identity=identity).data, result.data)
             self.assertEqual(draft.read_text(encoding='utf-8'), original)
 
     @unittest.skipUnless(shutil.which('pdftotext'), 'Caption output requires Poppler')
