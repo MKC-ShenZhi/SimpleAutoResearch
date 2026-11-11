@@ -153,7 +153,9 @@ class NativeGoalWorkTests(unittest.TestCase):
         owner = InspectionToolGateway.__new__(InspectionToolGateway)
         owner.protocol = 'subjects.v3'
         owner.workspace = SimpleNamespace(workspace=Path.cwd() / 'workspace')
-        owner._execution_facts = lambda *args, **kwargs: {}
+        execution = 'attempts/native-action-0123456789abcdef/native_result.json'
+        source = 'tools/inspection/native-tool-0012/sources-2.json#results/0'
+        owner._execution_facts = lambda *args, **kwargs: {execution: {'source_record': source}}
         owner._selected_inspection_rows = lambda *args: []
         owner._check_inspection_versions = lambda *args, **kwargs: None
         artifact = str(owner.workspace.workspace / 'project' / 'report.md')
@@ -170,7 +172,8 @@ class NativeGoalWorkTests(unittest.TestCase):
         self.assertEqual(owner._review_artifact_name(artifact), visible)
         response = {'conclusion': 'complete', 'applicability': 'The report was checked.',
             'investigations': [{'claim': 'The report states the measurement.', 'scope': 'The report.',
-                'basis': 'observed', 'method': 'Read the report.', 'reasoning': 'The value is present.',
+                'basis': 'executed', 'execution_records': [source],
+                'method': 'Check the report.', 'reasoning': 'The value is present.',
                 'evidence': ['evidence-1'], 'outcome': 'supported',
                 'findings': [{'severity': 'advisory', 'message': 'Clarify the units.', 'artifacts': [visible]}]}],
             'limitations': [], 'reassessed_prior': [],
@@ -186,22 +189,30 @@ class NativeGoalWorkTests(unittest.TestCase):
         self.assertEqual(error, '')
         self.assertEqual(final['requested_outcomes'][0]['artifacts'], [artifact])
         self.assertEqual(final['investigations'][0]['findings'][0]['artifacts'], [artifact])
+        self.assertEqual(final['investigations'][0]['execution_records'], [execution])
         self.assertEqual(response['requested_outcomes'][0]['artifacts'], [visible])
+        self.assertEqual(response['investigations'][0]['execution_records'], [source])
 
         # Previously offered absolute names remain valid, but an unlisted
         # short name cannot become a delivered artifact.
         old = deepcopy(response)
         old['requested_outcomes'][0]['artifacts'] = [artifact]
         old['investigations'][0]['findings'][0]['artifacts'] = [artifact]
+        old['investigations'][0]['execution_records'] = [execution]
         old_schema = deepcopy(schema)
         for definition in [old_schema, *old_schema.get('$defs', {}).values()]:
             if 'artifacts' in definition.get('properties', {}):
                 definition['properties']['artifacts']['items']['enum'] = [artifact]
+            if 'execution_records' in definition.get('properties', {}):
+                definition['properties']['execution_records']['items']['enum'] = [execution]
         old_offer = [{'type': 'function', 'function': {'name': 'record_inspection', 'parameters': old_schema}}]
         self.assertEqual(admit(old, old_offer)[1], '')
         missing = deepcopy(response)
         missing['requested_outcomes'][0]['artifacts'] = ['workspace/project/missing.md']
         self.assertIn('artifacts in the proposed delivery', admit(missing)[1])
+        missing = deepcopy(response)
+        missing['investigations'][0]['execution_records'] = ['tools/inspection/unknown']
+        self.assertIn('actual own successful action records', admit(missing)[1])
 
     def test_closed_history_continues_without_replaying_or_forging_provider_reasoning(self):
         from simple_ar.app.professional_conversation import continuation_blocks, NATIVE_HISTORY_POLICY

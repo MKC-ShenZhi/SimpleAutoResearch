@@ -2414,6 +2414,11 @@ class InspectionToolGateway:
                     'source_record':row['source_record']}
         return facts
 
+    @staticmethod
+    def _review_execution_names(facts: dict[str, dict]) -> dict[str, str]:
+        """Use the inspection's existing source-action locator for each accepted check."""
+        return {fact['source_record']:record for record, fact in facts.items()}
+
     def _delivery_assessment(self, saved: dict, receipt: dict, identity: str, failure: str,
                              *, check_versions: bool = True) -> tuple[dict, str]:
         """A whole-work opinion, never a representative file's extended pass."""
@@ -3116,8 +3121,13 @@ class InspectionToolGateway:
         execution_facts = (self._execution_facts(saved)
             if applicable and saved.get('inspection_material_policy') == 'operations.v3' else None)
         if saved.get('work_method') in NATIVE_WORK_METHODS and self._delivery_scope(saved):
-            base['executed_checks'] = sorted(execution_facts if execution_facts is not None
-                else self._executed_check_records(saved))
+            if (saved.get('inspection_evidence_policy') == 'presented.v6'
+                    and saved.get('inspection_material_policy') == 'operations.v3'):
+                facts = execution_facts if execution_facts is not None else self._execution_facts(saved)
+                base['executed_checks'] = sorted(self._review_execution_names(facts))
+            else:
+                base['executed_checks'] = sorted(execution_facts if execution_facts is not None
+                    else self._executed_check_records(saved))
         if saved.get('inspection_material_policy') == 'operations.v3':
             base['retained_investigations'] = [{'inspection':item['identity'],
                 'source_rounds':len(item.get('source_rounds', []))} for item in self._retained_inputs(saved)]
@@ -4386,6 +4396,12 @@ class InspectionToolGateway:
                             *(finding for check in final['investigations'] for finding in check['findings'])]
                         for row in rows:
                             row['artifacts'] = [artifacts.get(path, path) for path in row['artifacts']]
+                        if (saved.get('inspection_material_policy') == 'operations.v3'
+                                and any(check['execution_records'] for check in final['investigations'])):
+                            executions = self._review_execution_names(self._execution_facts(saved))
+                            for check in final['investigations']:
+                                check['execution_records'] = [executions.get(path, path)
+                                    for path in check['execution_records']]
                     if saved.get('inspection_evidence_policy') in {'presented.v3', 'presented.v4', 'presented.v5', 'presented.v6'}:
                         final, resolutions = self._retain_valid_investigations(saved, final)
                         owner_bindings.extend(resolutions)
@@ -4455,10 +4471,18 @@ class InspectionToolGateway:
             if 'evidence' in properties and (nested or definition is schema):
                 choices(properties['evidence'], sources)
             if nested and 'execution_records' in properties:
-                choices(properties['execution_records'], sorted(self._executed_check_records(saved)))
+                if (saved.get('inspection_evidence_policy') == 'presented.v6'
+                        and saved.get('inspection_material_policy') == 'operations.v3'):
+                    # The owner validates selected records against actual
+                    # executions; a second long enum is not an execution fact.
+                    properties['execution_records']['uniqueItems'] = True
+                else:
+                    choices(properties['execution_records'], sorted(self._executed_check_records(saved)))
                 if saved.get('inspection_material_policy') == 'operations.v3':
+                    kind = ('source-action records' if saved.get('inspection_evidence_policy') == 'presented.v6'
+                        else 'execution records')
                     properties['execution_records']['description'] = (
-                        'Eligible original independent execution records actually used in this judgment, '
+                        f'Eligible independent {kind} actually used in this judgment, '
                         'including verified retained runs. Choose only from executed_checks. '
                         'Retained work remains historical; do not claim it was executed afresh. '
                         'A derived or observed judgment may also cite relevant actual execution records.')
