@@ -102,6 +102,23 @@ def _delivered_project_version(reader: RetainedDelivery) -> tuple[int, Path] | N
     return len(versions), reader.mounts['workspace'] / project
 
 
+def _listed_native_project(reader: RetainedDelivery) -> Path | None:
+    """Use the delivery's declared project, or the compatible older contract."""
+    try:
+        if reader.record('delivery.json').get('project_root') is None:
+            try:
+                project = _native_project(reader)
+            except PartialProjectDelivery:
+                project = None
+            if project is not None:
+                return project[0]
+        delivered = _delivered_project_version(reader)
+        return delivered[1] if delivered is not None else None
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print_line(f'code_project unavailable: {exc}')
+        return None
+
+
 def select_reuse(root: Path, names: list[str] | tuple[str, ...], *,
                  access: ReuseAccess | None = None, version: int | None = None) -> ReuseSelection:
     """Select current byte-proved groups; never carry execution authority forward.
@@ -239,20 +256,8 @@ def session_materials(root: Path, *, authorize=None, include_project: bool = Tru
         reader = RetainedDelivery(root, authorize=authorize)
         available = reader.reusable_materials()
         available.pop('code_project', None)
-        if include_project:
-            eligible = True
-            try:
-                project = _native_project(reader)
-            except PartialProjectDelivery:
-                project = None
-            except (OSError, ValueError, KeyError, TypeError) as exc:
-                print_line(f'code_project unavailable: {exc}')
-                project = None
-                eligible = False
-            if project is not None:
-                available['code_project'] = [project[0]]
-            elif eligible and (delivered := _delivered_project_version(reader)) is not None:
-                available['code_project'] = [delivered[1]]
+        if available and include_project and (project := _listed_native_project(reader)) is not None:
+            available['code_project'] = [project]
         return available
     from simple_ar.core.capabilities import CapabilityRegistry
     from simple_ar.core.session import SessionController
@@ -266,23 +271,8 @@ def session_materials(root: Path, *, authorize=None, include_project: bool = Tru
         reader = RetainedDelivery(root)
         available = reader.reusable_materials()
         available.pop('code_project', None)  # Complete project proof is separate from portable file groups.
-        if not include_project:
-            return available
-        eligible = True
-        try:
-            project = session_project(session, authorize=authorize)
-        except PartialProjectDelivery:
-            project = None
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            # Portable files retain their own proof even when the complete
-            # executable project is ambiguous, unavailable or changed.
-            print_line(f'code_project unavailable: {exc}')
-            project = None
-            eligible = False
-        if project is not None:
-            available['code_project'] = [project[0]]
-        elif eligible and (delivered := _delivered_project_version(reader)) is not None:
-            available['code_project'] = [delivered[1]]
+        if available and include_project and (project := _listed_native_project(reader)) is not None:
+            available['code_project'] = [project]
         return available
     available: dict[str, list[Path]] = {}
     project = session_project(session, authorize=authorize)

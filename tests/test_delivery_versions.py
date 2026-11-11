@@ -65,15 +65,18 @@ class DeliveryVersionTests(unittest.TestCase):
         self.app.run(actions=[
             action('write_file', {'path': 'analysis/main.py', 'content': 'result = 1\n'}),
             action('write_file', {'path': 'analysis/private.csv', 'content': 'not delivered\n'}),
+            action('write_file', {'path': 'other/tool.py', 'content': 'other = 1\n'}),
+            action('copy_project', {'source': 'other', 'path': 'previous-copy'}),
             action('write_file', {'path': 'report.md', 'content': 'Summary\n'}),
             action('deliver_result', {'summary': 'Project and report', 'project_root': 'analysis',
-                'artifacts': ['analysis/main.py', 'report.md']})], progress=lambda _: None)
-        from simple_ar.app.reuse import select_reuse
+                'artifacts': ['analysis/main.py', 'report.md', 'previous-copy/tool.py']})], progress=lambda _: None)
+        from simple_ar.app.reuse import select_reuse, session_materials
         selection = select_reuse(self.root, ['code_project', 'artifacts'])
         self.assertEqual(selection.version, 1)
+        self.assertEqual(session_materials(self.root)['code_project'], [self.root/'workspace/analysis'])
         groups = DeliveryVersions(self.root).materials(1)
         self.assertEqual(list(groups['code_project']), ['analysis/main.py'])
-        self.assertEqual(set(groups['artifacts']), {'analysis/main.py', 'report.md'})
+        self.assertEqual(set(groups['artifacts']), {'analysis/main.py', 'report.md', 'previous-copy/tool.py'})
 
     def test_paused_task_history_becomes_exact_new_inputs_without_inheriting_task_state(self):
         first = self.deliver()
