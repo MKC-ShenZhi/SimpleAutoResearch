@@ -486,6 +486,18 @@ class GoalWorkTests(unittest.TestCase):
         self.case._create(delivery_protocol=None, current_method=True,
             goal='Prepare a bounded note from the supplied observations; independently check numerical claims.')
 
+    def test_inspection_process_default_is_accepted_by_its_owner(self):
+        owner = self.case.app.operations.inspection
+        tools = owner._shared_tools('review-example')
+        process = next(row['function'] for row in tools if row['function']['name'] == 'run_process')
+        cwd = process['parameters']['properties']['cwd']['default']
+        self.assertEqual(cwd, 'workspace/inspection-work/review-example')
+        saved = {'identity': 'review-example', 'targets': [], 'evidence': []}
+        call = {'function': {'name': 'run_process'}}
+        owner._shared_preflight(saved, call, {'cwd': cwd})
+        with self.assertRaisesRegex(ValueError, 'own work directory'):
+            owner._shared_preflight(saved, call, {'cwd': 'workspace'})
+
     def choice(self, *, actions=(), candidate=None, remaining=None):
         requests = self.case.app.state['requests']
         return _action('select_work', remaining=(remaining if remaining is not None else [

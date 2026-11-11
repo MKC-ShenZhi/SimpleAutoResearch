@@ -750,8 +750,10 @@ class InspectionToolGateway:
                      f'Destination inside workspace/inspection-work/{identity}/; ')
                     + 'Original files remain unchanged.')
             if spec.name == 'run_process' and 'cwd' in properties:
+                properties['cwd']['default'] = f'workspace/inspection-work/{identity}'
                 properties['cwd']['description'] = (
                     f'Working directory inside workspace/inspection-work/{identity}/. '
+                    'Use the recorded absolute paths for source files outside this directory. '
                     'Declared outputs must also be inside that directory. Ordinary approval applies; no sandbox is implied.')
             result.append({'type':'function', 'function':{'name':spec.name,
                 'description':spec.description, 'parameters':compact_json_schema(schema)}})

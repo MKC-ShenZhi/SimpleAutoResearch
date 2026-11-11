@@ -17,6 +17,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- Independent review now offers a process working-directory default within its allowed work area.
 - A report candidate declared complete surfaces known publication gaps before a final-scope review; incomplete candidates can still be investigated.
 - Independent review can accept opinions with redundant empty fields while retaining the original response and checks for substantive findings, evidence and versions.
 - Report export can be approved after a previously remembered process without treating publication settings as command arguments.
