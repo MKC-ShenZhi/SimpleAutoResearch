@@ -228,9 +228,10 @@ class WorkingSupplyContinuityTests(unittest.TestCase):
         feedback = feedback_observations({'review_observations': [{
             'record': record, 'subjects': [{'path': 'workspace/report.md', 'current_matches_review': True}],
             'result': {'data': {'review': 'Reuse the recorded comparison.'}}}]})
+        old_text = 'UNRELATED INSPECTION ' * 800
         rows = feedback + [{'turn': 0, 'record': record, 'kind': 'source_text',
             'role': 'historical_observation', 'path': 'workspace/other.txt', 'sha256': 'a' * 64,
-            'offset_bytes': 0, 'next_offset_bytes': 20, 'text': 'UNRELATED INSPECTION'}]
+            'offset_bytes': 0, 'next_offset_bytes': len(old_text), 'text': old_text}]
         arguments = dict(user_requests=['Continue the work'], system_text='Respect the task', base_context={},
             turn_blocks=[[{'role': 'assistant', 'content': 'Old inspection'}],
                 [{'role': 'assistant', 'content': 'RECENT_EXECUTION_RESULT'}],
@@ -249,7 +250,7 @@ class WorkingSupplyContinuityTests(unittest.TestCase):
         self.assertEqual([(row['record'], row['source']['kind']) for row in references],
                          [(record, 'operation_result')])
 
-        explicit, _ = select_working_context(**arguments, selected_records=[record])
+        explicit, _ = select_working_context(**{**arguments, 'context_token_target': 100000}, selected_records=[record])
         self.assertIn('UNRELATED INSPECTION', json.dumps(explicit))
 
     def test_current_observations_remain_eligible_after_multiple_read_turns(self):
