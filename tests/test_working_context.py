@@ -1744,6 +1744,25 @@ class CheckpointFailureTests(unittest.TestCase):
         self.assertNotIn('source_integrity',old)
         self.assertEqual(old['observed_versions']['/workspace/inputs/a.txt'], 'b'*64)
 
+    def test_checkpoint_note_binding_reuses_one_view_and_reloads_on_next_restoration(self):
+        from simple_ar.app.operation_tools import OperationTools
+        owner = OperationTools.__new__(OperationTools)
+        owner.config, owner.professional = {'native_supply_policy': TURN_SUPPLY_POLICY}, False
+        calls = []
+        rows = [{'record': 'attempts/read/native_result.json', 'tool_name': 'read_file', 'status': 'ok',
+                 'data': {'path': 'inputs/a.txt', 'absolute_path': '/workspace/inputs/a.txt', 'sha256': 'a'*64}}]
+        owner.observations = lambda: calls.append(1) or list(rows)
+        note = {'text': 'Observed result', 'records': ['records/read/native_result.json']}
+
+        bind = owner.checkpoint_note_binder()
+        first = bind([note])
+        self.assertEqual(bind([note]), first)
+        self.assertEqual(len(calls), 1)
+        rows[0] = {**rows[0], 'data': {**rows[0]['data'], 'sha256': 'b'*64}}
+        second = owner.checkpoint_note_binder()([note])
+        self.assertEqual(len(calls), 2)
+        self.assertNotEqual(first[0]['observed_versions'], second[0]['observed_versions'])
+
     def test_checkpoint_supplies_complete_decision_and_preserves_source_bindings(self):
         decision = {'role':'assistant', 'content':'Compare the measurements before reporting.',
             'tool_calls':[{'id':'read', 'function':{'name':'read_file', 'arguments':'{}'}},
@@ -2843,7 +2862,8 @@ class CheckpointFailureTests(unittest.TestCase):
         app.session = SimpleNamespace(store=journal, attempt_lineage=lambda:attempts,
             manifest=SimpleNamespace(current_attempt='native-turn-test', session_id='session'))
         app.ledger = self.ledger
-        app.operations = SimpleNamespace(bind_notes=self.bind, project_notes=deepcopy)
+        app.operations = SimpleNamespace(bind_notes=self.bind,
+            checkpoint_note_binder=lambda:self.bind, project_notes=deepcopy)
         app._request_capacity = lambda:10
         app._delivery_feedback = lambda:None
         app._coordination_result = lambda result, record, **kwargs:result

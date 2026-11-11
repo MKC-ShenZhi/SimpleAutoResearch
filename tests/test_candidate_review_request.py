@@ -81,12 +81,15 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertFalse((c.root/'delivery.json').exists())
         self.assertFalse(list((c.root/'workspace').rglob('*.pdf')))
         schemas = {r['function']['name']: r['function']['parameters'] for r in c.app.schemas}
-        self.assertNotIn('report', schemas['review_result']['properties'])
-        self.assertNotIn('summary_source', schemas['review_result']['properties'])
+        self.assertIn('report', schemas['review_result']['properties'])
         self.assertIn('report', schemas['deliver_result']['properties'])
+        candidate = validate_workspace_arguments('review_result', {'summary': 'Existing draft',
+            'artifacts': ['note.md'], 'report': {'status': 'candidate', 'manuscript': 'note.md',
+                'formats': ['markdown', 'pdf']}}, candidate_review_protocol='candidate.v1')
+        self.assertEqual(candidate.report.manuscript, 'note.md')
         with self.assertRaises(ValueError):
             validate_workspace_arguments('review_result', {'summary': 'Premature completion',
-                'artifacts': ['note.md'], 'report': {'status': 'canonical'}},
+                'artifacts': [], 'report': {'status': 'canonical', 'manuscript': 'note.md'}},
                 candidate_review_protocol='candidate.v1')
         before = len(c.inspection_requests)
         c._reload()

@@ -749,6 +749,18 @@ class OperationTools:
                 **({'source_integrity':'unknown'} if unknown else {})})
         return result
 
+    def checkpoint_note_binder(self):
+        """Share the original observation view while restoring one journal."""
+        observations = None
+
+        def bind(notes):
+            nonlocal observations
+            if observations is None:
+                observations = self.observations()
+            return self.bind_notes(notes, observations=observations)
+
+        return bind
+
     def project_notes(self, notes: list[dict]) -> list[dict]:
         from simple_ar.app.work_memory import note_currentness
         result = []

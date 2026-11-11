@@ -1123,14 +1123,7 @@ class ToolApplication:
         memory = {'notes':[], 'through_turn':0}
         if self.state['config'].get('memory_protocol') == 'journal.v1':
             memory['compacted_records'] = set()
-            observations = None
-
-            def bind_checkpoint_notes(notes):
-                nonlocal observations
-                if observations is None:
-                    observations = self.operations.observations()
-                return self.operations.bind_notes(notes, observations=observations)
-
+            bind_checkpoint_notes = self.operations.checkpoint_note_binder()
             # The existing attempt lineage orders closed work, including a
             # checkpoint whose following decision failed. There is no second
             # mutable memory state and a retry does not buy the summary again.
