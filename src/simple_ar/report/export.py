@@ -523,7 +523,8 @@ def _natural_table_widths(table: dict) -> list[float]:
             width = sum(2 if unicodedata.east_asian_width(char) in {'F', 'W'} else 1 for char in text)
             weights[column] = max(weights[column], min(width, 32))
     total = sum(weights)
-    return [(1 / count + weight / total) / 2 for weight in weights]
+    minimum = min(1 / 16, 1 / count)
+    return [minimum + (1 - count * minimum) * weight / total for weight in weights]
 
 
 def _breakable_technical_text(text: str, *, table_code: bool = False) -> str:
