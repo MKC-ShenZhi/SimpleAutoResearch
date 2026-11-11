@@ -99,9 +99,10 @@ class Delivery:
         self.config, self.observations, self.user_requests = config, observations, user_requests
         self.legacy_report_status = config.get('delivery_review_protocol') not in {'task.v4', 'task.v5'}
 
-    def working_guidance(self, accepted_delivery: dict | None, *, include_lifecycle: bool) -> tuple[dict | None, dict | None]:
+    def working_guidance(self, accepted_delivery: dict | None, *, include_lifecycle: bool,
+                         observations: list[dict] | None = None) -> tuple[dict | None, dict | None]:
         """Project one decision's guidance from the same observations and review."""
-        observations = self.observations()
+        observations = self.observations() if observations is None else observations
         reviewed: list[tuple[dict, list[str]]] = []
 
         def review_issues(rows: list[dict], binding: dict) -> list[str]:

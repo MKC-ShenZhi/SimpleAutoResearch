@@ -1762,6 +1762,9 @@ class CheckpointFailureTests(unittest.TestCase):
         second = owner.checkpoint_note_binder()([note])
         self.assertEqual(len(calls), 2)
         self.assertNotEqual(first[0]['observed_versions'], second[0]['observed_versions'])
+        supplied = owner.checkpoint_note_binder(list(rows))([note])
+        self.assertEqual(supplied, second)
+        self.assertEqual(len(calls), 2)
 
     def test_checkpoint_supplies_complete_decision_and_preserves_source_bindings(self):
         decision = {'role':'assistant', 'content':'Compare the measurements before reporting.',

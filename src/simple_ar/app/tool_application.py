@@ -1113,7 +1113,7 @@ class ToolApplication:
         return {'records/'+item['result'].removeprefix('attempts/'):
                 self._recorded_arguments(calls[item['id']]) for item in turn['tools']}
 
-    def _working_memory(self) -> dict:
+    def _working_memory(self, *, observations: list[dict] | None = None) -> dict:
         """Working understanding from the original journal, including prior feedback.
 
         This is model-authored working understanding, never another fact store.
@@ -1123,7 +1123,8 @@ class ToolApplication:
         memory = {'notes':[], 'through_turn':0}
         if self.state['config'].get('memory_protocol') == 'journal.v1':
             memory['compacted_records'] = set()
-            bind_checkpoint_notes = self.operations.checkpoint_note_binder()
+            bind_checkpoint_notes = (self.operations.checkpoint_note_binder() if observations is None else
+                                     self.operations.checkpoint_note_binder(observations))
             # The existing attempt lineage orders closed work, including a
             # checkpoint whose following decision failed. There is no second
             # mutable memory state and a retry does not buy the summary again.
@@ -1378,19 +1379,15 @@ class ToolApplication:
         return ([{**row, 'copy_lineage_required': True} for row in references]
             if self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES else references)
 
-    def _work_context(self, targets: list[str], *, consumer_selects: bool = False) -> dict[str, Any]:
-        """Pass related original feedback, not another coordinator summary.
+    def _work_feedback(self, targets: list[str]) -> dict[str, Any]:
+        """Find related original feedback for the requesting work owner.
 
         Only accepted checks with an intact owner/input binding are eligible.
         Changed subjects retain historical findings, never a current certificate.
-        The receiving owner freezes this projection with its normal request.
-        ``consumer_selects`` is only for an owner which submits these originals
-        to the shared measured selector; legacy frozen consumers keep admission.
         """
         roots = [self.workspace.resolve(path) for path in targets]
         selected_hashes = None
         reviews, covered = [], set()
-        professional = self.operations is not None and self.operations.professional
         for turn in reversed(self.state['turns']):
             calls = {row['id']: row for row in self.session.store.read_json(turn['reply']).get('tool_calls', [])}
             for item in reversed(turn['tools']):
@@ -1454,19 +1451,27 @@ class ToolApplication:
                     covered.add(subject)
                 reviews.append({'record': 'records/' + item['result'].removeprefix('attempts/'),
                     'arguments': arguments, 'result': result, 'subjects': subjects})
-        context = {'user_requests': list(self.state['requests']), 'review_observations': reviews,
-            'scope': 'Original requests and related accepted checks, not permission, scientific proof or verification of changed files. Historical checks without bound inputs are not inferred.'}
+        context = {'review_observations': reviews}
         findings = self.gateway.professional_inputs(targets)
         if findings:
             context['professional_findings'] = findings
+        return context
+
+    def _work_context(self, targets: list[str]) -> dict[str, Any]:
+        """Freeze the original requests, related feedback and working understanding for an owner."""
+        feedback = self._work_feedback(targets)
+        context = {'user_requests': list(self.state['requests']), 'review_observations': feedback['review_observations'],
+            'scope': 'Original requests and related accepted checks, not permission, scientific proof or verification of changed files. Historical checks without bound inputs are not inferred.'}
+        if 'professional_findings' in feedback:
+            context['professional_findings'] = feedback['professional_findings']
         if self.state['config'].get('input_contract') == _DECLARED_INPUTS:
             context['creation_declarations'] = self.state['config']['creation_declarations']
-        if professional:
+        if self.operations is not None and self.operations.professional:
             context['working_notes'] = self._working_memory()['notes']
         inherited = self._retained_working_inputs(targets)
         if inherited['notes']:
             context['historical_working_understanding'] = inherited['notes']
-        if not consumer_selects and len(json.dumps(context, ensure_ascii=False).encode('utf-8')) > 256000:
+        if len(json.dumps(context, ensure_ascii=False).encode('utf-8')) > 256000:
             raise ValueError('Related work context exceeds 256000 bytes; narrow the work unit instead of silently dropping feedback')
         return context
 
@@ -3515,7 +3520,8 @@ class ToolApplication:
                 names.add('deliver_result')
         return names
 
-    def _selection_context(self, *, closing: bool = False, schemas: list | None = None) -> dict:
+    def _selection_context(self, *, closing: bool = False, schemas: list | None = None,
+                           observations: list[dict] | None = None) -> dict:
         """Project the last declared candidate, never a separate adoption state."""
         candidate = self.operations.selection.retained_candidate(
             self.session.store, self.state['turns'], len(self.state['requests']))
@@ -3528,7 +3534,7 @@ class ToolApplication:
             except (ValueError, OSError):
                 artifacts = []  # A refused candidate must remain correctable, not break input construction.
         review = self.operations.delivery_review
-        concerns = review.pending_concerns(artifacts) if review is not None else []
+        concerns = review.pending_concerns(artifacts, observations) if review is not None else []
         operations = self._closing_operation_schemas() if closing else self.operation_schemas
         if self.operations.selection.policy == 'outcomes.v1' and schemas is not None:
             # The actual measured outer offer owns the inner action/transition
@@ -3607,11 +3613,16 @@ class ToolApplication:
                     'No read text or write payload is replaced. Archived text is not supplied; use read_history for original receipts.'},
         }
         delivery_guidance = None
+        observations = None
         if self.operations is not None:
+            # All consumers in this projection see the same original journal.
+            # A later decision rebuilds it after any action or checkpoint.
+            observations = self._operation_observations()
             accepted_delivery = (self.session.store.read_json('delivery.json')
                 if self.session.store.exists('delivery.json') else None)
             delivery_guidance = self.operations.delivery.working_guidance(accepted_delivery,
-                include_lifecycle=config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES)
+                include_lifecycle=config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES,
+                observations=observations)
         if config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES:
             context['delivery_conditions'] = delivery_guidance[0]
             context['delivery_conditions'].pop('review_followup', None)
@@ -3660,7 +3671,8 @@ class ToolApplication:
                 context['last_delivery_check'] = delivery_feedback
             if self.operations.selection is not None:
                 context.pop('work_plan', None)
-                context['work_selection'] = self._selection_context(closing=closing, schemas=schemas)
+                context['work_selection'] = self._selection_context(
+                    closing=closing, schemas=schemas, observations=observations)
         if config.get('report_protocol') == _REPORT_PROTOCOL and not (declared and closing):
             context['report_protocol']['instruction'] = (
                 'Declare report, original-text conversion or none using update_work_plan.report_intent, '
@@ -3966,7 +3978,7 @@ class ToolApplication:
                 except (ValueError,OSError):
                     return None
             journal = config.get('memory_protocol') == 'journal.v1'
-            memory = self._working_memory() if working_memory is None else working_memory
+            memory = self._working_memory(observations=observations) if working_memory is None else working_memory
             inherited = self._retained_working_inputs()
             working_rows.extend(inherited['observations'])
             work_notes = [*memory['notes'], *inherited['notes']]
@@ -4011,8 +4023,7 @@ class ToolApplication:
                 # results in that same selector, not in a byte-capped envelope.
                 # Requests and notes retain their existing single presentation.
                 from simple_ar.core.working_context import feedback_observations
-                related = feedback_observations(self._work_context(
-                    sorted(current_artifacts), consumer_selects=True))
+                related = feedback_observations(self._work_feedback(sorted(current_artifacts)))
                 additions = []
                 for row in related:
                     same = next((existing for existing in working_rows

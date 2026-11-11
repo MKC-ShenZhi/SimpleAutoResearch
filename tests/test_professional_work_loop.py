@@ -408,10 +408,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         state = deepcopy(self.app.state)
         calls = self.send.call_count
         selection = {}
-        with patch.object(self.app, '_work_context', return_value=feedback) as supply:
+        with patch.object(self.app, '_work_feedback', return_value=feedback) as supply:
             messages = self.app._messages(client=self.app._client(), working_selection=selection)
         supply.assert_called_once()
-        self.assertTrue(supply.call_args.kwargs['consumer_selects'])
         presented = json.loads(messages[1]['content'])
         bodies = [row['observation'] for row in presented['working_view']['observations']]
         self.assertTrue(any(row.get('record') == 'records/useful-feedback/result.json'
@@ -1033,7 +1032,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 raise AssertionError('No review exists that requires matching this file')
             return real_open(path, *args, **kwargs)
         with patch.object(Path, 'open', guard_before_any_review):
-            self.app._work_context([str(original_path)], consumer_selects=True)
+            self.app._work_feedback([str(original_path)])
         self._submit(_action('deliver_result', summary='Original data retained.', artifacts=['original.dat']))
         saved_delivery = (self.root/'delivery.json').read_bytes()
         command = _action('run_process', argv=['python', '-c',

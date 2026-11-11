@@ -749,10 +749,8 @@ class OperationTools:
                 **({'source_integrity':'unknown'} if unknown else {})})
         return result
 
-    def checkpoint_note_binder(self):
+    def checkpoint_note_binder(self, observations: list[dict] | None = None):
         """Share the original observation view while restoring one journal."""
-        observations = None
-
         def bind(notes):
             nonlocal observations
             if observations is None:
