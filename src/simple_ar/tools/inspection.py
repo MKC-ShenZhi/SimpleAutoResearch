@@ -509,6 +509,13 @@ class InspectionToolGateway:
                 'presented.v6': _PresentedClaimDeliveryResponseV4}.get(
                     saved.get('inspection_evidence_policy'), _ClaimDeliveryResponse)
 
+    def _review_artifact_name(self, path: str) -> str:
+        """Present workspace artifacts by their existing mount-relative name."""
+        candidate = Path(path)
+        if candidate.is_absolute() and candidate.is_relative_to(self.workspace.workspace):
+            return (Path('workspace') / candidate.relative_to(self.workspace.workspace)).as_posix()
+        return path
+
     @staticmethod
     def _observed_sources(saved: dict) -> bool:
         """New reads bind observed bytes, without adopting ancestral computation."""
@@ -2951,7 +2958,8 @@ class InspectionToolGateway:
             view['proposed_delivery'] = {
                 **({'claim':{key:value for key,value in delivery['claim'].items() if key != 'artifacts'}} if self._delivery_scope(saved) else
                     {'manuscript':delivery['manuscript'], 'formats':delivery['formats']}),
-                'artifacts': list(delivery['artifacts']),
+                'artifacts': ([self._review_artifact_name(path) for path in delivery['artifacts']]
+                    if saved.get('inspection_evidence_policy') == 'presented.v6' else list(delivery['artifacts'])),
                 'scope': 'Owner-bound actual delivery inventory, not proof of correctness. '
                     'Review the relevant original requests across this work, including methods, '
                     'supporting source/code/results and interpretations. Generated files agreeing '
@@ -4371,6 +4379,13 @@ class InspectionToolGateway:
                         owner_bindings.append({'decision_index': missing[0], 'subject': subject})
                 final = response_model.model_validate(value).model_dump(mode='json')
                 if self._delivery_scope(saved):
+                    if shared and saved.get('inspection_evidence_policy') == 'presented.v6':
+                        artifacts = {self._review_artifact_name(path):path
+                            for path in saved['delivery_context']['artifacts']}
+                        rows = [*final.get('requested_outcomes', []),
+                            *(finding for check in final['investigations'] for finding in check['findings'])]
+                        for row in rows:
+                            row['artifacts'] = [artifacts.get(path, path) for path in row['artifacts']]
                     if saved.get('inspection_evidence_policy') in {'presented.v3', 'presented.v4', 'presented.v5', 'presented.v6'}:
                         final, resolutions = self._retain_valid_investigations(saved, final)
                         owner_bindings.extend(resolutions)
@@ -4433,7 +4448,8 @@ class InspectionToolGateway:
             if 'artifacts' in properties:
                 field = properties['artifacts']
                 if saved['delivery_context']['artifacts']:
-                    field['items']['enum'] = sorted(saved['delivery_context']['artifacts'])
+                    if saved.get('inspection_evidence_policy') != 'presented.v6':
+                        field['items']['enum'] = sorted(saved['delivery_context']['artifacts'])
                 else:
                     field['maxItems'] = 0
             if 'evidence' in properties and (nested or definition is schema):

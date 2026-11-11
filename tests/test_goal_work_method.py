@@ -145,6 +145,64 @@ class NativeGoalWorkTests(unittest.TestCase):
         self.assertIn('extra', error)
         self.assertIsNone(final)
 
+    def test_review_short_artifact_names_keep_the_bound_delivery_and_prior_offers(self):
+        from types import SimpleNamespace
+        from simple_ar.tools.inspection import InspectionToolGateway
+        from simple_ar.tools.specs import GOAL_WORK_METHOD
+
+        owner = InspectionToolGateway.__new__(InspectionToolGateway)
+        owner.protocol = 'subjects.v3'
+        owner.workspace = SimpleNamespace(workspace=Path.cwd() / 'workspace')
+        owner._execution_facts = lambda *args, **kwargs: {}
+        owner._selected_inspection_rows = lambda *args: []
+        owner._check_inspection_versions = lambda *args, **kwargs: None
+        artifact = str(owner.workspace.workspace / 'project' / 'report.md')
+        visible = 'workspace/project/report.md'
+        saved = {'identity': 'review', 'work_method': GOAL_WORK_METHOD,
+            'finding_policy': 'linked.v1', 'inspection_material_policy': 'operations.v3',
+            'inspection_evidence_policy': 'presented.v6', 'coverage_policy': 'offered.v2',
+            'delivery_context': {'schema_version': 'delivery_review.v3', 'artifacts': {artifact: 'version'}},
+            'prior_required': [], 'evidence': [], 'targets': [
+                {'subject': 'evidence-1', 'readable': True, 'sha256': 'version', 'windows': [{}]}]}
+        model = owner._claim_response_model(saved)
+        schema = owner._delivery_schema(saved, model)
+        offered = [{'type': 'function', 'function': {'name': 'record_inspection', 'parameters': schema}}]
+        self.assertEqual(owner._review_artifact_name(artifact), visible)
+        response = {'conclusion': 'complete', 'applicability': 'The report was checked.',
+            'investigations': [{'claim': 'The report states the measurement.', 'scope': 'The report.',
+                'basis': 'observed', 'method': 'Read the report.', 'reasoning': 'The value is present.',
+                'evidence': ['evidence-1'], 'outcome': 'supported',
+                'findings': [{'severity': 'advisory', 'message': 'Clarify the units.', 'artifacts': [visible]}]}],
+            'limitations': [], 'reassessed_prior': [],
+            'requested_outcomes': [{'outcome': 'A report', 'status': 'delivered',
+                'artifacts': [visible], 'explanation': 'The report is included.'}]}
+
+        def admit(value, tools=offered):
+            call = {'id': 'final', 'type': 'function', 'function': {
+                'name': 'record_inspection', 'arguments': json.dumps(value)}}
+            return owner._admit_response(saved, [call], tools, model, set(), shared=True)
+
+        _, error, final, _ = admit(response)
+        self.assertEqual(error, '')
+        self.assertEqual(final['requested_outcomes'][0]['artifacts'], [artifact])
+        self.assertEqual(final['investigations'][0]['findings'][0]['artifacts'], [artifact])
+        self.assertEqual(response['requested_outcomes'][0]['artifacts'], [visible])
+
+        # Previously offered absolute names remain valid, but an unlisted
+        # short name cannot become a delivered artifact.
+        old = deepcopy(response)
+        old['requested_outcomes'][0]['artifacts'] = [artifact]
+        old['investigations'][0]['findings'][0]['artifacts'] = [artifact]
+        old_schema = deepcopy(schema)
+        for definition in [old_schema, *old_schema.get('$defs', {}).values()]:
+            if 'artifacts' in definition.get('properties', {}):
+                definition['properties']['artifacts']['items']['enum'] = [artifact]
+        old_offer = [{'type': 'function', 'function': {'name': 'record_inspection', 'parameters': old_schema}}]
+        self.assertEqual(admit(old, old_offer)[1], '')
+        missing = deepcopy(response)
+        missing['requested_outcomes'][0]['artifacts'] = ['workspace/project/missing.md']
+        self.assertIn('artifacts in the proposed delivery', admit(missing)[1])
+
     def test_closed_history_continues_without_replaying_or_forging_provider_reasoning(self):
         from simple_ar.app.professional_conversation import continuation_blocks, NATIVE_HISTORY_POLICY
         reply = {'role': 'assistant', 'content': None, 'tool_calls': [{
