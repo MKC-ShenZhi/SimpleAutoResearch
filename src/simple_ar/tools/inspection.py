@@ -4302,6 +4302,24 @@ class InspectionToolGateway:
         try:
             schemas = ({item['function']['name']:item['function']['parameters'] for item in offered}
                 if shared else {})
+            final_arguments = None
+
+            def terminal_opinion(value: Any) -> Any:
+                # Empty, undeclared containers carry no opinion to adopt. Keep
+                # the provider response intact in its receipt and validate the
+                # substantive opinion against the same evidence contract.
+                schema = schemas.get('record_inspection', {})
+                if (not isinstance(value, dict) or schema.get('additionalProperties') is not False
+                        or schema.get('patternProperties')):
+                    return value
+                fields = sorted(key for key, item in value.items()
+                    if key not in schema.get('properties', {})
+                    and isinstance(item, (list, dict)) and not item)
+                if not fields:
+                    return value
+                owner_bindings.append({'ignored_empty_opinion_fields': fields})
+                return {key:item for key, item in value.items() if key not in fields}
+
             for call in calls:
                 function = call['function']
                 arguments = json.loads(function['arguments'])
@@ -4316,10 +4334,13 @@ class InspectionToolGateway:
                 if shared and (name != 'record_inspection'
                         or saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES):
                     from jsonschema import Draft202012Validator
-                    errors = list(Draft202012Validator(schemas[name]).iter_errors(arguments))
+                    checked = terminal_opinion(arguments) if name == 'record_inspection' else arguments
+                    errors = list(Draft202012Validator(schemas[name]).iter_errors(checked))
                     if errors:
                         raise ValueError('Inspection operation arguments do not match the offered schema: '
                             + errors[0].message)
+                    if name == 'record_inspection':
+                        final_arguments = checked
             finals = sum(name == 'record_inspection' for name, _ in parsed)
             if finals and len(parsed) != 1:
                 raise ValueError('Return record_inspection alone, after source results have been observed')
@@ -4331,7 +4352,9 @@ class InspectionToolGateway:
             if finals or content_final:
                 # A terminal-only offer has no operation to dispatch. Preserve
                 # the original text receipt; never manufacture native call IDs.
-                value = parsed[0][1] if finals else json.loads(content)
+                value = (final_arguments if final_arguments is not None else parsed[0][1]) if finals else json.loads(content)
+                if content_final and saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES:
+                    value = terminal_opinion(value)
                 if not isinstance(value, dict):
                     raise ValueError('Inspection final opinion must be a JSON object')
                 if not self._delivery_scope(saved) and self.protocol and isinstance(value.get('decisions'), list):

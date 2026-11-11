@@ -107,20 +107,43 @@ class NativeGoalWorkTests(unittest.TestCase):
                 {'claim': 'The metrics were independently executed.', 'method': 'Run the check.',
                  'reasoning': 'The script was run.', 'scope': 'The metrics.', 'basis': 'executed',
                  'execution_records': [], 'evidence': ['evidence-1'], 'outcome': 'supported', 'findings': []}],
-            'limitations': [], 'reassessed_prior': []}
+            'limitations': [], 'reassessed_prior': [], 'findings': []}
         original = deepcopy(response)
         call = {'id': 'final', 'type': 'function', 'function': {
             'name': 'record_inspection', 'arguments': json.dumps(response)}}
         offered = [{'type': 'function', 'function': {'name': 'record_inspection', 'parameters': schema}}]
-        _, error, final, bindings = owner._admit_response(saved, [call], offered, model, set(), shared=True)
+        parsed, error, final, bindings = owner._admit_response(saved, [call], offered, model, set(), shared=True)
         self.assertEqual(error, '')
         self.assertEqual(response, original)
+        self.assertEqual(parsed[0][1]['findings'], [])
         self.assertEqual(final['investigations'][0]['findings'][0]['message'], 'Correct the split.')
         self.assertEqual(final['investigations'][1]['outcome'], 'unresolved')
         self.assertEqual(final['investigations'][1]['evidence'], [])
         self.assertEqual(final['conclusion'], 'incomplete')
-        self.assertEqual(bindings[0]['investigation_index'], 1)
-        self.assertIn('successful action records', bindings[0]['reason'])
+        self.assertEqual(bindings[0], {'ignored_empty_opinion_fields': ['findings']})
+        self.assertEqual(bindings[1]['investigation_index'], 1)
+        self.assertIn('successful action records', bindings[1]['reason'])
+        _, error, text_final, text_bindings = owner._admit_response(saved, [], offered, model,
+            set(), shared=True, content=json.dumps(original), closing=True)
+        self.assertEqual(error, '')
+        self.assertEqual(text_final, final)
+        self.assertEqual(text_bindings, bindings)
+
+        # Unknown substantive material cannot be silently dropped, and the
+        # relaxation never applies to actions that read or change the workspace.
+        response['findings'] = [{'message': 'A separate unbound concern.'}]
+        call['function']['arguments'] = json.dumps(response)
+        _, error, final, _ = owner._admit_response(saved, [call], offered, model, set(), shared=True)
+        self.assertIn('findings', error)
+        self.assertIsNone(final)
+        read_schema = {'type': 'object', 'properties': {'path': {'type': 'string'}},
+            'required': ['path'], 'additionalProperties': False}
+        read = {'id': 'read', 'type': 'function', 'function': {'name': 'read_file',
+            'arguments': json.dumps({'path': 'report.md', 'extra': []})}}
+        read_offered = [{'type': 'function', 'function': {'name': 'read_file', 'parameters': read_schema}}]
+        _, error, final, _ = owner._admit_response(saved, [read], read_offered, model, set(), shared=True)
+        self.assertIn('extra', error)
+        self.assertIsNone(final)
 
     def test_closed_history_continues_without_replaying_or_forging_provider_reasoning(self):
         from simple_ar.app.professional_conversation import continuation_blocks, NATIVE_HISTORY_POLICY
