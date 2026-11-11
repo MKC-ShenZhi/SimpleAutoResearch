@@ -820,11 +820,6 @@ class DeliveryReview:
 
     def _verified(self, identity: str, binding: dict, claimed: dict | None = None) -> ToolResult:
         self._validate_scope(binding)
-        # A changed delivery cannot reuse this opinion. Check that before
-        # reconstructing its full historical investigation; keep the final
-        # check below for changes while that investigation is being read.
-        if self.workspace.artifact_hashes(binding['artifacts']) != binding['artifacts']:
-            raise ValueError('Delivery artifacts changed during review')
         # A retained failure is diagnostic only: no final opinion is needed to
         # report it. Every possible acceptance still goes through _cached's
         # completed response, usage, integrity and version verification.

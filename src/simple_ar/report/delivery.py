@@ -178,6 +178,7 @@ class Delivery:
         next_tools = ['review_result', 'deliver_result'] if self.review_owner else ['deliver_result']
         proposal = None
         previously_delivered = False
+        delivered_current_request = False
         observations = self.observations() if observations is None else observations
         work_after_review = False
         review_followup = False
@@ -202,11 +203,15 @@ class Delivery:
                 prior_unresolved = list(proposal.unresolved)
                 proposal = None
                 previously_delivered = True
+                delivered_current_request = observed.get('current_request', True)
                 break
             review_followup = (completion.kind == 'review' and observed.get('status') == 'ok'
                 and observed.get('current_request', True) and not work_after_review)
             break
-        needs_review = self.review_owner is not None
+        # A new request still needs the saved final-review contract. A delivery
+        # already accepted for this request has no outstanding review floor.
+        needs_review = self.review_owner is not None and not (
+            previously_delivered and delivered_current_request)
         if proposal is None:
             conditions.append({'kind': 'candidate_submission',
                 'message': ('The previous delivery is recorded. Submit a new candidate when the '

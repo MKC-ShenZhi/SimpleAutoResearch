@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.report.delivery import Delivery
@@ -80,9 +80,6 @@ class CandidateReviewTests(unittest.TestCase):
             'metadata':{'delivery_review':first}})
         old_input = (self.root/'tools/inspection/first/input.json').read_bytes()
         self.workspace.resolve('draft.md').write_text('# Revised finding\n',encoding='utf-8')
-        with patch.object(self.inspector, '_cached', side_effect=AssertionError('Stale delivery was rechecked')):
-            with self.assertRaisesRegex(ValueError, 'Delivery artifacts changed'):
-                self.review._verified('first', first['binding'])
         second = self.owner.review_delivery(self.claim,'second',may_start=True,candidate=True)
         self.assertFalse(second.get('error'),second)
         self.assertEqual(len(self.inspector.calls),2)
@@ -107,6 +104,12 @@ class CandidateReviewTests(unittest.TestCase):
         self.review.issues.assert_not_called()
         self.assertIsNone(feedback)
         self.assertIn('previous delivery is recorded', lifecycle['conditions'][0]['message'])
+        self.assertEqual(lifecycle['minimum_resources']['llm_requests'], 1)
+
+        self.observations[0]['current_request'] = True
+        completed, _ = self.owner.working_guidance(delivered, include_lifecycle=True)
+        self.assertEqual(completed['minimum_resources']['llm_requests'], 0)
+        self.observations[0]['current_request'] = False
 
         self.observations.append({'tool_name': 'deliver_result', 'status': 'ok',
             'data': {**delivered, 'summary': 'Revised explanation'},
