@@ -11,7 +11,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 - Ordinary project reuse can carry a delivered subset in its original layout, without importing undelivered project files or the previous task's authority.
 - Report export can use complete captions written directly after figures, keeping authored labels without duplication; article and ACM layouts improve dense table spacing and technical wrapping.
-- Preparing a decision reuses related feedback and presents accepted historical opinions without repeating their investigations; current deliveries still check whether the opinions apply to their actual outputs.
+- Preparing a decision reuses related feedback and recent work without pulling every file read by an earlier review into the current view; current deliveries still check whether opinions apply to their actual outputs.
 - The working view no longer repeats locators for material it already displays; the index of material in retained messages remains available.
 - Independent review uses workspace paths and recorded action locations for artifacts and checks, retaining their original file, version and receipt bindings.
 

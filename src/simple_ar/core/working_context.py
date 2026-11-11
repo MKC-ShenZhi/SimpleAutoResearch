@@ -82,7 +82,7 @@ def feedback_observations(context: Mapping[str, Any]) -> list[dict[str, Any]]:
         record = source if isinstance(source, str) and source.startswith('records/') else row['record']
         role = ('Retained related feedback' if row.get('opinion_available', True)
                 else 'Unavailable feedback diagnostic')
-        projected.append({'record': record, 'kind': 'operation_result',
+        projected.append({'record': record, 'kind': 'operation_result', 'related_feedback': True,
             'text': json.dumps(row['result'], ensure_ascii=False, separators=(',', ':')),
             'subjects': deepcopy(row['subjects']),
             'evidence_role': role + '; guidance only, not source evidence, current certification or permission.'})
@@ -470,6 +470,7 @@ def select_working_context(
                                   else 'summarized' if isinstance(row.get('turn'),int)
                                       and row['turn'] < summarized_through_turn
                                       and row.get('record') not in explicit_references
+                                      and not row.get('related_feedback')
                                       and path not in artifacts else 'capacity'),
                        'estimated_tokens': estimate_tokens(dump(row))})
 
@@ -515,6 +516,8 @@ def select_working_context(
                 ' Entries in retained native turns are already supplied there and are not repeated here.')
 
     reference_indices: dict[str, list[int]] = {}
+    related_feedback = {i for i, row in enumerate(rows)
+        if row.get('kind') == 'operation_result' and row.get('related_feedback') is True}
     if whole_records:
         for i, row in enumerate(rows):
             if row.get('record') in reported_references:
@@ -622,7 +625,7 @@ def select_working_context(
                 'are in working_view. Archival receipts remain available through '+history_access+'.'}
         if retained_records:
             context['material_supply']['scope'] += (
-                ' References report explicitly selected records; optional note records can guide priority.')
+                ' References report selected records and relevant feedback; optional note records can guide priority.')
         if whole_records:
             # Required bookkeeping is never clipped to the recent omissions.
             # Keep per-window states: one supplied window cannot hide a gap in
@@ -635,6 +638,10 @@ def select_working_context(
                                for i in reference_indices.get(record, [])
                                for source in states[i].get('supplied_sources', [states[i]['source']])]
                               or [{'record': record, 'status': 'missing'}])]
+            context['material_supply']['references'].extend(
+                {'record': rows[i]['record'], 'status': states[i]['status'],
+                 'version_status': states[i]['version_status'], 'source': states[i]['source']}
+                for i in sorted(related_feedback) if rows[i]['record'] not in reported_references)
         cost = 0
         while True:
             context['working_context'] = {'latest_atomic_turn':latest,
@@ -872,6 +879,7 @@ def select_working_context(
         ordered = sorted(range(len(rows)), key=lambda i: (
             int(rows[i].get('record') in explicit_references),
             int(i in active_material),
+            int(i in related_feedback),
             observed_turn(i), *([observed_width(i)] if recent_set else []), *priority(i)), reverse=True)
     elif retained_records:
         # Explicit references and current objects precede the rest; original
@@ -939,6 +947,7 @@ def select_working_context(
             if supplied_handoffs:
                 ordered = [i for i in ordered if rows[i].get('turn') not in supplied_handoffs
                     or rows[i].get('record') in explicit_references
+                    or i in related_feedback
                     or i in reusable_material
                     or preserve_material_observations and not recent_set and rows[i].get('kind') in {'source_text', 'authored_text'}
                     or recent_set and (rows[i].get('record') in {
@@ -954,6 +963,7 @@ def select_working_context(
                     for record in note.get('records', ())}
                 ordered = [i for i in ordered if isinstance(rows[i].get('turn'), int) or latest is None
                     or rows[i].get('record') in needed
+                    or i in related_feedback
                     or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts]
                 # Explicit originals were admitted above. Recent complete work
                 # now precedes optional supporting original bodies.

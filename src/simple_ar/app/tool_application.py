@@ -3821,19 +3821,15 @@ class ToolApplication:
                             native_observations.append({key: value for key, value in working_rows[-1].items() if key != 'text'})
                     # This projection consumes recorded text only; malformed old
                     # arguments must not break later context or grant read access.
-                    text_rows = [(row['data'], row['field'], record, call['function']['name'])
+                    text_rows = [(row['data'], row['field'], record, call['function']['name'], row['request'])
                         for row in read_windows]
-                    if receipt_supply:
-                        text_rows = [({**row['data'], 'offset_bytes': row['data'].get(
-                            'offset_bytes', row['request'].get('offset_bytes', 0))},
-                            row['field'], record, call['function']['name']) for row in read_windows]
                     if working_mode and retained_inputs and item.get('review_result'):
                         try:
                             review = accepted_review_journal(self.workspace, self.session.store, item, result)
                             review_record = 'records/' + review['record'].removeprefix('attempts/')
                             selected = ((review['receipt'].get('metadata') or {}).get('delivery_assessment') or {}).get(
                                 'evidence_sha256', {})
-                            text_rows.extend((row['data'], row['field'], review_record, 'inspect_artifacts')
+                            text_rows.extend((row['data'], row['field'], review_record, 'inspect_artifacts', row['request'])
                                 for row in journal_read_windows(review['receipt'], {})
                                 if selected.get(row['data'].get('absolute_path')) == row['data'].get('sha256')
                                 and row['data'].get('sha256'))
@@ -3850,12 +3846,14 @@ class ToolApplication:
                         except (ValueError, TypeError, KeyError, OSError, RuntimeError):
                             pass  # A missing or unverified opinion grants no material observation.
                     if not read_windows and not retained_inputs:
-                        text_rows.append((data, 'data.text', record, call['function']['name']))
+                        text_rows.append((data, 'data.text', record, call['function']['name'], None))
                     if not retained_inputs:
                         for key in ('matches', 'retained_preview'):
-                            text_rows.extend((row, f'data.{key}.{number}.text', record, call['function']['name'])
+                            text_rows.extend((row, f'data.{key}.{number}.text', record, call['function']['name'], None)
                                 for number, row in enumerate(data.get(key) or []) if isinstance(row, dict))
-                    for row, field, source_record, source_tool in text_rows:
+                    for row, field, source_record, source_tool, request in text_rows:
+                        if receipt_supply and request is not None:
+                            row = {**row, 'offset_bytes': row.get('offset_bytes', request.get('offset_bytes', 0))}
                         text = row.get('text')
                         if not isinstance(text, str) or not text:
                             continue
@@ -4065,10 +4063,8 @@ class ToolApplication:
                     if same is None:
                         additions.append(row)
                     else:
-                        same.update(subjects=row['subjects'], evidence_role=row['evidence_role'])
+                        same.update(subjects=row['subjects'], evidence_role=row['evidence_role'], related_feedback=True)
                 working_rows = [*additions, *working_rows]
-                selected_records = list(dict.fromkeys([
-                    *selected_records, *(row['record'] for row in related)]))
             journal_rows = [{'turn':number, 'record':'records/'+path.removeprefix('attempts/')}
                 for number, turn in enumerate(turns) if not turn.get('remaining')
                 for path in ([item['result'] for item in turn['tools']] or [turn['reply']])] if journal else []

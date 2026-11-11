@@ -108,6 +108,33 @@ class WorkLifecycleTests(unittest.TestCase):
         self.assertEqual(app.ledger.to_dict(), before)
         case.send.assert_not_called()
 
+    def test_nested_review_windows_share_their_observed_byte_ranges(self):
+        from tests import test_professional_work_loop as fixture
+        from simple_ar.core.working_context import select_working_context
+
+        case = fixture.OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        app = case.app = ToolApplication.create(case.root, 'Provide the editable note.',
+            model='fixture', sources={}, services=case.services,
+            max_turns=12, max_tokens=900000, tool_contracts='full')
+        body = 'Observed result: ' + '\u03b1\u03b2\u03b3' * 3000 + '\n'
+        case._write('note.md', body)
+        case._submit(fixture._action('read_file', path='note.md', full_digest=True))
+        case._submit(fixture._action('deliver_result', summary='Editable note', artifacts=['note.md']))
+        item = next(item for turn in reversed(app.state['turns']) for item in turn['tools']
+                    if item.get('review_result'))
+        review = 'records/' + item['review_result'].removeprefix('attempts/')
+        with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select:
+            app._messages(client=app._client())
+        rows = [row for row in select.call_args.kwargs['observations']
+                if row.get('record') == review and row.get('kind') == 'source_text'
+                and row.get('absolute_path') == str(app.workspace.resolve('note.md'))]
+        self.assertTrue(rows)
+        self.assertTrue(all(type(row.get('offset_bytes')) is int for row in rows))
+        self.assertTrue(all(len(row['text'].encode()) == row['next_offset_bytes'] - row['offset_bytes']
+                            for row in rows))
+
     def test_closure_never_offers_unfunded_check_and_keeps_partial_exit(self):
         for requests, expected_reserve in ((2, 1), (1, 0)):
             with self.subTest(requests=requests):

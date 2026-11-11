@@ -221,6 +221,37 @@ class SelectedWorkContinuityTests(unittest.TestCase):
 
 
 class WorkingSupplyContinuityTests(unittest.TestCase):
+    def test_related_opinion_does_not_pin_every_window_in_its_receipt(self):
+        from simple_ar.core.working_context import feedback_observations
+
+        record = 'records/inspection/result.json'
+        feedback = feedback_observations({'review_observations': [{
+            'record': record, 'subjects': [{'path': 'workspace/report.md', 'current_matches_review': True}],
+            'result': {'data': {'review': 'Reuse the recorded comparison.'}}}]})
+        rows = feedback + [{'turn': 0, 'record': record, 'kind': 'source_text',
+            'role': 'historical_observation', 'path': 'workspace/other.txt', 'sha256': 'a' * 64,
+            'offset_bytes': 0, 'next_offset_bytes': 20, 'text': 'UNRELATED INSPECTION'}]
+        arguments = dict(user_requests=['Continue the work'], system_text='Respect the task', base_context={},
+            turn_blocks=[[{'role': 'assistant', 'content': 'Old inspection'}],
+                [{'role': 'assistant', 'content': 'RECENT_EXECUTION_RESULT'}],
+                [{'role': 'assistant', 'content': 'Latest decision'}]],
+            observations=rows, native_observations=[], schema_tokens=0, context_token_target=10000,
+            estimate_tokens=len, material_policy='working', require_work_notes=True, fit_work_notes=True,
+            sparse_handoffs=True, processed_turns=[0], archived_turns=[0],
+            work_notes=[{'text': 'The earlier review is retained.'}], version_resolver=lambda _: 'a' * 64,
+            working_set_policy='recent.v4')
+        messages, _ = select_working_context(**arguments)
+        context = json.loads(messages[1]['content'])
+        self.assertIn('RECENT_EXECUTION_RESULT', json.dumps(messages))
+        self.assertIn('Reuse the recorded comparison.', json.dumps(messages))
+        self.assertNotIn('UNRELATED INSPECTION', json.dumps(messages))
+        references = context['material_supply']['references']
+        self.assertEqual([(row['record'], row['source']['kind']) for row in references],
+                         [(record, 'operation_result')])
+
+        explicit, _ = select_working_context(**arguments, selected_records=[record])
+        self.assertIn('UNRELATED INSPECTION', json.dumps(explicit))
+
     def test_current_observations_remain_eligible_after_multiple_read_turns(self):
         def read(turn, name, text, digest='a' * 64):
             return {'turn': turn, 'record': f'records/{turn}.json', 'kind': 'source_text',
