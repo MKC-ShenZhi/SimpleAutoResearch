@@ -1048,7 +1048,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             "\\setlength{\\emergencystretch}{1em}\n") if template_files or article else ''
         preamble += _figure_pagination_preamble()
         if natural_layout and any(node.get('t') == 'Table' for node in _nodes(blocks)):
-            preamble += "\\AtBeginEnvironment{longtable}{\\small\\setlength{\\tabcolsep}{3pt}}\n"
+            preamble += "\\AtBeginEnvironment{longtable}{\\setlength{\\tabcolsep}{2pt}}\n"
         if adjacent_captions:
             # The author supplies the complete caption, including any label.
             # Let a supplied template load caption with its own options first.

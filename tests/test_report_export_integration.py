@@ -45,6 +45,7 @@ class PortableExportIntegrationTests(unittest.TestCase):
             output = root / 'export'
             result = export_acm_report(source, output, layout='article', compile_pdf=True)
             self.assertTrue(result['compiled'], result)
+            self.assertFalse(any('Overfull \\vbox' in warning for warning in result['compile_warnings']), result)
             bbox = subprocess.check_output(['pdftotext', '-bbox', str(output / 'main.pdf'), '-'], text=True)
             ns = '{http://www.w3.org/1999/xhtml}'
             words = list(ET.fromstring(bbox).iter(ns + 'word'))
