@@ -62,15 +62,6 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertTrue(c.inspection_requests)
         self.assertFalse((c.root/'delivery.json').exists())
 
-    def test_saved_automatic_handoff_keeps_its_original_behavior(self):
-        c = self.case
-        c.app.state['config']['candidate_handoff_policy'] = 'after_production.v2'
-        c.app._save()
-        c._reload()
-        self.work_before_report()
-        self.assertTrue(c.inspection_requests)
-        self.assertTrue(any(turn.get('origin') == 'professional' for turn in c.app.state['turns']))
-
     def test_current_files_are_inspected_before_publication_without_final_acceptance(self):
         c = self.case
         result = self.candidate()

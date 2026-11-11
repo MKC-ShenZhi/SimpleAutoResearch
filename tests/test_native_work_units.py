@@ -164,9 +164,10 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.drain(approved_execution=token)
         self.assertEqual(c._last('run_process')['status'], 'ok')
 
-    def test_edit_and_check_queue_independent_review_before_more_production(self):
+    def test_saved_edit_and_check_handoff_preserves_unknown_usage(self):
         c = self.case
         c.app.state['config']['tool_contracts'] = 'on_demand'
+        c.app.state['config']['candidate_handoff_policy'] = 'after_production.v2'
         c.app._save()
         c._reload()
         c.decisions.append(fixture._action('write_file', path='note.md', content='Before\nOriginal note.\nAfter\n'))
