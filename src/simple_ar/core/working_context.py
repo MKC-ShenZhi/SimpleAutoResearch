@@ -581,27 +581,6 @@ def select_working_context(
 
     prepared_turns = None
     prepared_projector = None
-    serialized_turns = None
-    serialized_messages: dict[tuple, str] = {}
-
-    def serialize_messages(messages: list[dict[str, Any]]) -> str:
-        """Serialize changing context while reusing unchanged message bodies."""
-        nonlocal serialized_turns
-        selection = tuple(recent)
-        if selection != serialized_turns:
-            serialized_turns = selection
-            serialized_messages.clear()
-        parts = []
-        for index, message in enumerate(messages):
-            if (index != 1 and type(message) is dict and set(message) == {'role', 'content'}
-                    and all(isinstance(value, str) for value in message.values())):
-                key = tuple(message.items())
-                if key not in serialized_messages:
-                    serialized_messages[key] = json.dumps(message, ensure_ascii=False)
-                parts.append(serialized_messages[key])
-            else:
-                parts.append(json.dumps(message, ensure_ascii=False))
-        return '[' + ', '.join(parts) + ']'
 
     def project() -> tuple[list[dict[str, Any]], int]:
         nonlocal prepared_turns, prepared_projector
@@ -686,7 +665,7 @@ def select_working_context(
                     prepared_projector = message_projector(messages)
                     prepared_turns = selection
                 messages = prepared_projector(context)
-            measured = schema_tokens+estimate_tokens(serialize_messages(messages))
+            measured = schema_tokens+estimate_tokens(json.dumps(messages,ensure_ascii=False))
             # A boolean/decimal-width change can reduce the serialized size
             # by one token. Keep the conservative bound rather than oscillate.
             if measured<=cost:

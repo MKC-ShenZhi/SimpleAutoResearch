@@ -552,6 +552,16 @@ class GoalWorkTests(unittest.TestCase):
             'The report changed after the inspection.\n', encoding='utf-8')
         with self.assertRaises(ValueError):
             owner._cached(identity)
+        item = next(item for turn in case.app.state['turns'] for item in turn['tools']
+            if Path(item['result']).parent.name == identity and item.get('review_result'))
+        parent = case.app.session.store.read_json(item['result'])
+        original_opinion = owner.store.read_json(owner._path(identity, 'result'))
+        ledger = case.app.ledger.to_dict()
+        with patch.object(owner, '_cached', side_effect=AssertionError('Presentation is not current adoption')):
+            shown = case.app.operations.delivery_review.resolve_observation(
+                {**parent, 'record': item['result']}, review_record=item['review_result'])
+        self.assertEqual(shown['metadata']['delivery_review']['result'], original_opinion)
+        self.assertEqual(case.app.ledger.to_dict(), ledger)
 
     def test_accessible_support_is_not_a_delivered_requested_output(self):
         case = self.case

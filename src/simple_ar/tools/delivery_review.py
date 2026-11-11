@@ -924,7 +924,23 @@ class DeliveryReview:
         return projected, result
 
     def resolve_observation(self, observed: dict, *, review_record: str | None = None) -> dict:
-        return self._resolve_observation(observed, review_record=review_record)[0]
+        """Present an accepted historical opinion; delivery adoption is separate."""
+        envelope = (observed.get('metadata') or {}).get('delivery_review')
+        if not self._pending_envelope(envelope) or not review_record:
+            return self._resolve_observation(observed, review_record=review_record)[0]
+        projected = deepcopy(observed)
+        try:
+            path = self.inspector._path(envelope['identity'], 'result')
+            raw = self.inspector.store.read_json(path) if self.inspector.store.exists(path) else None
+            accepted, intact, _ = self._accepted_pending_opinion(
+                {**observed, 'review_record': review_record}, envelope, raw)
+            if accepted is True and intact:
+                result = ToolResult.model_validate(raw)
+                projected['metadata']['delivery_review'] = self._envelope(envelope['binding'],
+                    envelope['identity'], result)
+        except _ERRORS:
+            pass  # An unreadable original remains its recorded pending marker.
+        return projected
 
     def _retained(self, identity: str) -> ToolResult:
         """Preserve failed work for diagnosis only; this never supplies acceptance."""
