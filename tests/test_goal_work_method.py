@@ -214,6 +214,21 @@ class NativeGoalWorkTests(unittest.TestCase):
         missing['investigations'][0]['execution_records'] = ['tools/inspection/unknown']
         self.assertIn('actual own successful action records', admit(missing)[1])
 
+        saved['prior_required'] = [{'id': 'a' * 64, 'severity': 'required', 'message': 'Check the result.'}]
+        saved['prior_reference_policy'] = 'short.v1'
+        short_schema = owner._delivery_schema(saved, model)
+        short_offer = [{'type': 'function', 'function': {'name': 'record_inspection', 'parameters': short_schema}}]
+        short = deepcopy(response)
+        short['investigations'][0]['reassessed_prior'] = ['concern-1']
+        _, error, final, _ = admit(short, short_offer)
+        self.assertEqual(error, '')
+        self.assertEqual(final['investigations'][0]['reassessed_prior'], ['a' * 64])
+        self.assertEqual(short['investigations'][0]['reassessed_prior'], ['concern-1'])
+        short['investigations'][0]['reassessed_prior'] = ['concern-2']
+        self.assertTrue(admit(short, short_offer)[1])
+        legacy = {**saved, 'prior_reference_policy': None}
+        self.assertEqual(owner._prior_references(legacy), {'a' * 64: 'a' * 64})
+
     def test_closed_history_continues_without_replaying_or_forging_provider_reasoning(self):
         from simple_ar.app.professional_conversation import continuation_blocks, NATIVE_HISTORY_POLICY
         reply = {'role': 'assistant', 'content': None, 'tool_calls': [{
@@ -516,6 +531,7 @@ class GoalWorkTests(unittest.TestCase):
                         'message': 'Revise the paired result.', 'artifacts': [
                             str(case.root/'workspace/a.md'), str(case.root/'workspace/b.md')]}]}]
             else:
+                self.assertEqual([row['id'] for row in view['prior_required']], ['concern-1'])
                 checks = [{**base, 'claim': 'The earlier issue is resolved.', 'evidence': [first],
                     'outcome': 'supported', 'findings': [],
                     'reassessed_prior': [row['id'] for row in view['prior_required']]},
@@ -549,6 +565,8 @@ class GoalWorkTests(unittest.TestCase):
         saved = owner.store.read_json(owner._path(identity, 'input'))
         receipt = owner.store.read_json(owner._path(identity, 'response'))
         self.assertEqual(saved['inspection_evidence_policy'], 'presented.v6')
+        self.assertEqual(saved['prior_reference_policy'], 'short.v1')
+        self.assertEqual(len(saved['prior_required'][0]['id']), 64)
         legacy_receipt = deepcopy(receipt)
         legacy_receipt['response'].pop('requested_outcomes', None)
         bindings = owner._stored_shared_bindings(saved, receipt['response'])

@@ -2940,9 +2940,20 @@ class InspectionToolGateway:
                 target.pop('limitation', None)
         return owners[0] if owners else None
 
+    @staticmethod
+    def _prior_references(saved: dict[str, Any]) -> dict[str, str]:
+        """Map reviewer-facing concern names to the owner's recorded identities."""
+        rows = saved['prior_required']
+        if saved.get('prior_reference_policy') == 'short.v1':
+            return {f'concern-{i + 1}': row['id'] for i, row in enumerate(rows)}
+        return {row['id']: row['id'] for row in rows}
+
     def _view(self, saved: dict[str, Any], request: InspectionRequest, *, source_result: bool = False) -> dict[str, Any]:
+        prior = saved['prior_required']
+        if saved.get('prior_reference_policy') == 'short.v1':
+            prior = [{**row, 'id':name} for row, name in zip(prior, self._prior_references(saved))]
         view = {'goal':request.goal,
-            'prior_required':saved['prior_required'],
+            'prior_required':prior,
             'prior_scope':('Reassess these concerns within the explicitly requested target scope and evidence; '
                 if saved.get('coverage_policy') == 'offered.v2' else
                 'Reassess these concerns against the current full targets and evidence; ') +
@@ -4375,6 +4386,12 @@ class InspectionToolGateway:
                     value = terminal_opinion(value)
                 if not isinstance(value, dict):
                     raise ValueError('Inspection final opinion must be a JSON object')
+                if saved.get('prior_reference_policy') == 'short.v1':
+                    value = deepcopy(value)
+                    references = self._prior_references(saved)
+                    for part in [value, *(value.get('investigations') or [])]:
+                        if isinstance(part, dict) and isinstance(part.get('reassessed_prior'), list):
+                            part['reassessed_prior'] = [references[name] for name in part['reassessed_prior']]
                 if not self._delivery_scope(saved) and self.protocol and isinstance(value.get('decisions'), list):
                     rows = value['decisions']
                     missing = [index for index, row in enumerate(rows) if isinstance(row, dict) and 'subject' not in row]
@@ -4491,9 +4508,9 @@ class InspectionToolGateway:
                         'State the actual combination of observation, derivation and execution in method '
                         'and reasoning. An unperformed check remains unresolved.')
             if nested and 'reassessed_prior' in properties and definition is not schema:
-                choices(properties['reassessed_prior'], [row['id'] for row in saved['prior_required']])
+                choices(properties['reassessed_prior'], list(self._prior_references(saved)))
         if response_model is _DeliveryResponseLinked or nested:
-            choices(schema['properties']['reassessed_prior'], [row['id'] for row in saved['prior_required']])
+            choices(schema['properties']['reassessed_prior'], list(self._prior_references(saved)))
             if nested and saved.get('inspection_evidence_policy') in {'presented.v1', *_PRESENTED_EVIDENCE_POLICIES}:
                 schema['properties']['reassessed_prior']['description'] = (
                     'Legacy package-level reassessments. Prefer placing each concern ID in the '
@@ -4993,6 +5010,7 @@ class InspectionToolGateway:
                     # New reviews bind each check to the windows actually presented.
                     # Existing inspection work orders keep their saved contract.
                     saved['inspection_evidence_policy'] = 'presented.v6'
+                    saved['prior_reference_policy'] = 'short.v1'
                     if self.artifact_changes:
                         saved['parent_artifact_changes'] = self.artifact_changes(list(delivery_context['artifacts']))
                 if applicable and self.material_policy == 'operations.v3' and self.execution_observations:
