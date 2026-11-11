@@ -922,19 +922,19 @@ class ToolApplication:
                 'parameters': compact_json_schema(row['function']['parameters'])}} for row in schemas]
         return schemas
 
-    def _closing_schemas(self) -> list[dict[str, Any]]:
-        operations = self._closing_operation_schemas()
+    def _closing_schemas(self, *, lifecycle: dict | None = None) -> list[dict[str, Any]]:
+        operations = self._closing_operation_schemas(lifecycle=lifecycle)
         selection = getattr(self.operations, 'selection', None)
         return selection.offer(operations) if selection else operations
 
-    def _closing_operation_schemas(self) -> list[dict[str, Any]]:
+    def _closing_operation_schemas(self, *, lifecycle: dict | None = None) -> list[dict[str, Any]]:
         """Offer executable closure before paying for the final decision.
 
         Selection is not permission or acceptance. Existing domain validation,
         approval and delivery checks still own every returned action.
         """
         if self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES:
-            lifecycle = self.operations.delivery.lifecycle_requirements()
+            lifecycle = self.operations.delivery.lifecycle_requirements() if lifecycle is None else lifecycle
             needed = lifecycle['minimum_resources'].get('llm_requests', 0)
             # Include this decision and a truthful exit after an unsuccessful
             # owner call. Minimum resources are a lower bound, not a pass.
@@ -2746,11 +2746,12 @@ class ToolApplication:
         return self._lifecycle_floor(
             {'llm_requests': 1, 'total_tokens': self._decision_tokens(client, messages)}, dispatch=dispatch)
 
-    def _lifecycle_floor(self, decision: dict[str, int], *, dispatch: bool = False) -> dict[str, int]:
+    def _lifecycle_floor(self, decision: dict[str, int], *, dispatch: bool = False,
+                         lifecycle: dict | None = None) -> dict[str, int]:
         """Let owners spend their own floor while ordinary work leaves it available."""
         if self.state['config'].get('work_lifecycle') not in INTEGRATED_WORK_LIFECYCLES:
             return decision
-        lifecycle = self.operations.delivery.lifecycle_requirements()
+        lifecycle = self.operations.delivery.lifecycle_requirements() if lifecycle is None else lifecycle
         if (self.state['config'].get('work_lifecycle') == 'integrated.v3'
                 and lifecycle.get('review_followup')):
             return decision  # Act on the completed opinion before reserving a later check.
@@ -2916,13 +2917,16 @@ class ToolApplication:
 
     def _messages(self, *, client: LLMClient | None = None, closing: bool = False,
                   native_history_start_turn: int | None = None, schemas: list | None = None,
-                  working_memory: dict | None = None, working_selection: dict | None = None) -> list[dict[str, Any]]:
+                  working_memory: dict | None = None, working_selection: dict | None = None,
+                  decision_observations: list[dict] | None = None,
+                  decision_guidance: tuple | None = None) -> list[dict[str, Any]]:
         protocol = self.state['config'].get('context_protocol')
         if protocol in _CONVERSATION_CONTEXT_PROTOCOLS:
             def conversation():
                 return self._conversation_messages(client=client, closing=closing,
                     native_history_start_turn=native_history_start_turn, schemas=schemas, working_memory=working_memory,
-                    working_selection=working_selection)
+                    working_selection=working_selection, decision_observations=decision_observations,
+                    decision_guidance=decision_guidance)
             if self.operations is not None:
                 with self.operations.inspection.presentation_scope():
                     return conversation()
@@ -3521,7 +3525,7 @@ class ToolApplication:
         return names
 
     def _selection_context(self, *, closing: bool = False, schemas: list | None = None,
-                           observations: list[dict] | None = None) -> dict:
+                           observations: list[dict] | None = None, lifecycle: dict | None = None) -> dict:
         """Project the last declared candidate, never a separate adoption state."""
         candidate = self.operations.selection.retained_candidate(
             self.session.store, self.state['turns'], len(self.state['requests']))
@@ -3535,7 +3539,7 @@ class ToolApplication:
                 artifacts = []  # A refused candidate must remain correctable, not break input construction.
         review = self.operations.delivery_review
         concerns = review.pending_concerns(artifacts, observations) if review is not None else []
-        operations = self._closing_operation_schemas() if closing else self.operation_schemas
+        operations = self._closing_operation_schemas(lifecycle=lifecycle) if closing else self.operation_schemas
         if self.operations.selection.policy == 'outcomes.v1' and schemas is not None:
             # The actual measured outer offer owns the inner action/transition
             # admission too, including a token-constrained partial-only exit.
@@ -3549,7 +3553,9 @@ class ToolApplication:
     def _conversation_messages(self, *, client: LLMClient | None = None, closing: bool = False,
                                native_history_start_turn: int | None = None,
                                schemas: list | None = None, working_memory: dict | None = None,
-                               working_selection: dict | None = None) -> list[dict[str, Any]]:
+                               working_selection: dict | None = None,
+                               decision_observations: list[dict] | None = None,
+                               decision_guidance: tuple | None = None) -> list[dict[str, Any]]:
         """One chronological working set; receipts retain their actual text once.
 
         This is historical conversation, not a revalidated evidence cache. Tool
@@ -3617,14 +3623,18 @@ class ToolApplication:
         if self.operations is not None:
             # All consumers in this projection see the same original journal.
             # A later decision rebuilds it after any action or checkpoint.
-            observations = self._operation_observations()
-            accepted_delivery = (self.session.store.read_json('delivery.json')
-                if self.session.store.exists('delivery.json') else None)
-            delivery_guidance = self.operations.delivery.working_guidance(accepted_delivery,
-                include_lifecycle=config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES,
-                observations=observations)
+            observations = (self._operation_observations() if decision_observations is None
+                            else decision_observations)
+            if decision_guidance is None:
+                accepted_delivery = (self.session.store.read_json('delivery.json')
+                    if self.session.store.exists('delivery.json') else None)
+                delivery_guidance = self.operations.delivery.working_guidance(accepted_delivery,
+                    include_lifecycle=config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES,
+                    observations=observations)
+            else:
+                delivery_guidance = decision_guidance
         if config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES:
-            context['delivery_conditions'] = delivery_guidance[0]
+            context['delivery_conditions'] = dict(delivery_guidance[0])
             context['delivery_conditions'].pop('review_followup', None)
             if schemas is not None:
                 offered = self._offered_operation_names(schemas)
@@ -3672,7 +3682,8 @@ class ToolApplication:
             if self.operations.selection is not None:
                 context.pop('work_plan', None)
                 context['work_selection'] = self._selection_context(
-                    closing=closing, schemas=schemas, observations=observations)
+                    closing=closing, schemas=schemas, observations=observations,
+                    lifecycle=delivery_guidance[0])
         if config.get('report_protocol') == _REPORT_PROTOCOL and not (declared and closing):
             context['report_protocol']['instruction'] = (
                 'Declare report, original-text conversion or none using update_work_plan.report_intent, '
@@ -4401,17 +4412,31 @@ class ToolApplication:
         journal = self.state['config'].get('memory_protocol') == 'journal.v1'
         inspection = self.operations.inspection if self.state['config'].get('control_protocol') else None
         working_memory, memory_refs = None, ()
+        decision_observations = None
+        decision_guidance = None
         selection = {}
         exit_value = None
         handoff_evidence = self._candidate_handoff()
         handoff_floor = None
 
         def project(closing):
-            nonlocal exit_value, handoff_floor
-            schemas = self._closing_schemas() if closing else self.schemas
+            nonlocal exit_value, handoff_floor, working_memory, decision_observations, decision_guidance
+            if (integrated and self.state['config'].get('context_protocol') in _WORKING_CONTEXT_PROTOCOLS
+                    and self.operations is not None):
+                if decision_observations is None:
+                    decision_observations = self._operation_observations()
+                    accepted = (self.session.store.read_json('delivery.json')
+                        if self.session.store.exists('delivery.json') else None)
+                    decision_guidance = self.operations.delivery.working_guidance(
+                        accepted, include_lifecycle=True, observations=decision_observations)
+                if working_memory is None:
+                    working_memory = self._working_memory(observations=decision_observations)
+            lifecycle = decision_guidance[0] if decision_guidance is not None else None
+            schemas = self._closing_schemas(lifecycle=lifecycle) if closing else self.schemas
             selection.clear()
             messages = self._messages(client=client, working_memory=working_memory,
-                closing=closing, schemas=schemas, working_selection=selection)
+                closing=closing, schemas=schemas, working_selection=selection,
+                decision_observations=decision_observations, decision_guidance=decision_guidance)
             value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
             if self.state['config'].get('work_lifecycle') == 'integrated.v3' and any(
                     row['function']['name'] == 'review_result' for row in schemas):
@@ -4425,23 +4450,25 @@ class ToolApplication:
                     schemas = [row for row in schemas if row['function']['name'] != 'review_result']
                     selection.clear()
                     messages = self._messages(client=client, working_memory=working_memory,
-                        closing=closing, schemas=schemas, working_selection=selection)
+                        closing=closing, schemas=schemas, working_selection=selection,
+                        decision_observations=decision_observations, decision_guidance=decision_guidance)
                     value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
             if integrated and closing:
                 # A service must leave the caller an exit even if its result is
                 # incomplete. Do not offer it solely because request slots fit.
                 if not conversation.can_protect(value, self._lifecycle_floor(
-                        {'llm_requests':1, 'total_tokens':conversation.tokens(value)})):
+                        {'llm_requests':1, 'total_tokens':conversation.tokens(value)}, lifecycle=lifecycle)):
                     selector = getattr(self.operations, 'selection', None)
                     if selector is not None and selector.policy == 'outcomes.v1':
-                        schemas = selector.offer([row for row in self._closing_operation_schemas()
+                        schemas = selector.offer([row for row in self._closing_operation_schemas(lifecycle=lifecycle)
                             if row['function']['name'] in {'ask_user', 'deliver_result'}])
                     else:
                         schemas = [row for row in schemas
                             if row['function']['name'] in {'ask_user', 'deliver_result'}]
                     selection.clear()
                     messages = self._messages(client=client, working_memory=working_memory,
-                        closing=True, schemas=schemas, working_selection=selection)
+                        closing=True, schemas=schemas, working_selection=selection,
+                        decision_observations=decision_observations, decision_guidance=decision_guidance)
                     value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
                 exit_value = value
             if not closing and handoff_evidence and {'review_result', 'load_tools'} <= {
@@ -4488,7 +4515,7 @@ class ToolApplication:
             return value
 
         def checkpoint(value, decision_tokens):
-            nonlocal working_memory, memory_refs
+            nonlocal working_memory, memory_refs, decision_observations, decision_guidance
             if value.projection.get('candidate_handoff'):
                 return  # Spend the next decision on the review choice, not optional compaction.
             omitted = selection.get('compaction_turns') if journal else None
@@ -4505,6 +4532,7 @@ class ToolApplication:
                           and selection.get('economical_compaction', False) else {}))
             if inspection is not None:
                 inspection.clear_presentation_scope()
+            decision_observations, decision_guidance, working_memory = None, None, None
             if memory_refs:
                 memory_refs = self._memory_artifacts(context.store, context.attempt.attempt_id)
                 if context.store.exists('memory_snapshot.json'):
@@ -4524,7 +4552,8 @@ class ToolApplication:
         with inspection.presentation_scope() if inspection is not None else nullcontext():
             value = conversation.prepare(project,
                 followup=lambda value:(self._lifecycle_floor(
-                    {'llm_requests':1, 'total_tokens':conversation.tokens(value)}) if integrated else
+                    {'llm_requests':1, 'total_tokens':conversation.tokens(value)},
+                    lifecycle=decision_guidance[0] if decision_guidance is not None else None) if integrated else
                     {'llm_requests':1, 'total_tokens':conversation.tokens(value)}
                     if operation_exit else self._completion_floor(client, value.messages)),
                 checkpoint=None if ((self.state.get('pending') or {}).get('skip_memory_checkpoint')

@@ -1,6 +1,7 @@
 """Owner-derived resource planning and truthful closure share the physical ledger."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -66,6 +67,25 @@ class WorkLifecycleTests(unittest.TestCase):
         conversation.call(value, native=True, label='work', call_id='decision')
         self.assertEqual(app.ledger.remaining('llm_requests'), 3)
         self.assertEqual(len(app.ledger.entries), 1)
+
+    def test_decision_reuses_guidance_but_the_next_decision_sees_new_review_needs(self):
+        app, client = self.app(5)
+        app.state['config'].update(context_protocol='working.v4', control_protocol='operations.v1')
+        app.session.store = SimpleNamespace(exists=lambda _: False)
+        app.operations.inspection = SimpleNamespace(presentation_scope=nullcontext)
+        app._operation_observations = Mock(return_value=[])
+        app._working_memory = Mock(return_value={'notes': [], 'through_turn': 0})
+        lifecycle = lambda count: {'conditions': [], 'next_tools': ['review_result', 'deliver_result'],
+            'minimum_resources': {'llm_requests': count}, 'review_followup': False}
+        app.operations.delivery.working_guidance = Mock(side_effect=[(lifecycle(1), None), (lifecycle(0), None)])
+
+        _, first, _, _ = self.prepare(app, client)
+        _, second, _, _ = self.prepare(app, client)
+        self.assertEqual(first.reserve['llm_requests'], 2)
+        self.assertEqual(second.reserve['llm_requests'], 1)
+        self.assertEqual(app.operations.delivery.working_guidance.call_count, 2)
+        self.assertEqual(app._operation_observations.call_count, 2)
+        self.assertEqual(app._working_memory.call_count, 2)
 
     def test_closure_never_offers_unfunded_check_and_keeps_partial_exit(self):
         for requests, expected_reserve in ((2, 1), (1, 0)):
