@@ -345,8 +345,9 @@ class Delivery:
             observations = [*self.observations(), *([current_result] if current_result is not None else [])]
             try:
                 self.validate_actual(request, observations, current_outputs=current_outputs)
-            except ValueError:
-                pass
+            except ValueError as exc:
+                if may_start and request.report is not None and request.report.status == 'canonical':
+                    raise ValueError('Candidate declared ready for delivery but is incomplete: ' + str(exc)) from exc
             else:
                 candidate = False
         if not may_start and not candidate and not self.requires_review(request):

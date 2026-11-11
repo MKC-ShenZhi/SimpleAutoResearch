@@ -1,11 +1,12 @@
 """Candidate investigation cannot acquire final-delivery authority."""
 from copy import deepcopy
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.report.delivery import Delivery
@@ -85,6 +86,28 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertEqual(len(self.inspector.calls),2)
         self.assertEqual((self.root/'tools/inspection/first/input.json').read_bytes(),old_input)
         self.assertNotEqual(first['binding']['artifacts'],second['binding']['artifacts'])
+
+    def test_complete_report_claim_surfaces_known_publication_gap_before_review(self):
+        ready = {**self.claim, 'unresolved': [], 'report': {**self.claim['report'], 'status': 'canonical'}}
+        with self.assertRaisesRegex(ValueError, 'declared ready.*publication binding'):
+            self.owner.review_delivery(ready, 'not-ready', may_start=True, candidate=True)
+        self.assertEqual(self.inspector.calls, [])
+        with patch.object(self.review, 'review', return_value={'identity': 'saved'}) as recover:
+            self.assertEqual(self.owner.review_delivery(ready, 'saved', may_start=False, candidate=True),
+                             {'identity': 'saved'})
+            recover.assert_called_once()
+        payload = {'metadata': {}}
+        self.owner.bind_result(DeliveryRequest.model_validate(ready), payload, 'new',
+            current_outputs=(), current_result={}, retain=lambda: None,
+            review_capacity=nullcontext, may_start=True, candidate=True)
+        self.assertIn('publication binding', payload['metadata']['delivery_review_error'])
+        self.assertEqual(self.inspector.calls, [])
+
+        # An honestly incomplete candidate can still receive useful feedback.
+        partial = {**ready, 'unresolved': ['PDF publication is not finished.']}
+        proof = self.owner.review_delivery(partial, 'partial', may_start=True, candidate=True)
+        self.assertFalse(proof.get('error'), proof)
+        self.assertEqual(self.inspector.calls[-1][3]['purpose'], 'candidate')
 
     def test_lifecycle_is_derived_guidance_not_a_second_acceptance_state(self):
         status = self.owner.lifecycle_requirements()
