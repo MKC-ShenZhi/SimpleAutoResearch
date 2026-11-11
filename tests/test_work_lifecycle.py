@@ -97,11 +97,14 @@ class WorkLifecycleTests(unittest.TestCase):
             max_turns=8, max_tokens=900000, tool_contracts='on_demand')
         case._write('note.md', 'An editable result.\n')
         before = app.ledger.to_dict()
-        with patch.object(app, '_work_feedback', wraps=app._work_feedback) as feedback:
+        with patch.object(app, '_work_feedback', wraps=app._work_feedback) as feedback, \
+                patch.object(app, '_coordination_result', wraps=app._coordination_result) as presentation:
             app._professional_model_input(SimpleNamespace(), app._client())
             self.assertEqual(feedback.call_count, 1)
+            self.assertEqual(presentation.call_count, 1)
             app._professional_model_input(SimpleNamespace(), app._client())
             self.assertEqual(feedback.call_count, 2)
+            self.assertEqual(presentation.call_count, 2)
         self.assertEqual(app.ledger.to_dict(), before)
         case.send.assert_not_called()
 

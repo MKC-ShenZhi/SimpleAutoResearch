@@ -240,6 +240,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             print_line("No current reusable delivery. The session may be incomplete." if args.version is None
                 else "No portable files in the selected retained delivery.")
         if "code_project" in deliveries:
+            print_line("Ordinary project reuse includes only delivered files; supply missing data and dependencies separately.")
             print_line("Revise code/figure: simple-ar start --from-session SESSION --reuse code_project --goal 'Your changes'")
         if session.manifest.transition_recipe == ToolApplication.RECIPE:
             print_line(f"Status: {session.manifest.status}")

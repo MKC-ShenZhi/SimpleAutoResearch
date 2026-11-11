@@ -2922,14 +2922,14 @@ class ToolApplication:
                   working_memory: dict | None = None, working_selection: dict | None = None,
                   decision_observations: list[dict] | None = None,
                   decision_guidance: tuple | None = None,
-                  decision_feedback: dict | None = None) -> list[dict[str, Any]]:
+                  decision_views: dict | None = None) -> list[dict[str, Any]]:
         protocol = self.state['config'].get('context_protocol')
         if protocol in _CONVERSATION_CONTEXT_PROTOCOLS:
             def conversation():
                 return self._conversation_messages(client=client, closing=closing,
                     native_history_start_turn=native_history_start_turn, schemas=schemas, working_memory=working_memory,
                     working_selection=working_selection, decision_observations=decision_observations,
-                    decision_guidance=decision_guidance, decision_feedback=decision_feedback)
+                    decision_guidance=decision_guidance, decision_views=decision_views)
             if self.operations is not None:
                 with self.operations.inspection.presentation_scope():
                     return conversation()
@@ -3559,7 +3559,7 @@ class ToolApplication:
                                working_selection: dict | None = None,
                                decision_observations: list[dict] | None = None,
                                decision_guidance: tuple | None = None,
-                               decision_feedback: dict | None = None) -> list[dict[str, Any]]:
+                               decision_views: dict | None = None) -> list[dict[str, Any]]:
         """One chronological working set; receipts retain their actual text once.
 
         This is historical conversation, not a revalidated evidence cache. Tool
@@ -3730,9 +3730,18 @@ class ToolApplication:
                     owner_observations.append({'record': item['result'], 'observation': result,
                                                'request_count': current})
                 record = 'records/' + item['result'].removeprefix('attempts/') if item else None
-                presented = self._coordination_result(result, record,
-                    delivery_feedback=delivery_feedback if self.operations is not None else None,
-                    review_record=item.get('review_result') if item else None) if item else result
+                if item:
+                    key = ('observation', record, item.get('review_result'))
+                    if decision_views is not None and decision_guidance is not None and key in decision_views:
+                        presented = decision_views[key]
+                    else:
+                        presented = self._coordination_result(result, record,
+                            delivery_feedback=delivery_feedback if self.operations is not None else None,
+                            review_record=item.get('review_result'))
+                        if decision_views is not None and decision_guidance is not None:
+                            decision_views[key] = presented
+                else:
+                    presented = result
                 if item:
                     presented_results[call_id] = presented
                 indexed = self._history_observation(call, result, item['result'] if item else turn['reply'])
@@ -4039,12 +4048,13 @@ class ToolApplication:
                 # Requests and notes retain their existing single presentation.
                 from simple_ar.core.working_context import feedback_observations
                 targets = tuple(sorted(current_artifacts))
-                if decision_feedback is None:
+                key = ('feedback', *targets)
+                if decision_views is None:
                     feedback = self._work_feedback(list(targets))
                 else:
-                    if targets not in decision_feedback:
-                        decision_feedback[targets] = self._work_feedback(list(targets))
-                    feedback = decision_feedback[targets]
+                    if key not in decision_views:
+                        decision_views[key] = self._work_feedback(list(targets))
+                    feedback = decision_views[key]
                 related = feedback_observations(feedback)
                 additions = []
                 for row in related:
@@ -4425,7 +4435,7 @@ class ToolApplication:
         working_memory, memory_refs = None, ()
         decision_observations = None
         decision_guidance = None
-        decision_feedback = {}
+        decision_views = {}
         selection = {}
         exit_value = None
         handoff_evidence = self._candidate_handoff()
@@ -4449,7 +4459,7 @@ class ToolApplication:
             messages = self._messages(client=client, working_memory=working_memory,
                 closing=closing, schemas=schemas, working_selection=selection,
                 decision_observations=decision_observations, decision_guidance=decision_guidance,
-                decision_feedback=decision_feedback)
+                decision_views=decision_views)
             value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
             if self.state['config'].get('work_lifecycle') == 'integrated.v3' and any(
                     row['function']['name'] == 'review_result' for row in schemas):
@@ -4465,7 +4475,7 @@ class ToolApplication:
                     messages = self._messages(client=client, working_memory=working_memory,
                         closing=closing, schemas=schemas, working_selection=selection,
                         decision_observations=decision_observations, decision_guidance=decision_guidance,
-                        decision_feedback=decision_feedback)
+                        decision_views=decision_views)
                     value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
             if integrated and closing:
                 # A service must leave the caller an exit even if its result is
@@ -4483,7 +4493,7 @@ class ToolApplication:
                     messages = self._messages(client=client, working_memory=working_memory,
                         closing=True, schemas=schemas, working_selection=selection,
                         decision_observations=decision_observations, decision_guidance=decision_guidance,
-                        decision_feedback=decision_feedback)
+                        decision_views=decision_views)
                     value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
                 exit_value = value
             if not closing and handoff_evidence and {'review_result', 'load_tools'} <= {
@@ -4547,7 +4557,7 @@ class ToolApplication:
                           and selection.get('economical_compaction', False) else {}))
             if inspection is not None:
                 inspection.clear_presentation_scope()
-            decision_feedback.clear()
+            decision_views.clear()
             decision_observations, decision_guidance, working_memory = None, None, None
             if memory_refs:
                 memory_refs = self._memory_artifacts(context.store, context.attempt.attempt_id)
