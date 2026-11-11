@@ -12,6 +12,8 @@ from pathlib import Path, PurePosixPath
 import re
 import tempfile
 
+from pydantic import ValidationError
+
 from simple_ar.core.artifacts import write_json
 from simple_ar.tools.specs import tool_completion
 
@@ -158,7 +160,8 @@ class DeliveryVersions:
             return path
         return None
 
-    def _material_groups(self, version: int) -> tuple[dict[str, dict[str, dict]], PurePosixPath | None]:
+    def _material_groups(self, version: int, *, include_project: bool = True
+                         ) -> tuple[dict[str, dict[str, dict]], PurePosixPath | None]:
         """Portable groups and, when declared, the delivered project layout."""
         from simple_ar.tools.workspace import _CopyProject
         selected = self.select(version)
@@ -181,7 +184,7 @@ class DeliveryVersions:
                         if name != 'code_project' and locators and all(
                                 path in files and hashes.get(path) == files[path]['sha256'] for path in locators):
                             groups[name] = {path: files[path] for path in locators}
-                    if result.get('tool_name') == 'copy_project' and explicit is None:
+                    if include_project and result.get('tool_name') == 'copy_project' and explicit is None:
                         calls = self.reader.record(turn['reply']).get('tool_calls') or []
                         call = next((row for row in calls if row['id'] == item['id']), None)
                         if call is not None and call['function']['name'] == 'copy_project':
@@ -190,7 +193,7 @@ class DeliveryVersions:
                                 root = self._workspace_relative(request.path)
                                 copy_data = result['data']
                                 receipt = self.reader.record(str(PurePosixPath(item['result']).parent / 'project-copy.json'))
-                            except (FileNotFoundError, KeyError, TypeError):
+                            except (FileNotFoundError, KeyError, TypeError, ValidationError):
                                 root = None
                             if (root is not None and root.parts
                                     and copy_data.get('absolute_path') == str(self.reader.mounts['workspace'] / root)
@@ -199,7 +202,7 @@ class DeliveryVersions:
                 if item['result'] == selected['observation']:
                     candidates = {root for root in ([explicit_root] if explicit is not None else roots)
                         if root is not None and any((relative := self._workspace_relative(path)) is not None
-                            and relative.is_relative_to(root) for path in files)}
+                            and relative.is_relative_to(root) for path in files)} if include_project else set()
                     project = next(iter(candidates)) if len(candidates) == 1 else None
                     if project is not None:
                         groups['code_project'] = {path: row for path, row in files.items()
@@ -208,8 +211,8 @@ class DeliveryVersions:
                     return groups, project
         raise ValueError('Selected delivery no longer belongs to the original journal')
 
-    def materials(self, version: int) -> dict[str, dict[str, dict]]:
-        return self._material_groups(version)[0]
+    def materials(self, version: int, *, include_project: bool = True) -> dict[str, dict[str, dict]]:
+        return self._material_groups(version, include_project=include_project)[0]
 
     def snapshot(self, version: int, names: list[str], *, max_bytes: int,
                  working_context: bool = False) -> tuple[dict, list[tuple[str, bytes]]]:
@@ -218,7 +221,7 @@ class DeliveryVersions:
         The existing creation transaction writes these bytes. No cache, old-task
         write, execution permission or current completion is created here.
         """
-        groups, project = self._material_groups(version)
+        groups, project = self._material_groups(version, include_project='code_project' in names)
         if not names or any(name not in groups for name in names):
             raise ValueError('Selected version does not contain every requested portable result group')
         files = {path: row for name in names for path, row in groups[name].items()}
@@ -279,7 +282,12 @@ class DeliveryVersions:
         from simple_ar.tools.materials import journal_read_windows, lossless_text_window
         from simple_ar.tools.professional_outcomes import accepted_native_result
         selected = self.select(version)
-        subjects = {str(self.reader.resolve(locator)): locator for locator in files}
+        subjects = {}
+        for locator in files:
+            try:
+                subjects[str(self.reader.resolve(locator))] = locator
+            except FileNotFoundError:
+                continue  # Retained bytes remain usable after the live output is removed.
         observations, notes, records, accepted = [], [], set(), {}
         for turn in self.reader.state['turns']:
             terminal = False
@@ -424,9 +432,9 @@ class DeliveryVersions:
                         'permission, completion, opinion approval, execution proof or ledger is inherited.'}
         raise ValueError('Selected delivery no longer belongs to the original journal')
 
-    def material_paths(self, version: int) -> dict[str, list[Path]]:
+    def material_paths(self, version: int, *, include_project: bool = True) -> dict[str, list[Path]]:
         return {name: [self._path(row['blob']) for row in files.values()]
-            for name, files in self.materials(version).items()}
+            for name, files in self.materials(version, include_project=include_project).items()}
 
     def _discard_stage(self, stage: Path, identity: dict) -> None:
         """Validate the entire owned stage before removing only known files.

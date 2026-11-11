@@ -90,6 +90,7 @@ def _delivered_project_version(reader: RetainedDelivery) -> tuple[int, Path] | N
     owner = DeliveryVersions(reader.root, authorize=reader.authorize)
     versions = owner.versions()
     if (not versions or versions[-1]['status'] != 'retained' or not reader.state['turns']
+            or not reader.state['turns'][-1]['tools']
             or versions[-1]['observation'] != reader.state['turns'][-1]['tools'][-1]['result']):
         return None
     ledger = reader.record('budget_ledger.json')
@@ -120,7 +121,7 @@ def select_reuse(root: Path, names: list[str] | tuple[str, ...], *,
     if version is not None:
         from simple_ar.tools.delivery_versions import DeliveryVersions
         owner = DeliveryVersions(root, authorize=access.authorize)
-        groups = owner.material_paths(version)
+        groups = owner.material_paths(version, include_project='code_project' in selected)
         if any(name not in groups for name in selected):
             raise ValueError('Selected retained version has no requested portable result group')
         if access.preflight is not None:
@@ -170,7 +171,7 @@ def select_reuse(root: Path, names: list[str] | tuple[str, ...], *,
         versions = owner.versions()
         if versions and versions[-1]['status'] == 'retained':
             latest = len(versions)
-            captured = owner.materials(latest)
+            captured = owner.materials(latest, include_project='code_project' in selected)
             if all(name in captured and {owner.reader.resolve(path) for path in captured[name]}
                     == set(groups[name]) for name in selected):
                 # Current registered results also have an explicit retained

@@ -140,6 +140,10 @@ class LocalWorkspaceTests(unittest.TestCase):
                 self.assertEqual((retained/'workspace/package/run.py').read_text(), 'print(1)\n')
                 self.assertFalse((retained/'workspace/package/data.csv').exists())
                 self.assertFalse(fresh.ledger.entries)
+                (tasks/'old/workspace/package/run.py').unlink()
+                later = workspace.preview_creation(data)
+                self.assertEqual(later['creation_declarations']['material_roles']['project'],
+                    ['retained_delivery/workspace/package'])
 
     def test_granted_project_reuse_uses_shared_proof_without_loading_old_task(self):
         from simple_ar.cli.start import migrate_new_start, native_creation_options
