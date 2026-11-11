@@ -2921,14 +2921,15 @@ class ToolApplication:
                   native_history_start_turn: int | None = None, schemas: list | None = None,
                   working_memory: dict | None = None, working_selection: dict | None = None,
                   decision_observations: list[dict] | None = None,
-                  decision_guidance: tuple | None = None) -> list[dict[str, Any]]:
+                  decision_guidance: tuple | None = None,
+                  decision_feedback: dict | None = None) -> list[dict[str, Any]]:
         protocol = self.state['config'].get('context_protocol')
         if protocol in _CONVERSATION_CONTEXT_PROTOCOLS:
             def conversation():
                 return self._conversation_messages(client=client, closing=closing,
                     native_history_start_turn=native_history_start_turn, schemas=schemas, working_memory=working_memory,
                     working_selection=working_selection, decision_observations=decision_observations,
-                    decision_guidance=decision_guidance)
+                    decision_guidance=decision_guidance, decision_feedback=decision_feedback)
             if self.operations is not None:
                 with self.operations.inspection.presentation_scope():
                     return conversation()
@@ -3557,7 +3558,8 @@ class ToolApplication:
                                schemas: list | None = None, working_memory: dict | None = None,
                                working_selection: dict | None = None,
                                decision_observations: list[dict] | None = None,
-                               decision_guidance: tuple | None = None) -> list[dict[str, Any]]:
+                               decision_guidance: tuple | None = None,
+                               decision_feedback: dict | None = None) -> list[dict[str, Any]]:
         """One chronological working set; receipts retain their actual text once.
 
         This is historical conversation, not a revalidated evidence cache. Tool
@@ -4036,7 +4038,14 @@ class ToolApplication:
                 # results in that same selector, not in a byte-capped envelope.
                 # Requests and notes retain their existing single presentation.
                 from simple_ar.core.working_context import feedback_observations
-                related = feedback_observations(self._work_feedback(sorted(current_artifacts)))
+                targets = tuple(sorted(current_artifacts))
+                if decision_feedback is None:
+                    feedback = self._work_feedback(list(targets))
+                else:
+                    if targets not in decision_feedback:
+                        decision_feedback[targets] = self._work_feedback(list(targets))
+                    feedback = decision_feedback[targets]
+                related = feedback_observations(feedback)
                 additions = []
                 for row in related:
                     same = next((existing for existing in working_rows
@@ -4416,6 +4425,7 @@ class ToolApplication:
         working_memory, memory_refs = None, ()
         decision_observations = None
         decision_guidance = None
+        decision_feedback = {}
         selection = {}
         exit_value = None
         handoff_evidence = self._candidate_handoff()
@@ -4438,7 +4448,8 @@ class ToolApplication:
             selection.clear()
             messages = self._messages(client=client, working_memory=working_memory,
                 closing=closing, schemas=schemas, working_selection=selection,
-                decision_observations=decision_observations, decision_guidance=decision_guidance)
+                decision_observations=decision_observations, decision_guidance=decision_guidance,
+                decision_feedback=decision_feedback)
             value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
             if self.state['config'].get('work_lifecycle') == 'integrated.v3' and any(
                     row['function']['name'] == 'review_result' for row in schemas):
@@ -4453,7 +4464,8 @@ class ToolApplication:
                     selection.clear()
                     messages = self._messages(client=client, working_memory=working_memory,
                         closing=closing, schemas=schemas, working_selection=selection,
-                        decision_observations=decision_observations, decision_guidance=decision_guidance)
+                        decision_observations=decision_observations, decision_guidance=decision_guidance,
+                        decision_feedback=decision_feedback)
                     value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
             if integrated and closing:
                 # A service must leave the caller an exit even if its result is
@@ -4470,7 +4482,8 @@ class ToolApplication:
                     selection.clear()
                     messages = self._messages(client=client, working_memory=working_memory,
                         closing=True, schemas=schemas, working_selection=selection,
-                        decision_observations=decision_observations, decision_guidance=decision_guidance)
+                        decision_observations=decision_observations, decision_guidance=decision_guidance,
+                        decision_feedback=decision_feedback)
                     value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
                 exit_value = value
             if not closing and handoff_evidence and {'review_result', 'load_tools'} <= {
@@ -4534,6 +4547,7 @@ class ToolApplication:
                           and selection.get('economical_compaction', False) else {}))
             if inspection is not None:
                 inspection.clear_presentation_scope()
+            decision_feedback.clear()
             decision_observations, decision_guidance, working_memory = None, None, None
             if memory_refs:
                 memory_refs = self._memory_artifacts(context.store, context.attempt.attempt_id)

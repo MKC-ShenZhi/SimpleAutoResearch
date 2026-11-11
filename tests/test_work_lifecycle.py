@@ -87,6 +87,24 @@ class WorkLifecycleTests(unittest.TestCase):
         self.assertEqual(app._operation_observations.call_count, 2)
         self.assertEqual(app._working_memory.call_count, 2)
 
+    def test_related_feedback_is_shared_within_a_decision_and_refreshed_next_time(self):
+        from tests import test_professional_work_loop as fixture
+        case = fixture.OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        app = case.app = ToolApplication.create(case.root, 'Continue the supplied work.',
+            model='fixture', sources={'measurements': case.inputs}, services=case.services,
+            max_turns=8, max_tokens=900000, tool_contracts='on_demand')
+        case._write('note.md', 'An editable result.\n')
+        before = app.ledger.to_dict()
+        with patch.object(app, '_work_feedback', wraps=app._work_feedback) as feedback:
+            app._professional_model_input(SimpleNamespace(), app._client())
+            self.assertEqual(feedback.call_count, 1)
+            app._professional_model_input(SimpleNamespace(), app._client())
+            self.assertEqual(feedback.call_count, 2)
+        self.assertEqual(app.ledger.to_dict(), before)
+        case.send.assert_not_called()
+
     def test_closure_never_offers_unfunded_check_and_keeps_partial_exit(self):
         for requests, expected_reserve in ((2, 1), (1, 0)):
             with self.subTest(requests=requests):
