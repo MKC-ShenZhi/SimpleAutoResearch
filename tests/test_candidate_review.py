@@ -96,6 +96,25 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertIn('review_result',status['next_tools'])
         self.assertFalse((self.root/'delivery.json').exists())
 
+    def test_feedback_keeps_prior_delivery_without_rechecking_it_as_a_new_candidate(self):
+        self.owner.config['tool_completions']['deliver_result'] = {'kind': 'delivery'}
+        delivered = {'summary': 'Earlier explanation', 'artifacts': ['draft.md']}
+        self.observations.append({'tool_name': 'deliver_result', 'status': 'ok', 'data': delivered,
+            'record': 'attempts/delivery/native_result.json', 'current_request': False})
+        self.review.issues = Mock(return_value=['Independent check required'])
+
+        lifecycle, feedback = self.owner.working_guidance(delivered, include_lifecycle=True)
+        self.review.issues.assert_not_called()
+        self.assertIsNone(feedback)
+        self.assertIn('previous delivery remains available', lifecycle['conditions'][0]['message'])
+
+        self.observations.append({'tool_name': 'deliver_result', 'status': 'ok',
+            'data': {**delivered, 'summary': 'Revised explanation'},
+            'record': 'attempts/revision/native_result.json', 'current_request': True})
+        lifecycle, feedback = self.owner.working_guidance(delivered, include_lifecycle=True)
+        self.review.issues.assert_called_once()
+        self.assertIn('Independent check required', feedback['issues'])
+
     def test_one_working_view_shares_review_but_later_views_recheck(self):
         self.owner.config['tool_completions']['deliver_result'] = {'kind': 'delivery'}
         claim = {'summary': 'Revised explanation', 'artifacts': ['draft.md']}

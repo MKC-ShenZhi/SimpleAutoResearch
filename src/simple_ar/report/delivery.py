@@ -113,7 +113,8 @@ class Delivery:
             reviewed.append((binding, issues))
             return issues
 
-        lifecycle = (self.lifecycle_requirements(observations=observations, review_issues=review_issues)
+        lifecycle = (self.lifecycle_requirements(observations=observations, review_issues=review_issues,
+                         accepted_delivery=accepted_delivery)
                      if include_lifecycle else None)
         return lifecycle, self.feedback(observations, accepted_delivery, review_issues=review_issues)
 
@@ -127,7 +128,7 @@ class Delivery:
             delivery = data.get(contract.field) if contract.field else data
             if delivery is None:
                 continue
-            if not row.get('current_request', True) and delivery == accepted_delivery:
+            if delivery == accepted_delivery:
                 return None
             try:
                 issues = self.issues(observations, delivery, review_issues=review_issues)
@@ -162,7 +163,8 @@ class Delivery:
         return (self.review_owner is not None
                 and delivery_requires_review(request, self.review_owner.protocol))
 
-    def lifecycle_requirements(self, *, observations: list[dict] | None = None, review_issues=None) -> dict:
+    def lifecycle_requirements(self, *, observations: list[dict] | None = None, review_issues=None,
+                               accepted_delivery: dict | None = None) -> dict:
         """Derive remaining obligations from original proposals and current bytes.
 
         This is working guidance, never acceptance or another saved task state.
@@ -175,6 +177,7 @@ class Delivery:
         prior_unresolved = []
         next_tools = ['review_result', 'deliver_result'] if self.review_owner else ['deliver_result']
         proposal = None
+        previously_delivered = False
         observations = self.observations() if observations is None else observations
         work_after_review = False
         review_followup = False
@@ -194,15 +197,23 @@ class Delivery:
             except (ValueError, TypeError):
                 work_after_review |= changed
                 continue
+            if (completion.kind == 'delivery' and observed.get('status') == 'ok'
+                    and value == accepted_delivery):
+                prior_unresolved = list(proposal.unresolved)
+                proposal = None
+                previously_delivered = True
+                break
             review_followup = (completion.kind == 'review' and observed.get('status') == 'ok'
                 and observed.get('current_request', True) and not work_after_review)
             break
         needs_review = self.review_owner is not None
         if proposal is None:
             conditions.append({'kind': 'candidate_submission',
-                'message': 'No candidate or delivery has been submitted. An applicable independent '
+                'message': ('The previous delivery remains available. Submit a new candidate when the '
+                    'current work is ready.' if previously_delivered else
+                    'No candidate or delivery has been submitted. An applicable independent '
                     'check may investigate useful work before final delivery; a final submission '
-                    'can also request the necessary check.'})
+                    'can also request the necessary check.')})
         else:
             prior_unresolved = list(proposal.unresolved)
             try:
