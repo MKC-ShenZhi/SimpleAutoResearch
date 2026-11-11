@@ -106,7 +106,7 @@ class CandidateReviewTests(unittest.TestCase):
         lifecycle, feedback = self.owner.working_guidance(delivered, include_lifecycle=True)
         self.review.issues.assert_not_called()
         self.assertIsNone(feedback)
-        self.assertIn('previous delivery remains available', lifecycle['conditions'][0]['message'])
+        self.assertIn('previous delivery is recorded', lifecycle['conditions'][0]['message'])
 
         self.observations.append({'tool_name': 'deliver_result', 'status': 'ok',
             'data': {**delivered, 'summary': 'Revised explanation'},

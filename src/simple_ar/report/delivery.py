@@ -209,7 +209,7 @@ class Delivery:
         needs_review = self.review_owner is not None
         if proposal is None:
             conditions.append({'kind': 'candidate_submission',
-                'message': ('The previous delivery remains available. Submit a new candidate when the '
+                'message': ('The previous delivery is recorded. Submit a new candidate when the '
                     'current work is ready.' if previously_delivered else
                     'No candidate or delivery has been submitted. An applicable independent '
                     'check may investigate useful work before final delivery; a final submission '
