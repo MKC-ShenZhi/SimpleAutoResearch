@@ -151,7 +151,7 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--from-session", type=Path, help="Reuse registered results or a validated project from an existing session.")
     parser.add_argument("--reuse-version", type=int, help="Explicit retained delivery version from results SESSION; portable inputs for new work.")
     parser.add_argument("--reuse", action="append", default=[],
-                        help="Registered result name shown by results SESSION; repeatable. Materials can serve any goal. code_project retains its saved edit scope and checker.")
+                        help="Registered result name shown by results SESSION; repeatable. Ordinary code_project reuse carries delivered files; historical exact-code contracts retain their scope and checker.")
     parser.add_argument("--chat", action="store_true", help="Opt-in model-assisted technical setup for explicit structured protocols, not the ordinary native preference entry. Requires a terminal and model connection.")
     parser.add_argument("--resume-setup", type=Path, help="Resume a saved natural-language setup directory, retaining replies and setup model accounting; not execution recovery.")
     parser.add_argument("--with-report", action="store_true", help="Data analysis: also write and review a report from the saved analysis and figures in the same session; requires a model. Default: analysis only, no task API calls.")
