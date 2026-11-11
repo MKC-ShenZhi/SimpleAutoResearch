@@ -21,6 +21,60 @@ def action(name, arguments):
 
 
 class DeliveryVersionTests(unittest.TestCase):
+    def test_delivered_project_subset_is_reused_as_new_task_input(self):
+        from simple_ar.app.reuse import select_reuse, session_materials
+        from simple_ar.cli.start import migrate_new_start, native_creation_options
+        from simple_ar.cli.parser import build_parser
+        old = b'value = 1\n'
+        result = self.app.run(actions=[
+            action('write_file', {'path': 'working/main.py', 'content': old.decode()}),
+            action('write_file', {'path': 'working/data.csv', 'content': 'old data\n'}),
+            action('copy_project', {'source': 'working', 'path': 'package'}),
+            action('write_file', {'path': 'package/main.py', 'content': 'value = 2\n',
+                'expected_sha256': hashlib.sha256(old).hexdigest()}),
+            action('deliver_result', {'summary': 'Updated source', 'artifacts': ['package/main.py']})],
+            progress=lambda _: None)
+        self.assertEqual(result['status'], 'completed', result)
+        files = {p: p.read_bytes() for p in (self.root/'actions.json', self.root/'session_manifest.json',
+            self.root/'budget_ledger.json', self.root/'delivery.json')}
+        self.assertIn('code_project', session_materials(self.root))
+        selected = select_reuse(self.root, ['code_project'])
+        self.assertEqual(selected.version, 1)
+        owner = DeliveryVersions(self.root)
+        self.assertEqual(list(owner.materials(1)['code_project']), ['package/main.py'])
+        args = build_parser().parse_args(['start'])
+        args.model, args.request = '', 'Continue the delivered project'
+        args.from_session, args.reuse = self.root, ['code_project']
+        with patch('sys.stdin.isatty', return_value=False):
+            self.assertTrue(migrate_new_start(args))
+        fresh = ToolApplication.create(self.base/'project-fresh', args.request, **native_creation_options(args))
+        copied = Path(fresh.state['config']['sources']['retained_delivery'])
+        self.assertEqual((copied/'workspace/package/main.py').read_text(), 'value = 2\n')
+        self.assertFalse((copied/'workspace/package/data.csv').exists())
+        self.assertEqual(fresh.state['config']['creation_declarations']['material_roles']['project'],
+            ['retained_delivery/workspace/package'])
+        self.assertFalse(fresh.state['config']['allow_execution'])
+        self.assertFalse(fresh.ledger.entries)
+        self.assertEqual({p: p.read_bytes() for p in files}, files)
+        (self.root/'workspace/package/main.py').unlink()
+        metadata, retained = owner.snapshot(1, ['code_project'], max_bytes=10000)
+        self.assertEqual(metadata['project_root'], 'workspace/package')
+        self.assertEqual(retained, [('workspace/package/main.py', b'value = 2\n')])
+
+    def test_explicit_project_root_uses_only_its_delivered_members(self):
+        self.app.run(actions=[
+            action('write_file', {'path': 'analysis/main.py', 'content': 'result = 1\n'}),
+            action('write_file', {'path': 'analysis/private.csv', 'content': 'not delivered\n'}),
+            action('write_file', {'path': 'report.md', 'content': 'Summary\n'}),
+            action('deliver_result', {'summary': 'Project and report', 'project_root': 'analysis',
+                'artifacts': ['analysis/main.py', 'report.md']})], progress=lambda _: None)
+        from simple_ar.app.reuse import select_reuse
+        selection = select_reuse(self.root, ['code_project', 'artifacts'])
+        self.assertEqual(selection.version, 1)
+        groups = DeliveryVersions(self.root).materials(1)
+        self.assertEqual(list(groups['code_project']), ['analysis/main.py'])
+        self.assertEqual(set(groups['artifacts']), {'analysis/main.py', 'report.md'})
+
     def test_paused_task_history_becomes_exact_new_inputs_without_inheriting_task_state(self):
         first = self.deliver()
         self.assertEqual(first['status'], 'completed')

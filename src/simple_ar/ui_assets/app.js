@@ -331,6 +331,14 @@ async function refresh() {
         creationMode(); saveDrafts(); refresh().catch(error => notice(error.message)); $('goal').focus();
       };
       $('delivery').append(button);
+      const project = document.createElement('button'); project.className = 'secondary';
+      project.textContent = '尝试用第 ' + version.number + ' 版项目文件新建任务';
+      project.onclick = () => {
+        selectTask(''); reuseOrigin = {...version.origin, reuse: ['code_project']}; $('taskConfig').value = '';
+        $('reuseSummary').textContent = '将检查此版是否包含已交付项目；只复用其中已交付的文件，缺少的数据和依赖需另行提供。';
+        creationMode(); saveDrafts(); refresh().catch(error => notice(error.message)); $('goal').focus();
+      };
+      $('delivery').append(project);
     }
     paragraph($('delivery'), '原交付记录的未解决事项（不认证科研质量）：', 'hint');
     if (delivery.unresolved?.length) {

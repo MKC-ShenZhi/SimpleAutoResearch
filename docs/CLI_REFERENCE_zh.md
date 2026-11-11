@@ -89,7 +89,7 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--guided` | 交互选择原生任务的成果偏好。 | 关闭 |
 | `--kind CHOICE` | 成果偏好；精确协议参数可能选择结构化兼容路径。不授予访问权限。 可选：`survey`, `bug_fix`, `reproduction`, `writing`, `data_analysis`, `figure`, `code`. | 未设置 |
 | `--from-session PATH` | 从此会话复用成果；配合 --reuse。 | 未设置 |
-| `--reuse NAME` | results 列出的登记成果名，可重复；code_project 保留编辑范围／检查器。 | [] |
+| `--reuse NAME` | results 列出的登记成果名，可重复；普通 `code_project` 复用已交付的项目文件，历史精确代码合同保留登记的编辑范围和检查器。 | [] |
 | `--reuse-version N` | 与 --from-session／--reuse 选择历史交付版本，保留原布局及可用的相关原始观察；工作笔记仅为历史判断，权限、记账与验收分别生效。 | 未设置：当前交付 |
 | `--scripted` | 配合 --kind data_analysis 使用原生代码分析；命令仍需逐项批准。 | 关闭 |
 | `--goal TEXT` | 目标文本，与位置参数 request 二选一。 | 未设置 |
@@ -261,6 +261,8 @@ simple-ar results SESSION
 simple-ar start --from-session SESSION --reuse code_project --goal "修改图例"
 simple-ar start --from-session SESSION --reuse artifacts --reuse-version 1 --goal "从首版成果继续分析"
 ```
+
+普通项目只复用声明或曾复制的项目目录中已交付的文件，并保留目录结构；缺少的数据和依赖需另行提供。新任务使用自己的执行授权和预算。
 
 
 ### `simple-ar status`

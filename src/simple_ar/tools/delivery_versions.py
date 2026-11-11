@@ -141,11 +141,32 @@ class DeliveryVersions:
             raise ValueError('Selected delivery has no retained bytes; current files cannot reconstruct it')
         return selected
 
-    def materials(self, version: int) -> dict[str, dict[str, dict]]:
-        """Portable groups from the selected receipt; no live-output dependency."""
+    def _workspace_relative(self, locator: str) -> PurePosixPath | None:
+        """Identify a saved workspace path without opening the old live file."""
+        workspace = self.reader.mounts['workspace']
+        native = Path(locator)
+        if native.is_absolute():
+            if not native.is_relative_to(workspace):
+                return None
+            return PurePosixPath(native.relative_to(workspace).as_posix())
+        path = PurePosixPath(locator)
+        if '\\' in locator or '..' in path.parts:
+            return None
+        if path.parts and path.parts[0] == 'workspace':
+            return PurePosixPath(*path.parts[1:])
+        if path.parts and path.parts[0] not in self.reader.mounts:
+            return path
+        return None
+
+    def _material_groups(self, version: int) -> tuple[dict[str, dict[str, dict]], PurePosixPath | None]:
+        """Portable groups and, when declared, the delivered project layout."""
+        from simple_ar.tools.workspace import _CopyProject
         selected = self.select(version)
         files = selected['files']
         groups = {'artifacts': dict(files)} if files else {}
+        explicit = selected['delivery'].get('project_root')
+        explicit_root = self._workspace_relative(explicit) if explicit else None
+        roots = set()
         for turn in self.reader.state['turns']:
             for item in turn['tools']:
                 try:
@@ -160,9 +181,35 @@ class DeliveryVersions:
                         if name != 'code_project' and locators and all(
                                 path in files and hashes.get(path) == files[path]['sha256'] for path in locators):
                             groups[name] = {path: files[path] for path in locators}
+                    if result.get('tool_name') == 'copy_project' and explicit is None:
+                        calls = self.reader.record(turn['reply']).get('tool_calls') or []
+                        call = next((row for row in calls if row['id'] == item['id']), None)
+                        if call is not None and call['function']['name'] == 'copy_project':
+                            try:
+                                request = _CopyProject.model_validate_json(call['function']['arguments'])
+                                root = self._workspace_relative(request.path)
+                                copy_data = result['data']
+                                receipt = self.reader.record(str(PurePosixPath(item['result']).parent / 'project-copy.json'))
+                            except (FileNotFoundError, KeyError, TypeError):
+                                root = None
+                            if (root is not None and root.parts
+                                    and copy_data.get('absolute_path') == str(self.reader.mounts['workspace'] / root)
+                                    and receipt == {'request': request.model_dump(), 'data': copy_data}):
+                                roots.add(root)
                 if item['result'] == selected['observation']:
-                    return groups
+                    candidates = {root for root in ([explicit_root] if explicit is not None else roots)
+                        if root is not None and any((relative := self._workspace_relative(path)) is not None
+                            and relative.is_relative_to(root) for path in files)}
+                    project = next(iter(candidates)) if len(candidates) == 1 else None
+                    if project is not None:
+                        groups['code_project'] = {path: row for path, row in files.items()
+                            if (relative := self._workspace_relative(path)) is not None
+                            and relative.is_relative_to(project)}
+                    return groups, project
         raise ValueError('Selected delivery no longer belongs to the original journal')
+
+    def materials(self, version: int) -> dict[str, dict[str, dict]]:
+        return self._material_groups(version)[0]
 
     def snapshot(self, version: int, names: list[str], *, max_bytes: int,
                  working_context: bool = False) -> tuple[dict, list[tuple[str, bytes]]]:
@@ -171,7 +218,7 @@ class DeliveryVersions:
         The existing creation transaction writes these bytes. No cache, old-task
         write, execution permission or current completion is created here.
         """
-        groups = self.materials(version)
+        groups, project = self._material_groups(version)
         if not names or any(name not in groups for name in names):
             raise ValueError('Selected version does not contain every requested portable result group')
         files = {path: row for name in names for path, row in groups[name].items()}
@@ -215,8 +262,10 @@ class DeliveryVersions:
             raise ValueError('Selected retained inputs and work context exceed max_snapshot_bytes; narrow the selected groups')
         if self.reader.record('actions.json') != self.reader.state:
             raise ValueError('Task changed during retained input selection')
+        project_layout = (PurePosixPath('workspace') / project).as_posix() if 'code_project' in names else None
         return {'session': str(self.root), 'version': version, 'results': list(names), 'files': sources,
             'groups': {name: [layout[path] for path in groups[name]] for name in names},
+            **({'project_root': project_layout} if project_layout is not None else {}),
             **({'working_context': handoff} if handoff is not None else {})}, result
 
     def working_context(self, version: int, files: dict, layout: dict, contents: dict) -> dict:

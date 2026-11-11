@@ -9,6 +9,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
+- Ordinary project reuse can carry a delivered subset in its original layout, without importing undelivered project files or the previous task's authority.
 - Report export can use complete captions written directly after figures, keeping authored labels without duplication; ACM output uses readable technical wrapping and table widths.
 - Preparing follow-up work reuses the current decision's records instead of rechecking a recorded delivery as a new candidate; new deliveries are still checked against their actual outputs.
 

@@ -159,6 +159,8 @@ class DeliveryRequest(BaseModel):
         description='Optional exact UTF-8 window of an actual delivered text file. After final work succeeds, the delivery owner replaces summary with this window and checks its existing delivery byte binding. No semantic representativeness or scientific correctness is certified. Omit to retain the free summary contract.')
     artifacts: list[str] = Field(default_factory=list,
         description="Existing workspace outputs (workspace-relative or explicitly mounted paths) or retained files in this task's evidence mount. Evidence remains read-only and is not certified. Directories expand to at most 200 accessible files; private paths, environments, bytecode caches and symlinks are excluded by existing inventory rules. New formal deliveries retain exact selected file bytes at the original terminal attempt. Storage failure prevents commit. Old deliveries without retained bytes are not reconstructed. This is not a whole-workspace archive or correctness certificate.")
+    project_root: str | None = Field(default=None, min_length=1, exclude_if=lambda value: value is None,
+        description='Optional workspace project root for later reuse. Only delivered artifacts below this root are included; other files, permissions and execution state are not transferred. State missing dependencies or data in the delivery when relevant.')
     unresolved: list[str] = Field(default_factory=list,
         description='Requested work still unfinished or a required defect still unresolved; nonempty makes delivery partial. Put inherent evidence limits in limitations instead.')
     limitations: list[str] = Field(default_factory=list,exclude_if=lambda value:not value,
@@ -553,6 +555,10 @@ def workspace_observation_view(result: dict, *, record: str, directory_path: str
         return result
 
 
+class PartialProjectDelivery(ValueError):
+    """A copied project cannot be reused whole, but delivered members may be portable."""
+
+
 class RetainedDelivery:
     """Read the existing delivery and provenance without assembling executable owners.
 
@@ -782,17 +788,17 @@ class RetainedDelivery:
                 records[record_path] = receipt
                 expected = members
                 if data['copy']['skipped_count']:
-                    raise ValueError('Delivered project copy has omissions; no complete project proof')
+                    raise PartialProjectDelivery('Delivered project copy has omissions; no complete project proof')
                 files = data['files']
                 if not files:
                     raise ValueError('Delivered project copy has no member inventory')
                 if not expected.keys() <= delivered.keys():
-                    raise ValueError('Deliver every copied project member before offering code_project')
+                    raise PartialProjectDelivery('Deliver every copied project member before offering code_project')
                 if any(delivered[path] != digest for path, digest in expected.items()):
-                    raise ValueError('Delivered project changed since copying; create a final snapshot')
+                    raise PartialProjectDelivery('Delivered project changed since copying; create a final snapshot')
                 inventory = bind_project_inventory(project, resolve=lambda value: self.resolve(value))
                 if {Path(name): digest for name, digest in inventory['file_hashes'].items()} != expected:
-                    raise ValueError('Delivered project inventory changed since copying')
+                    raise PartialProjectDelivery('Delivered project inventory changed since copying')
                 if project in candidates and candidates[project] != expected:
                     raise ValueError('Ambiguous copy inventories for the delivered project')
                 candidates[project] = expected
@@ -2473,6 +2479,12 @@ class WorkspaceToolGateway:
             raise ValueError("Final delivery must include the file being written")
         if any(path != writing and not path.is_file() for path in paths):
             raise ValueError("Delivery references a missing workspace file")
+        if request.project_root is not None:
+            project = self.resolve(request.project_root)
+            if not project.is_dir() or not project.is_relative_to(self.workspace):
+                raise ValueError('Reusable project root must be a workspace directory')
+            if not any(path.is_relative_to(project) for path in paths):
+                raise ValueError('Reusable project must include at least one delivered artifact')
         return {**request.model_dump(), 'artifacts': artifacts}
 
     def _read_file_window(self, target: Path, request: FileWindow, *,

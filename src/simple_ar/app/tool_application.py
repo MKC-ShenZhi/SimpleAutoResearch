@@ -1939,6 +1939,8 @@ class ToolApplication:
             config.setdefault('source_snapshots', {})[alias] = selected
             declarations = config['creation_declarations']
             declarations.setdefault('material_roles', {}).setdefault('material', []).append(alias)
+            if selected.get('project_root') is not None:
+                declarations['material_roles'].setdefault('project', []).append(alias + '/' + selected['project_root'])
             origin['prior_drafts'] = [alias + '/' + path for path in selected['groups'].get('report', [])]
         if max_output_tokens is not None:
             config['max_output_tokens'] = max_output_tokens

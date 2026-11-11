@@ -277,7 +277,7 @@ def migrate_new_start(args: argparse.Namespace, *, reuse_access: ReuseAccess | N
         if not args.guided:
             if args.scripted:
                 raise ValueError("--scripted requires --kind data_analysis.")
-            if not (reuse_inputs or args.project or args.document or args.material
+            if not (reuse_inputs or registered_origin or args.project or args.document or args.material
                     or args.data_file or args.data_path or args.with_report):
                 return False  # Bare start and plain requests already use native main.
         if args.resume_task:
@@ -337,7 +337,7 @@ def migrate_new_start(args: argparse.Namespace, *, reuse_access: ReuseAccess | N
     if not goal.strip():
         raise ValueError("Supply a nonempty task goal.")
     interactive = sys.stdin.isatty()
-    if interactive and not (args.source or args.document or args.material or args.project or args.data_file or args.data_path):
+    if interactive and not (reuse_origin or args.source or args.document or args.material or args.project or args.data_file or args.data_path):
         print_line("Materials are read-only. Supply common file/project/data paths, one per line; blank finishes.")
         while value := input("Material path / 材料路径（可留空）: ").strip():
             args.source.append(Path(value))
@@ -910,6 +910,13 @@ def reuse_session_materials(args: argparse.Namespace, *, native: bool = False,
             args._reuse_report_drafts = selection.prior_drafts
 
     if "code_project" in selected:
+        if selection.version is not None:
+            if not native:
+                raise ValueError('Retained project files require an ordinary native task')
+            append_materials()
+            args.from_session, args.reuse = None, []
+            print_line('Reuse only delivered project files with their directory layout; missing dependencies and data remain separate inputs.')
+            return
         project = selection.project
         if project is None:
             raise ValueError("No current reusable code_project; complete and validate the original project first.")

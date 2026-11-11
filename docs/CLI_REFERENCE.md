@@ -89,7 +89,7 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--guided` | Interactively select an outcome preference for a native task. | Off |
 | `--kind CHOICE` | Outcome preference; exact protocol options can select structured compatibility. Does not grant access. Choices: `survey`, `bug_fix`, `reproduction`, `writing`, `data_analysis`, `figure`, `code`. | Unset |
 | `--from-session PATH` | Reuse deliveries from this session; pair with --reuse. | Unset |
-| `--reuse NAME` | Registered result name shown by results; repeatable. code_project retains its edit scope/checker. | [] |
+| `--reuse NAME` | Registered result name shown by results; repeatable. Ordinary `code_project` reuse provides delivered project files; historical exact-code contracts retain their registered scope and checker. | [] |
 | `--reuse-version N` | Select a retained delivery version with --from-session and --reuse; preserve its layout and related original observations when available. Working notes remain historical judgments; permissions, accounting and acceptance are independent. | Unset: current delivery |
 | `--scripted` | With --kind data_analysis, use native code/analysis; commands still need individual approval. | Off |
 | `--goal TEXT` | Goal text, instead of the positional request. | Unset |
@@ -262,6 +262,8 @@ simple-ar results SESSION
 simple-ar start --from-session SESSION --reuse code_project --goal "Revise the figure legend"
 simple-ar start --from-session SESSION --reuse artifacts --reuse-version 1 --goal "Continue from the first delivered version"
 ```
+
+For an ordinary project, only the delivered files under the declared or previously copied project root are included. Their layout is retained; supply any missing data or dependencies separately. The new task has its own execution permissions and budget.
 
 
 ### `simple-ar status`

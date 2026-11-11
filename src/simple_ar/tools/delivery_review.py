@@ -18,6 +18,8 @@ def delivery_claim(request: DeliveryRequest, artifacts: list[str], resolve: Call
     """Canonical wire claim shared by live binding and recorded opinion reading."""
     claim = request.model_dump(mode='json', exclude_none=True)
     claim['artifacts'] = artifacts
+    if request.project_root is not None:
+        claim['project_root'] = str(resolve(request.project_root))
     if request.report is not None:
         if request.report.manuscript:
             claim['report']['manuscript'] = str(resolve(request.report.manuscript))

@@ -110,6 +110,37 @@ class LocalWorkspaceTests(unittest.TestCase):
         self.assertEqual(result['status'], 'completed', result)
         return app, root / 'workspace/package'
 
+    def test_project_version_creation_uses_only_delivered_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base, tasks = Path(temporary).resolve(), Path(temporary).resolve()/'tasks'
+            old = ToolApplication.create(tasks/'old', 'Deliver project files', model=None, sources={})
+            old.run(actions=[
+                call('write_file', {'path': 'work/run.py', 'content': 'print(1)\n'}),
+                call('write_file', {'path': 'work/data.csv', 'content': 'not delivered\n'}),
+                call('copy_project', {'source': 'work', 'path': 'package'}),
+                call('deliver_result', {'summary': 'Source', 'artifacts': ['package/run.py']})],
+                progress=lambda _: None)
+            catalog = base/'models.toml'
+            catalog.write_text('version = 1\n[routes]\ndefault="offline"\n[profiles.offline]\n'
+                'api="openai_chat"\nbase_url="https://offline.invalid/v1"\nmodel="fixture"\n'
+                'api_key_env="SAR_UI_TEST_KEY"\ncapabilities=["text","code"]\n', encoding='utf-8')
+            with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(catalog), 'SAR_UI_TEST_KEY': 'fixture'}), \
+                    patch.object(LLMClient, '_complete_request', side_effect=AssertionError('No provider traffic')):
+                workspace = Workspace(base, [], tasks)
+                data = dict(goal='Continue this project', materials=[], model='profile:offline',
+                    binding_id=workspace.connection('profile:offline')[1], max_turns=4, max_tokens=100000,
+                    process_invocations=0, process_wall_seconds=0, execution=False, network=False,
+                    from_session=str(tasks/'old'), reuse_version=1, reuse=['code_project'])
+                preview = workspace.preview_creation(data)
+                self.assertEqual(preview['creation_declarations']['material_roles']['project'],
+                    ['retained_delivery/workspace/package'])
+                created = workspace.mutate(dict(data, op='create', confirmed=True, preview_id=preview['preview_id']))
+                fresh = ToolApplication.load(tasks/created['task'])
+                retained = Path(fresh.state['config']['sources']['retained_delivery'])
+                self.assertEqual((retained/'workspace/package/run.py').read_text(), 'print(1)\n')
+                self.assertFalse((retained/'workspace/package/data.csv').exists())
+                self.assertFalse(fresh.ledger.entries)
+
     def test_granted_project_reuse_uses_shared_proof_without_loading_old_task(self):
         from simple_ar.cli.start import migrate_new_start, native_creation_options
         with tempfile.TemporaryDirectory() as temporary:
