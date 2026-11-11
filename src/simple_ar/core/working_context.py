@@ -453,12 +453,13 @@ def select_working_context(
                 version = ('unknown' if current is None or digest is None else
                            'matching' if current == digest else 'stale')
         # Identity of a supplied receipt is separate from repeated presentation.
-        # Only exact, same-path, same-version observed windows can share a body;
-        # this never infers provenance from an equal digest at another path.
+        # Exact, same-path/version observations or authored snapshots can share
+        # their own body. A write snapshot never replaces an independent read.
         repeatable = ((preserve_material_observations or recent_set) and version == 'matching'
-            and row.get('kind') == 'source_text' and row.get('role') == 'historical_observation'
+            and (row.get('kind'), row.get('role')) in {
+                ('source_text', 'historical_observation'), ('authored_text', 'write_context')}
             and type(row.get('offset_bytes')) is int and type(row.get('next_offset_bytes')) is int)
-        keys.append(dump(['observed_body', path, digest, row.get('offset_bytes'),
+        keys.append(dump(['material_body', row.get('kind'), row.get('role'), path, digest, row.get('offset_bytes'),
                           row.get('next_offset_bytes'), text]) if repeatable else
                     source_key(row) if native_observations is not None else dump([path, digest, row.get('kind'),
                           row.get('record') if not path or row.get('kind') == 'operation_result' else None,

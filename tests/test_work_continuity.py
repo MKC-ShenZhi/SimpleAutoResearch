@@ -221,6 +221,29 @@ class SelectedWorkContinuityTests(unittest.TestCase):
 
 
 class WorkingSupplyContinuityTests(unittest.TestCase):
+    def test_identical_authored_snapshots_share_text_without_replacing_a_read(self):
+        text = 'Current result.\n'
+        base = {'path': 'workspace/report.md', 'sha256': 'a' * 64,
+            'offset_bytes': 0, 'next_offset_bytes': len(text), 'text': text}
+        rows = [
+            {**base, 'turn': 0, 'record': 'records/write-1.json', 'kind': 'authored_text', 'role': 'write_context'},
+            {**base, 'turn': 1, 'record': 'records/write-2.json', 'kind': 'authored_text', 'role': 'write_context'},
+            {**base, 'turn': 1, 'record': 'records/read.json', 'kind': 'source_text', 'role': 'historical_observation'}]
+        messages, _ = select_working_context(
+            user_requests=['Continue'], system_text='Work', base_context={},
+            turn_blocks=[[], [], [{'role': 'assistant', 'content': 'Latest decision'}]],
+            observations=rows, selected_records=[row['record'] for row in rows], native_observations=[],
+            schema_tokens=0, context_token_target=100000, estimate_tokens=len, material_policy='working',
+            require_work_notes=True, fit_work_notes=True, sparse_handoffs=True,
+            processed_turns=[], archived_turns=[], working_set_policy='recent.v4',
+            version_resolver=lambda _: 'a' * 64)
+        context = json.loads(messages[1]['content'])
+        supplied = [item['observation'] for item in context['working_view']['observations']]
+        self.assertEqual([row['kind'] for row in supplied].count('authored_text'), 1)
+        self.assertEqual([row['kind'] for row in supplied].count('source_text'), 1)
+        self.assertEqual({row['record'] for row in context['material_supply']['references']},
+                         {row['record'] for row in rows})
+
     def test_related_opinion_does_not_pin_every_window_in_its_receipt(self):
         from simple_ar.core.working_context import feedback_observations
 
