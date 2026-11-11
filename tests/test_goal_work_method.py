@@ -561,6 +561,12 @@ class GoalWorkTests(unittest.TestCase):
             shown = case.app.operations.delivery_review.resolve_observation(
                 {**parent, 'record': item['result']}, review_record=item['review_result'])
         self.assertEqual(shown['metadata']['delivery_review']['result'], original_opinion)
+        owner.store.resolve(owner._path(identity, 'result')).unlink()
+        shown = case.app.operations.delivery_review.resolve_observation(
+            {**parent, 'record': item['result']}, review_record=item['review_result'])
+        self.assertEqual(shown['metadata']['delivery_review']['result'], original_opinion)
+        with self.assertRaises((ValueError, OSError)):
+            owner._cached(identity)
         self.assertEqual(case.app.ledger.to_dict(), ledger)
 
     def test_accessible_support_is_not_a_delivered_requested_output(self):

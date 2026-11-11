@@ -930,12 +930,18 @@ class DeliveryReview:
             return self._resolve_observation(observed, review_record=review_record)[0]
         projected = deepcopy(observed)
         try:
-            path = self.inspector._path(envelope['identity'], 'result')
-            raw = self.inspector.store.read_json(path) if self.inspector.store.exists(path) else None
-            accepted, intact, _ = self._accepted_pending_opinion(
-                {**observed, 'review_record': review_record}, envelope, raw)
-            if accepted is True and intact:
-                result = ToolResult.model_validate(raw)
+            from simple_ar.tools.professional_outcomes import accepted_scoped_opinion
+            record = observed.get('record')
+            if record is not None and (Path(record).name != 'native_result.json'
+                    or Path(record).parent.name != envelope['identity']):
+                return projected
+            self._pending_input(envelope)
+            root = self.inspector.store.root
+            session_id = self.inspector.store.read_json('session_manifest.json')['session_id']
+            _, raw, _ = accepted_scoped_opinion(root, self.workspace, session_id,
+                review_record, envelope['identity'])
+            result = ToolResult.model_validate(raw)
+            if result.tool_name == 'inspect_artifacts':
                 projected['metadata']['delivery_review'] = self._envelope(envelope['binding'],
                     envelope['identity'], result)
         except _ERRORS:
