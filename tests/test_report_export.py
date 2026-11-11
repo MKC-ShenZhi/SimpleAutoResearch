@@ -211,6 +211,7 @@ class ReportExportTests(unittest.TestCase):
             gateway = PublicationToolGateway(root, workspace, ledger)
             app = SimpleNamespace(workspace=workspace, publication=gateway,
                 gateway=SimpleNamespace(session_owner=lambda name: None))
+            app.execution_approval = lambda call: ToolApplication.execution_approval(app, call)
             call = {'function': {'name': 'export_report', 'arguments': json.dumps(arguments)}}
             old_token = hashlib.sha256(json.dumps({'call': call, 'inputs': approved}, sort_keys=True).encode()).hexdigest()
             self.assertEqual(ToolApplication.approval_token(app, call), old_token)

@@ -135,6 +135,45 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertEqual(c.app.state['pending']['call']['function']['name'], 'run_process')
         self.assertIn('explicit approval', c.app.session.manifest.status_reason)
 
+    @unittest.skipUnless(shutil.which('pandoc'), 'Publication requires Pandoc')
+    def test_legacy_publication_approval_after_remembered_process(self):
+        c = self.case
+        c.decisions.append([
+            fixture._action('write_file', path='check.py', content='print("ready")\n'),
+            fixture._action('write_file', path='note.md', content='# Note\n\nOriginal observations.\n'),
+        ])
+        self.drain()
+        c.decisions.append(fixture._action('run_process', argv=[sys.executable, 'check.py'], inputs=['check.py']))
+        self.drain()
+        token = c.app.approval_token(c.app.state['pending']['call'])
+        self.drain(approved_execution=token, remember_execution=True)
+        self.assertEqual(c._last('run_process')['status'], 'ok')
+        self.assertTrue(c.app.state['execution_grants'])
+        self.assertIsNone(c.app.gateway.session_owner('export_report'))
+
+        export = fixture._action('export_report', markdown='note.md', compile_pdf=False)
+        c.decisions.append(export)
+        self.drain()
+        call = c.app.state['pending']['call']
+        self.assertIn('explicit approval', c.app.session.manifest.status_reason)
+        token = c.app.approval_token(call)
+        self.assertEqual(c.app.execution_approval(call)['token'], token)
+        self.drain(approved_execution=token, remember_execution=True)
+        self.assertEqual(c._ok('export_report')['status'], 'ok')
+
+        c._reload()
+        c.decisions.append(export)
+        self.drain()
+        self.assertEqual(len(c._observations('export_report')), 2)
+        self.assertIsNone(c.app.state['pending'])
+        c.decisions.append(fixture._action('edit_file', path='note.md',
+            old_text='Original observations.', new_text='Revised observations.'))
+        self.drain()
+        c.decisions.append(export)
+        self.drain()
+        self.assertIn('explicit approval', c.app.session.manifest.status_reason)
+        self.assertNotEqual(c.app.approval_token(c.app.state['pending']['call']), token)
+
     def test_repeated_read_keeps_authorized_work_available_for_saved_sessions(self):
         c = self.case
         c.app.state['config']['tool_contracts'] = 'on_demand'

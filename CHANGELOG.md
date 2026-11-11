@@ -13,6 +13,10 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - Report export can use complete captions written directly after figures, keeping authored labels without duplication; ACM output uses readable technical wrapping and table widths.
 - Preparing a decision reuses related feedback and presents accepted historical opinions without repeating their investigations; current deliveries still check whether the opinions apply to their actual outputs.
 
+### Fixed
+
+- Report export can be approved after a previously remembered process without treating publication settings as command arguments.
+
 ## 2026-11-10
 
 ### Improved

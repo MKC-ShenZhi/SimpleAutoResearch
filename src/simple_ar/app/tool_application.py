@@ -5573,18 +5573,17 @@ class ToolApplication:
 
     def execution_approval(self, call: dict[str, Any]) -> dict[str, Any]:
         """Project approval through the execution owner, without granting it."""
+        owner = self.gateway.session_owner(call['function']['name'])
+        if owner is None and call['function']['name'] == 'export_report':
+            request = ExportRequest.model_validate(json.loads(call['function']['arguments']))
+            source = self.workspace.resolve(request.markdown, write=True)
+            binding = {'call': deepcopy(call), 'inputs': self.publication.input_binding(source, request)}
+            return {'binding': binding, 'token': self.workspace.approval_digest(binding)}
         return self.workspace.execution_approval(call, pending=self.state.get('pending'),
-            owner=self.gateway.session_owner(call['function']['name']))
+            owner=owner)
 
     def approval_token(self, call: dict[str, Any]) -> str:
-        if self.gateway.session_owner(call['function']['name']) is not None:
-            return self.execution_approval(call)['token']
-        if call["function"]["name"] == "export_report":
-            request = ExportRequest.model_validate(json.loads(call["function"]["arguments"]))
-            source = self.workspace.resolve(request.markdown, write=True)
-            return hashlib.sha256(json.dumps({"call": call,
-                "inputs": self.publication.input_binding(source, request)}, sort_keys=True).encode()).hexdigest()
-        return self.workspace.approval_token(call)
+        return self.execution_approval(call)['token']
 
     def _authorize(self, sources: tuple[Path, ...], *, execution: bool, network: bool, vision: bool) -> str:
         """Explicit caller grants within the existing task, never inferred intent."""
