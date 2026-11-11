@@ -36,6 +36,41 @@ class CandidateReviewTests(unittest.TestCase):
         self.drain()
         return c._last('review_result', reviewed=True)
 
+    def work_before_report(self):
+        c = self.case
+        c.decisions.extend([
+            _action('write_file', path='analysis.py', content=(
+                "from pathlib import Path\nvalue = 1\nPath('result.txt').write_text(str(value))\n")),
+            _action('edit_file', path='analysis.py', replacements=[
+                {'old_text': 'value = 1', 'new_text': 'value = 2'}]),
+            _action('run_process', argv=['python', 'analysis.py'], cwd='workspace',
+                inputs=['analysis.py'], outputs=['result.txt'], timeout_sec=10),
+            _action('write_file', path='note.md', content='The result is 2.\n'),
+        ])
+        self.drain(approve=lambda call, token: True)
+        self.assertEqual((c.root/'workspace/result.txt').read_text(), '2')
+        self.assertTrue((c.root/'workspace/note.md').exists())
+
+    def test_new_work_can_finish_its_candidate_before_independent_review(self):
+        c = self.case
+        self.work_before_report()
+        self.assertEqual(c.inspection_requests, [])
+        self.assertNotIn('compile_python', c.app._system_text())
+        c.decisions.append(_action('review_result', summary='The current bounded result.',
+            artifacts=['note.md', 'result.txt'], unresolved=['The requested PDF is not built yet.']))
+        self.drain()
+        self.assertTrue(c.inspection_requests)
+        self.assertFalse((c.root/'delivery.json').exists())
+
+    def test_saved_automatic_handoff_keeps_its_original_behavior(self):
+        c = self.case
+        c.app.state['config']['candidate_handoff_policy'] = 'after_production.v2'
+        c.app._save()
+        c._reload()
+        self.work_before_report()
+        self.assertTrue(c.inspection_requests)
+        self.assertTrue(any(turn.get('origin') == 'professional' for turn in c.app.state['turns']))
+
     def test_current_files_are_inspected_before_publication_without_final_acceptance(self):
         c = self.case
         result = self.candidate()

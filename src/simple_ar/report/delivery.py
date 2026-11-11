@@ -199,8 +199,9 @@ class Delivery:
         needs_review = self.review_owner is not None
         if proposal is None:
             conditions.append({'kind': 'candidate_submission',
-                'message': 'No candidate claim has been submitted for independent investigation. '
-                    'Useful work can be submitted before all requested formats are published.'})
+                'message': 'No candidate or delivery has been submitted. An applicable independent '
+                    'check may investigate useful work before final delivery; a final submission '
+                    'can also request the necessary check.'})
         else:
             prior_unresolved = list(proposal.unresolved)
             try:

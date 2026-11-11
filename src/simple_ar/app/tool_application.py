@@ -1123,6 +1123,14 @@ class ToolApplication:
         memory = {'notes':[], 'through_turn':0}
         if self.state['config'].get('memory_protocol') == 'journal.v1':
             memory['compacted_records'] = set()
+            observations = None
+
+            def bind_checkpoint_notes(notes):
+                nonlocal observations
+                if observations is None:
+                    observations = self.operations.observations()
+                return self.operations.bind_notes(notes, observations=observations)
+
             # The existing attempt lineage orders closed work, including a
             # checkpoint whose following decision failed. There is no second
             # mutable memory state and a retry does not buy the summary again.
@@ -1143,7 +1151,7 @@ class ToolApplication:
                     # Unknown/inflight work is never adopted. Its reservations
                     # still constrain native work on the original ledger.
                     if charges and all(entry.status in {'settled','released'} for entry in charges):
-                        self._memory_artifacts(store, attempt.attempt_id)
+                        self._memory_artifacts(store, attempt.attempt_id, bind_notes=bind_checkpoint_notes)
                         memory = ProfessionalConversation.adopt(previous=memory,
                             snapshot=store.read_json('memory_snapshot.json') if store.exists('memory_snapshot.json') else None,
                             failure=store.read_json('memory_failure.json') if store.exists('memory_failure.json') else None,
@@ -1199,7 +1207,7 @@ class ToolApplication:
             raise ValueError('Retained checkpoint records are not registered attempt outputs')
         return store.read_json(path)
 
-    def _memory_artifacts(self, store: ArtifactStore, attempt_id: str) -> tuple:
+    def _memory_artifacts(self, store: ArtifactStore, attempt_id: str, *, bind_notes=None) -> tuple:
         if not any(store.exists(path) for path in ('memory_input.json','memory_response.json',
                 'memory_snapshot.json','memory_failure.json')):
             return ()
@@ -1248,7 +1256,8 @@ class ToolApplication:
 
         validate_checkpoint_sources(view, source=source, owner='native', journal=journal)
         return checkpoint_artifacts(store=store,ledger=self.ledger,attempt_id=attempt_id,
-            session_id=self.session.manifest.session_id,bind_notes=self.operations.bind_notes)
+            session_id=self.session.manifest.session_id,
+            bind_notes=self.operations.bind_notes if bind_notes is None else bind_notes)
 
     def _retained_checkpoint_charge(self, entry: Any) -> bool:
         """Allow explicit recovery past optional work, never adoption or free usage."""
@@ -1998,7 +2007,6 @@ class ToolApplication:
                     config['inspection_execution_protocol'] = 'shared.v2'
                     config['candidate_review_protocol'] = 'candidate.v1'
                     config['working_set_policy'] = 'recent.v4'
-                    config['candidate_handoff_policy'] = 'after_production.v2'
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = ('native.v4'
                     if config.get('work_lifecycle') == 'integrated.v3' else 'native.v3')
