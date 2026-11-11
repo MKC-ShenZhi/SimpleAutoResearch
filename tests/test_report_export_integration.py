@@ -25,6 +25,35 @@ TECHNICAL_BODY = ('\n`' + INLINE_COMMAND + '`\n\nInline identifier `' + IDENTIFI
     all(shutil.which(name) for name in ("pandoc", "rsvg-convert", "pdflatex", "bibtex")),
     "Opt-in integration requires Pandoc, librsvg and acmart-equipped TeX")
 class PortableExportIntegrationTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('pdftotext'), 'Table layout check requires Poppler')
+    def test_dense_article_tables_keep_numeric_columns_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'input'
+            source.mkdir()
+            wide_values = ['0.1011', '7,321', '0.3033', '0.4044', '0.5055', '0.6066']
+            dense_values = [f'0.{index:04d}' for index in range(11, 21)]
+            def table(headers, cells):
+                return ('| ' + ' | '.join(headers) + ' |\n| ' + ' | '.join(['---'] * len(headers))
+                    + ' |\n| ' + ' | '.join(cells) + ' |\n\n')
+            body = ('# Measurements\n\n'
+                + table(['A descriptive column', 'B', 'C', 'D', 'E', 'F', 'G'],
+                        ['`observations.csv`', *wide_values])
+                + table(['File', *[str(index) for index in range(1, 11)]],
+                        ['`observations.csv`', *dense_values]))
+            (source / 'report_body.md').write_text(body, encoding='utf-8')
+            output = root / 'export'
+            result = export_acm_report(source, output, layout='article', compile_pdf=True)
+            self.assertTrue(result['compiled'], result)
+            bbox = subprocess.check_output(['pdftotext', '-bbox', str(output / 'main.pdf'), '-'], text=True)
+            ns = '{http://www.w3.org/1999/xhtml}'
+            words = list(ET.fromstring(bbox).iter(ns + 'word'))
+            for values in (wide_values, dense_values):
+                cells = [next(word for word in words if word.text == value) for value in values]
+                for left, right in zip(cells, cells[1:]):
+                    self.assertLess(float(left.attrib['xMax']), float(right.attrib['xMin']))
+            self.assertEqual((source / 'report_body.md').read_text(encoding='utf-8'), body)
+
     @unittest.skipUnless(all(shutil.which(name) for name in ('xelatex', 'pdftotext')),
         'The mixed-language article check requires XeLaTeX and Poppler')
     def test_article_keeps_authored_numbering_and_readable_technical_tables(self):

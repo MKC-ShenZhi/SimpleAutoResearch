@@ -501,7 +501,7 @@ def _figure_pagination_preamble() -> str:
 
 
 def _natural_table_widths(table: dict) -> list[float]:
-    """Allocate ordinary table columns from their rendered text, not equally."""
+    """Balance the available space between content length and all columns."""
     fields = table['c']
     count = len(fields[2])
     if len(fields) == 5:
@@ -523,10 +523,10 @@ def _natural_table_widths(table: dict) -> list[float]:
             width = sum(2 if unicodedata.east_asian_width(char) in {'F', 'W'} else 1 for char in text)
             weights[column] = max(weights[column], min(width, 32))
     total = sum(weights)
-    return [weight / total for weight in weights]
+    return [(1 / count + weight / total) / 2 for weight in weights]
 
 
-def _breakable_technical_text(text: str) -> str:
+def _breakable_technical_text(text: str, *, table_code: bool = False) -> str:
     """Break technical text at natural separators before splitting long tokens."""
     result = []
     for part in re.split(r'([/_.\-\s])', text):
@@ -534,7 +534,7 @@ def _breakable_technical_text(text: str) -> str:
             continue
         if len(part) == 1 and (part in '/_.-' or part.isspace()):
             result.append(_tex_literal(part) + r'\allowbreak{}')
-        elif len(part) > 24:
+        elif len(part) > 24 or table_code and any(char.isalpha() for char in part):
             result.append(r'\seqsplit{' + _tex_literal(part) + '}')
         else:
             result.append(_tex_literal(part))
@@ -547,13 +547,14 @@ def _prepare_technical_content(fragments: Any, output: Path, *, natural_layout: 
     # 32-character identifier boundary (operators and mixed letter/digit IDs
     # have no dependable language hyphenation). Keep ordinary words and their
     # interword spacing under TeX's native handling.
-    # Use TeX's discretionary splitting, not content-specific abbreviations,
-    # font reduction or inferred column roles. This table rule adds no breaks
-    # to numeric literals or math; existing identifier rules remain in effect.
+    # Use TeX's discretionary splitting, not content-specific abbreviations or
+    # inferred column roles. Numeric literals and math remain unchanged.
     # Link destinations are not Str nodes and remain unchanged.
     table_words = {id(word) for table in _nodes(fragments) if table.get('t') == 'Table'
                    for word in _nodes(table.get('c')) if word.get('t') == 'Str'
                    and not word['c'].isalpha() and any(char.isalpha() for char in word['c'])}
+    table_code = {id(code) for table in _nodes(fragments) if table.get('t') == 'Table'
+                  for code in _nodes(table.get('c')) if code.get('t') == 'Code'}
     block_index = 0
     code_files = []
     for node in _nodes(fragments):
@@ -590,7 +591,7 @@ def _prepare_technical_content(fragments: Any, output: Path, *, natural_layout: 
                 r"\VerbatimInput[breaklines=true,breakanywhere=true,breaksymbolleft={},breaksymbolright={},breakanywheresymbolpre={},breakanywheresymbolpost={}]{" + path.relative_to(output).as_posix() + "}"])
         elif node.get("t") == "Code":
             text = node['c'][1]
-            node.update(t="RawInline", c=["latex", r'\texttt{' + _breakable_technical_text(text) + '}'
+            node.update(t="RawInline", c=["latex", r'\texttt{' + _breakable_technical_text(text, table_code=id(node) in table_code) + '}'
                 if natural_layout else _breakable_code(text)])
         elif (node.get("t") == "Str" and not any(char.isspace() for char in node["c"])
                 and (id(node) in table_words or "/" in node["c"] or len(node["c"]) >= 32)):
@@ -983,9 +984,9 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         manifest['public_artifacts'].extend(copied_records)
         for image in publication_view['image_mapping'].values():
             manifest['public_artifacts'].extend(image['files'])
+        natural_layout = (article and article_rendering['schema_version'] == 'article-rendering.v3') or natural_acm
         manifest['public_artifacts'].extend(_prepare_technical_content([title_inlines, blocks, abstract], output,
-            natural_layout=(article and article_rendering['schema_version'] == 'article-rendering.v3')
-                or natural_acm))
+            natural_layout=natural_layout))
 
         division = template.get('top_level_division') if template_files else None
         body_tex = run([pandoc, "--from=json", "--to=latex", "--natbib", "--no-highlight",
@@ -1046,6 +1047,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             "\\providecommand{\\passthrough}[1]{#1}\n"
             "\\setlength{\\emergencystretch}{1em}\n") if template_files or article else ''
         preamble += _figure_pagination_preamble()
+        if natural_layout and any(node.get('t') == 'Table' for node in _nodes(blocks)):
+            preamble += "\\AtBeginEnvironment{longtable}{\\small\\setlength{\\tabcolsep}{3pt}}\n"
         if adjacent_captions:
             # The author supplies the complete caption, including any label.
             # Let a supplied template load caption with its own options first.
