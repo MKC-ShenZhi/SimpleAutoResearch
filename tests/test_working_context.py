@@ -1385,12 +1385,14 @@ class ReferencedWorkingContextTests(unittest.TestCase):
             turn_blocks=[[], [], block(2, 'new native session')], work_notes=notes,
             selected_records=[rows[0]['record'], rows[2]['record']],
             version_resolver=resolver, context_token_target=12000)
-        view = json.loads(messages[1]['content'])['working_view']
+        context = json.loads(messages[1]['content'])
+        view = context['working_view']
         self.assertEqual(view['notes'], notes)
         self.assertEqual(view['observations'], [
             {'observation': rows[0], 'version_status': 'matching'},
             {'observation': rows[1], 'version_status': 'unknown'},
             {'observation': rows[3], 'version_status': 'historical'}])
+        self.assertEqual(context['material_supply']['native_context'], [])
         self.assertEqual(budget['omitted_records'][0]['status'], 'stale')
         supply = json.loads(messages[1]['content'])['material_supply']['references']
         self.assertEqual({entry['record']: entry['status'] for entry in supply}, {
@@ -1421,6 +1423,8 @@ class ReferencedWorkingContextTests(unittest.TestCase):
         self.assertEqual(messages[-3:-1], latest)
         self.assertEqual(budget['omitted_records'][0]['status'], 'duplicate')
         self.assertEqual(budget['selected_records'][0]['status'], 'native')
+        native = json.loads(messages[1]['content'])['material_supply']['native_context']
+        self.assertEqual([row['record'] for row in native], [rows[1]['record']])
         supply = json.loads(messages[1]['content'])['material_supply']['references']
         self.assertEqual([entry['status'] for entry in supply], ['duplicate', 'native'])
 

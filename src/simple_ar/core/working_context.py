@@ -615,11 +615,11 @@ def select_working_context(
                 supplied_entry_ranges=ranges,
                 omitted_entries=len(operations) - len(ordered_indices))
         context['material_supply'] = {'native_context':[
-                *[state['source'] for state in states if state['status']=='native'],
-                *[locator(row['observation']) for row in view['observations']]],
+                state['source'] for state in states if state['status']=='native'],
             'omitted':[{'record':state['source'].get('record'),'status':state['status']}
                 for state in states if state['status'] not in {'native','working_view'}][-16:],
-            'scope':'Selected exact observations; archival receipts remain available through '+history_access+'.'}
+            'scope':'Native context lists observations in retained messages; other selected observations '
+                'are in working_view. Archival receipts remain available through '+history_access+'.'}
         if retained_records:
             context['material_supply']['scope'] += (
                 ' References report explicitly selected records; optional note records can guide priority.')
