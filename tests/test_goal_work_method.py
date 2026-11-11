@@ -693,7 +693,8 @@ class GoalWorkTests(unittest.TestCase):
             sources = case._inspection_sources(view, *paths)
             if any(row is None for row in sources):
                 return [_action('read_file', path=path) for path, row in zip(paths, sources) if row is None]
-            included = set(view['proposed_delivery']['artifacts'])
+            included = {str(case.app.workspace.resolve(path))
+                        for path in view['proposed_delivery']['artifacts']}
             self.assertEqual(sources[2]['delivery_role'],
                              'delivered' if helper in included else 'supporting_source_only')
             return {'conclusion': 'complete', 'applicability': 'Compare requested outcomes with the delivery.',
