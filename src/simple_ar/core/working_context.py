@@ -1025,10 +1025,10 @@ def select_working_context(
             represented.update(keys[j] for j, state in enumerate(states) if state['status'] == 'native')
             if recent_set and i == previous:
                 # Keep the latest complete work together, then protect the
-                # originals supporting supplied notes/current objects before
-                # optional older native history consumes the remaining room.
+                # originals and related feedback before optional older native
+                # history consumes the remaining room.
                 for j in ordered:
-                    if (rows[j].get('record') in needed or rows[j].get('path') in artifacts
+                    if (j in related_feedback or rows[j].get('record') in needed or rows[j].get('path') in artifacts
                             or rows[j].get('absolute_path') in artifacts):
                         admit(j)
         for i in ordered:

@@ -253,6 +253,25 @@ class WorkingSupplyContinuityTests(unittest.TestCase):
         explicit, _ = select_working_context(**{**arguments, 'context_token_target': 100000}, selected_records=[record])
         self.assertIn('UNRELATED INSPECTION', json.dumps(explicit))
 
+    def test_related_feedback_precedes_optional_older_work(self):
+        from simple_ar.core.working_context import feedback_observations
+
+        feedback = feedback_observations({'review_observations': [{
+            'record': 'records/review.json', 'subjects': [],
+            'result': {'review': 'RELATED_REVIEW ' * 200}}]})
+        messages, _ = select_working_context(
+            user_requests=['Continue the work'], system_text='Work', base_context={},
+            turn_blocks=[[{'role': 'assistant', 'content': 'OLDER_WORK ' * 800}],
+                [{'role': 'assistant', 'content': 'RECENT_EXECUTION_RESULT'}],
+                [{'role': 'assistant', 'content': 'Latest decision'}]],
+            observations=feedback, native_observations=[], schema_tokens=0, context_token_target=12000,
+            estimate_tokens=len, material_policy='working', require_work_notes=True, fit_work_notes=True,
+            sparse_handoffs=True, processed_turns=[], archived_turns=[], working_set_policy='recent.v4')
+        supplied = json.dumps(messages)
+        self.assertIn('RECENT_EXECUTION_RESULT', supplied)
+        self.assertIn('RELATED_REVIEW', supplied)
+        self.assertNotIn('OLDER_WORK', supplied)
+
     def test_current_observations_remain_eligible_after_multiple_read_turns(self):
         def read(turn, name, text, digest='a' * 64):
             return {'turn': turn, 'record': f'records/{turn}.json', 'kind': 'source_text',
