@@ -77,7 +77,7 @@ class WorkspaceExecutionTests(unittest.TestCase):
         review = next(row['function'] for row in tools if row['function']['name'] == 'run_process')
         self.assertIn('without per-command approval', review['description'])
         cwd = review['parameters']['properties']['cwd']['description']
-        self.assertIn('Writes stay in this directory', cwd)
+        self.assertIn('host_access', cwd)
         self.assertNotIn('no sandbox', cwd)
 
     def test_host_resources_require_explicit_approval_before_execution(self):
