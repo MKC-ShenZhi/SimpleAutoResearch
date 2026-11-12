@@ -326,7 +326,7 @@ class _Run(BaseModel):
     cwd: str = "workspace"
     timeout_sec: int = Field(default=60, ge=1, le=300)
     inputs: list[str] = Field(default_factory=list, max_length=64, exclude_if=lambda value: not value,
-        description='Optional existing regular-file inputs read at the start, including pre-existing scripts and data. Files created by this command are outputs, even if the command later uses them. No dependency inference or extra permission. At most 64 MiB total per binding.')
+        description='Optional existing regular-file inputs read at the start, including pre-existing scripts and data. An in-place edit can declare the same file as input and output. Files created by this command are outputs, even if the command later uses them. No dependency inference or extra permission. At most 64 MiB total per binding.')
     input_snapshot: dict[str, str] | None = Field(default=None, exclude_if=lambda value: value is None,
         description='Internal reference to an approved implementation execution owner; not an additional input or authority grant.')
     outputs: list[str] = Field(default_factory=list, max_length=64, exclude_if=lambda value: not value,
@@ -1244,21 +1244,41 @@ class WorkspaceToolGateway:
                 'inputs': inputs, 'outputs': outputs,
                 **({'input_snapshot': request.input_snapshot} if request.input_snapshot is not None else {})}
 
-    def _check_process_inputs(self, binding: dict[str, Any], *, identity: str | None = None) -> None:
-        """Recheck the owning declaration, without inventing historical coverage."""
+    def _completed_process_outputs(self, binding: dict | None, identity: str | None) -> dict[str, str]:
+        """Read output versions only from this operation's successful receipt."""
+        if binding is None or identity is None:
+            return {}
+        receipt = self.root / 'tools' / 'processes' / identity / 'invocation.json'
+        if not receipt.is_file():
+            return {}
+        record = read_json(receipt)
+        interpreted = _process_artifact_record(record)
+        if record.get('invocation_id') != identity or interpreted.binding != binding:
+            return {}
+        return interpreted.successful_outputs or {}
+
+    def _check_process_inputs(self, binding: dict[str, Any], *, identity: str | None = None,
+                              completed_outputs: dict[str, str] | None = None) -> dict[str, str]:
+        """Check unchanged inputs and accepted post-versions for in-place outputs."""
         if binding.get('input_snapshot') is not None:
             current = self.process_artifact_binding(binding['request'], identity=identity)
             if current != binding:
                 raise ValueError('Approved implementation snapshot changed')
+            return current['inputs']
         else:
             current = self._version_hashes(binding['inputs'])
-            changed = [name for name, digest in binding['inputs'].items() if current.get(name) != digest]
+            outputs = (self._completed_process_outputs(binding, identity)
+                       if completed_outputs is None else completed_outputs)
+            changed = [name for name, digest in binding['inputs'].items()
+                if current.get(name) != digest and not (name in binding['outputs']
+                    and name in outputs and current.get(name) == outputs[name])]
             if changed:
                 raise ValueError('Declared producer inputs/outputs changed: ' + json.dumps({
                     'producer': identity, 'changed_inputs': changed,
                     'declared_outputs': binding['outputs']}, ensure_ascii=False)
                     + '. Regenerate the affected outputs from current inputs in an explicitly approved '
                     'process declaring those outputs; no current publication or automatic rerun')
+            return current
 
     def artifact_sources(self, versions: dict[str, str], *, records: Iterable[dict] = (),
                          cache: dict | None = None) -> dict[str, dict]:
@@ -1639,9 +1659,13 @@ class WorkspaceToolGateway:
                     upstream = nodes[edge['node']]
                     if edge['kind'] == 'input':
                         path, digest = str(upstream['path']), upstream['sha256']
-                        if path in dependencies and dependencies[path] != digest:
-                            raise ValueError('Selected artifacts consume conflicting historical input versions: ' + path)
-                        dependencies[path] = digest
+                        producer_outputs = (node.get('producer') or {}).get('outputs', {})
+                        overwritten = any(self.resolve(name) == upstream['path'] and version != digest
+                                          for name, version in producer_outputs.items())
+                        if not overwritten:
+                            if path in dependencies and dependencies[path] != digest:
+                                raise ValueError('Selected artifacts consume conflicting historical input versions: ' + path)
+                            dependencies[path] = digest
                     if edge['kind'] != 'input' or upstream['path'] not in stop_at:
                         pending.append(edge['node'])
         return dependencies
@@ -1699,11 +1723,33 @@ class WorkspaceToolGateway:
         # a sibling may have been superseded or removed since this receipt.
         checked_records = set()
 
+        def authored_after_process(path: Path) -> bool:
+            # Use the existing journal's versioned owner, not a process-only
+            # inventory, when a later actual edit replaced a failed/stale output.
+            if 'records' not in self.mounts or not (self.root / 'actions.json').is_file():
+                return False
+            name = self.locator(str(path))
+            source = self.artifact_sources(self._version_hashes([name]), cache=cache)[name]
+            graph = source.get('lineage') or {}
+            node = next((item for item in graph.get('nodes', []) if item['id'] == graph.get('root')), {})
+            return (node.get('state') == 'recorded'
+                and (node.get('owner') or {}).get('tool_name') in {'write_file', 'edit_file'}
+                and not any(edge['kind'] != 'previous' for edge in node.get('edges', [])))
+
         def check(path: Path) -> None:
             if producer_index_cache is not None:
                 producer_index_cache.setdefault('observed', set()).add(path)
             if path in visited or path in checked_paths or path in visiting or path not in producers:
                 return
+            try:
+                check_owner(path)
+            except ValueError:
+                if not authored_after_process(path):
+                    raise
+                cache.setdefault('superseded', set()).add(path)
+                checked_paths.add(path)
+
+        def check_owner(path: Path) -> None:
             _, record, binding = producers[path]
             if record is None:
                 raise ValueError(f'Ambiguous producer timestamps for {path.name}; no current publication')
@@ -1773,7 +1819,8 @@ class WorkspaceToolGateway:
         result = {}
         for name in names:
             row: dict[str, Any] = {'path': name, 'sha256': hashes[name], 'producer': None}
-            entry = producers.get(self.resolve(name))
+            path = self.resolve(name)
+            entry = None if path in cache.get('superseded', ()) else producers.get(path)
             if entry is not None:
                 _, record, binding = entry
                 identity = record['invocation_id']
@@ -2047,11 +2094,13 @@ class WorkspaceToolGateway:
         contexts = {0: dict(versions)}
         projections = {}
 
-        def project(event, context):
-            key = (id(event), context)
+        def project(event, context, rewound=None):
+            key = (id(event), context, rewound)
             if key not in projections:
                 projected = len(contexts)
                 contexts[projected] = {**event['inputs'], **contexts[context]}
+                if rewound is not None:
+                    contexts[projected][rewound] = event['inputs'][rewound]
                 projections[key] = projected
             return projections[key]
 
@@ -2091,10 +2140,12 @@ class WorkspaceToolGateway:
             else:
                 for source, expected in event['inputs'].items():
                     observed = contexts[context].get(source)
-                    if observed is not None and observed != expected:
+                    overwritten = (source in event['outputs'] and observed is not None
+                                   and observed == event['outputs'][source])
+                    if observed is not None and observed != expected and not overwritten:
                         raise ValueError('Declared producer inputs/outputs changed: ' + str(source)
                                          + '; no current publication or automatic rerun')
-                    check(source, expected, event, context)
+                    check(source, expected, event, project(event, context, source) if overwritten else context)
                 result = None
             # Retained checks are per output/version/boundary/context. A process
             # with another unrelated output must not short-circuit this node.
@@ -2719,8 +2770,11 @@ class WorkspaceToolGateway:
             if binding is not None:
                 if binding['request'] != request.model_dump(exclude_none=True):
                     raise ValueError('Retained process artifact request changed; no replay')
-                if self.process_artifact_binding(request.model_dump(exclude_none=True), identity=identity) != binding:
+                current = self.process_artifact_binding(request.model_dump(exclude_none=True), identity=identity)
+                if ({key: value for key, value in current.items() if key != 'inputs'}
+                        != {key: value for key, value in binding.items() if key != 'inputs'}):
                     raise ValueError('Retained process inputs changed; no replay')
+                self._check_process_inputs(binding, identity=identity)
                 if record.get('returncode') == 0 and not record.get('stop_reason') and not record.get('output_binding_error'):
                     if outputs is None or self._version_hashes(outputs) != outputs:
                         raise ValueError('Retained process outputs changed or unbound; no replay')
@@ -2746,7 +2800,8 @@ class WorkspaceToolGateway:
             try:
                 record['output_binding'] = {'version': 1, 'outputs': self._version_hashes(binding['outputs'])}
                 phase = 'inputs'
-                self._check_process_inputs(binding, identity=identity)
+                self._check_process_inputs(binding, identity=identity,
+                    completed_outputs=record['output_binding']['outputs'])
             except (OSError, ValueError) as exc:
                 record.pop('output_binding', None)
                 record['output_binding_error'] = str(exc)

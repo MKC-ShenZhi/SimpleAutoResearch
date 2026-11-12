@@ -2246,7 +2246,7 @@ class ProcessArtifactBindingTests(unittest.TestCase):
                     self.assertFalse(workspace.call('run_process', {'argv': ['tool'], **declaration}, identity='bad').ok)
                 runner.assert_not_called()
 
-    def test_tied_timestamps_reject_and_self_mutation_cannot_hide_in_cycle(self):
+    def test_tied_timestamps_reject_and_in_place_output_keeps_both_versions(self):
         from simple_ar.core.artifacts import read_json, write_json
         from simple_ar.tools.workspace import WorkspaceToolGateway
 
@@ -2263,10 +2263,32 @@ class ProcessArtifactBindingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Ambiguous producer timestamps'):
                 workspace.check_artifact_producers(['asset'])
             workspace.resolve('self').write_bytes(b'input')
-            self_args = {'argv': ['tool'], 'inputs': ['self'], 'outputs': ['self']}
-            self.assertFalse(self._run(workspace, 'self', self_args, {'self': b'mutated'}).ok)
+            self_args = {'argv': ['tool'], 'inputs': ['self'], 'outputs': ['self', 'derived']}
+            self.assertTrue(self._run(workspace, 'self', self_args,
+                {'self': b'mutated', 'derived': b'result'}).ok)
+            record = read_json(Path(tmp) / 'tools/processes/self/invocation.json')
+            binding = record['input_binding']['workspace_artifacts']
+            self.assertNotEqual(binding['inputs']['workspace/self'],
+                                record['output_binding']['outputs']['workspace/self'])
+            workspace.check_artifact_producers(['self', 'derived'])
+            versions = {workspace.resolve(name): digest for name, digest in
+                        record['output_binding']['outputs'].items()}
+            workspace.check_artifact_producers([], retained_versions=versions,
+                retained_history=[{'process_ref': 'tools/processes/self/invocation.json', 'position': 1}])
+            with patch('simple_ar.tools.workspace.run_process') as runner, \
+                    patch('simple_ar.tools.workspace.settle_process_record'):
+                self.assertTrue(workspace.call('run_process', self_args, identity='self').ok)
+                runner.assert_not_called()
+            workspace.resolve('self').write_bytes(b'later unrecorded change')
             with self.assertRaisesRegex(ValueError, 'changed'):
                 workspace.check_artifact_producers(['self'])
+            workspace.resolve('source').write_bytes(b'input')
+            workspace.resolve('editable').write_bytes(b'before')
+            args = {'argv': ['tool'], 'inputs': ['source', 'editable'], 'outputs': ['editable']}
+            result = self._run(workspace, 'changed-source', args,
+                {'source': b'changed', 'editable': b'after'})
+            self.assertFalse(result.ok)
+            self.assertIn('workspace/source', result.error)
 
 
 if __name__ == "__main__":

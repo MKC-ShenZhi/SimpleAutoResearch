@@ -112,6 +112,28 @@ def _assessments(result):
 
 
 class OperationsWorkLoopTests(unittest.TestCase):
+    def test_later_edit_replaces_failed_process_output_without_rewriting_receipt(self):
+        self._create()
+        self._write('draft.md', 'original\n')
+        self._write('fail.py', "from pathlib import Path\nimport sys\n"
+                    "Path('draft.md').write_text('partially written\\n')\nsys.exit(1)\n")
+        self._submit(_action('run_process', argv=['python', 'fail.py'],
+            inputs=['fail.py'], outputs=['draft.md']), approve=lambda *_: True)
+        failed = self._last('run_process')
+        self.assertEqual(failed['status'], 'error')
+        receipt = self.root / failed['data']['receipt']
+        original_receipt = receipt.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'no successful output binding'):
+            self.app.workspace.check_artifact_producers(['draft.md'])
+
+        observed = self._read('draft.md')
+        self._submit(_action('edit_file', path='draft.md', expected_sha256=observed['sha256'],
+            old_text='partially written', new_text='corrected'))
+        self._ok('edit_file')
+        self.app.workspace.check_artifact_producers(['draft.md'])
+        self.assertIsNone(self.app.workspace.artifact_provenance(['draft.md'])['draft.md']['producer'])
+        self.assertEqual(receipt.read_bytes(), original_receipt)
+
     def test_feedback_received_during_model_call_precedes_its_unstarted_proposals(self):
         self._create(goal='Original request before concurrent feedback')
         feedback = 'Keep the original observations and answer the revised request.'

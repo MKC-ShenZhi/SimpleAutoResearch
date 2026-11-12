@@ -11,10 +11,15 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 - Linux tasks can authorize ordinary workspace execution and report rendering through bubblewrap, avoiding per-command approval while retaining process records and budgets.
 
+### Improved
+
+- Working-memory compaction omits duplicate provider reasoning metadata while retaining the original records.
+
 ### Fixed
 
 - Workspace files load independently of slow delivery details, and workspace build logs can be viewed.
 - Reusing retained project files no longer depends on unrelated unknown model charges; the original ledger remains unchanged.
+- Processes can record both versions of an in-place file edit. A later actual edit can replace a failed output while preserving the failure receipt.
 
 ## 2026-11-12
 

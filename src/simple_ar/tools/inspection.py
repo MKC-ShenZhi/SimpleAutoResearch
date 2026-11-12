@@ -914,20 +914,23 @@ class InspectionToolGateway:
         """Validate relevant accepted input facts without deriving an approval."""
         accepted = self._accepted_execution_binding(receipt)
         artifacts = accepted.get('artifacts')
+        current_inputs = {}
         if artifacts is not None:
-            self.workspace._check_process_inputs(artifacts, identity=receipt['attempt'])
+            current_inputs = self.workspace._check_process_inputs(artifacts, identity=receipt['attempt'])
         cwd = self.workspace.resolve(arguments['cwd'], write=True)
+        outputs = self.workspace.resolved_versions(self.workspace._completed_process_outputs(
+            artifacts, receipt['attempt']))
         versions = {}
         for value, digest in accepted.get('files', {}).items():
             try:
                 path = str(self.workspace.resolve(str((cwd / value).resolve())))
             except ValueError:
                 continue  # External runtime pins remain the common owner's facts.
-            versions[path] = digest
+            versions[path] = outputs.get(Path(path), digest)
         if self.workspace.artifact_hashes(versions) != versions:
             raise ValueError('Selected inspection process has changed input files')
         if artifacts is not None:
-            versions.update({str(self.workspace.resolve(path)):digest for path, digest in artifacts['inputs'].items()})
+            versions.update({str(self.workspace.resolve(path)):digest for path, digest in current_inputs.items()})
         return versions
 
     def _check_shared_dependencies(self, saved: dict, *, current_inputs: bool,

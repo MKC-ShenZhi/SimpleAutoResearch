@@ -5527,10 +5527,17 @@ class ToolApplication:
             if current != binding:
                 raise ValueError('Approved operation inputs changed before execution')
             return
-        # An output named in argv can appear after execution. It cannot change
-        # the pinned command/environment or any originally approved input.
+        # A successful in-place output has a new recorded version; unrelated
+        # command files and all other inputs still need their approved bytes.
+        outputs = self.workspace.resolved_versions(self.workspace._completed_process_outputs(
+            binding.get('artifacts'), pending['attempt']))
+        cwd = Path(binding.get('cwd', self.workspace.workspace))
+        changed_files = [path for path, digest in binding['files'].items()
+            if current['files'].get(path) != digest
+            and not ((cwd / path).resolve() in outputs
+                     and outputs[(cwd / path).resolve()] == current['files'].get(path))]
         if (any(current.get(key) != binding.get(key) for key in ('call', 'argv', 'cwd', 'environment'))
-                or any(current['files'].get(path) != digest for path,digest in binding['files'].items())):
+                or changed_files):
             raise ValueError('Approved operation inputs changed before receipt recovery')
         if binding.get('artifacts') is not None:
             self.workspace._check_process_inputs(binding['artifacts'], identity=pending['attempt'])
