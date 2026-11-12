@@ -15,7 +15,7 @@ import tempfile
 import zipfile
 from typing import Any, Iterable, Literal, NamedTuple
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 from simple_ar.core.artifacts import (is_private_path_name as _private_name,
     read_json, replace_exact_spans)
