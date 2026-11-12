@@ -5,7 +5,6 @@ lives here. Historical control is selected only by the loader of its saved task.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Callable
 
@@ -655,12 +654,6 @@ class OperationTools:
             reply = store.read_json(turn['reply'])
             if call not in reply.get('tool_calls', []):
                 raise ValueError('Work service differs from its retained native reply')
-            spec = self.registry.get(call['function']['name'])
-            if (spec is not None and spec.domain == 'workspace' and spec.completion is not None
-                    and spec.completion.field):
-                arguments = json.loads(call['function']['arguments'])
-                if isinstance(arguments, dict) and arguments.get(spec.completion.field) is not None:
-                    return False
             return call['function']['name'] not in {'review_result', 'deliver_result'}
         if binding.get('tool_admission') != 'work_selection.v1':
             return False

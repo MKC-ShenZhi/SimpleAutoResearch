@@ -405,6 +405,15 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertEqual(c.app.session.store.read_json('delivery.json')['unresolved'],
             ['The requested analysis remains unfinished.'])
 
+    def test_workspace_write_submits_actual_output_for_independent_review(self):
+        c = self.case
+        c.decisions.append(fixture._action('write_file', path='note.md', content='A bounded result.\n',
+            delivery={'summary': 'A bounded note', 'artifacts': ['note.md']}))
+        self.drain()
+        self.assertEqual(c.app.session.manifest.status, 'completed', c.app.result_snapshot())
+        self.assertEqual(len(c.inspection_requests), 1)
+        self.assertEqual(c.app.session.store.read_json('delivery.json')['summary'], 'A bounded note')
+
     def test_mixed_batch_retains_effects_but_cannot_review_unobserved_production(self):
         c = self.case
         claim = {'summary':'A bounded note', 'artifacts':['note.md']}

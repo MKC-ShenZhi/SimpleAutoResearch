@@ -10,6 +10,8 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Improved
 
 - Continuing work presents related review guidance more concisely and shares already displayed text for the same file version; original records and review scope remain available.
+- A task can deliver a previously reviewed claim directly, without recreating its summary and inventory; changed requests or artifacts still require an applicable review.
+- Workspace actions can explicitly submit their own completed or partial output through the common delivery path.
 
 ### Fixed
 
@@ -73,7 +75,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
-- New ordinary tasks use native tool batches on the shared queue. Complete work units retain the original reply, actions and receipts in working history, without an outer work-selection response or a second action compilation. Candidate review and final delivery use separate decisions after observing production; ordinary services cannot silently introduce either effect. Independent inspection retains its native operations and independent opinions on the same ledger. Saved task history and recovery remain available. Early candidate checks now accept the current claim, existing files and known gaps through a dedicated request, without final report or publication declarations. Final delivery keeps its full acceptance checks; unchanged observed file hashes remain reusable for guarded edits.
+- New ordinary tasks use native tool batches on the shared queue. Complete work units retain the original reply, actions and receipts in working history, without an outer work-selection response or a second action compilation. Candidate review and final delivery use observed production; ordinary services cannot silently introduce either effect. Independent inspection retains its native operations and independent opinions on the same ledger. Saved task history and recovery remain available. Early candidate checks now accept the current claim, existing files and known gaps through a dedicated request, without final report or publication declarations. Final delivery keeps its full acceptance checks; unchanged observed file hashes remain reusable for guarded edits.
 
 ## 2026-11-06
 

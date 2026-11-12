@@ -4856,9 +4856,12 @@ class ToolApplication:
             try:
                 selected_work = self.operations.selected_work_service(call, self.state['turns'][-1],
                     self.session.store, self.state['requests'])
+                spec = self.gateway.registry.get(call['function']['name'])
+                if (selected_work and self.state['config'].get('work_selection_policy') == 'native.v4'
+                        and spec.domain == 'workspace' and self._terminal_intent(call)):
+                    selected_work = False
                 service_error = self.operations.service_result_error(
-                    self.gateway.registry.get(call['function']['name']), payload.get('data') or {},
-                    selected_work=selected_work)
+                    spec, payload.get('data') or {}, selected_work=selected_work)
             except (ValueError, OSError, KeyError, TypeError) as exc:
                 service_error = str(exc)
             if service_error:
