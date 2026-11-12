@@ -46,20 +46,20 @@ approved working directory and executable; the original argv and environment are
 
 New ordinary tasks investigate, copy, edit and propose approved commands in the
 existing shared action loop. There is no mandatory source-assignment/return role
-transition before submitting a candidate. Delivery owns independent investigation
-and acceptance of the actual claim and versions; producers need not finish an
-exhaustive self-audit first. Optional document, publication and other professional
+transition before submitting a candidate. Delivery owns acceptance of the actual
+claim and versions, and delegates applicable independent investigation; producers
+need not finish an exhaustive self-audit first. Optional document, publication and other professional
 services retain their own responsibilities. Loading tools grants no authority.
 Saved source-role tasks keep their original scope, handoff and recovery behavior.
 
 New ordinary tasks return native tool batches directly to the action queue. There
 is no outer work-selection response or second compilation of the model's actions.
 Working history presents complete units with the original reply, actions and actual
-receipts. Independent inspection retains its own native operations and independent
-opinions on the same ledger. Candidate review and
-final delivery must each be a separate decision after observing production. Other
-tools run as services, with optional completion effects removed and checked again
-at dispatch and result binding. Questions and explicit caller operations retain
+receipts. Independent inspection retains its own native operations and opinions on
+the same ledger. A workspace action can explicitly submit its produced work for
+delivery; other services cannot silently introduce completion effects. A completed
+reviewed claim can be selected for delivery without restating its inventory.
+Questions and explicit caller operations retain
 their own contracts. The shared material view prioritizes recent complete work and
 necessary original windows, suppressing only verified overlapping bytes from the
 same file version. Archived observations remain retrievable. Saved selection,
@@ -68,8 +68,11 @@ history and inspection policies stay unchanged on reload and unrelated material 
 New ordinary tasks can submit an unfinished candidate for independent investigation
 before publication. Its dedicated request contains the current claim, existing files
 and known gaps; final report status and requested formats belong to final delivery.
-This binds the actual claim and files; its opinion is not a complete-delivery certificate. Final acceptance still checks all required outputs,
-publication versions and applicable independent findings. Delivery projects current
+This binds the actual claim and files; its opinion is not a complete-delivery certificate. Final acceptance checks required outputs,
+publication versions and applicable independent findings. New ordinary tasks may choose
+direct delivery when independent review is unnecessary; the default still requests review,
+and existing required findings cannot be waived. Saved tasks retain their review contract.
+Delivery projects current
 obligations into the shared work view. Early candidate investigation protects model capacity
 for revision, submission, a final independent check and a truthful fallback on the
 one ledger. Final delivery consumes that checking stage without recursively
