@@ -400,7 +400,9 @@ def migrate_new_start(args: argparse.Namespace, *, reuse_access: ReuseAccess | N
     args.request = goal
     args.goal = None
     args.source = sources
-    print_line("Ordinary preferences use the native task owner. Materials remain read-only; --allow-execution permits proposals only, and --yes accepts the summary only.")
+    print_line("Ordinary preferences use the native task owner. Materials remain read-only; "
+        + ("workspace execution is authorized; " if getattr(args, 'sandbox_execution', False)
+           else "--allow-execution permits proposals only; ") + "--yes accepts the summary only.")
     return True
 
 

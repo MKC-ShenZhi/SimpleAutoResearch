@@ -631,7 +631,7 @@ class ToolApplication:
             candidate_review_protocol=config.get('candidate_review_protocol'),
             sandbox_execution=config.get('sandbox_execution', False))
         registry = ToolRegistry()
-        registry.register_package(workspace_tool_specs(), self.workspace,
+        registry.register_package(workspace_tool_specs(sandbox_execution=config.get('sandbox_execution', False)), self.workspace,
             request_visible={'ask_user', 'deliver_result', 'read_file', 'list_directory'})
         if config.get('extension_host_protocol') not in {None, 'nested_calls.v1'}:
             raise ValueError('Unknown saved extension host-call protocol')

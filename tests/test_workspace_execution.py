@@ -70,6 +70,16 @@ class WorkspaceExecutionTests(unittest.TestCase):
         self.assertEqual((workspace / 'candidate.txt').read_text(), 'original')
         self.assertIn('candidate read-only', observed.data['stdout'])
 
+    def test_main_and_independent_tool_contracts_describe_the_actual_scope(self):
+        main = self.app.gateway.registry.get('run_process').description
+        self.assertIn('without per-command approval', main)
+        tools = self.app.operations.inspection._shared_tools('review-1')
+        review = next(row['function'] for row in tools if row['function']['name'] == 'run_process')
+        self.assertIn('without per-command approval', review['description'])
+        cwd = review['parameters']['properties']['cwd']['description']
+        self.assertIn('Writes stay in this directory', cwd)
+        self.assertNotIn('no sandbox', cwd)
+
     def test_saved_task_can_receive_the_explicit_scope_without_resetting_history(self):
         old = ToolApplication.create(self.base / 'old', 'Old task', model=None, sources={}, allow_execution=True)
         before = old.ledger.to_dict()
@@ -99,6 +109,15 @@ class WorkspaceExecutionAdmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'bubblewrap'):
                 ToolApplication.preview_creation(Path(tmp) / 'task', 'Work', model=None, sources={},
                     allow_execution=True, sandbox_execution=True)
+
+    def test_ordinary_saved_authorization_still_requires_command_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ToolApplication.create(Path(tmp) / 'task', 'Work', model=None, sources={}, allow_execution=True)
+            result = app.run(actions=[action('run_process', argv=['python', '-c', 'print(1)'])],
+                progress=lambda _: None)
+            self.assertEqual(result['status'], 'paused')
+            self.assertIn('explicit approval', app.session.manifest.status_reason)
+            self.assertFalse(app.ledger.entries)
 
 
 if __name__ == '__main__':

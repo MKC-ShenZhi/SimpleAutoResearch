@@ -348,7 +348,7 @@ _TOOLS = {
     "copy_file": (_Copy, "Copy an observed file or generated candidate into the workspace without retransmitting its contents. Source digest must match; read_file with full_digest=true and a small max_bytes obtains a streamed full-file digest up to 64 MiB. Existing destinations require their digest and retain a byte backup through the shared atomic writer. Original sources stay unchanged. Does not execute or certify a repair.", "write_patch"),
     "copy_project": (_CopyProject, "Prepare a writable project copy and optional portable ZIP in one operation, including ordinary source, tests, configuration, documentation and binary assets. Destination must be a new workspace subdirectory. Uses existing conservative code-workspace copying: private/runtime paths, symlinks, caches/build outputs and oversized files are omitted and reported. Total bounds are checked before publishing. Keeps originals unchanged, records copied file and archive hashes, and reconciles the same interrupted operation only when its published files still match. Inspect omissions before claiming a complete deliverable. Not a complete Git clone, dependency install, execution or correctness certificate.", "write_patch"),
     "edit_file": (_Edit, "Replace one or multiple exact unique, non-overlapping spans in a workspace file atomically, with one observed digest and backup. Batch related changes rather than repeating calls.", "write_patch"),
-    "run_process": (_Run, "Execute an argv without a shell in the workspace. Bare python/python3 use the task interpreter; its directory leads the filtered PATH for child commands. Use sys.executable for portable Python children. Declare known existing inputs and generated outputs when their relationship matters for reuse or publication; a script created by this command is an output, not a pre-existing input. Requires process authorization and is not a sandbox. Execution alone does not verify the result.", "execution"),
+    "run_process": (_Run, "Execute an argv without a shell in the workspace. Bare python/python3 use the task interpreter; its directory leads the filtered PATH for child commands. Use sys.executable for portable Python children. Declare known existing inputs and generated outputs when their relationship matters for reuse or publication; a script created by this command is an output, not a pre-existing input. Execution alone does not verify the result.", "execution"),
     "deliver_result": (DeliveryRequest, "Deliver actual workspace artifacts and optional retained task-evidence references; name unresolved work honestly.", "plan"),
     "review_result": (DeliveryRequest, "Submit a usable candidate and its actual completion claim for independent checking before final delivery. This does not finish the task. Keep the same claim and artifacts when delivering to reuse an applicable opinion; revise only affected work after findings.", "plan"),
     "ask_user": (_Question, "Ask a concentrated question only when needed to proceed; pause with all work preserved.", "plan"),
@@ -416,7 +416,8 @@ def resolve_mounted_path(mounts: dict[str, Path], value: str, *, write: bool = F
 
 def workspace_tool_specs(*, candidate_review: bool = False,
                          process_artifact_paths: str | None = None,
-                         candidate_review_protocol: str | None = None) -> list[CommonToolSpec]:
+                         candidate_review_protocol: str | None = None,
+                         sandbox_execution: bool = False) -> list[CommonToolSpec]:
     if candidate_review_protocol not in (None, 'candidate.v1'):
         raise ValueError('Unsupported saved candidate review protocol')
     specs = []
@@ -450,6 +451,9 @@ def workspace_tool_specs(*, candidate_review: bool = False,
                 'Execution checks the hash atomically and rejects changed bytes. '
                 'Empty for a new destination file.')
         if name == 'run_process':
+            description += (' Task authorization permits execution in the workspace without per-command approval. '
+                'Processes cannot access original source mounts or the network; copy needed sources to the workspace.'
+                if sandbox_execution else ' Requires exact process approval and is not a sandbox.')
             # Professional execution supplies this owner reference internally.
             # Ordinary commands retain their explicit file-list contract.
             schema['properties'].pop('input_snapshot')

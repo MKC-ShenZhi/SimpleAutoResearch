@@ -245,7 +245,7 @@ def read_task_view(root: Path, *, read_record: RecordReader, ledger: BudgetLedge
                for purpose, field in (('vision', 'vision_connection'), ('feasibility', 'feasibility_connection'))
                if config.get(field)}},
         catalog_hints=config.get('model_catalogs', {}), access={key: config.get(key) for key in
-            ('allow_network', 'allow_execution', 'allow_vision')},
+            ('allow_network', 'allow_execution', 'sandbox_execution', 'allow_vision')},
         sources=list(config.get('sources', {})),
         resources=ledger.snapshot() | {'entries': [
             {key: entry.to_dict()[key] for key in ('reservation_id', 'status', 'reserved', 'actual',
