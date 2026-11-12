@@ -283,7 +283,8 @@ class OperationTools:
         self.publication = PublicationToolGateway(root, self.workspace, ledger,
             work_lifecycle=config.get('work_lifecycle'),
             asset_protocol=config.get('publication_assets'), legacy_report_status=legacy_report_status)
-        self.registry.register_package(publication_tool_specs(preparation=False), self.publication,
+        self.registry.register_package(publication_tool_specs(preparation=False,
+            sandbox_execution=config.get('sandbox_execution', False)), self.publication,
             request_visible=config.get('professional_operations') in RETAINED_PROFESSIONAL_CONTRACTS)
         self.inspection = InspectionToolGateway(root, self.workspace,
             client_factory=lambda identity:client_factory(identity, 'writing'),

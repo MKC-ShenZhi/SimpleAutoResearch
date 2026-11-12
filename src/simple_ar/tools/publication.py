@@ -123,11 +123,18 @@ class ExportRequest(PublicationRequest):
         return self
 
 
-def publication_tool_specs(*, preparation: bool = True) -> list[CommonToolSpec]:
+def publication_tool_specs(*, preparation: bool = True, sandbox_execution: bool = False) -> list[CommonToolSpec]:
     return [CommonToolSpec(name="export_report", domain="publication", permission_level="execution",
         completion={'field': 'delivery', 'closing': True},
         risk_level="medium", input_schema=(ExportRequest if preparation else PublicationRequest).model_json_schema(),
-        description="Export workspace Markdown, bibliography and figures as an editable TeX project. Choose the built-in article or ACM layout, or a trusted Pandoc template; omitting both preserves ACM. Use for requested publication, not ordinary Markdown delivery. Compilation and optional page checks or previews require their dependencies and approval; templates are not sandboxed. No shell escape or official template discovery. Rendering and literal checks do not certify scientific, visual or venue compliance. Failed checks retain the project.")]
+        description=("Export workspace Markdown, bibliography and figures as an editable TeX project. "
+            "Choose the built-in article or ACM layout, or a trusted Pandoc template; omitting both preserves ACM. "
+            "Use for requested publication, not ordinary Markdown delivery. Compilation and optional page checks "
+            "or previews require their dependencies. "
+            + ("Rendering processes use the authorized workspace scope without per-command approval. "
+               if sandbox_execution else "Execution requires approval and is not sandboxed. ")
+            + "No shell escape or official template discovery. Rendering and literal checks do not certify "
+            "scientific, visual or venue compliance. Failed checks retain the project."))]
 
 
 def export_input_binding(source: Path, request: ExportRequest, *, output_root: Path | None = None,

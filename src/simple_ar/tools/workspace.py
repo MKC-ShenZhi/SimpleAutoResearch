@@ -847,8 +847,10 @@ class RetainedDelivery:
         if len(candidates) != 1:
             raise ValueError('Ambiguous delivery contains multiple code projects')
         ledger_record = self.record('budget_ledger.json')
-        if any(entry['status'] in {'reserved', 'unknown'} for entry in ledger_record['entries']):
-            raise ValueError('Project work has unsettled resource usage; no reusable project')
+        if any(entry['status'] in {'reserved', 'unknown'} and
+               {'process_invocations', 'process_wall_seconds'} & entry['reserved'].keys()
+               for entry in ledger_record['entries']):
+            raise ValueError('Project has an unresolved process execution; no live project reuse')
         project, files = next(iter(candidates.items()))
         # The checker follows these existing receipts at their recorded cutoffs;
         # later versions of an origin cannot rewrite a copied version's owner.

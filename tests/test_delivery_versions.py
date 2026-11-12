@@ -21,6 +21,40 @@ def action(name, arguments):
 
 
 class DeliveryVersionTests(unittest.TestCase):
+    def test_unknown_model_cost_does_not_hide_a_retained_delivered_project(self):
+        from simple_ar.app.reuse import select_reuse, session_materials
+        self.app.run(actions=[
+            action('write_file', {'path': 'analysis/main.py', 'content': 'result = 1\n'}),
+            action('deliver_result', {'summary': 'Project', 'project_root': 'analysis',
+                'artifacts': ['analysis/main.py']})], progress=lambda _: None)
+        self.app.ledger.reserve('old-model', {'llm_requests': 1, 'total_tokens': 100}, purpose='native-turn')
+        self.app.ledger.mark_unknown('old-model', reason='Provider usage not available', retain_reservation=True)
+        old_ledger = (self.root / 'budget_ledger.json').read_bytes()
+        self.assertEqual(session_materials(self.root)['code_project'], [self.root / 'workspace/analysis'])
+        selection = select_reuse(self.root, ['code_project'])
+        self.assertEqual(selection.version, 1)
+        metadata, inputs = DeliveryVersions(self.root).snapshot(1, ['code_project'], max_bytes=10000)
+        self.assertEqual(metadata['project_root'], 'workspace/analysis')
+        self.assertEqual(inputs, [('workspace/analysis/main.py', b'result = 1\n')])
+        self.assertEqual((self.root / 'budget_ledger.json').read_bytes(), old_ledger)
+
+    def test_live_project_requires_process_reconciliation_but_retained_bytes_remain_reusable(self):
+        from simple_ar.app.reuse import _native_project, select_reuse
+        self.app.run(actions=[
+            action('write_file', {'path': 'working/main.py', 'content': 'result = 1\n'}),
+            action('copy_project', {'source': 'working', 'path': 'package'}),
+            action('deliver_result', {'summary': 'Project', 'artifacts': ['package/main.py']})],
+            progress=lambda _: None)
+        self.app.ledger.reserve('old-model', {'llm_requests': 1, 'total_tokens': 100}, purpose='native-turn')
+        self.app.ledger.mark_unknown('old-model', reason='Provider usage not available', retain_reservation=True)
+        self.assertEqual(_native_project(RetainedDelivery(self.root))[0], self.root / 'workspace/package')
+        self.app.ledger.reserve('old-process', {'process_invocations': 1, 'process_wall_seconds': 1},
+            purpose='local_process')
+        self.app.ledger.mark_unknown('old-process', reason='Execution outcome not available')
+        with self.assertRaisesRegex(ValueError, 'unresolved process'):
+            _native_project(RetainedDelivery(self.root))
+        self.assertEqual(select_reuse(self.root, ['code_project']).version, 1)
+
     def test_delivered_project_subset_is_reused_as_new_task_input(self):
         from simple_ar.app.reuse import select_reuse, session_materials
         from simple_ar.cli.start import migrate_new_start, native_creation_options

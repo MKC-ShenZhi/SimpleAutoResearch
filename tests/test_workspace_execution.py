@@ -73,6 +73,8 @@ class WorkspaceExecutionTests(unittest.TestCase):
     def test_main_and_independent_tool_contracts_describe_the_actual_scope(self):
         main = self.app.gateway.registry.get('run_process').description
         self.assertIn('without per-command approval', main)
+        publication = self.app.gateway.registry.get('export_report').description
+        self.assertIn('without per-command approval', publication)
         tools = self.app.operations.inspection._shared_tools('review-1')
         review = next(row['function'] for row in tools if row['function']['name'] == 'run_process')
         self.assertIn('without per-command approval', review['description'])

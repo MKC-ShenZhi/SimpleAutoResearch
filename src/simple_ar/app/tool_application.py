@@ -744,7 +744,8 @@ class ToolApplication:
         # Contracts and owners enter together; discovery and dispatch consume
         # this same registration, including explicitly selected local packages.
         registry.register_package(source_tool_specs(), self.sources, request_visible=True)
-        registry.register_package(publication_tool_specs(), self.publication, request_visible=True)
+        registry.register_package(publication_tool_specs(sandbox_execution=config.get('sandbox_execution', False)),
+            self.publication, request_visible=True)
         registry.register_package(writing_tool_specs(), self.writing, request_visible=True)
         registry.register_package(implementation_tool_specs(exact=config.get('code_task') is not None),
             self.implementation, request_visible=False if self.implementation.exact else {'prepare_implementation'})

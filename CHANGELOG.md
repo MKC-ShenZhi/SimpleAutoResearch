@@ -14,6 +14,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Fixed
 
 - Workspace files load independently of slow delivery details, and workspace build logs can be viewed.
+- Reusing retained project files no longer depends on unrelated unknown model charges; the original ledger remains unchanged.
 
 ## 2026-11-12
 

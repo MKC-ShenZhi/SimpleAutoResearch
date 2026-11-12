@@ -93,9 +93,6 @@ def _delivered_project_version(reader: RetainedDelivery) -> tuple[int, Path] | N
             or not reader.state['turns'][-1]['tools']
             or versions[-1]['observation'] != reader.state['turns'][-1]['tools'][-1]['result']):
         return None
-    ledger = reader.record('budget_ledger.json')
-    if any(entry['status'] in {'reserved', 'unknown'} for entry in ledger['entries']):
-        raise ValueError('Project work has unsettled resource usage; no reusable project')
     groups, project = owner._material_groups(len(versions))
     if project is None or not groups.get('code_project'):
         return None
@@ -105,6 +102,9 @@ def _delivered_project_version(reader: RetainedDelivery) -> tuple[int, Path] | N
 def _listed_native_project(reader: RetainedDelivery) -> Path | None:
     """Use the delivery's declared project, or the compatible older contract."""
     try:
+        delivered = _delivered_project_version(reader)
+        if delivered is not None:
+            return delivered[1]
         if reader.record('delivery.json').get('project_root') is None:
             try:
                 project = _native_project(reader)
@@ -112,8 +112,7 @@ def _listed_native_project(reader: RetainedDelivery) -> Path | None:
                 project = None
             if project is not None:
                 return project[0]
-        delivered = _delivered_project_version(reader)
-        return delivered[1] if delivered is not None else None
+        return None
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print_line(f'code_project unavailable: {exc}')
         return None
@@ -155,21 +154,17 @@ def select_reuse(root: Path, names: list[str] | tuple[str, ...], *,
         reader = RetainedDelivery(root, authorize=access.authorize)
         groups = reader.reusable_materials()
         if 'code_project' in selected:
-            if reader.record('delivery.json').get('project_root') is not None:
-                delivered = _delivered_project_version(reader)
-                if delivered is None:
-                    raise ValueError('The declared project has no retained delivered files')
+            delivered = _delivered_project_version(reader)
+            if delivered is not None:
                 return select_reuse(root, selected, access=access, version=delivered[0])
+            if reader.record('delivery.json').get('project_root') is not None:
+                raise ValueError('The declared project has no retained delivered files')
             try:
                 project = _native_project(reader)
             except PartialProjectDelivery:
                 project = None
             if project is not None:
                 groups['code_project'] = [project[0]]
-            else:
-                delivered = _delivered_project_version(reader)
-                if delivered is not None:
-                    return select_reuse(root, selected, access=access, version=delivered[0])
     else:
         groups = session_materials(root, authorize=access.authorize,
                                    include_project='code_project' in selected)
