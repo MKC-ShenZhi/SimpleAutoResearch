@@ -1387,6 +1387,11 @@ class ToolApplication:
         Only accepted checks with an intact owner/input binding are eligible.
         Changed subjects retain historical findings, never a current certificate.
         """
+        inspection = self.operations.inspection if self.operations is not None else None
+        with inspection.presentation_scope() if inspection is not None else nullcontext():
+            return self._collect_work_feedback(targets)
+
+    def _collect_work_feedback(self, targets: list[str]) -> dict[str, Any]:
         roots = [self.workspace.resolve(path) for path in targets]
         selected_hashes = None
         reviews, covered = [], set()

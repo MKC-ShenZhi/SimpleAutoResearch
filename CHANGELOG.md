@@ -9,7 +9,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
-- Continuing work presents related review guidance more concisely, shares repeated receipt and accounting reads within a decision, and avoids repeating the same file text; original records and review scope remain available.
+- Continuing work presents related review guidance more concisely, shares repeated receipt and accounting reads within each working view, and avoids repeating the same file text; original records and review scope remain available.
 - New tasks focus their working view on the current request and relevant material; older records remain available on demand.
 - Shared work context no longer adds a fixed byte limit to professional handoffs; document work fits its input using the sender's model-aware JSON request counter.
 - A task can deliver a previously reviewed claim directly, without recreating its summary and inventory; changed requests or artifacts still require an applicable review.
