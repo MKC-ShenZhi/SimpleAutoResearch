@@ -198,6 +198,8 @@ def write_greenfield_project_from_agent_backend(
         **({'usage_status': result.metadata['usage_status'],
             'usage_reservation': result.metadata['usage_reservation']}
            if 'usage_status' in result.metadata else {}),
+        **({'process_record': result.metadata['process_record']}
+           if 'process_record' in result.metadata else {}),
     }
     memory.setdefault("agent_backends", []).append(agent_result)
     return code_artifacts, agent_result

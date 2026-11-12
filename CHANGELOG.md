@@ -19,7 +19,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Fixed
 
 - Material reads and delivery retention handle filesystem timestamp differences without rejecting stable files or reusing a stale version.
-- External agent launches retain process use and unknown model charges in the task ledger instead of treating them as zero; a failed unaccounted call is not retried automatically.
+- External agent launches use the shared process runner and retain unknown model charges in the task ledger; a failed unaccounted call is not retried automatically.
 - Independent review can identify a non-text file without claiming its contents were read, and reports an unfinished candidate review clearly.
 - XeLaTeX export embeds the Adobe-GB1 Unicode mapping needed by readers without CJK maps. Full-page preview no longer rejects reports solely for exceeding twelve pages.
 

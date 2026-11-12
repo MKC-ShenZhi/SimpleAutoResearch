@@ -1,5 +1,4 @@
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,6 +9,8 @@ from simple_ar.agent_backends import AgentRunRequest, AgentRunResult
 from simple_ar.agent_backends.external_cli import ExternalCliBackend, ExternalCliBackendConfig
 from simple_ar.code_task.generation.agent_backend import check_agent_budget, write_greenfield_project_from_agent_backend
 from simple_ar.core.budget import BudgetError, BudgetLedger
+from simple_ar.core.process import verify_process_accounting
+from simple_ar.core.artifacts import read_json
 
 
 class ExternalAgentAccountingTests(unittest.TestCase):
@@ -20,9 +21,9 @@ class ExternalAgentAccountingTests(unittest.TestCase):
         self.request = AgentRunRequest(provider='external_cli', run_dir=self.root,
             handoff_dir=self.root / 'handoff')
 
-    def backend(self, ledger=None, command=None):
+    def backend(self, ledger=None, command=None, timeout=5):
         return ExternalCliBackend(ExternalCliBackendConfig(provider='external_cli', binary=sys.executable,
-            enabled=True, timeout_sec=5, command_template=command or
+            enabled=True, timeout_sec=timeout, command_template=command or
                 ('{binary}', '-c', "print('ordinary local process')")),
             ledger=ledger, session_id='session', attempt_id='attempt')
 
@@ -32,15 +33,28 @@ class ExternalAgentAccountingTests(unittest.TestCase):
         result = self.backend(ledger).run(self.request)
         self.assertTrue(result.ok)
         self.assertEqual(result.metadata['usage_status'], 'unknown')
-        entry, = BudgetLedger.load(ledger.storage_path).entries
+        saved = BudgetLedger.load(ledger.storage_path)
+        entry = next(row for row in saved.entries if row.purpose == 'external_agent')
         self.assertEqual((entry.status, entry.session_id, entry.attempt_id), ('unknown', 'session', 'attempt'))
-        self.assertEqual(entry.actual['process_invocations'], 1)
-        self.assertGreaterEqual(entry.actual['process_wall_seconds'], 0)
+        record = read_json(Path(result.metadata['process_record']))
+        verify_process_accounting(record, saved, session_id='session', attempt_id='attempt', timeout_sec=5,
+                                  accounting_purpose='external_agent_process')
+        self.assertNotIn('local_process', {row.purpose for row in saved.entries})
+        self.assertTrue(record['argv_redacted'])
+        self.assertNotIn('ordinary local process', str(record['argv']))
         self.assertEqual(set(ledger.unknown_dimensions()), {'llm_requests', 'total_tokens'})
+        from simple_ar.code_task.execution.runner import recover_implementation_process
+        with patch('simple_ar.code_task.execution.runner.load_code_task_manifest',
+                   return_value={'code_task': {'native_binding': {'contract': {}}}}), \
+             patch('simple_ar.code_task.execution.runner.code_task_paths',
+                   return_value=SimpleNamespace(run_artifact_dir=self.root / 'artifacts')), \
+             patch('simple_ar.code_task.execution.runner.native_preparation_processes', return_value=set()):
+            self.assertIsNone(recover_implementation_process(self.root, budget_ledger=saved,
+                                                             session_id='session', attempt_id='attempt'))
 
     def test_finite_model_budget_does_not_start_unaccountable_cli(self):
         ledger = BudgetLedger({'llm_requests': 2, 'total_tokens': 10000})
-        with patch('simple_ar.agent_backends.external_cli.subprocess.run') as launch:
+        with patch('simple_ar.agent_backends.external_cli.run_process') as launch:
             with self.assertRaises(BudgetError):
                 self.backend(ledger).run(self.request)
         launch.assert_not_called()
@@ -50,25 +64,22 @@ class ExternalAgentAccountingTests(unittest.TestCase):
                                mode='handoff', ledger=ledger)
 
     def test_standalone_cli_retains_unknown_usage_at_the_task_root(self):
-        with patch('simple_ar.agent_backends.external_cli.subprocess.run',
-                   return_value=subprocess.CompletedProcess(['agent'], 0, stdout='ok', stderr='')):
-            result = self.backend().run(self.request)
+        result = self.backend().run(self.request)
         self.assertEqual(result.metadata['usage_status'], 'unknown')
-        entry, = BudgetLedger.load(self.root / 'budget_ledger.json').entries
+        entry = next(row for row in BudgetLedger.load(self.root / 'budget_ledger.json').entries
+                     if row.purpose == 'external_agent')
         self.assertEqual(entry.status, 'unknown')
 
     def test_missing_program_releases_reservation_but_timeout_remains_unknown(self):
         ledger = BudgetLedger({})
-        with patch('simple_ar.agent_backends.external_cli.subprocess.run', side_effect=FileNotFoundError('missing')):
-            result = self.backend(ledger).run(self.request)
+        result = self.backend(ledger, command=(str(self.root / 'missing-program'),)).run(self.request)
         self.assertEqual(result.metadata['usage_status'], 'not_started')
         self.assertEqual(ledger.entries[0].status, 'released')
-        with patch('simple_ar.agent_backends.external_cli.subprocess.run',
-                   side_effect=subprocess.TimeoutExpired('agent', 5, output=b'partial')):
-            result = self.backend(ledger).run(self.request)
+        result = self.backend(ledger, timeout=1, command=('{binary}', '-c',
+            "import time; print('partial', flush=True); time.sleep(3)")).run(self.request)
         self.assertEqual(result.metadata['usage_status'], 'unknown')
-        self.assertEqual(ledger.entries[-1].status, 'unknown')
-        self.assertEqual((self.request.handoff_dir / 'stdout.txt').read_text(), 'partial')
+        self.assertEqual([row.status for row in ledger.entries if row.purpose == 'external_agent'], ['released', 'unknown'])
+        self.assertEqual((self.request.handoff_dir / 'stdout.txt').read_text().strip(), 'partial')
 
     def test_unknown_external_failure_is_not_retried_by_code_task(self):
         handoff = self.root / 'handoff'

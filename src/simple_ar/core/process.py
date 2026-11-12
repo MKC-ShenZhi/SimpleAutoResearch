@@ -95,6 +95,7 @@ class ProcessSpec:
     session_id: str = ""
     attempt_id: str = ""
     input_binding: dict | None = None
+    display_argv: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -206,6 +207,7 @@ def run_process(
     cancel: threading.Event | None = None,
     budget_ledger: BudgetLedger | None = None,
     output_complete_callback: Callable[[], None] | None = None,
+    accounting_purpose: str = "local_process",
 ) -> ProcessResult:
     """Execute one invocation, optionally reserving and settling shared budget.
 
@@ -223,7 +225,7 @@ def run_process(
     budget_ledger.reserve(
         reservation, {"process_invocations": 1, "process_wall_seconds": spec.timeout_sec},
         session_id=spec.session_id, attempt_id=spec.attempt_id,
-        logical_call_id=spec.invocation_id, purpose="local_process",
+        logical_call_id=spec.invocation_id, purpose=accounting_purpose,
     )
     try:
         result = _run_process(spec, output_callback=output_callback, cancel=cancel,
@@ -246,7 +248,8 @@ def run_process(
 
 
 def verify_process_accounting(record: dict, ledger: BudgetLedger, *, session_id: str,
-                              attempt_id: str, timeout_sec: int) -> None:
+                              attempt_id: str, timeout_sec: int,
+                              accounting_purpose: str = 'local_process') -> None:
     """Read-only verification of a finalized physical invocation and its ledger."""
     invocation, duration = record['invocation_id'], record['duration_sec']
     if (not isinstance(invocation, str) or not re.fullmatch(r'[0-9a-f]{32}', invocation)
@@ -261,7 +264,7 @@ def verify_process_accounting(record: dict, ledger: BudgetLedger, *, session_id:
     entry = entries[0]
     if (entry.logical_call_id != invocation or entry.attempt_id != attempt_id
             or entry.session_id != session_id or entry.status != 'settled'
-            or entry.purpose != 'local_process' or entry.actual_source != 'executor_wall_clock'
+            or entry.purpose != accounting_purpose or entry.actual_source != 'executor_wall_clock'
             or entry.reserved != {'process_invocations': 1, 'process_wall_seconds': timeout_sec}
             or entry.actual != {'process_invocations': 1, 'process_wall_seconds': duration}
             or type(entry.actual.get('process_invocations')) is not int):
@@ -306,7 +309,7 @@ def _run_process(
         "invocation_id": spec.invocation_id,
         "session_id": spec.session_id,
         "attempt_id": spec.attempt_id,
-        "argv": list(spec.argv),
+        "argv": list(spec.argv if spec.display_argv is None else spec.display_argv),
         "cwd": str(spec.cwd.resolve()),
         "status": "starting",
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -314,6 +317,8 @@ def _run_process(
         "environment_policy": "inherited" if spec.env is None else "caller_supplied",
         "resource_enforcement": {"cpu": "not_enforced", "gpu": "not_enforced", "memory": "not_enforced"},
     }
+    if spec.display_argv is not None:
+        record["argv_redacted"] = True
     if spec.input_binding is not None:
         # The caller owns this authority/source identity; retain it with the
         # actual expanded argv/environment before launch, in the same record.

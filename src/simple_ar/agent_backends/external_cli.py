@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +12,8 @@ from typing import Sequence
 from uuid import uuid4
 
 from simple_ar.core.budget import BudgetError, BudgetLedger
+from simple_ar.core.artifacts import read_json
+from simple_ar.core.process import ProcessSpec, run_process
 
 from .base import AgentBackend, AgentRunRequest, AgentRunResult
 
@@ -72,7 +73,7 @@ class ExternalCliBackend(AgentBackend):
             payload = self._run_payload(
                 request,
                 status="blocked",
-                command=self.preview_command(request),
+                command=[self.config.binary, '<external agent arguments omitted>'],
                 message="External agent backend is disabled by configuration.",
                 returncode=None,
                 timed_out=False,
@@ -92,67 +93,58 @@ class ExternalCliBackend(AgentBackend):
         command = self.build_command(request)
         reservation = 'external-agent-' + uuid4().hex
         timeout = max(1, self.config.timeout_sec)
-        ledger.reserve(reservation, {'llm_requests': 0, 'total_tokens': 0,
-                                     'process_invocations': 1, 'process_wall_seconds': timeout},
+        ledger.reserve(reservation, {'llm_requests': 0, 'total_tokens': 0},
                        session_id=self.session_id, attempt_id=self.attempt_id,
                        logical_call_id=reservation, purpose='external_agent')
-        timed_out = False
+        process_id = uuid4().hex
+        process_dir = request.handoff_dir / 'processes' / process_id
+        process_record = process_dir / 'invocation.json'
         returncode: int | None = None
+        stop_reason: str | None = None
         message = "External agent completed."
-        process_started = time.perf_counter()
-
-        def record_unknown(reason: str, *, measured: bool = True) -> None:
-            actual = {'process_invocations': 1, 'process_wall_seconds': time.perf_counter() - process_started}
-            ledger.mark_unknown(reservation, reason=reason, known_actual=actual if measured else None)
-
+        timed_out = False
         try:
-            completed = subprocess.run(
-                command,
-                cwd=str(request.handoff_dir.resolve()),
-                env=self._safe_env(request),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            ledger.release(reservation, reason='External agent could not be started')
-            message = f"External agent could not be started: {exc}"
-            usage_status = 'not_started'
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            message = f"External agent timed out after {self.config.timeout_sec}s."
-            record_unknown('External agent model use is not reported')
-            usage_status = 'unknown'
-            stdout_path.write_text(_as_text(exc.stdout), encoding="utf-8", errors="replace")
-            stderr_path.write_text(_as_text(exc.stderr), encoding="utf-8", errors="replace")
-        except OSError as exc:
-            record_unknown('External agent execution failed; model use is unknown', measured=False)
-            usage_status = 'unknown'
+            completed = run_process(ProcessSpec(argv=command, cwd=request.handoff_dir.resolve(),
+                timeout_sec=timeout, env=self._safe_env(request), output_dir=process_dir,
+                invocation_id=process_id, session_id=self.session_id, attempt_id=self.attempt_id,
+                display_argv=[command[0], '<external agent arguments omitted>']), budget_ledger=ledger,
+                accounting_purpose='external_agent_process')
+        except BaseException as exc:
+            try:
+                not_started = not process_record.exists() or read_json(process_record).get('status') == 'launch_failed'
+            except (OSError, ValueError, AttributeError):
+                not_started = False
+            if not_started:
+                ledger.release(reservation, reason='External agent could not be started')
+            else:
+                ledger.mark_unknown(reservation, reason='External agent execution was interrupted; model use is unknown')
+            if not isinstance(exc, OSError):
+                raise
             message = f"External agent execution failed: {exc}"
-        except BaseException:
-            record_unknown('External agent execution was interrupted; model use is unknown', measured=False)
-            raise
+            usage_status = 'not_started' if not_started else 'unknown'
         else:
-            record_unknown('External agent model use is not reported')
+            ledger.mark_unknown(reservation, reason='External agent model use is not reported')
             usage_status = 'unknown'
             returncode = completed.returncode
-            stdout_path.write_text(completed.stdout or "", encoding="utf-8", errors="replace")
-            stderr_path.write_text(completed.stderr or "", encoding="utf-8", errors="replace")
-            if completed.returncode != 0:
+            stop_reason = completed.stop_reason
+            timed_out = stop_reason == 'timeout'
+            stdout_path.write_text(completed.stdout, encoding="utf-8", errors="replace")
+            stderr_path.write_text(completed.stderr, encoding="utf-8", errors="replace")
+            if timed_out:
+                message = f"External agent timed out after {timeout}s."
+            elif completed.returncode != 0 or stop_reason:
                 message = _failure_message(completed.returncode, stderr=completed.stderr or "",
                                            stdout=completed.stdout or "", provider=self.name)
 
         elapsed = round(time.perf_counter() - started, 6)
-        status = "passed" if returncode == 0 and not timed_out else "failed"
+        status = "passed" if returncode == 0 and not stop_reason else "failed"
         artifacts = _collect_agent_artifacts(request.handoff_dir)
-        artifacts.extend(path for path in (stdout_path, stderr_path) if path.exists())
+        artifacts.extend(path for path in (stdout_path, stderr_path, process_record,
+            process_dir / 'stdout.log', process_dir / 'stderr.log') if path.exists())
         payload = self._run_payload(
             request,
             status=status,
-            command=self.preview_command(request),
+            command=[command[0], '<external agent arguments omitted>'],
             message=message,
             returncode=returncode,
             timed_out=timed_out,
@@ -161,6 +153,8 @@ class ExternalCliBackend(AgentBackend):
         payload["artifacts"] = [str(path.relative_to(request.handoff_dir)) for path in artifacts]
         payload['usage_status'] = usage_status
         payload['usage_reservation'] = reservation
+        if process_record.exists():
+            payload['process_record'] = str(process_record.relative_to(request.handoff_dir))
         run_meta.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         artifacts.append(run_meta)
 
@@ -172,7 +166,8 @@ class ExternalCliBackend(AgentBackend):
             result_path=str(run_meta),
             review_path=str(request.handoff_dir / "review.md") if (request.handoff_dir / "review.md").exists() else "",
             elapsed_sec=elapsed,
-            metadata={'usage_status': usage_status, 'usage_reservation': reservation},
+            metadata={'usage_status': usage_status, 'usage_reservation': reservation,
+                      **({'process_record': str(process_record)} if process_record.exists() else {})},
         )
 
     def build_command(self, request: AgentRunRequest) -> list[str]:
@@ -316,10 +311,6 @@ class OpenCodeCliBackend(ExternalCliBackend):
         command.extend(self.config.extra_args)
         command.append(_instruction_prompt(request.handoff_dir))
         return command
-
-
-def _as_text(value: str | bytes | None) -> str:
-    return value.decode('utf-8', errors='replace') if isinstance(value, bytes) else value or ''
 
 
 def _instruction_prompt(handoff_dir: Path) -> str:
