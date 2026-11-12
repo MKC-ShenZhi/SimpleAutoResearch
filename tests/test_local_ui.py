@@ -398,10 +398,10 @@ class LocalWorkspaceTests(unittest.TestCase):
             descriptor.unlink()
             with patch.object(ToolApplication, 'load', side_effect=AssertionError('No executable assembly')):
                 self.assertTrue(workspace.delivery('retained')['current'])
-            self.assertEqual(visible['unavailable_file_count'], 1)
-            self.assertEqual({row['path'] for row in visible['files']}, {'report.txt'})
-            with self.assertRaisesRegex(ValueError, 'cannot be served'):
-                workspace.file('retained', 'workspace', 'execution.log')
+            self.assertEqual(visible['unavailable_file_count'], 0)
+            self.assertEqual({row['path'] for row in visible['files']}, {'report.txt', 'execution.log'})
+            self.assertEqual(workspace.file('retained', 'workspace', 'execution.log').read_text(),
+                             'Retained process evidence')
             self.assertEqual({p: p.read_bytes() for p in records}, records)
             # Hidden from HTTP does not mean exempt from native version checks.
             log = root / 'workspace/execution.log'
@@ -563,6 +563,59 @@ function json(path, data) {
   $('taskConfig').value = '';
   creationMode();
   assert.equal($('plainCreation').disabled, false);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+        result = subprocess.run([node, '-e', script], capture_output=True, text=True,
+            encoding='utf-8', timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_files_load_while_delivery_projection_is_pending(self):
+        node = shutil.which('node')
+        if node is None:
+            self.skipTest('Node is required for browser state regression')
+        from simple_ar import ui
+        source = (Path(ui.__file__).parent / 'ui_assets/app.js').read_text(encoding='utf-8')
+        functions = source[source.index('async function refresh()'):source.index('async function previewFile(')]
+        script = r"""
+const assert = require('node:assert/strict');
+const elements = new Map();
+const $ = id => {
+  if (!elements.has(id)) elements.set(id, {id, value: '', options: [], textContent: '',
+    replaceChildren() { this.options = []; this.value = ''; },
+    append(child) { if (this.id === 'mount') this.options.push(child); }});
+  return elements.get(id);
+};
+const document = {createElement: () => ({value: '', disabled: false, textContent: ''})};
+const pretty = value => JSON.stringify(value);
+let selected = 'alpha', snapshot = null, folder = '', viewEpoch = 1, refreshSequence = 0;
+let listingKey = '', deliveryKey = '', previewURL = '', previewTarget = null;
+let view = {tasks: {alpha: {}}}, requests = [], releaseDelivery, notices = [];
+const task = {task: 'alpha', mode: 'saved', manifest: {session_id: 'alpha', topic: 'Goal',
+  status: 'completed', updated_at: ''}, saved_connections: {}, sources: ['source0'],
+  source_access: {source0: true}, resources: {limits: {}, remaining: {}, unknown_dimensions: []}};
+const query = (path, args) => ({path, args});
+function notice(message) { notices.push(message); }
+function renderActivity() {}
+function confirmationControls() {}
+function paragraph() {}
+async function json(value) {
+  const path = typeof value === 'string' ? value : value.path;
+  if (path === '/api/tasks') return [];
+  if (path === '/api/task') return task;
+  if (path === '/api/delivery') return new Promise(resolve => { releaseDelivery = resolve; });
+  if (path === '/api/files') { requests.push(value.args); return []; }
+  throw Error('Unexpected request ' + path);
+}
+""" + functions + r"""
+(async () => {
+  const loading = refresh();
+  while (!releaseDelivery) await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal($('mount').value, 'workspace');
+  assert.deepEqual(requests, [{task: 'alpha', mount: 'workspace', path: ''}]);
+  assert.deepEqual(notices, []);
+  releaseDelivery({current: true, label: 'Saved', summary: '', versions: [], files: [], unresolved: []});
+  await loading;
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """
         result = subprocess.run([node, '-e', script], capture_output=True, text=True,

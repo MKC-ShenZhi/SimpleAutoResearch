@@ -426,8 +426,8 @@ class Workspace:
         # Shared resolvers own native private/runtime exclusions. These extra
         # HTTP preview exclusions concern mounted contents (or a file root's
         # basename), not names of explicitly granted directory ancestors.
-        if any(p.startswith('.') or re.search(r'(?i)(credential|secret|^keys?$|^logs?$|\.log$|\.pem$|\.key$|^models\.toml$)', p)
-               for p in parts):
+        if any(p.startswith('.') or re.search(r'(?i)(credential|secret|^keys?$|\.pem$|\.key$|^models\.toml$)', p)
+               or mount != 'workspace' and re.search(r'(?i)(^logs?$|\.log$)', p) for p in parts):
             raise ValueError('Private/configuration files cannot be served')
         return path
 

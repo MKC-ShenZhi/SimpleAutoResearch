@@ -272,7 +272,7 @@ async function refresh() {
       button.className = row.task === selected ? 'active' : '';
       button.onclick = async () => {
         selectTask(row.task);
-        try { await refresh(); await files(); } catch (error) { notice(error.message); }
+        try { await refresh(); } catch (error) { notice(error.message); }
       };
       $('tasks').append(button);
     }
@@ -311,6 +311,22 @@ async function refresh() {
   $('approvalBox').hidden = !snapshot.approval;
   $('proposal').textContent = pretty(snapshot.approval);
   confirmationControls();
+  const mounts = ['workspace', 'evidence', ...snapshot.sources];
+  const available = mount => snapshot.source_access?.[mount] !== false;
+  if (pretty([...$('mount').options].map(o => [o.value, !o.disabled])) !==
+      pretty(mounts.map(mount => [mount, available(mount)]))) {
+    const oldMount = $('mount').value || view.tasks[task]?.mount;
+    $('mount').replaceChildren();
+    for (const mount of mounts) {
+      const option = document.createElement('option'); option.value = mount;
+      option.textContent = mount + (mount === 'evidence' ? ' · 已留存来源' : mount === 'workspace' ? ' · 工作文件' : ' · 只读材料');
+      if (!available(mount)) { option.disabled = true; option.textContent += '（当前不可访问）'; }
+      $('mount').append(option);
+    }
+    if ([...$('mount').options].some(o => o.value === oldMount && !o.disabled)) $('mount').value = oldMount;
+    else { $('mount').value = 'workspace'; folder = ''; }
+    files(); // File navigation does not wait for a long delivery projection.
+  }
   const delivery = await json(query('/api/delivery', {task}));
   if (selected !== task || epoch !== viewEpoch || sequence !== refreshSequence) return;
   const nextDeliveryKey = pretty({task, delivery});
@@ -363,20 +379,6 @@ async function refresh() {
       $('delivery').append(button);
     }
   }
-  const mounts = ['workspace', 'evidence', ...snapshot.sources];
-  const available = mount => snapshot.source_access?.[mount] !== false;
-  if (pretty([...$('mount').options].map(o => [o.value, !o.disabled])) ===
-      pretty(mounts.map(mount => [mount, available(mount)]))) return;
-  const oldMount = $('mount').value || view.tasks[task]?.mount;
-  $('mount').replaceChildren();
-  for (const mount of mounts) {
-    const option = document.createElement('option'); option.value = mount;
-    option.textContent = mount + (mount === 'evidence' ? ' · 已留存来源' : mount === 'workspace' ? ' · 工作文件' : ' · 只读材料');
-    if (!available(mount)) { option.disabled = true; option.textContent += '（当前不可访问）'; }
-    $('mount').append(option);
-  }
-  if ([...$('mount').options].some(o => o.value === oldMount && !o.disabled)) $('mount').value = oldMount;
-  else { $('mount').value = 'workspace'; folder = ''; }
 }
 async function files() {
   if (!selected || snapshot?.task !== selected) return;
@@ -562,7 +564,7 @@ async function poll() {
       else if (typeof value === 'string') $(id).value = value;
     }
     selectTask(view.selected, false);
-    recipient(); effectiveAccess(); creationMode(); await refresh(); await files();
+    recipient(); effectiveAccess(); creationMode(); await refresh();
   } catch (error) {
     notice(error.message + '。请使用本次启动终端打印的完整链接；可点击新建或任务列表重新选择。');
   }
