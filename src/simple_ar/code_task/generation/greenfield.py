@@ -44,6 +44,7 @@ from simple_ar.integrations.llm import LLMClient, LLMError
 
 from .agent_backend import (
     check_agent_budget,
+    retained_greenfield_plan,
     should_use_agent_backend,
     write_greenfield_project_from_agent_backend,
 )
@@ -321,7 +322,19 @@ def generate_greenfield_code_task(
     )
     planning_dir = paths.meta_dir / "planning"
     planning_snapshot: dict[str, Any] | None = None
-    if source_snapshot is not None:
+    retained_plan = (retained_greenfield_plan(run_dir=root, provider=implementation_provider,
+        client=writer_client, enabled=implementation_allow_external_agent, binary=implementation_agent_binary,
+        model=implementation_agent_model, timeout_sec=implementation_agent_timeout_sec,
+        args=implementation_agent_args, ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+        contract=prompt_contract, result_schema=result_schema)
+        if should_use_agent_backend(implementation_provider) else None)
+    if retained_plan is not None:
+        architecture, architecture_mode, planning_snapshot = retained_plan
+        previous_source = (planning_snapshot or {}).get('source_run_dir')
+        if (str(source_snapshot.expanduser().resolve()) if source_snapshot else None) != previous_source:
+            raise ValueError('Retained agent handoff has a different planning source; preserve it and start a new attempt')
+        _emit(message_callback, 'Reusing the retained external handoff and its original plan.')
+    elif source_snapshot is not None:
         _emit(message_callback, "Importing immutable accepted greenfield plan.")
         architecture, architecture_mode, planning_snapshot = _load_planning_snapshot(
             source_run_dir=source_snapshot,

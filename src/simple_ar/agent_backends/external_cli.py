@@ -12,7 +12,7 @@ from typing import Sequence
 from uuid import uuid4
 
 from simple_ar.core.budget import BudgetError, BudgetLedger
-from simple_ar.core.artifacts import read_json
+from simple_ar.core.artifacts import read_json, write_json
 from simple_ar.core.process import ProcessSpec, run_process
 
 from .base import AgentBackend, AgentRunRequest, AgentRunResult
@@ -62,12 +62,63 @@ class ExternalCliBackend(AgentBackend):
                               'use a budget-accounted backend for this task.')
         return ledger
 
+    def retained_result(self, request: AgentRunRequest) -> AgentRunResult | None:
+        """Reuse a finished handoff, or leave an interrupted execution untouched."""
+        root = request.handoff_dir.resolve()
+        meta_path = root / 'agent_run.json'
+        ledger_path = Path(request.run_dir) / 'budget_ledger.json'
+        ledger = self.ledger or (BudgetLedger.load(ledger_path) if ledger_path.exists() else None)
+        if not meta_path.is_file():
+            processes = list((root / 'processes').glob('*/invocation.json'))
+            unresolved = ledger and any(row.purpose == 'external_agent' and row.status == 'reserved'
+                and row.session_id == self.session_id and row.attempt_id == self.attempt_id for row in ledger.entries)
+            if unresolved or any(read_json(path).get('status') != 'launch_failed' for path in processes):
+                raise RuntimeError('External agent handoff was interrupted; inspect its original process and ledger before continuing')
+            return None
+        payload = read_json(meta_path)
+        if payload.get('usage_status') != 'unknown':
+            referenced = (root / payload.get('process_record', '')).resolve()
+            processes = (root / 'processes').glob('*/invocation.json')
+            unresolved = ledger and any(row.reservation_id == payload.get('usage_reservation')
+                and row.status in {'reserved', 'unknown'} for row in ledger.entries)
+            if unresolved or any((path.resolve() != referenced or payload.get('usage_status') == 'starting')
+                                 and read_json(path).get('status') != 'launch_failed' for path in processes):
+                raise RuntimeError('External agent handoff was interrupted; inspect its original process and ledger before continuing')
+            return None
+        if ledger is None:
+            raise ValueError('Retained external agent result has no original ledger')
+        entries = [row for row in ledger.entries if row.reservation_id == payload.get('usage_reservation')]
+        if (len(entries) != 1 or entries[0].status != 'unknown' or entries[0].purpose != 'external_agent'
+                or entries[0].session_id != self.session_id or entries[0].attempt_id != self.attempt_id
+                or payload.get('provider') != request.provider or payload.get('cwd') != str(root)):
+            raise ValueError('Retained external agent result does not belong to this task and attempt')
+        process_path = (root / payload['process_record']).resolve()
+        if not process_path.is_relative_to(root):
+            raise ValueError('External agent process record is outside its handoff')
+        process = read_json(process_path)
+        status = 'passed' if process.get('returncode') == 0 and not process.get('stop_reason') else 'failed'
+        if (process.get('status') not in {'finished', 'stopped'} or process.get('cwd') != str(root)
+                or process.get('session_id') != self.session_id or process.get('attempt_id') != self.attempt_id
+                or payload.get('status') != status):
+            raise ValueError('Retained external agent process has no matching final result')
+        artifacts = [(root / path).resolve() for path in payload.get('artifacts', [])]
+        if any(not path.is_relative_to(root) for path in artifacts):
+            raise ValueError('External agent result contains an artifact outside its handoff')
+        return AgentRunResult(provider=request.provider, status=status, message=payload.get('message', ''),
+            artifacts=[str(path) for path in [*artifacts, meta_path]], result_path=str(meta_path),
+            review_path=str(root / 'review.md') if (root / 'review.md').exists() else '',
+            elapsed_sec=payload.get('elapsed_sec', 0), metadata={'usage_status': 'unknown',
+                'usage_reservation': entries[0].reservation_id, 'process_record': str(process_path)})
+
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         started = time.perf_counter()
         request.handoff_dir.mkdir(parents=True, exist_ok=True)
         run_meta = request.handoff_dir / "agent_run.json"
         stdout_path = request.handoff_dir / "stdout.txt"
         stderr_path = request.handoff_dir / "stderr.txt"
+
+        if (retained := self.retained_result(request)) is not None:
+            return retained
 
         if not self.config.enabled:
             payload = self._run_payload(
@@ -79,7 +130,7 @@ class ExternalCliBackend(AgentBackend):
                 timed_out=False,
                 elapsed_sec=round(time.perf_counter() - started, 6),
             )
-            run_meta.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            write_json(run_meta, payload)
             return AgentRunResult(
                 provider=request.provider,
                 status="blocked",
@@ -92,13 +143,16 @@ class ExternalCliBackend(AgentBackend):
         ledger = self.accounting_ledger(request.run_dir)
         command = self.build_command(request)
         reservation = 'external-agent-' + uuid4().hex
+        process_id = uuid4().hex
+        process_dir = request.handoff_dir / 'processes' / process_id
+        process_record = process_dir / 'invocation.json'
+        write_json(run_meta, {'provider': request.provider, 'status': 'starting',
+            'cwd': str(request.handoff_dir.resolve()), 'usage_status': 'starting',
+            'usage_reservation': reservation, 'process_record': str(process_record.relative_to(request.handoff_dir))})
         timeout = max(1, self.config.timeout_sec)
         ledger.reserve(reservation, {'llm_requests': 0, 'total_tokens': 0},
                        session_id=self.session_id, attempt_id=self.attempt_id,
                        logical_call_id=reservation, purpose='external_agent')
-        process_id = uuid4().hex
-        process_dir = request.handoff_dir / 'processes' / process_id
-        process_record = process_dir / 'invocation.json'
         returncode: int | None = None
         stop_reason: str | None = None
         message = "External agent completed."
@@ -155,7 +209,7 @@ class ExternalCliBackend(AgentBackend):
         payload['usage_reservation'] = reservation
         if process_record.exists():
             payload['process_record'] = str(process_record.relative_to(request.handoff_dir))
-        run_meta.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_json(run_meta, payload)
         artifacts.append(run_meta)
 
         return AgentRunResult(

@@ -7,10 +7,11 @@ from unittest.mock import Mock, patch
 
 from simple_ar.agent_backends import AgentRunRequest, AgentRunResult
 from simple_ar.agent_backends.external_cli import ExternalCliBackend, ExternalCliBackendConfig
-from simple_ar.code_task.generation.agent_backend import check_agent_budget, write_greenfield_project_from_agent_backend
+from simple_ar.code_task.generation.agent_backend import (
+    check_agent_budget, retained_greenfield_plan, write_greenfield_project_from_agent_backend)
 from simple_ar.core.budget import BudgetError, BudgetLedger
 from simple_ar.core.process import verify_process_accounting
-from simple_ar.core.artifacts import read_json
+from simple_ar.core.artifacts import read_json, write_json
 
 
 class ExternalAgentAccountingTests(unittest.TestCase):
@@ -69,6 +70,67 @@ class ExternalAgentAccountingTests(unittest.TestCase):
         entry = next(row for row in BudgetLedger.load(self.root / 'budget_ledger.json').entries
                      if row.purpose == 'external_agent')
         self.assertEqual(entry.status, 'unknown')
+
+    def test_completed_handoff_is_reused_and_interrupted_handoff_is_not_replayed(self):
+        ledger = BudgetLedger({})
+        backend = self.backend(ledger)
+        result = backend.run(self.request)
+        before = ledger.to_dict()
+        with patch('simple_ar.agent_backends.external_cli.run_process', side_effect=AssertionError('replayed')):
+            retained = backend.run(self.request)
+        self.assertEqual(retained.status, result.status)
+        self.assertEqual(retained.metadata, result.metadata)
+        self.assertEqual(ledger.to_dict(), before)
+
+        (self.request.handoff_dir / 'agent_run.json').unlink()
+        with patch('simple_ar.agent_backends.external_cli.run_process', side_effect=AssertionError('replayed')):
+            with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                backend.run(self.request)
+        self.assertEqual(ledger.to_dict(), before)
+
+        interrupted = self.request.model_copy(update={'handoff_dir': self.root / 'interrupted'})
+        ledger.reserve('external-agent-pending', {'llm_requests': 0, 'total_tokens': 0},
+            session_id='session', attempt_id='attempt', purpose='external_agent')
+        write_json(interrupted.handoff_dir / 'agent_run.json', {'usage_status': 'starting',
+            'usage_reservation': 'external-agent-pending', 'process_record': 'processes/pending/invocation.json'})
+        with patch('simple_ar.agent_backends.external_cli.run_process', side_effect=AssertionError('replayed')):
+            with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                backend.run(interrupted)
+
+    def test_greenfield_reuses_the_original_plan_and_external_result(self):
+        ledger = BudgetLedger({})
+        command = ('{binary}', '-c', "from pathlib import Path; p=Path('generated_files'); "
+            "p.mkdir(); (p/'main.py').write_text('print(1)\\n')")
+        backend = self.backend(ledger, command=command)
+        handoff = self.root / 'agent_handoff' / 'code-task-greenfield-external_cli'
+        context = handoff / 'context'
+        context.mkdir(parents=True)
+        contract, schema, architecture = {'goal': 'Example'}, {'metric': 'value'}, {'files': [{'path': 'main.py'}]}
+        for name, value in [('contract.json', contract), ('result_schema.json', schema),
+                            ('architecture_plan.json', architecture)]:
+            write_json(context / name, value)
+        write_json(self.root / 'code_task/meta/implementation_plan.json',
+            {'architecture_mode': 'existing', 'ablation': {'planning_snapshot': None}})
+        request = AgentRunRequest(provider='external_cli', run_dir=self.root, handoff_dir=handoff,
+            workspace_dir=self.root / 'code_task/workspace')
+        backend.run(request)
+        before = ledger.to_dict()
+        with patch('simple_ar.code_task.generation.agent_backend.create_agent_backend', return_value=backend), \
+             patch('simple_ar.code_task.generation.agent_backend.build_code_task_greenfield_handoff',
+                   side_effect=AssertionError('replaced handoff')), \
+             patch('simple_ar.agent_backends.external_cli.run_process', side_effect=AssertionError('replayed')):
+            plan = retained_greenfield_plan(run_dir=self.root, provider='external_cli', client=None,
+                enabled=True, binary=sys.executable, model='', timeout_sec=5, args=(), ledger=ledger,
+                session_id='session', attempt_id='attempt', contract=contract, result_schema=schema)
+            artifacts, result = write_greenfield_project_from_agent_backend(run_dir=self.root,
+                project_dir=self.root / 'code_task/workspace/generated_project', provider='external_cli',
+                agent_mode='handoff', contract=contract, result_schema=schema, architecture=architecture,
+                memory={}, client=None, timeout_sec=5, external_enabled=True, budget_ledger=ledger,
+                session_id='session', attempt_id='attempt')
+        self.assertEqual(plan, (architecture, 'existing', None))
+        self.assertEqual(result['usage_status'], 'unknown')
+        self.assertTrue((self.root / 'code_task/workspace/generated_project/main.py').is_file())
+        self.assertEqual(ledger.to_dict(), before)
 
     def test_missing_program_releases_reservation_but_timeout_remains_unknown(self):
         ledger = BudgetLedger({})

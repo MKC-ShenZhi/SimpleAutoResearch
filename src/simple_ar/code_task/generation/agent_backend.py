@@ -15,7 +15,7 @@ from simple_ar.agent_backends import (
     normalize_agent_mode,
     validate_agent_mode_for_provider,
 )
-from simple_ar.core.artifacts import write_json
+from simple_ar.core.artifacts import read_json, write_json
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.agent_backends.external_cli import ExternalCliBackend
 from simple_ar.integrations.llm import LLMClient
@@ -38,6 +38,34 @@ def check_agent_budget(run_dir: Path, provider: str, *, enabled: bool,
                                        budget_ledger=ledger)
         if isinstance(backend, ExternalCliBackend):
             backend.accounting_ledger(run_dir)
+
+
+def retained_greenfield_plan(*, run_dir: Path, provider: str, client: LLMClient | None,
+                             enabled: bool, binary: str, model: str, timeout_sec: int,
+                             args: tuple[str, ...], ledger: BudgetLedger | None,
+                             session_id: str, attempt_id: str, contract: Mapping[str, Any],
+                             result_schema: Mapping[str, Any]) -> tuple[dict, str, dict | None] | None:
+    """Find a completed external handoff before buying a replacement plan."""
+    normalized = _normalize_provider(provider)
+    handoff = run_dir / 'agent_handoff' / f'code-task-greenfield-{normalized}'
+    if not handoff.is_dir():
+        return None
+    backend = create_agent_backend(normalized, enabled=enabled, client=client, model=model or None,
+        timeout_sec=timeout_sec, binary=binary or None, extra_args=args, budget_ledger=ledger,
+        session_id=session_id, attempt_id=attempt_id)
+    if not isinstance(backend, ExternalCliBackend):
+        return None
+    request = AgentRunRequest(provider=normalized, run_dir=run_dir, handoff_dir=handoff,
+        workspace_dir=run_dir / 'code_task' / 'workspace')
+    if backend.retained_result(request) is None:
+        return None
+    context = handoff / 'context'
+    if (read_json(context / 'contract.json') != dict(contract)
+            or read_json(context / 'result_schema.json') != dict(result_schema)):
+        raise ValueError('Retained agent handoff has different work inputs; preserve it and start a new attempt')
+    plan = read_json(run_dir / 'code_task' / 'meta' / 'implementation_plan.json')
+    return (read_json(context / 'architecture_plan.json'), plan['architecture_mode'],
+            (plan.get('ablation') or {}).get('planning_snapshot'))
 
 
 def write_greenfield_project_from_agent_backend(
@@ -109,20 +137,12 @@ def write_greenfield_project_from_agent_backend(
             "SimpleAutoResearch will ingest, validate, review, and run the generated project separately.",
         ],
     )
-    package = build_code_task_greenfield_handoff(
-        root,
-        name=f"code-task-greenfield-{normalized_provider}",
-        permission_policy=permission_policy,
-        context_files={
-            "architecture_plan.json": _json_context(architecture),
-            "result_schema.json": _json_context(result_schema),
-            "contract.json": _json_context(contract),
-        },
-    )
+    handoff_name = f"code-task-greenfield-{normalized_provider}"
+    handoff_dir = root / 'agent_handoff' / handoff_name
     request = AgentRunRequest(
         provider=normalized_provider,
         run_dir=root,
-        handoff_dir=package.handoff_dir,
+        handoff_dir=handoff_dir,
         workspace_dir=root / "code_task" / "workspace",
         timeout_sec=timeout_sec,
         metadata={
@@ -145,9 +165,22 @@ def write_greenfield_project_from_agent_backend(
         session_id=session_id,
         attempt_id=attempt_id,
     )
-    result = backend.run(request)
-    ingestion = ingest_agent_outputs(run_dir=root, handoff_dir=package.handoff_dir)
-    generated_dir = package.handoff_dir / "generated_files"
+    result = backend.retained_result(request) if isinstance(backend, ExternalCliBackend) else None
+    if result is not None:
+        expected = {'architecture_plan.json': architecture, 'result_schema.json': result_schema, 'contract.json': contract}
+        if any(read_json(handoff_dir / 'context' / name) != dict(value) for name, value in expected.items()):
+            raise ValueError('Retained agent handoff has different work inputs; preserve it and start a new attempt')
+    else:
+        package = build_code_task_greenfield_handoff(root, name=handoff_name,
+            permission_policy=permission_policy, context_files={
+                "architecture_plan.json": _json_context(architecture),
+                "result_schema.json": _json_context(result_schema),
+                "contract.json": _json_context(contract)})
+        handoff_dir = package.handoff_dir
+        request = request.model_copy(update={'handoff_dir': handoff_dir})
+        result = backend.run(request)
+    ingestion = ingest_agent_outputs(run_dir=root, handoff_dir=handoff_dir)
+    generated_dir = handoff_dir / "generated_files"
     generated_files = _generated_file_paths(generated_dir)
     if (not result.ok or not generated_files) and result.metadata.get('usage_status') != 'unknown':
         retry_package = build_code_task_greenfield_handoff(
@@ -175,14 +208,14 @@ def write_greenfield_project_from_agent_backend(
         retry_request = request.model_copy(update={"handoff_dir": retry_package.handoff_dir})
         result = backend.run(retry_request)
         ingestion = ingest_agent_outputs(run_dir=root, handoff_dir=retry_package.handoff_dir)
-        package = retry_package
-        generated_dir = package.handoff_dir / "generated_files"
+        handoff_dir = retry_package.handoff_dir
+        generated_dir = handoff_dir / "generated_files"
         generated_files = _generated_file_paths(generated_dir)
     if not result.ok or not generated_files:
         raise RuntimeError(
             "Agent greenfield backend did not produce validated generated_files/. "
             f"Status={result.status}; generated_file_count={len(generated_files)}; "
-            f"message={result.message}; result={result.result_path or package.handoff_dir}."
+            f"message={result.message}; result={result.result_path or handoff_dir}."
         )
     with generation_candidate(project_dir, validate=validate_candidate) as candidate:
         shutil.copytree(generated_dir, candidate, ignore=_copy_ignore, dirs_exist_ok=True)
@@ -191,7 +224,7 @@ def write_greenfield_project_from_agent_backend(
         "provider": normalized_provider,
         "status": result.status,
         "agent_mode": resolved_agent_mode.value,
-        "handoff_dir": package.handoff_dir.relative_to(root).as_posix(),
+        "handoff_dir": handoff_dir.relative_to(root).as_posix(),
         "ingestion": ingestion,
         "result_path": result.result_path,
         "review_path": result.review_path,
