@@ -44,6 +44,24 @@ class _Client:
 
 
 class DocumentWorkTests(unittest.TestCase):
+    def test_large_related_feedback_is_admitted_by_the_consumers_model_capacity(self):
+        from simple_ar.app.tool_application import ToolApplication
+
+        reviews = [{'record': f'records/review-{number}/result.json',
+                    'result': {'message': 'Relevant evidence and revision guidance. ' * 350}}
+                   for number in range(20)]
+        app = SimpleNamespace(state={'requests': ['Revise the supplied work'], 'config': {}},
+            operations=None, _work_feedback=lambda targets: {'review_observations': reviews},
+            _retained_working_inputs=lambda targets: {'notes': []})
+        context = ToolApplication._work_context(app, ['workspace/project'])
+        self.assertGreater(len(json.dumps(context).encode()), 256000)
+        prompt = {'goal': 'Revise the supplied work', 'work_context': context,
+                  'coverage': 'Actual observations only.', 'read_results': [], 'observations': []}
+        client = SimpleNamespace(_settings=SimpleNamespace(context_input_tokens=128000))
+        presented, selection = DocumentWorkToolGateway._working_input(prompt, [], client, 'work', 'Work on the request.')
+        self.assertEqual(presented['work_context']['review_observations'], reviews)
+        self.assertLessEqual(selection['estimated_input_tokens'], 128000)
+
     def test_shared_context_keeps_large_observation_history_without_a_cumulative_read_gate(self):
         root, source, ledger, workspace = self.workspace()
         for number in range(1, 6):

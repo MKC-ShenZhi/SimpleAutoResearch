@@ -1473,8 +1473,6 @@ class ToolApplication:
         inherited = self._retained_working_inputs(targets)
         if inherited['notes']:
             context['historical_working_understanding'] = inherited['notes']
-        if len(json.dumps(context, ensure_ascii=False).encode('utf-8')) > 256000:
-            raise ValueError('Related work context exceeds 256000 bytes; narrow the work unit instead of silently dropping feedback')
         return context
 
     def _retained_working_inputs(self, targets: list[str] | None = None) -> dict:
