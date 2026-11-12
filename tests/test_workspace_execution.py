@@ -80,6 +80,19 @@ class WorkspaceExecutionTests(unittest.TestCase):
         self.assertIn('Writes stay in this directory', cwd)
         self.assertNotIn('no sandbox', cwd)
 
+    def test_host_resources_require_explicit_approval_before_execution(self):
+        outside = self.base / 'outside.txt'
+        program = f'from pathlib import Path; Path({str(outside)!r}).write_text("approved")'
+        result = self.app.run(actions=[action('run_process', argv=['python', '-c', program], host_access=True)],
+            progress=lambda _: None)
+        self.assertEqual(result['status'], 'paused')
+        self.assertFalse(outside.exists())
+        self.assertFalse(self.app.ledger.entries)
+        token = self.app.approval_token(self.app.state['pending']['call'])
+        self.app.run(approved_execution=token, progress=lambda _: None)
+        self.assertEqual(outside.read_text(), 'approved')
+        self.assertEqual(self.app.ledger.entries[-1].status, 'settled')
+
     def test_saved_task_can_receive_the_explicit_scope_without_resetting_history(self):
         old = ToolApplication.create(self.base / 'old', 'Old task', model=None, sources={}, allow_execution=True)
         before = old.ledger.to_dict()

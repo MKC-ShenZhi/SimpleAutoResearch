@@ -321,6 +321,8 @@ class _Run(BaseModel):
     argv: list[str] = Field(min_length=1, max_length=40)
     literal_argv: bool = Field(default=False, exclude_if=lambda value: not value,
         description='Use literal OS arguments relative to cwd, without mount-alias expansion. Bare python/python3 still selects the task interpreter. Does not add authority or sandboxing.')
+    host_access: bool = Field(default=False, exclude_if=lambda value: not value,
+        description='Request host execution when the task needs resources outside the workspace boundary, such as GPU or network. Requires explicit approval of this command; the host process is not sandboxed.')
     cwd: str = "workspace"
     timeout_sec: int = Field(default=60, ge=1, le=300)
     inputs: list[str] = Field(default_factory=list, max_length=64, exclude_if=lambda value: not value,
@@ -452,11 +454,14 @@ def workspace_tool_specs(*, candidate_review: bool = False,
                 'Empty for a new destination file.')
         if name == 'run_process':
             description += (' Task authorization permits execution in the workspace without per-command approval. '
-                'Processes cannot access original source mounts or the network; copy needed sources to the workspace.'
+                'Processes cannot access original source mounts, the network or host GPU; copy needed sources '
+                'to the workspace. Request host_access when the work needs a wider scope.'
                 if sandbox_execution else ' Requires exact process approval and is not a sandbox.')
             # Professional execution supplies this owner reference internally.
             # Ordinary commands retain their explicit file-list contract.
             schema['properties'].pop('input_snapshot')
+            if not sandbox_execution:
+                schema['properties'].pop('host_access')
             if process_artifact_paths == 'cwd.v1':
                 for field in ('inputs', 'outputs'):
                     schema['properties'][field]['description'] += (
@@ -2217,7 +2222,7 @@ class WorkspaceToolGateway:
                 data = model.model_dump()
             elif name == "run_process":
                 recovering = (self.root / "tools" / "processes" / identity / "invocation.json").exists()
-                data = self._run(model, identity, sandboxed=self.sandbox_execution)
+                data = self._run(model, identity, sandboxed=self.sandbox_execution and not model.host_access)
                 if not recovering:
                     receipt = self.root / data['receipt']
                     data['receipt_sha256'] = hashlib.sha256(receipt.read_bytes()).hexdigest()

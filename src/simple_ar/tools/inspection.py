@@ -793,7 +793,8 @@ class InspectionToolGateway:
                 properties['cwd']['description'] = (
                     f'Working directory inside workspace/inspection-work/{identity}/. '
                     + ('The task workspace is readable; copy original source mounts into it before execution. '
-                       'Writes stay in this directory and process networking is disabled. '
+                       'Scoped writes stay in this directory and process networking is disabled; '
+                       'host_access requires explicit approval. '
                        if getattr(self.workspace, 'sandbox_execution', False) else
                        'Use recorded absolute paths for source files outside this directory. '
                        'Ordinary approval applies; no sandbox is implied. ')

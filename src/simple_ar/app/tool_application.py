@@ -6213,7 +6213,9 @@ class ToolApplication:
                         or (binding.get('artifacts') or {}).get('inputs')):
                     grant = self.workspace.approval_digest({
                         'name': name, 'arguments': json.loads(call['function']['arguments']), 'binding': binding})
-            task_scope = self.state['config'].get('sandbox_execution') and name in {'run_process', 'export_report'}
+            task_scope = (self.state['config'].get('sandbox_execution') and name in {'run_process', 'export_report'}
+                and not (name == 'run_process' and token is not None
+                         and json.loads(call['function']['arguments']).get('host_access') is True))
             if token is not None and not started and not task_scope and approved_execution != token and grant not in grants:
                 decision = approve(call, token) if approve else False
                 if isinstance(decision, ExecutionRejection):
