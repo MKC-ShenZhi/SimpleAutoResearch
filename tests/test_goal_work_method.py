@@ -719,12 +719,21 @@ class GoalWorkTests(unittest.TestCase):
                 owner.clear_presentation_scope()
                 self.assertEqual(owner._cached(identity), first)
                 self.assertEqual(read.call_count, 2)
+        review_owner = case.app.operations.delivery_review
+        binding = case._last('review_result', reviewed=True)['metadata']['delivery_review']['binding']
+        observations = case.app._operation_observations()
+        with patch.object(owner, '_read_retained_result', wraps=owner._read_retained_result) as read:
+            self.assertEqual(review_owner.issues(observations, binding), [])
+            validated = [(call.args[0], call.kwargs['current_inputs']) for call in read.call_args_list]
+            self.assertTrue(validated)
+            self.assertEqual(len(validated), len(set(validated)))
         case._submit(_action('deliver_result', **final))
         self.assertEqual(case.app.session.manifest.status, 'completed')
         (case.root / 'workspace' / 'report.md').write_text(
             'The report changed after the inspection.\n', encoding='utf-8')
         with self.assertRaises(ValueError):
             owner._cached(identity)
+        self.assertTrue(review_owner.issues(observations, binding))
         item = next(item for turn in case.app.state['turns'] for item in turn['tools']
             if Path(item['result']).parent.name == identity and item.get('review_result'))
         parent = case.app.session.store.read_json(item['result'])

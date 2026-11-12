@@ -1,6 +1,7 @@
 """Whole-delivery review using the existing inspection owner and native receipts."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 from copy import deepcopy
 import hashlib
 import json
@@ -329,6 +330,10 @@ class DeliveryReview:
         self.include_package_feedback = include_package_feedback
         self.supply_work_feedback = supply_work_feedback
         self.compact_work_feedback = compact_work_feedback
+
+    def _inspection_scope(self):
+        scope = getattr(self.inspector, 'presentation_scope', None)
+        return scope() if scope is not None else nullcontext()
 
     def work_inputs(self, targets: list[str], *, include_observations: bool = False) -> list[dict]:
         if include_observations:
@@ -752,6 +757,10 @@ class DeliveryReview:
 
     def pending_concerns(self, artifacts: Any, observations: list[dict] | None = None) -> list[dict]:
         """Return unresolved original concerns, not defects asserted on new bytes."""
+        with self._inspection_scope():
+            return self._pending_concerns(artifacts, observations)
+
+    def _pending_concerns(self, artifacts: Any, observations: list[dict] | None = None) -> list[dict]:
         if not self.track_findings:
             return []
         rows = observations if observations is not None else (
@@ -1102,6 +1111,10 @@ class DeliveryReview:
         raise ValueError('Reviewed candidate was not found in the accepted task records')
 
     def issues(self, observations: list[dict], binding: dict | None) -> list[str]:
+        with self._inspection_scope():
+            return self._issues(observations, binding)
+
+    def _issues(self, observations: list[dict], binding: dict | None) -> list[str]:
         try:
             if binding is None:
                 return []

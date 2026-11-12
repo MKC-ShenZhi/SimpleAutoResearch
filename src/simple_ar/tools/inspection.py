@@ -1556,7 +1556,7 @@ class InspectionToolGateway:
 
     @contextmanager
     def presentation_scope(self):
-        """Share validated opinions while preparing one decision's inputs."""
+        """Share validated opinions during one read-only view or acceptance check."""
         if _PRESENTATION_RESULTS.get() is not None:
             yield
             return
