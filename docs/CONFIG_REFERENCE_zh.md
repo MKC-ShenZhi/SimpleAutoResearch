@@ -496,7 +496,8 @@ init 读取项目／工作区；execute 读取执行／模型／预算。研究�
 | `implementation.agent_model`、`agent_binary`、`agent_args` | implementation 下外部模型／程序／argv | 可选字符串／列表；空模型用外部账号默认值 | 执行 |
 | `implementation.agent_timeout_sec` | 外部时限 | 正整数 600 秒 | 执行 |
 
-显式启用的外部 Agent CLI 在共同进程执行器之外运行，其进程和模型用量不计入任务的共用账本。
+显式启用的外部 Agent CLI 在共同进程执行器之外运行。账本记录启动和已观察到的耗时，模型用量记为未知；设置有限模型调用数或 token 额度时，需要能执行限制并报告用量的后端。
+交接文件只描述请求的访问范围；文件和网络隔离取决于外部 CLI 本身。
 
 <a id="execute-与-budget-字段"></a>
 

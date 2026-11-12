@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from simple_ar.core.artifacts import file_stat_version
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.tools.professional_outcomes import accepted_native_result, accepted_review_journal
 from simple_ar.tools.workspace import FileWindow
@@ -61,13 +62,14 @@ def read_bound_material_bytes(workspace: Any, locator: str, digest: str, *, max_
     if type(max_bytes) is not int or not 0 <= max_bytes <= 256000:
         raise ValueError('Complete material read exceeds its inspection bound')
     path = workspace.resolve_material_root(locator)
-    def version(stat):
-        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
     with path.open('rb') as handle:
-        before = version(os.fstat(handle.fileno()))
+        before = file_stat_version(os.fstat(handle.fileno()))
+        path_before = file_stat_version(path.stat())
+        if before[:-1] != path_before[:-1]:
+            raise ValueError('Professional attachment changed during complete reading')
         raw = handle.read(max_bytes + 1)
-        if (version(os.fstat(handle.fileno())) != before
-                or workspace.resolve(locator) != path or version(path.stat()) != before):
+        if (file_stat_version(os.fstat(handle.fileno())) != before
+                or workspace.resolve(locator) != path or file_stat_version(path.stat()) != path_before):
             raise ValueError('Professional attachment changed during complete reading')
     if len(raw) > max_bytes:
         raise ValueError('Complete professional unit inspection exceeds 256000 total text bytes')

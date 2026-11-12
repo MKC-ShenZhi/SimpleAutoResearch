@@ -1383,8 +1383,9 @@ class InspectionOfferCoverageTests(unittest.TestCase):
         result = self.case._inspect([target], [])
         assessment = _assessments(result)[0]
         self.assertEqual((assessment['coverage'], assessment['verdict']), ('scoped', 'passed'))
-        self.assertEqual(assessment['scope'], {'start':len(lines[0].encode()),
-            'end':len(''.join(lines[:3]).encode()), 'size_bytes':len(''.join(lines).encode())})
+        actual_lines = (self.case.root / 'workspace' / 'note.md').read_bytes().splitlines(keepends=True)
+        self.assertEqual(assessment['scope'], {'start':len(actual_lines[0]),
+            'end':len(b''.join(actual_lines[:3])), 'size_bytes':len(b''.join(actual_lines))})
 
         # A previously saved task keeps its own policy, even when resumed on
         # a newer application. Its recorded opinion is never upgraded.

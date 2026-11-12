@@ -24,6 +24,7 @@ from simple_ar.code_task.runtime.state import (
     utcnow_iso,
 )
 from simple_ar.core.artifacts import read_json, read_text, write_json, write_text
+from simple_ar.core.budget import BudgetLedger
 from simple_ar.code_task.generation.architecture import (
     build_architecture_plan,
     file_plan_from_architecture,
@@ -42,6 +43,7 @@ from simple_ar.code_task.generation.review import review_generated_project
 from simple_ar.integrations.llm import LLMClient, LLMError
 
 from .agent_backend import (
+    check_agent_budget,
     should_use_agent_backend,
     write_greenfield_project_from_agent_backend,
 )
@@ -213,6 +215,9 @@ def generate_greenfield_code_task(
     budget_profile: str | None = None,
     edit_budget_overrides: dict[str, Any] | None = None,
     allow_large_edits: bool = False,
+    budget_ledger: BudgetLedger | None = None,
+    session_id: str = '',
+    attempt_id: str = '',
 ) -> GreenfieldCodeTaskResult:
     """Generate a greenfield project inside a code-task workspace.
 
@@ -242,6 +247,14 @@ def generate_greenfield_code_task(
             generated_files=tuple(str(row["path"]) for row in artifacts.get("generated_files", [])
                                   if isinstance(row, dict) and row.get("path")),
         )
+    if should_use_agent_backend(implementation_provider):
+        client_ledger = llm_client.budget_ledger if isinstance(llm_client, LLMClient) else None
+        if budget_ledger is None:
+            budget_ledger = client_ledger
+        elif client_ledger is not None and client_ledger is not budget_ledger:
+            raise ValueError('Code task and model client must use the same budget ledger')
+        check_agent_budget(root, implementation_provider, enabled=implementation_allow_external_agent,
+                           binary=implementation_agent_binary, mode=implementation_agent_mode, ledger=budget_ledger)
     boundary = review_workspace_boundary(paths.workspace_dir / 'generated_project',
         boundary=code_task_workspace_boundary(root))
     paths.meta_dir.mkdir(parents=True, exist_ok=True)
@@ -433,6 +446,9 @@ def generate_greenfield_code_task(
             agent_model=implementation_agent_model,
             agent_binary=implementation_agent_binary,
             agent_args=implementation_agent_args,
+            budget_ledger=budget_ledger,
+            session_id=session_id,
+            attempt_id=attempt_id,
             validate_candidate=validate_candidate,
         )
     else:

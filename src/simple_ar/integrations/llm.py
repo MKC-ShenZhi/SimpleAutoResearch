@@ -359,6 +359,11 @@ class LLMClient:
         self._budget_reservation_sequence = 0
         self._usage_lock = threading.Lock()
 
+    @property
+    def budget_ledger(self) -> BudgetLedger | None:
+        """The shared physical ledger used for this client's model calls."""
+        return self._budget_ledger
+
     @classmethod
     def from_env(
         cls,

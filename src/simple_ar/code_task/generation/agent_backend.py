@@ -16,6 +16,8 @@ from simple_ar.agent_backends import (
     validate_agent_mode_for_provider,
 )
 from simple_ar.core.artifacts import write_json
+from simple_ar.core.budget import BudgetLedger
+from simple_ar.agent_backends.external_cli import ExternalCliBackend
 from simple_ar.integrations.llm import LLMClient
 from simple_ar.code_task.generation.common import safe_relative_path as _safe_project_path
 from simple_ar.code_task.generation.common import generation_candidate
@@ -25,6 +27,17 @@ from simple_ar.code_task.generation.file_specs import is_deliverable_project_fil
 def should_use_agent_backend(provider: str) -> bool:
     normalized = _normalize_provider(provider)
     return normalized != "local" and is_external_agent_provider(normalized)
+
+
+def check_agent_budget(run_dir: Path, provider: str, *, enabled: bool,
+                       binary: str, mode: str, ledger: BudgetLedger | None) -> None:
+    """Detect an incompatible external budget before planning invokes a model."""
+    if (enabled and should_use_agent_backend(provider)
+            and normalize_agent_mode(mode, provider=_normalize_provider(provider)) != AgentExecutionMode.DELEGATED_WORKSPACE):
+        backend = create_agent_backend(provider, enabled=True, binary=binary or None,
+                                       budget_ledger=ledger)
+        if isinstance(backend, ExternalCliBackend):
+            backend.accounting_ledger(run_dir)
 
 
 def write_greenfield_project_from_agent_backend(
@@ -43,18 +56,24 @@ def write_greenfield_project_from_agent_backend(
     agent_model: str = "",
     agent_binary: str = "",
     agent_args: tuple[str, ...] = (),
+    budget_ledger: BudgetLedger | None = None,
+    session_id: str = '',
+    attempt_id: str = '',
     validate_candidate: Callable[[Path], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Run a bounded external backend for greenfield code-task generation.
+    """Run an external backend for greenfield code-task generation.
 
-    The external agent never writes directly into the code-task workspace. It
-    writes candidate files under ``agent_handoff/<name>/generated_files``; this
-    function ingests those untrusted outputs, copies them into
-    ``code_task/workspace/generated_project``, and returns normal code artifacts
-    for the shared reviewer/validator/runner path.
+    The handoff asks for candidates under ``agent_handoff/<name>/generated_files``.
+    Those outputs are ingested into the code-task workspace for normal review;
+    filesystem and network isolation depend on the selected CLI, not the handoff.
     """
 
     root = Path(run_dir)
+    client_ledger = client.budget_ledger if isinstance(client, LLMClient) else None
+    if budget_ledger is None:
+        budget_ledger = client_ledger
+    elif client_ledger is not None and client_ledger is not budget_ledger:
+        raise ValueError('Code task and model client must use the same budget ledger')
     normalized_provider = _normalize_provider(provider)
     resolved_agent_mode = normalize_agent_mode(agent_mode, provider=normalized_provider)
     if resolved_agent_mode == AgentExecutionMode.DELEGATED_WORKSPACE:
@@ -122,12 +141,15 @@ def write_greenfield_project_from_agent_backend(
         timeout_sec=timeout_sec,
         binary=agent_binary or None,
         extra_args=agent_args,
+        budget_ledger=budget_ledger,
+        session_id=session_id,
+        attempt_id=attempt_id,
     )
     result = backend.run(request)
     ingestion = ingest_agent_outputs(run_dir=root, handoff_dir=package.handoff_dir)
     generated_dir = package.handoff_dir / "generated_files"
     generated_files = _generated_file_paths(generated_dir)
-    if not result.ok or not generated_files:
+    if (not result.ok or not generated_files) and result.metadata.get('usage_status') != 'unknown':
         retry_package = build_code_task_greenfield_handoff(
             root,
             name=f"code-task-greenfield-{normalized_provider}-retry",
@@ -173,6 +195,9 @@ def write_greenfield_project_from_agent_backend(
         "ingestion": ingestion,
         "result_path": result.result_path,
         "review_path": result.review_path,
+        **({'usage_status': result.metadata['usage_status'],
+            'usage_reservation': result.metadata['usage_reservation']}
+           if 'usage_status' in result.metadata else {}),
     }
     memory.setdefault("agent_backends", []).append(agent_result)
     return code_artifacts, agent_result

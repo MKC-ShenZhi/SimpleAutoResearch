@@ -18,7 +18,7 @@ from typing import Any, Iterable, Literal, NamedTuple
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 from simple_ar.core.artifacts import (is_private_path_name as _private_name,
-    read_json, replace_exact_spans)
+    file_stat_version, read_json, replace_exact_spans)
 from simple_ar.core.budget import BudgetError, BudgetExceededError, BudgetLedger
 from simple_ar.core.process import ProcessSpec, process_observation, run_process, settle_process_record
 from simple_ar.tools.specs import CommonToolSpec, ToolResult, tool_completion
@@ -2533,17 +2533,26 @@ class WorkspaceToolGateway:
         with target.open('rb') as handle:
             def version(stat: os.stat_result | None = None) -> tuple:
                 stat = stat if stat is not None else os.fstat(handle.fileno())
-                return (str(target), stat.st_dev, stat.st_ino, stat.st_size,
-                    stat.st_mtime_ns, stat.st_ctime_ns)
+                return (str(target), *file_stat_version(stat))
 
             before = version()
+            path_before = version(target.stat())
+            # Handle and path timestamps are not interchangeable on every
+            # platform. Compare file identity/size/mtime across them, then
+            # compare each source to itself after the read.
+            if before[:-1] != path_before[:-1]:
+                raise ValueError('File changed during material read; inspect its current window')
+            cache_key = (*before, path_before[-1])
+            # Windows stat reports creation time rather than a reliable inode
+            # change time. Same-size writes can also share a coarse mtime.
+            digest_cache = read_cache if os.name != 'nt' else None
             size = before[3]
             request.validate_read_size(size)
             digest = None
             if size <= 256000 or request.full_digest or require_digest:
                 # Cache only this opened version, independently of the window.
                 # Every consumer still resolves authority, opens and reads.
-                digest = read_cache.get(before) if read_cache is not None else None
+                digest = digest_cache.get(cache_key) if digest_cache is not None else None
                 if digest is None:
                     digest = hashlib.file_digest(handle, 'sha256').hexdigest()
             offset = request.offset_bytes
@@ -2559,10 +2568,10 @@ class WorkspaceToolGateway:
                 if 'max_lines' in request.model_fields_set:
                     raw = b''.join(io.BytesIO(raw).readlines()[:request.max_lines])
             if (version() != before or self.resolve(request.path) != target
-                    or version(target.stat()) != before):
+                    or version(target.stat()) != path_before):
                 raise ValueError('File changed during material read; inspect its current window')
-            if read_cache is not None and digest is not None:
-                read_cache[before] = digest
+            if digest_cache is not None and digest is not None:
+                digest_cache[cache_key] = digest
         data = {'sha256': digest, 'size_bytes': size,
             'next_offset_bytes': offset + len(raw), 'has_more': offset + len(raw) < size}
         if request.start_line is not None:

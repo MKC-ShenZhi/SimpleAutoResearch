@@ -39,8 +39,10 @@ flowchart LR
 
 The application coordinates work; domain modules own their professional operations.
 Ordinary shared actions use the task's execution records and resource accounting.
-An explicitly enabled external agent CLI in standalone CodeTask still runs outside
-the shared process runner; its process and model usage are not in that ledger.
+An explicitly enabled external agent CLI still runs outside the shared process
+runner. Its launch and observed duration are recorded in the task ledger, while
+model usage remains unknown. The CLI cannot run under a finite request or token
+limit until it supports enforceable accounting.
 Task-local scripts remain subject to the task's permissions. The shared POSIX
 process runner enters process-group supervision before switching to the approved
 working directory and executable; the original argv and environment are preserved.

@@ -27,6 +27,7 @@ class CommonToolGateway:
         trace_path: Path | None = None,
         debug_payloads: bool = False,
         domain_gateways: dict[str, Any] | None = None,
+        work_input_owners: dict[str, Any] | None = None,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.registry = registry or default_tool_registry(include_report=report_context is not None)
@@ -39,6 +40,7 @@ class CommonToolGateway:
         self._report_context = report_context
         self._trace = ToolTraceWriter(trace_path or self.run_dir / "tools" / "tool_trace.jsonl", debug_payloads=debug_payloads)
         self._domain_gateways = self.registry.domain_gateways()
+        self._work_input_owners = work_input_owners or {}
         for domain, owner in (domain_gateways or {}).items():
             if domain in self._domain_gateways and self._domain_gateways[domain] is not owner:
                 raise ValueError('Conflicting registered domain owner: ' + domain)
@@ -122,7 +124,8 @@ class CommonToolGateway:
         scientific certification or authority to read beyond the supplied scope.
         """
         results, seen = [], set()
-        for owner in self._domain_gateways.values():
+        for domain, gateway in self._domain_gateways.items():
+            owner = self._work_input_owners.get(domain, gateway)
             if id(owner) in seen:
                 continue
             seen.add(id(owner))

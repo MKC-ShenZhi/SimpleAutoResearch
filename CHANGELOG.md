@@ -18,6 +18,8 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- Stable files on Windows are no longer rejected because handle and path creation timestamps differ.
+- External agent launches retain process use and unknown model charges in the task ledger instead of treating them as zero; a failed unaccounted call is not retried automatically.
 - Independent review can identify a non-text file without claiming its contents were read, and reports an unfinished candidate review clearly.
 - XeLaTeX export embeds the Adobe-GB1 Unicode mapping needed by readers without CJK maps. Full-page preview no longer rejects reports solely for exceeding twelve pages.
 

@@ -416,7 +416,6 @@ class InspectionToolGateway:
                  execution_history: Callable[[], list[dict]] | None = None,
                  artifact_changes: Callable[[list[str]], list[dict]] | None = None,
                  user_requests: Callable[[], list[str]] | None = None,
-                 feedback_provider: Callable[[list[str]], list[dict]] | None = None,
                  protocol: str | None = None,
                  context_authority: str | None = None,
                  coverage_policy: str | None = None,
@@ -427,7 +426,6 @@ class InspectionToolGateway:
                  work_method: str | None = None,
                  work_lifecycle: str | None = None,
                  working_set_policy: str | None = None,
-                 compact_work_feedback: bool = False,
                  material_policy: str | None = None,
                  execution_protocol: str | None = None,
                  operation_specs: Callable[[], list[CommonToolSpec]] | None = None,
@@ -468,7 +466,6 @@ class InspectionToolGateway:
         self.execution_history = execution_history
         self.artifact_changes = artifact_changes
         self.user_requests = user_requests
-        self.feedback_provider = feedback_provider
         self.protocol = protocol
         self.context_authority = context_authority
         self.coverage_policy = coverage_policy
@@ -479,7 +476,6 @@ class InspectionToolGateway:
         self.work_method = work_method
         self.work_lifecycle = work_lifecycle
         self.working_set_policy = working_set_policy
-        self.compact_work_feedback = compact_work_feedback
         self.material_policy = material_policy
         self.execution_protocol = execution_protocol
         self.operation_specs = operation_specs
@@ -2999,12 +2995,6 @@ class InspectionToolGateway:
 
     def work_inputs(self, targets: list[str], *, include_observations: bool = False) -> list[dict]:
         """Supply relevant current opinions to source work, not another copy of its evidence."""
-        if self.feedback_provider is not None:
-            if include_observations:
-                return []
-            feedback = self.feedback_provider(targets)
-            return ([{**row, 'result': self.compact_feedback(row['result'])} for row in feedback]
-                    if self.compact_work_feedback else feedback)
         roots = [self.workspace.resolve(path) for path in targets]
         result = []
         for assessment in self.prior_assessments() if self.prior_assessments else []:
@@ -5042,6 +5032,7 @@ class InspectionToolGateway:
     def call(self, name: str, arguments: dict[str, Any], identity: str, *,
              delivery_context: dict[str, Any] | None = None,
              prior_required: list[dict[str, Any]] | None = None,
+             prior_work_opinions: list[dict[str, Any]] | None = None,
              retained_from: dict[str, Any] | None = None) -> ToolResult:
         try:
             if name != 'inspect_artifacts':
@@ -5193,8 +5184,7 @@ class InspectionToolGateway:
                             or len({row['id'] for row in prior_required}) != len(prior_required)):
                         raise ValueError('Delivery inspection requires its owner-projected prior concerns')
                 else:
-                    saved['prior_work_opinions'] = (self.feedback_provider(sorted(delivery_context['artifacts']))
-                        if self.feedback_provider else [])
+                    saved['prior_work_opinions'] = deepcopy(prior_work_opinions or [])
             if saved.get('execution_protocol') not in _SHARED_EXECUTION_PROTOCOLS:
                 self.store.write_json(input_path, saved)
             saved['evidence'] = [self._observe(value, f'evidence-{i + 1}', identity, remaining)

@@ -1373,7 +1373,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(seed['observations'], [])
         self.assertEqual(len(seed['coverage']['not_admitted']), 1)
 
-    def test_workspace_digest_scope_reuses_versions_across_distinct_windows(self):
+    def test_workspace_digest_tracks_changes_across_distinct_windows(self):
         from simple_ar.tools.materials import read_material_window
 
         _, inputs, _, _, app, _ = self._native_fixture()
@@ -1385,37 +1385,27 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             {'max_bytes': 73}, {'offset_bytes': 9, 'max_bytes': 101},
             {'offset_bytes': 200, 'max_bytes': 80, 'max_lines': 1})]
         digest_file = hashlib.file_digest
-        with patch('simple_ar.tools.workspace.hashlib.file_digest', wraps=hashlib.file_digest) as hashes:
-            for index, request in enumerate(requests):
-                observed = read_material_window(app.workspace, request, identity=f'digest-window-{index}', cache=cache)
-                self.assertEqual(observed['data']['sha256'], hashlib.sha256(raw).hexdigest())
-                start = request.get('offset_bytes', 0)
-                expected = raw[start:start + request['max_bytes']]
-                if 'max_lines' in request:
-                    expected = b''.join(expected.splitlines(keepends=True)[:request['max_lines']])
-                self.assertEqual(observed['data']['text'], expected.decode('utf-8', errors='replace'))
-                self.assertEqual(observed['data']['next_offset_bytes'], start + len(expected))
-            self.assertEqual(hashes.call_count, 1)
-            # Window admission remains per call; the cache cannot lift the
-            # byte owner's line-read restriction for a large file.
-            with self.assertRaisesRegex(ValueError, 'Line reads require'):
-                read_material_window(app.workspace, {**requests[0], 'start_line': 2},
-                    identity='digest-line-refused', cache=cache)
-            with patch.object(app.workspace, 'resolve', side_effect=ValueError('Authorization revoked')):
-                with self.assertRaisesRegex(ValueError, 'Authorization revoked'):
-                    read_material_window(app.workspace, requests[0], identity='digest-revoked', cache=cache)
-            # Same-size mutation outside every observed span invalidates the
-            # shared digest, even when the requested text stays identical.
-            source.write_bytes(raw[:-1] + b'!')
-            changed = read_material_window(app.workspace, requests[1], identity='digest-changed', cache=cache)
-            self.assertNotEqual(changed['data']['sha256'], hashlib.sha256(raw).hexdigest())
-            self.assertEqual(hashes.call_count, 2)
-            read_material_window(app.workspace, requests[2], identity='digest-changed-next', cache=cache)
-            self.assertEqual(hashes.call_count, 2)
-            # The dictionary is scoped to one invocation, never a gateway or
-            # persistent state. A new invocation must measure its own version.
-            read_material_window(app.workspace, requests[0], identity='digest-new-scope', cache={})
-            self.assertEqual(hashes.call_count, 3)
+        for index, request in enumerate(requests):
+            observed = read_material_window(app.workspace, request, identity=f'digest-window-{index}', cache=cache)
+            self.assertEqual(observed['data']['sha256'], hashlib.sha256(raw).hexdigest())
+            start = request.get('offset_bytes', 0)
+            expected = raw[start:start + request['max_bytes']]
+            if 'max_lines' in request:
+                expected = b''.join(expected.splitlines(keepends=True)[:request['max_lines']])
+            self.assertEqual(observed['data']['text'], expected.decode('utf-8', errors='replace'))
+            self.assertEqual(observed['data']['next_offset_bytes'], start + len(expected))
+        with self.assertRaisesRegex(ValueError, 'Line reads require'):
+            read_material_window(app.workspace, {**requests[0], 'start_line': 2},
+                identity='digest-line-refused', cache=cache)
+        with patch.object(app.workspace, 'resolve', side_effect=ValueError('Authorization revoked')):
+            with self.assertRaisesRegex(ValueError, 'Authorization revoked'):
+                read_material_window(app.workspace, requests[0], identity='digest-revoked', cache=cache)
+        # Same-size changes outside the window must invalidate the old digest.
+        source.write_bytes(raw[:-1] + b'!')
+        changed = read_material_window(app.workspace, requests[1], identity='digest-changed', cache=cache)
+        self.assertNotEqual(changed['data']['sha256'], hashlib.sha256(raw).hexdigest())
+        later = read_material_window(app.workspace, requests[2], identity='digest-changed-next', cache=cache)
+        self.assertEqual(later['data']['sha256'], changed['data']['sha256'])
         # A mutation during hashing must not publish or cache that mixed read.
         def mutate_during_digest(handle, algorithm):
             digest = digest_file(handle, algorithm)

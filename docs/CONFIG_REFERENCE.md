@@ -495,8 +495,10 @@ Most sections ignore unknown keys; workspace/execute.ablation reject extras. Mis
 | `implementation.agent_model`, `agent_binary`, `agent_args` | External model/program/argv under implementation | Optional strings / list; empty model uses external account default | Execute |
 | `implementation.agent_timeout_sec` | External timeout | Positive integer 600 seconds | Execute |
 
-An explicitly enabled external agent CLI runs outside the shared process runner;
-its process and model usage are not recorded in the task's shared ledger.
+An explicitly enabled external agent CLI runs outside the shared process runner.
+Its launch and observed duration enter the task ledger; model usage is unknown.
+Finite model-request or token limits require a backend that can enforce and report usage.
+The handoff describes requested access; filesystem and network isolation depend on the external CLI.
 
 <a id="execute-and-budget-fields"></a>
 

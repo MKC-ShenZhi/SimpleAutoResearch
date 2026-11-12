@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from simple_ar.core.budget import BudgetLedger
 from simple_ar.integrations.llm import LLMClient
 
 from .base import AgentBackend
@@ -27,6 +28,9 @@ def create_agent_backend(
     timeout_sec: int = 600,
     binary: str | None = None,
     extra_args: Iterable[str] = (),
+    budget_ledger: BudgetLedger | None = None,
+    session_id: str = '',
+    attempt_id: str = '',
 ) -> AgentBackend:
     normalized = provider.strip().lower().replace("-", "_")
     args = tuple(extra_args)
@@ -35,11 +39,14 @@ def create_agent_backend(
     if normalized in {"local_llm", "llm"}:
         return LocalLlmAgentBackend(client)
     if normalized == "codex":
-        return CodexCliBackend(binary=binary or "codex", model=model or "", enabled=enabled, timeout_sec=timeout_sec, extra_args=args)
+        return CodexCliBackend(binary=binary or "codex", model=model or "", enabled=enabled, timeout_sec=timeout_sec, extra_args=args,
+                               ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id)
     if normalized in {"claude", "claude_code"}:
-        return ClaudeCodeCliBackend(binary=binary or "claude", model=model or "", enabled=enabled, timeout_sec=timeout_sec, extra_args=args)
+        return ClaudeCodeCliBackend(binary=binary or "claude", model=model or "", enabled=enabled, timeout_sec=timeout_sec, extra_args=args,
+                                    ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id)
     if normalized == "opencode":
-        return OpenCodeCliBackend(binary=binary or "opencode", model=model or "", enabled=enabled, timeout_sec=timeout_sec, extra_args=args)
+        return OpenCodeCliBackend(binary=binary or "opencode", model=model or "", enabled=enabled, timeout_sec=timeout_sec, extra_args=args,
+                                 ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id)
     if normalized in {"external_cli", "cli"}:
         if not binary:
             raise ValueError("external_cli backend requires a binary.")
@@ -51,7 +58,7 @@ def create_agent_backend(
                 model=model,
                 timeout_sec=timeout_sec,
                 extra_args=args,
-            )
+            ), ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id
         )
     raise ValueError(f"Unknown agent backend provider: {provider}")
 

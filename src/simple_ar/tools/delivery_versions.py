@@ -14,7 +14,7 @@ import tempfile
 
 from pydantic import ValidationError
 
-from simple_ar.core.artifacts import write_json
+from simple_ar.core.artifacts import file_stat_version, write_json
 from simple_ar.tools.specs import tool_completion
 
 
@@ -536,6 +536,9 @@ class DeliveryVersions:
                 digest, size = hashlib.sha256(), 0
                 with source.open('rb') as stream, temporary.open('wb') as output:
                     before = os.fstat(stream.fileno())
+                    path_before = file_stat_version(source.stat())
+                    if file_stat_version(before)[:-1] != path_before[:-1]:
+                        raise ValueError('Delivery retention source changed; no version published')
                     remaining = before.st_size
                     while remaining:
                         chunk = stream.read(min(65536, remaining))
@@ -551,10 +554,8 @@ class DeliveryVersions:
                     os.fsync(output.fileno())
                     after = os.fstat(stream.fileno())
                 current = self.reader.resolve(locator).stat()
-                def fingerprint(stat):
-                    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
                 sha = digest.hexdigest()
-                if (fingerprint(before) != fingerprint(after) or fingerprint(after) != fingerprint(current)
+                if (file_stat_version(before) != file_stat_version(after) or path_before != file_stat_version(current)
                         or hashes.get(locator) != sha):
                     raise ValueError('Delivery retention source changed; no version published')
                 blob = destination.relative_to(self.root).as_posix() + '/bytes/' + sha

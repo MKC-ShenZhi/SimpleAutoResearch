@@ -1115,6 +1115,7 @@ def _execute_greenfield_code_task(
             message_callback=message_callback,
             budget_profile=budget_profile, edit_budget_overrides=edit_budget_overrides,
             allow_large_edits=allow_large_edits,
+            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
         )
         _record(
             steps,

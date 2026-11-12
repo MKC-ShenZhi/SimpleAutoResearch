@@ -818,7 +818,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._inspect(['legacy-note.md'])
         calls = self.send.call_count
         self._reload()
-        feedback = self.app.operations.inspection.work_inputs(['legacy-note.md'])
+        feedback = self.app.gateway.professional_inputs(['legacy-note.md'])
         self.assertIn('Clarify the original assumption.', json.dumps(feedback))
         self.assertEqual(self.send.call_count, calls)
 
@@ -3161,7 +3161,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         source = next(row for row in references
             if self.app.workspace.resolve(row['request']['path']) == self.inputs/'observations.csv')
         admitted = validate_material_observation(self.app.workspace, source, identity='review-result-reuse')
-        self.assertEqual(admitted['data']['text'], (self.inputs/'observations.csv').read_text())
+        self.assertEqual(admitted['data']['text'], (self.inputs/'observations.csv').read_bytes().decode('utf-8'))
         self.assertNotIn('findings', admitted)
         # The coordinator's ordinary working view must also receive actual
         # separately accepted reads, not just an opinion and a receipt count.
@@ -3311,7 +3311,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         for name, body in [('说明.md','这三个观察值的均值为2.0。\n'), ('summary.json','{"mean":2.0}\n')]:
             self._submit(_action('write_file', path=name, content=body,
                 expected_sha256=_digest(self.root/'workspace'/name)))
-        guidance = self.app.operations.inspection.work_inputs(['workspace/summary.json'])
+        guidance = self.app.gateway.professional_inputs(['workspace/summary.json'])
         prior = next(row for row in guidance if row.get('delivery_context')==scope)
         self.assertFalse(prior['subjects'][0]['current_matches_review'])
         self.assertIn('contradicts', json.dumps(prior['result']))
@@ -3345,7 +3345,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertGreater(len(self.inspection_requests), calls, 'Changed claims require a fresh independent opinion')
         self.assertNotEqual(self.app.session.manifest.status, 'completed')
         negative = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']
-        feedback = self.app.operations.inspection.work_inputs([])
+        feedback = self.app.gateway.professional_inputs([])
         self.assertTrue(any(row.get('delivery_context')==self.app.operations.inspection.delivery_scope_view(negative['binding'])
             and 'overstates' in json.dumps(row['result']) for row in feedback))
         def review_direct_answer(view):
@@ -6655,7 +6655,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertFalse(assessment_issues(self.app.workspace, self._observations(), ['notes.md']))
         self.assertEqual(assessment_issues(self.app.workspace, self._observations(),
             ['notes.md'], retain_stale_findings=True), [])
-        feedback = self.app.operations.inspection.work_inputs(['notes.md'])
+        feedback = self.app.gateway.professional_inputs(['notes.md'])
         self.assertEqual(json.dumps(feedback).count('The stated claim is not supported by the observed sample.'), 1)
         self.assertEqual(sum(len(row.get('related_opinion_records', [])) for row in feedback), 1)
 
@@ -6667,7 +6667,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._inspect(['notes.md'])
         self.review = lambda _: {'findings':[], 'limitations':[]}
         self._submit(_action('inspect_artifacts', goal='Check only the heading.', targets=['notes.md']))
-        feedback = self.app.operations.inspection.work_inputs(['notes.md'])
+        feedback = self.app.gateway.professional_inputs(['notes.md'])
         self.assertEqual(json.dumps(feedback).count('Consider making the uncertainty explicit.'), 1)
         self.assertFalse(assessment_issues(self.app.workspace, self._observations(), ['notes.md']))
 

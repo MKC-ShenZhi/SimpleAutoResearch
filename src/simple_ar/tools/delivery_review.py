@@ -318,7 +318,8 @@ class DeliveryReview:
     def __init__(self, workspace: Any, inspector: Any, *,
                  observations: Callable[[], list[dict]] | None = None,
                  protocol: str = 'task.v1', track_findings: bool = False,
-                 include_package_feedback: bool = True) -> None:
+                 include_package_feedback: bool = True,
+                 supply_work_feedback: bool = False, compact_work_feedback: bool = False) -> None:
         if protocol not in {'task.v1', 'task.v2', 'task.v3', 'task.v4', 'task.v5'}:
             raise ValueError('Unknown delivery review protocol')
         self.workspace, self.inspector = workspace, inspector
@@ -326,6 +327,15 @@ class DeliveryReview:
         self.protocol = protocol
         self.track_findings = track_findings
         self.include_package_feedback = include_package_feedback
+        self.supply_work_feedback = supply_work_feedback
+        self.compact_work_feedback = compact_work_feedback
+
+    def work_inputs(self, targets: list[str], *, include_observations: bool = False) -> list[dict]:
+        if include_observations:
+            return []
+        feedback = self.inspection_feedback(targets)
+        return ([{**row, 'result': self.inspector.compact_feedback(row['result'])} for row in feedback]
+                if self.compact_work_feedback else feedback)
 
     def feedback_from_observation(self, observed: dict, *, guidance_only: bool = False) -> dict | None:
         """Resolve original opinions once for revision and completion consumers."""
@@ -1027,7 +1037,10 @@ class DeliveryReview:
             result = self.inspector.call('inspect_artifacts', self._arguments(binding), identity,
                 delivery_context=deepcopy(binding),
                 **({'retained_from':retained} if retained is not None else {}),
-                **({'prior_required': deepcopy(pending)} if self.track_findings else {}))
+                **({'prior_required': deepcopy(pending)} if self.track_findings else {}),
+                **({'prior_work_opinions': self.inspection_feedback(sorted(binding['artifacts']))}
+                   if self.supply_work_feedback and not self.track_findings
+                      and binding.get('schema_version') == 'delivery_review.v3' else {}))
             if result.ok and result.data.get('inspection_pending') == identity:
                 return self._envelope(binding, identity, result)
             if not result.ok:

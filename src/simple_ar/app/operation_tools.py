@@ -271,7 +271,6 @@ class OperationTools:
             work_method=config.get('work_method'),
             work_lifecycle=config.get('work_lifecycle'),
             working_set_policy=('recent.v4' if config.get('working_set_policy') in {'recent.v4', 'recent.v5'} else None),
-            compact_work_feedback=config.get('working_set_policy') == 'recent.v5',
             material_policy=config.get('inspection_material_policy'),
             native_history_policy=config.get('native_history_policy'),
             material_observations=material_observations,
@@ -294,7 +293,10 @@ class OperationTools:
             self.delivery_review = DeliveryReview(workspace=self.workspace, inspector=self.inspection,
                 observations=observations,
                 protocol=config['delivery_review_protocol'],
-                track_findings=config.get('inspection_finding_policy') == 'linked.v1')
+                track_findings=config.get('inspection_finding_policy') == 'linked.v1',
+                supply_work_feedback=self.professional,
+                compact_work_feedback=config.get('working_set_policy') == 'recent.v5')
+        feedback_owner = None
         if self.professional:
             # One owner supplies both revision guidance and delivery concerns.
             # Older professional tasks without package review still receive
@@ -302,10 +304,10 @@ class OperationTools:
             if self.delivery_review is None:
                 from simple_ar.tools.delivery_review import DeliveryReview
                 feedback_owner = DeliveryReview(workspace=self.workspace, inspector=self.inspection,
-                    observations=observations, include_package_feedback=False)
+                    observations=observations, include_package_feedback=False,
+                    compact_work_feedback=config.get('working_set_policy') == 'recent.v5')
             else:
                 feedback_owner = self.delivery_review
-            self.inspection.feedback_provider = feedback_owner.inspection_feedback
         self.registry.register_package(analysis_tool_specs(),
             AnalysisToolGateway(root,self.workspace,contract=config.get('table_analysis')),
             request_visible=config.get('table_analysis') is not None)
@@ -470,7 +472,8 @@ class OperationTools:
                 blocked.update(spec.name for spec in self.registry.list_specs()
                     if spec.domain=='scientific' and spec.permission_level=='execution')
         self.gateway = CommonToolGateway(root,registry=self.registry,policy=ToolPermissionPolicy(
-            allowed_permissions=permissions,max_risk_level='high',blocked_tools=blocked))
+            allowed_permissions=permissions,max_risk_level='high',blocked_tools=blocked),
+            work_input_owners={'inspection': feedback_owner} if feedback_owner else None)
         inspection_execution = config.get('inspection_execution_protocol')
         if inspection_execution not in {None, 'shared.v1', 'shared.v2'}:
             raise ValueError('Unsupported saved inspection execution contract')

@@ -10,6 +10,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
+from uuid import uuid4
+
+from simple_ar.core.budget import BudgetError, BudgetLedger
 
 from .base import AgentBackend, AgentRunRequest, AgentRunResult
 
@@ -41,12 +44,22 @@ class ExternalCliBackendConfig:
 class ExternalCliBackend(AgentBackend):
     """Run an external coding/research agent CLI against a handoff directory."""
 
-    def __init__(self, config: ExternalCliBackendConfig) -> None:
+    def __init__(self, config: ExternalCliBackendConfig, *, ledger: BudgetLedger | None = None,
+                 session_id: str = '', attempt_id: str = '') -> None:
         self.config = config
+        self.ledger, self.session_id, self.attempt_id = ledger, session_id, attempt_id
 
     @property
     def name(self) -> str:
         return self.config.provider
+
+    def accounting_ledger(self, run_dir: Path) -> BudgetLedger:
+        path = Path(run_dir) / 'budget_ledger.json'
+        ledger = self.ledger or (BudgetLedger.load(path) if path.exists() else BudgetLedger(storage_path=path))
+        if any(ledger.limits.get(name) is not None for name in ('llm_requests', 'total_tokens')):
+            raise BudgetError('External agent CLI cannot enforce the task model budget or report its usage; '
+                              'use a budget-accounted backend for this task.')
+        return ledger
 
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         started = time.perf_counter()
@@ -75,10 +88,23 @@ class ExternalCliBackend(AgentBackend):
                 elapsed_sec=payload["elapsed_sec"],
             )
 
+        ledger = self.accounting_ledger(request.run_dir)
         command = self.build_command(request)
+        reservation = 'external-agent-' + uuid4().hex
+        timeout = max(1, self.config.timeout_sec)
+        ledger.reserve(reservation, {'llm_requests': 0, 'total_tokens': 0,
+                                     'process_invocations': 1, 'process_wall_seconds': timeout},
+                       session_id=self.session_id, attempt_id=self.attempt_id,
+                       logical_call_id=reservation, purpose='external_agent')
         timed_out = False
         returncode: int | None = None
         message = "External agent completed."
+        process_started = time.perf_counter()
+
+        def record_unknown(reason: str, *, measured: bool = True) -> None:
+            actual = {'process_invocations': 1, 'process_wall_seconds': time.perf_counter() - process_started}
+            ledger.mark_unknown(reservation, reason=reason, known_actual=actual if measured else None)
+
         try:
             completed = subprocess.run(
                 command,
@@ -88,26 +114,36 @@ class ExternalCliBackend(AgentBackend):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=max(1, self.config.timeout_sec),
+                timeout=timeout,
                 check=False,
             )
+        except FileNotFoundError as exc:
+            ledger.release(reservation, reason='External agent could not be started')
+            message = f"External agent could not be started: {exc}"
+            usage_status = 'not_started'
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            message = f"External agent timed out after {self.config.timeout_sec}s."
+            record_unknown('External agent model use is not reported')
+            usage_status = 'unknown'
+            stdout_path.write_text(_as_text(exc.stdout), encoding="utf-8", errors="replace")
+            stderr_path.write_text(_as_text(exc.stderr), encoding="utf-8", errors="replace")
+        except OSError as exc:
+            record_unknown('External agent execution failed; model use is unknown', measured=False)
+            usage_status = 'unknown'
+            message = f"External agent execution failed: {exc}"
+        except BaseException:
+            record_unknown('External agent execution was interrupted; model use is unknown', measured=False)
+            raise
+        else:
+            record_unknown('External agent model use is not reported')
+            usage_status = 'unknown'
             returncode = completed.returncode
             stdout_path.write_text(completed.stdout or "", encoding="utf-8", errors="replace")
             stderr_path.write_text(completed.stderr or "", encoding="utf-8", errors="replace")
             if completed.returncode != 0:
-                message = _failure_message(
-                    completed.returncode,
-                    stderr=completed.stderr or "",
-                    stdout=completed.stdout or "",
-                    provider=self.name,
-                )
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            message = f"External agent timed out after {self.config.timeout_sec}s."
-            stdout_path.write_text(exc.stdout or "", encoding="utf-8", errors="replace")
-            stderr_path.write_text(exc.stderr or "", encoding="utf-8", errors="replace")
-        except OSError as exc:
-            message = f"External agent could not be started: {exc}"
+                message = _failure_message(completed.returncode, stderr=completed.stderr or "",
+                                           stdout=completed.stdout or "", provider=self.name)
 
         elapsed = round(time.perf_counter() - started, 6)
         status = "passed" if returncode == 0 and not timed_out else "failed"
@@ -123,6 +159,8 @@ class ExternalCliBackend(AgentBackend):
             elapsed_sec=elapsed,
         )
         payload["artifacts"] = [str(path.relative_to(request.handoff_dir)) for path in artifacts]
+        payload['usage_status'] = usage_status
+        payload['usage_reservation'] = reservation
         run_meta.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         artifacts.append(run_meta)
 
@@ -134,6 +172,7 @@ class ExternalCliBackend(AgentBackend):
             result_path=str(run_meta),
             review_path=str(request.handoff_dir / "review.md") if (request.handoff_dir / "review.md").exists() else "",
             elapsed_sec=elapsed,
+            metadata={'usage_status': usage_status, 'usage_reservation': reservation},
         )
 
     def build_command(self, request: AgentRunRequest) -> list[str]:
@@ -187,6 +226,7 @@ class CodexCliBackend(ExternalCliBackend):
         enabled: bool = False,
         timeout_sec: int = 600,
         extra_args: tuple[str, ...] = (),
+        ledger: BudgetLedger | None = None, session_id: str = '', attempt_id: str = '',
     ) -> None:
         super().__init__(
             ExternalCliBackendConfig(
@@ -196,7 +236,7 @@ class CodexCliBackend(ExternalCliBackend):
                 model=model or None,
                 timeout_sec=timeout_sec,
                 extra_args=extra_args,
-            )
+            ), ledger=ledger, session_id=session_id, attempt_id=attempt_id
         )
 
     def build_command(self, request: AgentRunRequest) -> list[str]:
@@ -226,6 +266,7 @@ class ClaudeCodeCliBackend(ExternalCliBackend):
         enabled: bool = False,
         timeout_sec: int = 600,
         extra_args: tuple[str, ...] = (),
+        ledger: BudgetLedger | None = None, session_id: str = '', attempt_id: str = '',
     ) -> None:
         super().__init__(
             ExternalCliBackendConfig(
@@ -235,7 +276,7 @@ class ClaudeCodeCliBackend(ExternalCliBackend):
                 model=model or None,
                 timeout_sec=timeout_sec,
                 extra_args=extra_args,
-            )
+            ), ledger=ledger, session_id=session_id, attempt_id=attempt_id
         )
 
     def build_command(self, request: AgentRunRequest) -> list[str]:
@@ -255,6 +296,7 @@ class OpenCodeCliBackend(ExternalCliBackend):
         enabled: bool = False,
         timeout_sec: int = 600,
         extra_args: tuple[str, ...] = (),
+        ledger: BudgetLedger | None = None, session_id: str = '', attempt_id: str = '',
     ) -> None:
         super().__init__(
             ExternalCliBackendConfig(
@@ -264,7 +306,7 @@ class OpenCodeCliBackend(ExternalCliBackend):
                 model=model or None,
                 timeout_sec=timeout_sec,
                 extra_args=extra_args,
-            )
+            ), ledger=ledger, session_id=session_id, attempt_id=attempt_id
         )
 
     def build_command(self, request: AgentRunRequest) -> list[str]:
@@ -274,6 +316,10 @@ class OpenCodeCliBackend(ExternalCliBackend):
         command.extend(self.config.extra_args)
         command.append(_instruction_prompt(request.handoff_dir))
         return command
+
+
+def _as_text(value: str | bytes | None) -> str:
+    return value.decode('utf-8', errors='replace') if isinstance(value, bytes) else value or ''
 
 
 def _instruction_prompt(handoff_dir: Path) -> str:
