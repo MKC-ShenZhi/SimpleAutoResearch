@@ -112,6 +112,27 @@ def _assessments(result):
 
 
 class OperationsWorkLoopTests(unittest.TestCase):
+    def test_in_place_process_keeps_approval_and_recovers_without_reexecution(self):
+        self._create()
+        self._write('draft.md', 'before\n')
+        self._write('edit.py', "from pathlib import Path\nimport sys\n"
+                    "p = Path(sys.argv[1])\np.write_text(p.read_text().replace('before', 'after'))\n")
+        args = {'argv': ['python', 'edit.py', 'draft.md'],
+                'inputs': ['edit.py', 'draft.md'], 'outputs': ['draft.md']}
+        call = {'id': 'edit', 'type': 'function', 'function': {
+            'name': 'run_process', 'arguments': json.dumps(args)}}
+        approval = self.app.execution_approval(call)
+        self._submit(_action('run_process', **args), approve=lambda *_: True)
+        result = self._ok('run_process')
+        pending = {'attempt': Path(result['data']['receipt']).parent.name,
+                   'call': call, 'execution_approval': approval}
+        self._reload()
+        self.app._check_action_inputs(pending)
+        self.assertEqual(self.app.workspace.resolve('draft.md').read_text(), 'after\n')
+        self.app.workspace.resolve('edit.py').write_text('# changed after execution\n')
+        with self.assertRaisesRegex(ValueError, 'inputs changed'):
+            self.app._check_action_inputs(pending)
+
     def test_later_edit_replaces_failed_process_output_without_rewriting_receipt(self):
         self._create()
         self._write('draft.md', 'original\n')
