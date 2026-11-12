@@ -65,6 +65,8 @@ the current request, relevant feedback, selected references and observed source
 windows. Older work stays retrievable instead of filling unused context. Repeated
 windows of the same file version share their overlapping text. Saved selection,
 history and inspection policies stay unchanged on reload and unrelated material supply.
+Document handoffs retain their original feedback; the receiving operation fits
+its input using the same model-aware JSON request counter as the sender.
 
 New ordinary tasks can submit an unfinished candidate for independent investigation
 before publication. Its dedicated request contains the current claim, existing files
