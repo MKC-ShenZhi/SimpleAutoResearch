@@ -327,7 +327,7 @@ class DeliveryReview:
         self.track_findings = track_findings
         self.include_package_feedback = include_package_feedback
 
-    def feedback_from_observation(self, observed: dict) -> dict | None:
+    def feedback_from_observation(self, observed: dict, *, guidance_only: bool = False) -> dict | None:
         """Resolve original opinions once for revision and completion consumers."""
         envelope = (observed.get('metadata') or {}).get('delivery_review')
         if isinstance(envelope, dict) and self.include_package_feedback:
@@ -354,14 +354,15 @@ class DeliveryReview:
                                    else 'Independent opinion acceptance cannot be verified')).model_dump(mode='json'),
                         **({'_accepted_result': accepted_result} if accepted_result is not None else {}),
                         'scope': 'Diagnostic only; the original review remains available for recovery.'}
-            feedback = self.feedback_observation(envelope)
+            feedback = self.feedback_observation(envelope, **({'guidance_only': True} if guidance_only else {}))
             if accepted is not None:
                 feedback['opinion_accepted'] = accepted
                 if not feedback.get('opinion_available') and accepted_result is not None:
                     feedback['_accepted_result'] = accepted_result
             return feedback
         if observed.get('tool_name') == 'inspect_artifacts':
-            return self.inspector.feedback_from_observation(observed)
+            return self.inspector.feedback_from_observation(observed,
+                **({'guidance_only': True} if guidance_only else {}))
         return None
 
     def inspection_feedback(self, targets: list[str]) -> list[dict]:
@@ -374,7 +375,7 @@ class DeliveryReview:
         selected = None
         result, concluded, repeated = [], set(), {}
         for observed in reversed(self.observations() if self.observations is not None else []):
-            feedback = self.feedback_from_observation(observed)
+            feedback = self.feedback_from_observation(observed, guidance_only=True)
             if feedback is None:
                 continue
             if selected is None:
@@ -928,7 +929,7 @@ class DeliveryReview:
         return ToolResult(tool_name='inspect_artifacts', status='blocked',
                           error='Delivery inspection started without a completed result; no replay')
 
-    def feedback_observation(self, envelope: dict) -> dict:
+    def feedback_observation(self, envelope: dict, *, guidance_only: bool = False) -> dict:
         """Return the inspector's original opinion with its full delivery scope.
 
         A revision changes the inventory, so the current _verified acceptance
@@ -945,7 +946,8 @@ class DeliveryReview:
                     claimed = raw
             except _ERRORS:
                 pass  # The inspector returns unavailable guidance for the pending marker.
-        feedback = self.inspector.feedback_observation(identity, claimed)
+        feedback = self.inspector.feedback_observation(identity, claimed,
+            **({'guidance_only': True} if guidance_only else {}))
         original = feedback.get('delivery_context') or {}
         if (original != binding or feedback.get('arguments') != self._arguments(binding)):
             feedback.update(opinion_available=False,

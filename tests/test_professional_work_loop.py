@@ -3099,6 +3099,20 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(action['origin']['scope'], first['identity'])
         self.assertEqual(first['result']['metadata']['delivery_assessment']['verdict'], 'needs_revision')
         self.assertIn('contradicts', ' '.join(self.app._delivery_feedback()['issues']))
+        inspector = self.app.operations.inspection
+        source = self.root / inspector._path(first['identity'], 'sources-0')
+        source_bytes = source.read_bytes()
+        try:
+            source.write_bytes(b'{}')
+            guidance = inspector.feedback_observation(first['identity'], actual_opinion, guidance_only=True)
+            strict = inspector.feedback_observation(first['identity'], actual_opinion)
+            self.assertTrue(guidance['opinion_available'])
+            self.assertIn('not rechecked', guidance['scope'])
+            self.assertFalse(strict['opinion_available'])
+            with self.assertRaisesRegex(ValueError, 'opinion cannot be verified'):
+                self.app.operations.delivery_review.pending_concerns(['workspace/summary.json'])
+        finally:
+            source.write_bytes(source_bytes)
         feedback = self.app._work_context(['workspace/summary.json'])['professional_findings']
         scope = self.app.operations.inspection.delivery_scope_view(first['binding'])
         self.assertTrue(any(row.get('delivery_context')==scope

@@ -91,11 +91,11 @@ class ControlledInspector:
                 raise ValueError('Inspection target/evidence version changed; no replay')
         return ToolResult.model_validate(result)
 
-    def feedback_from_observation(self, observed):
+    def feedback_from_observation(self, observed, *, guidance_only=False):
         from simple_ar.tools.inspection import InspectionToolGateway
-        return InspectionToolGateway.feedback_from_observation(self, observed)
+        return InspectionToolGateway.feedback_from_observation(self, observed, guidance_only=guidance_only)
 
-    def feedback_observation(self, identity, claimed, *, expected_arguments=None):
+    def feedback_observation(self, identity, claimed, *, expected_arguments=None, guidance_only=False):
         # Feedback verifies the original receipt, not the applicability of its
         # old file versions to a revision. Acceptance still uses _cached.
         result = self.store.read_json(self._path(identity, 'result'))
@@ -713,7 +713,7 @@ class FindingsInspector(ControlledInspector):
         self.expected[identity] = deepcopy(payload)
         return result
 
-    def feedback_observation(self, identity, claimed, *, expected_arguments=None):
+    def feedback_observation(self, identity, claimed, *, expected_arguments=None, guidance_only=False):
         if identity in self.rejected:
             raise ValueError(self.rejected[identity])
         # Intact original receipts remain readable after their source changes.

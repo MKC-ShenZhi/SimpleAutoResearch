@@ -1579,12 +1579,8 @@ class InspectionToolGateway:
             results[key] = self._read_retained_result(identity, current_inputs=current_inputs)
         return results[key].model_copy(deep=True)
 
-    def _read_retained_result(self, identity: str, *, current_inputs: bool) -> ToolResult:
-        """Verify saved opinions separately from their applicability to current bytes.
-
-        Acceptance always uses _cached. Revision may read an intact old opinion
-        after changing its subject; that does not certify the replacement.
-        """
+    def _recorded_opinion(self, identity: str) -> tuple[dict, dict, ToolResult, bool]:
+        """Resolve the owner's recorded opinion, without re-investigating its evidence."""
         receipt = self._receipt(identity)
         result_path = self._path(identity, 'result')
         if receipt.get('result_sha256') != self._digest(result_path):
@@ -1592,15 +1588,6 @@ class InspectionToolGateway:
         saved = self.store.read_json(self._path(identity, 'input'))
         if saved.get('protocol') != self.protocol:
             raise ValueError('Inspection identity is bound to a different protocol; no replay')
-        for number, digest in enumerate(saved.get('source_rounds', [])):
-            trace_path = self._path(identity, f'sources-{number}')
-            if self._digest(trace_path) != digest:
-                raise ValueError('Inspection source investigation record changed; no replay')
-            for path, expected in self.store.read_json(trace_path).get('checkpoint', {}).items():
-                if self._digest(path) != expected:
-                    raise ValueError('Inspection checkpoint record changed; no replay')
-        if saved.get('memory_protocol') == 'journal.v1':
-            self._conversation_memory(saved, self._conversation_rows(saved))
         result = ToolResult.model_validate(self.store.read_json(result_path))
         binding = result.metadata['inspection_binding']
         package = self._delivery_scope(saved)
@@ -1617,6 +1604,20 @@ class InspectionToolGateway:
         if self.protocol and (binding.get('assessment_path') != artifact
                 or result.data.get('record') != artifact or result.artifacts != [artifact]):
             raise ValueError('Inspection cached assessment path changed; no replay')
+        return saved, receipt, result, package
+
+    def _read_retained_result(self, identity: str, *, current_inputs: bool) -> ToolResult:
+        """Verify saved investigation evidence before applying an opinion."""
+        saved, receipt, result, package = self._recorded_opinion(identity)
+        for number, digest in enumerate(saved.get('source_rounds', [])):
+            trace_path = self._path(identity, f'sources-{number}')
+            if self._digest(trace_path) != digest:
+                raise ValueError('Inspection source investigation record changed; no replay')
+            for path, expected in self.store.read_json(trace_path).get('checkpoint', {}).items():
+                if self._digest(path) != expected:
+                    raise ValueError('Inspection checkpoint record changed; no replay')
+        if saved.get('memory_protocol') == 'journal.v1':
+            self._conversation_memory(saved, self._conversation_rows(saved))
         # Successful shared assessments revalidate the same selected sources
         # when their authoritative final bindings are reconstructed below.
         # Other outcomes still need the original journal dependency check.
@@ -1634,7 +1635,8 @@ class InspectionToolGateway:
                 selected=self._selected_inspection_rows(saved, receipt['response']))
         return result
 
-    def feedback_observation(self, identity: str, claimed: dict, *, expected_arguments: dict | None = None) -> dict:
+    def feedback_observation(self, identity: str, claimed: dict, *, expected_arguments: dict | None = None,
+                             guidance_only: bool = False) -> dict:
         """Original, integrity-checked revision guidance; never an acceptance pass."""
         saved = {}
         try:
@@ -1644,7 +1646,8 @@ class InspectionToolGateway:
             if ('delivery_context' in saved
                     and saved.get('user_requests') != saved['delivery_context'].get('requests')):
                 raise ValueError('Delivery inspection feedback differs from its original user requests')
-            result = self._retained_result(identity, current_inputs=False)
+            result = (self._recorded_opinion(identity)[2] if guidance_only
+                      else self._retained_result(identity, current_inputs=False))
             if result.model_dump(mode='json') != claimed:
                 raise ValueError('Inspection feedback differs from its retained owner result')
         except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
@@ -1666,9 +1669,10 @@ class InspectionToolGateway:
             'reviewed_subjects': {row['path']: row['sha256'] for row in saved['targets']
                 if row.get('sha256')},
             'scope': 'Retained independent opinion about the bound original versions; '
-                'not current acceptance, a source fact, or permission.'}
+                'not current acceptance, a source fact, or permission.'
+                + (' Historical investigation evidence is not rechecked for this guidance.' if guidance_only else '')}
 
-    def feedback_from_observation(self, observed: dict) -> dict | None:
+    def feedback_from_observation(self, observed: dict, *, guidance_only: bool = False) -> dict | None:
         """Resolve a native inspection once for revision and delivery consumers."""
         if observed.get('tool_name') != 'inspect_artifacts':
             return None
@@ -1687,7 +1691,8 @@ class InspectionToolGateway:
         arguments = observed.get('arguments')
         if not isinstance(arguments, dict):
             raise ValueError('Inspection feedback has no accepted arguments')
-        return self.feedback_observation(identity, tool_result_payload(observed), expected_arguments=arguments)
+        return self.feedback_observation(identity, tool_result_payload(observed), expected_arguments=arguments,
+                                         **({'guidance_only': True} if guidance_only else {}))
 
     def can_reconcile(self, name: str, identity: str) -> bool:
         if name != 'inspect_artifacts' or not self.has_started(identity):
