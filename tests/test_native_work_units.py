@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from simple_ar.app.professional_conversation import work_unit_messages
-from simple_ar.app.tool_application import ToolApplication
+from simple_ar.app.tool_application import ExecutionRejection, ToolApplication
 from tests import test_professional_work_loop as fixture
 
 
@@ -108,6 +108,25 @@ class NativeWorkQueueTests(unittest.TestCase):
         c = self.case
         return c._run(should_stop=lambda: not c.decisions and c.app.state['pending'] is None
             and not any(turn['remaining'] for turn in c.app.state['turns']), **kwargs)
+
+    def test_rejected_execution_survives_reload_without_starting_a_process(self):
+        c = self.case
+        c.decisions.append(fixture._action('run_process', argv=[sys.executable, '-c',
+            "from pathlib import Path; Path('should-not-exist').write_text('ran')"]))
+        self.drain()
+        self.assertEqual(c.app.state['pending']['call']['function']['name'], 'run_process')
+        reason = 'The proposed output is outside the authorized work area.'
+        with patch.object(c.app, '_attempt', side_effect=OSError('Interrupted after decision')):
+            self.drain(approve=lambda _call, _token: ExecutionRejection(reason))
+        self.assertEqual(c.app.state['pending']['execution_rejection'], reason)
+        c._reload()
+        self.drain()
+        result = c._last('run_process')
+        self.assertEqual(result['status'], 'blocked')
+        self.assertIn(reason, result['error'])
+        self.assertFalse(result['data']['executed'])
+        self.assertFalse((c.root/'workspace/should-not-exist').exists())
+        self.assertFalse(c._process_receipts())
 
     def test_task_execution_grant_only_reuses_matching_inputs(self):
         c = self.case

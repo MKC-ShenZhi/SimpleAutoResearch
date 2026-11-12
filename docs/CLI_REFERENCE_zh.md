@@ -201,6 +201,8 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 
 新原生任务的 assisted／checkpoints 等待设计／协议回复；autonomous 可在保存限额内接受有效设计。没有额外阶段／交付里程碑对话。接受设计不批准进程；即使 --yes 仍要求精确待执行命令令牌。
 
+交互式执行提示中，输入 `y` 批准当前操作，回车暂缓，输入 `r` 可填写原因并拒绝。被拒绝的操作不会执行；原因会返回发起任务或独立复核，供其继续工作。
+
 示例：
 
 ```bash

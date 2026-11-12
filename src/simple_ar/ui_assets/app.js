@@ -182,6 +182,7 @@ function confirmationControls() {
   const busy = actionSending || !!snapshot?.local_workers?.length || !!snapshot?.worker_live;
   $('createSubmit').disabled = locked || actionSending || creationPreviewSending || !metadata;
   $('approve').disabled = locked || busy || !snapshot?.approval;
+  $('reject').disabled = locked || busy || !snapshot?.approval;
   $('rememberExecution').disabled = locked || busy || !snapshot?.approval;
   $('switch').disabled = locked || busy || snapshot?.task !== selected;
   $('resume').disabled = locked || busy || snapshot?.task !== selected;
@@ -489,6 +490,12 @@ $('approve').onclick = () => {
       ? '批准本页操作；绑定输入的进程和导出可在同一任务中复用相同操作及输入版本的批准。'
       : '批准本页 token 绑定的操作并继续同一任务；服务器仍核对当前 pending 提案和原执行权限。'
   });
+};
+$('reject').onclick = () => {
+  if (snapshot?.task !== selected || !snapshot.approval || snapshot.worker_live) return;
+  const reason = $('rejectReason').value.trim();
+  if (!reason) { notice('请填写不执行的原因。'); return; }
+  action('reject', {token: snapshot.approval.token, reason});
 };
 $('feedbackForm').onsubmit = async event => { event.preventDefault(); await action('feedback', {feedback: $('feedback').value}); };
 $('switch').onclick = () => {

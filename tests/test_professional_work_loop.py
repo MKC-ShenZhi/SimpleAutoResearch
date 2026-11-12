@@ -25,7 +25,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from simple_ar.app.tool_application import ToolApplication
+from simple_ar.app.tool_application import ExecutionRejection, ToolApplication
 from tests.native_history_fixture import load_native_history
 from simple_ar.core.assessments import ArtifactAssessment
 from simple_ar.integrations.llm import LLMClient, LLMSettings, estimate_tokens
@@ -1613,6 +1613,55 @@ class OperationsWorkLoopTests(unittest.TestCase):
         renderer.assert_not_called()
         self.assertNotEqual(stale.status, 'ok')
         self.assertTrue(self.app.operations.delivery.issues(self.app._operation_observations(), saved))
+
+    def test_shared_inspection_can_continue_after_rejected_process_and_reload(self):
+        self._create(goal='Independently review the supplied note.')
+        self._write('note.md', 'Three supplied observations: 1, 2, and 3.\n')
+        original_review = self.review
+        received = []
+
+        def review(view):
+            replies = [json.loads(message['content']) for message in self.inspection_requests[-1]['messages']
+                if message['role'] == 'tool']
+            rejected = [row for row in replies if row.get('tool_name') == 'run_process'
+                and row.get('status') == 'blocked']
+            if rejected:
+                received.extend(rejected)
+                return original_review(view)
+            functions = {tool['function']['name']:tool['function']
+                for tool in self.inspection_requests[-1]['tools']}
+            description = functions['write_file']['parameters']['properties']['path']['description']
+            scope = description.split('workspace/inspection-work/', 1)[1].split('/', 1)[0]
+            return [_action('run_process', argv=[sys.executable, '-c',
+                "from pathlib import Path; Path('should-not-exist').write_text('ran')"],
+                cwd='workspace/inspection-work/'+scope, timeout_sec=5)]
+
+        self.review = review
+        self._submit(_action('inspect_artifacts', goal='Check the note', targets=['note.md'],
+            evidence=['measurements/observations.csv']))
+        pending = self.app.state['pending']
+        self.assertEqual(pending['action']['call']['function']['name'], 'run_process')
+        action_handler = self.app.session.registry.resolve('native_action')
+        interrupted = []
+
+        def interrupt_before_observation(*, context, accepted, perform):
+            if accepted.get('execution_rejection') and not interrupted:
+                context.store.write_json('action.json', accepted, kind='operation_binding')
+                interrupted.append(True)
+                raise OSError('Interrupted after the rejection was saved')
+            return action_handler(context=context, accepted=accepted, perform=perform)
+
+        self.app.session.registry.register('native_action', interrupt_before_observation, replace=True)
+        self._run(approve=lambda _call, _token: ExecutionRejection('The proposed output is outside task scope.'))
+        self.assertTrue(interrupted)
+        self.assertFalse(self._process_receipts())
+        self._reload()
+        self._run()
+        self.assertTrue(received, self.app.result_snapshot())
+        self.assertFalse(received[-1]['data']['executed'])
+        self.assertIn('outside task scope', received[-1]['error'])
+        self.assertEqual(self._last('inspect_artifacts')['status'], 'ok')
+        self.assertFalse(self._process_receipts())
 
     def test_shared_inspection_computes_once_after_exact_approval_and_reviews_feedback_delivery(self):
         self._create(goal='Read the supplied CSV, check its sample mean independently, '

@@ -69,6 +69,23 @@ class LocalWorkspaceTests(unittest.TestCase):
                                       'remember_execution': 'false'})
                 dispatch.assert_called_once()
 
+    def test_rejection_is_bound_to_the_pending_action_and_delivered_once(self):
+        from simple_ar.app.tool_application import ExecutionRejection
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            workspace = Workspace(root, [], root / 'tasks')
+            with patch.object(workspace, 'task', return_value=root), \
+                    patch.object(workspace, 'validate_sources'), \
+                    patch.object(workspace, 'snapshot_unlocked_approval', return_value='current-token'), \
+                    patch.object(workspace, 'dispatch') as dispatch:
+                with self.assertRaisesRegex(ValueError, 'current pending proposal'):
+                    workspace.mutate({'op':'reject', 'task':'one', 'token':'wrong', 'reason':'Outside scope'})
+                workspace.mutate({'op':'reject', 'task':'one', 'token':'current-token', 'reason':'Outside scope'})
+                callback = dispatch.call_args.args[2]['approve']
+                self.assertFalse(callback({}, 'different-token'))
+                self.assertEqual(callback({}, 'current-token'), ExecutionRejection('Outside scope'))
+                self.assertFalse(callback({}, 'current-token'))
+
     def test_historical_version_preview_and_creation_share_the_same_input_binding(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()

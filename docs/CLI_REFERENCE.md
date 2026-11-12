@@ -201,6 +201,8 @@ Keep --retry-model separate from feedback, access/resource grants and command ap
 
 For new native tasks, assisted/checkpoints wait for design/protocol replies; autonomous can accept valid designs within saved limits. There are no extra stage/delivery milestone dialogs. Design acceptance does not approve a process. Exact pending command tokens are required even with --yes.
 
+At an interactive execution prompt, `y` approves the displayed operation, Enter defers it, and `r` declines it with a reason. A declined operation is not run; its reason returns to the requesting task or independent review so work can continue.
+
 Examples:
 
 ```bash

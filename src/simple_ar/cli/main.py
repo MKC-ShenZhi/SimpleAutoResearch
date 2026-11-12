@@ -2902,7 +2902,7 @@ def _run_native_start(args: argparse.Namespace) -> None:
         if args.prepare_only:
             return
 
-        def approve(call: dict[str, Any], token: str) -> bool:
+        def approve(call: dict[str, Any], token: str):
             print_line(f"Execution proposal ({call['function']['name']}): {call['function']['arguments']}")
             if call['function']['name'] == 'execute_implementation':
                 import json
@@ -2921,7 +2921,14 @@ def _run_native_start(args: argparse.Namespace) -> None:
                     + ('Preparation only; implementation and each formal measurement require separate approval.'
                        if call['function']['name'] == 'prepare_code_task' else f'Includes at most {repairs} technical repairs.'))
             print_line("Execution is not sandboxed. Inspect the generated code before approving.")
-            return interactive and input("Execute this command / 执行此命令? [y/N]: ").strip().lower() in {"y", "yes"}
+            if not interactive:
+                return False
+            answer = input("Execute, defer, or reject / 执行、暂缓或拒绝? [y/N/r]: ").strip().lower()
+            if answer == 'r':
+                from simple_ar.app.tool_application import ExecutionRejection
+                reason = input('Reason for rejection / 拒绝原因: ').strip()
+                return ExecutionRejection(reason) if reason else False
+            return answer in {"y", "yes"}
 
         def run_initial():
             status = app.run(feedback=feedback, approved_execution=args.approve_execution,

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -74,6 +75,17 @@ _CONTEXT_PROTOCOLS = {None, *_CONVERSATION_CONTEXT_PROTOCOLS}
 
 class _ActionSuspended(BaseException):
     """Return control to the caller with the accepted action still pending."""
+
+
+@dataclass(frozen=True)
+class ExecutionRejection:
+    """Decline the proposed execution and return the reason to its requester."""
+
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise ValueError('An execution rejection requires a reason')
 
 
 _ADOPTING_OWNER_MODES = {_ADOPTING_OWNERS, _REQUEST_OWNER}
@@ -4630,7 +4642,10 @@ class ToolApplication:
         return CapabilityResult(status="completed", artifacts=(*memory_refs,ref))
 
     def _tool(self, *, context: Any, call: dict[str, Any], recovering: bool = False) -> CapabilityResult:
-        refusal = self._offered_tool_refusal(call)
+        pending = self.state.get('pending') or {}
+        refusal = (self._execution_rejection(pending)
+            if pending.get('attempt') == context.attempt.attempt_id and pending.get('execution_rejection')
+            else self._offered_tool_refusal(call))
         if refusal is not None:
             payload = refusal.model_dump(mode='json')
             context.store.write_json('native_result.json', payload, kind='native_observation')
@@ -5371,7 +5386,9 @@ class ToolApplication:
                             ToolCall(tool_name=function.get('name', ''), trace_id=identity))
                 if not self.session.store.exists(relative):
                     call = pending.get("call", {})
-                    if confirmed:
+                    if capability == 'native_tool' and pending.get('execution_rejection'):
+                        recovered = self._tool(context=CapabilityContext(store, existing), call=call, recovering=True)
+                    elif confirmed:
                         # Core owns the confirmed failure and accounting. Only fill
                         # the missing native observation; never replay or replace it.
                         ref = self.workspace.locator(str(store.resolve('capability_result.json')))
@@ -5387,6 +5404,9 @@ class ToolApplication:
                         raise RuntimeError("Interrupted operation has no durable result; inspect receipts before any replay")
                     else:
                         recovered = self._tool(context=CapabilityContext(store, existing), call=call, recovering=True)
+                elif capability == 'native_tool' and pending.get('execution_rejection'):
+                    if store.read_json('native_result.json') != self._execution_rejection(pending).model_dump(mode='json'):
+                        raise ValueError('Saved execution rejection differs from its decision')
                 elif (capability == 'native_tool' and self.operations is not None
                         and self.operations.delivery_review is not None
                         and (not store.exists('capability_result.json')
@@ -5500,6 +5520,8 @@ class ToolApplication:
 
     def _action_recovery(self, pending: dict, perform: Callable | None) -> Callable | None:
         """Recover only an existing owner's closed receipt, never repeat its effect."""
+        if pending.get('execution_rejection'):
+            return lambda: self._execution_rejection(pending).model_dump(mode='json')
         if pending['kind'] in {'opinion', 'receipt'}:
             return lambda: perform(pending['attempt'])
         if pending['kind'] == 'model':
@@ -5978,7 +6000,7 @@ class ToolApplication:
             resource_allowances: dict[str, int | float] | None = None,
             authorization_id: str = "", authorization_reason: str = "",
             decision: dict[str, str] | None = None,
-            approve: Callable[[dict[str, Any], str], bool] | None = None,
+            approve: Callable[[dict[str, Any], str], bool | ExecutionRejection] | None = None,
             progress: Callable[[str], None] = print,
             should_stop: Callable[[], bool] | None = None) -> dict[str, Any]:
         if remember_execution and not approved_execution:
@@ -6144,6 +6166,8 @@ class ToolApplication:
                         remember_execution: bool = False) -> bool:
         """One protocol and exact-approval boundary for accepted process actions."""
         check_llm_call_stop()
+        if pending.get('execution_rejection'):
+            return True  # The saved decision has no process effect to authorize.
         call = pending['call']
         name = call['function']['name']
         spec = self.gateway.registry.get(name)
@@ -6173,13 +6197,18 @@ class ToolApplication:
                         or (binding.get('artifacts') or {}).get('inputs')):
                     grant = self.workspace.approval_digest({
                         'name': name, 'arguments': json.loads(call['function']['arguments']), 'binding': binding})
-            if (token is not None and not started and approved_execution != token
-                    and grant not in grants and not (approve and approve(call, token))):
-                self.session.pause(f'Process requires explicit approval; token={token}')
-                progress(f"Pending command: {call['function']['arguments']}\nApproval token: {token}")
-                if name in {'prepare_code_task', 'implement_code_task'}:
-                    progress('Frozen CodeTask contract: ' + json.dumps(self.implementation.exact.model_dump(), ensure_ascii=False))
-                return False
+            if token is not None and not started and approved_execution != token and grant not in grants:
+                decision = approve(call, token) if approve else False
+                if isinstance(decision, ExecutionRejection):
+                    pending['execution_rejection'] = decision.reason.strip()
+                    self._save()
+                    return True
+                if not decision:
+                    self.session.pause(f'Process requires explicit approval; token={token}')
+                    progress(f"Pending command: {call['function']['arguments']}\nApproval token: {token}")
+                    if name in {'prepare_code_task', 'implement_code_task'}:
+                        progress('Frozen CodeTask contract: ' + json.dumps(self.implementation.exact.model_dump(), ensure_ascii=False))
+                    return False
             check_llm_call_stop()
             if token is not None and not started:
                 approval = (self.execution_approval(call)
@@ -6192,6 +6221,12 @@ class ToolApplication:
                 pending['execution_approval'] = approval
                 self._save()
         return True
+
+    @staticmethod
+    def _execution_rejection(pending: dict) -> ToolResult:
+        return ToolResult(tool_name=pending['call']['function']['name'], status='blocked',
+            error='Execution declined: ' + pending['execution_rejection'],
+            data={'executed': False}, metadata={'approval_decision': 'rejected'})
 
     def _action(self, *, context: CapabilityContext, accepted: dict,
                 perform: Callable[[str], dict], recovering: bool = False) -> CapabilityResult:
@@ -6252,6 +6287,8 @@ class ToolApplication:
                 raise _ActionSuspended()
             progress(f'Independent {kind} — {identity}')
         fresh = not any(row.attempt_id == identity for row in self.session.list_attempts())
+        if action.get('execution_rejection'):
+            perform = lambda _identity: self._execution_rejection(action).model_dump(mode='json')
         relative = self._attempt('native_action', action, perform=perform)
         action['result'] = relative
         self._save()  # Retained until the professional journal acknowledges this receipt.

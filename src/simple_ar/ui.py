@@ -22,7 +22,7 @@ import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from simple_ar.app.tool_application import ToolApplication
+from simple_ar.app.tool_application import ExecutionRejection, ToolApplication
 from simple_ar.app.reuse import ReuseAccess
 from simple_ar.app.task_view import read_task_view, saved_model_recipients
 from simple_ar.cli.project_tasks import discover_project_tasks
@@ -525,13 +525,26 @@ class Workspace:
                 ToolApplication.load(root).switch_model(data['model'], switch_id=data['switch_id'],
                     reason=data['reason'], expected_connection=binding)
                 return {'task': name}
-            if op not in {'resume', 'approve'}:
+            if op not in {'resume', 'approve', 'reject'}:
                 raise ValueError('Unsupported operation')
             kwargs = {}
-            if op == 'approve':
+            if op in {'approve', 'reject'}:
                 approval = self.snapshot_unlocked_approval(root)
                 if not approval or data['token'] != approval:
                     raise ValueError('Approval differs from current pending proposal')
+            if op == 'reject':
+                rejection = ExecutionRejection(data.get('reason', ''))
+                used = False
+
+                def reject_proposal(_call, token):
+                    nonlocal used
+                    if not used and token == approval:
+                        used = True
+                        return rejection
+                    return False
+
+                kwargs['approve'] = reject_proposal
+            elif op == 'approve':
                 remember = data.get('remember_execution', False)
                 if type(remember) is not bool:
                     raise ValueError('Remembering execution must be a boolean choice')
