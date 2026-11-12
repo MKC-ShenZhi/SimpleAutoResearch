@@ -684,7 +684,7 @@ class DeliveryReview:
                 if self._pending_envelope(envelope):
                     # Establish whether a historical action was accepted before
                     # interpreting its mutable owner result or skipping a scope.
-                    feedback = self.feedback_from_observation(observed)
+                    feedback = self.feedback_from_observation(observed, guidance_only=True)
                     if feedback.get('opinion_accepted') is False:
                         continue
                     if not feedback.get('opinion_available'):
@@ -708,7 +708,12 @@ class DeliveryReview:
                         or any(not row.subjects for row in assessment.findings)
                         or assessment.reassessed_prior):
                     continue
-                feedback = feedback or self.feedback_from_observation(observed)
+                if not assessment.reassessed_prior and not any(
+                        row.severity == 'required' for row in assessment.findings):
+                    # This opinion cannot introduce or retire a required concern.
+                    # Its recorded guidance remains available to other consumers.
+                    continue
+                feedback = self.feedback_from_observation(observed)
                 if feedback.get('opinion_accepted') is False:
                     continue  # A closed but unaccepted response is not an opinion.
                 if not feedback.get('opinion_available'):
@@ -746,6 +751,10 @@ class DeliveryReview:
             if not any(isinstance(row, dict) and self._relevant(row.get('subjects', {}), selected)
                        for row in values):
                 continue
+            if not any(isinstance(row, dict) and (row.get('reassessed_prior') or any(
+                    finding.get('severity') == 'required' for finding in row.get('findings', [])))
+                    for row in values):
+                continue  # This observation cannot change the outstanding concerns.
             feedback = self.feedback_from_observation(observed)
             if feedback is None or not feedback.get('opinion_available'):
                 raise ValueError('Retained artifact concern opinion cannot be verified')

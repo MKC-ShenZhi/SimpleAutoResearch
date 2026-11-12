@@ -1012,6 +1012,17 @@ class DeliveryFindingContractTests(unittest.TestCase):
         self.assertEqual(self.review('reuse'), proof)
         self.assertEqual(len(self.inspector.calls), 1)
 
+    def test_advisory_only_opinions_do_not_revalidate_or_retire_required_concerns(self):
+        self.local('required')
+        pending = self.concerns()
+        proof = self.review('advisory-only')
+        self.observe(proof)
+        self.local('unrelated-pass', required=False)
+        with patch.object(self.owner, '_verified', wraps=self.owner._verified) as verified:
+            self.assertEqual(self.concerns(), pending)
+        self.assertNotIn('advisory-only', [call.args[0] for call in verified.call_args_list])
+        self.assertTrue(self.issues(self.observations, self.delivery))
+
     def test_partial_package_preserves_completed_individual_rechecks(self):
         self.local('finding-1')
         self.local('finding-2')
