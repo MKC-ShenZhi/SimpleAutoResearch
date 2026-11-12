@@ -152,6 +152,7 @@ class ReportExportTests(unittest.TestCase):
 
     def test_explicit_template_uses_bound_publication_owner_and_retains_failed_versions(self):
         from types import SimpleNamespace
+        from pypdf import PdfWriter
         from simple_ar.core.budget import BudgetLedger, BudgetUnknownError
         from simple_ar.tools.workspace import WorkspaceToolGateway
         from simple_ar.tools.publication import ExportRequest, PublicationToolGateway, export_input_binding
@@ -225,7 +226,9 @@ class ReportExportTests(unittest.TestCase):
                 self.assertNotIn('OPENAI_API_KEY', spec.env)
                 spec.output_dir.mkdir(parents=True, exist_ok=True)
                 if spec.argv[0] in {'xelatex', 'bibtex'}:
-                    (spec.cwd / 'main.pdf').write_bytes(b'%PDF-check-fixture')
+                    pdf = PdfWriter()
+                    pdf.add_blank_page(width=72, height=72)
+                    pdf.write(spec.cwd / 'main.pdf')
                     text = 'Compiler fixture'
                 elif spec.argv[0] == 'pdfinfo':
                     self.assertEqual(spec.env['LC_ALL'], 'C')
