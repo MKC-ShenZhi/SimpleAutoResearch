@@ -81,6 +81,8 @@ class ExternalAgentAccountingTests(unittest.TestCase):
         self.assertEqual(retained.status, result.status)
         self.assertEqual(retained.metadata, result.metadata)
         self.assertEqual(ledger.to_dict(), before)
+        with self.assertRaisesRegex(ValueError, 'does not belong'):
+            backend.run(self.request.model_copy(update={'workspace_dir': self.root / 'different-project'}))
 
         (self.request.handoff_dir / 'agent_run.json').unlink()
         with patch('simple_ar.agent_backends.external_cli.run_process', side_effect=AssertionError('replayed')):

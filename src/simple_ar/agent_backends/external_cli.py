@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from simple_ar.core.budget import BudgetError, BudgetLedger
 from simple_ar.core.artifacts import read_json, write_json
-from simple_ar.core.process import ProcessSpec, run_process
+from simple_ar.core.process import ProcessSpec, run_process, verify_process_accounting
 
 from .base import AgentBackend, AgentRunRequest, AgentRunResult
 
@@ -90,7 +90,8 @@ class ExternalCliBackend(AgentBackend):
         entries = [row for row in ledger.entries if row.reservation_id == payload.get('usage_reservation')]
         if (len(entries) != 1 or entries[0].status != 'unknown' or entries[0].purpose != 'external_agent'
                 or entries[0].session_id != self.session_id or entries[0].attempt_id != self.attempt_id
-                or payload.get('provider') != request.provider or payload.get('cwd') != str(root)):
+                or payload.get('provider') != request.provider or payload.get('cwd') != str(root)
+                or payload.get('workspace_dir') != (str(request.workspace_dir) if request.workspace_dir else None)):
             raise ValueError('Retained external agent result does not belong to this task and attempt')
         process_path = (root / payload['process_record']).resolve()
         if not process_path.is_relative_to(root):
@@ -99,8 +100,10 @@ class ExternalCliBackend(AgentBackend):
         status = 'passed' if process.get('returncode') == 0 and not process.get('stop_reason') else 'failed'
         if (process.get('status') not in {'finished', 'stopped'} or process.get('cwd') != str(root)
                 or process.get('session_id') != self.session_id or process.get('attempt_id') != self.attempt_id
-                or payload.get('status') != status):
+                or payload.get('status') != status or payload.get('returncode') != process.get('returncode')):
             raise ValueError('Retained external agent process has no matching final result')
+        verify_process_accounting(process, ledger, session_id=self.session_id, attempt_id=self.attempt_id,
+            timeout_sec=process['timeout_sec'], accounting_purpose='external_agent_process')
         artifacts = [(root / path).resolve() for path in payload.get('artifacts', [])]
         if any(not path.is_relative_to(root) for path in artifacts):
             raise ValueError('External agent result contains an artifact outside its handoff')
