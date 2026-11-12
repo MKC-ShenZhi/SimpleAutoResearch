@@ -451,14 +451,14 @@ class ProfessionalWorkTools:
         available, _ = self._scope_locations(scope, targets)
         if not available:
             return []
-        result, cache = [], {}
+        result = []
         try:
             references = self.material_observations(available)
         except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
             return [{'status': 'unavailable', 'diagnostic': str(exc), 'scope': 'material receipt lookup'}]
         for reference in references:
             try:
-                observed = validate_material_observation(self.workspace, reference, identity=identity, cache=cache)
+                observed = validate_material_observation(self.workspace, reference, identity=identity)
                 data = observed['data']
                 result.append({'record': reference.get('record'), 'path': data.get('absolute_path'),
                     'sha256': data.get('sha256'), 'offset_bytes': data.get('offset_bytes', 0),

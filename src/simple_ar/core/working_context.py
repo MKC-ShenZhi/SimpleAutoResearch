@@ -92,15 +92,14 @@ def feedback_observations(context: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 def history_view(turns: list[dict[str, Any]]) -> Any:
     # Lossless presentation of receipt-derived indexes, never saved memory.
-    columns, column_indices, rows = [], {}, []
+    columns, rows = [], []
     for turn in turns:
         observations = []
         for observation in turn['observations']:
-            keys = tuple(observation)
-            if keys not in column_indices:
-                column_indices[keys] = len(columns)
-                columns.append(list(keys))
-            observations.append([column_indices[keys], list(observation.values())])
+            keys = list(observation)
+            if keys not in columns:
+                columns.append(keys)
+            observations.append([columns.index(keys), list(observation.values())])
         rows.append([turn['reply'], turn['request_count'], observations])
     table = {'columns': ['reply', 'request_count', 'observations'],
         'observation_columns': columns, 'rows': rows}
@@ -590,7 +589,6 @@ def select_working_context(
     prepared_projector = None
     prepared_operations = None
     prepared_overview = None
-    navigation_rows: dict[int, dict] = {}
 
     def project() -> tuple[list[dict[str, Any]], int]:
         nonlocal prepared_turns, prepared_projector, prepared_operations, prepared_overview
@@ -612,16 +610,14 @@ def select_working_context(
                     else:
                         ranges.append([i, i + 1])
                     operation = operations[i]
-                    if i not in navigation_rows:
-                        navigation = {'entry_index': i, **{key: operation[key] for key in
-                            ('turn', 'turn_complete', 'call_id') if key in operation}}
-                        if navigation.keys() & operation['observation'].keys():
-                            raise ValueError('Operation observation conflicts with navigation fields')
-                        navigation_rows[i] = {**navigation, **operation['observation']}
+                    navigation = {'entry_index': i, **{key: operation[key] for key in
+                        ('turn', 'turn_complete', 'call_id') if key in operation}}
+                    if navigation.keys() & operation['observation'].keys():
+                        raise ValueError('Operation observation conflicts with navigation fields')
                     group = groups.setdefault((operation['reply'], operation['request_count']),
                         {'reply': operation['reply'], 'request_count': operation['request_count'],
                          'observations': []})
-                    group['observations'].append(navigation_rows[i])
+                    group['observations'].append({**navigation, **operation['observation']})
                 prepared_operations = ordered_indices
                 prepared_overview = {'entries': history_view(list(groups.values())),
                     'supplied_entry_ranges': ranges, 'omitted_entries': len(operations) - len(ordered_indices)}

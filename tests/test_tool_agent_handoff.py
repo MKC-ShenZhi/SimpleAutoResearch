@@ -1335,7 +1335,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(app.ledger.to_dict(), ledger)
         self.assertEqual(app.state, state)
 
-    def test_shared_observation_cache_rechecks_bytes_permissions_and_receipts(self):
+    def test_shared_observations_recheck_bytes_permissions_and_receipts(self):
         from simple_ar.tools.materials import (current_text_window, material_inventories,
             material_observation_seed, observe_text_window, validate_material_observation)
 
@@ -1348,26 +1348,20 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         indexed = observe_text_window({}, app.workspace, 'read_file', reference['request'], receipt['data'],
             record=reference['record'], receipt_sha256=reference['receipt_sha256'], turn=0)
         window, = indexed.values()
-        cache = {}
         inventories = material_inventories(app.workspace, [str(source)], identity='cache-validation')
-        with patch.object(app.workspace, 'call', wraps=app.workspace.call) as reads, \
-                patch('simple_ar.tools.workspace.hashlib.file_digest', wraps=hashlib.file_digest) as hashes:
-            original = validate_material_observation(app.workspace, reference, identity='first', cache=cache)
-            self.assertEqual(current_text_window(app.workspace, window, cache=cache)['text'], original['data']['text'])
-            self.assertEqual(reads.call_count, 2)  # Windows always pass through their byte owner.
-            self.assertEqual(hashes.call_count, 1)
-            with patch.object(app.workspace, 'resolve', side_effect=ValueError('Authorization revoked')):
-                with self.assertRaisesRegex(ValueError, 'Authorization revoked'):
-                    current_text_window(app.workspace, window, cache=cache)
-            with _changed_record(record, {**receipt, 'status': 'blocked'}):
-                with self.assertRaisesRegex(ValueError, 'receipt changed'):
-                    current_text_window(app.workspace, window, cache=cache)
-            # A changed unread tail invalidates the old version even though
-            # this window's text is identical; cached reads cannot adopt it.
-            source.write_bytes(source.read_bytes() + b'UNREAD_CHANGE')
-            with self.assertRaisesRegex(ValueError, 'contents changed'):
-                current_text_window(app.workspace, window, cache=cache)
-            self.assertEqual(hashes.call_count, 2)
+        original = validate_material_observation(app.workspace, reference, identity='first')
+        self.assertEqual(current_text_window(app.workspace, window)['text'], original['data']['text'])
+        with patch.object(app.workspace, 'resolve', side_effect=ValueError('Authorization revoked')):
+            with self.assertRaisesRegex(ValueError, 'Authorization revoked'):
+                current_text_window(app.workspace, window)
+        with _changed_record(record, {**receipt, 'status': 'blocked'}):
+            with self.assertRaisesRegex(ValueError, 'receipt changed'):
+                current_text_window(app.workspace, window)
+        # A changed unread tail invalidates the old version even when the
+        # selected window's text remains identical.
+        source.write_bytes(source.read_bytes() + b'UNREAD_CHANGE')
+        with self.assertRaisesRegex(ValueError, 'contents changed'):
+            current_text_window(app.workspace, window)
         seed = material_observation_seed(workspace=app.workspace, inventories=inventories,
             provider=lambda _: [reference], roots=[str(source)], context={})
         self.assertEqual(seed['observations'], [])
@@ -1380,13 +1374,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         source = inputs / 'digest-windows.txt'
         raw = ('原始与生成内容\n' * 50000).encode('utf-8')
         source.write_bytes(raw)
-        cache = {}
         requests = [dict(path=str(source), full_digest=True, **window) for window in (
             {'max_bytes': 73}, {'offset_bytes': 9, 'max_bytes': 101},
             {'offset_bytes': 200, 'max_bytes': 80, 'max_lines': 1})]
         digest_file = hashlib.file_digest
         for index, request in enumerate(requests):
-            observed = read_material_window(app.workspace, request, identity=f'digest-window-{index}', cache=cache)
+            observed = read_material_window(app.workspace, request, identity=f'digest-window-{index}')
             self.assertEqual(observed['data']['sha256'], hashlib.sha256(raw).hexdigest())
             start = request.get('offset_bytes', 0)
             expected = raw[start:start + request['max_bytes']]
@@ -1396,15 +1389,15 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertEqual(observed['data']['next_offset_bytes'], start + len(expected))
         with self.assertRaisesRegex(ValueError, 'Line reads require'):
             read_material_window(app.workspace, {**requests[0], 'start_line': 2},
-                identity='digest-line-refused', cache=cache)
+                identity='digest-line-refused')
         with patch.object(app.workspace, 'resolve', side_effect=ValueError('Authorization revoked')):
             with self.assertRaisesRegex(ValueError, 'Authorization revoked'):
-                read_material_window(app.workspace, requests[0], identity='digest-revoked', cache=cache)
+                read_material_window(app.workspace, requests[0], identity='digest-revoked')
         # Same-size changes outside the window must invalidate the old digest.
         source.write_bytes(raw[:-1] + b'!')
-        changed = read_material_window(app.workspace, requests[1], identity='digest-changed', cache=cache)
+        changed = read_material_window(app.workspace, requests[1], identity='digest-changed')
         self.assertNotEqual(changed['data']['sha256'], hashlib.sha256(raw).hexdigest())
-        later = read_material_window(app.workspace, requests[2], identity='digest-changed-next', cache=cache)
+        later = read_material_window(app.workspace, requests[2], identity='digest-changed-next')
         self.assertEqual(later['data']['sha256'], changed['data']['sha256'])
         # A mutation during hashing must not publish or cache that mixed read.
         def mutate_during_digest(handle, algorithm):
@@ -1412,11 +1405,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             source.write_bytes(source.read_bytes() + b'x')
             return digest
 
-        interrupted_cache = {}
         with patch('simple_ar.tools.workspace.hashlib.file_digest', side_effect=mutate_during_digest):
             with self.assertRaisesRegex(ValueError, 'File changed during material read'):
-                read_material_window(app.workspace, requests[0], identity='digest-concurrent-change', cache=interrupted_cache)
-        self.assertEqual(interrupted_cache, {})
+                read_material_window(app.workspace, requests[0], identity='digest-concurrent-change')
 
     def test_parent_material_seed_capacity_exposes_refusals_without_consuming_extra_decisions(self):
         from simple_ar.core.capabilities import ArtifactStore

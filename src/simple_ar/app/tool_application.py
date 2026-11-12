@@ -3289,7 +3289,6 @@ class ToolApplication:
         for row in unavailable_reads:
             record_gap(coverage(row), fresh=row['turn'] == working_turn)
         candidates = []
-        observation_reads: dict = {}
         read_allowed, read_reason = self.gateway.policy.is_allowed(self.gateway.registry.get('read_file'))
         for window in sorted(text_windows.values(), key=lambda value: value['turn'], reverse=True):
             if explicit_inputs and window['record'] == focus['record']:
@@ -3301,7 +3300,7 @@ class ToolApplication:
             try:
                 if not read_allowed:
                     raise ValueError(read_reason)
-                observation = current_text_window(self.workspace, window, cache=observation_reads)
+                observation = current_text_window(self.workspace, window)
             except (ValueError, TypeError, KeyError, OSError, RuntimeError) as error:
                 record_gap(coverage(window) | {'role': role, 'status': 'unavailable', 'reason': str(error)},
                     fresh=window['turn'] == working_turn)

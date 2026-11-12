@@ -2145,8 +2145,7 @@ class WorkspaceToolGateway:
             raise ValueError("Generated output or attempt history is not original-source evidence")
         return path
 
-    def call(self, name: str, arguments: dict[str, Any], *, identity: str,
-             read_cache: dict | None = None) -> ToolResult:
+    def call(self, name: str, arguments: dict[str, Any], *, identity: str) -> ToolResult:
         try:
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,100}", identity):
                 raise ValueError("Invalid durable tool invocation identity")
@@ -2273,7 +2272,7 @@ class WorkspaceToolGateway:
                                         for p in selected], "next_offset": model.offset + len(selected),
                             "has_more": model.offset + len(selected) < len(children)}
                 elif name == "read_file":
-                    raw, data = self._read_file_window(target, model, read_cache=read_cache)
+                    raw, data = self._read_file_window(target, model)
                     data = {"text": raw.decode("utf-8", errors="replace"), **data}
                 else:
                     delivery = None
@@ -2523,12 +2522,11 @@ class WorkspaceToolGateway:
         return {**request.model_dump(), 'artifacts': artifacts}
 
     def _read_file_window(self, target: Path, request: FileWindow, *,
-                          read_cache: dict | None = None,
                           require_digest: bool = False) -> tuple[bytes, dict[str, Any]]:
         """Read one authorized opened version; no decoding, accounting or records.
 
         Delivery needs a streamed digest even for a large byte window. Ordinary
-        read_file retains its original optional full-digest policy and cache.
+        read_file retains its original optional full-digest policy.
         """
         with target.open('rb') as handle:
             def version(stat: os.stat_result | None = None) -> tuple:
@@ -2542,19 +2540,11 @@ class WorkspaceToolGateway:
             # compare each source to itself after the read.
             if before[:-1] != path_before[:-1]:
                 raise ValueError('File changed during material read; inspect its current window')
-            cache_key = (*before, path_before[-1])
-            # Windows stat reports creation time rather than a reliable inode
-            # change time. Same-size writes can also share a coarse mtime.
-            digest_cache = read_cache if os.name != 'nt' else None
             size = before[3]
             request.validate_read_size(size)
             digest = None
             if size <= 256000 or request.full_digest or require_digest:
-                # Cache only this opened version, independently of the window.
-                # Every consumer still resolves authority, opens and reads.
-                digest = digest_cache.get(cache_key) if digest_cache is not None else None
-                if digest is None:
-                    digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+                digest = hashlib.file_digest(handle, 'sha256').hexdigest()
             offset = request.offset_bytes
             if request.start_line is not None:
                 handle.seek(0)
@@ -2570,8 +2560,6 @@ class WorkspaceToolGateway:
             if (version() != before or self.resolve(request.path) != target
                     or version(target.stat()) != path_before):
                 raise ValueError('File changed during material read; inspect its current window')
-            if digest_cache is not None and digest is not None:
-                digest_cache[cache_key] = digest
         data = {'sha256': digest, 'size_bytes': size,
             'next_offset_bytes': offset + len(raw), 'has_more': offset + len(raw) < size}
         if request.start_line is not None:
