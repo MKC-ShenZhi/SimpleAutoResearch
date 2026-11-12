@@ -121,6 +121,19 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertFalse(clients[0].calls)
         self.assertFalse(ledger.entries)
 
+        # A provider-aware count can exceed the cheap character estimate even
+        # for a short prompt; the sender must stop before buying a response.
+        def provider_counted(identity):
+            client = constrained(identity)
+            client.estimate_json_input_tokens = lambda system, user: 1001
+            return client
+        gateway.client_factory = provider_counted
+        result = gateway.call('work_document', {'goal': 'Check the supplied work'}, identity='provider-overflow')
+        self.assertFalse(result.ok)
+        self.assertIn('saved model input capacity', result.error)
+        self.assertFalse(clients[-1].calls)
+        self.assertFalse(ledger.entries)
+
     def workspace(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         source = root / 'source'

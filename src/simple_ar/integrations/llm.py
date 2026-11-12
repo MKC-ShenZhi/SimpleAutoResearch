@@ -36,6 +36,7 @@ UsageCallback = Callable[["LLMUsage"], None]
 MAX_VISION_BYTES = 20 * 1024 * 1024
 MAX_VISION_PIXELS = 4_194_304
 ESTIMATED_IMAGE_INPUT_TOKENS = 8192
+_JSON_ONLY_SUFFIX = "\n\nReturn valid JSON only. Do not include markdown or extra text."
 
 # Public diagnostics contain event names only, never HTTPX trace payloads.
 _TRANSPORT_PHASES = frozenset({"unobserved"} | {
@@ -661,6 +662,15 @@ class LLMClient:
         return (estimate_tokens(json.dumps(messages, ensure_ascii=False))
                 + estimate_tokens(json.dumps(tools, ensure_ascii=False)))
 
+    def estimate_json_input_tokens(self, system: str, user: str) -> int:
+        """Measure the same text and format that ask_json will send."""
+        user += _JSON_ONLY_SUFFIX
+        if self._settings.token_counting == 'deepseek_v41' and self._settings.api_mode == 'chat':
+            return self.estimate_native_input_tokens(
+                [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}], [],
+                response_format=_json_response_format_request(self._settings.json_response_format))
+        return estimate_tokens(system) + estimate_tokens(user)
+
     def _complete_request(
         self, request: dict[str, Any], system: str, user: str, *,
         label: str, max_output_tokens: int | None = None,
@@ -1189,7 +1199,7 @@ class LLMClient:
         Raises:
             LLMError: If the request fails or no JSON object can be parsed.
         """
-        json_user = user + "\n\nReturn valid JSON only. Do not include markdown or extra text."
+        json_user = user + _JSON_ONLY_SUFFIX
         response_format = _json_response_format_request(self._settings.json_response_format)
         try:
             raw = self.ask(
@@ -1633,6 +1643,12 @@ def estimate_native_input_tokens(client: Any, messages: list, tools: list) -> in
         return counter(messages, tools)
     return (estimate_tokens(json.dumps(messages, ensure_ascii=False))
             + estimate_tokens(json.dumps(tools, ensure_ascii=False)))
+
+
+def estimate_json_request_tokens(client: Any, system: str, user: str) -> int:
+    """Use the sender's JSON-request counter, including its output format."""
+    counter = getattr(client, 'estimate_json_input_tokens', None)
+    return counter(system, user) if callable(counter) else estimate_tokens(system) + estimate_tokens(user + _JSON_ONLY_SUFFIX)
 
 
 def _usage_from_response(response: object) -> tuple[int, int, int] | None:

@@ -656,8 +656,8 @@ class DocumentWorkToolGateway:
     @staticmethod
     def _working_input(prompt: dict, observations: list[dict], client: Any, identity: str, system: str) -> tuple[dict, dict]:
         """The common selector owns presentation; the complete journal stays intact."""
-        from simple_ar.core.working_context import select_working_context
-        from simple_ar.integrations.llm import estimate_tokens
+        from simple_ar.core.working_context import fit_working_context
+        from simple_ar.integrations.llm import estimate_json_request_tokens, estimate_tokens
         base = {key: value for key, value in prompt.items() if key != 'observations'}
         recalled = {row['id'] for row in prompt.get('read_results', []) if row.get('status') == 'recalled'}
         base['coverage'] += (' Only the supplied observation bodies are in this input. Repeat an original '
@@ -671,7 +671,9 @@ class DocumentWorkToolGateway:
                 return [messages[0], {'role': 'user', 'content': json.dumps(context, ensure_ascii=False)}]
             return project
 
-        messages, selection = select_working_context(user_requests=[], system_text=system,
+        messages, selection = fit_working_context(
+            measure_input=lambda messages: estimate_json_request_tokens(client, system, messages[1]['content']),
+            user_requests=[], system_text=system,
             base_context=base, turn_blocks=[], observations=[{
                 'record': f'records/{identity}/document_work/observations.json', 'field': str(index),
                 'turn': index + (len(observations) if row['id'] in recalled else 0),

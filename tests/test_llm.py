@@ -78,6 +78,23 @@ class LLMParsingTests(unittest.TestCase):
                 client.chat_turn(messages, tools=tools)
             provider.assert_not_called()
 
+    def test_json_request_planning_counts_the_same_input_as_provider_reservation(self):
+        settings = LLMSettings(api_key='fixture', model='fixture-v41', api_mode='chat',
+            token_counting='deepseek_v41', tokenizer_file='fixture-tokenizer.json', max_output_tokens=10)
+        ledger = BudgetLedger({'llm_requests': 1, 'total_tokens': 160})
+        client = LLMClient(settings, budget_ledger=ledger)
+        response = {'choices': [{'message': {'content': '{"ok": true}'}}],
+                    'usage': {'prompt_tokens': 120, 'completion_tokens': 2, 'total_tokens': 122}}
+        with patch('simple_ar.integrations.token_counting.deepseek_v41_input_tokens', return_value=150) as counter, \
+                patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response):
+            self.assertEqual(client.estimate_json_input_tokens('system', '请检查结果'), 150)
+            self.assertEqual(client.ask_json('system', '请检查结果'), {'ok': True})
+        self.assertEqual(counter.call_count, 2)
+        self.assertEqual(counter.call_args_list[0].kwargs['messages'], counter.call_args_list[1].kwargs['messages'])
+        self.assertEqual(counter.call_args_list[0].kwargs['response_format'],
+                         counter.call_args_list[1].kwargs['response_format'])
+        self.assertEqual(ledger.entries[0].reserved['total_tokens'], 160)
+
     def test_call_stop_scopes_inherit_restore_and_cover_injected_professional_clients(self):
         from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
         from simple_ar.app.tool_application import _RuntimeClientPort
