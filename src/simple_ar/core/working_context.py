@@ -145,7 +145,6 @@ def select_working_context(
     observations: Sequence[Mapping[str, Any]],
     schema_tokens: int, context_token_target: int,
     estimate_tokens: Callable[[str], int],
-    estimate_serialized_length: Callable[[int], int] | None = None,
     work_notes: Sequence[Mapping[str, Any]] = (),
     selected_records: Sequence[str] = (),
     priority_source_paths: Sequence[str] = (),
@@ -590,12 +589,9 @@ def select_working_context(
     prepared_projector = None
     prepared_operations = None
     prepared_overview = None
-    measured_turns = None
-    serialized_messages: dict[int, tuple[Mapping[str, Any], int]] = {}
 
     def project() -> tuple[list[dict[str, Any]], int]:
         nonlocal prepared_turns, prepared_projector, prepared_operations, prepared_overview
-        nonlocal measured_turns
         # Selection and model-visible bookkeeping share one admission cost.
         # Callers must not append a second unbudgeted description afterwards.
         if context_authority == 'sources.v1':
@@ -681,27 +677,7 @@ def select_working_context(
                     prepared_projector = message_projector(messages)
                     prepared_turns = selection
                 messages = prepared_projector(context)
-            if estimate_serialized_length is None:
-                measured = schema_tokens+estimate_tokens(json.dumps(messages,ensure_ascii=False))
-            else:
-                # In one selection, only the context message changes. Preserve
-                # exact JSON length while reusing the other messages' encoding
-                # lengths; no result or file cache survives this decision.
-                selection = tuple(recent)
-                if selection != measured_turns:
-                    serialized_messages.clear()
-                    measured_turns = selection
-                length = 2 + max(0, len(messages) - 1) * 2
-                for index, message in enumerate(messages):
-                    cached = serialized_messages.get(id(message)) if index != 1 else None
-                    if cached is None:
-                        size = len(json.dumps(message, ensure_ascii=False))
-                        if index != 1:
-                            serialized_messages[id(message)] = (message, size)
-                    else:
-                        size = cached[1]
-                    length += size
-                measured = schema_tokens + estimate_serialized_length(length)
+            measured = schema_tokens+estimate_tokens(json.dumps(messages,ensure_ascii=False))
             # A boolean/decimal-width change can reduce the serialized size
             # by one token. Keep the conservative bound rather than oscillate.
             if measured<=cost:
@@ -1261,9 +1237,6 @@ def fit_working_context(*, measure_input: Callable[[list[dict[str, Any]]], int],
         if scale != 1.0:
             options['estimate_tokens'] = lambda text: math.ceil(estimate(text) * scale)
             options['schema_tokens'] = math.ceil(schema_cost * scale)
-            if options.get('estimate_serialized_length') is not None:
-                estimate_length = arguments['estimate_serialized_length']
-                options['estimate_serialized_length'] = lambda length: math.ceil(estimate_length(length) * scale)
         messages, metadata = select_working_context(**options)
         actual = measure_input(messages)
         estimated = metadata['estimated_input_tokens']

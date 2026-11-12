@@ -18,7 +18,7 @@ from simple_ar.app.work_memory import (
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.core.capabilities import ArtifactStore
-from simple_ar.integrations.llm import LLMClient, LLMSettings, estimate_tokens, estimate_tokens_from_length
+from simple_ar.integrations.llm import LLMClient, LLMSettings, estimate_tokens
 
 
 def block(number, text):
@@ -57,22 +57,6 @@ def expand_history_view(view):
 
 
 class WorkingContextTests(unittest.TestCase):
-    def test_reusing_fixed_message_lengths_preserves_work_selection(self):
-        from simple_ar.app.professional_conversation import (
-            prepare_recorded_work_messages, prepare_work_unit_messages)
-        observations = [observation(i, ('内容 "quoted" \\ text ' * 40) + str(i)) for i in range(8)]
-        arguments = dict(base_context={'permissions': {'write': ['outputs/']}, 'resources': {}},
-            turn_blocks=[block(i, observations[i]['text']) for i in range(8)],
-            observations=observations, material_policy='referenced',
-            selected_records=[row['record'] for row in observations],
-            context_token_target=2000, estimate_tokens=estimate_tokens)
-        for projector in (None, prepare_recorded_work_messages, prepare_work_unit_messages):
-            with self.subTest(projector=projector):
-                expected = select(**arguments, message_projector=projector)
-                actual = select(**arguments, message_projector=projector,
-                                estimate_serialized_length=estimate_tokens_from_length)
-                self.assertEqual(actual, expected)
-
     def test_source_authority_preserves_requests_and_atomic_history(self):
         requests = ['  Analyze the supplied measurements.\n', 'Retain uncertainty: ±1.',
                     'Explain the remaining limitations.']

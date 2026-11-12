@@ -24,7 +24,7 @@ from simple_ar.core.capabilities import ArtifactRef, ArtifactStore, AttemptManif
 from simple_ar.core.session import BudgetState, SessionController
 from simple_ar.integrations.llm import (
     LLMCallStopped, LLMClient, LLMError, LLMSettings, check_llm_call_stop,
-    estimate_native_input_tokens, estimate_tokens, estimate_tokens_from_length, llm_call_stop_scope)
+    estimate_native_input_tokens, estimate_tokens, llm_call_stop_scope)
 from simple_ar.integrations.model_profiles import catalog_path, model_connections_compatible
 from simple_ar.tools.gateway import CommonToolGateway
 from simple_ar.tools.openai_schema import compact_json_schema, export_openai_tool_schemas
@@ -4024,8 +4024,7 @@ class ToolApplication:
                 preserve_material_observations=config.get('work_lifecycle') == 'integrated.v1',
                 working_set_policy=(config.get('working_set_policy', 'recent.v2')
                     if config.get('work_lifecycle') in {'integrated.v2', 'integrated.v3'} else None),
-                estimate_tokens=estimate_tokens, estimate_serialized_length=estimate_tokens_from_length,
-                work_notes=work_notes,
+                estimate_tokens=estimate_tokens,work_notes=work_notes,
                 require_work_notes=config.get('memory_protocol') == 'journal.v1',
                 fit_work_notes=config.get('memory_protocol') == 'journal.v1',
                 economical_checkpoint=config.get('context_checkpoint_policy') in {'economic.v1', 'economic.v2', 'economic.v3'},

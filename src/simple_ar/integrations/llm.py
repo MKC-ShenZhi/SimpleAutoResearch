@@ -1636,12 +1636,9 @@ def estimate_tokens(text: str) -> int:
         and can be lower than the provider's actual input-token count.
     """
     stripped = text.strip()
-    return estimate_tokens_from_length(len(stripped))
-
-
-def estimate_tokens_from_length(length: int) -> int:
-    """Apply the same character estimate to an already measured nonblank input."""
-    return (length + 3) // 4
+    if not stripped:
+        return 0
+    return max(1, (len(stripped) + 3) // 4)
 
 
 def estimate_native_input_tokens(client: Any, messages: list, tools: list) -> int:
