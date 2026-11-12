@@ -170,8 +170,11 @@ class Delivery:
         return self._actual_issues(observations, request, resolved, proposed=proposed, review_issues=review_issues)
 
     def requires_review(self, request: DeliveryRequest) -> bool:
-        return (self.review_owner is not None
-                and delivery_requires_review(request, self.review_owner.protocol))
+        if self.review_owner is None:
+            return False
+        if self.config.get('delivery_review_selection') == 'model.v1' and request.independent_review is False:
+            return False
+        return delivery_requires_review(request, self.review_owner.protocol)
 
     def lifecycle_requirements(self, *, observations: list[dict] | None = None, review_issues=None,
                                accepted_delivery: dict | None = None) -> dict:
@@ -220,8 +223,9 @@ class Delivery:
             break
         # A new request still needs the saved final-review contract. A delivery
         # already accepted for this request has no outstanding review floor.
-        needs_review = self.review_owner is not None and not (
-            previously_delivered and delivered_current_request)
+        needs_review = (self.review_owner is not None
+            and self.config.get('delivery_review_selection') != 'model.v1'
+            and not (previously_delivered and delivered_current_request))
         if proposal is None:
             conditions.append({'kind': 'candidate_submission',
                 'message': ('The previous delivery is recorded. Submit a new candidate when the '
@@ -240,7 +244,7 @@ class Delivery:
                 if publication:
                     next_tools.append('export_report')
                     conditions.extend({'kind': 'publication', 'message': text} for text in publication)
-                if self.review_owner and not proposal.unresolved:
+                if self.requires_review(proposal):
                     binding = prepare_delivery_review(self.workspace, proposal, resolved['artifacts'],
                         self.user_requests, protocol=self.review_owner.protocol)
                     concerns = (review_issues or self.review_owner.issues)(observations, binding)
@@ -297,6 +301,8 @@ class Delivery:
             return [str(exc)]
         issues.extend(report_issues)
         scoped_review = self.requires_review(request)
+        direct = (self.config.get('delivery_review_selection') == 'model.v1'
+                  and request.independent_review is False)
         package_review = scoped_review and self.review_owner.protocol in {'task.v3', 'task.v4', 'task.v5'}
         # Admission need not already have the review it is about to perform.
         # The whole-work owner reconsiders retained local opinions against this
@@ -305,7 +311,10 @@ class Delivery:
         # contracts keep their gate. A package pass is never a local file pass.
         if include_inspection and not package_review and not (scoped_review and proposed is not None):
             issues.extend(assessment_issues(self.workspace,observations,resolved['artifacts'],
-                require_pass=[] if scoped_review else required))
+                require_pass=[] if scoped_review or direct else required))
+            if direct and self.review_owner is not None:
+                issues.extend('Delivery retains a concern requiring explicit reassessment: ' + row['message']
+                    for row in self.review_owner.pending_concerns(resolved['artifacts'], observations))
         if include_inspection and scoped_review and proposed is None:
             try:
                 binding = prepare_delivery_review(self.workspace, request, resolved['artifacts'],
@@ -397,6 +406,11 @@ class Delivery:
             and self.review_owner.protocol in {'task.v3', 'task.v4', 'task.v5'})
         if package_review and request.summary_source is not None:
             delivery['summary'] = self.workspace.delivery_summary(delivery, hashes)
+        if not candidate and not self.requires_review(request):
+            if request.summary_source is not None and not package_review:
+                delivery['summary'] = self.workspace.delivery_summary(delivery, hashes)
+            metadata['delivery_hashes'] = hashes
+            return delivery
         try:
             if may_start and self.review_owner is not None:
                 metadata['delivery_hashes'] = hashes

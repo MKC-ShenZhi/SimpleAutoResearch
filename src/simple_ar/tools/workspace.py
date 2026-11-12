@@ -165,6 +165,8 @@ class DeliveryRequest(BaseModel):
         description='Requested work still unfinished or a required defect still unresolved; nonempty makes delivery partial. Put inherent evidence limits in limitations instead.')
     limitations: list[str] = Field(default_factory=list,exclude_if=lambda value:not value,
         description='Scope, unavailable evidence and uncertainty honestly stated in the completed work. These do not by themselves mean the requested task is unfinished, and cannot waive required findings.')
+    independent_review: bool | None = Field(default=None, exclude_if=lambda value: value is None,
+        description='For tasks that allow a review decision, set false only when independent review is unnecessary for the request and result. Omit or set true to request it. This cannot waive required findings or change saved task policies.')
     report: ReportDelivery | None = Field(default=None, exclude_if=lambda value: value is None,
         description='For a formal report, identify the current editable manuscript and requested formats. Canonical means current required checks passed; candidate means unfinished work disclosed. Publication must match that manuscript; no scientific certification.')
 
@@ -185,6 +187,8 @@ class CandidateReviewRequest(DeliveryRequest):
         description='Known requested work or required corrections still unfinished. These gaps do not prevent independent investigation of the available candidate.')
     limitations: list[str] = Field(default_factory=list, exclude_if=lambda value: not value,
         description='Known evidence limits, scope and uncertainty relevant to the current claim; these do not certify correctness or waive required findings.')
+    independent_review: Literal[True] | None = Field(default=None, exclude_if=lambda value: value is None,
+        description='An explicit candidate review always requests independent investigation.')
 
 
 class ReviewedDeliveryRequest(DeliveryRequest):
@@ -199,7 +203,8 @@ class ReviewedDeliveryRequest(DeliveryRequest):
     def select_claim(self) -> 'ReviewedDeliveryRequest':
         if self.reviewed_candidate is not None:
             if (self.summary or self.summary_source is not None or self.artifacts or self.project_root is not None
-                    or self.unresolved or self.limitations or self.report is not None):
+                    or self.unresolved or self.limitations or self.report is not None
+                    or self.independent_review is not None):
                 raise ValueError('A reviewed candidate cannot be combined with a new delivery claim')
         elif not self.summary.strip():
             raise ValueError('Provide a delivery summary or select a reviewed candidate')

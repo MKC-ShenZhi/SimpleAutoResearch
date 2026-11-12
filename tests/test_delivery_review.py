@@ -768,6 +768,20 @@ class DeliveryFindingContractTests(unittest.TestCase):
             self.inspector.store.write_json(record, proof['result'])
         return observed
 
+    def test_direct_delivery_does_not_waive_an_existing_required_finding(self):
+        from simple_ar.report.delivery import Delivery
+
+        self.local()
+        owner = Delivery(workspace=self.workspace,
+            gateway=SimpleNamespace(delivery_issues=lambda *args, **kwargs: []),
+            publication=SimpleNamespace(check_requested_delivery=lambda *args, **kwargs: None,
+                conversion_inputs=lambda *args: set()),
+            review_owner=self.owner, config={'delivery_review_protocol': 'task.v3',
+                'delivery_review_selection': 'model.v1'},
+            observations=lambda: self.observations, user_requests=lambda: self.requests)
+        issues = owner.issues(self.observations, {**self.delivery, 'independent_review': False})
+        self.assertTrue(any('Check the original sample scope' in item for item in issues), issues)
+
     def test_revision_view_keeps_related_versions_and_omits_unrelated_findings(self):
         from simple_ar.tools.inspection import InspectionToolGateway
 

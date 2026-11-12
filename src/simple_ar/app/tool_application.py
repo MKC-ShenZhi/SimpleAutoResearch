@@ -480,6 +480,8 @@ class ToolApplication:
             raise ValueError('Journal continuity requires the saved shared native work context')
         if config.get('delivery_review_protocol') not in {None, 'task.v1', 'task.v2', 'task.v3', 'task.v4', 'task.v5'}:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
+        if config.get('delivery_review_selection') not in {None, 'model.v1'}:
+            raise ValueError('Unsupported saved delivery review selection')
         if (config.get('candidate_review_protocol') not in {None, 'candidate.v1'}
                 or config.get('candidate_review_protocol') is not None and (
                     config.get('work_method') != GOAL_WORK_METHOD
@@ -2006,6 +2008,7 @@ class ToolApplication:
                     config['work_lifecycle'] = 'integrated.v3'
                     config['inspection_execution_protocol'] = 'shared.v2'
                     config['candidate_review_protocol'] = 'candidate.v1'
+                    config['delivery_review_selection'] = 'model.v1'
                     config['working_set_policy'] = 'recent.v4'
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = ('native.v4'

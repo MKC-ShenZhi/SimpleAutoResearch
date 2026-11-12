@@ -12,6 +12,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - Continuing work presents related review guidance more concisely and shares already displayed text for the same file version; original records and review scope remain available.
 - A task can deliver a previously reviewed claim directly, without recreating its summary and inventory; changed requests or artifacts still require an applicable review.
 - Workspace actions can explicitly submit their own completed or partial output through the common delivery path.
+- New ordinary tasks can choose direct delivery when independent review is unnecessary; the default and saved task contracts retain their review behavior, and required findings remain open.
 
 ### Fixed
 

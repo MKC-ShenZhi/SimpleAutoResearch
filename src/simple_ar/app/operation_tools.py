@@ -501,6 +501,11 @@ class OperationTools:
                     and self.config.get('candidate_review_protocol') == 'candidate.v1'
                     and self.config.get('working_set_policy') == 'recent.v4'
                     and self.config.get('candidate_handoff_policy') is None):
+                if self.config.get('delivery_review_selection') == 'model.v1':
+                    return (_ORDINARY_WORK + ' For a completed delivery, set independent_review=false only when '
+                        'the request and result do not need independent review. Keep independent review when '
+                        'the user requests it or the result needs a separate assessment. Omit the field to '
+                        'use the default review; this choice cannot waive an unresolved finding.')
                 return _ORDINARY_WORK
             instructions = _GOAL_WORK
             if self.config.get('candidate_review_protocol') == 'candidate.v1':

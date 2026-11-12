@@ -414,6 +414,28 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertEqual(len(c.inspection_requests), 1)
         self.assertEqual(c.app.session.store.read_json('delivery.json')['summary'], 'A bounded note')
 
+    def test_new_task_can_deliver_without_unnecessary_independent_review(self):
+        c = self.case
+        c._write('note.md', 'A short note.\n')
+        c.decisions.append(fixture._action('deliver_result', summary='A short note',
+            artifacts=['note.md'], independent_review=False))
+        self.drain()
+        self.assertEqual(c.app.session.manifest.status, 'completed', c.app.result_snapshot())
+        self.assertFalse(c.inspection_requests)
+        self.assertIs(c.app.session.store.read_json('delivery.json')['independent_review'], False)
+
+    def test_saved_task_keeps_its_automatic_review_contract(self):
+        c = self.case
+        c.app.state['config'].pop('delivery_review_selection')
+        c.app._save()
+        c._reload()
+        c._write('note.md', 'A short note.\n')
+        c.decisions.append(fixture._action('deliver_result', summary='A short note',
+            artifacts=['note.md'], independent_review=False))
+        self.drain()
+        self.assertEqual(c.app.session.manifest.status, 'completed', c.app.result_snapshot())
+        self.assertEqual(len(c.inspection_requests), 1)
+
     def test_mixed_batch_retains_effects_but_cannot_review_unobserved_production(self):
         c = self.case
         claim = {'summary':'A bounded note', 'artifacts':['note.md']}
