@@ -21,6 +21,42 @@ from simple_ar.tools.specs import ToolResult
 from simple_ar.tools.workspace import DeliveryRequest, WorkspaceToolGateway
 
 
+class WorkGuidanceTests(unittest.TestCase):
+    def test_historical_opinions_keep_open_issues_and_receipts(self):
+        def opinion(record, *, findings, investigations, outcomes):
+            return {'record': record, 'result': {'data': {'source_observations': {
+                'record': record, 'scope': 'Original opinion.'}}, 'metadata': {'delivery_opinion': {
+                    'coverage': 'complete', 'verdict': 'passed', 'findings': findings,
+                    'investigations': investigations, 'requested_outcomes': outcomes,
+                    'limitations': ['Known limitation.']}}}}
+
+        newest = opinion('records/new.json', findings=[],
+            investigations=[{'claim': 'Current result', 'outcome': 'supported', 'basis': 'Current evidence'}],
+            outcomes=[{'outcome': 'Current report', 'status': 'delivered'}])
+        older = opinion('records/old.json',
+            findings=[{'severity': 'required', 'message': 'Explain the discrepancy.', 'artifacts': ['report.md']}],
+            investigations=[{'claim': 'Old result', 'outcome': 'supported'},
+                {'claim': 'Unresolved result', 'outcome': 'unresolved'},
+                {'claim': 'Reassessed concern', 'outcome': 'supported', 'reassessed_prior': ['finding']}],
+            outcomes=[{'outcome': 'Old report', 'status': 'delivered'},
+                {'outcome': 'Missing explanation', 'status': 'missing'}])
+        originals = [newest, older]
+        owner = DeliveryReview(None, SimpleNamespace(compact_feedback=InspectionToolGateway.compact_feedback),
+            compact_work_feedback=True)
+        with patch.object(owner, 'inspection_feedback', return_value=originals):
+            latest, historical = owner.work_inputs(['report.md'])
+        self.assertEqual(latest['result']['metadata']['delivery_opinion']['requested_outcomes'],
+            newest['result']['metadata']['delivery_opinion']['requested_outcomes'])
+        prior = historical['result']['metadata']['delivery_opinion']
+        self.assertEqual(prior['findings'], older['result']['metadata']['delivery_opinion']['findings'])
+        self.assertEqual([row['claim'] for row in prior['investigations']],
+            ['Unresolved result', 'Reassessed concern'])
+        self.assertEqual([row['status'] for row in prior['requested_outcomes']], ['missing'])
+        self.assertEqual(prior['limitations'], ['Known limitation.'])
+        self.assertEqual(historical['result']['data']['source_observations']['record'], 'records/old.json')
+        self.assertEqual(len(older['result']['metadata']['delivery_opinion']['investigations']), 3)
+
+
 class ControlledInspector:
     retained_scope = InspectionToolGateway.retained_scope
     delivery_scope = InspectionToolGateway.delivery_scope

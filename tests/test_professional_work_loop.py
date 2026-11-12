@@ -6671,6 +6671,24 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(json.dumps(feedback).count('Consider making the uncertainty explicit.'), 1)
         self.assertFalse(assessment_issues(self.app.workspace, self._observations(), ['notes.md']))
 
+    def test_review_guidance_follows_recorded_copy_not_unrelated_equal_bytes(self):
+        self._create(current_method=True, delivery_protocol=None)
+        content = 'A short statement to inspect.\n'
+        self._write('source.md', content)
+        self._write('unrelated.md', content)
+        self.review = lambda _: {'findings':[{'subject':'target-1', 'severity':'advisory',
+            'message':'Clarify the source statement.'}], 'limitations':[]}
+        self._inspect(['source.md'])
+
+        unrelated = self.app.gateway.professional_inputs(['unrelated.md'])
+        self.assertNotIn('Clarify the source statement.', json.dumps(unrelated))
+        source = self._read('source.md')
+        self._submit(_action('copy_file', source='source.md', path='copied.md',
+            source_sha256=source['sha256']))
+        self._ok('copy_file')
+        guidance = self.app.gateway.professional_inputs(['copied.md'])
+        self.assertIn('Clarify the source statement.', json.dumps(guidance))
+
     def test_pending_required_projection_keeps_versions_until_explicit_current_reassessment(self):
         from simple_ar.core.assessments import (
             assessment_state, current_assessments, finding_id,

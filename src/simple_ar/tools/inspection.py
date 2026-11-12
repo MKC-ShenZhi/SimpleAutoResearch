@@ -1288,23 +1288,30 @@ class InspectionToolGateway:
             'artifact_count': len(binding['artifacts'])}
 
     @staticmethod
-    def compact_feedback(result: dict) -> dict:
-        """Keep unresolved checks intact; supported details remain at their original receipt."""
+    def compact_feedback(result: dict, *, historical: bool = False) -> dict:
+        """Keep actionable guidance; full prior opinions remain in their receipts."""
         source = (result.get('data') or {}).get('source_observations') or {}
         opinion = (result.get('metadata') or {}).get('delivery_opinion') or {}
         investigations = opinion.get('investigations')
-        if (not source.get('record') or not isinstance(investigations, list) or not any(
-                isinstance(item, dict) and item.get('outcome') == 'supported' for item in investigations)):
+        outcomes = opinion.get('requested_outcomes')
+        if not source.get('record') or not opinion:
             return result
         projected = deepcopy(result)
-        projected['metadata']['delivery_opinion']['investigations'] = [
-            {key: value for key, value in item.items() if key in
-                {'claim', 'outcome', 'scope', 'necessary', 'basis', 'reassessed_prior'}}
-            if isinstance(item, dict) and item.get('outcome') == 'supported' else item
-            for item in investigations]
+        target = projected['metadata']['delivery_opinion']
+        if isinstance(investigations, list):
+            target['investigations'] = [
+                {key: value for key, value in item.items() if key in
+                    {'claim', 'outcome', 'scope', 'necessary', 'basis', 'reassessed_prior'}}
+                if isinstance(item, dict) and item.get('outcome') == 'supported' else item
+                for item in investigations if not (historical and isinstance(item, dict)
+                    and item.get('outcome') == 'supported' and not item.get('reassessed_prior'))]
+        if historical and isinstance(outcomes, list):
+            target['requested_outcomes'] = [item for item in outcomes
+                if not isinstance(item, dict) or item.get('status') != 'delivered']
         locator = projected['data']['source_observations']
         locator['scope'] = (locator.get('scope', '') +
-            ' Details of supported investigations remain in the original receipt.')
+            (' Earlier supported investigations and delivered outcomes remain in the original receipt.'
+             if historical else ' Details of supported investigations remain in the original receipt.'))
         return projected
 
     @staticmethod

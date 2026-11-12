@@ -334,8 +334,12 @@ class DeliveryReview:
         if include_observations:
             return []
         feedback = self.inspection_feedback(targets)
-        return ([{**row, 'result': self.inspector.compact_feedback(row['result'])} for row in feedback]
-                if self.compact_work_feedback else feedback)
+        if not self.compact_work_feedback:
+            return feedback
+        latest = next((i for i, row in enumerate(feedback)
+            if (row['result'].get('metadata') or {}).get('delivery_opinion')), None)
+        return [{**row, 'result': self.inspector.compact_feedback(row['result'],
+            historical=latest is not None and i > latest)} for i, row in enumerate(feedback)]
 
     def feedback_from_observation(self, observed: dict, *, guidance_only: bool = False) -> dict | None:
         """Resolve original opinions once for revision and completion consumers."""
@@ -381,8 +385,11 @@ class DeliveryReview:
         Changed subjects keep guidance with explicit old/current versions, never
         acceptance. Source bodies remain in the original read observations.
         """
+        from simple_ar.tools.materials import related_review_target
+
         roots = [self.workspace.resolve(path) for path in targets]
         selected = None
+        copy_cache = {}
         result, concluded, repeated = [], set(), {}
         for observed in reversed(self.observations() if self.observations is not None else []):
             feedback = self.feedback_from_observation(observed, guidance_only=True)
@@ -404,7 +411,6 @@ class DeliveryReview:
                     subject = self.workspace.resolve(locator)
                 except ValueError:
                     continue  # Old locators do not grant new access.
-                copy = next((path for path, value in selected.items() if value == digest), None)
                 has_guidance = any(finding.get('severity') in {'required', 'advisory'}
                     and locator in (finding.get('subjects') or {})
                     for assessment in assessments if isinstance(assessment, dict)
@@ -425,12 +431,14 @@ class DeliveryReview:
                 if signature in repeated:
                     duplicate_records.append(signature)
                     continue
-                if (not package and (subject, digest) in concluded and not has_guidance or not (copy is not None or any(subject == root
-                        or root.is_dir() and subject.is_relative_to(root) for root in roots))):
+                if not package and (subject, digest) in concluded and not has_guidance:
+                    continue
+                current_path = related_review_target(self.workspace, subject, digest, roots, selected,
+                    copy_lineage=True, cache=copy_cache)
+                if current_path is None:
                     continue
                 if signature is not None:
                     signatures.append(signature)
-                current_path = copy or subject
                 current = (self.workspace.artifact_hashes([str(current_path)])[str(current_path)]
                     if current_path.is_file() else None)
                 subjects.append({'path': locator, 'reviewed_sha256': digest,

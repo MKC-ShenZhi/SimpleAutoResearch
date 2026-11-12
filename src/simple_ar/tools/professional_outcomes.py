@@ -29,6 +29,7 @@ def related_feedback(workspace: Any, store: ArtifactStore, session_id: str, turn
     """
     roots = [workspace.resolve(path) for path in targets]
     selected_hashes = None
+    copy_cache = {}
     reviews, covered = [], set()
     for turn in reversed(turns):
         calls = {row['id']: row for row in store.read_json(turn['reply']).get('tool_calls', [])}
@@ -53,16 +54,13 @@ def related_feedback(workspace: Any, store: ArtifactStore, session_id: str, turn
                     subject = workspace.resolve(locator)
                 except ValueError:
                     continue
-                if copy_lineage:
-                    from simple_ar.tools.materials import _recorded_copy_source
-                    selected = next((path for path, value in selected_hashes.items()
-                        if value == digest and (path == subject or _recorded_copy_source(
-                            workspace, str(path), digest, str(subject)))), None)
-                else:
-                    selected = next((path for path, value in selected_hashes.items() if value == digest), None)
-                if subject not in covered and (selected is not None or any(subject == root or root.is_dir()
-                        and subject.is_relative_to(root) for root in roots)):
-                    relevant[locator] = (subject, selected or subject, digest)
+                if subject in covered:
+                    continue
+                from simple_ar.tools.materials import related_review_target
+                selected = related_review_target(workspace, subject, digest, roots, selected_hashes,
+                    copy_lineage=copy_lineage, cache=copy_cache)
+                if selected is not None:
+                    relevant[locator] = (subject, selected, digest)
             if not relevant:
                 continue
             identity = Path(item['result']).parent.name

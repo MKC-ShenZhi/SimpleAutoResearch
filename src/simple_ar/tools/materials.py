@@ -607,6 +607,20 @@ def _recorded_copy_source(workspace: Any, target: str, digest: str, source: str,
     return False
 
 
+def related_review_target(workspace: Any, subject: Path, digest: str, roots: list[Path],
+                          selected: dict[Path, str], *, copy_lineage: bool,
+                          cache: dict | None = None) -> Path | None:
+    """Relate a reviewed subject to a requested file or a recorded copy."""
+    if not copy_lineage:
+        previous = next((path for path, value in selected.items() if value == digest), None)
+        if previous is not None:
+            return previous
+    if any(subject == root or root.is_dir() and subject.is_relative_to(root) for root in roots):
+        return subject
+    return next((path for path, value in selected.items() if value == digest and copy_lineage
+        and _recorded_copy_source(workspace, str(path), digest, str(subject), cache=cache)), None)
+
+
 def material_observation_seed(*, workspace: Any, inventories: list[dict] | None = None,
                               provider: Callable[[list[str]], list[dict]] | None,
                               roots: list[str], context: dict,
