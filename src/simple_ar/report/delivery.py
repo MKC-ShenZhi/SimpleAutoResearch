@@ -14,7 +14,7 @@ from typing import Any, Callable
 from simple_ar.core.assessments import assessment_issues
 from simple_ar.tools.delivery_review import delivery_requires_review, prepare_delivery_review
 from simple_ar.tools.specs import tool_completion
-from simple_ar.tools.workspace import DeliveryRequest
+from simple_ar.tools.workspace import DeliveryRequest, ReviewedDeliveryRequest
 
 
 def operation_report_admission(request: DeliveryRequest, requirement: dict | None) -> list[str]:
@@ -99,6 +99,16 @@ class Delivery:
         self.config, self.observations, self.user_requests = config, observations, user_requests
         self.legacy_report_status = config.get('delivery_review_protocol') not in {'task.v4', 'task.v5'}
 
+    def resolve_request(self, delivery: dict | DeliveryRequest, observations: list[dict]) -> DeliveryRequest:
+        """Resolve an explicit review reference to the original checked claim."""
+        if ((isinstance(delivery, dict) and delivery.get('reviewed_candidate') is not None)
+                or isinstance(delivery, ReviewedDeliveryRequest) and delivery.reviewed_candidate is not None):
+            choice = ReviewedDeliveryRequest.model_validate(delivery)
+            if self.review_owner is None or self.user_requests is None:
+                raise ValueError('This task has no reusable independent review')
+            return self.review_owner.reviewed_claim(choice.reviewed_candidate, observations, self.user_requests)
+        return delivery if isinstance(delivery, DeliveryRequest) else DeliveryRequest.model_validate(delivery)
+
     def working_guidance(self, accepted_delivery: dict | None, *, include_lifecycle: bool,
                          observations: list[dict] | None = None) -> tuple[dict | None, dict | None]:
         """Project one decision's guidance from the same observations and review."""
@@ -143,7 +153,7 @@ class Delivery:
         return None
 
     def issues(self, observations: list[dict], delivery: dict, *, proposed=None, review_issues=None):
-        request = DeliveryRequest.model_validate(delivery)
+        request = self.resolve_request(delivery, observations)
         if request.unresolved:
             return []  # Existing terminal binding still proves actual partial files.
         admission = operation_report_admission(request, self.config.get('report_requirement'))
@@ -319,7 +329,7 @@ class Delivery:
         Partial delivery still resolves real files but claims no complete review.
         This API does not replace saved canonical Writer contract validation.
         """
-        request = delivery if isinstance(delivery, DeliveryRequest) else DeliveryRequest.model_validate(delivery)
+        request = self.resolve_request(delivery, observations)
         admission = operation_report_admission(request, self.config.get('report_requirement'))
         if admission:
             raise ValueError('; '.join(admission))

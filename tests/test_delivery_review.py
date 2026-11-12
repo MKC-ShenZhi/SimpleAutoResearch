@@ -583,6 +583,34 @@ class DeliveryReviewTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'missing workspace file'):
             owner.validate_actual({**partial, 'artifacts': ['absent']}, [])
 
+    def test_reviewed_candidate_reuses_only_the_unchanged_accepted_claim(self):
+        from simple_ar.report.delivery import Delivery
+        from simple_ar.tools.workspace import ReviewedDeliveryRequest
+
+        proof = self.review()
+        self.observe(proof)
+        owner = Delivery(workspace=self.workspace,
+            gateway=SimpleNamespace(delivery_issues=lambda *args, **kwargs: []),
+            publication=SimpleNamespace(check_requested_delivery=lambda *args, **kwargs: None,
+                conversion_inputs=lambda *args: set()),
+            review_owner=self.owner, config={'delivery_review_protocol': 'task.v3'},
+            observations=lambda: self.observations, user_requests=lambda: self.requests)
+        reference = {'reviewed_candidate': 'parent-1'}
+        claim = owner.resolve_request(reference, self.observations)
+        self.assertEqual(claim.summary, self.delivery['summary'])
+        self.assertEqual(owner.issues(self.observations, reference), [])
+        self.assertEqual(len(self.inspector.calls), 1)
+        with self.assertRaises(ValueError):
+            ReviewedDeliveryRequest.model_validate({**reference, 'summary': 'A new claim'})
+
+        self.requests.append('A new request')
+        with self.assertRaisesRegex(ValueError, 'no longer matches'):
+            owner.resolve_request(reference, self.observations)
+        self.requests.pop()
+        (self.workspace.workspace / 'bundle' / 'appendix.txt').write_text('Changed', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'no longer matches'):
+            owner.resolve_request(reference, self.observations)
+
     def test_actual_delivery_owner_binds_registered_current_outputs_and_rechecks_versions(self):
         from simple_ar.report.delivery import Delivery
         owner = Delivery(workspace=self.workspace,

@@ -598,7 +598,10 @@ class OperationTools:
                 spec = self.registry.get(row['function']['name'])
                 # These owners supply outer decisions, never inner work actions.
                 if spec.name in {'select_work', 'review_result', 'deliver_result'} or (
-                        spec.completion is not None and spec.completion.kind == 'question'):
+                        spec.completion is not None and spec.completion.kind == 'question') or (
+                        self.config.get('work_selection_policy') == 'native.v4'
+                        and spec.domain == 'workspace' and spec.completion is not None
+                        and spec.completion.field):
                     result.append(row)
                     continue
                 schema = spec.service_parameters_schema()
@@ -620,7 +623,7 @@ class OperationTools:
     def service_error(self, spec: CommonToolSpec, arguments: dict, *, selected_work: bool = False) -> str:
         if ((selected_work and self.config.get('work_selection_policy') == 'outcomes.v1'
                 or self.config.get('work_selection_policy') == 'native.v4'
-                and spec.name not in {'review_result', 'deliver_result'})
+                and spec.domain != 'workspace' and spec.name not in {'review_result', 'deliver_result'})
                 and spec.completion is not None and spec.completion.kind != 'question'):
             completion = spec.completion
             if (spec.service_parameters_schema() is None
@@ -651,6 +654,12 @@ class OperationTools:
             reply = store.read_json(turn['reply'])
             if call not in reply.get('tool_calls', []):
                 raise ValueError('Work service differs from its retained native reply')
+            spec = self.registry.get(call['function']['name'])
+            if (spec is not None and spec.domain == 'workspace' and spec.completion is not None
+                    and spec.completion.field):
+                arguments = json.loads(call['function']['arguments'])
+                if isinstance(arguments, dict) and arguments.get(spec.completion.field) is not None:
+                    return False
             return call['function']['name'] not in {'review_result', 'deliver_result'}
         if binding.get('tool_admission') != 'work_selection.v1':
             return False

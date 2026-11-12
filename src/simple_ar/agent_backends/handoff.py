@@ -109,10 +109,7 @@ def build_code_task_handoff(
     task_path = run_dir / "code_task" / "task.md"
     if not task_text and task_path.is_file():
         task_text = task_path.read_text(encoding="utf-8", errors="replace")
-    try:
-        memory_context = task_memory_context(run_dir)
-    except Exception:
-        memory_context = ""
+    memory_context = task_memory_context(run_dir)
     memory_paths = code_task_memory_paths(run_dir)
     refs = [
         "code_task/task.md",
@@ -172,10 +169,7 @@ def build_code_task_greenfield_handoff(
     task_path = run_dir / "code_task" / "task.md"
     if not task_text and task_path.is_file():
         task_text = task_path.read_text(encoding="utf-8", errors="replace")
-    try:
-        memory_context = task_memory_context(run_dir)
-    except Exception:
-        memory_context = ""
+    memory_context = task_memory_context(run_dir)
     memory_paths = code_task_memory_paths(run_dir)
     refs = [
         "code_task/task.md",

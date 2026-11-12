@@ -4872,7 +4872,13 @@ class ToolApplication:
         if payload.get('status') == 'ok' and delivery is not None:
             outputs = tuple(store.require(ArtifactRef.from_dict(row))
                 for row in payload.get('metadata', {}).get('capability_artifacts', []))
-            request = DeliveryRequest.model_validate(delivery)
+            try:
+                request = (self.operations.delivery.resolve_request(delivery, self._operation_observations())
+                           if self.operations is not None and delivery.get('reviewed_candidate') is not None
+                           else DeliveryRequest.model_validate(delivery))
+            except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
+                payload.update(status='blocked', error=str(exc))
+                return payload
             if self.state['config'].get('report_protocol') == _REPORT_PROTOCOL:
                 try:
                     canonical = self.workspace.resolve_delivery(request, current_outputs=outputs)

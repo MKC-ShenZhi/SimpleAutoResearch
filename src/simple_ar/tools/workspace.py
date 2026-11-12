@@ -187,6 +187,25 @@ class CandidateReviewRequest(DeliveryRequest):
         description='Known evidence limits, scope and uncertainty relevant to the current claim; these do not certify correctness or waive required findings.')
 
 
+class ReviewedDeliveryRequest(DeliveryRequest):
+    """Deliver a new claim, or select an existing independently reviewed one."""
+
+    summary: str = Field(default='', description='Completion claim; omit when selecting a reviewed candidate.')
+    reviewed_candidate: str | None = Field(default=None, min_length=1,
+        exclude_if=lambda value: value is None,
+        description='A prior review_result record or inspection identity. Deliver its unchanged reviewed claim and inventory without copying them. Omit all other delivery fields when using this.')
+
+    @model_validator(mode='after')
+    def select_claim(self) -> 'ReviewedDeliveryRequest':
+        if self.reviewed_candidate is not None:
+            if (self.summary or self.summary_source is not None or self.artifacts or self.project_root is not None
+                    or self.unresolved or self.limitations or self.report is not None):
+                raise ValueError('A reviewed candidate cannot be combined with a new delivery claim')
+        elif not self.summary.strip():
+            raise ValueError('Provide a delivery summary or select a reviewed candidate')
+        return self
+
+
 def prepared_report_delivery_schema(schema: dict, field: str) -> None:
     """Annotate the declared completion path, without relying on model names.
 
@@ -407,6 +426,11 @@ def workspace_tool_specs(*, candidate_review: bool = False,
                 'It returns independent findings without delivering. If the candidate is ready for final '
                 'delivery, provide the intended final claim, report and inventory; an unchanged final claim '
                 'can reuse its opinion. A pending review itself is not unfinished requested work.')
+        if name == 'deliver_result' and candidate_review_protocol == 'candidate.v1':
+            model = ReviewedDeliveryRequest
+            description = ('Deliver actual artifacts and disclose unfinished work, or select a passed '
+                'review_result by its record or identity to deliver the same reviewed claim and inventory. '
+                'A changed request or artifact requires a current applicable review.')
         if candidate_review_protocol == 'candidate.v1' and name == 'edit_file':
             model = _ContextEdit
             description = ('Replace text in a workspace file using exact old text or two short unique anchors. '
@@ -453,6 +477,8 @@ def validate_workspace_arguments(name: str, arguments: dict[str, Any], *,
         raise ValueError('Unsupported saved candidate review protocol')
     if name == 'review_result' and candidate_review_protocol == 'candidate.v1':
         return CandidateReviewRequest.model_validate(arguments)
+    if name == 'deliver_result' and candidate_review_protocol == 'candidate.v1':
+        return ReviewedDeliveryRequest.model_validate(arguments)
     if name == 'edit_file' and candidate_review_protocol == 'candidate.v1':
         return _ContextEdit.model_validate(arguments)
     return _TOOLS[name][0].model_validate(arguments)
@@ -2158,7 +2184,11 @@ class WorkspaceToolGateway:
                     # candidate request stays in its accepted action receipt;
                     # existing delivery/inspection owners bind these actual bytes.
                     model = DeliveryRequest.model_validate(model.model_dump())
-                data = self.resolve_delivery(model)
+                if isinstance(model, ReviewedDeliveryRequest):
+                    data = ({'reviewed_candidate': model.reviewed_candidate} if model.reviewed_candidate
+                        else self.resolve_delivery(DeliveryRequest.model_validate(model.model_dump())))
+                else:
+                    data = self.resolve_delivery(model)
             elif name == "ask_user":
                 data = model.model_dump()
             elif name == "run_process":

@@ -1075,6 +1075,40 @@ class DeliveryReview:
                     result = ToolResult(tool_name='inspect_artifacts', status='blocked', error=str(exc))
             return self._envelope(binding, identity, result, error=str(exc))
 
+    def reviewed_claim(self, reference: str, observations: list[dict],
+                       user_requests: Callable[[], list[str]]) -> DeliveryRequest:
+        """Select a passed prior claim without asking the model to copy it again."""
+        def locator(value: Any) -> str:
+            value = value if isinstance(value, str) else ''
+            return value.replace('\\', '/').removeprefix('records/').removeprefix('attempts/')
+
+        wanted = locator(reference)
+        for observed in reversed(observations):
+            candidate = (observed.get('metadata') or {}).get('delivery_review')
+            if not isinstance(candidate, dict):
+                continue
+            identity = candidate.get('identity', '')
+            names = {locator(identity), locator(observed.get('record')),
+                     locator(observed.get('review_record'))}
+            if not wanted or wanted not in names:
+                continue
+            binding = candidate.get('binding')
+            if not isinstance(binding, dict) or binding.get('schema_version') != 'delivery_review.v3' or binding.get('purpose'):
+                raise ValueError('The selected review does not cover a completed delivery claim')
+            request = DeliveryRequest.model_validate(binding['claim'])
+            if request.unresolved:
+                raise ValueError('The selected review covers unfinished work')
+            resolved = self.workspace.resolve_delivery(request)
+            current = prepare_delivery_review(self.workspace, request, resolved['artifacts'],
+                user_requests, protocol=self.protocol)
+            if current != binding:
+                raise ValueError('The selected review no longer matches the current request or artifacts')
+            issues = self.issues(observations, current)
+            if issues:
+                raise ValueError('; '.join(issues))
+            return request
+        raise ValueError('Reviewed candidate was not found in the accepted task records')
+
     def issues(self, observations: list[dict], binding: dict | None) -> list[str]:
         try:
             if binding is None:

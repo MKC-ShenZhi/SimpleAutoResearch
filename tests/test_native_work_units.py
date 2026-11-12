@@ -379,6 +379,32 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.drain()
         self.assertEqual(c.app.session.manifest.status, 'partial')
 
+    def test_reviewed_candidate_can_be_delivered_without_recopying_or_rechecking(self):
+        c = self.case
+        c._write('note.md', 'The supplied observations support this bounded note.\n')
+        c.decisions.append(fixture._action('review_result', summary='A bounded note', artifacts=['note.md']))
+        self.drain()
+        reviewed = c._last('review_result')
+        identity = reviewed['metadata']['delivery_review']['identity']
+        count = len(c.inspection_requests)
+        c._reload()
+        c.decisions.append(fixture._action('deliver_result', reviewed_candidate=identity))
+        self.drain()
+        self.assertEqual(c.app.session.manifest.status, 'completed', c.app.result_snapshot())
+        self.assertEqual(len(c.inspection_requests), count)
+        self.assertEqual(c.app.session.store.read_json('delivery.json')['summary'], 'A bounded note')
+
+    def test_workspace_write_can_deliver_its_actual_partial_result(self):
+        c = self.case
+        c.decisions.append(fixture._action('write_file', path='note.md', content='Available work.\n',
+            delivery={'summary': 'Available note', 'artifacts': ['note.md'],
+                      'unresolved': ['The requested analysis remains unfinished.']}))
+        self.drain()
+        self.assertEqual(c.app.session.manifest.status, 'partial', c.app.result_snapshot())
+        self.assertEqual((c.root / 'workspace/note.md').read_text(), 'Available work.\n')
+        self.assertEqual(c.app.session.store.read_json('delivery.json')['unresolved'],
+            ['The requested analysis remains unfinished.'])
+
     def test_mixed_batch_retains_effects_but_cannot_review_unobserved_production(self):
         c = self.case
         claim = {'summary':'A bounded note', 'artifacts':['note.md']}
