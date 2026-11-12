@@ -178,7 +178,8 @@ class LocalWorkspaceTests(unittest.TestCase):
             before = {p: p.read_bytes() for p in app.session.store.root.rglob('*') if p.is_file()}
             catalog = Mock()
             catalog.select.return_value = ('fixture', Mock())
-            with patch.object(ToolApplication, 'load', side_effect=AssertionError('No old executable assembly')), \
+            with patch('simple_ar.app.reuse._delivered_project_version', return_value=None), \
+                    patch.object(ToolApplication, 'load', side_effect=AssertionError('No old executable assembly')), \
                     patch.object(LLMClient, 'from_env', side_effect=AssertionError('No model resolution')), \
                     patch.object(Path, 'mkdir', side_effect=AssertionError('No task/proof writes')), \
                     patch.object(BudgetLedger, 'save', side_effect=AssertionError('No old ledger settlement')), \
@@ -236,7 +237,8 @@ class LocalWorkspaceTests(unittest.TestCase):
                 admitted.append(path)
                 return workspace.read(path)
 
-            with patch.object(ToolApplication, 'load', side_effect=AssertionError('No old executable assembly')):
+            with patch('simple_ar.app.reuse._delivered_project_version', return_value=None), \
+                    patch.object(ToolApplication, 'load', side_effect=AssertionError('No old executable assembly')):
                 with self.assertRaises(ValueError):
                     select_reuse(app.session.store.root, ['code_project'], access=ReuseAccess(authorize=admit))
             self.assertIn(secret, admitted)
@@ -252,9 +254,18 @@ class LocalWorkspaceTests(unittest.TestCase):
                     raise AssertionError('Receipt bytes read before exact admission')
                 return read_json(path)
 
-            with patch('simple_ar.tools.workspace.read_json', side_effect=read_allowed):
+            with patch('simple_ar.app.reuse._delivered_project_version', return_value=None), \
+                    patch('simple_ar.tools.workspace.read_json', side_effect=read_allowed):
                 with self.assertRaisesRegex(ValueError, 'Denied exact process receipt'):
                     select_reuse(base / 'old', ['code_project'], access=ReuseAccess(authorize=deny_receipt))
+
+            # A captured delivery can be carried into a new task without
+            # opening unrelated live-process inputs or inheriting authority.
+            admitted.clear()
+            selected = select_reuse(base / 'old', ['code_project'], access=ReuseAccess(authorize=admit))
+            self.assertEqual(selected.version, 1)
+            self.assertNotIn(secret, admitted)
+            self.assertIsNone(selected.project)
 
     def test_running_ui_feedback_reuses_submission_receipts_and_execution_boundary(self):
         with tempfile.TemporaryDirectory() as temporary:
