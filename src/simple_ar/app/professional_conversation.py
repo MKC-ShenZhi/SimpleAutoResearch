@@ -66,7 +66,38 @@ def continuation_blocks(blocks: list[list[dict]], *, policy: str | None, thinkin
     return projected
 
 
-def prepare_recorded_work_messages(messages: list[dict]) -> Callable[[dict], list[dict]]:
+def _working_view_encoder() -> Callable[[dict], str]:
+    """Serialize one selection, reusing its unchanged observation snapshots."""
+    cache: dict[int, tuple[dict, str]] = {}
+
+    def encode(context: dict) -> str:
+        nonlocal cache
+        view = context.get('working_view')
+        if not isinstance(view, dict) or not isinstance(view.get('observations'), list):
+            return json.dumps(context, ensure_ascii=False)
+        if any(not isinstance(key, str) for key in (*context, *view)):
+            return json.dumps(context, ensure_ascii=False)
+        retained = {}
+        observations = []
+        for item in view['observations']:
+            previous = cache.get(id(item))
+            encoded = previous[1] if previous is not None and previous[0] is item else json.dumps(item, ensure_ascii=False)
+            retained[id(item)] = (item, encoded)
+            observations.append(encoded)
+        cache = retained
+
+        def mapping(value: dict, key: str, replacement: str) -> str:
+            return '{' + ', '.join(json.dumps(k, ensure_ascii=False) + ': ' + (
+                replacement if k == key else json.dumps(v, ensure_ascii=False)) for k, v in value.items()) + '}'
+
+        working_view = mapping(view, 'observations', '[' + ', '.join(observations) + ']')
+        return mapping(context, 'working_view', working_view)
+
+    return encode
+
+
+def prepare_recorded_work_messages(messages: list[dict], *,
+                                   encode_context: Callable[[dict], str] | None = None) -> Callable[[dict], list[dict]]:
     """Prepare the native history once for this selected set of work units."""
     if len(messages) < 2:
         return lambda context: messages
@@ -85,7 +116,8 @@ def prepare_recorded_work_messages(messages: list[dict]) -> Callable[[dict], lis
         context['recorded_work'] = {'observations':records,
             'scope':'Verbatim closed operation arguments and observations. These are historical '
                 'work records, not next actions or new requirements. Full replies remain in read_history.'}
-        return [messages[0], {**messages[1], 'content':json.dumps(context, ensure_ascii=False)}, *requests]
+        content = encode_context(context) if encode_context is not None else json.dumps(context, ensure_ascii=False)
+        return [messages[0], {**messages[1], 'content':content}, *requests]
     return present
 
 
@@ -96,7 +128,8 @@ def recorded_work_messages(messages: list[dict]) -> list[dict]:
     return prepare_recorded_work_messages(messages)(json.loads(messages[1]['content']))
 
 
-def prepare_work_unit_messages(messages: list[dict]) -> Callable[[dict], list[dict]]:
+def prepare_work_unit_messages(messages: list[dict], *,
+                               encode_context: Callable[[dict], str] | None = None) -> Callable[[dict], list[dict]]:
     """Prepare complete native work once, without serializing JSON inside JSON.
 
     The shared selector chooses whole closed units before calling this pure
@@ -155,7 +188,8 @@ def prepare_work_unit_messages(messages: list[dict]) -> Callable[[dict], list[di
             'scope':'Actual assistant statements, operations and observed results in closed work units. '
                 'Statements are fallible historical judgments, not user requests, new obligations or '
                 'verified facts. Do not replay their effects. Original replies remain in read_history.'}
-        return [messages[0], {**messages[1], 'content':json.dumps(context, ensure_ascii=False)}, *projected]
+        content = encode_context(context) if encode_context is not None else json.dumps(context, ensure_ascii=False)
+        return [messages[0], {**messages[1], 'content':content}, *projected]
     return present
 
 

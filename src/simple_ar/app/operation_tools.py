@@ -550,12 +550,15 @@ class OperationTools:
         """Select a pure projector once before the capacity selector iterates."""
         if self.config.get('work_method') != GOAL_WORK_METHOD:
             return None
-        if self.config.get('work_selection_policy') == 'native.v4':
-            from simple_ar.app.professional_conversation import prepare_work_unit_messages
-            return prepare_work_unit_messages
-        from simple_ar.app.professional_conversation import prepare_recorded_work_messages
-        return (None if self.work is not None and self.work.source_work
-                and self.work.selected() is not None else prepare_recorded_work_messages)
+        from simple_ar.app.professional_conversation import (
+            _working_view_encoder, prepare_recorded_work_messages, prepare_work_unit_messages)
+        if (self.config.get('work_selection_policy') != 'native.v4' and self.work is not None
+                and self.work.source_work and self.work.selected() is not None):
+            return None
+        prepare = (prepare_work_unit_messages if self.config.get('work_selection_policy') == 'native.v4'
+                   else prepare_recorded_work_messages)
+        encode = _working_view_encoder()
+        return lambda messages: prepare(messages, encode_context=encode)
 
     def coordinator_eligible(self, spec: CommonToolSpec) -> bool:
         """Consumer role, not authorization; callers and inspectors keep primitives."""

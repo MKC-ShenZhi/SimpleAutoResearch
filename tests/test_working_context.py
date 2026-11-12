@@ -57,6 +57,23 @@ def expand_history_view(view):
 
 
 class WorkingContextTests(unittest.TestCase):
+    def test_work_view_serialization_preserves_material_selection(self):
+        from simple_ar.app.professional_conversation import (
+            _working_view_encoder, prepare_recorded_work_messages, prepare_work_unit_messages)
+        observations = [observation(i, ('内容 "quoted" \\ text ' * 40) + str(i)) for i in range(8)]
+        arguments = dict(base_context={'permissions': {'write': ['outputs/']}, 'resources': {}},
+            turn_blocks=[block(i, observations[i]['text']) for i in range(8)],
+            observations=observations, material_policy='referenced',
+            selected_records=[row['record'] for row in observations],
+            context_token_target=2000, estimate_tokens=estimate_tokens)
+        for prepare in (prepare_recorded_work_messages, prepare_work_unit_messages):
+            with self.subTest(prepare=prepare):
+                expected = select(**arguments, message_projector=prepare)
+                encode = _working_view_encoder()
+                actual = select(**arguments,
+                    message_projector=lambda messages: prepare(messages, encode_context=encode))
+                self.assertEqual(actual, expected)
+
     def test_source_authority_preserves_requests_and_atomic_history(self):
         requests = ['  Analyze the supplied measurements.\n', 'Retain uncertainty: ±1.',
                     'Explain the remaining limitations.']
