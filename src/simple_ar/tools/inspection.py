@@ -1627,6 +1627,7 @@ class InspectionToolGateway:
                 selected=self._selected_inspection_rows(saved, receipt['response']) if current_inputs else None)
         if self.protocol and result.status == 'ok':
             assess = self._delivery_assessment if package else self._subject_assessments
+            key = 'delivery_assessment' if package else 'assessments'
             expected, error = assess(saved, receipt, identity, '', check_versions=current_inputs)
             if error or result.metadata[key] != expected:
                 raise ValueError('Inspection cached subject decisions differ from the retained response; no replay')
