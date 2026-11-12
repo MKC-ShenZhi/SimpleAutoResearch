@@ -533,8 +533,17 @@ class GoalWorkTests(unittest.TestCase):
                 owner.bind_result(request, payload, 'review-attempt', current_outputs=(),
                     current_result={}, retain=lambda: None, review_capacity=nullcontext,
                     may_start=True, candidate=is_candidate)
+        failed = ToolResult(tool_name='inspect_artifacts', status='error',
+            error='Independent review failed').model_dump(mode='json')
+        returned = ToolResult(tool_name='review_result').model_dump(mode='json')
+        with patch.object(owner, 'review_delivery', return_value={'identity': 'review-attempt', 'result': failed}):
+            owner.bind_result(request, returned, 'review-attempt', current_outputs=(),
+                current_result={}, retain=lambda: None, review_capacity=nullcontext,
+                may_start=True, candidate=True)
         self.assertEqual(candidate['status'], 'blocked')
         self.assertIn('Review could not start', candidate['error'])
+        self.assertEqual(returned['status'], 'blocked')
+        self.assertEqual(returned['error'], 'Independent review failed')
         self.assertEqual(producer['status'], 'ok')
         self.assertIn('Review could not start', producer['metadata']['delivery_review_error'])
         self.assertEqual((case.root / 'workspace' / 'note.md').read_text(),
