@@ -20,66 +20,76 @@ def native_result_digest(observed: dict) -> str:
 
 
 def related_feedback(workspace: Any, store: ArtifactStore, session_id: str, turns: list[dict],
-                     targets: list[str], owners: dict[str, Any], *, copy_lineage: bool) -> list[dict]:
+                     targets: list[str], owners: dict[str, Any], *, copy_lineage: bool,
+                     observations: list[dict] | None = None) -> list[dict]:
     """Project accepted domain reviews onto the requested materials.
 
     Domain owners interpret and validate their own receipts. This shared view
     relates reviewed versions to current materials; it neither re-runs reviews
     nor turns an earlier opinion into acceptance of a later version.
     """
+    def records():
+        if observations is not None:
+            from simple_ar.tools.specs import tool_result_payload
+            for observed in reversed(observations):
+                owner = owners.get(observed.get('tool_name'))
+                if owner is not None and observed.get('status') == 'ok':
+                    yield owner, observed['arguments'], tool_result_payload(observed), observed['record']
+            return
+        for turn in reversed(turns):
+            calls = {row['id']: row for row in store.read_json(turn['reply']).get('tool_calls', [])}
+            for item in reversed(turn['tools']):
+                call = calls[item['id']]
+                owner = owners.get(call['function']['name'])
+                if owner is None:
+                    continue
+                result = store.read_json(item['result'])
+                if result.get('status') == 'ok':
+                    yield owner, json.loads(call['function']['arguments']), result, item['result']
+
     roots = [workspace.resolve(path) for path in targets]
     selected_hashes = None
     reviews, covered = [], set()
-    for turn in reversed(turns):
-        calls = {row['id']: row for row in store.read_json(turn['reply']).get('tool_calls', [])}
-        for item in reversed(turn['tools']):
-            call = calls[item['id']]
-            owner = owners.get(call['function']['name'])
-            if owner is None:
+    for owner, arguments, result, record in records():
+        inputs = owner.retained_feedback_inputs(arguments, result.get('data') or {})
+        if not inputs:
+            continue
+        if selected_hashes is None:
+            selected_hashes = {path: workspace.artifact_hashes([str(path)])[str(path)]
+                               for path in roots if path.is_file()}
+        relevant = {}
+        for locator, digest in inputs.items():
+            try:
+                subject = workspace.resolve(locator)
+            except ValueError:
                 continue
-            result = store.read_json(item['result'])
-            if result.get('status') != 'ok':
-                continue
-            arguments = json.loads(call['function']['arguments'])
-            inputs = owner.retained_feedback_inputs(arguments, result.get('data') or {})
-            if not inputs:
-                continue
-            if selected_hashes is None:
-                selected_hashes = {path: workspace.artifact_hashes([str(path)])[str(path)]
-                                   for path in roots if path.is_file()}
-            relevant = {}
-            for locator, digest in inputs.items():
-                try:
-                    subject = workspace.resolve(locator)
-                except ValueError:
-                    continue
-                if copy_lineage:
-                    from simple_ar.tools.materials import _recorded_copy_source
-                    selected = next((path for path, value in selected_hashes.items()
-                        if value == digest and (path == subject or _recorded_copy_source(
-                            workspace, str(path), digest, str(subject)))), None)
-                else:
-                    selected = next((path for path, value in selected_hashes.items() if value == digest), None)
-                if subject not in covered and (selected is not None or any(subject == root or root.is_dir()
-                        and subject.is_relative_to(root) for root in roots)):
-                    relevant[locator] = (subject, selected or subject, digest)
-            if not relevant:
-                continue
-            identity = Path(item['result']).parent.name
-            attempt = ArtifactStore(store.root / 'attempts' / identity)
-            if (attempt.exists('capability_result.json')
-                    and attempt.read_capability_result().provenance.get('native_result_sha256')):
-                accepted_native_result(store.root, session_id, result, identity, require_content_binding=True)
-            owner.validate_retained_feedback(store.root, workspace, identity, arguments, result)
-            subjects = []
-            for locator, (subject, selected, digest) in relevant.items():
-                current = workspace.artifact_hashes([str(selected)])[str(selected)] if selected.is_file() else None
-                subjects.append({'path': locator, 'reviewed_sha256': digest,
-                    'selected_path': str(selected), 'current_sha256': current,
-                    'current_matches_review': current == digest})
-                covered.add(subject)
-            reviews.append({'record': 'records/' + item['result'].removeprefix('attempts/'),
-                'arguments': arguments, 'result': result, 'subjects': subjects})
+            if copy_lineage:
+                from simple_ar.tools.materials import _recorded_copy_source
+                selected = next((path for path, value in selected_hashes.items()
+                    if value == digest and (path == subject or _recorded_copy_source(
+                        workspace, str(path), digest, str(subject)))), None)
+            else:
+                selected = next((path for path, value in selected_hashes.items() if value == digest), None)
+            if subject not in covered and (selected is not None or any(subject == root or root.is_dir()
+                    and subject.is_relative_to(root) for root in roots)):
+                relevant[locator] = (subject, selected or subject, digest)
+        if not relevant:
+            continue
+        identity = Path(record).parent.name
+        attempt = ArtifactStore(store.root / 'attempts' / identity)
+        if (attempt.exists('capability_result.json')
+                and attempt.read_capability_result().provenance.get('native_result_sha256')):
+            accepted_native_result(store.root, session_id, result, identity, require_content_binding=True)
+        owner.validate_retained_feedback(store.root, workspace, identity, arguments, result)
+        subjects = []
+        for locator, (subject, selected, digest) in relevant.items():
+            current = workspace.artifact_hashes([str(selected)])[str(selected)] if selected.is_file() else None
+            subjects.append({'path': locator, 'reviewed_sha256': digest,
+                'selected_path': str(selected), 'current_sha256': current,
+                'current_matches_review': current == digest})
+            covered.add(subject)
+        reviews.append({'record': 'records/' + record.removeprefix('attempts/'),
+            'arguments': arguments, 'result': result, 'subjects': subjects})
     return reviews
 
 

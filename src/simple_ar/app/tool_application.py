@@ -1381,7 +1381,7 @@ class ToolApplication:
         return ([{**row, 'copy_lineage_required': True} for row in references]
             if self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES else references)
 
-    def _work_feedback(self, targets: list[str]) -> dict[str, Any]:
+    def _work_feedback(self, targets: list[str], *, observations: list[dict] | None = None) -> dict[str, Any]:
         """Find related original feedback for the requesting work owner.
 
         Only accepted checks with an intact owner/input binding are eligible.
@@ -1389,15 +1389,16 @@ class ToolApplication:
         """
         inspection = self.operations.inspection if self.operations is not None else None
         with inspection.presentation_scope() if inspection is not None else nullcontext():
-            return self._collect_work_feedback(targets)
+            return self._collect_work_feedback(targets, observations=observations)
 
-    def _collect_work_feedback(self, targets: list[str]) -> dict[str, Any]:
+    def _collect_work_feedback(self, targets: list[str], *, observations: list[dict] | None = None) -> dict[str, Any]:
         context = {'review_observations': related_feedback(
             self.workspace, self.session.store, self.session.manifest.session_id,
             self.state['turns'], targets,
             {'inspect_images': VisualToolGateway, 'review_document': WritingToolGateway},
-            copy_lineage=self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES)}
-        findings = self.gateway.professional_inputs(targets)
+            copy_lineage=self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES,
+            observations=observations)}
+        findings = self.gateway.professional_inputs(targets, observations=observations)
         if findings:
             context['professional_findings'] = findings
         return context
@@ -3992,10 +3993,10 @@ class ToolApplication:
                 targets = tuple(sorted(current_artifacts))
                 key = ('feedback', *targets)
                 if decision_views is None:
-                    feedback = self._work_feedback(list(targets))
+                    feedback = self._work_feedback(list(targets), observations=observations)
                 else:
                     if key not in decision_views:
-                        decision_views[key] = self._work_feedback(list(targets))
+                        decision_views[key] = self._work_feedback(list(targets), observations=observations)
                     feedback = decision_views[key]
                 related = feedback_observations(feedback)
                 additions = []

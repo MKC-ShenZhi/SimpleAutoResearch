@@ -3289,6 +3289,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
         feedback = self.app._work_context(['workspace/summary.json'])['professional_findings']
         self.assertTrue(any(row.get('delivery_context')==scope
             and 'contradicts' in json.dumps(row['result']) for row in feedback))
+        expected_feedback = self.app._work_feedback(['workspace/summary.json'])
+        snapshot = self.app._operation_observations()
+        with patch.object(self.app, '_operation_observations',
+                          side_effect=AssertionError('The decision already supplied its journal')):
+            shared_feedback = self.app._work_feedback(['workspace/summary.json'], observations=snapshot)
+        self.assertEqual(shared_feedback, expected_feedback)
         failed = self._versions(self.root/'tools/inspection'/first['identity'])
         ledger, calls = self.app.ledger.to_dict(), self.send.call_count
         self._reload()
