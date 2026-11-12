@@ -5,6 +5,12 @@
 User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-11-13
+
+### Fixed
+
+- Workspace files load independently of slow delivery details, and workspace build logs can be viewed.
+
 ## 2026-11-12
 
 ### Improved
@@ -18,7 +24,6 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - New ordinary tasks can choose direct delivery when independent review is unnecessary; the default and saved task contracts retain their review behavior, and required findings remain open.
 
 ### Fixed
-
 - Material reads and delivery retention handle filesystem timestamp differences without rejecting stable files or reusing a stale version.
 - External agent launches use the shared process runner and retain unknown model charges in the task ledger. Completed handoffs can reuse their original plan and result; interrupted or unaccounted work is not rerun automatically.
 - Review guidance uses recorded copy relationships across paths instead of treating unrelated files with identical contents as copies.

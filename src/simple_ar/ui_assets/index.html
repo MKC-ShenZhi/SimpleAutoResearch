@@ -39,7 +39,7 @@
 <details><summary>原始请求与待处理动作</summary><pre id="pending"></pre></details></article>
 <article><h3>资源与成本记录</h3><p class="hint">预留与 unknown 保留；预留不一定覆盖实际用量。缺失价格不折算成 0 元。</p><pre id="budgetSummary"></pre><details><summary>原始账本</summary><pre id="resources"></pre></details></article></div>
 <article id="approvalBox" hidden><h3>待批准的原始操作</h3><pre id="proposal"></pre><label class="check"><input type="checkbox" id="rememberExecution">在本任务中复用绑定输入的相同进程或导出批准</label><button id="approve">批准上述精确操作</button><p><input id="rejectReason" placeholder="不执行的原因，将反馈给任务"><button id="reject" class="secondary">拒绝并继续</button></p></article>
-<article><h3>来源与成果</h3><p class="hint">点击文件查看；声明的来源包显示标题、URL、提取状态与有限摘录，普通 JSON 按原文显示。工作文件不会标成原始来源。文件浏览不认证内容质量或当前交付；反馈在途时，旧成果仍可见。</p>
+<article><h3>来源与成果</h3><p class="hint">点击文件查看；声明的来源包显示标题、URL、提取状态与有限摘录。文本预览和下载会遮蔽已识别的凭据，原文件不受影响。工作文件不会标成原始来源。文件浏览不认证内容质量或当前交付；反馈在途时，旧成果仍可见。</p>
 <div class="filebar"><select id="mount"></select><button id="root" class="secondary">返回根目录</button><span id="location"></span></div><div id="files"></div><div id="preview"></div></article>
 <article><h3>继续同一项研究</h3><p class="hint">当前任务选择、材料目录与未提交文字保存在本浏览器标签页，刷新和切换任务可恢复。反馈发送后仍保留草稿，请核对原始请求记录；刷新不会自动执行或重新批准。</p><form id="feedbackForm"><textarea id="feedback" required placeholder="给出反馈，保留同一任务、原成果与账本"></textarea><button id="feedbackSubmit" type="submit">发送反馈并继续</button></form>
 <details><summary>显式更换命名连接</summary><p class="hint">接收方将变化；原预算、未知用量与历史保留，安全条件由原 owner 校验。</p><select id="switchProfile"></select><input id="switchReason" placeholder="更换原因"><button id="switch" class="secondary">确认更换连接</button></details></article>
