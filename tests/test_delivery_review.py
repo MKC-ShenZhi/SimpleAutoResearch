@@ -756,6 +756,8 @@ class DeliveryFindingContractTests(unittest.TestCase):
              'subjects':{first:versions[first], second:versions[second]}},
             {'severity':'required', 'message':'Overall claim', 'subjects':{}},
         ]
+        assessment['requested_outcomes'] = [{'outcome':'Supply both files', 'status':'supported',
+            'artifacts':[first, second], 'explanation':'Both outputs were inspected.'}]
         self.inspector.store.write_json(self.inspector._path('scoped-guidance', 'result'), proof['result'])
         self.inspector.expected['scoped-guidance'] = deepcopy(proof['result'])
         self.observe(proof)
@@ -797,6 +799,12 @@ class DeliveryFindingContractTests(unittest.TestCase):
                 restricted, = self.owner.inspection_feedback(['bundle/manuscript.md'])
         findings = view['result']['metadata']['delivery_opinion']['findings']
         self.assertEqual({row['message'] for row in findings}, {'First only', 'Compare both', 'Overall claim'})
+        outcome, = view['result']['metadata']['delivery_opinion']['requested_outcomes']
+        self.assertEqual((outcome['outcome'], outcome['status'], outcome['artifact_count']),
+            ('Supply both files', 'supported', 2))
+        self.assertIn('Both outputs were inspected.', outcome['explanation'])
+        self.assertNotIn('artifacts', outcome)
+        self.assertEqual(raw['metadata']['delivery_assessment']['requested_outcomes'][0]['artifacts'], [first, second])
         self.assertEqual({row['path'] for row in view['subjects']}, {first, second})
         linked = next(row for row in view['subjects'] if row['path'] == second)
         self.assertEqual(linked['review_role'], 'related_subject')

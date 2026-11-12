@@ -498,6 +498,48 @@ class GoalWorkTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'own work directory'):
             owner._shared_preflight(saved, call, {'cwd': 'workspace'})
 
+    def test_inspection_can_identify_binary_without_claiming_to_read_its_content(self):
+        from simple_ar.tools.inspection import InspectionRequest
+
+        owner = self.case.app.operations.inspection
+        content = b'%PDF-1.7\n\xffbinary content'
+        (self.case.root / 'workspace' / 'result.pdf').write_bytes(content)
+        saved = {'identity': 'binary-review', 'targets': [], 'evidence': [], 'prior_required': []}
+        request = InspectionRequest(goal='Check the delivery', targets=['workspace/result.pdf'])
+        read = lambda **kwargs: owner._shared_read(saved, request,
+            {'path': 'workspace/result.pdf', 'max_bytes': 1, **kwargs},
+            'binary-read', 100, None)
+        result = read(full_digest=True)
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(result['data']['sha256'], hashlib.sha256(content).hexdigest())
+        self.assertEqual(result['data']['text_windows'], [])
+        self.assertEqual(result['data']['observed_ranges'], [])
+        self.assertFalse(result['metadata']['inspection_source']['observation']['readable'])
+        self.assertEqual(read()['status'], 'error')
+
+    def test_failed_candidate_review_reports_failure_without_losing_produced_work(self):
+        from contextlib import nullcontext
+        from simple_ar.tools.specs import ToolResult
+        from simple_ar.tools.workspace import DeliveryRequest
+
+        case = self.case
+        case._write('note.md', 'Existing work remains available.\n')
+        request = DeliveryRequest(summary='Check this candidate', artifacts=['note.md'])
+        owner = case.app.operations.delivery
+        candidate = ToolResult(tool_name='review_result').model_dump(mode='json')
+        producer = ToolResult(tool_name='write_file').model_dump(mode='json')
+        with patch.object(owner, 'review_delivery', side_effect=ValueError('Review could not start')):
+            for payload, is_candidate in [(candidate, True), (producer, False)]:
+                owner.bind_result(request, payload, 'review-attempt', current_outputs=(),
+                    current_result={}, retain=lambda: None, review_capacity=nullcontext,
+                    may_start=True, candidate=is_candidate)
+        self.assertEqual(candidate['status'], 'blocked')
+        self.assertIn('Review could not start', candidate['error'])
+        self.assertEqual(producer['status'], 'ok')
+        self.assertIn('Review could not start', producer['metadata']['delivery_review_error'])
+        self.assertEqual((case.root / 'workspace' / 'note.md').read_text(),
+            'Existing work remains available.\n')
+
     def choice(self, *, actions=(), candidate=None, remaining=None):
         requests = self.case.app.state['requests']
         return _action('select_work', remaining=(remaining if remaining is not None else [

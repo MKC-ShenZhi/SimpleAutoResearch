@@ -1356,6 +1356,17 @@ class InspectionToolGateway:
             if isinstance(opinion, dict):
                 opinion['findings'] = [row for row in opinion.get('findings', [])
                     if not row.get('artifacts') or selected.intersection(row['artifacts'])]
+                outcomes = opinion.get('requested_outcomes')
+                if isinstance(outcomes, list) and any('artifacts' in row for row in outcomes):
+                    # This is recurring guidance, not the acceptance record.
+                    # Keep what was judged and why; detailed outcome-to-file
+                    # bindings remain in the original review receipt.
+                    opinion['requested_outcomes'] = [
+                        {**{key: value for key, value in row.items() if key != 'artifacts'},
+                         **({'artifact_count': len(row['artifacts'])} if 'artifacts' in row else {})}
+                        for row in outcomes]
+                    source = result['data']['source_observations']
+                    source['scope'] += ' Exact files supporting each requested outcome remain in this receipt.'
             values = metadata.get('assessments')
             if isinstance(values, list):
                 metadata['assessments'] = [
@@ -2385,10 +2396,12 @@ class InspectionToolGateway:
                         owner['windows'].append(deepcopy(window))
                         remaining[0] -= count
 
-    def _execution_facts(self, saved: dict, *, current_inputs: bool = True) -> dict[str, dict]:
+    def _execution_facts(self, saved: dict, *, current_inputs: bool = True,
+                         retained: list[dict] | None = None) -> dict[str, dict]:
         """Qualify real executions against current inputs, separately from judgment."""
         facts = {}
-        for parent in [saved, *self._retained_inputs(saved)]:
+        parents = self._retained_inputs(saved) if retained is None else retained
+        for parent in [saved, *parents]:
             for row in self._investigation_actions(parent, receipts=True):
                 result, data = row['result'], row['result'].get('data', {})
                 if (row['call']['function']['name'] != 'run_process' or result.get('status') != 'ok'
@@ -3131,19 +3144,22 @@ class InspectionToolGateway:
                     'Further investigation also protects a measured final opinion. Return '
                     'established required findings promptly; disclose unfinished necessary scope.'}
         applicable = self._applicable_scope(saved)
-        execution_facts = (self._execution_facts(saved)
+        retained_inputs = (self._retained_inputs(saved)
+            if saved.get('inspection_material_policy') == 'operations.v3' else None)
+        execution_facts = (self._execution_facts(saved, retained=retained_inputs)
             if applicable and saved.get('inspection_material_policy') == 'operations.v3' else None)
         if saved.get('work_method') in NATIVE_WORK_METHODS and self._delivery_scope(saved):
             if (saved.get('inspection_evidence_policy') == 'presented.v6'
                     and saved.get('inspection_material_policy') == 'operations.v3'):
-                facts = execution_facts if execution_facts is not None else self._execution_facts(saved)
+                facts = (execution_facts if execution_facts is not None else
+                    self._execution_facts(saved, retained=retained_inputs))
                 base['executed_checks'] = sorted(self._review_execution_names(facts))
             else:
                 base['executed_checks'] = sorted(execution_facts if execution_facts is not None
                     else self._executed_check_records(saved))
         if saved.get('inspection_material_policy') == 'operations.v3':
             base['retained_investigations'] = [{'inspection':item['identity'],
-                'source_rounds':len(item.get('source_rounds', []))} for item in self._retained_inputs(saved)]
+                'source_rounds':len(item.get('source_rounds', []))} for item in retained_inputs]
             base['retained_scope'] = ('Original independent work, including failed opinions. '
                 'Use applicable observations; decide current requests and claims anew. Retained executions '
                 'are historical, not fresh runs. read_history accepts one of these inspection IDs. '
@@ -4447,7 +4463,8 @@ class InspectionToolGateway:
         allowance = [remaining]
         number = (max((int(item['subject'].split('-')[1]) for item in local['evidence']), default=0)
             if self.progressive else len(local['evidence'])) + 1
-        row = self._observe(FileWindow.model_validate(arguments), f'evidence-{number}',
+        window = FileWindow.model_validate(arguments)
+        row = self._observe(window, f'evidence-{number}',
             attempt, allowance, read_limit=read_limit, operation_call=self.operation_call)
         owner = self._target_observation(local, row)
         if owner is None:
@@ -4457,8 +4474,15 @@ class InspectionToolGateway:
         observed = {**row, 'subject':owner['subject']} if owner else row
         visible = self._view({**local, 'targets':[], 'evidence':[], role:[observed]}, request,
             source_result=True)[role][0]
-        result = ToolResult(tool_name='read_file', status='ok' if row.get('readable') else 'error',
-            data=visible, error='' if row.get('readable') else row.get('limitation', 'Read failed'),
+        identity_only = (window.full_digest and not row.get('readable') and bool(row.get('sha256'))
+            and bool(row.get('windows')) and 'review_text' in row['windows'][-1])
+        if identity_only:
+            visible.update(sha256=row['sha256'], size_bytes=row['windows'][0]['size_bytes'],
+                observed_ranges=[], version_scope='File identity only; content has not been read or reviewed.')
+        success = row.get('readable') or identity_only
+        result = ToolResult(tool_name='read_file', status='ok' if success else 'error',
+            data=visible, error='' if success else row.get('limitation', 'Read failed'),
+            summary='File identity obtained; content was not reviewed.' if identity_only else '',
             metadata={'inspection_source':{'observation':row, 'remaining_before':remaining,
                 'remaining_after':allowance[0]}})
         return result.model_dump(mode='json')

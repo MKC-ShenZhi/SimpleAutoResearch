@@ -415,6 +415,12 @@ class Delivery:
                 raise ValueError('Delivery changed during its independent review')
         except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
             metadata['delivery_review_error'] = str(exc)
+            if candidate and may_start:
+                # Production actions keep their successful result if review
+                # fails, but review_result itself must not report success when
+                # the requested review could not start or finish.
+                payload.update(status='blocked', error=str(exc),
+                    summary='Independent review did not complete; existing work is retained.')
         if request.summary_source is not None and not package_review:
             delivery['summary'] = self.workspace.delivery_summary(delivery, hashes)
         metadata['delivery_hashes'] = hashes
