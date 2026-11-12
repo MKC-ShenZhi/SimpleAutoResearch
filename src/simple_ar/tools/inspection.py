@@ -1422,6 +1422,10 @@ class InspectionToolGateway:
     def _usage(self, identity: str) -> list[dict[str, Any]]:
         # Closed references identify evidence; admitted common headers also bind
         # failed/unknown charges whose dispatch never returned a closed wrapper.
+        presentation = _PRESENTATION_RESULTS.get()
+        key = (self, 'usage', identity)
+        if presentation is not None and key in presentation:
+            return deepcopy(presentation[key])
         path = self._path(identity,'input')
         saved = self.store.read_json(path) if self.store.exists(path) else {}
         invocations = saved.get('source_invocations', [])
@@ -1430,19 +1434,25 @@ class InspectionToolGateway:
             attempts = {row['attempt'] for row in invocations}
             candidates = {value for entry in entries for value in (entry.attempt_id, entry.logical_call_id)
                 if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', value)}
+            headers = presentation.setdefault((self, 'usage_headers'), {}) if presentation is not None else {}
             for candidate in candidates - attempts:
-                header_path = f'attempts/{candidate}/action.json'
-                if self.store.exists(header_path):
-                    header = self.store.read_json(header_path)
-                    if (header.get('attempt') == candidate
-                            and header.get('origin', {}).get('scope') == identity):
-                        attempts.add(candidate)
-            return [entry.to_dict() for entry in entries
+                if candidate not in headers:
+                    header_path = f'attempts/{candidate}/action.json'
+                    headers[candidate] = self.store.read_json(header_path) if self.store.exists(header_path) else None
+                header = headers[candidate]
+                if (header and header.get('attempt') == candidate
+                        and header.get('origin', {}).get('scope') == identity):
+                    attempts.add(candidate)
+            usage = [entry.to_dict() for entry in entries
                 if entry.attempt_id == identity or entry.attempt_id in attempts
                 or entry.logical_call_id in attempts]
-        # Historical owners retain their original invocation-list accounting.
-        return [entry.to_dict() for entry in self.workspace.ledger.entries
-                if entry.attempt_id == identity or entry.logical_call_id in invocations]
+        else:
+            # Historical owners retain their original invocation-list accounting.
+            usage = [entry.to_dict() for entry in self.workspace.ledger.entries
+                    if entry.attempt_id == identity or entry.logical_call_id in invocations]
+        if presentation is not None:
+            presentation[key] = deepcopy(usage)
+        return usage
 
     def _digest(self, path: str) -> str:
         return hashlib.sha256(self.store.resolve(path).read_bytes()).hexdigest()

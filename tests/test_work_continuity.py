@@ -553,6 +553,34 @@ class WorkingSupplyContinuityTests(unittest.TestCase):
 
 
 class InspectionWorkingContinuityTests(unittest.TestCase):
+    def test_feedback_usage_is_shared_within_one_view_and_refreshed_afterward(self):
+        from simple_ar.core.budget import BudgetEntry
+        from simple_ar.tools.inspection import InspectionToolGateway
+
+        with tempfile.TemporaryDirectory() as temporary:
+            entries = [BudgetEntry('first', {}, {'total_tokens': 10}, 'settled', attempt_id='action-a'),
+                       BudgetEntry('second', {}, {}, 'unknown', attempt_id='action-b')]
+            ledger = SimpleNamespace(entries=entries)
+            owner = InspectionToolGateway(Path(temporary), SimpleNamespace(ledger=ledger), lambda _: None)
+            for identity in ('review-a', 'review-b'):
+                owner.store.write_json(owner._path(identity, 'input'),
+                    {'execution_protocol': 'shared.v1', 'source_invocations': []})
+            for attempt, identity in (('action-a', 'review-a'), ('action-b', 'review-b')):
+                owner.store.write_json(f'attempts/{attempt}/action.json',
+                    {'attempt': attempt, 'origin': {'scope': identity}})
+            expected = {identity: owner._usage(identity) for identity in ('review-a', 'review-b')}
+            with patch.object(owner.store, 'exists', wraps=owner.store.exists) as exists:
+                with owner.presentation_scope():
+                    self.assertEqual(owner._usage('review-a'), expected['review-a'])
+                    self.assertEqual(owner._usage('review-b'), expected['review-b'])
+                    self.assertEqual(owner._usage('review-a'), expected['review-a'])
+                headers = [call.args[0] for call in exists.call_args_list
+                           if str(call.args[0]).endswith('/action.json')]
+                self.assertEqual(len(headers), len(set(headers)))
+            entries[1].status = 'settled'
+            with owner.presentation_scope():
+                self.assertEqual(owner._usage('review-b')[0]['status'], 'settled')
+
     def test_independent_inspection_freezes_work_policy_and_resume_preserves_it(self):
         from simple_ar.tools.inspection import InspectionRequest, InspectionToolGateway
         with tempfile.TemporaryDirectory() as temporary:
