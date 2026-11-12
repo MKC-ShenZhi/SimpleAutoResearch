@@ -1147,7 +1147,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                 'Supported contract: $body$, $title$, $abstract$, the standard '
                 '$for(header-includes)$$header-includes$$endfor$ hook (required in preamble), '
                 '$bibliography$, $biblio-style$; no Pandoc partials, scripts, filters, downloads or arbitrary metadata.\n'
-                'header-includes contains renderer-owned support only; source YAML metadata is excluded.\n'
+                'header-includes contains renderer-owned support only; source YAML contributes only a plain title.\n'
                 'Templates own class, packages, title/abstract placement and BibTeX style. '
                 'Only pdflatex or xelatex with BibTeX is supported; no Biber or external build recipes.\n'
                 'Body hierarchy uses the declared top_level_division when supplied; no class-name inference.\n'
