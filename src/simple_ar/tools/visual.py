@@ -34,6 +34,16 @@ def visual_tool_specs() -> list[CommonToolSpec]:
 
 class VisualToolGateway:
     @staticmethod
+    def retained_feedback_inputs(arguments: dict, data: dict) -> dict:
+        """Return the image versions actually presented in an earlier review."""
+        return data.get('input_sha256', {})
+
+    @staticmethod
+    def validate_retained_feedback(root: Path, workspace: Any, identity: str,
+                                   arguments: dict, result: dict) -> None:
+        VisualToolGateway.validate_feedback(workspace, identity, arguments, result.get('data') or {})
+
+    @staticmethod
     def validate_feedback(workspace: Any, identity: str, arguments: dict, data: dict) -> None:
         """Bind feedback to the owner's saved request and consumed image bytes.
 

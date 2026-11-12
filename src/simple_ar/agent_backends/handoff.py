@@ -97,6 +97,19 @@ def create_agent_handoff(
     return package
 
 
+def _code_task_context(run_dir: Path, task_text: str) -> tuple[str, str, list[str]]:
+    """Supply the same retained task and memory to both code-agent entry points."""
+    task_path = run_dir / "code_task" / "task.md"
+    if not task_text and task_path.is_file():
+        task_text = task_path.read_text(encoding="utf-8", errors="replace")
+    memory_context = task_memory_context(run_dir)
+    paths = code_task_memory_paths(run_dir)
+    refs = [_artifact_ref_inside_run(run_dir, path) for path in (
+        paths.task_memory_md, paths.compressed_memory_md,
+        paths.review_findings_jsonl, paths.repair_memory_jsonl)]
+    return task_text, memory_context, [ref for ref in refs if ref]
+
+
 def build_code_task_handoff(
     run_dir: Path,
     *,
@@ -106,11 +119,7 @@ def build_code_task_handoff(
 ) -> AgentHandoffPackage:
     """Create a handoff package from the current code-task artifacts."""
     run_dir = Path(run_dir)
-    task_path = run_dir / "code_task" / "task.md"
-    if not task_text and task_path.is_file():
-        task_text = task_path.read_text(encoding="utf-8", errors="replace")
-    memory_context = task_memory_context(run_dir)
-    memory_paths = code_task_memory_paths(run_dir)
+    task_text, memory_context, memory_refs = _code_task_context(run_dir, task_text)
     refs = [
         "code_task/task.md",
         "code_task/work_plan.md",
@@ -119,16 +128,7 @@ def build_code_task_handoff(
         "code_task/meta/environment_report.json",
         "code_task/meta/proposed_edits.json",
     ]
-    refs.extend(
-        ref
-        for ref in (
-            _artifact_ref_inside_run(run_dir, memory_paths.task_memory_md),
-            _artifact_ref_inside_run(run_dir, memory_paths.compressed_memory_md),
-            _artifact_ref_inside_run(run_dir, memory_paths.review_findings_jsonl),
-            _artifact_ref_inside_run(run_dir, memory_paths.repair_memory_jsonl),
-        )
-        if ref
-    )
+    refs.extend(memory_refs)
     context_files = {"task.md": task_text} if task_text else {}
     if memory_context.strip():
         context_files["task_memory.md"] = memory_context
@@ -166,11 +166,7 @@ def build_code_task_greenfield_handoff(
 ) -> AgentHandoffPackage:
     """Create a generated-files handoff package for greenfield code-task runs."""
     run_dir = Path(run_dir)
-    task_path = run_dir / "code_task" / "task.md"
-    if not task_text and task_path.is_file():
-        task_text = task_path.read_text(encoding="utf-8", errors="replace")
-    memory_context = task_memory_context(run_dir)
-    memory_paths = code_task_memory_paths(run_dir)
+    task_text, memory_context, memory_refs = _code_task_context(run_dir, task_text)
     refs = [
         "code_task/task.md",
         "code_task/summary.md",
@@ -182,16 +178,7 @@ def build_code_task_greenfield_handoff(
         "code_task/meta/file_plan.json",
         "code_task/meta/repo_map_summary.md",
     ]
-    refs.extend(
-        ref
-        for ref in (
-            _artifact_ref_inside_run(run_dir, memory_paths.task_memory_md),
-            _artifact_ref_inside_run(run_dir, memory_paths.compressed_memory_md),
-            _artifact_ref_inside_run(run_dir, memory_paths.review_findings_jsonl),
-            _artifact_ref_inside_run(run_dir, memory_paths.repair_memory_jsonl),
-        )
-        if ref
-    )
+    refs.extend(memory_refs)
     merged_context = dict(context_files or {})
     if task_text.strip():
         merged_context.setdefault("task.md", task_text)

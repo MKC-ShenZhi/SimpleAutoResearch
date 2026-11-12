@@ -649,6 +649,47 @@ class InspectionToolGateway:
             raise ValueError('Invalid inspection invocation identity')
         return f'tools/inspection/{identity}/{leaf}.json'
 
+    def retained_scope(self, identity: str) -> dict:
+        """Return the original work order; it is not an acceptance decision."""
+        return self.store.read_json(self._path(identity, 'input'))
+
+    def delivery_scope(self, identity: str, binding: dict, arguments: dict, *, pending: bool = False) -> dict:
+        """Check that a delivery opinion belongs to its original inspection work order."""
+        saved = self.retained_scope(identity)
+        if (pending and saved.get('execution_protocol') not in _SHARED_EXECUTION_PROTOCOLS
+                or saved.get('identity') != identity or saved.get('delivery_context') != binding
+                or saved.get('arguments') != arguments or saved.get('user_requests') != binding['requests']):
+            raise ValueError('Pending delivery review differs from its retained inspection scope' if pending
+                             else 'Delivery review does not match the retained full delivery context')
+        return saved
+
+    def retained_opinion(self, identity: str) -> dict | None:
+        """Return a recorded result for diagnosis; acceptance requires verified_opinion."""
+        path = self._path(identity, 'result')
+        return self.store.read_json(path) if self.store.exists(path) else None
+
+    def verified_opinion(self, identity: str) -> ToolResult:
+        """Return a failure as recorded or verify a completed opinion for adoption."""
+        raw = self.retained_opinion(identity)
+        retained = ToolResult.model_validate(raw) if raw is not None else None
+        return retained if retained is not None and not retained.ok else self._cached(identity)
+
+    def retained_investigation(self, identity: str) -> dict | None:
+        """Find a recorded investigation available to a later review, if any."""
+        if self.retained_opinion(identity) is None:
+            return None
+        saved = self.retained_scope(identity)
+        response = self.store.read_json(self._path(identity, 'response'))
+        return saved if response.get('completed') or saved.get('source_invocations') else None
+
+    def accepted_opinion(self, identity: str, record: str, *, expected: dict | None = None) -> dict:
+        """Resolve the common action owner's accepted review without changing it."""
+        from simple_ar.tools.professional_outcomes import accepted_scoped_opinion
+        session_id = self.store.read_json('session_manifest.json')['session_id']
+        _, raw, _ = accepted_scoped_opinion(self.store.root, self.workspace, session_id,
+                                            record, identity, expected=expected)
+        return raw
+
     @staticmethod
     def _position(number: int, role: str, call_id: str = '') -> str:
         return f'sources-{number}/{role}' + (f'/{call_id}' if call_id else '')

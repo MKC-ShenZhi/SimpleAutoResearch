@@ -580,6 +580,21 @@ def writing_tool_specs() -> list[CommonToolSpec]:
 
 
 class WritingToolGateway:
+    @staticmethod
+    def retained_feedback_inputs(arguments: dict, data: dict) -> dict:
+        """Return only the draft that the original document review assessed."""
+        return {row['path']: row['sha256'] for row in data.get('inputs', [])
+                if row.get('path') == arguments.get('prior_draft') and row.get('sha256')}
+
+    @staticmethod
+    def validate_retained_feedback(root: Path, workspace: Any, identity: str,
+                                   arguments: dict, result: dict) -> None:
+        data = result.get('data') or {}
+        owner = ArtifactStore(root / 'tools/writing' / identity)
+        if (owner.read_json('result.json').get('data') != data
+                or workspace.artifact_hashes(result['artifacts']) != data.get('artifact_sha256')):
+            raise ValueError('Retained document feedback changed')
+
     def requires_followup(self, name: str, arguments: dict) -> bool:
         return arguments.get('publication') is not None
 

@@ -16,11 +16,19 @@ from simple_ar.core.budget import BudgetLedger
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.tools.delivery_review import (DeliveryReview, recorded_delivery_review,
     delivery_requires_review, prepare_delivery_review)
+from simple_ar.tools.inspection import InspectionToolGateway
 from simple_ar.tools.specs import ToolResult
 from simple_ar.tools.workspace import DeliveryRequest, WorkspaceToolGateway
 
 
 class ControlledInspector:
+    retained_scope = InspectionToolGateway.retained_scope
+    delivery_scope = InspectionToolGateway.delivery_scope
+    retained_opinion = InspectionToolGateway.retained_opinion
+    verified_opinion = InspectionToolGateway.verified_opinion
+    retained_investigation = InspectionToolGateway.retained_investigation
+    accepted_opinion = InspectionToolGateway.accepted_opinion
+
     def __init__(self, root, workspace, requests):
         self.store = ArtifactStore(root)
         self.workspace, self.requests = workspace, requests
@@ -197,6 +205,19 @@ class DeliveryReviewTests(unittest.TestCase):
 
     def review(self, identity='parent-1', may_start=True):
         return self.owner.review(self.binding(self.delivery), identity, may_start=may_start)
+
+    def test_delivery_adopts_an_opinion_through_its_owner_and_checks_current_artifacts(self):
+        proof = self.review()
+        inspector = self.inspector
+        # A receiving delivery owner needs the inspection contract, not its
+        # storage layout or private cache methods.
+        self.owner.inspector = SimpleNamespace(
+            verified_opinion=inspector.verified_opinion, delivery_scope=inspector.delivery_scope)
+        self.assertEqual(self.owner._verified('parent-1', proof['binding'], proof).tool_name,
+                         'inspect_artifacts')
+        self.workspace.resolve('workspace/bundle/manuscript.md').write_text('Revised', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'version changed'):
+            self.owner._verified('parent-1', proof['binding'], proof)
 
     def test_completion_claim_and_inventory_are_bound_without_report_or_surrogate_target(self):
         self.delivery.pop('report')

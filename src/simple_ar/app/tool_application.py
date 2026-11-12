@@ -33,7 +33,7 @@ from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.extensions import LocalExtension, freeze_extensions
 from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, ToolCompletion, tool_completion, NATIVE_WORK_METHODS, CURRENT_WORK_METHOD, GOAL_WORK_METHOD
 from simple_ar.tools.professional_outcomes import (
-    accepted_review_journal, check_professional_stop, stop_decision)
+    accepted_review_journal, check_professional_stop, related_feedback, stop_decision)
 from simple_ar.tools.workspace import (WorkspaceToolGateway, workspace_tool_specs,
     DeliveryRequest, FileWindow, validate_workspace_arguments, workspace_observation_view,
     resolve_source_mount)
@@ -1392,73 +1392,11 @@ class ToolApplication:
             return self._collect_work_feedback(targets)
 
     def _collect_work_feedback(self, targets: list[str]) -> dict[str, Any]:
-        roots = [self.workspace.resolve(path) for path in targets]
-        selected_hashes = None
-        reviews, covered = [], set()
-        for turn in reversed(self.state['turns']):
-            calls = {row['id']: row for row in self.session.store.read_json(turn['reply']).get('tool_calls', [])}
-            for item in reversed(turn['tools']):
-                call = calls[item['id']]
-                name = call['function']['name']
-                if name not in {'inspect_images', 'review_document'}:
-                    continue
-                result = self.session.store.read_json(item['result'])
-                if result.get('status') != 'ok':
-                    continue
-                arguments = json.loads(call['function']['arguments'])
-                data = result.get('data') or {}
-                if name == 'inspect_images':
-                    inputs = data.get('input_sha256', {})
-                else:
-                    inputs = {row['path']: row['sha256'] for row in data.get('inputs', [])
-                        if row.get('path') == arguments.get('prior_draft') and row.get('sha256')}
-                if not inputs:
-                    continue
-                if selected_hashes is None:
-                    selected_hashes = {path: self.workspace.artifact_hashes([str(path)])[str(path)]
-                        for path in roots if path.is_file()}
-                relevant = {}
-                for locator, digest in inputs.items():
-                    try:
-                        subject = self.workspace.resolve(locator)
-                    except ValueError:
-                        continue  # A retired source mount is not a new grant.
-                    if self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES:
-                        from simple_ar.tools.materials import _recorded_copy_source
-                        selected = next((path for path, value in selected_hashes.items()
-                            if value == digest and (path == subject or _recorded_copy_source(
-                                self.workspace, str(path), digest, str(subject)))), None)
-                    else:
-                        selected = next((path for path, value in selected_hashes.items() if value == digest), None)
-                    if subject not in covered and (selected is not None or any(subject == root or root.is_dir()
-                            and subject.is_relative_to(root) for root in roots)):
-                        relevant[locator] = (subject, selected or subject, digest)
-                if not relevant:
-                    continue
-                attempt = ArtifactStore(self.session.store.root / 'attempts' / Path(item['result']).parent.name)
-                if (attempt.exists('capability_result.json')
-                        and attempt.read_capability_result().provenance.get('native_result_sha256')):
-                    from simple_ar.tools.professional_outcomes import accepted_native_result
-                    accepted_native_result(self.session.store.root, self.session.manifest.session_id,
-                        result, attempt.root.name, require_content_binding=True)
-                if name == 'inspect_images':
-                    VisualToolGateway.validate_feedback(self.workspace,
-                        Path(item['result']).parent.name, arguments, data)
-                else:
-                    owner = ArtifactStore(self.session.store.root / 'tools/writing' / Path(item['result']).parent.name)
-                    if (owner.read_json('result.json').get('data') != data
-                            or self.workspace.artifact_hashes(result['artifacts']) != data.get('artifact_sha256')):
-                        raise ValueError('Retained document feedback changed')
-                subjects = []
-                for locator, (subject, selected, digest) in relevant.items():
-                    current = self.workspace.artifact_hashes([str(selected)])[str(selected)] if selected.is_file() else None
-                    subjects.append({'path': locator, 'reviewed_sha256': digest,
-                        'selected_path': str(selected),
-                        'current_sha256': current, 'current_matches_review': current == digest})
-                    covered.add(subject)
-                reviews.append({'record': 'records/' + item['result'].removeprefix('attempts/'),
-                    'arguments': arguments, 'result': result, 'subjects': subjects})
-        context = {'review_observations': reviews}
+        context = {'review_observations': related_feedback(
+            self.workspace, self.session.store, self.session.manifest.session_id,
+            self.state['turns'], targets,
+            {'inspect_images': VisualToolGateway, 'review_document': WritingToolGateway},
+            copy_lineage=self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES)}
         findings = self.gateway.professional_inputs(targets)
         if findings:
             context['professional_findings'] = findings

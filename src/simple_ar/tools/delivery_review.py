@@ -333,10 +333,10 @@ class DeliveryReview:
         if isinstance(envelope, dict) and self.include_package_feedback:
             accepted, accepted_result = None, None
             if self._pending_envelope(envelope):
-                path = self.inspector._path(envelope['identity'], 'result')
                 try:
-                    raw = (self.inspector.store.read_json(path) if self.inspector.store.exists(path)
-                           else envelope['result'])
+                    raw = self.inspector.retained_opinion(envelope['identity'])
+                    if raw is None:
+                        raw = envelope['result']
                 except _ERRORS:
                     raw = None
                 accepted, intact, accepted_result = self._accepted_pending_opinion(observed, envelope, raw)
@@ -492,7 +492,7 @@ class DeliveryReview:
         """Only the original inspection work order may authorize a reassessment."""
         ids = assessment.reassessed_prior or []
         if ids:
-            saved = self.inspector.store.read_json(self.inspector._path(identity, 'input'))
+            saved = self.inspector.retained_scope(identity)
             offered = {row['id'] for row in saved.get('prior_required', [])}
             if not set(ids) <= offered:
                 raise ValueError('Delivery reassessment references a concern not supplied at inspection start')
@@ -529,14 +529,10 @@ class DeliveryReview:
         if not isinstance(record, str) or not record:
             return False, False, None
         try:
-            from simple_ar.tools.professional_outcomes import accepted_scoped_opinion
             if (Path(observed.get('record', '')).name != 'native_result.json'
                     or Path(observed['record']).parent.name != envelope['identity']):
                 return None, False, None
-            root = self.inspector.store.root
-            session_id = self.inspector.store.read_json('session_manifest.json')['session_id']
-            _, accepted_raw, _ = accepted_scoped_opinion(root, self.workspace, session_id,
-                record, envelope['identity'])
+            accepted_raw = self.inspector.accepted_opinion(envelope['identity'], record)
             if not isinstance(raw, dict) or accepted_raw != raw:
                 return True, False, accepted_raw
             try:
@@ -601,7 +597,7 @@ class DeliveryReview:
         if not current or not assessment.reassessed_prior or (
                 assessment.coverage != 'complete' and not assessment.evidence_sha256):
             return []
-        saved = self.inspector.store.read_json(self.inspector._path(identity, 'input'))
+        saved = self.inspector.retained_scope(identity)
         frozen = {row['id']: row for row in saved.get('prior_required', [])}
         originals = {finding_id(event, finding): finding for event in prior_events
                      for finding in event['findings'] if finding['severity'] == 'required'}
@@ -671,10 +667,9 @@ class DeliveryReview:
                         if self._accepted_opinion_is_unrelated(feedback.get('_accepted_result'), binding, selected, events):
                             continue
                         raise ValueError('Retained delivery concern opinion cannot be verified')
-                raw = (self.inspector.store.read_json(self.inspector._path(identity, 'result'))
-                       if self._pending_envelope(envelope)
-                       and self.inspector.store.exists(self.inspector._path(identity, 'result'))
-                       else envelope['result'])
+                raw = self.inspector.retained_opinion(identity) if self._pending_envelope(envelope) else None
+                if raw is None:
+                    raw = envelope['result']
                 value = (raw.get('metadata') or {}).get('delivery_assessment')
                 if value is None:
                     continue  # Pending/failed work has no independent opinion.
@@ -822,18 +817,8 @@ class DeliveryReview:
 
     def _verified(self, identity: str, binding: dict, claimed: dict | None = None) -> ToolResult:
         self._validate_scope(binding)
-        # A retained failure is diagnostic only: no final opinion is needed to
-        # report it. Every possible acceptance still goes through _cached's
-        # completed response, usage, integrity and version verification.
-        path = self.inspector._path(identity, 'result')
-        retained = (ToolResult.model_validate(self.inspector.store.read_json(path))
-                    if self.inspector.store.exists(path) else None)
-        result = retained if retained is not None and not retained.ok else self.inspector._cached(identity)
-        saved = self.inspector.store.read_json(self.inspector._path(identity, 'input'))
-        if (saved.get('identity') != identity or saved.get('delivery_context') != binding
-                or saved.get('arguments') != self._arguments(binding)
-                or saved.get('user_requests') != binding['requests']):
-            raise ValueError('Delivery review does not match the retained full delivery context')
+        result = self.inspector.verified_opinion(identity)
+        self.inspector.delivery_scope(identity, binding, self._arguments(binding))
         if claimed is not None and (claimed.get('identity') != identity
                 or claimed.get('binding') != binding
                 or (result.ok and claimed.get('error'))
@@ -869,12 +854,7 @@ class DeliveryReview:
     def _pending_input(self, envelope: dict) -> dict:
         identity, binding = envelope['identity'], envelope['binding']
         self._validate_scope(binding)
-        saved = self.inspector.store.read_json(self.inspector._path(identity, 'input'))
-        if (saved.get('execution_protocol') not in {'shared.v1', 'shared.v2'} or saved.get('identity') != identity
-                or saved.get('delivery_context') != binding or saved.get('arguments') != self._arguments(binding)
-                or saved.get('user_requests') != binding['requests']):
-            raise ValueError('Pending delivery review differs from its retained inspection scope')
-        return saved
+        return self.inspector.delivery_scope(identity, binding, self._arguments(binding), pending=True)
 
     def _envelope_result(self, envelope: dict, binding: dict, *, record: str | None = None) -> ToolResult | None:
         """Verify a final claim, or resolve an original pending marker to its owner result."""
@@ -887,7 +867,7 @@ class DeliveryReview:
                 or Path(record).parent.name != identity):
             raise ValueError('Pending delivery review does not belong to its producer observation')
         self._pending_input(envelope)
-        if not self.inspector.store.exists(self.inspector._path(identity, 'result')):
+        if self.inspector.retained_opinion(identity) is None:
             return None
         return self._verified(identity, binding)
 
@@ -908,14 +888,10 @@ class DeliveryReview:
         try:
             result = self._envelope_result(envelope, envelope['binding'], record=projected.get('record'))
             if result is not None and review_record is not None:
-                from simple_ar.tools.professional_outcomes import accepted_scoped_opinion
-
                 if not isinstance(review_record, str) or not review_record:
                     raise ValueError('Review record must identify an accepted opinion')
-                root = self.inspector.store.root
-                session_id = self.inspector.store.read_json('session_manifest.json')['session_id']
-                accepted_scoped_opinion(root, self.workspace, session_id, review_record,
-                    envelope['identity'], expected=result.model_dump(mode='json'))
+                self.inspector.accepted_opinion(envelope['identity'], review_record,
+                    expected=result.model_dump(mode='json'))
         except _ERRORS:
             return projected, None
         if result is not None:
@@ -930,16 +906,12 @@ class DeliveryReview:
             return self._resolve_observation(observed, review_record=review_record)[0]
         projected = deepcopy(observed)
         try:
-            from simple_ar.tools.professional_outcomes import accepted_scoped_opinion
             record = observed.get('record')
             if record is not None and (Path(record).name != 'native_result.json'
                     or Path(record).parent.name != envelope['identity']):
                 return projected
             self._pending_input(envelope)
-            root = self.inspector.store.root
-            session_id = self.inspector.store.read_json('session_manifest.json')['session_id']
-            _, raw, _ = accepted_scoped_opinion(root, self.workspace, session_id,
-                review_record, envelope['identity'])
+            raw = self.inspector.accepted_opinion(envelope['identity'], review_record)
             result = ToolResult.model_validate(raw)
             if result.tool_name == 'inspect_artifacts':
                 projected['metadata']['delivery_review'] = self._envelope(envelope['binding'],
@@ -950,9 +922,9 @@ class DeliveryReview:
 
     def _retained(self, identity: str) -> ToolResult:
         """Preserve failed work for diagnosis only; this never supplies acceptance."""
-        path = self.inspector._path(identity, 'result')
-        if self.inspector.store.exists(path):
-            return ToolResult.model_validate(self.inspector.store.read_json(path))
+        raw = self.inspector.retained_opinion(identity)
+        if raw is not None:
+            return ToolResult.model_validate(raw)
         return ToolResult(tool_name='inspect_artifacts', status='blocked',
                           error='Delivery inspection started without a completed result; no replay')
 
@@ -968,9 +940,9 @@ class DeliveryReview:
         if self._pending_envelope(envelope):
             try:
                 self._pending_input(envelope)
-                path = self.inspector._path(identity, 'result')
-                if self.inspector.store.exists(path):
-                    claimed = self.inspector.store.read_json(path)
+                raw = self.inspector.retained_opinion(identity)
+                if raw is not None:
+                    claimed = raw
             except _ERRORS:
                 pass  # The inspector returns unavailable guidance for the pending marker.
         feedback = self.inspector.feedback_observation(identity, claimed)
@@ -993,9 +965,8 @@ class DeliveryReview:
         try:
             self._validate_scope(binding)
             if self.inspector.has_started(identity):
-                if self.inspector.store.read_json(self.inspector._path(identity, 'input')).get(
-                        'execution_protocol') in {'shared.v1', 'shared.v2'} and not self.inspector.store.exists(
-                            self.inspector._path(identity, 'result')):
+                if self.inspector.retained_scope(identity).get('execution_protocol') in {'shared.v1', 'shared.v2'} \
+                        and self.inspector.retained_opinion(identity) is None:
                     result = self.inspector.call('inspect_artifacts', self._arguments(binding), identity,
                         delivery_context=deepcopy(binding))
                     return self._envelope(binding, identity, result)
@@ -1039,12 +1010,10 @@ class DeliveryReview:
                         continue
                     old_identity = candidate['identity']
                     old_binding = candidate.get('binding')
-                    if not isinstance(old_binding, dict) or not self.inspector.store.exists(
-                            self.inspector._path(old_identity, 'result')):
+                    if not isinstance(old_binding, dict):
                         continue
-                    previous = self.inspector.store.read_json(self.inspector._path(old_identity, 'input'))
-                    response = self.inspector.store.read_json(self.inspector._path(old_identity, 'response'))
-                    if not response.get('completed') and not previous.get('source_invocations'):
+                    previous = self.inspector.retained_investigation(old_identity)
+                    if previous is None:
                         continue  # A preflight failure has no closed investigation to inherit.
                     reference = {'identity': old_identity, 'binding': old_binding,
                         'arguments': self._arguments(old_binding)}
