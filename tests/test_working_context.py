@@ -1724,14 +1724,19 @@ class CheckpointFailureTests(unittest.TestCase):
         owner = OperationTools.__new__(OperationTools)
         owner.config, owner.professional = {'native_supply_policy':TURN_SUPPLY_POLICY}, False
         owner.observations = lambda:items
-        owner.workspace = SimpleNamespace(artifact_hashes=lambda value:value)
+        hash_reads = []
+        def current_hashes(paths):
+            hash_reads.append(tuple(paths))
+            return {path:'b'*64 for path in paths}
+        owner.workspace = SimpleNamespace(artifact_hashes=current_hashes)
         mixed = {'text':'Working observation', 'records':['records/r1/native_result.json',
                                                            'records/r2/native_result.json']}
         conflicting = {'text':'Comparison across versions', 'records':['records/r0/native_result.json',
                                                                         'records/r1/native_result.json']}
         notes = owner.bind_notes([mixed,conflicting])
         self.assertEqual([note['source_integrity'] for note in notes], ['unknown','unknown'])
-        self.assertEqual([note['current'] for note in owner.project_notes(notes)], [None,None])
+        self.assertEqual([note['current'] for note in owner.project_notes(notes)], [None,False])
+        self.assertEqual(len(hash_reads), 1)
         self.assertEqual(notes[1]['observed_versions']['/workspace/inputs/a.txt'], 'a'*64)
         inspector_rows = [{'record':item['record'], 'result':value, 'source_currentness':'file_bytes'}
                           for item,value in zip(items,(first,second,process))]

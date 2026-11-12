@@ -5,6 +5,7 @@ lives here. Historical control is selected only by the loader of its saved task.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Callable
 
@@ -770,11 +771,24 @@ class OperationTools:
 
     def project_notes(self, notes: list[dict]) -> list[dict]:
         from simple_ar.app.work_memory import note_currentness
-        result = []
+        result, versions = [], {}
+
+        def versions_match(expected):
+            # Notes often cite the same source. Resolve its current version once
+            # for this working view; no version or memory is persisted here.
+            for path, digest in expected.items():
+                if path not in versions:
+                    try:
+                        versions[path] = self.workspace.artifact_hashes([path])[path]
+                    except (KeyError, ValueError, OSError):
+                        versions[path] = None
+                if versions[path] is None or versions[path] != digest:
+                    return False
+            return True
+
         for note in notes:
             bindings = note.get('observed_versions', {})
-            current = note_currentness(note,
-                versions_match=lambda versions: self.workspace.artifact_hashes(versions) == versions)
+            current = note_currentness(note, versions_match=versions_match)
             result.append({**note,'current':current,
                 'version_scope':'Referenced file bytes unchanged; derived claims still need checking' if bindings and current else
                     'Unversioned working judgment' if current else
