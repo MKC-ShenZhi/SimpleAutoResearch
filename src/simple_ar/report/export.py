@@ -779,6 +779,13 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     # Pandoc otherwise expands tabs before parsing literal code. Preserve
     # code bytes here; TeX owns their display width, not source normalization.
     ast = json.loads(run([pandoc, "--preserve-tabs", "--from=markdown-raw_tex-raw_html+tex_math_single_backslash", "--to=json"], cwd=root, text=source))
+    source_title = ast.get("meta", {}).get("title", {})
+    if isinstance(source_title, dict) and source_title.get("t") == "MetaInlines":
+        source_title = _plain_inlines(source_title["c"])
+    elif isinstance(source_title, dict) and source_title.get("t") == "MetaString":
+        source_title = source_title["c"]
+    else:
+        source_title = ""
     ast["meta"] = {}  # Input metadata must not supply a TeX preamble or includes.
     captions = {}
     parsed_captions = {}
@@ -811,12 +818,16 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     blocks = ast["blocks"]
     # Explicit titles are literal prose, not one unbreakable identifier.
     title_inlines = [{"t": "Space"} if token.isspace() else {"t": "Str", "c": token}
-                    for token in re.split(r"(\s+)", title or "") if token]
+                    for token in re.split(r"(\s+)", title or source_title) if token]
     renders_title = not template_files or '$title$' in template_files['template.latex'].read_text(encoding='utf-8')
     if blocks and blocks[0].get("t") == "Header" and blocks[0]["c"][0] == 1:
-        # A user template need not render title metadata. Keep the authored
-        # heading in that case, just as we retain its authored abstract below.
-        header = blocks.pop(0) if renders_title else blocks[0]
+        header = blocks[0]
+        # A distinct authored heading is body content. Only remove it when it
+        # supplies the title or duplicates the separately supplied title.
+        same_title = " ".join(_plain_inlines(header["c"][2]).split()).casefold() == \
+            " ".join(_plain_inlines(title_inlines).split()).casefold()
+        if renders_title and (not title_inlines or same_title):
+            blocks.pop(0)
         if not title_inlines:
             title_inlines = header["c"][2]
     if not title_inlines:

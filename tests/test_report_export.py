@@ -747,6 +747,42 @@ class ReportExportTests(unittest.TestCase):
         (report / "references.bib").write_text("@misc{p1, title={Evidence}}\n", encoding="utf-8")
         return report
 
+    def test_title_metadata_and_explicit_title_preserve_distinct_first_section(self):
+        cases = (
+            ('Study', None, '摘要', 'Study', ['摘要', 'Results']),
+            (None, 'Study', '摘要', 'Study', ['摘要', 'Results']),
+            ('Study', 'Other title', 'Study', 'Study', ['Results']),
+            (None, 'Study', 'Study', 'Study', ['Results']),
+            (None, None, 'Study', 'Study', ['Results']),
+            ('Other title', None, 'Study', 'Other title', ['Study', 'Results']),
+        )
+        for explicit, metadata, first_heading, expected_title, expected_headings in cases:
+            with self.subTest(explicit=explicit, metadata=metadata, heading=first_heading), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = self._source(root)
+                document = _ast()
+                document['blocks'][0]['c'][2] = [{'t': 'Str', 'c': first_heading}]
+                document['blocks'] = [document['blocks'][0], *document['blocks'][2:]]
+                if metadata:
+                    document['meta']['title'] = {'t': 'MetaInlines', 'c': [{'t': 'Str', 'c': metadata}]}
+                converted = []
+
+                def convert(argv, **kwargs):
+                    if '--to=json' in argv:
+                        return json.dumps(document)
+                    current = json.loads(kwargs['text'])
+                    converted.append(current)
+                    return (_standalone_fixture(current, kwargs['cwd']) if '--standalone' in argv
+                            else json.dumps(current['blocks']))
+
+                with patch('simple_ar.report.export.shutil.which', return_value='pandoc'), \
+                        patch('simple_ar.report.export._run', side_effect=convert):
+                    export_acm_report(source, root / 'export', title=explicit, layout='article')
+                headers = [node['c'][2][0]['c'] for node in converted[0]['blocks'] if node['t'] == 'Header']
+                self.assertEqual(headers, expected_headings)
+                title_nodes = converted[-1]['meta']['title']['c']
+                self.assertEqual(''.join(' ' if n['t'] == 'Space' else n['c'] for n in title_nodes), expected_title)
+
     def test_supplied_templates_preserve_body_without_inferred_abstract_roles(self):
         # Template variables are presentation, not proof that authored text
         # will be rendered. Do not move a section out of the body by its name.
