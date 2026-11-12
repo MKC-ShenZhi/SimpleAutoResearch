@@ -113,7 +113,7 @@ calls may incur provider charges. Optional catalog prices produce local estimate
 missing prices or unknown usage do not mean a call was free.
 See [native entry](CLI_REFERENCE.md#native-task-entry-experimental) for limits.
 
-If a process is needed, continue with the printed `Task session` path:
+Without workspace execution, continue with the printed `Task session` path when a process is needed:
 
 ```bash
 uv run simple-ar start --resume-task "SESSION" "Calculate the requested quantities; propose the command and retain the explanation." --allow-execution --yes

@@ -233,7 +233,7 @@ llm_requests = 20
 total_tokens = 600000
 ```
 
-Supply requires supply_id, reason and [changes]; source aliases resolve from the supply file. By default it fills missing contracts. Explicit replace_existing = true revises saved contracts; replacing sources requires the complete alias map. Evidence and charges remain. New protocols may need fresh acceptance; processes need separate approval. Keep supply separate from feedback, retry, CLI grants and command approval.
+Supply requires supply_id, reason and [changes]; source aliases resolve from the supply file. By default it fills missing contracts. Explicit replace_existing = true revises saved contracts; replacing sources requires the complete alias map. Evidence and charges remain. To authorize workspace execution for an existing task, set `sandbox_execution = true` in [changes] and also grant `allow_execution` if absent. An unstarted pending operation is cancelled and may be proposed again; host execution still requires approval. Keep supply separate from feedback, retry, CLI grants and command approval.
 
 ```bash
 simple-ar start --resume-task SESSION --supply-task supply.toml --prepare-only

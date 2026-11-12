@@ -233,7 +233,7 @@ llm_requests = 20
 total_tokens = 600000
 ```
 
-补齐要求 supply_id、reason、[changes]；来源别名相对补齐文件解析。默认补缺失合同；显式 replace_existing = true 修订已有合同，替换 sources 要求完整别名映射。保留证据及费用。新协议可能需重新接受；进程另行批准。补齐与反馈、重试、CLI 授权及命令批准分开。
+补齐要求 supply_id、reason、[changes]；来源别名相对补齐文件解析。默认补缺失合同；显式 replace_existing = true 修订已有合同，替换 sources 要求完整别名映射。保留证据及费用。已有任务如需授权工作区自动执行，可在 [changes] 中设置 `sandbox_execution = true`，没有执行权限时同时授予 `allow_execution`。未开始的待执行操作会取消，可再次提出；宿主机执行仍须批准。补齐与反馈、重试、CLI 授权及命令批准分开。
 
 ```bash
 simple-ar start --resume-task SESSION --supply-task supply.toml --prepare-only

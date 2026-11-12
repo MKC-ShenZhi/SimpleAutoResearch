@@ -107,7 +107,7 @@ uv run simple-ar start "根据所给曲线数据与配置写一份简短 Markdow
 模型目录中的可选价格仅用于本地估算；缺少价格或用量未知不表示免费。
 具体限额见[原生入口](CLI_REFERENCE_zh.md#原生任务入口实验性)。
 
-需要进程时，用打印的 `Task session` 路径续跑：
+未开启工作区自动执行时，需要进程可用打印的 `Task session` 路径续跑：
 
 ```bash
 uv run simple-ar start --resume-task "SESSION" "计算所需数值，先提出命令并保留原说明。" --allow-execution --yes
