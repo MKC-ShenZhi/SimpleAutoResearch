@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -1142,6 +1143,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     self.assertEqual(defaults['max_turns'], args.max_turns)
                     self.assertEqual(defaults['max_tokens'], args.max_tokens)
                     self.assertEqual(defaults['allow_execution'], args.allow_execution)
+                    self.assertEqual(defaults['sandbox_execution'], args.sandbox_execution)
                     _, _, owner_limits, _ = ToolApplication.preview_creation(workspace.tasks,
                         'Configuration preview', model=None, sources={},
                         max_turns=args.max_turns, max_tokens=args.max_tokens)
@@ -1149,7 +1151,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                         self.assertEqual(defaults[field], owner_limits[field])
                         self.assertGreater(defaults[field], 0)
                     self.assertEqual(set(defaults), {'max_turns', 'max_tokens', 'max_images',
-                        'allow_execution', 'allow_network', 'allow_vision',
+                        'allow_execution', 'sandbox_execution', 'allow_network', 'allow_vision',
                         'process_invocations', 'process_wall_seconds'})
                     # Parser changes flow into metadata without a second UI default.
                     args.max_turns += 1
@@ -1168,6 +1170,13 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                         goal='Keep original evidence and limits', materials=[str(project)], max_turns=defaults['max_turns'],
                         max_tokens=defaults['max_tokens'], process_invocations=0, process_wall_seconds=0,
                         network=False, execution=False)
+                    if sys.platform.startswith('linux') and shutil.which('bwrap'):
+                        status, scoped = request('/api/action', create | {'op': 'preview_create',
+                            'execution': True, 'sandbox_execution': True,
+                            'process_invocations': 2, 'process_wall_seconds': 10})
+                        self.assertEqual(status, 200, scoped)
+                        self.assertTrue(scoped['access']['sandbox_execution'])
+                        self.assertEqual(list(workspace.tasks.iterdir()), [])
                     self.assertEqual(request('/api/action', create | {'confirmed': False})[0], 400)
                     self.assertEqual(request('/api/action', create | {'max_tokens': -1})[0], 400)
                     self.assertEqual(request('/api/action', create)[0], 400)  # No legacy confirmation bypass.
