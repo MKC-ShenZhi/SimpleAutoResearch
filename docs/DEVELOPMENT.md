@@ -38,11 +38,12 @@ flowchart LR
 ```
 
 The application coordinates work; domain modules own their professional operations.
-All operations use the same execution records and resource accounting. Task-local
-scripts can provide a parser, calculation or plot when an existing operation is
-insufficient; they remain subject to the task's permissions.
-POSIX command startup enters process-group supervision before switching to the
-approved working directory and executable; the original argv and environment are preserved.
+Ordinary shared actions use the task's execution records and resource accounting.
+An explicitly enabled external agent CLI in standalone CodeTask still runs outside
+the shared process runner; its process and model usage are not in that ledger.
+Task-local scripts remain subject to the task's permissions. The shared POSIX
+process runner enters process-group supervision before switching to the approved
+working directory and executable; the original argv and environment are preserved.
 
 New ordinary tasks investigate, copy, edit and propose approved commands in the
 existing shared action loop. There is no mandatory source-assignment/return role

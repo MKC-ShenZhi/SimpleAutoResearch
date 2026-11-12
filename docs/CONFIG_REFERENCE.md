@@ -495,6 +495,9 @@ Most sections ignore unknown keys; workspace/execute.ablation reject extras. Mis
 | `implementation.agent_model`, `agent_binary`, `agent_args` | External model/program/argv under implementation | Optional strings / list; empty model uses external account default | Execute |
 | `implementation.agent_timeout_sec` | External timeout | Positive integer 600 seconds | Execute |
 
+An explicitly enabled external agent CLI runs outside the shared process runner;
+its process and model usage are not recorded in the task's shared ledger.
+
 <a id="execute-and-budget-fields"></a>
 
 ### Execute and budget fields
