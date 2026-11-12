@@ -772,6 +772,8 @@ class ReportExportTests(unittest.TestCase):
                         return json.dumps(document)
                     current = json.loads(kwargs['text'])
                     converted.append(current)
+                    if '--to=markdown' in argv:
+                        return json.dumps(current)
                     return (_standalone_fixture(current, kwargs['cwd']) if '--standalone' in argv
                             else json.dumps(current['blocks']))
 
@@ -782,6 +784,55 @@ class ReportExportTests(unittest.TestCase):
                 self.assertEqual(headers, expected_headings)
                 title_nodes = converted[-1]['meta']['title']['c']
                 self.assertEqual(''.join(' ' if n['t'] == 'Space' else n['c'] for n in title_nodes), expected_title)
+
+    def test_subtitle_is_preserved_in_export_and_portable_source(self):
+        for layout, subtitle_slot in (('article', True), ('acm', True), ('custom', True), ('custom', False)):
+            with self.subTest(layout=layout, subtitle_slot=subtitle_slot), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = self._source(root)
+                document = _ast()
+                document['meta'].update({
+                    'title': {'t': 'MetaInlines', 'c': [{'t': 'Str', 'c': 'Evidence report'}]},
+                    'subtitle': {'t': 'MetaInlines', 'c': [
+                        {'t': 'Str', 'c': 'Methods'}, {'t': 'Space'}, {'t': 'Str', 'c': 'and results'}]},
+                })
+                template = None
+                if layout == 'custom':
+                    path = source / 'layout.latex'
+                    path.write_text('\\documentclass{article}\n$for(header-includes)$\n$header-includes$\n$endfor$\n'
+                        '\\begin{document}\n$title$\n' + ('$subtitle$\n' if subtitle_slot else '')
+                        + '$body$\n\\end{document}\n', encoding='utf-8')
+                    template = {'path': path.name}
+                body_docs, source_docs, final_docs = [], [], []
+
+                def convert(argv, **kwargs):
+                    if '--to=json' in argv:
+                        return json.dumps(document)
+                    current = json.loads(kwargs['text'])
+                    if '--to=markdown' in argv:
+                        source_docs.append((argv, current))
+                        return json.dumps(current, ensure_ascii=False)
+                    if '--standalone' in argv:
+                        final_docs.append(current)
+                        return _standalone_fixture(current, kwargs['cwd'])
+                    body_docs.append(current)
+                    return json.dumps(current['blocks'], ensure_ascii=False)
+
+                with patch('simple_ar.report.export.shutil.which', return_value='pandoc'), \
+                        patch('simple_ar.report.export._run', side_effect=convert):
+                    export_acm_report(source, root / 'export', template=template,
+                                      layout=layout if layout != 'custom' else None)
+                self.assertIn('--standalone', source_docs[0][0])
+                self.assertEqual(set(source_docs[0][1]['meta']), {'title', 'subtitle'})
+                self.assertNotIn('header-includes', source_docs[0][1]['meta'])
+                self.assertIn('Methods', (root / 'export/source.md').read_text(encoding='utf-8'))
+                if subtitle_slot:
+                    self.assertIn('subtitle', final_docs[0]['meta'])
+                    self.assertIn('Methods and results', (root / 'export/main.tex').read_text(encoding='utf-8'))
+                    self.assertNotIn('Methods', json.dumps(body_docs[0]['blocks']))
+                else:
+                    self.assertNotIn('subtitle', final_docs[0]['meta'])
+                    self.assertIn('Methods', json.dumps(body_docs[0]['blocks']))
 
     def test_supplied_templates_preserve_body_without_inferred_abstract_roles(self):
         # Template variables are presentation, not proof that authored text

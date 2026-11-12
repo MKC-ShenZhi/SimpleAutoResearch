@@ -237,6 +237,26 @@ def _plain_inlines(inlines: list[dict]) -> str:
     return " ".join(str(node.get("c", "")) for node in _nodes(inlines) if node.get("t") == "Str")
 
 
+def _inline_text(inlines: list[dict]) -> str:
+    return "".join(node["c"] if node.get("t") == "Str" else
+                   " " if node.get("t") in {"Space", "SoftBreak", "LineBreak"} else
+                   node["c"][-1] if node.get("t") in {"Code", "Math"} else ""
+                   for node in _nodes(inlines))
+
+
+def _metadata_text(value: Any) -> str:
+    if isinstance(value, dict) and value.get("t") == "MetaInlines":
+        return _inline_text(value["c"])
+    if isinstance(value, dict) and value.get("t") == "MetaString":
+        return value["c"]
+    return ""
+
+
+def _literal_inlines(text: str) -> list[dict]:
+    return [{"t": "Space"} if token.isspace() else {"t": "Str", "c": token}
+            for token in re.split(r"(\s+)", text) if token]
+
+
 def _bind_figure_captions(ast: dict, captions: dict[str, list[dict]], *,
                           caption_owner: Literal['manifest', 'markdown', 'adjacent'] = 'manifest') -> list[str]:
     """Bind recorded figure captions, for both legacy and modern Pandoc ASTs.
@@ -693,6 +713,9 @@ $endfor$
 """ + (r"\setcounter{secnumdepth}{0}" + '\n' if version == 'article-rendering.v3' else '') + r"""
 \begin{document}
 """ + title + r"""
+$if(subtitle)$
+\begin{center}{\large $subtitle$\par}\end{center}
+$endif$
 $body$
 $if(bibliography)$
 \bibliographystyle{$biblio-style$}
@@ -779,13 +802,9 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     # Pandoc otherwise expands tabs before parsing literal code. Preserve
     # code bytes here; TeX owns their display width, not source normalization.
     ast = json.loads(run([pandoc, "--preserve-tabs", "--from=markdown-raw_tex-raw_html+tex_math_single_backslash", "--to=json"], cwd=root, text=source))
-    source_title = ast.get("meta", {}).get("title", {})
-    if isinstance(source_title, dict) and source_title.get("t") == "MetaInlines":
-        source_title = _plain_inlines(source_title["c"])
-    elif isinstance(source_title, dict) and source_title.get("t") == "MetaString":
-        source_title = source_title["c"]
-    else:
-        source_title = ""
+    source_metadata = ast.get("meta", {})
+    source_title = _metadata_text(source_metadata.get("title"))
+    source_subtitle = _metadata_text(source_metadata.get("subtitle"))
     ast["meta"] = {}  # Input metadata must not supply a TeX preamble or includes.
     captions = {}
     parsed_captions = {}
@@ -815,23 +834,28 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     bound_captions = _bind_figure_captions(ast, captions,
         caption_owner='adjacent' if adjacent_captions else caption_owner)
     source_ast = deepcopy(ast)
+    source_ast["meta"] = {key: {"t": "MetaInlines", "c": _literal_inlines(value)}
+                          for key, value in (("title", source_title), ("subtitle", source_subtitle)) if value}
     blocks = ast["blocks"]
     # Explicit titles are literal prose, not one unbreakable identifier.
-    title_inlines = [{"t": "Space"} if token.isspace() else {"t": "Str", "c": token}
-                    for token in re.split(r"(\s+)", title or source_title) if token]
+    title_inlines = _literal_inlines(title or source_title)
+    subtitle_inlines = _literal_inlines(source_subtitle)
     renders_title = not template_files or '$title$' in template_files['template.latex'].read_text(encoding='utf-8')
+    renders_subtitle = not template_files or '$subtitle$' in template_files['template.latex'].read_text(encoding='utf-8')
     if blocks and blocks[0].get("t") == "Header" and blocks[0]["c"][0] == 1:
         header = blocks[0]
         # A distinct authored heading is body content. Only remove it when it
         # supplies the title or duplicates the separately supplied title.
-        same_title = " ".join(_plain_inlines(header["c"][2]).split()).casefold() == \
-            " ".join(_plain_inlines(title_inlines).split()).casefold()
+        same_title = " ".join(_inline_text(header["c"][2]).split()).casefold() == \
+            " ".join(_inline_text(title_inlines).split()).casefold()
         if renders_title and (not title_inlines or same_title):
             blocks.pop(0)
         if not title_inlines:
             title_inlines = header["c"][2]
     if not title_inlines:
         title_inlines = [{"t": "Str", "c": "Research report"}]
+    if subtitle_inlines and not renders_subtitle:
+        blocks.insert(0, {"t": "Para", "c": deepcopy(subtitle_inlines)})
     abstract: list[dict] = []
     # Only the historical ACM layout owns abstract projection. A general
     # article keeps authored sections; a supplied template may omit or conditionally suppress $abstract$; moving
@@ -866,7 +890,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         # Ignore locator strings, discarded YAML and non-rendered attributes;
         # include literal code/math which the technical preamble later rewrites.
         visible_text = []
-        for node in _nodes([title_inlines, blocks, abstract]):
+        for node in _nodes([title_inlines, subtitle_inlines, blocks, abstract]):
             if node.get('t') == 'Str':
                 visible_text.append(node['c'])
             elif node.get('t') in {'Code', 'CodeBlock', 'Math'}:
@@ -999,7 +1023,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         for image in publication_view['image_mapping'].values():
             manifest['public_artifacts'].extend(image['files'])
         natural_layout = (article and article_rendering['schema_version'] == 'article-rendering.v3') or natural_acm
-        manifest['public_artifacts'].extend(_prepare_technical_content([title_inlines, blocks, abstract], output,
+        manifest['public_artifacts'].extend(_prepare_technical_content([title_inlines, subtitle_inlines, blocks, abstract], output,
             natural_layout=natural_layout))
 
         division = template.get('top_level_division') if template_files else None
@@ -1009,7 +1033,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         body_tex = _paginate_figure_tex(body_tex)
         (output / "body.tex").write_text(body_tex + "\n", encoding="utf-8")
         (output / "references.bib").write_text(bibliography, encoding="utf-8")
-        markdown = run([pandoc, "--from=json", "--to=markdown", "--wrap=none"],
+        markdown = run([pandoc, "--from=json", "--to=markdown", "--wrap=none",
+                        *(['--standalone'] if source_ast['meta'] else [])],
                         cwd=output, text=json.dumps(source_ast))
         (output / "source.md").write_text(markdown, encoding="utf-8")
         publication_view['source_markdown_sha256'] = hashlib.sha256((output / 'source.md').read_bytes()).hexdigest()
@@ -1043,7 +1068,9 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             # address footnote; users can add real authors/addresses themselves.
             "\\authorsaddresses{}\n"
             "\\setlength{\\emergencystretch}{1em}\n"
-            "\\title[Research report]{$title$}\n\\begin{document}\n"
+            "\\title[Research report]{$title$}\n"
+            + "$if(subtitle)$\\subtitle{$subtitle$}\n$endif$"
+            + "\\begin{document}\n"
             + "$if(abstract)$\\begin{abstract}\n$abstract$\n\\end{abstract}\n$endif$"
             + "\\maketitle\n$body$\n"
             + "$if(bibliography)$\\bibliographystyle{ACM-Reference-Format}\n\\bibliography{references}\n$endif$"
@@ -1092,11 +1119,13 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             # actual Unicode (also an explicit title absent from source.md),
             # without dispatching separate fragment conversions to discover it.
             preamble += _scientific_unicode_preamble(
-                json.dumps([title_inlines, abstract], ensure_ascii=False), body_tex, bibliography, source)
+                json.dumps([title_inlines, subtitle_inlines, abstract], ensure_ascii=False), body_tex, bibliography, source)
         def meta_tex(value: str) -> dict:
             return {'t': 'MetaBlocks', 'c': [{'t': 'RawBlock', 'c': ['latex', value]}]}
         metadata = {'title': {'t': 'MetaInlines', 'c': title_inlines},
             'header-includes': {'t': 'MetaList', 'c': [meta_tex(preamble)]}}
+        if subtitle_inlines and renders_subtitle:
+            metadata['subtitle'] = {'t': 'MetaInlines', 'c': subtitle_inlines}
         if abstract:
             metadata['abstract'] = {'t': 'MetaBlocks', 'c': abstract}
         if citations:
@@ -1147,7 +1176,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                 'Supported contract: $body$, $title$, $abstract$, the standard '
                 '$for(header-includes)$$header-includes$$endfor$ hook (required in preamble), '
                 '$bibliography$, $biblio-style$; no Pandoc partials, scripts, filters, downloads or arbitrary metadata.\n'
-                'header-includes contains renderer-owned support only; source YAML contributes only a plain title.\n'
+                'header-includes contains renderer-owned support only; source YAML contributes only title and subtitle text.\n'
                 'Templates own class, packages, title/abstract placement and BibTeX style. '
                 'Only pdflatex or xelatex with BibTeX is supported; no Biber or external build recipes.\n'
                 'Body hierarchy uses the declared top_level_division when supplied; no class-name inference.\n'
