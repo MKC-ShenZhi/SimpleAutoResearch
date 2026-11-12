@@ -15,7 +15,7 @@ FIELDS = {
     'kind': str, 'project': str, 'document': list, 'material': list,
     'extensions': list, 'from_session': str, 'reuse': list, 'reuse_version': int,
     'data_file': str, 'data_path': list,
-    'project_python': str, 'allow_execution': bool, 'allow_network': bool,
+    'project_python': str, 'allow_execution': bool, 'sandbox_execution': bool, 'allow_network': bool,
     'allow_vision': bool, 'max_images': int, 'max_turns': int, 'max_tokens': int,
     'max_processes': int, 'max_process_seconds': (int, float),
 }
@@ -80,7 +80,7 @@ def validate_resume_options(args: argparse.Namespace) -> None:
         return
     creation = set(getattr(args, '_explicit_start_destinations', ())) & {
         'max_turns', 'max_tokens', 'max_images', 'max_processes',
-        'max_process_seconds', 'project_python', 'output_root',
+        'max_process_seconds', 'project_python', 'output_root', 'sandbox_execution',
         'extensions', 'from_session', 'reuse', 'reuse_version',
     }
     creation.update(name for name in ('max_processes', 'max_process_seconds')
@@ -166,6 +166,7 @@ def write_task_config(args: argparse.Namespace) -> bool:
         'data_path': 'Additional read-only data files/directories.',
         'project_python': 'Python entry path, preserving a virtualenv symlink; relative paths use this file location. Saved task environments do not change on resume.',
         'allow_execution': 'Allows process proposals only. Each actual command still needs approval.',
+        'sandbox_execution': 'With allow_execution, run ordinary work and rendering in the task workspace using Linux bubblewrap. Processes cannot access original sources or the network.',
         'allow_network': 'Allows public source acquisition; does not authorize installations.',
         'allow_vision': 'Allows sending rendered images to the configured vision connection.',
         'max_images': 'Paid image generation/edit submissions, separate from inspecting images.',

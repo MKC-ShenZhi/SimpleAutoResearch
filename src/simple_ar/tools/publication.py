@@ -845,7 +845,10 @@ class PublicationToolGateway:
                     try:
                         result = run_process(ProcessSpec(argv=command, cwd=cwd, timeout_sec=timeout,
                             env=environment, output_dir=logs, invocation_id=process_id,
-                            attempt_id=identity, tail_bytes=12000, log_bytes=2000000), budget_ledger=self.ledger)
+                            attempt_id=identity, tail_bytes=12000, log_bytes=2000000,
+                            sandbox=self.workspace.process_sandbox(cwd,
+                                extra_read=(*((render_source.parent,) if request.candidate_result else ()),
+                                            *((input_path,) if text is not None else ())))), budget_ledger=self.ledger)
                     except BudgetError as exc:
                         raise ReportExportResourceError(
                             f"Rendering budget unavailable: {exc}. Retain the export and process receipts; "

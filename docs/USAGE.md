@@ -101,6 +101,7 @@ source retrieval nor process proposals. Add access only when the task needs it:
 | --- | --- | --- |
 | Public search and source acquisition | `--allow-network` | Does not authorize installation or commands |
 | Propose a calculation or other process | `--allow-execution` | Each command still requires approval |
+| Automatically run ordinary workspace work | `--allow-execution --sandbox-execution` | Linux with bubblewrap; copy needed source materials to the workspace, processes cannot use the network |
 | Inspect rendered images | `--allow-vision` | Sends images to the configured vision route |
 | Generate/edit raster concepts | `--max-images N` | Requires an image route and retains the allowance |
 

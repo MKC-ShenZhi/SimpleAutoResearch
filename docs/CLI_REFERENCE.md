@@ -109,7 +109,8 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | --- | --- | --- |
 | `--max-processes N` | Cumulative native process count, including search backends; zero disables processes. | 10 × max-turns unless a contract sets it |
 | `--max-process-seconds N` | Cumulative process wall time in seconds; not a per-command timeout. | 300 × max-turns unless a contract sets it |
-| `--allow-execution` | Allow process proposals; each command still needs exact approval. Execution is not an OS sandbox. | Off |
+| `--allow-execution` | Allow process proposals; without workspace execution each command still needs exact approval. | Off |
+| `--sandbox-execution` | Run ordinary commands and report rendering within the task workspace without per-command approval. Processes have no external network or direct access to original source mounts; copy needed inputs first. | Requires `--allow-execution`, Linux and bubblewrap |
 | `--allow-network` | Authorize public-source search/acquisition; not package installation or arbitrary commands. | Off |
 | `--allow-vision` | Send mounted rendered PNG/JPEG/WebP to the vision route; shares the model budget. | Off |
 | `--max-images N` | Image generation/edit submissions through the image route; separate from visual inspection. | 0 |

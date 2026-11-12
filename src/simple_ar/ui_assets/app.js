@@ -14,7 +14,7 @@ let confirmation = null, confirmationSending = false, actionSending = false, cre
 let previewTarget = null;
 let reuseOrigin = null;
 let viewKey = '', view = {selected: '', tasks: {}, create: {}};
-const createFields = ['taskConfig', 'goal', 'materials', 'profile', 'turns', 'tokens', 'processes', 'seconds', 'network', 'execution'];
+const createFields = ['taskConfig', 'goal', 'materials', 'profile', 'turns', 'tokens', 'processes', 'seconds', 'network', 'execution', 'sandboxExecution'];
 function persistView() {
   if (!viewKey) return;
   try { sessionStorage.setItem(viewKey, JSON.stringify(view)); }
@@ -248,7 +248,8 @@ function effectiveAccess() {
   const blocked = Number($('processes').value) === 0 || Number($('seconds').value) === 0;
   $('effectiveAccess').textContent = ($('execution').checked
     ? blocked ? '已允许提出执行，但进程次数或墙钟上限为 0，实际执行不可用；请调整额度或关闭权限。'
-              : '可提出执行；实际运行仍需要逐项精确批准，并受所示进程上限约束。'
+              : $('sandboxExecution').checked ? '工作区内的普通命令和报告构建自动执行；进程无外网，其他执行仍需批准。'
+                : '可提出执行；实际运行仍需要逐项精确批准，并受所示进程上限约束。'
     : '进程额度不会授予执行权限；执行提议权限当前关闭。')
     + ' 图像权限与生成额度：' + pretty({allow_vision: metadata.creation_defaults.allow_vision,
                                        max_images: metadata.creation_defaults.max_images});
@@ -458,7 +459,8 @@ $('createForm').onsubmit = async event => {
     model: $('profile').value, binding_id: metadata.profiles.find(p => p.selector === $('profile').value)?.binding_id,
     max_turns: Number($('turns').value), max_tokens: Number($('tokens').value),
     process_invocations: Number($('processes').value), process_wall_seconds: Number($('seconds').value),
-    network: $('network').checked, execution: $('execution').checked, ...(reuseOrigin || {})};
+    network: $('network').checked, execution: $('execution').checked,
+    sandbox_execution: $('sandboxExecution').checked, ...(reuseOrigin || {})};
   const epoch = viewEpoch;
   creationPreviewSending = true; confirmationControls();
   try {
@@ -472,7 +474,7 @@ $('createForm').onsubmit = async event => {
         token_note: '输入预留为估算，实际结算可能超过预留或 token 额度。'},
       '生效权限': preview.access,
       '受信任扩展（含代码、资源身份与工具声明）': preview.extensions,
-      '信任与审批边界': '扩展 Python 具有宿主机 OS 权限，read_only/plan 声明不是隔离，也不受关闭执行/网络开关的沙箱保护。确认即信任所列扩展代码。原生进程提议仍逐项精确批准；网络许可不授权安装。视觉许可允许向所列视觉连接发送图像；生成图像另受 image_requests 额度限制。',
+      '信任与审批边界': '扩展 Python 具有宿主机 OS 权限，确认即信任扩展代码。若开启工作区自动执行，普通命令和报告构建在隔离范围内接续；其他执行仍需批准。公共来源网络许可不授权进程联网或安装。视觉许可和图像生成分别受对应配置与额度约束。',
       '操作范围': '只创建并保存原生任务；创建后选择“继续执行”才开始工作。配置、连接或扩展变化会拒绝创建，请重新预览。'
     });
   } catch (error) { notice(error.message); }
@@ -522,7 +524,7 @@ for (const id of [...createFields, 'feedback', 'switchReason', 'switchProfile'])
   $(id).addEventListener('change', saveDrafts);
 }
 window.addEventListener('pagehide', saveDrafts);
-for (const id of ['processes', 'seconds', 'execution']) $(id).oninput = () => { if (metadata) effectiveAccess(); };
+for (const id of ['processes', 'seconds', 'execution', 'sandboxExecution']) $(id).oninput = () => { if (metadata) effectiveAccess(); };
 $('taskConfig').addEventListener('input', creationMode);
 async function poll() {
   try { await refresh(); }
@@ -541,6 +543,7 @@ async function poll() {
     }
     $('network').checked = metadata.creation_defaults.allow_network;
     $('execution').checked = metadata.creation_defaults.allow_execution;
+    $('sandboxExecution').checked = metadata.creation_defaults.sandbox_execution;
     effectiveAccess(); $('createSubmit').disabled = false;
     for (const id of ['profile', 'switchProfile']) {
       const placeholder = document.createElement('option'); placeholder.value = '';

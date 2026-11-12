@@ -109,7 +109,8 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | --- | --- | --- |
 | `--max-processes N` | 原生累计进程次数，含检索后端；0 禁止进程。 | 没有合同设置时为 10 × max-turns |
 | `--max-process-seconds N` | 累计进程实际耗时（秒）；不是单命令超时。 | 没有合同设置时为 300 × max-turns |
-| `--allow-execution` | 允许提出进程命令；每条命令仍需精确批准。执行不是操作系统沙箱。 | 关闭 |
+| `--allow-execution` | 允许提出进程命令；未开启工作区执行时，每条命令仍需精确批准。 | 关闭 |
+| `--sandbox-execution` | 在任务工作区内自动执行普通命令和报告构建，无需逐条批准。进程不能访问外网或原始材料挂载，所需材料须先复制到工作区。 | 需同时设置 `--allow-execution`、Linux 和 bubblewrap |
 | `--allow-network` | 授权公开来源检索／获取；不授权安装软件包或任意命令。 | 关闭 |
 | `--allow-vision` | 将挂载的 PNG/JPEG/WebP 渲染图发往 vision 路由；共用模型预算。 | 关闭 |
 | `--max-images N` | 通过 image 路由生成／编辑图片的提交额度；与视觉检查分开。 | 0 |

@@ -97,6 +97,7 @@ uv run simple-ar start "根据所给曲线数据与配置写一份简短 Markdow
 | --- | --- | --- |
 | 公开检索与来源获取 | `--allow-network` | 不授权安装或命令 |
 | 提出计算等进程 | `--allow-execution` | 每条命令仍须批准 |
+| 自动执行工作区内普通操作 | `--allow-execution --sandbox-execution` | 需要 Linux 与 bubblewrap；先将所需原始材料复制到工作区，进程不能联网 |
 | 检查渲染图像 | `--allow-vision` | 将图像发送给配置的 vision 路由 |
 | 生成或编辑栅格概念图 | `--max-images N` | 需要 image 路由，额度保留 |
 

@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
+from simple_ar.core.process_sandbox import ProcessSandbox, sandbox_command
+
 from simple_ar.core.artifacts import read_json, write_json
 from simple_ar.core.budget import BudgetConflictError, BudgetLedger
 
@@ -51,8 +53,9 @@ except OSError as exc:
 @contextmanager
 def _spawn_process(spec: ProcessSpec):
     options = dict(env=spec.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    argv = sandbox_command(spec.sandbox, spec.cwd, spec.argv) if spec.sandbox else spec.argv
     if os.name == 'nt':
-        yield subprocess.Popen(spec.argv, cwd=spec.cwd, **options,
+        yield subprocess.Popen(argv, cwd=spec.cwd, **options,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP), lambda: None
         return
     # /proc exposes the running binary without traversing a remote venv path.
@@ -68,7 +71,7 @@ def _spawn_process(spec: ProcessSpec):
                 environment.write(json.dumps(dict(os.environ) if spec.env is None else spec.env).encode('utf-8'))
                 environment.seek(0)
                 process = subprocess.Popen([interpreter, '-I', '-S', '-c', _POSIX_EXEC_BOOTSTRAP,
-                    str(writer), str(environment.fileno()), str(spec.cwd), *spec.argv],
+                    str(writer), str(environment.fileno()), str(spec.cwd), *argv],
                     **options, start_new_session=True, pass_fds=(writer, environment.fileno()))
         finally:
             os.close(writer)
@@ -96,6 +99,7 @@ class ProcessSpec:
     attempt_id: str = ""
     input_binding: dict | None = None
     display_argv: list[str] | None = None
+    sandbox: ProcessSandbox | None = None
 
 
 @dataclass(frozen=True)
@@ -325,6 +329,8 @@ def _run_process(
         record.update(input_binding=spec.input_binding, environment=spec.env)
     if os.name != 'nt':
         record['launch_transport'] = 'isolated_python_exec.v1'
+    if spec.sandbox is not None:
+        record['execution_scope'] = 'workspace'
 
     def save() -> None:
         if spec.output_dir:
@@ -335,7 +341,7 @@ def _run_process(
     with ExitStack() as resources:
         try:
             process, launch_error = resources.enter_context(_spawn_process(spec))
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             record.update(status="launch_failed", error=str(exc))
             save()
             raise

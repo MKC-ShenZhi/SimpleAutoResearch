@@ -7,6 +7,10 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ## 2026-11-13
 
+### Added
+
+- Linux tasks can authorize ordinary workspace execution and report rendering through bubblewrap, avoiding per-command approval while retaining process records and budgets.
+
 ### Fixed
 
 - Workspace files load independently of slow delivery details, and workspace build logs can be viewed.

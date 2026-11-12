@@ -267,7 +267,8 @@ class OperationTools:
             project_python=Path(config['project_python']) if config.get('project_python') else None,
             record_artifacts=record_artifacts,
             process_artifact_paths=config.get('process_artifact_paths'),
-            candidate_review_protocol=config.get('candidate_review_protocol'))
+            candidate_review_protocol=config.get('candidate_review_protocol'),
+            sandbox_execution=config.get('sandbox_execution', False))
         self.registry = ToolRegistry()
         self.registry.register_package(workspace_tool_specs(candidate_review=config.get('work_method') in NATIVE_WORK_METHODS,
             process_artifact_paths=config.get('process_artifact_paths'),
@@ -474,6 +475,10 @@ class OperationTools:
                 self.selection = WorkSelection(config.get('work_selection_policy'))
                 self.registry.register_package([self.selection.spec()], self.selection, request_visible=True)
                 self.system = self.selection.system
+        if config.get('sandbox_execution'):
+            self.system += (' Process commands can access the task workspace, not the original source mounts. '
+                'Copy needed inputs into the workspace before running them. Internet access is unavailable to '
+                'processes; public source tools retain their separate authorization.')
         if not legacy_report_status:
             from simple_ar.tools.workspace import prepared_report_delivery_schema
             for spec in self.registry.list_specs():

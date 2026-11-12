@@ -628,7 +628,8 @@ class ToolApplication:
             project_python=Path(config['project_python']) if config.get('project_python') else None,
             record_artifacts=self._record_artifacts,
             process_artifact_paths=config.get('process_artifact_paths'),
-            candidate_review_protocol=config.get('candidate_review_protocol'))
+            candidate_review_protocol=config.get('candidate_review_protocol'),
+            sandbox_execution=config.get('sandbox_execution', False))
         registry = ToolRegistry()
         registry.register_package(workspace_tool_specs(), self.workspace,
             request_visible={'ask_user', 'deliver_result', 'read_file', 'list_directory'})
@@ -1618,7 +1619,8 @@ class ToolApplication:
 
     @classmethod
     def _configuration(cls, root: Path, goal: str, *, model: str | None, sources: dict[str, Path],
-               allow_execution: bool = False, allow_network: bool = False, allow_vision: bool = False, max_turns: int = 30,
+               allow_execution: bool = False, sandbox_execution: bool = False,
+               allow_network: bool = False, allow_vision: bool = False, max_turns: int = 30,
                max_tokens: int = 600000, max_images: int = 0,
                project_python: Path | None = None, code_task: dict[str, Any] | None = None,
                process_limits: dict[str, int | float] | None = None,
@@ -1642,6 +1644,13 @@ class ToolApplication:
         """Validate caller contracts before creation or supply; never execute or persist."""
         if control_protocol not in {None, 'operations.v1'}:
             raise ValueError('Unsupported operation control protocol')
+        if type(sandbox_execution) is not bool or sandbox_execution and not allow_execution:
+            raise ValueError('Workspace execution requires explicit process authorization')
+        if sandbox_execution:
+            import shutil
+            import sys
+            if not sys.platform.startswith('linux') or shutil.which('bwrap') is None:
+                raise ValueError('Workspace execution requires bubblewrap on a Linux execution host')
         if completion_policy is None:
             completion_policy = _OPERATION_EXIT if control_protocol is not None else 'closing_decision.v2'
         frozen_extensions = freeze_extensions(extensions or [])
@@ -1849,6 +1858,8 @@ class ToolApplication:
             "max_turns": max_turns}
         if control_protocol is not None:
             config['control_protocol'] = control_protocol
+        if sandbox_execution:
+            config['sandbox_execution'] = True
         if frozen_extensions:
             config['extensions'] = frozen_extensions
             config['extension_host_protocol'] = 'nested_calls.v1'
@@ -1970,7 +1981,8 @@ class ToolApplication:
 
     @classmethod
     def create(cls, root: Path, goal: str, *, model: str | None, sources: dict[str, Path],
-               allow_execution: bool = False, allow_network: bool = False, allow_vision: bool = False, max_turns: int = 30,
+               allow_execution: bool = False, sandbox_execution: bool = False,
+               allow_network: bool = False, allow_vision: bool = False, max_turns: int = 30,
                max_tokens: int = 600000, max_images: int = 0,
                project_python: Path | None = None, code_task: dict[str, Any] | None = None,
                process_limits: dict[str, int | float] | None = None,
@@ -1998,7 +2010,8 @@ class ToolApplication:
         retain their saved contracts, approvals and ledger without migration.
         """
         prepared = cls.preview_creation(root, goal, model=model, sources=sources,
-            allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
+            allow_execution=allow_execution, sandbox_execution=sandbox_execution,
+            allow_network=allow_network, allow_vision=allow_vision,
             max_turns=max_turns, max_tokens=max_tokens, max_images=max_images, project_python=project_python,
             code_task=code_task, process_limits=process_limits, report_requirement=report_requirement, report_protocol=report_protocol,
             research_policy=research_policy, table_analysis=table_analysis, max_output_tokens=max_output_tokens,
@@ -2139,7 +2152,7 @@ class ToolApplication:
                     or not isinstance(changes, dict) or not changes or type(replace_existing) is not bool):
                 raise ValueError('Supply requires a stable id, reason, explicit contracts and a boolean replacement choice')
             supply_id, reason = supply_id.strip(), reason.strip()
-            fields = {'model', 'sources', 'allow_execution', 'allow_network', 'code_task',
+            fields = {'model', 'sources', 'allow_execution', 'sandbox_execution', 'allow_network', 'code_task',
                 'execution_contract', 'research_policy', 'table_analysis', 'report_requirement', 'max_output_tokens',
                 'tool_contracts', 'completion_policy', 'delivery_files', 'document_source_contract'}
             if set(changes) - fields:
@@ -2185,7 +2198,7 @@ class ToolApplication:
                 if name == 'sources':
                     if not replace_existing and any(alias in old['sources'] and old['sources'][alias] != path for alias, path in value.items()):
                         raise ValueError('Supply cannot replace an existing source alias')
-                elif name in {'allow_execution', 'allow_network'}:
+                elif name in {'allow_execution', 'sandbox_execution', 'allow_network'}:
                     if type(value) is not bool or not replace_existing and old.get(name, False) and not value:
                         raise ValueError('Supply access is an explicit additional grant, not revocation')
                 elif name == 'model' and old.get(name) is not None and old[name] != value:
@@ -2211,7 +2224,8 @@ class ToolApplication:
                 raise ValueError('First model binding requires explicit positive llm_requests and total_tokens allowances')
             config, reused, _, _ = self._configuration(self.session.store.root, self.state['requests'][0],
                 model=candidate['model'], sources={key: Path(value) for key, value in candidate['sources'].items()},
-                allow_execution=candidate['allow_execution'], allow_network=candidate.get('allow_network', False),
+                allow_execution=candidate['allow_execution'], sandbox_execution=candidate.get('sandbox_execution', False),
+                allow_network=candidate.get('allow_network', False),
                 allow_vision=candidate.get('allow_vision', False), max_images=candidate.get('max_images', 0),
                 max_turns=allowances['llm_requests'] if first_model else max(1, candidate['max_turns']),
                 max_tokens=allowances['total_tokens'] if first_model else max(1, self.ledger.limits['total_tokens']),
@@ -2239,7 +2253,7 @@ class ToolApplication:
                 config['producer_completion'] = old['producer_completion']
             if 'result_investigation' in old:
                 config['result_investigation'] = old['result_investigation']
-            for name in fields - {'model', 'sources', 'allow_execution', 'allow_network'}:
+            for name in fields - {'model', 'sources', 'allow_execution', 'sandbox_execution', 'allow_network'}:
                 if not replace_existing and old.get(name) is not None and old[name] != config.get(name):
                     raise ValueError(f'{name} is already frozen; use its existing feedback/revision contract')
                 if name in supplied and supplied[name] is None:
@@ -6197,7 +6211,8 @@ class ToolApplication:
                         or (binding.get('artifacts') or {}).get('inputs')):
                     grant = self.workspace.approval_digest({
                         'name': name, 'arguments': json.loads(call['function']['arguments']), 'binding': binding})
-            if token is not None and not started and approved_execution != token and grant not in grants:
+            task_scope = self.state['config'].get('sandbox_execution') and name in {'run_process', 'export_report'}
+            if token is not None and not started and not task_scope and approved_execution != token and grant not in grants:
                 decision = approve(call, token) if approve else False
                 if isinstance(decision, ExecutionRejection):
                     pending['execution_rejection'] = decision.reason.strip()

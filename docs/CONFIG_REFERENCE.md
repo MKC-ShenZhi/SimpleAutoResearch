@@ -180,6 +180,7 @@ Place `notes.md` beside the file. All fields below belong to `[task]`; paths use
 | `output_root` | Output parent | Path string `runs/assistant` | New task location |
 | `project_python` | Project Python entry, preserving venv entry path | Optional path string | New task environment |
 | `allow_execution` | Permit process proposals | Boolean false | New task; each command still needs approval |
+| `sandbox_execution` | Authorize ordinary workspace processes and report rendering | Boolean false | Requires `allow_execution`, Linux and bubblewrap; no process network or direct source mounts |
 | `allow_network` | Public-source acquisition | Boolean false | New task; not installation authorization |
 | `allow_vision` | Send mounted images to vision route | Boolean false | New task; separate from generation |
 | `max_turns`, `max_tokens` | Shared model request/token allowances | Integers `30`, `600000` | New ledger limits |

@@ -136,7 +136,7 @@ class Workspace:
         options.update(model=None, sources={})
         _, _, limits, _ = ToolApplication.preview_creation(self.tasks, 'Configuration preview', **options)
         return {key: options[key] for key in ('max_turns', 'max_tokens', 'max_images',
-                    'allow_execution', 'allow_network', 'allow_vision')} | {
+                    'allow_execution', 'sandbox_execution', 'allow_network', 'allow_vision')} | {
             key: limits[key] for key in ('process_invocations', 'process_wall_seconds')}
 
     def connection(self, selector: str) -> tuple[dict, str]:
@@ -195,6 +195,7 @@ class Workspace:
                 args.reuse = data.get('reuse', ['artifacts'])
                 args.reuse_version = data.get('reuse_version')
             args.allow_execution = data.get('execution') is True
+            args.sandbox_execution = data.get('sandbox_execution') is True
             args.allow_network = data.get('network') is True
             for field, destination in (('max_turns', 'max_turns'), ('max_tokens', 'max_tokens'),
                     ('process_invocations', 'max_processes'), ('process_wall_seconds', 'max_process_seconds')):
@@ -288,7 +289,7 @@ class Workspace:
             task_root=str(self.tasks), model=config['model'],
             binding_id=hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest(),
             recipients=recipients, sources=config['sources'], project_python=config['project_python'],
-            access={k: config[k] for k in ('allow_execution', 'allow_network', 'allow_vision')},
+            access={k: config.get(k, False) for k in ('allow_execution', 'sandbox_execution', 'allow_network', 'allow_vision')},
             limits=limits, attempts=attempts, extensions=config.get('extensions', []))
 
     def listing(self) -> list[dict]:

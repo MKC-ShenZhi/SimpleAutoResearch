@@ -24,7 +24,8 @@
 <label>进程次数<input id="processes" type="number" min="0" required></label>
 <label>进程总墙钟秒<input id="seconds" type="number" min="0" step="any" required></label></div>
 <label class="check"><input id="network" type="checkbox">允许公共网络来源获取</label>
-<label class="check"><input id="execution" type="checkbox">允许提出进程执行（每项仍需精确批准；不是系统沙箱）</label>
+<label class="check"><input id="execution" type="checkbox">允许提出进程执行</label>
+<label class="check"><input id="sandboxExecution" type="checkbox">允许在任务工作区内自动执行和生成报告（Linux bubblewrap；进程无外网，原始材料需先复制）</label>
 <p id="effectiveAccess" class="hint"></p></fieldset><button id="createSubmit" type="submit" disabled>预览实际配置</button>
 <p class="hint">创建只保存原任务。选择“继续执行”后才开始工作。自然语言中的资源偏好不能替代这些额度。</p></form></section>
 <section id="detail" hidden>

@@ -878,7 +878,8 @@ class WorkspaceToolGateway:
     def __init__(self, root: Path, sources: dict[str, Path], ledger: BudgetLedger,
                  project_python: Path | None = None, record_artifacts: Any | None = None,
                  create_workspace: bool = True, process_artifact_paths: str | None = None,
-                 candidate_review_protocol: str | None = None) -> None:
+                 candidate_review_protocol: str | None = None,
+                 sandbox_execution: bool = False) -> None:
         if process_artifact_paths not in (None, 'cwd.v1'):
             raise ValueError('Unsupported saved process artifact paths')
         self.process_artifact_paths = process_artifact_paths
@@ -902,6 +903,21 @@ class WorkspaceToolGateway:
             raise ValueError("Private/runtime files cannot be mounted as task sources")
         self.ledger = ledger
         self.record_artifacts = record_artifacts
+        self.sandbox_execution = sandbox_execution
+
+    def process_sandbox(self, cwd: Path, *, extra_read: tuple[Path, ...] = ()):
+        if not self.sandbox_execution:
+            return None
+        from simple_ar.core.process_sandbox import ProcessSandbox
+        workspace = self.workspace.resolve()
+        working = cwd.resolve()
+        relative = working.relative_to(workspace) if working.is_relative_to(workspace) else Path('.')
+        # Independent inspection owns only its own scratch directory. It can
+        # read the task workspace but cannot change the candidate under review.
+        writable = (workspace.joinpath(*relative.parts[:2])
+            if len(relative.parts) >= 2 and relative.parts[0] == 'inspection-work' else workspace)
+        return ProcessSandbox(workspace=workspace, writable=writable, python=self.python,
+                              extra_read=extra_read)
 
     def resolve(self, value: str, *, write: bool = False) -> Path:
         diagnostic = self._process_diagnostic_path(value, write=write)
@@ -2197,7 +2213,7 @@ class WorkspaceToolGateway:
                 data = model.model_dump()
             elif name == "run_process":
                 recovering = (self.root / "tools" / "processes" / identity / "invocation.json").exists()
-                data = self._run(model, identity)
+                data = self._run(model, identity, sandboxed=self.sandbox_execution)
                 if not recovering:
                     receipt = self.root / data['receipt']
                     data['receipt_sha256'] = hashlib.sha256(receipt.read_bytes()).hexdigest()
@@ -2672,7 +2688,7 @@ class WorkspaceToolGateway:
                 "returncode": result["returncode"], "stop_reason": result["stop_reason"],
                 "stderr": result["stderr"], "receipt": result["receipt"]}
 
-    def _run(self, request: _Run, identity: str) -> dict[str, Any]:
+    def _run(self, request: _Run, identity: str, *, sandboxed: bool = False) -> dict[str, Any]:
         cwd = self.resolve(request.cwd, write=True)
         argv = self.process_argv(request.argv, resolve_mounts=not request.literal_argv)
         output = self.root / "tools" / "processes" / identity
@@ -2708,7 +2724,8 @@ class WorkspaceToolGateway:
                    if request.inputs or request.outputs or request.input_snapshot is not None else None)
         result = run_process(ProcessSpec(argv=argv, cwd=cwd, timeout_sec=request.timeout_sec,
             env=self.process_environment(), output_dir=output, invocation_id=identity, tail_bytes=12000, log_bytes=200000,
-            input_binding={'workspace_artifacts': binding} if binding is not None else None),
+            input_binding={'workspace_artifacts': binding} if binding is not None else None,
+            sandbox=self.process_sandbox(cwd) if sandboxed else None),
             budget_ledger=self.ledger)
         if binding is not None and result.returncode == 0 and not result.stop_reason:
             from simple_ar.core.artifacts import write_json

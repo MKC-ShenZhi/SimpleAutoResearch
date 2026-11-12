@@ -2885,7 +2885,9 @@ def _run_native_start(args: argparse.Namespace) -> None:
                 f"Public source access: {args.allow_network}\n"
                 f"Rendered-image inspection: {args.allow_vision} (named vision route)\n"
                 f"Image submissions: {args.max_images} (named image route)\n"
-                f"Process proposals: {args.allow_execution}; commands need approval, not an OS sandbox.",
+                f"Process proposals: {args.allow_execution}; workspace execution: {args.sandbox_execution}. "
+                + ("Ordinary commands run in the task workspace without per-command approval." if args.sandbox_execution
+                   else "Commands need approval, not an OS sandbox."),
                 title="Task / 任务"))
             if not args.yes and not args.prepare_only:
                 if not interactive or input("Start / 开始? [y/N]: ").strip().lower() not in {"y", "yes"}:
