@@ -364,7 +364,7 @@ class DeliveryReview:
             return self.inspector.feedback_from_observation(observed)
         return None
 
-    def inspection_feedback(self, targets: list[str], *, observations: list[dict] | None = None) -> list[dict]:
+    def inspection_feedback(self, targets: list[str]) -> list[dict]:
         """Project original owner-verified opinions through the shared work-input port.
 
         Changed subjects keep guidance with explicit old/current versions, never
@@ -373,8 +373,7 @@ class DeliveryReview:
         roots = [self.workspace.resolve(path) for path in targets]
         selected = None
         result, concluded, repeated = [], set(), {}
-        rows = observations if observations is not None else self.observations() if self.observations is not None else []
-        for observed in reversed(rows):
+        for observed in reversed(self.observations() if self.observations is not None else []):
             feedback = self.feedback_from_observation(observed)
             if feedback is None:
                 continue

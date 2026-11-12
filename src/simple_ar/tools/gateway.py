@@ -115,8 +115,7 @@ class CommonToolGateway:
             raise ValueError('Professional continuation requires a positive attempt floor')
         return minimum
 
-    def professional_inputs(self, targets: list[str], *, include_observations: bool = False,
-                            observations: list[dict] | None = None) -> list[dict]:
+    def professional_inputs(self, targets: list[str], *, include_observations: bool = False) -> list[dict]:
         """Ask registered owners for current result context, never infer it here.
 
         Owners retain source/version/access proof. This creates no state,
@@ -129,12 +128,7 @@ class CommonToolGateway:
             seen.add(id(owner))
             provide = getattr(owner, 'work_inputs', None)
             if provide is not None:
-                from_journal = getattr(owner, 'work_inputs_from_observations', None)
-                if observations is not None and from_journal is not None:
-                    results.extend(from_journal(targets, include_observations=include_observations,
-                                                observations=observations))
-                else:
-                    results.extend(provide(targets, include_observations=include_observations))
+                results.extend(provide(targets, include_observations=include_observations))
         return results
 
     def requires_followup(self, name: str, arguments: dict) -> bool:

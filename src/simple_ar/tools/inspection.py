@@ -2991,14 +2991,12 @@ class InspectionToolGateway:
                                    'severity': 'required', 'message': finding['message']})
         return result
 
-    def work_inputs(self, targets: list[str], *, include_observations: bool = False,
-                    observations: list[dict] | None = None) -> list[dict]:
+    def work_inputs(self, targets: list[str], *, include_observations: bool = False) -> list[dict]:
         """Supply relevant current opinions to source work, not another copy of its evidence."""
         if self.feedback_provider is not None:
             if include_observations:
                 return []
-            feedback = (self.feedback_provider(targets) if observations is None
-                        else self.feedback_provider(targets, observations=observations))
+            feedback = self.feedback_provider(targets)
             return ([{**row, 'result': self.compact_feedback(row['result'])} for row in feedback]
                     if self.compact_work_feedback else feedback)
         roots = [self.workspace.resolve(path) for path in targets]
@@ -3010,9 +3008,6 @@ class InspectionToolGateway:
                     'scope':'Current version-bound inspection opinion, not original source evidence, '
                         'execution permission or a certificate for changed files.'})
         return result
-
-    # Other owners may provide work_inputs without consuming a native journal.
-    work_inputs_from_observations = work_inputs
 
     def _mark_evidence(self, saved: dict[str, Any]) -> None:
         if self.protocol:
