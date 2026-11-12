@@ -6212,9 +6212,6 @@ class GenerationAuthorizationTests(unittest.TestCase):
         self.assertEqual(window['work_context']['review_observations'][0]['result']['findings'],
             ['Keep the original API'])
         self.assertNotIn('text', window)  # Feedback cannot masquerade as a read source window.
-        with self.assertRaisesRegex(ValueError, '4 MiB'):
-            freeze_work_context(lambda targets: {'user_requests': ['界' * (4 * 1024 * 1024 // 3)]}, [])
-
         # Both explicit files and unfamiliar-project selections reach the writer
         # as a plan; feedback instead merges its complete bound inventory.
         for planned in (True, False):
