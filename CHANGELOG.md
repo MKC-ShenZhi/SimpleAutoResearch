@@ -9,6 +9,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
+- A pending execution can be declined with a reason, returning a not-executed result to the task or independent review without abandoning the work.
 - Continuing work reuses related review guidance without repeatedly reconstructing its historical investigation, shares receipt and accounting reads, and avoids repeating file text and serializing unchanged selected material within one decision. Delivery still checks applicable artifacts and evidence.
 - New tasks focus their working view on the current request and relevant material; older records remain available on demand.
 - Shared work context no longer adds a fixed byte limit to professional handoffs; document work fits its input using the sender's model-aware JSON request counter.
