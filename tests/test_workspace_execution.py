@@ -78,7 +78,8 @@ class WorkspaceExecutionTests(unittest.TestCase):
         restored = ToolApplication.load(old.session.store.root)
         self.assertTrue(restored.state['config']['sandbox_execution'])
         self.assertEqual(restored.ledger.to_dict(), before)
-        self.assertEqual(restored.state['requests'], ['Old task'])
+        self.assertEqual(restored.state['requests'][0], 'Old task')
+        self.assertIn('Authorize workspace execution', restored.state['requests'][-1])
 
     @unittest.skipUnless(shutil.which('pandoc') and shutil.which('xelatex'), 'Pandoc and XeLaTeX required')
     def test_publication_uses_the_same_scope_and_records_each_process(self):

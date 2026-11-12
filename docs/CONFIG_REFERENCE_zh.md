@@ -179,7 +179,7 @@ max_tokens = 1000000 # 示例：将本次新任务的 token 总额度设为一�
 | `data_file`、`data_path` | 主表／额外只读数据 | 可选路径／路径列表 [] | 新任务；不推断列 |
 | `output_root` | 输出父目录 | 路径 runs/assistant | 新任务位置 |
 | `project_python` | 项目 Python 入口，保留 venv 入口路径 | 可选路径 | 新任务环境 |
-| `allow_execution` | 允许提出进程命令 | 布尔 false | 新任务；每条命令仍须批准 |
+| `allow_execution` | 允许提出进程命令 | 布尔 false | 新任务；未授权工作区执行时每条命令仍须批准 |
 | `sandbox_execution` | 允许工作区内普通进程和报告构建自动执行 | 布尔 false | 需开启 `allow_execution`、Linux 和 bubblewrap；进程不能联网或直接访问原始材料 |
 | `allow_network` | 公共来源获取 | 布尔 false | 新任务；不授权安装 |
 | `allow_vision` | 将挂载图像发送给视觉路由 | 布尔 false | 新任务；与生成分开 |

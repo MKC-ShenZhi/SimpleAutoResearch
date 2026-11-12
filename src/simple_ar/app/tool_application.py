@@ -2239,6 +2239,8 @@ class ToolApplication:
                 completion_policy=candidate.get('completion_policy', 'protected_decision.v1'),
                 delivery_files=candidate.get('delivery_files'), model_catalogs=hints,
                 creation_declarations=old.get('creation_declarations') if old.get('input_contract') == _DECLARED_INPUTS else None)
+            if 'sandbox_execution' in supplied and not supplied['sandbox_execution']:
+                config['sandbox_execution'] = False
             if old.get('professional_inputs') is not None:
                 config['professional_inputs'] = old['professional_inputs']
             if old.get('control_protocol') is not None:
