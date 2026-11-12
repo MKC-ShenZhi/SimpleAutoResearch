@@ -27,6 +27,21 @@ def observation_digest(value: Any) -> str:
         separators=(',', ':')).encode('utf-8')).hexdigest()
 
 
+def _checkpoint_decision(reply: Any) -> Any:
+    """Present repeated provider reasoning once, keeping every distinct field."""
+    if not isinstance(reply, dict):
+        return reply
+    fields = reply.get('provider_specific_fields')
+    if not isinstance(fields, dict):
+        return reply
+    duplicates = {key for key in ('reasoning_content', 'reasoning')
+        if isinstance(reply.get(key), str) and fields.get(key) == reply[key]}
+    if not duplicates:
+        return reply
+    return {**reply, 'provider_specific_fields': {
+        key: value for key, value in fields.items() if key not in duplicates}}
+
+
 def direct_file_observation(value: dict, *, absolute: bool = False) -> bool:
     """Only a direct file read can bind its observed bytes without inferred dependencies."""
     data = value.get('data') or {}
@@ -213,7 +228,8 @@ def validate_checkpoint_sources(view: dict, *, source: Any, owner: str,
             raise ValueError(mismatch)
 
         if strict:
-            if observation_digest(decisions[turn]) != observation_digest(original.get('decision')):
+            if observation_digest(_checkpoint_decision(decisions[turn])) != observation_digest(
+                    _checkpoint_decision(original.get('decision'))):
                 raise ValueError('Checkpoint decision differs from the original reply' if native else mismatch)
             if row.get('call_id') != original.get('call_id'):
                 raise ValueError(('Reply-only checkpoint cannot name a tool call'
@@ -473,9 +489,9 @@ def prepare_checkpoint_input(*, requests: list[str], previous: dict, rows: list[
         view['native_supply_policy'] = native_supply_policy
     if native_supply_policy == TURN_SUPPLY_POLICY:
         view['turn_decisions'] = []
-        view['scope'] += (' Each supplied turn decision is the original assistant reply for the '
-            'observations with that turn number. Decisions and earlier notes are fallible, may be '
-            'out of date and are not independent evidence.')
+        view['scope'] += (' Each supplied turn decision presents the original assistant reply for the '
+            'observations with that turn number, omitting repeated provider metadata. Decisions and '
+            'earlier notes are fallible, may be out of date and are not independent evidence.')
     if journal:
         view['handoff_policy'] = CITATION_HANDOFF_POLICY
         view['scope'] += (
@@ -497,10 +513,11 @@ def prepare_checkpoint_input(*, requests: list[str], previous: dict, rows: list[
         additions = []
         decision_count = len(view.get('turn_decisions', ()))
         if native_supply_policy == TURN_SUPPLY_POLICY:
-            decision = group[0].get('decision')
-            if (not isinstance(decision, dict) or any(not isinstance(row.get('decision'), dict)
-                    or observation_digest(row['decision']) != observation_digest(decision) for row in group)):
+            original_decision = group[0].get('decision')
+            if (not isinstance(original_decision, dict) or any(not isinstance(row.get('decision'), dict)
+                    or observation_digest(row['decision']) != observation_digest(original_decision) for row in group)):
                 continue  # A result cannot stand in for an unavailable decision.
+            decision = _checkpoint_decision(original_decision)
             existing = next((row for row in view['turn_decisions'] if row['turn'] == turn), None)
             if existing is not None and observation_digest(existing['reply']) != observation_digest(decision):
                 continue

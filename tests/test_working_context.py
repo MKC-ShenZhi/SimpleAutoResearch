@@ -1681,6 +1681,50 @@ class CheckpointFailureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             check(partial_legacy, 'inspection')
 
+    def test_checkpoint_omits_duplicate_provider_reasoning_without_changing_history(self):
+        arguments = {'argv': ['python', 'analysis.py']}
+        reasoning = 'Relevant working reasoning. ' * 800
+        decision = {'role': 'assistant', 'content': 'Run the analysis.',
+            'reasoning_content': reasoning,
+            'provider_specific_fields': {'reasoning_content': reasoning, 'refusal': None,
+                                         'other': 'distinct provider information'},
+            'tool_calls': [{'id': 'run', 'function': {'name': 'run_process',
+                'arguments': json.dumps(arguments)}}]}
+        result = {'tool_name': 'run_process', 'status': 'ok', 'data': {'returncode': 0}}
+        source = {'turn': 0, 'request_count': 1, 'decision': decision, 'call_id': 'run',
+                  'arguments': arguments, 'result': result}
+        row = {**source, 'record': 'records/run.json'}
+        view = prepare_checkpoint_input(requests=['Analyze the inputs'],
+            previous={'notes': [], 'through_turn': 0, 'compacted_records': set()}, rows=[row],
+            target=200000, estimate_tokens=len, native_supply_policy=TURN_SUPPLY_POLICY)
+        presented = checkpoint_decisions(view)[0]
+        self.assertEqual(presented['reasoning_content'], reasoning)
+        self.assertEqual(presented['provider_specific_fields'], {
+            'refusal': None, 'other': 'distinct provider information'})
+        self.assertEqual(checkpoint_arguments(view['observations'][0], {0: presented}), arguments)
+        self.assertEqual(decision['provider_specific_fields']['reasoning_content'], reasoning)
+        self.assertLess(len(json.dumps(presented)), len(json.dumps(decision)) - len(reasoning))
+        distinct = {**decision, 'provider_specific_fields': {
+            **decision['provider_specific_fields'], 'reasoning_content': 'different'}}
+        distinct_view = prepare_checkpoint_input(requests=['Analyze the inputs'],
+            previous={'notes': [], 'through_turn': 0, 'compacted_records': set()},
+            rows=[{**row, 'decision': distinct}], target=200000, estimate_tokens=len,
+            native_supply_policy=TURN_SUPPLY_POLICY)
+        self.assertEqual(checkpoint_decisions(distinct_view)[0], distinct)
+
+        for owner in ('native', 'inspection'):
+            options = dict(source=lambda item: source, owner=owner, journal=owner == 'native',
+                           before_turn=1 if owner == 'inspection' else None)
+            validate_checkpoint_sources(view, **options)
+            # Previously saved checkpoints include the duplicate and remain valid.
+            old = {**view, 'turn_decisions': [{'turn': 0, 'reply': decision}]}
+            validate_checkpoint_sources(old, **options)
+            changed = {**presented, 'provider_specific_fields': {
+                **presented['provider_specific_fields'], 'reasoning_content': 'different'}}
+            with self.assertRaises(ValueError):
+                validate_checkpoint_sources({**view, 'turn_decisions': [{'turn': 0, 'reply': changed}]},
+                                            **options)
+
     def test_owner_selected_checkpoint_keeps_decision_and_original_receipt(self):
         # A large useful decision can have a tiny execution receipt. The shared
         # selector has already considered replay cost; the model window size
