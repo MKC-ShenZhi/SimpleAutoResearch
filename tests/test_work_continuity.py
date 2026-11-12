@@ -221,6 +221,36 @@ class SelectedWorkContinuityTests(unittest.TestCase):
 
 
 class WorkingSupplyContinuityTests(unittest.TestCase):
+    def test_recorded_read_windows_share_an_authored_body_without_losing_its_receipt(self):
+        text = 'Current report, one body.\n'
+        split = 8
+        common = {'path': 'workspace/report.md', 'sha256': 'a' * 64}
+        rows = [
+            {**common, 'turn': 0, 'record': 'records/write.json', 'kind': 'authored_text',
+             'role': 'write_context', 'offset_bytes': 0, 'next_offset_bytes': len(text), 'text': text},
+            {**common, 'turn': 1, 'record': 'records/read.json', 'kind': 'source_text',
+             'role': 'historical_observation', 'tool': 'read_file', 'offset_bytes': 0,
+             'next_offset_bytes': split, 'text': text[:split]},
+            {**common, 'turn': 1, 'record': 'records/read.json', 'kind': 'source_text',
+             'role': 'historical_observation', 'tool': 'read_file', 'offset_bytes': split,
+             'next_offset_bytes': len(text), 'text': text[split:]},
+        ]
+        arguments = dict(user_requests=['Continue'], system_text='Work', base_context={},
+            turn_blocks=[[], [], [{'role': 'assistant', 'content': 'Latest decision'}]],
+            observations=rows, native_observations=[], schema_tokens=0, context_token_target=100000,
+            estimate_tokens=len, material_policy='working', require_work_notes=True, fit_work_notes=True,
+            sparse_handoffs=True, processed_turns=[], archived_turns=[], working_set_policy='recent.v4',
+            version_resolver=lambda _: 'a' * 64)
+        messages, selection = select_working_context(**arguments)
+        supplied = [item['observation'] for item in json.loads(messages[1]['content'])['working_view']['observations']]
+        self.assertEqual(''.join(row['text'] for row in sorted(supplied, key=lambda row: row['offset_bytes'])), text)
+        self.assertEqual({row['kind'] for row in supplied}, {'source_text'})
+        omitted = next(row for row in selection['omitted_records'] if row['source']['record'] == 'records/write.json')
+        self.assertEqual(omitted['status'], 'duplicate')
+        explicit, _ = select_working_context(**arguments, selected_records=['records/write.json'])
+        supplied = json.loads(explicit[1]['content'])['working_view']['observations']
+        self.assertTrue(any(row['observation']['record'] == 'records/write.json' for row in supplied))
+
     def test_identical_authored_snapshots_share_text_without_replacing_a_read(self):
         text = 'Current result.\n'
         base = {'path': 'workspace/report.md', 'sha256': 'a' * 64,

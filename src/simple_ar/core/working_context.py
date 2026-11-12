@@ -1090,7 +1090,7 @@ def select_working_context(
         supplied_keys = {keys[i] for i, state in enumerate(states)
                          if state['status'] in {'native', 'working_view'}}
         for i, state in enumerate(states):
-            if state['status'] == 'duplicate' and keys[i] not in supplied_keys:
+            if state['status'] == 'duplicate' and keys[i] not in supplied_keys and not state.get('shared_body'):
                 if recent_set and rows[i].get('kind') == 'source_text' and not material_window_views(
                         rows[i], supplied_material()):
                     continue
@@ -1141,6 +1141,27 @@ def select_working_context(
         required_cost = cost
     else:
         required_cost = min(required_cost, cost)
+    if recent_set:
+        # A recorded read and an authored snapshot remain different facts,
+        # but their identical same-version text need only be presented once.
+        # Explicitly selected records retain their original presentation.
+        reads = [row for row in supplied_material() if row.get('kind') == 'source_text'
+                 and row.get('role') == 'historical_observation']
+        shared_authored = False
+        for row, state in zip(rows, states):
+            if (state['status'] != 'working_view' or row.get('kind') != 'authored_text'
+                    or row.get('role') != 'write_context' or row.get('record') in explicit_references):
+                continue
+            body = {**row, 'kind': 'source_text', 'role': 'historical_observation'}
+            if material_window_views(body, reads):
+                continue
+            view['observations'] = [item for item in view['observations']
+                if source_key(item['observation']) != source_key(row)]
+            state.update(status='duplicate', shared_body=True)
+            shared_authored = True
+        if shared_authored:
+            messages, cost = settle_projection()
+            required_cost = min(required_cost, cost)
     # Once an unprocessed closed turn actually falls out of the window,
     # checkpoint the other closed unsummarized turns as one bounded batch too.
     # Otherwise each subsequent turn can evict one more block and force a
