@@ -427,6 +427,7 @@ class InspectionToolGateway:
                  work_method: str | None = None,
                  work_lifecycle: str | None = None,
                  working_set_policy: str | None = None,
+                 compact_work_feedback: bool = False,
                  material_policy: str | None = None,
                  execution_protocol: str | None = None,
                  operation_specs: Callable[[], list[CommonToolSpec]] | None = None,
@@ -478,6 +479,7 @@ class InspectionToolGateway:
         self.work_method = work_method
         self.work_lifecycle = work_lifecycle
         self.working_set_policy = working_set_policy
+        self.compact_work_feedback = compact_work_feedback
         self.material_policy = material_policy
         self.execution_protocol = execution_protocol
         self.operation_specs = operation_specs
@@ -1247,6 +1249,26 @@ class InspectionToolGateway:
         return {'projection': 'delivery_scope', 'requests': binding['requests'],
             'claim': {key: value for key, value in binding['claim'].items() if key != 'artifacts'},
             'artifact_count': len(binding['artifacts'])}
+
+    @staticmethod
+    def compact_feedback(result: dict) -> dict:
+        """Keep unresolved checks intact; supported details remain at their original receipt."""
+        source = (result.get('data') or {}).get('source_observations') or {}
+        opinion = (result.get('metadata') or {}).get('delivery_opinion') or {}
+        investigations = opinion.get('investigations')
+        if (not source.get('record') or not isinstance(investigations, list) or not any(
+                isinstance(item, dict) and item.get('outcome') == 'supported' for item in investigations)):
+            return result
+        projected = deepcopy(result)
+        projected['metadata']['delivery_opinion']['investigations'] = [
+            {key: value for key, value in item.items() if key in
+                {'claim', 'outcome', 'scope', 'necessary', 'basis', 'reassessed_prior'}}
+            if isinstance(item, dict) and item.get('outcome') == 'supported' else item
+            for item in investigations]
+        locator = projected['data']['source_observations']
+        locator['scope'] = (locator.get('scope', '') +
+            ' Details of supported investigations remain in the original receipt.')
+        return projected
 
     @staticmethod
     def coordination_result(result: ToolResult, *, receipt_path: str, receipt_prefix: str | None = None) -> dict:
@@ -2921,7 +2943,11 @@ class InspectionToolGateway:
     def work_inputs(self, targets: list[str], *, include_observations: bool = False) -> list[dict]:
         """Supply relevant current opinions to source work, not another copy of its evidence."""
         if self.feedback_provider is not None:
-            return [] if include_observations else self.feedback_provider(targets)
+            if include_observations:
+                return []
+            feedback = self.feedback_provider(targets)
+            return ([{**row, 'result': self.compact_feedback(row['result'])} for row in feedback]
+                    if self.compact_work_feedback else feedback)
         roots = [self.workspace.resolve(path) for path in targets]
         result = []
         for assessment in self.prior_assessments() if self.prior_assessments else []:

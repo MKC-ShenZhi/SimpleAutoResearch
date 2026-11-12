@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import gzip
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import unicodedata
 from typing import Any, Callable, Literal
 from urllib.parse import unquote, urlsplit
@@ -906,7 +908,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         manifest['citation_style'] = citation_style
     if render_preview:
         manifest['pdf_preview'] = {'rendered': False, 'visual_reviewed': False,
-            'max_pages': 12, 'dpi': 120, 'max_dimension_px': 1600, 'pages': []}
+            'dpi': 120, 'max_dimension_px': 1600, 'pages': []}
     if checks is not None:
         manifest['checks'] = {'rules': deepcopy(checks), 'status': 'blocked',
             'scope': 'User-declared rules only; no official certification. Literal absence does not establish anonymity. Images, metadata and indirect identity are not covered.',
@@ -1169,6 +1171,9 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                 'Citations are numeric by default; bibliography records and missing metadata are not rewritten.\n'
                 f'Rebuild here: {engine} -no-shell-escape -halt-on-error main.tex; '
                 'bibtex main (if cited); repeat the selected TeX command twice.\n'
+                + ('The framework embeds a Unicode map for Adobe-GB1 fonts in its compiled PDF. '
+                   'A standalone XeLaTeX rebuild may require a viewer with CJK maps; re-export through '
+                   'the framework for the same portable PDF.\n' if engine == 'xelatex' else '') +
                 'The shared renderer restricts file access and records logs; TeX is not a security sandbox.\n'
                 'No scientific, visual, anonymity or page-limit compliance is certified. '
                 'Inspect the PDF and any requested previews independently.\n')
@@ -1332,7 +1337,7 @@ def _check_publication_pdf(output: Path, receipt: dict[str, Any], *, runner: Cal
 
 
 def _render_pdf_preview(output: Path, *, runner: Callable, pdf_info: dict | None = None) -> dict[str, Any]:
-    """Render all actual pages under fixed bounds; never infer visual quality."""
+    """Render all actual pages; never infer visual quality."""
     pdftoppm = shutil.which('pdftoppm')
     if not pdftoppm:
         raise ReportExportError("PDF preview requires Poppler pdfinfo and pdftoppm; compiled PDF and editable source retained")
@@ -1345,8 +1350,8 @@ def _render_pdf_preview(output: Path, *, runner: Callable, pdf_info: dict | None
     if len(counts) != 1:
         raise ReportExportError("Poppler did not report one PDF page count; no bounded full preview")
     page_count = int(counts[0])
-    if not 1 <= page_count <= 12:
-        raise ReportExportError(f"PDF has {page_count} pages; full preview requires 1 to 12 pages. No pages silently omitted")
+    if page_count < 1:
+        raise ReportExportError(f"PDF has {page_count} pages; full preview requires at least one page")
     previews = output / 'previews'
     previews.mkdir()
     runner([pdftoppm, '-png', '-r', '120', '-scale-to', '1600', '-f', '1', '-l', str(page_count),
@@ -1380,6 +1385,64 @@ def _missing_tex_glyphs(output: Path, text: str) -> list[str]:
     if log.is_file():
         text += '\n' + log.read_text(encoding='utf-8', errors='replace')
     return list(dict.fromkeys(re.findall(r'Missing character:[^\n]*', text)))
+
+
+def _embed_adobe_gb1_unicode(pdf: Path) -> None:
+    """Make XeTeX's Adobe-GB1 CID fonts readable without viewer-side CMaps."""
+    from importlib import resources
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import DecodedStreamObject, NameObject
+
+    writer = PdfWriter()
+    writer.clone_document_from_reader(PdfReader(pdf))
+    fonts = []
+    visited = set()
+
+    def visit(resource):
+        resource = resource.get_object()
+        if id(resource) in visited:
+            return
+        visited.add(id(resource))
+        font_resources = resource.get('/Font')
+        for ref in font_resources.get_object().values() if font_resources else ():
+            font = ref.get_object()
+            if (font.get('/Subtype') != '/Type0' or font.get('/Encoding') not in {'/Identity-H', '/Identity-V'}
+                    or font.get('/ToUnicode')):
+                continue
+            descendants = font.get('/DescendantFonts', [])
+            info = descendants[0].get_object().get('/CIDSystemInfo') if descendants else None
+            info = info.get_object() if info else {}
+            if info.get('/Registry') == 'Adobe' and info.get('/Ordering') == 'GB1':
+                fonts.append(font)
+        xobjects = resource.get('/XObject')
+        for ref in xobjects.get_object().values() if xobjects else ():
+            nested = ref.get_object().get('/Resources')
+            if nested is not None:
+                visit(nested)
+
+    for page in writer.pages:
+        if page.get('/Resources') is not None:
+            visit(page['/Resources'])
+    if not fonts:
+        return
+
+    # The bundled Adobe resource retains its original copyright and license.
+    cmap = resources.files('simple_ar').joinpath('report_templates/cmaps/Adobe-GB1-UCS2.gz')
+    if not cmap.is_file():
+        cmap = Path(__file__).resolve().parents[3] / 'templates/report/cmaps/Adobe-GB1-UCS2.gz'
+    stream = DecodedStreamObject()
+    stream.set_data(gzip.decompress(cmap.read_bytes()))
+    reference = writer._add_object(stream.flate_encode())
+    for font in fonts:
+        font[NameObject('/ToUnicode')] = reference
+    with tempfile.NamedTemporaryFile(dir=pdf.parent, suffix='.pdf', delete=False) as temporary:
+        temporary_path = Path(temporary.name)
+        try:
+            writer.write(temporary)
+            temporary.close()
+            os.replace(temporary_path, pdf)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _compile(output: Path, has_citations: bool, *, runner: Callable | None = None,
@@ -1432,6 +1495,8 @@ def _compile(output: Path, has_citations: bool, *, runner: Callable | None = Non
     finally:
         (output / "build.log").write_text("\n".join(logs), encoding="utf-8")
     compiled = (output / "main.pdf").is_file()
+    if compiled and engine == 'xelatex':
+        _embed_adobe_gb1_unicode(output / 'main.pdf')
     final_log = (output / "main.log").read_text(encoding="utf-8", errors="replace") if (output / "main.log").is_file() else ""
     warnings = re.findall(r"(?:Class \w+ Warning|LaTeX Warning|Package \w+ Warning):[^\n]*|Overfull \\[hv]box[^\n]*|Missing character:[^\n]*", final_log)
     return {"status": "compiled" if compiled else "compile_failed", "compiled": compiled,

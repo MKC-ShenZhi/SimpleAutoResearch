@@ -79,6 +79,16 @@ class PortableExportIntegrationTests(unittest.TestCase):
             self.assertIn('53.679', text)
             self.assertIn('中文结果', text)
             self.assertIn('≪', text)
+            from pypdf import PdfReader
+            reader = PdfReader(root / 'export/main.pdf')
+            fonts = [ref.get_object() for page in reader.pages
+                     for ref in page['/Resources']['/Font'].get_object().values()]
+            cjk = [font for font in fonts if font.get('/Subtype') == '/Type0'
+                   and font.get('/DescendantFonts')
+                   and font['/DescendantFonts'][0].get_object().get('/CIDSystemInfo', {}).get('/Ordering') == 'GB1']
+            self.assertTrue(cjk)
+            self.assertTrue(all(font.get('/ToUnicode') for font in cjk))
+            self.assertIn('中文结果', ''.join(page.extract_text() for page in reader.pages))
             self.assertEqual((source / 'report_body.md').read_text(encoding='utf-8'), body)
 
     def test_publication_caption_source_follows_explicit_authoring_choice(self):

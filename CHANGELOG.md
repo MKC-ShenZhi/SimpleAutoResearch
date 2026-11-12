@@ -10,6 +10,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Improved
 
 - Continuing work presents related review guidance more concisely and shares already displayed text for the same file version; original records and review scope remain available.
+- New tasks focus their working view on the current request and relevant material; older records remain available on demand.
 - A task can deliver a previously reviewed claim directly, without recreating its summary and inventory; changed requests or artifacts still require an applicable review.
 - Workspace actions can explicitly submit their own completed or partial output through the common delivery path.
 - New ordinary tasks can choose direct delivery when independent review is unnecessary; the default and saved task contracts retain their review behavior, and required findings remain open.
@@ -17,6 +18,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Fixed
 
 - Independent review can identify a non-text file without claiming its contents were read, and reports an unfinished candidate review clearly.
+- XeLaTeX export embeds the Adobe-GB1 Unicode mapping needed by readers without CJK maps. Full-page preview no longer rejects reports solely for exceeding twelve pages.
 
 ## 2026-11-11
 

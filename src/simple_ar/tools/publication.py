@@ -97,7 +97,7 @@ class PublicationRequest(BaseModel):
     template: PublicationTemplate | None = Field(default=None,
         description='Explicit user-provided trusted template bundle, mutually exclusive with layout. Omit both for the historical ACM manuscript layout. Compilation does not establish anonymous/page/official compliance.')
     render_preview: bool = Field(default=False, exclude_if=lambda value: value is False,
-        description="Explicitly render every compiled PDF page with Poppler: at most 12 pages, 120 DPI scaled to a maximum 1600 pixels per dimension. Requires compile_pdf=true. Returns PNG locators for optional inspect_images; rendering is not visual review. Incomplete previews prevent delivery. False preserves historical request bindings.")
+        description="Explicitly render every compiled PDF page with Poppler at 120 DPI, scaled to a maximum 1600 pixels per dimension. Requires compile_pdf=true. Returns PNG locators for optional inspect_images; rendering is not visual review. Incomplete previews prevent delivery. False preserves historical request bindings.")
     delivery: DeliveryRequest | None = Field(default=None,
         description="Optional explicit final delivery after successful export/compilation. Exported files are added automatically; artifacts selects other already-existing outputs or retained task evidence. Disclose unresolved work. This does not certify scientific or visual quality. Request this operation alone when delivering.")
     @model_validator(mode="after")

@@ -180,7 +180,7 @@ Feedback uses the original session's materials, permissions and remaining allowa
 
 For a written explanation, Markdown can be the final deliverable. If you need a PDF,
 you can request a plain single-column article and an editable LaTeX project in the task.
-This layout requires Pandoc, BibTeX and a LaTeX engine; Chinese compilation needs XeLaTeX, CTeX, Fandol, and DejaVu Sans and Sans Mono fonts.
+This layout requires Pandoc, BibTeX and a LaTeX engine; Chinese compilation needs XeLaTeX, CTeX, Fandol, and DejaVu Sans and Sans Mono fonts. The framework embeds the required Adobe-GB1 Unicode map when it compiles the PDF; a standalone TeX rebuild may require a viewer with CJK maps.
 
 ### Export ACM LaTeX and PDF
 

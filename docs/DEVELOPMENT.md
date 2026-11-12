@@ -60,9 +60,10 @@ the same ledger. A workspace action can explicitly submit its produced work for
 delivery; other services cannot silently introduce completion effects. A completed
 reviewed claim can be selected for delivery without restating its inventory.
 Questions and explicit caller operations retain
-their own contracts. The shared material view prioritizes recent complete work and
-necessary original windows, suppressing only verified overlapping bytes from the
-same file version. Archived observations remain retrievable. Saved selection,
+their own contracts. For new ordinary tasks, the shared material view prioritizes
+the current request, relevant feedback, selected references and observed source
+windows. Older work stays retrievable instead of filling unused context. Repeated
+windows of the same file version share their overlapping text. Saved selection,
 history and inspection policies stay unchanged on reload and unrelated material supply.
 
 New ordinary tasks can submit an unfinished candidate for independent investigation

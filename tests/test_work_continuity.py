@@ -221,6 +221,69 @@ class SelectedWorkContinuityTests(unittest.TestCase):
 
 
 class WorkingSupplyContinuityTests(unittest.TestCase):
+    def test_feedback_working_set_keeps_relevant_originals_without_filling_old_history(self):
+        def read(turn, record, text):
+            return {'turn': turn, 'record': record, 'kind': 'source_text',
+                'role': 'historical_observation', 'tool': 'read_file', 'path': 'workspace/' + record,
+                'sha256': 'a' * 64, 'offset_bytes': 0, 'next_offset_bytes': len(text), 'text': text}
+        rows = [read(0, 'old-unused', 'UNRELATED HISTORICAL BODY'),
+                read(1, 'old-needed', 'NOTE-SUPPORTED ORIGINAL'),
+                read(2, 'old-selected', 'EXPLICIT ORIGINAL'),
+                read(3, 'current-read', 'CURRENT ORIGINAL')]
+        blocks = [[{'role': 'assistant', 'content': 'UNRELATED OLD WORK'}], [], [],
+            [{'role': 'assistant', 'content': 'CURRENT WORK'}],
+            [{'role': 'assistant', 'content': 'LATEST WORK'}]]
+        arguments = dict(user_requests=['Original task', 'Revise the work'], system_text='Work', base_context={},
+            turn_blocks=blocks, block_request_counts=[1, 1, 1, 2, 2], observations=rows,
+            selected_records=['old-selected'], native_observations=[], schema_tokens=0,
+            context_token_target=100000, estimate_tokens=len, material_policy='working',
+            require_work_notes=True, fit_work_notes=True, sparse_handoffs=True,
+            processed_turns=[], archived_turns=[],
+            work_notes=[{'text': 'Keep the established result', 'records': ['old-needed']}],
+            version_resolver=lambda _: 'a' * 64)
+        previous, _ = select_working_context(**arguments, working_set_policy='recent.v4')
+        focused, selection = select_working_context(**arguments, working_set_policy='recent.v5')
+        self.assertIn('UNRELATED HISTORICAL BODY', json.dumps(previous))
+        self.assertNotIn('UNRELATED HISTORICAL BODY', json.dumps(focused))
+        self.assertNotIn('UNRELATED OLD WORK', json.dumps(focused))
+        for body in ('NOTE-SUPPORTED ORIGINAL', 'EXPLICIT ORIGINAL', 'CURRENT ORIGINAL', 'CURRENT WORK'):
+            self.assertIn(body, json.dumps(focused))
+        self.assertIn('old-unused', {row['source']['record'] for row in selection['omitted_records']})
+        self.assertLess(selection['estimated_input_tokens'], 100000)
+
+    def test_compact_feedback_keeps_unresolved_checks_and_original_receipt(self):
+        from simple_ar.core.working_context import feedback_observations
+        from simple_ar.tools.inspection import InspectionToolGateway
+        record = 'records/review/result.json'
+        supported = {'claim': 'The calculation ran', 'outcome': 'supported', 'scope': 'recorded output',
+            'method': 'LONG SUPPORT METHOD', 'reasoning': 'LONG SUPPORT REASONING', 'evidence': ['e1']}
+        unresolved = {'claim': 'The method generalizes', 'outcome': 'unresolved',
+            'method': 'NOT YET CHECKED', 'reasoning': 'Need additional data', 'evidence': []}
+        result = {'data': {'source_observations': {'record': record}}, 'metadata': {'delivery_opinion': {
+            'findings': [{'severity': 'required', 'message': 'Check the scope'}],
+            'investigations': [supported, unresolved], 'limitations': ['One dataset']}}}
+        feedback = {'review_observations': [{'record': record, 'subjects': [], 'result': result}]}
+        original = deepcopy(feedback)
+        compact_result = InspectionToolGateway.compact_feedback(result)
+        compact, = feedback_observations({'review_observations': [{
+            'record': record, 'subjects': [], 'result': compact_result}]})
+        opinion = json.loads(compact['text'])['metadata']['delivery_opinion']
+        self.assertEqual(feedback, original)
+        self.assertEqual(compact['record'], record)
+        self.assertEqual(opinion['investigations'][1], unresolved)
+        self.assertEqual(opinion['findings'], result['metadata']['delivery_opinion']['findings'])
+        self.assertNotIn('LONG SUPPORT REASONING', compact['text'])
+        self.assertIn('original receipt', compact['text'])
+
+    def test_producer_findings_can_share_the_feedback_view_without_inspector_wrapper(self):
+        from simple_ar.core.working_context import feedback_observations
+        finding = {'record': 'records/producer/native_result.json', 'summary': 'The code produced a table.',
+            'issues': ['The next comparison is still needed.']}
+        row, = feedback_observations({'professional_findings': [finding]})
+        self.assertEqual(row['record'], finding['record'])
+        self.assertEqual(json.loads(row['text']), finding)
+        self.assertEqual(row['subjects'], [])
+
     def test_recorded_read_windows_share_an_authored_body_without_losing_its_receipt(self):
         text = 'Current report, one body.\n'
         split = 8
@@ -348,8 +411,9 @@ class WorkingSupplyContinuityTests(unittest.TestCase):
             work_notes=[{'text': 'Prior work retained in the journal'}], version_resolver=lambda _: 'a' * 64)
         _, previous = select_working_context(**common, working_set_policy='recent.v3')
         self.assertNotIn('records/1.json', {x['source']['record'] for x in previous['selected_records']})
-        for inspection_observations in (False, True):
-            with self.subTest(inspection_observations=inspection_observations):
+        for policy, inspection_observations in ((policy, inspected) for policy in ('recent.v4', 'recent.v5')
+                                                for inspected in (False, True)):
+            with self.subTest(policy=policy, inspection_observations=inspection_observations):
                 observations = deepcopy(rows)
                 if inspection_observations:
                     # Independent inspection supplies actual read windows with
@@ -357,7 +421,7 @@ class WorkingSupplyContinuityTests(unittest.TestCase):
                     for row in observations:
                         row.pop('tool')
                 _, selected = select_working_context(**{**common, 'observations': observations},
-                    working_set_policy='recent.v4')
+                    working_set_policy=policy)
                 self.assertEqual({x['source']['record'] for x in selected['selected_records']},
                     {'records/1.json', 'records/2.json', 'records/3.json'})
 

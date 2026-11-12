@@ -270,7 +270,8 @@ class OperationTools:
                     and config.get('inspection_protocol') == 'subjects.v3' else None),
             work_method=config.get('work_method'),
             work_lifecycle=config.get('work_lifecycle'),
-            working_set_policy=('recent.v4' if config.get('working_set_policy') == 'recent.v4' else None),
+            working_set_policy=('recent.v4' if config.get('working_set_policy') in {'recent.v4', 'recent.v5'} else None),
+            compact_work_feedback=config.get('working_set_policy') == 'recent.v5',
             material_policy=config.get('inspection_material_policy'),
             native_history_policy=config.get('native_history_policy'),
             material_observations=material_observations,
@@ -499,7 +500,7 @@ class OperationTools:
         if self.config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES:
             if (self.config.get('work_lifecycle') == 'integrated.v3'
                     and self.config.get('candidate_review_protocol') == 'candidate.v1'
-                    and self.config.get('working_set_policy') == 'recent.v4'
+                    and self.config.get('working_set_policy') in {'recent.v4', 'recent.v5'}
                     and self.config.get('candidate_handoff_policy') is None):
                 if self.config.get('delivery_review_selection') == 'model.v1':
                     return (_ORDINARY_WORK + ' For a completed delivery, set independent_review=false only when '
@@ -519,7 +520,7 @@ class OperationTools:
                     'Use deliver_result for actual final delivery with its complete claim, inventory and requested '
                     'report formats. Earlier findings remain evidence; an opinion applies only to its bound claim '
                     'and versions. New artifacts or completion claims need the applicable final checks. ')
-            if self.config.get('working_set_policy') in {'recent.v3', 'recent.v4'}:
+            if self.config.get('working_set_policy') in {'recent.v3', 'recent.v4', 'recent.v5'}:
                 instructions = instructions.replace(
                     'Choose a coherent investigation or implementation that resolves a concrete gap; batch related '
                     'reads and run a complete useful calculation rather than repeatedly inventorying or rerunning '

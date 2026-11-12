@@ -489,7 +489,7 @@ class ToolApplication:
             raise ValueError('Unsupported saved candidate review request contract; no silent migration')
         if config.get('inspection_coverage_policy') not in {None, 'offered.v1', 'offered.v2'}:
             raise ValueError('Unsupported saved inspection coverage policy; no silent migration')
-        if config.get('working_set_policy') not in {None, 'recent.v3', 'recent.v4'}:
+        if config.get('working_set_policy') not in {None, 'recent.v3', 'recent.v4', 'recent.v5'}:
             raise ValueError('Unsupported saved working set policy')
         if config.get('action_offer_policy') not in {None, 'observed_edit.v1'}:
             raise ValueError('Unsupported saved action offer policy')
@@ -2009,7 +2009,7 @@ class ToolApplication:
                     config['inspection_execution_protocol'] = 'shared.v2'
                     config['candidate_review_protocol'] = 'candidate.v1'
                     config['delivery_review_selection'] = 'model.v1'
-                    config['working_set_policy'] = 'recent.v4'
+                    config['working_set_policy'] = 'recent.v5'
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = ('native.v4'
                     if config.get('work_lifecycle') == 'integrated.v3' else 'native.v3')

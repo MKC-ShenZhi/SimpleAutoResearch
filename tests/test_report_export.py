@@ -1322,7 +1322,7 @@ class ReportExportTests(unittest.TestCase):
     def test_requested_pdf_preview_renders_all_pages_or_retains_failed_request(self):
         from PIL import Image
 
-        cases = ('complete', 'checked', 'twelve_pages', 'missing_poppler', 'too_many_pages', 'zero_pages',
+        cases = ('complete', 'checked', 'twelve_pages', 'missing_poppler', 'thirteen_pages', 'zero_pages',
             'missing_count', 'duplicate_count', 'renderer_failure', 'renderer_timeout',
             'partial_pages', 'unexpected_page', 'large_dimensions', 'large_file', 'invalid_png',
             'missing_tex', 'missing_pdf', 'checked_bad_count', 'checked_metadata_failure',
@@ -1334,7 +1334,7 @@ class ReportExportTests(unittest.TestCase):
                 original = (source / 'report_body.md').read_bytes()
                 output = root / 'acm'
                 calls = []
-                page_count = 12 if case == 'twelve_pages' else 13 if case == 'too_many_pages' else 0 if case == 'zero_pages' else 2
+                page_count = 12 if case == 'twelve_pages' else 13 if case == 'thirteen_pages' else 0 if case == 'zero_pages' else 2
 
                 def compile_project(directory, has_citations, *, runner):
                     if case == 'missing_tex':
@@ -1388,7 +1388,7 @@ class ReportExportTests(unittest.TestCase):
                         'simple_ar.report.export._compile', side_effect=compile_project):
                     options = {'checks': {'max_pages': 12, 'forbidden_identifiers': ['PRIVATE']}} if (
                         case.startswith('checked') or case == 'changed_after_checks') else {}
-                    if case in {'complete', 'checked', 'twelve_pages'}:
+                    if case in {'complete', 'checked', 'twelve_pages', 'thirteen_pages'}:
                         manifest = export_acm_report(source, output, compile_pdf=True, render_preview=True, runner=render, **options)
                         preview = manifest['pdf_preview']
                         self.assertEqual(manifest['status'], 'compiled')
@@ -1408,8 +1408,8 @@ class ReportExportTests(unittest.TestCase):
                     self.assertFalse(manifest['quality_checked'])
                     self.assertFalse(manifest['pdf_preview']['visual_reviewed'])
                     self.assertEqual({key: manifest['pdf_preview'][key] for key in
-                        ('max_pages', 'dpi', 'max_dimension_px')},
-                        {'max_pages': 12, 'dpi': 120, 'max_dimension_px': 1600})
+                        ('dpi', 'max_dimension_px')},
+                        {'dpi': 120, 'max_dimension_px': 1600})
                     self.assertEqual((source / 'report_body.md').read_bytes(), original)
                     self.assertTrue((output / 'main.tex').is_file())
                     # Page count is shared with checks, while every page still
@@ -1423,7 +1423,7 @@ class ReportExportTests(unittest.TestCase):
                         self.assertEqual(hashlib.sha256(raw).hexdigest(), row['evidence_sha256'])
                         self.assertEqual(manifest['checks']['pdf_sha256'],
                             hashlib.sha256((output / 'main.pdf').read_bytes()).hexdigest())
-                    if case in {'missing_poppler', 'too_many_pages', 'zero_pages', 'missing_count',
+                    if case in {'missing_poppler', 'zero_pages', 'missing_count',
                             'duplicate_count', 'missing_tex', 'missing_pdf', 'checked_bad_count',
                             'checked_metadata_failure', 'changed_during_metadata', 'changed_after_checks'}:
                         self.assertFalse(any(argv[0] == 'pdftoppm' for argv, _ in calls))

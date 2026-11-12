@@ -78,13 +78,14 @@ def feedback_observations(context: Mapping[str, Any]) -> list[dict[str, Any]]:
         subject.get('current_matches_review') for subject in row.get('subjects', ())))
     projected = []
     for row in reviews:
-        source = (row['result'].get('data', {}).get('source_observations') or {}).get('record')
+        result = row.get('result', row)
+        source = (result.get('data', {}).get('source_observations') or {}).get('record')
         record = source if isinstance(source, str) and source.startswith('records/') else row['record']
         role = ('Retained related feedback' if row.get('opinion_available', True)
                 else 'Unavailable feedback diagnostic')
         projected.append({'record': record, 'kind': 'operation_result', 'related_feedback': True,
-            'text': json.dumps(row['result'], ensure_ascii=False, separators=(',', ':')),
-            'subjects': deepcopy(row['subjects']),
+            'text': json.dumps(result, ensure_ascii=False, separators=(',', ':')),
+            'subjects': deepcopy(row.get('subjects', [])),
             'evidence_role': role + '; guidance only, not source evidence, current certification or permission.'})
     return projected
 
@@ -166,7 +167,7 @@ def select_working_context(
     context_authority: Literal['sources.v1'] | None = None,
     message_projector: Callable | None = None,
     preserve_material_observations: bool = False,
-    working_set_policy: Literal['recent.v2', 'recent.v3', 'recent.v4'] | None = None,
+    working_set_policy: Literal['recent.v2', 'recent.v3', 'recent.v4', 'recent.v5'] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -254,10 +255,11 @@ def select_working_context(
     """
     if context_authority is not None and context_authority != 'sources.v1':
         raise ValueError('Unknown context authority policy')
-    if working_set_policy not in (None, 'recent.v2', 'recent.v3', 'recent.v4'):
+    if working_set_policy not in (None, 'recent.v2', 'recent.v3', 'recent.v4', 'recent.v5'):
         raise ValueError('Unknown working set policy')
     recent_set = working_set_policy is not None
-    active_material_policy = working_set_policy in {'recent.v3', 'recent.v4'}
+    focused_working_set = working_set_policy == 'recent.v5'
+    active_material_policy = working_set_policy in {'recent.v3', 'recent.v4', 'recent.v5'}
     # None preserves historical consumers. An explicit (possibly empty) supply
     # is derived by the message owner, never inferred from matching prose.
     def source_key(row: Mapping[str, Any]) -> str:
@@ -739,7 +741,7 @@ def select_working_context(
         paths = {location(i) for i in current_reads if observed_turn(i) in read_turns}
         active_material = {i for i in current_reads if location(i) in paths}
         reusable_material = active_material
-        if working_set_policy == 'recent.v4':
+        if working_set_policy in {'recent.v4', 'recent.v5'}:
             # A checkpoint is a summary, not proof that earlier originals are
             # no longer useful. Let this request's observed, current sources
             # compete for remaining capacity after recent work.
@@ -849,9 +851,14 @@ def select_working_context(
         return (operations[i].get('turn') not in recent, i)
 
     def admit_navigation() -> None:
+        cited = explicit_references | {record for note in view['notes'] if active(note)
+                                       for record in note.get('records', ())} if focused_working_set else set()
         for i in sorted(range(len(operations)), key=operation_priority, reverse=True):
             if retained_records and operations[i].get('turn') in recent:
                 continue  # Its native block is already present in the input.
+            if focused_working_set and operations[i].get('request_count', 1) < len(user_requests):
+                if operations[i]['observation'].get('record') not in cited:
+                    continue  # The original work is available through read_history.
             operation_indices.append(i)
             if project()[1] > context_token_target:
                 operation_indices.pop()  # Never excerpt a serialized operation.
@@ -968,6 +975,10 @@ def select_working_context(
                     or rows[i].get('record') in needed
                     or i in related_feedback
                     or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts]
+                if focused_working_set:
+                    ordered = [i for i in ordered if rows[i].get('record') in needed
+                        or i in reusable_material or i in related_feedback
+                        or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts]
                 # Explicit originals were admitted above. Recent complete work
                 # now precedes optional supporting original bodies.
                 preferred = {i for i in ordered if rows[i].get('record') in explicit_references
@@ -993,6 +1004,9 @@ def select_working_context(
         for i in reversed(range(latest or 0)):
             if not blocks[i]:
                 continue
+            if (focused_working_set and counts[i] < len(user_requests)
+                    and i not in protected_turns):
+                continue  # Prior requests remain in the original journal.
             if sparse_handoffs and i in supplied_handoffs and i not in protected_turns:
                 continue
             if (not sparse_handoffs and journal_selection
