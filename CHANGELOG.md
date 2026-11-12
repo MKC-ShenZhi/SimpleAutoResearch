@@ -5,6 +5,16 @@
 User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-11-12
+
+### Improved
+
+- Continuing work presents related review guidance more concisely and shares already displayed text for the same file version; original records and review scope remain available.
+
+### Fixed
+
+- Independent review can identify a non-text file without claiming its contents were read, and reports an unfinished candidate review clearly.
+
 ## 2026-11-11
 
 ### Improved
