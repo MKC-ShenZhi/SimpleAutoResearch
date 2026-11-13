@@ -1441,6 +1441,9 @@ class ToolApplication:
             context['creation_declarations'] = self.state['config']['creation_declarations']
         if self.operations is not None and self.operations.professional:
             context['working_notes'] = self._working_memory()['notes']
+            prior = self.operations.delivery.retained_prior_delivery()
+            if prior is not None:
+                context['retained_prior_delivery'] = prior
         inherited = self._retained_working_inputs(targets)
         if inherited['notes']:
             context['historical_working_understanding'] = inherited['notes']
@@ -2762,12 +2765,7 @@ class ToolApplication:
                 and (self.state['turns'][-1].get('origin') == 'caller'
                      or self.ledger.remaining('llm_requests') == 1)):
             return {}  # The accepted terminal submission may use the last request for its review.
-        decision = self._completion_floor(client, dispatch=True)
-        if self.state['config'].get('work_lifecycle') != 'integrated.v3' or not candidate:
-            return decision
-        from simple_ar.app.professional_conversation import ProfessionalConversation
-        return ProfessionalConversation.resource_floor(
-            self.operations.delivery.review_continuation(decision))
+        return self._completion_floor(client, dispatch=True)
 
     def _terminal_batch(self) -> bool:
         """A fitting task exit or professional return needs no later decision."""
@@ -3639,6 +3637,15 @@ class ToolApplication:
         if config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES:
             context['delivery_conditions'] = dict(delivery_guidance[0])
             context['delivery_conditions'].pop('review_followup', None)
+            key = ('retained_prior_delivery',)
+            if decision_views is None or key not in decision_views:
+                prior = self.operations.delivery.retained_prior_delivery()
+                if decision_views is not None:
+                    decision_views[key] = prior
+            else:
+                prior = decision_views[key]
+            if prior is not None:
+                context['retained_prior_delivery'] = prior
             if schemas is not None:
                 offered = self._offered_operation_names(schemas)
                 context['delivery_conditions']['next_tools'] = [name for name in
@@ -4378,6 +4385,7 @@ class ToolApplication:
             'summary': 'Investigate whether the current edited and executed candidate addresses the latest '
                        'user request. Identify any necessary revisions using independent evidence.',
             'artifacts': list(dict.fromkeys(artifacts)),
+            'review_scope': 'candidate',
         }
         remaining_attempts = self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts
         if remaining_attempts < self.gateway.continuation_attempts(name, arguments) + 4:
@@ -4385,8 +4393,7 @@ class ToolApplication:
         from simple_ar.app.professional_conversation import ProfessionalConversation
         client = self._client()
         decision = self._completion_floor(client, dispatch=True)
-        floor = ProfessionalConversation.resource_floor({'investigation': decision,
-            **self.operations.delivery.review_continuation(decision)})
+        floor = ProfessionalConversation.resource_floor({'investigation': decision, 'followup': decision})
         if ({'llm_requests', 'total_tokens'}.intersection(
                 self.ledger.unknown_dimensions(unbounded_only=True, current_allowance_only=True))
                 or any((remaining := self.ledger.remaining(key)) is not None and remaining < amount
@@ -4464,22 +4471,6 @@ class ToolApplication:
                 decision_observations=decision_observations, decision_guidance=decision_guidance,
                 decision_views=decision_views)
             value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
-            if self.state['config'].get('work_lifecycle') == 'integrated.v3' and any(
-                    row['function']['name'] == 'review_result' for row in schemas):
-                measured = conversation.request_resources(value)
-                stages = self.operations.delivery.review_continuation(measured)
-                # A candidate investigation must leave a revision path, in
-                # addition to its own first measured model request. Inspection
-                # measures its final opinion itself on the same protected ledger.
-                if not conversation.can_protect(value, conversation.resource_floor(
-                        {'investigation':measured, **stages})):
-                    schemas = [row for row in schemas if row['function']['name'] != 'review_result']
-                    selection.clear()
-                    messages = self._messages(client=client, working_memory=working_memory,
-                        closing=closing, schemas=schemas, working_selection=selection,
-                        decision_observations=decision_observations, decision_guidance=decision_guidance,
-                        decision_views=decision_views)
-                    value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
             if integrated and closing:
                 # A service must leave the caller an exit even if its result is
                 # incomplete. Do not offer it solely because request slots fit.
@@ -4538,8 +4529,7 @@ class ToolApplication:
                 # Check and repair use the normal rich projections, not the
                 # small handoff packet's token count.
                 ordinary = conversation.request_resources(value)
-                floor = conversation.resource_floor({'investigation': ordinary,
-                    **self.operations.delivery.review_continuation(ordinary)})
+                floor = conversation.resource_floor({'investigation': ordinary, 'followup': ordinary})
                 if (measured['total_tokens'] - (client.effective_output_limit() or 0)
                         <= selection['input_token_target'] and conversation.can_protect(handoff, floor)):
                     handoff_floor = floor
@@ -4641,6 +4631,10 @@ class ToolApplication:
                 self._decision_tokens(client, messages, schemas=schemas)),
             'closing_required': closing,
             'tool_admission': 'work_selection.v1' if 'work_selection' in projection else 'offered.v1',
+            **({'candidate_review_scope': 'explicit.v1'} if any(
+                row.get('function', {}).get('name') == 'review_result'
+                and 'review_scope' in row['function'].get('parameters', {}).get('properties', {})
+                for row in schemas) else {}),
             **({'request_count':len(self.state['requests'])} if 'work_selection' in projection else {}),
             **({'request_owner': _REQUEST_OWNER}
                 if self.state['config'].get('professional_work') == _REQUEST_OWNER else {}),
@@ -4913,6 +4907,16 @@ class ToolApplication:
             if self.operations is not None:
                 record = (store.root.relative_to(self.session.store.root) / 'native_result.json').as_posix()
                 try:
+                    review_scope = None
+                    if (self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES
+                            and self._completion(call['function']['name']).kind == 'review'):
+                        arguments = self._recorded_arguments(call)
+                        review_scope = arguments.get('review_scope') if isinstance(arguments, dict) else None
+                        turn = self.state['turns'][-1]
+                        decision = str(Path(turn['reply']).with_name('decision_budget.json'))
+                        if (review_scope is None and self.session.store.exists(decision)
+                                and self.session.store.read_json(decision).get('candidate_review_scope') == 'explicit.v1'):
+                            review_scope = 'candidate'
                     delivery = self.operations.delivery.bind_result(request, payload, store.root.name,
                         current_outputs=outputs,
                         current_result=self._operation_observation(payload, call, record),
@@ -4921,7 +4925,7 @@ class ToolApplication:
                             self._review_floor(self._client(store.root.name),
                                 candidate=self._completion(call['function']['name']).kind == 'review')),
                         may_start=start_review,
-                        **({'candidate': True} if self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES
+                        **({'candidate': True, 'review_scope': review_scope} if self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES
                             and self._completion(call['function']['name']).kind == 'review' else {}))
                 except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
                     payload.update(status='blocked', error=str(exc))

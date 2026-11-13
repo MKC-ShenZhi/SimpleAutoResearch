@@ -109,6 +109,24 @@ class Delivery:
             return self.review_owner.reviewed_claim(choice.reviewed_candidate, observations, self.user_requests)
         return delivery if isinstance(delivery, DeliveryRequest) else DeliveryRequest.model_validate(delivery)
 
+    def retained_prior_delivery(self) -> dict | None:
+        """Present the last retained complete delivery for a continuing request."""
+        if self.user_requests is None:
+            return None
+        requests = self.user_requests()
+        if len(requests) < 2:
+            return None
+        from simple_ar.tools.delivery_versions import DeliveryVersions
+        row = DeliveryVersions(self.workspace.root).latest_prior(len(requests))
+        if row is None:
+            return None
+        delivery = row['delivery']
+        return {'record': row['observation'], 'summary': delivery.get('summary', ''),
+            'artifacts': delivery.get('artifacts', []),
+            **({'project_root': delivery['project_root']} if delivery.get('project_root') else {}),
+            'scope': 'Retained prior work, not the current delivery or proof that live files are unchanged. '
+                'Reuse only work relevant to the current request; current delivery and review use actual versions.'}
+
     def working_guidance(self, accepted_delivery: dict | None, *, include_lifecycle: bool,
                          observations: list[dict] | None = None) -> tuple[dict | None, dict | None]:
         """Project one decision's guidance from the same observations and review."""
@@ -138,6 +156,11 @@ class Delivery:
             delivery = data.get(contract.field) if contract.field else data
             if delivery is None:
                 continue
+            review = (row.get('metadata') or {}).get('delivery_review') or {}
+            if contract.kind == 'review' and review.get('binding', {}).get('purpose') == 'candidate':
+                # The inspection receipt supplies its own findings. A local
+                # investigation is not a rejected final-delivery proposal.
+                return None
             if delivery == accepted_delivery:
                 return None
             try:
@@ -195,6 +218,7 @@ class Delivery:
         observations = self.observations() if observations is None else observations
         work_after_review = False
         review_followup = False
+        candidate_only = False
         for observed in reversed(observations):
             name = observed.get('tool_name', '')
             completion = tool_completion(name, self.config.get('tool_completions'))
@@ -220,6 +244,9 @@ class Delivery:
                 break
             review_followup = (completion.kind == 'review' and observed.get('status') == 'ok'
                 and observed.get('current_request', True) and not work_after_review)
+            review = (observed.get('metadata') or {}).get('delivery_review') or {}
+            candidate_only = (completion.kind == 'review'
+                and review.get('binding', {}).get('purpose') == 'candidate')
             break
         # A new request still needs the saved final-review contract. A delivery
         # already accepted for this request has no outstanding review floor.
@@ -244,7 +271,7 @@ class Delivery:
                 if publication:
                     next_tools.append('export_report')
                     conditions.extend({'kind': 'publication', 'message': text} for text in publication)
-                if self.requires_review(proposal):
+                if self.requires_review(proposal) and not candidate_only:
                     binding = prepare_delivery_review(self.workspace, proposal, resolved['artifacts'],
                         self.user_requests, protocol=self.review_owner.protocol)
                     concerns = (review_issues or self.review_owner.issues)(observations, binding)
@@ -259,17 +286,6 @@ class Delivery:
                 'statement, not a current obligation. Reconsider it against the request and actual work. '
                 'This is not a pass or an exact cost forecast. '
                 'Final acceptance rechecks the actual inventory, publication and applicable opinion.'}
-
-    def review_continuation(self, decision: dict) -> dict[str, dict]:
-        """Leave a decision to act on an opinion and a request for its exit.
-
-        A revision or another check may be necessary, but their cost and even
-        their need are not known before the opinion. The follow-up can deliver
-        an accepted candidate or choose the next action for a finding. Keep a
-        request slot to report a revision, but assess its token cost when that
-        request is prepared instead of forecasting a second full context now.
-        """
-        return {'followup': dict(decision), 'exit': {'llm_requests': 1}}
 
     def _actual_issues(self, observations: list[dict], request: DeliveryRequest,
                          resolved: dict, *, proposed=None,
@@ -353,15 +369,21 @@ class Delivery:
 
     def review_delivery(self, delivery: dict, identity: str, *, may_start: bool,
                         current_result: dict | None = None,
-                        current_outputs: tuple[Path, ...] = (), candidate: bool = False) -> dict | None:
+                        current_outputs: tuple[Path, ...] = (), candidate: bool = False,
+                        review_scope: str | None = None) -> dict | None:
         if self.review_owner is None:
             return None
         request = DeliveryRequest.model_validate(delivery)
         if request.unresolved and not candidate:
             return None  # The executor still binds and commits actual partial files.
-        if candidate and not request.unresolved:
+        if candidate and review_scope == 'delivery':
+            if request.unresolved:
+                raise ValueError('A complete delivery review cannot claim unfinished work')
+            candidate = False
+        elif candidate and review_scope is None and not request.unresolved:
             # A fully eligible claim keeps the normal reusable final binding.
-            # Only unfinished admission needs a distinct early investigation.
+            # Retain this historical inference for saved decisions; new model
+            # decisions select their scope explicitly or default to candidate.
             observations = [*self.observations(), *([current_result] if current_result is not None else [])]
             try:
                 self.validate_actual(request, observations, current_outputs=current_outputs)
@@ -390,7 +412,8 @@ class Delivery:
     def bind_result(self, request: DeliveryRequest, payload: dict, identity: str, *,
                     current_outputs: tuple[Path, ...], current_result: dict,
                     retain: Callable[[], None], review_capacity: Callable[[], Any],
-                    may_start: bool = False, candidate: bool = False) -> dict:
+                    may_start: bool = False, candidate: bool = False,
+                    review_scope: str | None = None) -> dict:
         """Bind completed production and applicable review to one exact claim.
 
         The executor supplies receipt persistence and physical resource protection;
@@ -417,11 +440,13 @@ class Delivery:
                 metadata['delivery_hashes'] = hashes
                 retain()  # Pin production before paid work; recovery never reruns it.
             review = self.review_delivery(delivery, identity, may_start=False,
-                current_result=current_result, current_outputs=current_outputs, candidate=candidate)
+                current_result=current_result, current_outputs=current_outputs, candidate=candidate,
+                review_scope=review_scope)
             if review is None and may_start:
                 with review_capacity() if candidate or self.requires_review(request) else nullcontext():
                     review = self.review_delivery(delivery, identity, may_start=True,
-                        current_result=current_result, current_outputs=current_outputs, candidate=candidate)
+                        current_result=current_result, current_outputs=current_outputs, candidate=candidate,
+                        review_scope=review_scope)
             if review is not None:
                 if metadata.get('delivery_review', review) != review:
                     raise ValueError('Retained delivery review differs from its actual receipt')

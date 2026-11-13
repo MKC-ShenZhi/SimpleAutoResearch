@@ -179,6 +179,10 @@ class DeliveryRequest(BaseModel):
 
 class CandidateReviewRequest(DeliveryRequest):
     """Investigate available work without claiming a completed delivery."""
+    review_scope: Literal['candidate', 'delivery'] = Field(default='candidate',
+        description='Use candidate to investigate the selected work without claiming the whole task is ready; '
+        'use delivery only when this claim and inventory are intended as the complete final delivery. '
+        'If omitted for a new model decision, the review covers the candidate.')
     summary: str = Field(min_length=1,
         description='The current claim to investigate in the available candidate, not a declaration that the task is complete.')
     artifacts: list[str] = Field(min_length=1,
@@ -431,9 +435,10 @@ def workspace_tool_specs(*, candidate_review: bool = False,
             description = ('Investigate a current candidate and its actual available files against the original '
                 'request. Known unfinished work, missing requested publication and incomplete final packaging '
                 'do not prevent checks already possible. Submit this operation alone after observing production. '
-                'It returns independent findings without delivering. If the candidate is ready for final '
-                'delivery, provide the intended final claim, report and inventory; an unchanged final claim '
-                'can reuse its opinion. A pending review itself is not unfinished requested work.')
+                'It returns independent findings without delivering. Choose review_scope=delivery only for '
+                'the intended complete final claim and inventory, so an unchanged delivery can reuse its '
+                'opinion; otherwise the selected candidate is checked without implying final packaging. '
+                'A pending review itself is not unfinished requested work.')
         if name == 'deliver_result' and candidate_review_protocol == 'candidate.v1':
             model = ReviewedDeliveryRequest
             description = ('Deliver actual artifacts and disclose unfinished work, or select a passed '
@@ -2268,7 +2273,7 @@ class WorkspaceToolGateway:
                     # Normalize once at the result boundary. The original
                     # candidate request stays in its accepted action receipt;
                     # existing delivery/inspection owners bind these actual bytes.
-                    model = DeliveryRequest.model_validate(model.model_dump())
+                    model = DeliveryRequest.model_validate(model.model_dump(exclude={'review_scope'}))
                 if isinstance(model, ReviewedDeliveryRequest):
                     data = ({'reviewed_candidate': model.reviewed_candidate} if model.reviewed_candidate
                         else self.resolve_delivery(DeliveryRequest.model_validate(model.model_dump())))

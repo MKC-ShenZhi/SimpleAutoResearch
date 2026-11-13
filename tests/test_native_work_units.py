@@ -297,7 +297,7 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertTrue(any('recorded_work_unit' in row.get('content', '') for row in messages[2:]))
         before = deepcopy(c.app.ledger.to_dict())
         claim = {'summary':'A bounded note', 'artifacts':['note.md']}
-        c.decisions.append(fixture._action('review_result', **claim))
+        c.decisions.append(fixture._action('review_result', review_scope='delivery', **claim))
         self.drain()
         checked = len(c.inspection_requests)
         self.assertGreater(checked, 0)
@@ -322,7 +322,7 @@ class NativeWorkQueueTests(unittest.TestCase):
         c._write('note.md', 'The sample mean is 2.0 across three supplied observations.\n')
         claim = {'summary': 'A bounded note', 'artifacts': ['note.md'],
             'report': {'status': 'canonical', 'manuscript': 'note.md', 'formats': ['markdown']}}
-        c.decisions.append(fixture._action('review_result', **claim))
+        c.decisions.append(fixture._action('review_result', review_scope='delivery', **claim))
         self.drain()
         self.assertEqual(c._last('review_result')['status'], 'ok')
         self.assertEqual(c.app.ledger.remaining('llm_requests'), 2)
@@ -331,6 +331,25 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.drain()
         self.assertEqual(c.app.session.manifest.status, 'completed', c.app.result_snapshot())
         self.assertEqual(c._last('deliver_result', reviewed=True)['metadata']['delivery_review']['identity'], reviewed)
+
+    def test_candidate_review_is_offered_with_one_measured_followup_remaining(self):
+        c = self.case
+        c.root = c.directory / 'review-with-followup'
+        c.app = ToolApplication.create(c.root, 'Inspect the supplied note and retain any gaps.',
+            model='fixture', sources={'measurements': c.inputs}, services=c.services,
+            max_turns=3, max_tokens=300000, tool_contracts='on_demand')
+        c._write('note.md', 'The supplied observations are bounded.\n')
+
+        def choose():
+            request = c.send.call_args.kwargs.get('request') or c.send.call_args.args[1]
+            self.assertIn('review_result', {row['function']['name'] for row in request['tools']})
+            return fixture._action('review_result', review_scope='candidate',
+                summary='Inspect the note', artifacts=['note.md'])
+
+        c.decisions.append(choose)
+        self.drain()
+        self.assertEqual(c._last('review_result')['status'], 'ok')
+        self.assertGreaterEqual(c.app.ledger.remaining('llm_requests'), 1)
 
     def test_current_report_gets_read_when_retained_material_uses_its_allowance(self):
         c = self.case
@@ -421,7 +440,8 @@ class NativeWorkQueueTests(unittest.TestCase):
     def test_reviewed_candidate_can_be_delivered_without_recopying_or_rechecking(self):
         c = self.case
         c._write('note.md', 'The supplied observations support this bounded note.\n')
-        c.decisions.append(fixture._action('review_result', summary='A bounded note', artifacts=['note.md']))
+        c.decisions.append(fixture._action('review_result', summary='A bounded note',
+            artifacts=['note.md'], review_scope='delivery'))
         self.drain()
         reviewed = c._last('review_result')
         identity = reviewed['metadata']['delivery_review']['identity']
@@ -432,6 +452,29 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertEqual(c.app.session.manifest.status, 'completed', c.app.result_snapshot())
         self.assertEqual(len(c.inspection_requests), count)
         self.assertEqual(c.app.session.store.read_json('delivery.json')['summary'], 'A bounded note')
+        c._submit(fixture._action('read_file', path='note.md'),
+            feedback='Clarify the same note and retain the earlier work.')
+        prior = c.app.operations.delivery.retained_prior_delivery()
+        self.assertEqual(prior['artifacts'], ['note.md'])
+        self.assertEqual(c.app._work_context(['note.md'])['retained_prior_delivery'], prior)
+
+    def test_new_model_review_defaults_to_candidate_scope_without_claiming_delivery(self):
+        c = self.case
+        c._write('note.md', 'A useful intermediate explanation.\n')
+        c.decisions.append(fixture._action('review_result', summary='Check the current explanation',
+            artifacts=['note.md']))
+        self.drain()
+        result = c._last('review_result', reviewed=True)
+        self.assertEqual(result['metadata']['delivery_review']['binding']['purpose'], 'candidate')
+        supplied = json.loads(c.inspection_requests[-1]['messages'][1]['content'])
+        self.assertIn('not a complete delivery', supplied['proposed_delivery']['scope'])
+        self.assertNotEqual(c.app.session.manifest.status, 'completed')
+        self.assertFalse((c.root / 'delivery.json').exists())
+        identity = result['metadata']['delivery_review']['identity']
+        c.decisions.append(fixture._action('deliver_result', reviewed_candidate=identity))
+        self.drain()
+        self.assertNotEqual(c.app.session.manifest.status, 'completed')
+        self.assertFalse((c.root / 'delivery.json').exists())
 
     def test_workspace_write_can_deliver_its_actual_partial_result(self):
         c = self.case

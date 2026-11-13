@@ -75,6 +75,27 @@ class CandidateReviewTests(unittest.TestCase):
             self.owner.review_delivery(complete,'legacy',may_start=True)
         self.assertEqual(len(self.inspector.calls),1)
 
+    def test_scoped_candidate_does_not_become_a_final_claim_when_no_gap_is_listed(self):
+        claim = {'summary': 'Check the revised argument', 'artifacts': ['draft.md']}
+        proof = self.owner.review_delivery(claim, 'scoped', may_start=True,
+            candidate=True, review_scope='candidate')
+        self.assertEqual(proof['binding']['purpose'], 'candidate')
+        row = {'tool_name': 'review_result', 'status': 'ok', 'record': 'attempts/scoped/native_result.json',
+            'data': claim, 'metadata': {'delivery_review': proof}, 'current_request': True}
+        self.observations.append(row)
+        self.assertIsNone(self.owner.feedback(self.observations, None))
+        guidance = self.owner.lifecycle_requirements(observations=self.observations)
+        self.assertTrue(guidance['review_followup'])
+        self.assertNotIn('independent_review', [item['kind'] for item in guidance['conditions']])
+
+    def test_explicit_delivery_scope_and_historical_claim_keep_final_review(self):
+        claim = {'summary': 'Complete explanation', 'artifacts': ['draft.md']}
+        explicit = self.owner.review_delivery(claim, 'explicit', may_start=True,
+            candidate=True, review_scope='delivery')
+        self.assertNotIn('purpose', explicit['binding'])
+        historical = self.owner.review_delivery(claim, 'historical', may_start=True, candidate=True)
+        self.assertNotIn('purpose', historical['binding'])
+
     def test_candidate_versions_are_rechecked_and_new_investigation_does_not_replay_old_work(self):
         first = self.owner.review_delivery(self.claim,'first',may_start=True,candidate=True)
         self.observations.append({'tool_name':'review_result','status':'ok',

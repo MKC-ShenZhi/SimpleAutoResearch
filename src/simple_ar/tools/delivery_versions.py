@@ -133,6 +133,22 @@ class DeliveryVersions:
                 'files': {}, 'binding': 'unavailable', 'status': 'unavailable', 'reason': reason})
         return rows
 
+    def latest_prior(self, request_count: int) -> dict | None:
+        """Find the most recent retained complete work before this request."""
+        for record, turn in reversed(list(self._closed())):
+            if turn.get('request_count', 1) >= request_count:
+                continue
+            try:
+                owner = self._owner(record, turn)
+                if owner is None or owner[1].get('unresolved'):
+                    continue
+                saved = self._load(record, *owner)
+                if saved is not None:
+                    return saved
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                continue  # An unavailable retained version is not current work.
+        return None
+
     def select(self, version: int) -> dict:
         """Select an explicit retained delivery, independently of current work."""
         rows = self.versions()

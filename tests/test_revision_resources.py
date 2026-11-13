@@ -251,9 +251,6 @@ class RevisionInspectionFlowTests(unittest.TestCase):
         self.assertEqual(pending['action']['call']['function']['name'], 'run_process')
         self.assertFalse(case.app.workspace.resolve(probe['work']+'/count.txt').exists())
         floor = case.app._review_floor(case.app._client(pending['inspection']), candidate=True)
-        declared = case.app.operations.delivery.review_continuation(
-            case.app._completion_floor(case.app._client(pending['inspection']), dispatch=True))
-        self.assertEqual(floor, ProfessionalConversation.resource_floor(declared))
         token = case.app.approval_token(pending['action']['call'])
         before_approval = case.app.ledger.to_dict()
         case._reload()

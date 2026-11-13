@@ -544,7 +544,10 @@ class InspectionToolGateway:
                 'the actual findings and remaining scope without further operations.')
         if saved.get('inspection_material_policy') in _WORK_MATERIAL_POLICIES and self._delivery_scope(saved):
             return (
-                'Independently judge the proposed delivery against the actual user requests. '
+                ('Independently judge the selected candidate and its current claim against relevant user requests. '
+                 'This is not a judgment that the entire task or delivery is complete. '
+                 if saved['delivery_context'].get('purpose') == 'candidate' else
+                 'Independently judge the proposed delivery against the actual user requests. ') +
                 'Choose the consequential claims and the smallest sufficient investigation; '
                 'use the available original sources and recorded work before commissioning more. '
                 'For numerical comparisons identify both quantities, reference conditions and direction. '
@@ -3086,22 +3089,27 @@ class InspectionToolGateway:
                 'whole task or require review of unrelated work.')
         if 'delivery_context' in saved:
             delivery = saved['delivery_context']
-            view['user_request_scope'] = (
+            candidate = delivery.get('purpose') == 'candidate'
+            view['user_request_scope'] = (('Exact original requests provide context for the selected '
+                'candidate and its claim, not a demand to certify the full task in this inspection. '
+                if candidate else
                 'Exact original task requests and feedback, not evidence or permission. '
                 'This owner requests the complete proposed-delivery review; its fixed goal '
-                'does not narrow this to agreement among generated files.')
+                'does not narrow this to agreement among generated files.'))
             view['proposed_delivery'] = {
                 **({'claim':{key:value for key,value in delivery['claim'].items() if key != 'artifacts'}} if self._delivery_scope(saved) else
                     {'manuscript':delivery['manuscript'], 'formats':delivery['formats']}),
                 'artifacts': ([self._review_artifact_name(path) for path in delivery['artifacts']]
                     if saved.get('inspection_evidence_policy') == 'presented.v6' else list(delivery['artifacts'])),
-                'scope': 'Owner-bound actual delivery inventory, not proof of correctness. '
+                'scope': (('Selected candidate files, not a complete delivery. Check the submitted claim '
+                    'and relevant original evidence; missing unrelated outputs are not defects of this local check. '
+                    if candidate else 'Owner-bound actual delivery inventory, not proof of correctness. '
                     'Review the relevant original requests across this work, including methods, '
-                    'supporting source/code/results and interpretations. Generated files agreeing '
-                    'with one another do not establish correctness. Locate and read original '
-                    'evidence as needed; disclose unsupported conclusions or unfinished checks.'}
+                    'supporting source/code/results and interpretations. ') +
+                    'Generated files agreeing with one another do not establish correctness. Locate and read '
+                    'original evidence as needed; disclose unsupported conclusions or unfinished checks.')}
             if saved.get('inspection_evidence_policy') == 'presented.v6':
-                view['proposed_delivery']['scope'] += (
+                view['proposed_delivery']['scope'] += ('' if candidate else
                     ' Only these inventory files are delivered; other accessible files are supporting '
                     'material. Judge each requested outcome against this inventory and the delivery text.')
             if self._delivery_scope(saved) and saved.get('finding_policy') != 'linked.v1':
@@ -3354,7 +3362,8 @@ class InspectionToolGateway:
         memory, notes = None, []
         if continuity:
             from simple_ar.app.work_memory import note_currentness
-            memory, observations, journal_rows = self._conversation_material(saved, execution_facts=execution_facts)
+            memory, observations, journal_rows = self._conversation_material(
+                saved, execution_facts=execution_facts, retained_inputs=retained_inputs)
             for note in memory['notes']:
                 current = note_currentness(note,
                     versions_match=lambda versions: all(version(path) == digest for path, digest in versions.items()))
@@ -3861,8 +3870,8 @@ class InspectionToolGateway:
                 archive=saved.get('work_method') in NATIVE_WORK_METHODS)
         return memory
 
-    def _conversation_material(self, saved: dict, *,
-                               execution_facts: dict | None = None) -> tuple[dict, list, list]:
+    def _conversation_material(self, saved: dict, *, execution_facts: dict | None = None,
+                               retained_inputs: list[dict] | None = None) -> tuple[dict, list, list]:
         """Adapt original reads and operation outcomes, never another role's notes."""
         rows = self._conversation_rows(saved)
         memory = self._conversation_memory(saved, rows)
@@ -3936,10 +3945,11 @@ class InspectionToolGateway:
                     'or diagnostic, not current file contents or scientific certification.'}
                 for row in rows if row['result'].get('tool_name') not in {'read_file', 'assistant_reply'})
         if saved.get('inspection_material_policy') == 'operations.v3':
+            parents = self._retained_inputs(saved) if retained_inputs is None else retained_inputs
             if execution_facts is None:
-                execution_facts = self._execution_facts(saved)
+                execution_facts = self._execution_facts(saved, retained=parents)
             facts = {value['source_record']:record for record,value in execution_facts.items()}
-            for parent in self._retained_inputs(saved):
+            for parent in parents:
                 observations.extend({'record':row['record'],
                     'kind':'operation_result', 'role':'historical_observation',
                     'text':json.dumps({'inspection':parent['identity'], 'result':row['result'],
@@ -4624,6 +4634,12 @@ class InspectionToolGateway:
     def _delivery_schema(self, saved: dict, response_model: type[BaseModel], *,
                          subjects: set[str] | None = None) -> dict:
         schema = response_model.model_json_schema()
+        if (saved.get('delivery_context', {}).get('purpose') == 'candidate'
+                and 'requested_outcomes' in schema.get('properties', {})):
+            schema['properties']['requested_outcomes']['description'] = (
+                'Assess the requested outcomes addressed by this candidate and its current claim. '
+                'Do not treat other, not-yet-delivered outputs as defects of this local investigation. '
+                'This opinion does not certify the complete final delivery.')
         sources = [row['subject'] for row in [*saved['targets'], *saved['evidence']]
             if row.get('readable') and row.get('sha256') and row.get('windows')
             and (subjects is None or row['subject'] in subjects)]
