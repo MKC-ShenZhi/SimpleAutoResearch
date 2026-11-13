@@ -3388,7 +3388,7 @@ class InspectionToolGateway:
         # ordinary work. Retiring a native turn must not retire its only usable
         # source body while unused input capacity remains. Original read IDs,
         # decoded ranges and receipts remain the authority for adoption.
-        memory, notes = None, []
+        memory, notes, original_observations = None, [], None
         if continuity:
             from simple_ar.app.work_memory import note_currentness
             memory, observations, journal_rows = self._conversation_material(
@@ -3400,6 +3400,7 @@ class InspectionToolGateway:
                     **({'version_scope':'Source support is incomplete or indirect; reassess before reuse'}
                        if current is None else {})})
             if saved.get('initial_material_memory') == 'provided.v1':
+                original_observations = observations
                 observations = self._handoff_provided_sources(observations, journal_rows, notes,
                     memory['compacted_records'], self._path(saved['identity'], 'input'))
         else:
@@ -3494,7 +3495,7 @@ class InspectionToolGateway:
                 selected_records.extend(fact['source_record'] for fact in execution_facts.values()
                     if fact['inspection'] != saved['identity']
                     or pending.intersection(fact['dependencies']))
-        messages, metadata = fit_working_context(
+        fit_options = dict(
             measure_input=lambda value: estimate_native_input_tokens(client, value, offered),
             context_authority=saved.get('context_authority'),
             user_requests=saved.get('user_requests', [request.goal]),system_text=system,
@@ -3530,6 +3531,15 @@ class InspectionToolGateway:
                 } if continuity else {}),
             history_access=('read_history' if history else 'read_file at the recorded authorized source path and range'),
             trailing_messages=[finish] if finish is not None else [])
+        messages, metadata = fit_working_context(**fit_options)
+        if original_observations is not None and len(observations) != len(original_observations):
+            supplied_notes = json.loads(messages[1]['content'])['working_view']['notes']
+            visible = self._handoff_provided_sources(original_observations, journal_rows, supplied_notes,
+                memory['compacted_records'], self._path(saved['identity'], 'input'))
+            if len(visible) != len(observations):
+                # A capacity-omitted note cannot replace the original source.
+                fit_options['observations'] = original_observations
+                messages, metadata = fit_working_context(**fit_options)
         if continuity and saved.get('initial_material_memory') == 'provided.v1':
             self._schedule_provided_source_memory(metadata, journal_rows, memory, blocks,
                 self._path(saved['identity'], 'input'))

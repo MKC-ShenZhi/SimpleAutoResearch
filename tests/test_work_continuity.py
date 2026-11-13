@@ -629,6 +629,31 @@ class InspectionWorkingContinuityTests(unittest.TestCase):
                 _, supply = resumed._working_messages(saved, request, history, [], client)
             self.assertTrue(any(row['source']['record'] == record for row in supply['selected_records']))
 
+            # An offered source cannot disappear if its supporting note does
+            # not fit into the actual selected view.
+            from simple_ar.core.working_context import fit_working_context
+            provided_record = resumed._path('inspection', 'sources-0') + '#provided/0'
+            provided = {**observation, 'record': path, 'subject': 'target-1'}
+            source = {'turn': 0, 'record': provided_record,
+                'result': {'tool_name': 'provided_source', 'data': provided}}
+            carried = {'notes': [{'text': 'A concise interpretation', 'records': [provided_record],
+                'observed_versions': {str(file): observation['sha256']}}], 'through_turn': 1,
+                'compacted_records': {provided_record}, 'archived_records': set()}
+            selected_sizes = []
+
+            def omit_note_once(**options):
+                selected_sizes.append(len(options['observations']))
+                if len(selected_sizes) == 1:
+                    options['work_notes'] = []
+                return fit_working_context(**options)
+
+            updated = {**saved, 'initial_material_memory': 'provided.v1'}
+            with patch.object(resumed, '_conversation_material', return_value=(carried, [provided], [source])), \
+                    patch('simple_ar.core.working_context.fit_working_context', side_effect=omit_note_once):
+                _, supply = resumed._working_messages(updated, request, history, [], client)
+            self.assertEqual(selected_sizes, [0, 1])
+            self.assertTrue(any(row['source']['record'] == path for row in supply['selected_records']))
+
             # A historical started inspection remains historical even under a
             # freshly configured integrated gateway. Its immutable input wins.
             historical = deepcopy(saved)
