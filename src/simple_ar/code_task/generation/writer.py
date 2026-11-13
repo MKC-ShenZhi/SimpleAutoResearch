@@ -717,6 +717,7 @@ def _generate_implementation_contents(
                     selection = None
                     if bounded_context:
                         from simple_ar.code_task.generation.source_context import source_messages
+                        from simple_ar.core.working_context import input_capacity
                         from simple_ar.integrations.llm import estimate_tokens
 
                         # One current byte snapshot supplies the selector. It
@@ -728,10 +729,10 @@ def _generate_implementation_contents(
                             (row['request']['path'], row.get('absolute_path', row['request']['path']))}
                         paths = {name: str(candidate_draft.path(name)) for name in candidate_draft.files}
                         versions.update({paths[name]: digest for name, digest in candidate_draft.files.items()})
-                        target = client._settings.context_input_tokens
                         remaining_tokens = ledger.remaining('total_tokens') if isinstance(ledger, BudgetLedger) else None
-                        if remaining_tokens is not None:
-                            target = min(target, max(0, int(remaining_tokens) - (client.effective_output_limit() or 0)))
+                        target = input_capacity(client._settings.context_input_tokens,
+                            int(remaining_tokens) if remaining_tokens is not None else None,
+                            client.effective_output_limit() or 0)
                         messages, selection = source_messages(system=system, context=context, blocks=native_blocks,
                             record_root=str(artifact_dir), draft_paths=paths, versions=versions,
                             tools=tools, input_target=target, estimate_tokens=estimate_tokens)
