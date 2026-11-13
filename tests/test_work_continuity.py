@@ -629,6 +629,19 @@ class InspectionWorkingContinuityTests(unittest.TestCase):
                 _, supply = resumed._working_messages(saved, request, history, [], client)
             self.assertTrue(any(row['source']['record'] == record for row in supply['selected_records']))
 
+            # Ordinary and closing offers share one read-only projection;
+            # a checkpoint refreshes it before the next offer.
+            material_cache = {}
+            with patch.object(resumed, '_conversation_material', return_value=(memory, [observation], journal)) as project:
+                first = resumed._working_messages(saved, request, history, [], client, material_cache=material_cache)
+                second = resumed._working_messages(saved, request, history, [], client, material_cache=material_cache)
+                self.assertEqual(project.call_count, 1)
+                material_cache.clear()
+                refreshed = resumed._working_messages(saved, request, history, [], client, material_cache=material_cache)
+            self.assertEqual(project.call_count, 2)
+            self.assertEqual(first, second)
+            self.assertEqual(first, refreshed)
+
             # An offered source cannot disappear if its supporting note does
             # not fit into the actual selected view.
             from simple_ar.core.working_context import fit_working_context

@@ -3252,7 +3252,7 @@ class InspectionToolGateway:
 
     def _working_messages(self, saved: dict, request: InspectionRequest, history: list | None,
                           offered: list, client: Any, *, finish: dict | None = None,
-                          validate_capacity: bool = True) -> tuple[list, dict]:
+                          validate_capacity: bool = True, material_cache: dict | None = None) -> tuple[list, dict]:
         """Project actual turns; admission uses the owner's closed journal.
 
         ``None`` requests that journal for a capacity probe. An empty live prefix
@@ -3391,8 +3391,15 @@ class InspectionToolGateway:
         memory, notes, original_observations, handoff_size = None, [], None, None
         if continuity:
             from simple_ar.app.work_memory import note_currentness
-            memory, observations, journal_rows = self._conversation_material(
-                saved, execution_facts=execution_facts, retained_inputs=retained_inputs)
+            cached = material_cache.get('conversation') if material_cache is not None else None
+            if cached is None:
+                cached = self._conversation_material(saved, execution_facts=execution_facts,
+                    retained_inputs=retained_inputs)
+                if material_cache is not None:
+                    material_cache['conversation'] = cached
+            memory, recorded_observations, journal_rows = cached
+            # Navigation and native-source bindings are local to this projection.
+            observations = [dict(row) for row in recorded_observations]
             for note in memory['notes']:
                 current = note_currentness(note,
                     versions_match=lambda versions: all(version(path) == digest for path, digest in versions.items()))
@@ -4109,6 +4116,7 @@ class InspectionToolGateway:
         conversation = ProfessionalConversation(client)
         trace = self._path(saved['identity'], f'sources-{number}')
         last_floor = {}
+        material_cache = {}
         previously_supplied = (self._offered_text_ranges(saved)
             if response_model is not None and self._delivery_scope(saved)
             and saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES else {})
@@ -4116,7 +4124,7 @@ class InspectionToolGateway:
         def project(closing):
             offered = [terminal] if closing else [*tools, terminal]
             projected, metadata = self._working_messages(saved, request, messages, offered, client,
-                finish=finish if closing else None)
+                finish=finish if closing else None, material_cache=material_cache)
             if (response_model is not None and self._delivery_scope(saved)
                     and saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES):
                 # A retained source descriptor is navigation, not a body the
@@ -4293,8 +4301,14 @@ class InspectionToolGateway:
         checkpoint_input = record.get('checkpoint_input') if dispatch is not None else None
         if checkpoint_input is not None:
             shared_checkpoint(checkpoint_input, restore_floor=True)
+        def checkpoint_and_refresh(value, decision_tokens):
+            try:
+                return checkpoint(value, decision_tokens)
+            finally:
+                material_cache.clear()
+
         value = conversation.prepare(project,
-            checkpoint=None if checkpoint_input is not None else checkpoint,
+            checkpoint=None if checkpoint_input is not None else checkpoint_and_refresh,
             followup=followup,
             force_close=remaining[0] <= 0, additional=True,
             exit_first=saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS)
