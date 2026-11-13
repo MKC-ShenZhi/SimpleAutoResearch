@@ -515,6 +515,11 @@ class InspectionToolGateway:
         return path
 
     @staticmethod
+    def _command_preview(argv: list) -> str:
+        command = json.dumps(argv, ensure_ascii=False)
+        return command if len(command) <= 320 else command[:160] + '…' + command[-160:]
+
+    @staticmethod
     def _observed_sources(saved: dict) -> bool:
         """New reads bind observed bytes, without adopting ancestral computation."""
         return saved.get('source_provenance') == 'versions.v2'
@@ -3289,9 +3294,8 @@ class InspectionToolGateway:
                 base['executed_check_details'] = {}
                 for name in base['executed_checks']:
                     fact = facts[visible[name]]
-                    command = json.dumps(fact.get('argv', []), ensure_ascii=False)
                     base['executed_check_details'][name] = {'cwd': fact.get('cwd', 'workspace'),
-                        'argv_preview': command if len(command) <= 320 else command[:160] + '…' + command[-160:]}
+                        'argv_preview': self._command_preview(fact.get('argv', []))}
                 if visible:
                     base['executed_check_scope'] = ('Commands are previews of the accepted executions, '
                         'not their outputs or proof of a claim. Read the original action for details.')
@@ -3395,11 +3399,24 @@ class InspectionToolGateway:
                 except (ValueError, OSError, KeyError, TypeError):
                     continue
                 accessible += 1
+                # The saved index owns receipt digests and full requests. The
+                # model needs paths and windows for navigation, not another
+                # copy of every path and digest inside each receipt descriptor.
+                navigation = []
+                for row in records:
+                    window = {key: row['request'][key] for key in
+                        ('start_line', 'max_lines', 'offset_bytes', 'max_bytes')
+                        if key in row.get('request', {})}
+                    item = {key: row[key] for key in ('record', 'input_index') if key in row}
+                    if window:
+                        item['window'] = window
+                    if item not in navigation:
+                        navigation.append(item)
                 observations.append({'record':self._path(saved['identity'], 'input'),
                     'field':'source_history', 'chunk_id':'source-history:' + entry['path'],
                     'kind':'operation_result', 'role':'source_navigation',
-                    'text':json.dumps({**entry, 'records':records,
-                        'scope':'Navigation only; neither source text nor a current evidence version.'},
+                    'text':json.dumps({'path':entry['path'], 'requested_byte_ranges':entry.get('requested_byte_ranges', []),
+                        'line_windows':entry.get('line_windows', []), 'records':navigation},
                         ensure_ascii=False)})
             base['source_history'].update(accessible_paths=accessible,
                 inaccessible_paths=base['source_history']['indexed_paths'] - accessible)
@@ -3407,7 +3424,9 @@ class InspectionToolGateway:
                 observations.append({'record':self._path(saved['identity'], 'input'),
                     'field':'parent_process_history', 'chunk_id':'parent-process:' + entry['receipt'],
                     'kind':'operation_result', 'role':'source_navigation',
-                    'text':json.dumps(entry, ensure_ascii=False)})
+                    'text':json.dumps({'receipt':entry['receipt'], 'cwd':entry.get('cwd'),
+                        'returncode':entry.get('returncode'), 'argv_preview':self._command_preview(entry.get('argv', []))},
+                        ensure_ascii=False)})
         if 'user_requests' in saved:
             # The shared projector pins exact user text; the coordinator's local
             # inspection goal stays a separately labelled scope in base context.

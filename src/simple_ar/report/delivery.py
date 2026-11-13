@@ -121,11 +121,12 @@ class Delivery:
         if row is None:
             return None
         delivery = row['delivery']
-        return {'record': row['observation'], 'summary': delivery.get('summary', ''),
+        return {'record': 'records/' + row['observation'].removeprefix('attempts/'),
             'artifacts': delivery.get('artifacts', []),
             **({'project_root': delivery['project_root']} if delivery.get('project_root') else {}),
             'scope': 'Retained prior work, not the current delivery or proof that live files are unchanged. '
-                'Reuse only work relevant to the current request; current delivery and review use actual versions.'}
+                'Read its original record for the full claim. Reuse work relevant to the current request; '
+                'current delivery and review use actual versions.'}
 
     def working_guidance(self, accepted_delivery: dict | None, *, include_lifecycle: bool,
                          observations: list[dict] | None = None) -> tuple[dict | None, dict | None]:

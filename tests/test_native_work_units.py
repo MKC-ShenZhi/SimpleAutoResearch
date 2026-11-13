@@ -456,6 +456,7 @@ class NativeWorkQueueTests(unittest.TestCase):
             feedback='Clarify the same note and retain the earlier work.')
         prior = c.app.operations.delivery.retained_prior_delivery()
         self.assertEqual(prior['artifacts'], c.app.session.store.read_json('delivery.json')['artifacts'])
+        self.assertTrue(c.app.workspace.resolve(prior['record']).is_file())
         self.assertEqual(c.app._work_context(['note.md'])['retained_prior_delivery'], prior)
 
     def test_new_model_review_defaults_to_candidate_scope_without_claiming_delivery(self):

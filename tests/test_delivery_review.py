@@ -1653,6 +1653,8 @@ class ApplicableDeliveryInspectionTests(unittest.TestCase):
                     for row in view['working_view']['observations']
                     if row['observation'].get('field') == 'source_history']
                 entry = next(row for row in descriptors if row['path'] == str(source))
+                self.assertNotIn('receipt_sha256', entry['records'][0])
+                self.assertTrue(entry['requested_byte_ranges'] or entry['line_windows'])
                 records.append(entry['records'][0]['record'])
                 return [_action('read_file', path=records[-1], max_bytes=64000),
                     _action('read_file', path=str(source), max_bytes=4096),
