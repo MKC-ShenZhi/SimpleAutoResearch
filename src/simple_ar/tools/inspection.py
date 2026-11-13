@@ -3113,6 +3113,29 @@ class InspectionToolGateway:
                         'scope': 'Selected working_view entries navigate recorded parent executions. '
                             'Read a receipt to inspect its actual result; the index is not an independent check.'}
         source_cache: dict = {}
+        source_views: dict[str, dict] = {}
+        if saved.get('source_provenance') in {'versions.v1', 'versions.v2'}:
+            role_versions = {role: {row['path']: row['sha256'] for row in saved[role]
+                if row.get('readable') and row.get('path') and row.get('sha256')}
+                for role in ('targets', 'evidence')}
+            targets, evidence = role_versions['targets'], role_versions['evidence']
+            shared = None
+            if all(path not in targets or targets[path] == digest for path, digest in evidence.items()):
+                versions = {**targets, **evidence}
+                try:
+                    shared = (self.workspace.artifact_sources(versions,
+                        records=saved.get('source_invocations', []), cache=source_cache) if versions else {})
+                except (ValueError, OSError, KeyError, TypeError, RuntimeError):
+                    pass  # Keep the previous per-role availability boundary below.
+            if shared is not None:
+                source_views = {'targets': shared, 'evidence': shared}
+            else:
+                for role, versions in role_versions.items():
+                    try:
+                        source_views[role] = (self.workspace.artifact_sources(versions,
+                            records=saved.get('source_invocations', []), cache=source_cache) if versions else {})
+                    except (ValueError, OSError, KeyError, TypeError, RuntimeError):
+                        source_views[role] = {}
         for role in ('targets','evidence'):
             view[role] = [{'subject':row['subject'], 'path':row.get('path'), 'complete':row['complete'],
                 'limitation':row.get('limitation',''),
@@ -3129,13 +3152,7 @@ class InspectionToolGateway:
                     visible['delivery_role'] = ('delivered' if original.get('path') in delivered
                                                 else 'supporting_source_only')
             if saved.get('source_provenance') in {'versions.v1', 'versions.v2'}:
-                versions = {row['path']: row['sha256'] for row in saved[role]
-                            if row.get('readable') and row.get('path') and row.get('sha256')}
-                try:
-                    sources = (self.workspace.artifact_sources(versions,
-                        records=saved.get('source_invocations', []), cache=source_cache) if versions else {})
-                except (ValueError, OSError, KeyError, TypeError, RuntimeError):
-                    sources = {}
+                sources = source_views[role]
                 for original, visible in zip(saved[role], view[role]):
                     source = sources.get(original.get('path'), {})
                     lineage = source.get('lineage', {})

@@ -197,6 +197,39 @@ class WorkingContextTests(unittest.TestCase):
             page = owner._read_history(saved, {'start_turn':0, 'action':0, 'field':'result'}, before_turn=1)
         self.assertTrue(__import__('math').isnan(json.loads(page.data['text'])['data']['value']))
 
+    def test_inspection_shares_provenance_without_mixing_versions_or_failures(self):
+        from simple_ar.tools.inspection import InspectionRequest, InspectionToolGateway
+
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        def lookup(versions, **_):
+            if 'unavailable' in versions:
+                raise ValueError('Unavailable source')
+            return {path: {'status': 'recorded', 'tool_name': 'write_file', 'record': version}
+                    for path, version in versions.items()}
+        workspace = SimpleNamespace(mounts={'workspace': root}, artifact_sources=Mock(side_effect=lookup))
+        owner = InspectionToolGateway(root, workspace, Mock())
+        def row(subject, path, version):
+            return {'subject': subject, 'path': path, 'sha256': version, 'readable': True,
+                    'complete': False, 'independent': True, 'windows': []}
+        saved = {'prior_required': [], 'source_provenance': 'versions.v2',
+                 'targets': [row('target', 'draft', 'a')],
+                 'evidence': [row('evidence', 'source', 'b')]}
+        request = InspectionRequest(goal='Inspect both materials', targets=['draft'])
+        view = owner._view(saved, request)
+        self.assertEqual(workspace.artifact_sources.call_count, 1)
+        self.assertEqual([view[key][0]['provenance']['record'] for key in ('targets', 'evidence')], ['a', 'b'])
+
+        workspace.artifact_sources.reset_mock()
+        saved['evidence'] = [row('evidence', 'draft', 'b')]
+        view = owner._view(saved, request)
+        self.assertEqual(workspace.artifact_sources.call_count, 2)
+        self.assertEqual([view[key][0]['provenance']['record'] for key in ('targets', 'evidence')], ['a', 'b'])
+
+        saved['evidence'] = [row('evidence', 'unavailable', 'b')]
+        view = owner._view(saved, request)
+        self.assertEqual(view['targets'][0]['provenance']['record'], 'a')
+        self.assertEqual(view['evidence'][0]['provenance']['status'], 'unknown')
+
     def test_inspection_history_projects_selected_owner_values_without_replaying_offers(self):
         from simple_ar.tools.inspection import InspectionToolGateway
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
