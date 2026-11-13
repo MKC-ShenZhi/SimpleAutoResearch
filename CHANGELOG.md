@@ -13,6 +13,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
+- Continuing work can find the last complete retained delivery in shared and professional work views. Review history navigation avoids duplicated detail while retaining the original records.
 - Working-memory compaction omits duplicate provider reasoning metadata while retaining the original records.
 - When a new ordinary task cannot afford another decision, it can perform one useful action for continuation or submit an actual delivery with the work; independent review and unfinished requirements still follow the recorded result.
 - Merging retained sources shares the existing text capacity across documents; supplied file observations show whether their versions still match. Independent review shares source preparation across compatible targets and evidence.
@@ -20,6 +21,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- Candidate checks distinguish a local investigation from a complete delivery review, so a selected subset is not mistaken for the final inventory. Saved tasks retain their existing contract.
 - Workspace files load independently of slow delivery details, and workspace build logs can be viewed.
 - Reusing retained project files no longer depends on unrelated unknown model charges; the original ledger remains unchanged.
 - Processes can record both versions of an in-place file edit. A later actual edit can replace a failed output while preserving the failure receipt.
