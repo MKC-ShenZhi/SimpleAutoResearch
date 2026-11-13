@@ -131,11 +131,14 @@ class NativeWorkQueueTests(unittest.TestCase):
 
     def test_invalid_tool_json_reports_the_parse_error_without_execution(self):
         c = self.case
-        call = fixture._action('run_process', argv=[sys.executable, '-c',
-            "from pathlib import Path; Path('unexpected').write_text('ran')"])
-        call['function']['arguments'] += '}'
-        c.decisions.append(call)
-        self.drain()
+        c.decisions.append(fixture._action('run_process', argv=[sys.executable, '-c',
+            "from pathlib import Path; Path('unexpected').write_text('ran')"]))
+        def malformed(*args, **kwargs):
+            response = c._provider(*args, **kwargs)
+            response['choices'][0]['message']['tool_calls'][0]['function']['arguments'] += '}'
+            return response
+        with patch.object(c.send, 'side_effect', malformed):
+            self.drain()
         result = c.app.session.store.read_json(c.app.state['turns'][-1]['tools'][-1]['result'])
         self.assertEqual(result['status'], 'blocked')
         self.assertIn('Extra data', result['error'])
