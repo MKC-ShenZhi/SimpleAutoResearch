@@ -2545,6 +2545,15 @@ class InspectionToolGateway:
         return facts
 
     @staticmethod
+    def _relevant_execution_sources(saved: dict, facts: dict[str, dict]) -> set[str]:
+        paths = {path for finding in saved.get('prior_required', []) for path in finding.get('pending_subjects', [])}
+        paths.update(row['path'] for row in saved['targets'] if row.get('path'))
+        paths.update(row['path'] for row in saved.get('evidence', [])
+            if row.get('path') and not row.get('retained_from'))
+        paths.update(saved.get('delivery_context', {}).get('artifacts', {}))
+        return {fact['source_record'] for fact in facts.values() if paths.intersection(fact['dependencies'])}
+
+    @staticmethod
     def _review_execution_names(facts: dict[str, dict]) -> dict[str, str]:
         """Resolve existing source-action and unambiguous process receipt locators."""
         names = {fact['source_record']:record for record, fact in facts.items()}
@@ -3470,13 +3479,10 @@ class InspectionToolGateway:
             if row['result'].get('tool_name') in {'run_process', 'inspect_images'}]
             if continuity and saved.get('inspection_material_policy') in _WORK_MATERIAL_POLICIES else [])
         if execution_facts is not None:
-            pending = {path for finding in saved['prior_required'] for path in finding['pending_subjects']}
             if saved.get('source_priming_policy') == 'priority.v3':
-                relevant = pending | {row['path'] for row in saved['targets'] if row.get('path')}
-                relevant.update(saved.get('delivery_context', {}).get('artifacts', {}))
-                selected_records.extend(fact['source_record'] for fact in execution_facts.values()
-                    if relevant.intersection(fact['dependencies']))
+                selected_records.extend(self._relevant_execution_sources(saved, execution_facts))
             else:
+                pending = {path for finding in saved['prior_required'] for path in finding['pending_subjects']}
                 selected_records.extend(fact['source_record'] for fact in execution_facts.values()
                     if fact['inspection'] != saved['identity']
                     or pending.intersection(fact['dependencies']))
@@ -3985,6 +3991,8 @@ class InspectionToolGateway:
             if execution_facts is None:
                 execution_facts = self._execution_facts(saved, retained=parents)
             facts = {value['source_record']:record for record,value in execution_facts.items()}
+            relevant = (self._relevant_execution_sources(saved, execution_facts)
+                if saved.get('source_priming_policy') == 'priority.v3' else None)
             for parent in parents:
                 observations.extend({'record':row['record'],
                     'kind':'operation_result', 'role':'historical_observation',
@@ -3993,7 +4001,8 @@ class InspectionToolGateway:
                         'scope':'Original independent outcome, not an adopted opinion or current file body. '
                             'A missing execution_record means diagnostic history only.'}, ensure_ascii=False)}
                     for row in self._conversation_rows(parent)
-                    if row['result'].get('tool_name') not in {'read_file', 'assistant_reply', 'record_inspection'})
+                    if row['result'].get('tool_name') not in {'read_file', 'assistant_reply', 'record_inspection'}
+                    and (relevant is None or row['record'] in relevant))
         return memory, observations, rows
 
     def _prepare_conversation_round(self, saved, request, messages, tools, terminal, finish,

@@ -79,6 +79,18 @@ class NativeWorkProjectionTests(unittest.TestCase):
         self.assertEqual(parent['evidence'][1]['windows'], [window])
         self.assertEqual(remaining[0], 80)
 
+    def test_prior_executions_are_selected_for_current_artifacts_and_open_findings(self):
+        from simple_ar.tools.inspection import InspectionToolGateway
+        saved = {'targets': [{'path': 'target.txt'}],
+            'evidence': [{'path': 'paper.pdf'}, {'path': 'other.txt', 'retained_from': {'inspection': 'old'}}],
+            'delivery_context': {'artifacts': {'output.txt': 'version'}},
+            'prior_required': [{'pending_subjects': ['open.txt']}]}
+        facts = {name: {'source_record': name, 'dependencies': {path: 'version'}}
+            for name, path in (('target', 'target.txt'), ('output', 'output.txt'),
+                               ('open', 'open.txt'), ('paper', 'paper.pdf'), ('other', 'other.txt'))}
+        self.assertEqual(InspectionToolGateway._relevant_execution_sources(saved, facts),
+                         {'target', 'output', 'open', 'paper'})
+
     def test_units_keep_statements_arguments_results_and_feedback_order_without_double_encoding(self):
         original = [{'role':'system', 'content':'Original permissions'},
             {'role':'user', 'content':json.dumps({'work_plan':{'old':'fallible'}})},
