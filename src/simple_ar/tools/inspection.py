@@ -63,6 +63,11 @@ class _RetainedInspectionHistory(_InspectionHistory):
         description='An explicitly supplied retained inspection ID; omit for this inspection. Read-only original history.')
 
 
+class _ProvidedInspectionHistory(_RetainedInspectionHistory):
+    field: Literal['result', 'arguments', 'provided'] = Field(default='result',
+        description='Retained result or arguments; provided selects an initially supplied source window by its index.')
+
+
 class InspectionRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     goal: str = Field(min_length=1)
@@ -3751,13 +3756,26 @@ class InspectionToolGateway:
                            if receipts else {})})
         return actions
 
+    def _provided_sources(self, saved: dict, trace: dict):
+        """Windows actually supplied in the first closed inspection offer."""
+        if saved.get('initial_material_memory') != 'provided.v1':
+            return
+        offer = json.loads(trace['offer']['messages'][1]['content'])
+        initial = self._path(saved['identity'], 'input')
+        for index, entry in enumerate(offer.get('working_view', {}).get('observations', [])):
+            observed = entry['observation']
+            if (entry.get('version_status') == 'matching' and observed.get('kind') == 'source_text'
+                    and observed.get('record') == initial):
+                yield index, observed
+
     def _read_history(self, saved: dict, arguments: dict, *, before_turn: int,
                       read_limit: int | None = None) -> ToolResult:
         """Project navigation or a selected semantic value from validated own receipts."""
         if not self._history_enabled(saved):
             raise ValueError('Inspection history was not offered by this saved contract')
+        provided = saved.get('initial_material_memory') == 'provided.v1'
         if saved.get('inspection_material_policy') == 'operations.v3':
-            selection = _RetainedInspectionHistory.model_validate(arguments)
+            selection = (_ProvidedInspectionHistory if provided else _RetainedInspectionHistory).model_validate(arguments)
             if selection.inspection is not None and selection.inspection != saved['identity']:
                 prior = {item['identity']:item for item in self._retained_inputs(saved)}
                 if selection.inspection not in prior:
@@ -3766,7 +3784,7 @@ class InspectionToolGateway:
                 return self._read_history(old, selection.model_dump(exclude={'inspection'}),
                     before_turn=len(old.get('source_rounds', [])), read_limit=read_limit)
             arguments = selection.model_dump(exclude={'inspection'})
-        page = _InspectionHistory.model_validate(arguments)
+        page = (_ProvidedInspectionHistory if provided else _InspectionHistory).model_validate(arguments)
         if read_limit is not None and (type(read_limit) is not int or read_limit <= 0):
             raise ValueError('History read capacity must be a positive integer')
         total = min(before_turn, len(saved.get('source_rounds', [])))
@@ -3796,6 +3814,10 @@ class InspectionToolGateway:
                         'original_arguments':record+f'#results/{index}/arguments'})
                 if not trace['results']:
                     actions.append({'action':0, 'tool':'assistant_reply', 'result':record+'#response'})
+                if number == 0 and provided:
+                    actions.extend({'action':index, 'field':'provided', 'tool':'provided_source',
+                        'path':source['path'], 'result':record+f'#provided/{index}'}
+                        for index, source in self._provided_sources(saved, trace))
                 entries.append({'turn':number, 'record':record, 'sha256':saved['source_rounds'][number], 'actions':actions})
             value = entries
             binding = {'projection':'navigation_index', 'scope':'Derived navigation; previews are incomplete '
@@ -3803,7 +3825,13 @@ class InspectionToolGateway:
                 'read the retained semantic value.'}
         else:
             trace = self._history_round(saved, page.start_turn)
-            if trace['results']:
+            if page.field == 'provided':
+                sources = dict(self._provided_sources(saved, trace)) if page.start_turn == 0 else {}
+                if page.action not in sources:
+                    raise ValueError('Selected initial source window is absent')
+                receipt, relation, value = None, 'round_only', sources[page.action]
+                pointer = f'/offer/messages/1/content#/working_view/observations/{page.action}/observation'
+            elif trace['results']:
                 if page.action >= len(trace['results']):
                     raise ValueError('Selected history action is outside this round')
                 row = trace['results'][page.action]
@@ -3860,13 +3888,7 @@ class InspectionToolGateway:
                 # The first offer is an actual model input, not a tool call.
                 # Give its supplied source windows the same checkpoint owner as
                 # later reads, while retaining their original offer and bytes.
-                offer = json.loads(trace['offer']['messages'][1]['content'])
-                initial = self._path(saved['identity'], 'input')
-                for index, entry in enumerate(offer.get('working_view', {}).get('observations', [])):
-                    observed = entry['observation']
-                    if (entry.get('version_status') != 'matching' or observed.get('kind') != 'source_text'
-                            or observed.get('record') != initial):
-                        continue
+                for index, observed in self._provided_sources(saved, trace):
                     data = {key: observed[key] for key in ('subject', 'path', 'sha256', 'offset_bytes',
                         'next_offset_bytes', 'size_bytes', 'text') if key in observed}
                     for key in ('offset_bytes', 'next_offset_bytes'):
@@ -4814,14 +4836,19 @@ class InspectionToolGateway:
             for spec in workspace_tool_specs() if spec.name in read_names]
         if self._history_enabled(saved):
             read_names.add('read_history')
+            provided = saved.get('initial_material_memory') == 'provided.v1'
+            history_schema = (_ProvidedInspectionHistory if provided else _RetainedInspectionHistory
+                if saved.get('inspection_material_policy') == 'operations.v3' else _InspectionHistory)
             tools.append({'type':'function', 'function':{'name':'read_history',
-                'description':'Navigate compact own turn/action indexes; omit action and pin end_turn while paging. '
+                'description':('Navigate compact own turn/action indexes; omit action and pin end_turn while paging. '
                     'Select start_turn and action for the retained result, or field=arguments for retained arguments. '
-                    'Continue the same selection at next_offset_bytes. Returned text is a canonical JSON projection '
-                    'with original round/receipt/action hashes and JSON pointer; no offers are replayed. '
-                    'Historical observations grant no current evidence, permission or repeated execution.',
-                'parameters':(_RetainedInspectionHistory if saved.get('inspection_material_policy') == 'operations.v3'
-                    else _InspectionHistory).model_json_schema()}})
+                    + ('For an initial source window listed in the index, select start_turn=0, its action, '
+                       'and field=provided to reread the originally supplied window. ' if provided else '')
+                    + 'Continue the same selection at next_offset_bytes. Returned text is a canonical JSON projection '
+                    + ('with original round/receipt/action hashes and JSON pointer; '
+                       + ('' if provided else 'no offers are replayed. '))
+                    + 'Historical observations grant no current evidence, permission or repeated execution.'),
+                'parameters':history_schema.model_json_schema()}})
         package = self._delivery_scope(saved)
         response_model = ((self._claim_response_model(saved) if saved.get('work_method') in CLAIM_WORK_METHODS else
                            _ScopedDeliveryResponse if saved.get('work_method') in NATIVE_WORK_METHODS else

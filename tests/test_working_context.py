@@ -216,7 +216,8 @@ class WorkingContextTests(unittest.TestCase):
 
         owner = InspectionToolGateway.__new__(InspectionToolGateway)
         saved = {'identity': 'initial-source', 'source_rounds': ['closed'],
-                 'initial_material_memory': 'provided.v1', 'native_supply_policy': TURN_SUPPLY_POLICY}
+                 'initial_material_memory': 'provided.v1', 'native_supply_policy': TURN_SUPPLY_POLICY,
+                 'inspection_history_policy': 'receipts.v1', 'inspection_material_policy': 'operations.v3'}
         offered = {'record': owner._path(saved['identity'], 'input'), 'kind': 'source_text',
             'subject': 'evidence-1', 'path': '/source/result.txt', 'sha256': 'a' * 64,
             'offset_bytes': 0, 'next_offset_bytes': 7, 'size_bytes': 7, 'text': 'Result.'}
@@ -233,6 +234,18 @@ class WorkingContextTests(unittest.TestCase):
                                               if key != 'initial_material_memory'})
         self.assertEqual(len(legacy), 1)
         self.assertEqual(rows[0]['result']['tool_name'], 'provided_source')
+        with patch.object(owner, '_history_round', return_value=trace):
+            index = json.loads(owner._read_history(saved, {}, before_turn=1).data['text'])
+            provided = next(item for item in index[0]['actions'] if item['tool'] == 'provided_source')
+            self.assertEqual((provided['field'], provided['action']), ('provided', 0))
+            page = owner._read_history(saved, {'action': 0, 'field': 'provided'}, before_turn=1).data
+            self.assertEqual(json.loads(page['text']), offered)
+            self.assertEqual(page['field'], 'provided')
+            with self.assertRaisesRegex(ValueError, 'absent'):
+                owner._read_history(saved, {'action': 1, 'field': 'provided'}, before_turn=1)
+            with self.assertRaises(ValueError):
+                owner._read_history({key: value for key, value in saved.items()
+                    if key != 'initial_material_memory'}, {'action': 0, 'field': 'provided'}, before_turn=1)
         previous = {'notes': [], 'compacted_records': set()}
         view = prepare_checkpoint_input(requests=['Check the result'], previous=previous, rows=rows,
             target=30000, estimate_tokens=len, native_supply_policy=TURN_SUPPLY_POLICY)
