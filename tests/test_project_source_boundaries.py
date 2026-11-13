@@ -50,19 +50,21 @@ class ProjectSourceBoundaryTests(unittest.TestCase):
             outcome = first.run(actions=first_actions, approve=lambda *_: True, progress=lambda _: None)
             self.assertEqual(outcome['status'], 'completed', outcome)
             selected = select_reuse(first.session.store.root, ['code_project'])
-            project = selected.project[0]
-            self.assertEqual((project / 'first-result.txt').read_text(), '2.0')
+            self.assertEqual(selected.version, 1)
+            original = first.workspace.workspace / 'published'
+            self.assertEqual((original / 'first-result.txt').read_text(), '2.0')
 
             second = ToolApplication.create(Path(folder) / 'second', 'Apply the retained method to new data',
-                model=None, sources={'source0': project}, allow_execution=True,
+                model=None, sources={}, creation_declarations={'reuse_origin': selected.origin}, allow_execution=True,
                 process_limits={'process_invocations': 2, 'process_wall_seconds': 20})
-            denied = second.workspace.call('write_file', {'path': 'source0/skills/mean/SKILL.md',
+            project = 'retained_delivery/workspace/published'
+            denied = second.workspace.call('write_file', {'path': f'{project}/skills/mean/SKILL.md',
                 'content': 'unapproved'}, identity='source-write')
             self.assertEqual(denied.status, 'blocked')
             second_actions = [
-                {'tool_name': 'inspect_project', 'arguments': {'path': 'source0'}},
-                {'tool_name': 'read_file', 'arguments': {'path': 'source0/skills/mean/SKILL.md'}},
-                {'tool_name': 'copy_project', 'arguments': {'source': 'source0', 'path': 'work'}},
+                {'tool_name': 'inspect_project', 'arguments': {'path': project}},
+                {'tool_name': 'read_file', 'arguments': {'path': f'{project}/skills/mean/SKILL.md'}},
+                {'tool_name': 'copy_project', 'arguments': {'source': project, 'path': 'work'}},
                 {'tool_name': 'write_file', 'arguments': {'path': 'work/second.txt', 'content': '2 4 9\n'}},
                 {'tool_name': 'run_process', 'arguments': {'cwd': 'work',
                     'argv': ['python', 'skills/mean/mean.py', 'second.txt', 'second-result.txt'],
@@ -81,7 +83,7 @@ class ProjectSourceBoundaryTests(unittest.TestCase):
             observed = next(row for row in results if row['tool_name'] == 'read_file')
             self.assertEqual(observed['data']['text'], method)
             self.assertEqual((second.workspace.workspace / 'work/second-result.txt').read_text(), '5.0')
-            self.assertEqual((project / 'skills/mean/SKILL.md').read_text(), method)
+            self.assertEqual((original / 'skills/mean/SKILL.md').read_text(), method)
 
     def test_workspace_keeps_dotenv_private_while_code_task_keeps_examples(self):
         from simple_ar.tools.workspace import WorkspaceToolGateway, resolve_source_mount
