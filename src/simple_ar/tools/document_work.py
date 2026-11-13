@@ -389,7 +389,8 @@ class DocumentWorkToolGateway:
             if Path(path).suffix.lower() != '.json' or files[path] > 8_000_000:
                 continue
             try:
-                original = self.workspace.resolve_source_record(path)
+                original = (self.sources.resolve_source_handoff(path) if self.sources is not None
+                    else self.workspace.resolve_source_record(path))
             except ValueError:
                 continue
             before = self.workspace.artifact_hashes([str(original)])[str(original)]
@@ -822,8 +823,10 @@ class DocumentWorkToolGateway:
                 feedback.append({'status': 'not_read', 'request': window.model_dump(exclude_unset=True), 'error': str(exc)})
         for query in decision.source_queries:
             try:
-                path = str(self.workspace.resolve_source_record(query.document_record))
-                if path not in source_views or self.sources is None:
+                if self.sources is None:
+                    raise ValueError('Query requires the existing source owner')
+                path = str(self.sources.resolve_source_handoff(query.document_record))
+                if path not in source_views:
                     raise ValueError('Query only inventoried original bundles through the existing source owner')
                 arguments = query.model_dump(mode='json')
                 key = _digest({**arguments, 'document_record': path})
@@ -831,7 +834,7 @@ class DocumentWorkToolGateway:
                     if not cumulative_capacity:
                         row = next(row for row in observations if row['kind'] == 'source_passages'
                             and _digest({**row['request'], 'document_record':str(
-                                self.workspace.resolve_source_record(row['request']['document_record']))}) == key)
+                                self.sources.resolve_source_handoff(row['request']['document_record']))}) == key)
                         feedback.append({'status': 'recalled', 'id': row['id']})
                         continue
                     raise ValueError('This exact source query was already observed')
@@ -908,7 +911,8 @@ class DocumentWorkToolGateway:
             if row['kind'] == 'material_window':
                 validate_material_observation(self.workspace, row['observation'], identity=identity)
             elif row['kind'] == 'source_passages':
-                path = self.workspace.resolve_source_record(row['request']['document_record'])
+                path = (self.sources.resolve_source_handoff(row['request']['document_record'])
+                    if self.sources is not None else self.workspace.resolve_source_record(row['request']['document_record']))
                 digest = self.workspace.artifact_hashes([str(path)])[str(path)]
                 if digest != row['data']['document_sha256']:
                     raise ValueError('Selected original source changed')

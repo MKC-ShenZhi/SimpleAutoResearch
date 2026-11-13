@@ -419,6 +419,55 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertIn('changed', stale.error.lower())
         self.assertEqual(len(clients[0].calls), 2)
 
+    def test_research_source_handoff_remains_readable_through_document_work(self):
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+
+        root, source, ledger, workspace = self.workspace()
+        (source / 'paper.txt').write_text(
+            '# Results\nCalibration depends on the observed population.\n', encoding='utf-8')
+        sources = SourceToolGateway(root, workspace, ledger)
+        context = CapabilityContext(ArtifactStore(root / 'attempts' / 'ingest'),
+            AttemptManifest('ingest', capability='native_tool'))
+        ingested = sources.execute_tool('research', context,
+            {'operation': 'ingest', 'question': 'What affects calibration?',
+             'materials': ['source0/paper.txt']})
+        self.assertTrue(ingested.ok, ingested.error)
+        locator = ingested.data['document_record']
+        lookup = sources.call('find_source_passages',
+            {'document_record': locator, 'query': 'calibration population'}, identity='lookup')
+        self.assertTrue(lookup.ok, lookup.error)
+        self.assertIn('observed population', lookup.data['matches'][0]['text'])
+        retained = sources.retained_passages([{'data': lookup.data, 'turn': 1,
+            'record': 'records/lookup/native_result.json'}], before_turn=2)
+        self.assertEqual(retained[0]['passage'], lookup.data['matches'][0])
+
+        def decide(view, count):
+            self.assertEqual(len(view['original_source_bundles']), 1)
+            if count == 1:
+                return {'action': 'investigate', 'source_queries': [
+                    {'document_record': locator, 'query': 'calibration population'}]}
+            self.assertIn('observed population', view['observations'][0]['data']['matches'][0]['text'])
+            return {'action': 'finish', 'selected_observation_ids': ['o1'],
+                'manuscript_markdown': '# Result\nCalibration depends on the observed population.\n'}
+
+        writer, clients = self.gateway(root, source, ledger, workspace, decide, sources=sources)
+        args = {'goal': 'Explain the supplied paper', 'material_roots': [locator]}
+        result = writer.call('work_document', args, identity='source-work')
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.data['provenance']['evidence'][0]['kind'], 'source_passages')
+        self.assertEqual(len(clients[0].calls), 2)
+
+        generated = workspace.workspace / 'invented-bundle.json'
+        generated.write_bytes(workspace.resolve(locator).read_bytes())
+        blocked = sources.call('find_source_passages',
+            {'document_record': 'workspace/invented-bundle.json'}, identity='unbound')
+        self.assertFalse(blocked.ok)
+        workspace.resolve(locator).write_text('{}', encoding='utf-8')
+        self.assertFalse(sources.call('find_source_passages',
+            {'document_record': locator}, identity='changed').ok)
+        self.assertFalse(writer.call('work_document', args, identity='source-work').ok)
+        self.assertEqual(len(clients[0].calls), 2)
+
     def test_candidate_recovers_after_interrupted_write_without_another_model_call(self):
         root, source, ledger, workspace = self.workspace()
         asset = source / 'figure.png'

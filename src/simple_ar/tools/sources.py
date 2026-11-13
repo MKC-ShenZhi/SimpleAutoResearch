@@ -141,7 +141,7 @@ class _Acquire(BaseModel):
 
 class _Passages(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    document_record: str = Field(description="DocumentBundle record in saved evidence or a supplied read-only source mount.")
+    document_record: str = Field(description="DocumentBundle record returned by research or acquisition, or supplied in a read-only source mount.")
     query: str = Field(default="", max_length=2000,
         description="Question for lexical passage lookup; omit to inspect source identity and retained-text coverage without reading the full JSON.")
     limit: int = Field(default=5, ge=1, le=8)
@@ -297,11 +297,11 @@ class SourceToolGateway:
             if location not in digests:
                 digests[location] = None
                 try:
-                    path = self.workspace.resolve_source_record(location)
+                    path = self.resolve_source_handoff(location)
                     if path == Path(location) and path.is_file() and path.stat().st_size <= 64 * 1024 * 1024:
                         with path.open('rb') as handle:
                             digest = hashlib.file_digest(handle, 'sha256').hexdigest()
-                        if self.workspace.resolve_source_record(location) == path:
+                        if self.resolve_source_handoff(location) == path:
                             digests[location] = digest
                 except (ValueError, KeyError, OSError, RuntimeError):
                     pass
@@ -357,7 +357,7 @@ class SourceToolGateway:
                 raise ValueError('Unknown source operation')
             if name == "find_source_passages":
                 request = _Passages.model_validate(arguments)
-                path = self.workspace.resolve_source_record(request.document_record)
+                path = self.resolve_source_handoff(request.document_record)
                 raw = path.read_bytes()
                 bundle = DocumentBundle.from_handoff_dict(json.loads(raw))
                 identity = {
@@ -381,7 +381,7 @@ class SourceToolGateway:
                         "matches": source_chunk_views(selected, query=request.query, max_chars=request.max_chars),
                         "selected_chunks": len(selected),
                         "scope": "Lexical lookup in retained text; not full reading or proof of absence"}
-                current = self.workspace.resolve_source_record(request.document_record)
+                current = self.resolve_source_handoff(request.document_record)
                 if current != path or current.read_bytes() != raw:
                     raise ValueError('Source record changed during passage selection')
                 return ToolResult(tool_name=name, data=data)
@@ -548,14 +548,22 @@ class SourceToolGateway:
                 raise ValueError('Material must be a bounded authorized file')
         return paths
 
-    def _handoff(self, locator: str, schema: str) -> dict[str, Any]:
-        path = self.workspace.resolve(locator)
-        if path.is_relative_to((self.root / 'attempts').resolve()):
-            receipt = json.loads((path.parent / 'source_result.json').read_text(encoding='utf-8'))
+    def resolve_source_handoff(self, locator: str) -> Path:
+        """Resolve a supplied source or an output bound by this source owner."""
+        try:
+            return self.workspace.resolve_source_record(locator)
+        except ValueError as original_error:
+            path = self.workspace.resolve(locator)
+            receipt_path = path.parent / 'source_result.json'
+            if not path.is_relative_to((self.root / 'attempts').resolve()) or not receipt_path.is_file():
+                raise original_error
+            receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
             if receipt['hashes'].get(str(path)) != self._digest(path):
                 raise ValueError('Research handoff changed since its bound result')
-        else:
-            self.workspace.resolve_source_record(locator)
+            return path
+
+    def _handoff(self, locator: str, schema: str) -> dict[str, Any]:
+        path = self.resolve_source_handoff(locator)
         if path.stat().st_size > 64 * 1024 * 1024:
             raise ValueError('Research handoff exceeds bounded input size')
         data = json.loads(path.read_text(encoding='utf-8'))

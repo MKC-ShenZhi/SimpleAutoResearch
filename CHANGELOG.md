@@ -11,6 +11,10 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 - New tasks keep reused delivery files and completed review evidence accessible without automatically treating the entire previous delivery as new work. Actionable review findings retain their supporting observations.
 
+### Fixed
+
+- Research source bundles produced from supplied documents can be queried and passed to document work through the same source owner.
+
 ## 2026-11-13
 
 ### Added
