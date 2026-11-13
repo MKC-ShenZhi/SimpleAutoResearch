@@ -669,9 +669,10 @@ class InspectionWorkingContinuityTests(unittest.TestCase):
             with patch.object(resumed, '_conversation_material', return_value=(carried, [provided], [source])), \
                     patch.object(resumed, '_native_source_supply', side_effect=add_navigation), \
                     patch('simple_ar.core.working_context.fit_working_context', side_effect=count_selection):
-                _, supply = resumed._working_messages(updated, request, history, [], client)
+                messages, supply = resumed._working_messages(updated, request, history, [], client)
             self.assertEqual(selected_sizes, [1])
             self.assertFalse(any(row['source'].get('kind') == 'source_text' for row in supply['selected_records']))
+            self.assertIn('field=result, arguments or provided', json.loads(messages[1]['content'])['history_archive']['scope'])
 
             # A historical started inspection remains historical even under a
             # freshly configured integrated gateway. Its immutable input wins.

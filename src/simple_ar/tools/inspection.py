@@ -3474,6 +3474,9 @@ class InspectionToolGateway:
             if saved.get('inspection_material_policy') == 'operations.v3':
                 base['history_archive']['scope'] = base['history_archive']['scope'].replace(
                     'of this inspection only', 'of the selected inspection (default: this inspection)')
+            if saved.get('initial_material_memory') == 'provided.v1':
+                base['history_archive']['scope'] = base['history_archive']['scope'].replace(
+                    'field=result or arguments ', 'field=result, arguments or provided ')
         base['reading_scope'] = ('Only the supplied decoded windows were observed. Retired source bodies '
             'remain in the original inspection records; ' + (
                 'use read_history for original observations, including failures and unread tails. Read an '
