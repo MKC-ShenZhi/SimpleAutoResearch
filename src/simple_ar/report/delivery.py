@@ -285,8 +285,9 @@ class Delivery:
         if self.config.get('delivery_review_protocol') not in {'task.v4', 'task.v5'}:
             try:
                 conversion_inputs = self.publication.conversion_inputs(observations, resolved['artifacts'])
-                self.workspace.check_artifact_producers(path for path in resolved['artifacts']
-                    if self.workspace.resolve(path) not in conversion_inputs)
+                self.workspace.check_artifact_producers((path for path in resolved['artifacts']
+                    if self.workspace.resolve(path) not in conversion_inputs),
+                    allow_authored_replacement=False)
             except (ValueError, OSError, KeyError, RuntimeError) as exc:
                 issues.append(str(exc))
         from simple_ar.tools.workspace import missing_delivery_files

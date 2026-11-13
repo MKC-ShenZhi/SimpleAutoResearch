@@ -1672,6 +1672,7 @@ class WorkspaceToolGateway:
 
     def check_artifact_producers(self, locators: Iterable[str], *, cache: dict | None = None,
                                  refresh: bool = False,
+                                 allow_authored_replacement: bool = True,
                                  retained_versions: dict[Path, str] | None = None,
                                  retained_history: list[dict] | None = None,
                                  producer_index_cache: dict | None = None,
@@ -1683,6 +1684,8 @@ class WorkspaceToolGateway:
         failed runs. A later successful explicit run can supersede an older one.
         Each requested output must match its owner; process success and complete
         output binding still apply to the whole invocation.
+        Explicit later edits are new work, not proof that a process produced them;
+        older delivery contracts may retain their original path-owner gate.
         Retained delivery instead follows version edges at their record boundary;
         it never reduces past ownership to the latest path owner.
         """
@@ -1739,18 +1742,18 @@ class WorkspaceToolGateway:
         def check(path: Path) -> None:
             if producer_index_cache is not None:
                 producer_index_cache.setdefault('observed', set()).add(path)
-            if path in visited or path in checked_paths or path in visiting or path not in producers:
+            if (path in visited or path in checked_paths or path in visiting or path not in producers
+                    or allow_authored_replacement and path in cache.get('superseded', ())):
                 return
             try:
                 check_owner(path)
             except ValueError:
-                if not authored_after_process(path):
+                if not allow_authored_replacement or not authored_after_process(path):
                     raise
                 cache.setdefault('superseded', set()).add(path)
-                checked_paths.add(path)
 
         def check_owner(path: Path) -> None:
-            _, record, binding, receipt = producers[path]
+            _, record, binding = producers[path]
             if record is None:
                 raise ValueError(f'Ambiguous producer timestamps for {path.name}; no current publication')
             owner = (id(record), id(binding))
@@ -1760,8 +1763,7 @@ class WorkspaceToolGateway:
             if outputs is None:
                 raise ValueError(f'Declared producer has no successful output binding: {path.name}; inspect receipt, no replay')
             if owner not in checked_records:
-                self._check_process_inputs(binding, identity=record['invocation_id'],
-                    completed_outputs=(outputs if receipt.parent.name == record['invocation_id'] else None))
+                self._check_process_inputs(binding, identity=record['invocation_id'])
             owned_outputs = {name: digest for name, digest in outputs.items()
                              if resolve_mounted_path(self.mounts, name, discovery=True) == path}
             if not owned_outputs:
@@ -1823,7 +1825,7 @@ class WorkspaceToolGateway:
             path = self.resolve(name)
             entry = None if path in cache.get('superseded', ()) else producers.get(path)
             if entry is not None:
-                _, record, binding, _ = entry
+                _, record, binding = entry
                 identity = record['invocation_id']
                 if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
                     raise ValueError('Invalid registered producer identity')
@@ -2159,16 +2161,16 @@ class WorkspaceToolGateway:
 
     def _artifact_producers(self, directory: Path) -> dict:
         producers = {}
-        for receipt, record, binding, _, _ in self._artifact_producer_records(directory):
+        for _, record, binding, _, _ in self._artifact_producer_records(directory):
             order = record.get('started_at', '')
             for locator in binding['outputs']:
                 path = resolve_mounted_path(self.mounts, locator, write=True, discovery=True)
                 if path not in producers or order > producers[path][0]:
-                    producers[path] = (order, record, binding, receipt)
+                    producers[path] = (order, record, binding)
                 elif order == producers[path][0]:
                     # Wall-clock precision is not a causal ordering guarantee.
                     # Never let an invocation name break a provenance tie.
-                    producers[path] = (order, None, None, None)
+                    producers[path] = (order, None, None)
         return producers
 
     def _artifact_producer_records(self, directory: Path, *, reader: RetainedDelivery | None = None

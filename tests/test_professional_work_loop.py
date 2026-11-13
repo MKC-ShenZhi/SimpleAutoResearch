@@ -151,7 +151,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(_action('edit_file', path='draft.md', expected_sha256=observed['sha256'],
             old_text='partially written', new_text='corrected'))
         self._ok('edit_file')
-        self.app.workspace.check_artifact_producers(['draft.md'])
+        checked = {}
+        self.app.workspace.check_artifact_producers(['draft.md'], cache=checked)
+        self.assertNotIn(self.app.workspace.resolve('draft.md'), checked['checked'])
         self.assertIsNone(self.app.workspace.artifact_provenance(['draft.md'])['draft.md']['producer'])
         self.assertEqual(receipt.read_bytes(), original_receipt)
 
@@ -5875,7 +5877,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         final_budget = self.app.session.store.read_json(str(
             Path(self.app.state['turns'][-1]['reply']).with_name('decision_budget.json')))
         self.assertTrue(final_budget['closing_required'])
-        self.assertEqual(final_budget['closing_action_contract'], 'lifecycle_step.v1')
+        self.assertEqual(final_budget['closing_action_contract'], 'single_terminal.v1')
         self.assertEqual(self.app.ledger.limits, limits)
         entries = [entry.to_dict() for entry in self.app.ledger.entries]
         self.assertEqual(entries[:len(charged)], charged)

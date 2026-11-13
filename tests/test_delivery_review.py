@@ -2163,8 +2163,7 @@ class IndependentDeliveryApplicabilityTests(unittest.TestCase):
         self.assertEqual(proof['binding']['artifacts'], operations.workspace.artifact_hashes(
             [str(operations.workspace.resolve('note.md'))]))
         self.assertFalse((self.case.root/'tools/publications').exists())
-        with self.assertRaisesRegex(ValueError, 'outputs changed'):
-            operations.workspace.check_artifact_producers(['note.md'])
+        self.assertIsNone(operations.workspace.artifact_provenance(['note.md'])['note.md']['producer'])
         # A changed current version cannot reuse the independent opinion.
         (self.case.root/'workspace/note.md').write_text('Another revision.\n', encoding='utf-8')
         self.assertTrue(operations.delivery.issues(self.case.app._operation_observations(), delivery))
