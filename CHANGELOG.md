@@ -16,7 +16,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - Working-memory compaction omits duplicate provider reasoning metadata while retaining the original records.
 - When a new ordinary task cannot afford another decision, an authorized final operation can submit its actual delivery with the work; independent review and unfinished requirements still follow the recorded result.
 - Merging retained sources shares the existing text capacity across documents; supplied file observations show whether their versions still match. Independent review shares source preparation across compatible targets and evidence.
-- Independent review can cite its successful process receipts directly, identify checks from command previews and correct missing or unavailable execution references.
+- Independent review can cite successful process receipts directly, retain applicable execution results across review turns and correct missing or unavailable execution references.
 
 ### Fixed
 

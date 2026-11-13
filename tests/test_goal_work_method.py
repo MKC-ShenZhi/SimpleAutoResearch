@@ -1553,7 +1553,10 @@ class GoalWorkTests(unittest.TestCase):
         case = self.case
         case._write('claim.md', 'The sample mean is 2.0.\n')
         reject = True
+        read_after_handoff = False
+        retained_after_read = False
         def review(view):
+            nonlocal read_after_handoff, retained_after_read
             if not view.get('executed_checks'):
                 functions = {tool['function']['name']:tool['function']
                     for tool in case.inspection_requests[-1]['tools']}
@@ -1564,6 +1567,14 @@ class GoalWorkTests(unittest.TestCase):
                         "csv.DictReader(open(sys.argv[1]))]; print('INDEPENDENT_MEAN',sum(v)/len(v))",
                         str(case.inputs/'observations.csv')], inputs=['measurements/observations.csv'],
                     timeout_sec=5)]
+            if not reject and not read_after_handoff:
+                read_after_handoff = True
+                return [_action('read_file', path='claim.md')]
+            if read_after_handoff and not retained_after_read:
+                observations = view['working_view']['observations']
+                self.assertTrue(any('INDEPENDENT_MEAN 2.0' in row['observation'].get('text', '')
+                    for row in observations))
+                retained_after_read = True
             sources = case._inspection_sources(view, 'measurements/observations.csv', 'claim.md')
             missing = [_action('read_file', path=path) for path,source in
                 zip(('measurements/observations.csv', 'claim.md'), sources) if source is None]
@@ -1598,6 +1609,7 @@ class GoalWorkTests(unittest.TestCase):
         case._submit(_action('deliver_result', **claim))
         accepted = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
         self.assertEqual(case.app.session.manifest.status, 'completed', accepted.get('error'))
+        self.assertTrue(retained_after_read)
         self.assertNotEqual(accepted['identity'], failed['identity'])
         self.assertEqual(len(case._process_receipts()), 1)
         self.assertEqual(case.app.ledger.to_dict()['entries'][:len(prefix)], prefix)

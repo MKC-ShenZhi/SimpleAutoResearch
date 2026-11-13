@@ -3433,7 +3433,8 @@ class InspectionToolGateway:
         if execution_facts is not None:
             pending = {path for finding in saved['prior_required'] for path in finding['pending_subjects']}
             selected_records.extend(fact['source_record'] for fact in execution_facts.values()
-                if pending.intersection(fact['dependencies']))
+                if fact['inspection'] != saved['identity']
+                or pending.intersection(fact['dependencies']))
         messages, metadata = fit_working_context(
             measure_input=lambda value: estimate_native_input_tokens(client, value, offered),
             context_authority=saved.get('context_authority'),
