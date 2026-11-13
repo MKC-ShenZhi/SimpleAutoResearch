@@ -408,7 +408,8 @@ class NativeWorkQueueTests(unittest.TestCase):
         def choose():
             request = c.send.call_args.kwargs.get('request') or c.send.call_args.args[1]
             offered = {row['function']['name']: row['function']['parameters'] for row in request['tools']}
-            self.assertIn('delivery', offered['write_file']['required'])
+            self.assertIn('delivery', offered['write_file']['properties'])
+            self.assertNotIn('delivery', offered['write_file'].get('required', []))
             self.assertIn('deliver_result', offered)
             return fixture._action('deliver_result', **claim,
                 unresolved=['The revised note still needs independent review.'])
@@ -460,7 +461,7 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertEqual((c.root / 'workspace/checked.txt').read_text(), 'Available work.\n')
         turn = next(row for row in c.app.state['turns'] if row.get('origin') != 'caller')
         decision = c.app.session.store.read_json(str(Path(turn['reply']).with_name('decision_budget.json')))
-        self.assertEqual(decision['closing_action_contract'], 'single_terminal.v1')
+        self.assertEqual(decision['closing_action_contract'], 'single_action.v2')
         self.assertIn('run_process', decision['input_projection']['tool_names'])
         self.assertEqual(c.app.session.store.read_json('delivery.json')['unresolved'],
             ['Independent review remains unfinished.'])
