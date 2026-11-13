@@ -2522,13 +2522,23 @@ class InspectionToolGateway:
                     continue
                 facts[row['record']] = {'inspection':parent['identity'], 'dependencies':dependencies,
                     'source_record':row['source_record'], 'argv':row['arguments'].get('argv', []),
-                    'cwd':row['arguments'].get('cwd', 'workspace')}
+                    'cwd':row['arguments'].get('cwd', 'workspace'), 'process_receipt':data.get('receipt')}
         return facts
 
     @staticmethod
     def _review_execution_names(facts: dict[str, dict]) -> dict[str, str]:
-        """Use the inspection's existing source-action locator for each accepted check."""
-        return {fact['source_record']:record for record, fact in facts.items()}
+        """Resolve existing source-action and unambiguous process receipt locators."""
+        names = {fact['source_record']:record for record, fact in facts.items()}
+        receipts: dict[str, str | None] = {}
+        for record, fact in facts.items():
+            receipt = fact.get('process_receipt')
+            if isinstance(receipt, str) and receipt:
+                if receipt not in receipts:
+                    receipts[receipt] = record
+                elif receipts[receipt] != record:
+                    receipts[receipt] = None
+        names.update({receipt:record for receipt, record in receipts.items() if record is not None})
+        return names
 
     def _delivery_assessment(self, saved: dict, receipt: dict, identity: str, failure: str,
                              *, check_versions: bool = True) -> tuple[dict, str]:
@@ -3265,14 +3275,16 @@ class InspectionToolGateway:
                 facts = (execution_facts if execution_facts is not None else
                     self._execution_facts(saved, retained=retained_inputs))
                 names = self._review_execution_names(facts)
-                base['executed_checks'] = sorted(names)
+                visible = {fact['process_receipt'] if names.get(fact.get('process_receipt')) == record
+                           else fact['source_record']:record for record, fact in facts.items()}
+                base['executed_checks'] = sorted(visible)
                 base['executed_check_details'] = {}
                 for name in base['executed_checks']:
-                    fact = facts[names[name]]
-                    command = json.dumps(fact['argv'], ensure_ascii=False)
-                    base['executed_check_details'][name] = {'cwd': fact['cwd'],
+                    fact = facts[visible[name]]
+                    command = json.dumps(fact.get('argv', []), ensure_ascii=False)
+                    base['executed_check_details'][name] = {'cwd': fact.get('cwd', 'workspace'),
                         'argv_preview': command if len(command) <= 320 else command[:160] + '…' + command[-160:]}
-                if names:
+                if visible:
                     base['executed_check_scope'] = ('Commands are previews of the accepted executions, '
                         'not their outputs or proof of a claim. Read the original action for details.')
             else:

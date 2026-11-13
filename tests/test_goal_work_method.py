@@ -155,7 +155,9 @@ class NativeGoalWorkTests(unittest.TestCase):
         owner.workspace = SimpleNamespace(workspace=Path.cwd() / 'workspace')
         execution = 'attempts/native-action-0123456789abcdef/native_result.json'
         source = 'tools/inspection/native-tool-0012/sources-2.json#results/0'
-        owner._execution_facts = lambda *args, **kwargs: {execution: {'source_record': source}}
+        receipt = 'tools/processes/native-action-0123456789abcdef/invocation.json'
+        owner._execution_facts = lambda *args, **kwargs: {
+            execution: {'source_record': source, 'process_receipt': receipt}}
         owner._selected_inspection_rows = lambda *args: []
         owner._check_inspection_versions = lambda *args, **kwargs: None
         artifact = str(owner.workspace.workspace / 'project' / 'report.md')
@@ -192,6 +194,14 @@ class NativeGoalWorkTests(unittest.TestCase):
         self.assertEqual(final['investigations'][0]['execution_records'], [execution])
         self.assertEqual(response['requested_outcomes'][0]['artifacts'], [visible])
         self.assertEqual(response['investigations'][0]['execution_records'], [source])
+        by_receipt = deepcopy(response)
+        by_receipt['investigations'][0]['execution_records'] = [receipt]
+        self.assertEqual(admit(by_receipt)[2]['investigations'][0]['execution_records'], [execution])
+        ambiguous = owner._review_execution_names({
+            'action-1': {'source_record': 'source-1', 'process_receipt': receipt},
+            'action-2': {'source_record': 'source-2', 'process_receipt': receipt}})
+        self.assertNotIn(receipt, ambiguous)
+        self.assertEqual({ambiguous['source-1'], ambiguous['source-2']}, {'action-1', 'action-2'})
 
         # Previously offered absolute names remain valid, but an unlisted
         # short name cannot become a delivered artifact.
@@ -1284,6 +1294,7 @@ class GoalWorkTests(unittest.TestCase):
                     outputs=[work['path'] + '/checked.json'], timeout_sec=5)]
             details = view['executed_check_details']
             self.assertEqual(set(details), set(view['executed_checks']))
+            self.assertTrue(all(record.endswith('/invocation.json') for record in details))
             self.assertEqual(next(iter(details.values()))['cwd'], work['path'])
             self.assertIn('argv_preview', next(iter(details.values())))
             paths = ['measurements/observations.csv', work['path'] + '/checked.json', 'claim.md']
