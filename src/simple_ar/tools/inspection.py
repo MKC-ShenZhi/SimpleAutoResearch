@@ -3864,9 +3864,6 @@ class InspectionToolGateway:
                     'the receipt retains the original owner output and metadata. '
                     'Historical output is not current evidence or permission.')
         raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
-        if json.dumps(json.loads(raw), ensure_ascii=False, sort_keys=True,
-                      separators=(',', ':')).encode('utf-8') != raw:
-            raise ValueError('History projection differs from its retained owner value')
         binding.update(serialization='canonical_json', projection_sha256=hashlib.sha256(raw).hexdigest())
         size = len(raw)
         if page.offset_bytes > size:
