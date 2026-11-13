@@ -647,12 +647,31 @@ class InspectionWorkingContinuityTests(unittest.TestCase):
                     options['work_notes'] = []
                 return fit_working_context(**options)
 
+            def add_navigation(_saved, observations, _blocks):
+                observations.append({'record': path, 'field': 'source_history', 'chunk_id': 'history',
+                    'kind': 'operation_result', 'role': 'source_navigation', 'text': 'available history'})
+                return []
+
             updated = {**saved, 'initial_material_memory': 'provided.v1'}
             with patch.object(resumed, '_conversation_material', return_value=(carried, [provided], [source])), \
+                    patch.object(resumed, '_native_source_supply', side_effect=add_navigation), \
                     patch('simple_ar.core.working_context.fit_working_context', side_effect=omit_note_once):
                 _, supply = resumed._working_messages(updated, request, history, [], client)
-            self.assertEqual(selected_sizes, [0, 1])
+            self.assertEqual(selected_sizes, [1, 2])
             self.assertTrue(any(row['source']['record'] == path for row in supply['selected_records']))
+
+            selected_sizes.clear()
+
+            def count_selection(**options):
+                selected_sizes.append(len(options['observations']))
+                return fit_working_context(**options)
+
+            with patch.object(resumed, '_conversation_material', return_value=(carried, [provided], [source])), \
+                    patch.object(resumed, '_native_source_supply', side_effect=add_navigation), \
+                    patch('simple_ar.core.working_context.fit_working_context', side_effect=count_selection):
+                _, supply = resumed._working_messages(updated, request, history, [], client)
+            self.assertEqual(selected_sizes, [1])
+            self.assertFalse(any(row['source'].get('kind') == 'source_text' for row in supply['selected_records']))
 
             # A historical started inspection remains historical even under a
             # freshly configured integrated gateway. Its immutable input wins.
