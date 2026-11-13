@@ -1471,8 +1471,11 @@ class GoalWorkTests(unittest.TestCase):
         case.app.run(progress=lambda _: None)
         self.assertEqual(case.app.session.manifest.status, 'partial')
         self.assertEqual(case.send.call_count, 1)
-        self.assertEqual({tool['function']['name'] for tool in case.app._closing_schemas()},
-                         {'ask_user', 'deliver_result'})
+        offered = {tool['function']['name']: tool['function']['parameters']
+                   for tool in case.app._closing_schemas()}
+        self.assertTrue({'ask_user', 'deliver_result'} <= set(offered))
+        self.assertNotIn('read_file', offered)
+        self.assertIn('delivery', offered['write_file']['required'])
         context = json.loads(case.app._messages(client=case.app._client(), closing=True,
             schemas=case.app._closing_schemas())[1]['content'])
         self.assertNotIn('work_selection', context)
