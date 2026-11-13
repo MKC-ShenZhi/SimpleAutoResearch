@@ -15,7 +15,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 - Working-memory compaction omits duplicate provider reasoning metadata while retaining the original records.
 - When a new ordinary task cannot afford another decision, an authorized final operation can submit its actual delivery with the work; independent review and unfinished requirements still follow the recorded result.
-- Merging retained sources shares the existing text capacity across documents; supplied file observations show whether their versions still match.
+- Merging retained sources shares the existing text capacity across documents; supplied file observations show whether their versions still match. Independent review shares source preparation across compatible targets and evidence.
 
 ### Fixed
 
@@ -23,6 +23,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - Reusing retained project files no longer depends on unrelated unknown model charges; the original ledger remains unchanged.
 - Processes can record both versions of an in-place file edit. A later actual edit can replace a failed output while preserving the failure receipt.
 - Publication export preserves distinct first sections and retains authored titles and subtitles from Markdown metadata.
+- Invalid tool-call JSON reports the parsing location without executing the operation.
 
 ## 2026-11-12
 

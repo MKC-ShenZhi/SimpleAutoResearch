@@ -129,6 +129,20 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertFalse((c.root/'workspace/should-not-exist').exists())
         self.assertFalse(c._process_receipts())
 
+    def test_invalid_tool_json_reports_the_parse_error_without_execution(self):
+        c = self.case
+        call = fixture._action('run_process', argv=[sys.executable, '-c',
+            "from pathlib import Path; Path('unexpected').write_text('ran')"])
+        call['function']['arguments'] += '}'
+        c.decisions.append(call)
+        self.drain()
+        result = c.app.session.store.read_json(c.app.state['turns'][-1]['tools'][-1]['result'])
+        self.assertEqual(result['status'], 'blocked')
+        self.assertIn('Extra data', result['error'])
+        self.assertIn('column', result['error'])
+        self.assertFalse((c.root / 'workspace/unexpected').exists())
+        self.assertFalse(c._process_receipts())
+
     def test_task_execution_grant_only_reuses_matching_inputs(self):
         c = self.case
         c.decisions.append(fixture._action('write_file', path='check.py', content='print("first")\n'))

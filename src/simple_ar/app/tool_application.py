@@ -4753,7 +4753,11 @@ class ToolApplication:
                     if expected is not None:
                         arguments[field] = expected
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            payload = {"status": "blocked", "error": f"Invalid tool arguments: {type(exc).__name__}"}
+            error = f"Invalid tool arguments: {type(exc).__name__}"
+            if (isinstance(exc, json.JSONDecodeError)
+                    and exc.doc == call['function']['arguments']):
+                error += f" ({exc.msg}, line {exc.lineno}, column {exc.colno})"
+            payload = {"status": "blocked", "error": error}
         else:
             terminal_error = self._terminal_error(call)
             spec = self.gateway.registry.get(call['function']['name'])
