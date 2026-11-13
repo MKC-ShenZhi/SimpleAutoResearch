@@ -396,8 +396,21 @@ def select_working_context(
             native = candidate
 
     def locator(row: Mapping[str, Any]) -> dict[str, Any]:
-        return {key: deepcopy(value) for key, value in row.items()
-                if key not in {'text'}}
+        feedback = bool(row.get('related_feedback'))
+        omitted = {'text', 'review_scope', 'subjects'} if feedback else {'text'}
+        result = {key: deepcopy(value) for key, value in row.items() if key not in omitted}
+        if feedback:
+            # The selected opinion already carries its full scope and version
+            # bindings. Navigation only needs enough to find an omitted one.
+            scope = row.get('review_scope')
+            if isinstance(scope, dict):
+                result['review_scope'] = {key: deepcopy(scope[key])
+                    for key in ('purpose', 'artifact_count') if key in scope}
+            if isinstance(row.get('subjects'), list):
+                result['subjects'] = [{key: deepcopy(subject[key]) for key in
+                    ('path', 'selected_path', 'current_matches_review', 'review_role') if key in subject}
+                    for subject in row['subjects']]
+        return result
 
     explicit_references = set(selected_records)
     references = set(explicit_references)

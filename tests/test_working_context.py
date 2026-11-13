@@ -194,11 +194,21 @@ class WorkingContextTests(unittest.TestCase):
         scope = InspectionToolGateway.delivery_scope_view(binding)
         row, = feedback_observations({'professional_findings': [{
             'record': 'records/review/result.json', 'delivery_context': scope,
-            'subjects': [], 'result': {'status': 'ok'}}]})
+            'subjects': [{'path': 'workspace/draft.md', 'reviewed_sha256': 'original-version',
+                'current_sha256': 'current-version', 'current_matches_review': False}],
+            'result': {'status': 'ok'}}]})
         self.assertEqual(row['review_scope']['purpose'], 'candidate')
         self.assertEqual(row['review_scope']['claim'], {'summary': 'Check the draft'})
         self.assertEqual(row['review_scope']['unfinished'], ['Add the analysis'])
         self.assertNotIn('requests', row['review_scope'])
+        messages, _ = select(observations=[row], selected_records=[row['record']],
+            material_policy='referenced', context_token_target=10000)
+        view = json.loads(messages[1]['content'])
+        self.assertEqual(view['working_view']['observations'][0]['observation'], row)
+        navigation = view['material_supply']['references'][0]['source']
+        self.assertEqual(navigation['review_scope'], {'purpose': 'candidate', 'artifact_count': 1})
+        self.assertFalse(navigation['subjects'][0]['current_matches_review'])
+        self.assertNotIn('reviewed_sha256', navigation['subjects'][0])
 
     def test_inspection_history_can_recover_nonfinite_numeric_results(self):
         from simple_ar.tools.inspection import InspectionToolGateway
