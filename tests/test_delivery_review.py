@@ -1833,7 +1833,7 @@ class ApplicableDeliveryInspectionTests(unittest.TestCase):
                     self.assertEqual(self.case.send.call_count, before)
 
     def test_subject_support_requires_each_pending_current_subject_not_inventory(self):
-        from simple_ar.tools.delivery_review import reassessment_has_subject_support
+        from simple_ar.core.assessments import reassessment_has_subject_support
 
         prior = {'subjects':{'a':'0'*64, 'b':'1'*64}, 'pending_subjects':['a', 'b']}
         current = {'a':'2'*64, 'b':'3'*64}

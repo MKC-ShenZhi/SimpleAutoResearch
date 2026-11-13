@@ -8,6 +8,30 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+def applicable_delivery_scope(binding: dict) -> bool:
+    """Recognize the saved review scope without interpreting its findings."""
+    if 'scope_policy' not in binding:
+        return False
+    if (binding.get('schema_version') != 'delivery_review.v3'
+            or binding['scope_policy'] not in {'applicable.v1', 'applicable.v2'}):
+        raise ValueError('Unsupported delivery inspection scope policy')
+    return True
+
+
+def reassessment_has_subject_support(prior: dict, artifacts: dict,
+                                     evidence_scopes: list[dict[str, str]]) -> bool:
+    """Check provenance for pending subjects; the inspector judges the evidence."""
+    subjects, pending = prior.get('subjects'), prior.get('pending_subjects')
+    if not isinstance(subjects, dict) or not isinstance(pending, list):
+        return False
+    if not subjects:
+        return not pending
+    if not pending or not set(pending) <= subjects.keys():
+        return False
+    return all(path in artifacts and any(scope.get(path) == artifacts[path]
+        for scope in evidence_scopes) for path in pending)
+
+
 class ArtifactFinding(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     severity: Literal['required', 'advisory']

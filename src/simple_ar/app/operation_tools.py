@@ -298,7 +298,7 @@ class OperationTools:
                     and config.get('inspection_protocol') == 'subjects.v3' else None),
             work_method=config.get('work_method'),
             work_lifecycle=config.get('work_lifecycle'),
-            working_set_policy=('recent.v4' if config.get('working_set_policy') in {'recent.v4', 'recent.v5'} else None),
+            working_set_policy=('recent.v4' if config.get('working_set_policy') in {'recent.v4', 'recent.v5', 'recent.v6'} else None),
             material_policy=config.get('inspection_material_policy'),
             native_history_policy=config.get('native_history_policy'),
             material_observations=material_observations,
@@ -323,7 +323,7 @@ class OperationTools:
                 protocol=config['delivery_review_protocol'],
                 track_findings=config.get('inspection_finding_policy') == 'linked.v1',
                 supply_work_feedback=self.professional,
-                compact_work_feedback=config.get('working_set_policy') == 'recent.v5')
+                compact_work_feedback=config.get('working_set_policy') in {'recent.v5', 'recent.v6'})
         feedback_owner = None
         if self.professional:
             # One owner supplies both revision guidance and delivery concerns.
@@ -333,7 +333,7 @@ class OperationTools:
                 from simple_ar.tools.delivery_review import DeliveryReview
                 feedback_owner = DeliveryReview(workspace=self.workspace, inspector=self.inspection,
                     observations=observations, include_package_feedback=False,
-                    compact_work_feedback=config.get('working_set_policy') == 'recent.v5')
+                    compact_work_feedback=config.get('working_set_policy') in {'recent.v5', 'recent.v6'})
             else:
                 feedback_owner = self.delivery_review
         self.registry.register_package(analysis_tool_specs(),
@@ -533,7 +533,7 @@ class OperationTools:
         if self.config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES:
             if (self.config.get('work_lifecycle') == 'integrated.v3'
                     and self.config.get('candidate_review_protocol') == 'candidate.v1'
-                    and self.config.get('working_set_policy') in {'recent.v4', 'recent.v5'}
+                    and self.config.get('working_set_policy') in {'recent.v4', 'recent.v5', 'recent.v6'}
                     and self.config.get('candidate_handoff_policy') is None):
                 if self.config.get('delivery_review_selection') == 'model.v1':
                     return (_ORDINARY_WORK + ' For a completed delivery, set independent_review=false only when '
@@ -542,7 +542,7 @@ class OperationTools:
                         'use the default review; this choice cannot waive an unresolved finding.')
                 return _ORDINARY_WORK
             instructions = _goal_work_system(candidate=self.config.get('candidate_review_protocol') == 'candidate.v1',
-                recent=self.config.get('working_set_policy') in {'recent.v3', 'recent.v4', 'recent.v5'})
+                recent=self.config.get('working_set_policy') in {'recent.v3', 'recent.v4', 'recent.v5', 'recent.v6'})
             return instructions + (self.methods.instructions()
                 if self.methods is not None and not getattr(self.methods, 'source_work', False) else '')
         return self.system + (self.methods.instructions() if self.methods is not None and not getattr(self.methods, 'source_work', False) else '')

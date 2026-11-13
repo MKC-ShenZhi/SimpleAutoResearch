@@ -10,7 +10,8 @@ from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from simple_ar.core.assessments import assessment_issues, assessment_state, current_assessments, finding_id
+from simple_ar.core.assessments import (applicable_delivery_scope, assessment_issues, assessment_state,
+    current_assessments, finding_id)
 from simple_ar.tools.specs import ToolResult, tool_completion
 from simple_ar.tools.workspace import DeliveryRequest
 
@@ -124,41 +125,6 @@ _APPLICABLE_GOAL = (
     'uncertainty and optional improvements from unfinished requested work. Return the same final '
     'inspection opinion, without imposing unrelated reading, execution or publication.'
 )
-
-
-def applicable_delivery_scope(binding: dict) -> bool:
-    """Recognize an owner-only policy in the existing version-bound context.
-
-    Absence preserves historical behavior; unknown policies must never silently
-    fall back to either contract. Public InspectionRequest has no such field.
-    """
-    if 'scope_policy' not in binding:
-        return False
-    if (binding.get('schema_version') != 'delivery_review.v3'
-            or binding['scope_policy'] not in {'applicable.v1', 'applicable.v2'}):
-        raise ValueError('Unsupported delivery inspection scope policy')
-    return True
-
-
-def reassessment_has_subject_support(prior: dict, artifacts: dict,
-                                     evidence_scopes: list[dict[str, str]]) -> bool:
-    """Require a provenance link to each pending subject, not semantic proof.
-
-    Scopes come from supplied observations and their owner-validated inputs,
-    never from inventory membership or a model's assertion of relevance. The
-    inspector still judges which windows/checks actually resolve the concern.
-    Empty subjects identify the exact completion claim already in its input;
-    they must not borrow a file finding's scope (or vice versa).
-    """
-    subjects, pending = prior.get('subjects'), prior.get('pending_subjects')
-    if not isinstance(subjects, dict) or not isinstance(pending, list):
-        return False
-    if not subjects:
-        return not pending
-    if not pending or not set(pending) <= subjects.keys():
-        return False
-    return all(path in artifacts and any(scope.get(path) == artifacts[path]
-        for scope in evidence_scopes) for path in pending)
 
 
 class _DeliveryFinding(BaseModel):

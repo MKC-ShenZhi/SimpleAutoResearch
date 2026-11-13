@@ -501,7 +501,7 @@ class ToolApplication:
             raise ValueError('Unsupported saved candidate review request contract; no silent migration')
         if config.get('inspection_coverage_policy') not in {None, 'offered.v1', 'offered.v2'}:
             raise ValueError('Unsupported saved inspection coverage policy; no silent migration')
-        if config.get('working_set_policy') not in {None, 'recent.v3', 'recent.v4', 'recent.v5'}:
+        if config.get('working_set_policy') not in {None, 'recent.v3', 'recent.v4', 'recent.v5', 'recent.v6'}:
             raise ValueError('Unsupported saved working set policy')
         if config.get('action_offer_policy') not in {None, 'observed_edit.v1'}:
             raise ValueError('Unsupported saved action offer policy')
@@ -1991,7 +1991,7 @@ class ToolApplication:
                     config['inspection_execution_protocol'] = 'shared.v2'
                     config['candidate_review_protocol'] = 'candidate.v1'
                     config['delivery_review_selection'] = 'model.v1'
-                    config['working_set_policy'] = 'recent.v5'
+                    config['working_set_policy'] = 'recent.v6'
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = ('native.v5'
                     if config.get('work_lifecycle') == 'integrated.v3' else 'native.v3')
@@ -3837,8 +3837,17 @@ class ToolApplication:
                         try:
                             review = accepted_review_journal(self.workspace, self.session.store, item, result)
                             review_record = 'records/' + review['record'].removeprefix('attempts/')
-                            selected = ((review['receipt'].get('metadata') or {}).get('delivery_assessment') or {}).get(
-                                'evidence_sha256', {})
+                            assessment = ((review['receipt'].get('metadata') or {}).get('delivery_assessment') or {})
+                            selected = assessment.get('evidence_sha256', {})
+                            if (config.get('working_set_policy') == 'recent.v6'
+                                    and assessment.get('coverage') == 'complete'
+                                    and assessment.get('verdict') == 'passed'
+                                    and not assessment.get('findings')):
+                                # The completed opinion already supplies source locators.
+                                # Reopen its original windows when needed, rather than repeat
+                                # the entire inspection on each production decision. Opinions
+                                # needing action still supply their supporting originals.
+                                selected = {}
                             text_rows.extend((row['data'], row['field'], review_record, 'inspect_artifacts', row['request'])
                                 for row in journal_read_windows(review['receipt'], {})
                                 if selected.get(row['data'].get('absolute_path')) == row['data'].get('sha256')
@@ -3932,7 +3941,7 @@ class ToolApplication:
         if working_mode:
             from simple_ar.core.working_context import (
                 current_material_paths, fit_working_context, processed_journal_turns)
-            current_artifacts = set()
+            current_artifacts, feedback_targets = set(), set()
             if config.get('professional_operations') in RETAINED_PROFESSIONAL_CONTRACTS and config['context_protocol'] == 'working.v4':
                 retained = self._retained_work(observations=owner_observations)
                 # Owner references remain compact; the complete inventory stays at
@@ -3988,15 +3997,27 @@ class ToolApplication:
                     if unavailable:
                         context['retained_work']['last_delivery']['unavailable'] = unavailable
                 # Resolution grants no new mount and does not read output bytes.
-                current_artifacts = current_material_paths(identities=retained['identities'],
-                    request_count=len(self.state['requests']),
-                    selected_paths=[primary['locator'], manuscript_path] if manuscript_path is not None else [])
+                selected_paths = [primary['locator'], manuscript_path] if manuscript_path is not None else []
+                feedback_targets = current_material_paths(identities=retained['identities'],
+                    request_count=len(self.state['requests']), selected_paths=selected_paths)
+                current_identities = retained['identities']
+                if config.get('working_set_policy') == 'recent.v6':
+                    # Delivery inventories identify reusable files, not newly
+                    # produced work. Preserve their locators above without
+                    # promoting every old body into the next working view.
+                    current_identities = [row for row in current_identities
+                        if row.get('provenance', {}).get('kind') != 'delivery_binding']
+                current_artifacts = current_material_paths(identities=current_identities,
+                    request_count=len(self.state['requests']), selected_paths=selected_paths)
                 spellings = {value for row in working_rows
                     for value in (row.get('path'), row.get('absolute_path')) if isinstance(value, str)}
-                for value in spellings - current_artifacts:
+                for value in spellings:
                     try:
-                        if str(self.workspace.resolve(value)) in current_artifacts:
+                        resolved = str(self.workspace.resolve(value))
+                        if resolved in current_artifacts:
                             current_artifacts.add(value)
+                        if resolved in feedback_targets:
+                            feedback_targets.add(value)
                     except (OSError, ValueError):
                         pass
             context.pop('requests',None)  # Requests are retained verbatim as messages, once.
@@ -4061,8 +4082,8 @@ class ToolApplication:
                     related.extend(feedback_observations(feedback))
                     professional['original_feedback'] = {key: value for key, value in feedback.items()
                         if key not in {'review_observations', 'professional_findings'}}
-                if current_artifacts:
-                    targets = tuple(sorted(current_artifacts))
+                if feedback_targets:
+                    targets = tuple(sorted(feedback_targets))
                     key = ('feedback', *targets)
                     if decision_views is None:
                         feedback = self._work_feedback(list(targets))
@@ -4097,7 +4118,8 @@ class ToolApplication:
                 observations=working_rows, schema_tokens=schema_cost,context_token_target=target,
                 native_observations=native_observations if receipt_supply else None,
                 preserve_material_observations=config.get('work_lifecycle') == 'integrated.v1',
-                working_set_policy=(config.get('working_set_policy', 'recent.v2')
+                working_set_policy=(('recent.v5' if config.get('working_set_policy') == 'recent.v6'
+                    else config.get('working_set_policy', 'recent.v2'))
                     if config.get('work_lifecycle') in {'integrated.v2', 'integrated.v3'} else None),
                 estimate_tokens=estimate_tokens,work_notes=work_notes,
                 require_work_notes=config.get('memory_protocol') == 'journal.v1',

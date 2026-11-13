@@ -1070,13 +1070,22 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.decisions.extend([
             _action('read_file',path='说明.md'),
             _action('write_file',path='修订说明.md',content=revised),
-            _action('deliver_result',summary='已补充后续建议。',artifacts=['修订说明.md']),
+            _action('deliver_result',summary='已补充后续建议。',artifacts=['说明.md', '修订说明.md']),
         ])
         self._run(feedback='保留原说明，另存一个版本，加一句后续建议。仍然用中文 Markdown。')
         self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
         self.assertEqual((self.root/'workspace/说明.md').read_text(encoding='utf-8'),first)
         self.assertEqual((self.root/'workspace/修订说明.md').read_text(encoding='utf-8'),revised)
         self.assertNotEqual((self.root/'delivery.json').read_bytes(),old_delivery)
+        with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select, \
+                patch.object(self.app, '_work_feedback', wraps=self.app._work_feedback) as guidance:
+            self.app._messages()
+        self.assertNotIn('workspace/说明.md', select.call_args.kwargs['current_artifacts'])
+        self.assertIn('workspace/修订说明.md', select.call_args.kwargs['current_artifacts'])
+        targets = set(guidance.call_args.args[0])
+        self.assertIn('workspace/说明.md', targets)
+        self.assertIn('workspace/修订说明.md', targets)
+        self.assertIn('说明.md', self.app.session.store.read_json('delivery.json')['artifacts'])
         self.assertEqual(self.app.ledger.to_dict()['entries'][:len(ledger)],ledger)
         self.assertFalse(self._process_receipts())
         self.assertFalse(self._observations('inspect_artifacts'))
@@ -3440,6 +3449,25 @@ class OperationsWorkLoopTests(unittest.TestCase):
         current = self._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
         self.assertEqual(current['verdict'], 'passed')
         self.assertEqual(set(current['artifacts']), {str(self.root/'workspace'/n) for n in claim['artifacts']})
+        passed_item = self.app.state['turns'][-1]['tools'][-1]
+        passed_record = 'records/' + passed_item['review_result'].removeprefix('attempts/')
+        saved_policy = self.app.state['config'].get('working_set_policy')
+        try:
+            self.app.state['config']['working_set_policy'] = 'recent.v5'
+            old_view = json.loads(self.app._messages()[1]['content'])['working_view']
+            self.app.state['config']['working_set_policy'] = 'recent.v6'
+            new_view = json.loads(self.app._messages()[1]['content'])['working_view']
+        finally:
+            self.app.state['config']['working_set_policy'] = saved_policy
+        def review_windows(view):
+            return [row['observation'] for row in view['observations']
+                if row['observation'].get('record') == passed_record
+                and row['observation'].get('role') == 'historical_observation']
+        self.assertTrue(review_windows(old_view))
+        self.assertFalse(review_windows(new_view))
+        self.assertTrue(self.app.workspace.resolve(passed_record).is_file())
+        self.assertTrue(any(row.get('record') == passed_record
+            for row in self.app._material_observations(['measurements'])))
         self.assertEqual(len(self._process_receipts()), 1)  # The real inspection process is not replayed.
         self.assertFalse(list((self.root/'workspace').rglob('*.pdf')))
         calls, ledger = self.send.call_count, self.app.ledger.to_dict()

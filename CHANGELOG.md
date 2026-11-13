@@ -5,6 +5,12 @@
 User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-11-14
+
+### Improved
+
+- New tasks keep reused delivery files and completed review evidence accessible without automatically treating the entire previous delivery as new work. Actionable review findings retain their supporting observations.
+
 ## 2026-11-13
 
 ### Added

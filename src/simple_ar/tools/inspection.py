@@ -22,7 +22,7 @@ from simple_ar.integrations.llm import LLMCallStopped, LLMSettings, estimate_nat
 from simple_ar.tools.specs import CommonToolSpec, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS, CLAIM_WORK_METHODS, GOAL_WORK_METHOD, tool_result_payload
 from simple_ar.tools.workspace import FileWindow, workspace_tool_specs
 from simple_ar.tools.materials import lossless_text_window
-from simple_ar.tools.delivery_review import applicable_delivery_scope, reassessment_has_subject_support
+from simple_ar.core.assessments import applicable_delivery_scope, reassessment_has_subject_support
 
 _PRESENTATION_RESULTS: ContextVar[dict | None] = ContextVar('inspection_presentation_results', default=None)
 
