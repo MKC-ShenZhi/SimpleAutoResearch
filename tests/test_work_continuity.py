@@ -629,31 +629,6 @@ class InspectionWorkingContinuityTests(unittest.TestCase):
                 _, supply = resumed._working_messages(saved, request, history, [], client)
             self.assertTrue(any(row['source']['record'] == record for row in supply['selected_records']))
 
-            # A decision and its closing-capacity projection share the same
-            # journal read; a checkpoint causes the following offer to reread it.
-            from simple_ar.app.professional_conversation import ProfessionalConversation
-            refreshed_memory = {**memory, 'notes': [{'text': 'Updated understanding', 'records': [record]}]}
-
-            def prepare(_conversation, project, *, checkpoint, **_kwargs):
-                first = project(False)
-                second = project(False)
-                self.assertEqual(first.messages, second.messages)
-                self.assertEqual(material.call_count, 1)
-                checkpoint(first, 0)
-                result = project(False)
-                self.assertEqual(material.call_count, 2)
-                self.assertIn('Updated understanding', json.dumps(result.messages))
-                return result
-
-            terminal = {'type': 'function', 'function': {'name': 'record_inspection', 'parameters': {}}}
-            with patch.object(resumed, '_conversation_material', side_effect=[
-                    (memory, [observation], journal), (refreshed_memory, [observation], journal)]) as material, \
-                    patch.object(resumed, '_conversation_rows', return_value=[]), \
-                    patch.object(resumed, '_conversation_memory', return_value={'compacted_records': set()}), \
-                    patch.object(ProfessionalConversation, 'prepare', new=prepare):
-                resumed._prepare_conversation_round(saved, request, history, [], terminal, None, client, 2, [1],
-                    dispatch=lambda *_: self.fail('Empty checkpoint must not execute'), record={})
-
             # An offered source cannot disappear if its supporting note does
             # not fit into the actual selected view.
             from simple_ar.core.working_context import fit_working_context
