@@ -35,7 +35,7 @@ class _InspectionDispatchRaised(BaseException):
 
 
 _SHARED_EXECUTION_PROTOCOLS = frozenset({'shared.v1', 'shared.v2'})
-_PRIORITY_SOURCE_POLICIES = frozenset({'priority.v1', 'priority.v2'})
+_PRIORITY_SOURCE_POLICIES = frozenset({'priority.v1', 'priority.v2', 'priority.v3'})
 _PRESENTED_EVIDENCE_POLICIES = frozenset({'presented.v2', 'presented.v3', 'presented.v4', 'presented.v5', 'presented.v6'})
 
 SHARED_INSPECTION_OPERATIONS = frozenset({'read_file', 'list_directory', 'search_files', 'compile_python',
@@ -2472,6 +2472,13 @@ class InspectionToolGateway:
         saved['retained_investigations'] = [*previous.get('retained_investigations', []), pinned]
         parents = self._retained_inputs(saved)
         owners = {(row['path'], row['sha256']):row for row in saved['evidence'] if row.get('sha256')}
+        selected_paths = None
+        if saved.get('source_priming_policy') == 'priority.v3':
+            selected_paths = {row['path'] for row in [*saved['targets'], *saved['evidence']]
+                if row.get('path')}
+            if 'delivery_context' in saved:
+                selected_paths.update(saved['delivery_context']['artifacts'])
+                selected_paths.update(self._delivery_source_paths(saved))
         number = max((int(row['subject'].split('-')[1]) for row in saved['evidence']), default=0)
         for parent in reversed(parents):
             for row in [*parent['targets'], *parent['evidence']]:
@@ -2490,6 +2497,10 @@ class InspectionToolGateway:
                     saved['evidence'].append(owner)
                     owners[key] = owner
                 owner = owners[key]
+                if selected_paths is not None and row['path'] not in selected_paths:
+                    # Keep the source locator, not an unrelated prior body in
+                    # every decision. Its original inspection remains readable.
+                    continue
                 for window in row['windows']:
                     start, end = window['offset_bytes'], window['review_next_offset_bytes']
                     count = end - start
@@ -3460,9 +3471,15 @@ class InspectionToolGateway:
             if continuity and saved.get('inspection_material_policy') in _WORK_MATERIAL_POLICIES else [])
         if execution_facts is not None:
             pending = {path for finding in saved['prior_required'] for path in finding['pending_subjects']}
-            selected_records.extend(fact['source_record'] for fact in execution_facts.values()
-                if fact['inspection'] != saved['identity']
-                or pending.intersection(fact['dependencies']))
+            if saved.get('source_priming_policy') == 'priority.v3':
+                relevant = pending | {row['path'] for row in saved['targets'] if row.get('path')}
+                relevant.update(saved.get('delivery_context', {}).get('artifacts', {}))
+                selected_records.extend(fact['source_record'] for fact in execution_facts.values()
+                    if relevant.intersection(fact['dependencies']))
+            else:
+                selected_records.extend(fact['source_record'] for fact in execution_facts.values()
+                    if fact['inspection'] != saved['identity']
+                    or pending.intersection(fact['dependencies']))
         messages, metadata = fit_working_context(
             measure_input=lambda value: estimate_native_input_tokens(client, value, offered),
             context_authority=saved.get('context_authority'),
@@ -4277,7 +4294,7 @@ class InspectionToolGateway:
             # This contract primes the whole delivery, so its other originals
             # must get a window before a long manuscript consumes the input.
             return list(dict.fromkeys([*primary, *artifacts]))
-        if saved.get('source_priming_policy') == 'priority.v2' and len(saved['delivery_context']['artifacts']) > 1:
+        if saved.get('source_priming_policy') in {'priority.v2', 'priority.v3'} and len(saved['delivery_context']['artifacts']) > 1:
             # A multi-file inventory does not identify which sources answer
             # the claim. The inspector can select other files when needed.
             return primary
@@ -5184,7 +5201,8 @@ class InspectionToolGateway:
                 if self.operation_specs is None or self.operation_call is None:
                     raise ValueError('Shared inspection requires the actual operation specs and operation gateway')
                 saved['execution_protocol'] = self.execution_protocol
-                saved['source_priming_policy'] = 'priority.v2'
+                saved['source_priming_policy'] = ('priority.v3' if self.material_policy == 'operations.v3'
+                    else 'priority.v2')
                 saved['source_provenance'] = 'versions.v2'
                 if self.material_policy == 'operations.v3':
                     saved['inspection_destinations'] = 'work-relative.v1'
@@ -5305,7 +5323,7 @@ class InspectionToolGateway:
                             if path in artifacts and Path(path).suffix.lower() not in _BINARY:
                                 size = self.workspace.resolve(path).stat().st_size
                                 priority[path] = max(priority.get(path, 0), min(window, size))
-                    if priority or saved.get('source_priming_policy') == 'priority.v2':
+                    if priority or saved.get('source_priming_policy') in {'priority.v2', 'priority.v3'}:
                         reserve = min(remaining[0], window + sum(priority.values()))
                         reusable = [remaining[0] - reserve]
                 if self.adaptive and self.material_observations is not None:

@@ -23,6 +23,7 @@ class NativeWorkProjectionTests(unittest.TestCase):
         saved = {'delivery_context': context, 'source_priming_policy': 'priority.v2'}
         select = InspectionToolGateway._delivery_source_paths
         self.assertEqual(select(saved), [])
+        self.assertEqual(select({**saved, 'source_priming_policy': 'priority.v3'}), [])
         self.assertEqual(select({**saved, 'source_priming_policy': 'priority.v1'}), ['tool.py'])
         one = {**context, 'artifacts': {'tool.py': 'a' * 64}}
         self.assertEqual(select({**saved, 'delivery_context': one}), ['tool.py'])
@@ -50,6 +51,33 @@ class NativeWorkProjectionTests(unittest.TestCase):
         owner._inherit_investigation(saved, {'identity': 'earlier', 'binding': {}, 'arguments': {}}, remaining)
         self.assertEqual(remaining[0], 80)
         self.assertEqual(saved['evidence'][0]['windows'], [window, later])
+
+    def test_retained_inspection_exposes_unselected_sources_without_replaying_their_bodies(self):
+        from simple_ar.tools.inspection import InspectionToolGateway
+        owner = InspectionToolGateway.__new__(InspectionToolGateway)
+        owner.workspace = SimpleNamespace(artifact_hashes=lambda paths: {path: 'version' for path in paths})
+        previous = {'identity': 'earlier', 'arguments': {}, 'delivery_context': {}}
+        owner.store = SimpleNamespace(read_json=lambda _: previous)
+        owner._path = lambda identity, leaf: identity + '/' + leaf
+        owner._digest = lambda _: 'retained'
+        window = {'offset_bytes': 0, 'review_next_offset_bytes': 20, 'text': 'original evidence'}
+        parent = {'identity': 'earlier', 'targets': [], 'evidence': [
+            {'subject': 'evidence-1', 'path': name, 'sha256': 'version',
+             'readable': True, 'windows': [deepcopy(window)]}
+            for name in ('selected.txt', 'supporting.txt')]}
+        owner._retained_inputs = lambda _: [parent]
+        saved = {'inspection_material_policy': 'operations.v3', 'work_lifecycle': 'integrated.v3',
+            'source_priming_policy': 'priority.v3', 'arguments': {}, 'targets': [], 'evidence': [],
+            'delivery_context': {'claim': {}, 'artifacts': {'selected.txt': 'version'}}}
+        remaining = [100]
+        owner._inherit_investigation(saved, {'identity': 'earlier', 'binding': {}, 'arguments': {}}, remaining)
+        selected, supporting = saved['evidence']
+        self.assertEqual(selected['windows'], [window])
+        self.assertEqual(supporting['windows'], [])
+        self.assertEqual(supporting['path'], 'supporting.txt')
+        self.assertEqual(supporting['retained_from']['inspection'], 'earlier')
+        self.assertEqual(parent['evidence'][1]['windows'], [window])
+        self.assertEqual(remaining[0], 80)
 
     def test_units_keep_statements_arguments_results_and_feedback_order_without_double_encoding(self):
         original = [{'role':'system', 'content':'Original permissions'},

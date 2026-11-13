@@ -201,7 +201,7 @@ class ReviewedDeliveryRequest(DeliveryRequest):
     summary: str = Field(default='', description='Completion claim; omit when selecting a reviewed candidate.')
     reviewed_candidate: str | None = Field(default=None, min_length=1,
         exclude_if=lambda value: value is None,
-        description='A prior review_result record or inspection identity. Deliver its unchanged reviewed claim and inventory without copying them. Omit all other delivery fields when using this.')
+        description='A passed delivery-scope review_result record or inspection identity. Deliver its unchanged complete claim and inventory without copying them. A local candidate review cannot represent the full delivery. Omit all other delivery fields when using this.')
 
     @model_validator(mode='after')
     def select_claim(self) -> 'ReviewedDeliveryRequest':
