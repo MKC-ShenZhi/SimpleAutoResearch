@@ -55,6 +55,9 @@ class DocumentWorkTests(unittest.TestCase):
             {'record': 'records/review-current/result.json',
              'subjects': [{'current_matches_review': True}],
              'result': {'message': 'Explain the observed value.'}}]}
+        review = root / 'attempts' / 'review-large' / 'result.json'
+        review.parent.mkdir(parents=True)
+        review.write_text(json.dumps(context['review_observations'][0]['result']), encoding='utf-8')
 
         def decide(view, count):
             handoff = view['work_context']
@@ -68,10 +71,13 @@ class DocumentWorkTests(unittest.TestCase):
             if count == 1:
                 return {'action': 'investigate', 'read_windows': [
                     {'path': handoff['work_context_archive']['record'], 'max_bytes': 512},
+                    {'path': 'records/review-large/result.json', 'max_bytes': 512},
                     {'path': 'source0/result.txt', 'max_bytes': 512}]}
             observations = {row['kind']: row['id'] for row in view['observations']}
             self.assertIn('work_context', observations)
             self.assertIn('material_window', observations)
+            self.assertTrue(any('Older guidance.' in row['observation']['data']['text']
+                for row in view['observations'] if row['kind'] == 'work_context'))
             if count == 2:
                 return {'action': 'finish', 'manuscript_markdown': '# Result\nThe observed value is 2.\n',
                     'selected_observation_ids': [observations['work_context'], observations['material_window']]}

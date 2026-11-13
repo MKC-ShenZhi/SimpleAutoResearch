@@ -14,6 +14,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Improved
 
 - Continuing work can find the last complete retained delivery in shared and professional work views. New reviews prioritize current artifacts and related executions while keeping other history available on demand.
+- New document work selects related review guidance and working notes within the shared task budget; complete records remain available on demand.
 - Working-memory compaction omits duplicate provider reasoning metadata while retaining the original records.
 - When a new ordinary task cannot afford another decision, it can perform one useful action for continuation or submit an actual delivery with the work; independent review and unfinished requirements still follow the recorded result.
 - Merging retained sources shares the existing text capacity across documents; supplied file observations show whether their versions still match. Independent review shares source preparation across compatible targets and evidence.
