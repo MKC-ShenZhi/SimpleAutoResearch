@@ -184,6 +184,22 @@ class WorkingContextTests(unittest.TestCase):
         self.assertNotIn('sha256', rows[1])
         self.assertIn('not source evidence', rows[1]['evidence_role'])
 
+    def test_related_candidate_feedback_keeps_its_actual_review_scope(self):
+        from simple_ar.core.working_context import feedback_observations
+        from simple_ar.tools.inspection import InspectionToolGateway
+
+        binding = {'requests': ['Complete the project'], 'claim': {'summary': 'Check the draft',
+            'artifacts': ['workspace/draft.md']}, 'artifacts': {'workspace/draft.md': 'version'},
+            'purpose': 'candidate', 'unfinished': ['Add the analysis']}
+        scope = InspectionToolGateway.delivery_scope_view(binding)
+        row, = feedback_observations({'professional_findings': [{
+            'record': 'records/review/result.json', 'delivery_context': scope,
+            'subjects': [], 'result': {'status': 'ok'}}]})
+        self.assertEqual(row['review_scope']['purpose'], 'candidate')
+        self.assertEqual(row['review_scope']['claim'], {'summary': 'Check the draft'})
+        self.assertEqual(row['review_scope']['unfinished'], ['Add the analysis'])
+        self.assertNotIn('requests', row['review_scope'])
+
     def test_inspection_history_can_recover_nonfinite_numeric_results(self):
         from simple_ar.tools.inspection import InspectionToolGateway
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))

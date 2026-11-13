@@ -1302,7 +1302,8 @@ class InspectionToolGateway:
         """Model navigation, never the version-bound acceptance contract."""
         return {'projection': 'delivery_scope', 'requests': binding['requests'],
             'claim': {key: value for key, value in binding['claim'].items() if key != 'artifacts'},
-            'artifact_count': len(binding['artifacts'])}
+            'artifact_count': len(binding['artifacts']),
+            **({key: deepcopy(binding[key]) for key in ('purpose', 'unfinished') if key in binding})}
 
     @staticmethod
     def compact_feedback(result: dict, *, historical: bool = False) -> dict:
@@ -3253,7 +3254,7 @@ class InspectionToolGateway:
         cannot represent turns already handed off to working notes.
         """
         from simple_ar.core.working_context import (
-            current_material_paths, fit_working_context, processed_journal_turns)
+            current_material_paths, fit_working_context, input_capacity, processed_journal_turns)
 
         policy = saved.get('inspection_context_policy')
         if 'inspection_context_policy' in saved and policy != 'retained.v1':
@@ -3282,8 +3283,7 @@ class InspectionToolGateway:
             target = LLMSettings.context_input_tokens
         if saved.get('memory_protocol') == 'journal.v1' and client._budget_ledger is not None:
             remaining = client._budget_ledger.remaining('total_tokens')
-            if remaining is not None:
-                target = min(target, max(0, remaining - (client.effective_output_limit() or 0)))
+            target = input_capacity(target, remaining, client.effective_output_limit() or 0)
         base = self._view(saved, request)
         if saved.get('execution_protocol') == 'shared.v2':
             ledger = client._budget_ledger

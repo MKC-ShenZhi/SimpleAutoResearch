@@ -72,6 +72,9 @@ selection errors return your draft and actual observations in this same work
 unit; correct the selection while preserving useful prose and investigation.
 """
 
+_WORKING_CONTRACTS = frozenset({'document_work_operation.v4', 'document_work_operation.v5'})
+_MATERIAL_ID_CONTRACTS = frozenset({'document_work_operation.v3', *_WORKING_CONTRACTS})
+
 
 class _CandidateSelectionError(ValueError):
     """A rejected proposal with no output writes or unresolved side effects."""
@@ -80,7 +83,10 @@ class _CandidateSelectionError(ValueError):
 def _system_for(binding: dict) -> str:
     systems = {'document_work_operation.v1': _SYSTEM,
         'document_work_operation.v2': _CANDIDATE_SYSTEM, 'document_work_operation.v3': _MATERIAL_ID_SYSTEM,
-        'document_work_operation.v4': _MATERIAL_ID_SYSTEM}
+        'document_work_operation.v4': _MATERIAL_ID_SYSTEM,
+        'document_work_operation.v5': (_MATERIAL_ID_SYSTEM + '\nRelated feedback and working notes are guidance. '
+            'The work context archive identifies the frozen complete context; use read_windows when '
+            'omitted context is needed. That context is not original research evidence.')}
     if binding['contract'] not in systems:
         raise ValueError('Unknown saved document work contract')
     return systems[binding['contract']]
@@ -198,7 +204,7 @@ class DocumentWorkToolGateway:
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
                  material_roots: Callable[[], list[str]] | None = None,
                  sources: Any | None = None, context_policy: str | None = None) -> None:
-        if context_policy not in (None, 'working.v1'):
+        if context_policy not in (None, 'working.v1', 'working.v2'):
             raise ValueError('Unknown document context policy')
         self.context_policy = context_policy
         self.root, self.workspace, self.ledger, self.session_id = Path(root), workspace, ledger, session_id
@@ -248,9 +254,9 @@ class DocumentWorkToolGateway:
                     or snapshot['system'] != _system_for(binding)
                     or snapshot['budget_call_id'] != f'{identity}:document:{step}'
                     or (snapshot['input']['observations'] != observations
-                        if binding['contract'] != 'document_work_operation.v4' else
+                        if binding['contract'] not in _WORKING_CONTRACTS else
                         any(row not in observations for row in snapshot['input']['observations']))
-                    or any(snapshot['input'].get(key) != value for key, value in binding['context'].items())):
+                    or not self._context_matches(binding, snapshot['input'], identity)):
                 return None
             return binding, observations, decision, step
         except (ValueError, TypeError, KeyError, OSError):
@@ -422,7 +428,9 @@ class DocumentWorkToolGateway:
             excluded_paths=source_paths | ({prior_path} if prior_path else set()),
             **({'remaining_bytes': context_input_tokens * 4}
                if self.context_policy else {}))
-        binding = {'contract': 'document_work_operation.v4' if self.context_policy else 'document_work_operation.v3',
+        contract = ('document_work_operation.v5' if self.context_policy == 'working.v2' else
+                    'document_work_operation.v4' if self.context_policy else 'document_work_operation.v3')
+        binding = {'contract': contract,
             'request_sha256': _digest(request.model_dump(mode='json')),
             'context': base, 'inventories': inventories, 'seed': seed}
         store.write_json('input.json', binding)
@@ -561,6 +569,8 @@ class DocumentWorkToolGateway:
         feedback = []
         preview = None
         system = _system_for(binding)
+        feedback_projection = (self._feedback_context(context['work_context'], identity)
+            if binding['contract'] == 'document_work_operation.v5' else None)
         step = 0
         while True:
             step += 1
@@ -571,8 +581,10 @@ class DocumentWorkToolGateway:
             if preview is not None:
                 prompt['candidate_preview'] = preview
             projection = None
-            if binding['contract'] == 'document_work_operation.v4':
-                prompt, projection = self._working_input(prompt, observations, client, identity, system)
+            if binding['contract'] in _WORKING_CONTRACTS:
+                prompt, projection = self._working_input(prompt, observations, client, identity, system,
+                    project_feedback=binding['contract'] == 'document_work_operation.v5',
+                    feedback_projection=feedback_projection)
             serialized = json.dumps(prompt, ensure_ascii=False, allow_nan=False)
             if projection is None and len(serialized.encode('utf-8')) > 512000:
                 raise ValueError('Document investigation context exceeds 512 KB; preserve the records and narrow the work unit')
@@ -646,7 +658,10 @@ class DocumentWorkToolGateway:
                 return
             feedback, added = self._investigate(store, decision, observations, visible, source_views,
                 seen_reads, seen_queries, identity, step,
-                cumulative_capacity=binding['contract'] != 'document_work_operation.v4')
+                cumulative_capacity=binding['contract'] not in _WORKING_CONTRACTS,
+                context_records=([f'records/{identity}/document_work/input.json',
+                    *(row['record'] for row in feedback_projection[1])]
+                    if feedback_projection is not None else ()))
             signature = _digest({'decision': response, 'feedback': feedback})
             if not added:
                 if signature in no_progress:
@@ -654,11 +669,66 @@ class DocumentWorkToolGateway:
                 no_progress.add(signature)
 
     @staticmethod
-    def _working_input(prompt: dict, observations: list[dict], client: Any, identity: str, system: str) -> tuple[dict, dict]:
+    def _feedback_context(context: dict, identity: str) -> tuple[dict, list[dict]]:
+        """Project feedback and notes through the shared working view."""
+        from simple_ar.core.working_context import feedback_observations
+        rows = feedback_observations(context)
+        record = f'records/{identity}/document_work/input.json'
+        note_keys = [key for key in ('working_notes', 'historical_working_understanding') if context.get(key)]
+        for key in note_keys:
+            rows.extend({'record': record, 'field': f'context.work_context.{key}.{index}',
+                'kind': 'operation_result', 'work_note': key, 'turn': index,
+                'text': json.dumps(note, ensure_ascii=False)}
+                for index, note in enumerate(context[key]))
+        if not rows:
+            return dict(context), rows
+        projected = {key: value for key, value in context.items()
+                     if key not in {'review_observations', 'professional_findings', *note_keys}}
+        projected['work_context_archive'] = {
+            'record': record,
+            'scope': 'Related opinions and working notes are guidance, not original evidence or current acceptance. '
+                'Material supply references identify related opinions. The complete context remains '
+                'in this input record; read either record by window when needed.'}
+        return projected, rows
+
+    @staticmethod
+    def _feedback_view(row: dict) -> dict:
+        return {**{key: value for key, value in row.items() if key != 'text'},
+                'result': json.loads(row['text'])}
+
+    @staticmethod
+    def _context_matches(binding: dict, prompt: dict, identity: str) -> bool:
+        """Keep old inputs exact; the new view may select only its frozen feedback."""
+        context = binding['context']
+        if any(prompt.get(key) != value for key, value in context.items() if key != 'work_context'):
+            return False
+        if binding['contract'] != 'document_work_operation.v5':
+            return prompt.get('work_context') == context['work_context']
+        expected, rows = DocumentWorkToolGateway._feedback_context(context['work_context'], identity)
+        actual = prompt.get('work_context')
+        if not isinstance(actual, dict):
+            return False
+        supplied = actual.get('related_feedback', [])
+        available = [DocumentWorkToolGateway._feedback_view(row) for row in rows if row.get('related_feedback')]
+        note_keys = {row['work_note'] for row in rows if row.get('work_note')}
+        return (isinstance(supplied, list)
+            and {key: value for key, value in actual.items() if key not in {'related_feedback', *note_keys}} == expected
+            and all(isinstance(actual.get(key), list) and all(note in context['work_context'][key]
+                    for note in actual[key]) for key in note_keys)
+            and all(row in available for row in supplied))
+
+    @staticmethod
+    def _working_input(prompt: dict, observations: list[dict], client: Any, identity: str, system: str,
+                       *, project_feedback: bool = False,
+                       feedback_projection: tuple[dict, list[dict]] | None = None) -> tuple[dict, dict]:
         """The common selector owns presentation; the complete journal stays intact."""
-        from simple_ar.core.working_context import fit_working_context
+        from simple_ar.core.working_context import fit_working_context, input_capacity
         from simple_ar.integrations.llm import estimate_json_request_tokens, estimate_tokens
         base = {key: value for key, value in prompt.items() if key != 'observations'}
+        feedback = []
+        if project_feedback:
+            base['work_context'], feedback = (feedback_projection or
+                DocumentWorkToolGateway._feedback_context(base['work_context'], identity))
         recalled = {row['id'] for row in prompt.get('read_results', []) if row.get('status') == 'recalled'}
         base['coverage'] += (' Only the supplied observation bodies are in this input. Repeat an original '
             'window/query request to recall its recorded observation without repeating the investigation.')
@@ -667,19 +737,35 @@ class DocumentWorkToolGateway:
             def project(context):
                 context = dict(context)
                 view = context.pop('working_view')
-                context['observations'] = [json.loads(row['observation']['text']) for row in view['observations']]
+                selected = [row['observation'] for row in view['observations']]
+                context['observations'] = [json.loads(row['text']) for row in selected
+                    if not row.get('related_feedback') and not row.get('work_note')]
+                if feedback:
+                    context['work_context'] = {**context['work_context'],
+                        'related_feedback': [DocumentWorkToolGateway._feedback_view(row)
+                                             for row in selected if row.get('related_feedback')]}
+                    for key in {row['work_note'] for row in feedback if row.get('work_note')}:
+                        context['work_context'][key] = [json.loads(row['text'])
+                            for row in selected if row.get('work_note') == key]
                 return [messages[0], {'role': 'user', 'content': json.dumps(context, ensure_ascii=False)}]
             return project
 
+        target = client._settings.context_input_tokens
+        ledger = getattr(client, '_budget_ledger', None)
+        if project_feedback and ledger is not None:
+            remaining = ledger.remaining('total_tokens')
+            output_limit = getattr(client, 'effective_output_limit', lambda: None)() or 0
+            target = input_capacity(target, remaining, output_limit)
         messages, selection = fit_working_context(
             measure_input=lambda messages: estimate_json_request_tokens(client, system, messages[1]['content']),
             user_requests=[], system_text=system,
-            base_context=base, turn_blocks=[], observations=[{
+            base_context=base, turn_blocks=[], observations=[*feedback, *[{
                 'record': f'records/{identity}/document_work/observations.json', 'field': str(index),
                 'turn': index + (len(observations) if row['id'] in recalled else 0),
                 'kind': 'operation_result', 'role': 'historical_observation',
-                'text': json.dumps(row, ensure_ascii=False)} for index, row in enumerate(observations)],
-            schema_tokens=0, context_token_target=client._settings.context_input_tokens,
+                'text': json.dumps(row, ensure_ascii=False)} for index, row in enumerate(observations)]],
+            selected_records=[row['record'] for row in feedback],
+            schema_tokens=0, context_token_target=target,
             estimate_tokens=estimate_tokens, material_policy='retained',
             native_observations=[], message_projector=present,
             history_access='the saved document observation IDs; request a focused unread window when needed')
@@ -689,25 +775,33 @@ class DocumentWorkToolGateway:
 
     def _investigate(self, store: ArtifactStore, decision: _Decision, observations: list[dict],
                      visible: dict, source_views: dict, seen_reads: set, seen_queries: set,
-                     identity: str, step: int, *, cumulative_capacity: bool = True) -> tuple[list[dict], bool]:
+                     identity: str, step: int, *, cumulative_capacity: bool = True,
+                     context_records: tuple[str, ...] | list[str] = ()) -> tuple[list[dict], bool]:
         feedback, added = [], False
+        context_paths = set()
+        for record in context_records:
+            try:
+                context_paths.add(str(self.workspace.resolve_material_root(record)))
+            except (ValueError, OSError):
+                continue
         for window in decision.read_windows:
             try:
                 path = str(self.workspace.resolve_material_root(window.path))
-                if path not in visible or path in source_views:
+                is_context = path in context_paths and path not in visible
+                if not is_context and (path not in visible or path in source_views):
                     raise ValueError('Read only inventoried files; original source bundles require a source query')
                 if Path(path).suffix.lower() in {'.png', '.jpg', '.jpeg', '.pdf'}:
                     raise ValueError('Binary figure/PDF has no text-window reader; preserve it or use an independent reader')
                 key = window_key(self.workspace, window)
                 if key in seen_reads:
                     if not cumulative_capacity:
-                        row = next(row for row in observations if row['kind'] == 'material_window'
+                        row = next(row for row in observations if row['kind'] in {'material_window', 'work_context'}
                             and window_key(self.workspace, FileWindow.model_validate(row['observation']['request'])) == key)
                         feedback.append({'status': 'recalled', 'id': row['id']})
                         continue
                     raise ValueError('This exact window was already observed')
                 size = self.workspace.resolve_material_root(window.path).stat().st_size
-                if size != visible[path]['size_bytes']:
+                if not is_context and size != visible[path]['size_bytes']:
                     raise ValueError('Material candidate changed during investigation')
                 remaining = 96000 - sum(len(row['observation']['data']['text']) for row in observations
                     if row['kind'] == 'material_window')
@@ -718,7 +812,8 @@ class DocumentWorkToolGateway:
                 row = read_material_window(self.workspace, args, identity=identity)
                 if row['data']['size_bytes'] != size:
                     raise ValueError('Material candidate changed during reading')
-                observations.append({'id': f'o{len(observations) + 1}', 'kind': 'material_window', 'observation': row})
+                observations.append({'id': f'o{len(observations) + 1}',
+                    'kind': 'work_context' if is_context else 'material_window', 'observation': row})
                 seen_reads.add(key)
                 added = True
                 store.write_json('observations.json', observations)
@@ -757,7 +852,7 @@ class DocumentWorkToolGateway:
         return feedback, added
 
     def _selected_sources(self, binding: dict, attachments: list[str]) -> list[str]:
-        if binding['contract'] in {'document_work_operation.v3', 'document_work_operation.v4'}:
+        if binding['contract'] in _MATERIAL_ID_CONTRACTS:
             inventory = {row['delivery_path']: row['path'] for row in binding['context']['candidates']}
             if len(attachments) != len(set(attachments)) or any(item not in inventory for item in attachments):
                 raise _CandidateSelectionError('Attachments must be distinct delivery_path IDs from the supplied inventory')
@@ -776,6 +871,8 @@ class DocumentWorkToolGateway:
         if len(ids) != len(set(ids)) or any(item not in by_id for item in ids):
             raise _CandidateSelectionError('Selected evidence must name distinct actually observed IDs')
         selected = [by_id[item] for item in ids]
+        if any(row['kind'] == 'work_context' for row in selected):
+            raise _CandidateSelectionError('Working context is guidance, not an original evidence observation')
         visible = {row['path']: row for row in binding['context']['candidates']}
         assets = []
         for source in self._selected_sources(binding, decision.attachments):
@@ -836,7 +933,7 @@ class DocumentWorkToolGateway:
                 or record['response_sha256'] != _digest(record['response']) or not record['accounting_known']
                 or snapshot['system'] != _system_for(binding)
                 or snapshot['budget_call_id'] != f"{identity}:document:{candidate['decision']}"
-                or any(snapshot['input'].get(key) != value for key, value in binding['context'].items())
+                or not self._context_matches(binding, snapshot['input'], identity)
                 or decision.action != 'finish' or decision.manuscript_markdown != candidate['markdown']
                 or decision.gaps != candidate['gaps']
                 or candidate['manuscript'] != f'workspace/document-work/{identity}/manuscript.md'
@@ -845,7 +942,7 @@ class DocumentWorkToolGateway:
         saved_observations = store.read_json('observations.json')
         prompted = snapshot['input']['observations']
         supplied = prompted
-        if binding['contract'] == 'document_work_operation.v4':
+        if binding['contract'] in _WORKING_CONTRACTS:
             supplied = []
             for step in range(1, candidate['decision'] + 1):
                 actual = store.read_json(f'decisions/{step}/request.json')
@@ -857,7 +954,7 @@ class DocumentWorkToolGateway:
                 if any(row not in saved_observations for row in rows):
                     raise ValueError('Presented document observation differs from its original journal')
                 supplied.extend(rows)
-        if ((binding['contract'] != 'document_work_operation.v4' and saved_observations != prompted)
+        if ((binding['contract'] not in _WORKING_CONTRACTS and saved_observations != prompted)
                 or any(row not in supplied for row in candidate['selected'])):
             raise ValueError('Selected original observation record changed')
         visible = {row['path']: row for row in binding['context']['candidates']}
@@ -927,7 +1024,7 @@ class DocumentWorkToolGateway:
             'coverage': {'omitted_files': binding['context']['omitted_files'],
                 'scope': 'Inventory and observed windows are bounded; unread content is not evidence of absence.'},
             'gaps': gaps, 'receipt': f'records/{identity}/document_work/receipt.json'}
-        if binding['contract'] in {'document_work_operation.v2', 'document_work_operation.v3', 'document_work_operation.v4'}:
+        if binding['contract'] == 'document_work_operation.v2' or binding['contract'] in _MATERIAL_ID_CONTRACTS:
             data['measurements'] = manuscript_measurements(markdown)
         result = ToolResult(tool_name='work_document', data=data, artifacts=artifacts,
             metadata={'material_observations': self._material_observations(saved_observations)},

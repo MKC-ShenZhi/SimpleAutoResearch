@@ -15,6 +15,11 @@ TURN_SUPPLY_POLICY = 'turns.v1'
 RECEIPT_SUPPLY_POLICIES = frozenset({'receipts.v1', TURN_SUPPLY_POLICY})
 
 
+def input_capacity(target: int, remaining: int | None, output_tokens: int) -> int:
+    """Fit optional input to the caller's existing spendable capacity."""
+    return target if remaining is None else min(target, max(0, remaining - output_tokens))
+
+
 def material_window_views(observation: Mapping[str, Any], supplied: Sequence[Mapping[str, Any]]) -> list[dict]:
     """Show only unsupplied reversible text of one original same-path version.
 
@@ -79,6 +84,7 @@ def feedback_observations(context: Mapping[str, Any]) -> list[dict[str, Any]]:
     projected = []
     for row in reviews:
         result = row.get('result', row)
+        scope = row.get('delivery_context') or {}
         source = (result.get('data', {}).get('source_observations') or {}).get('record')
         record = source if isinstance(source, str) and source.startswith('records/') else row['record']
         role = ('Retained related feedback' if row.get('opinion_available', True)
@@ -86,6 +92,9 @@ def feedback_observations(context: Mapping[str, Any]) -> list[dict[str, Any]]:
         projected.append({'record': record, 'kind': 'operation_result', 'related_feedback': True,
             'text': json.dumps(result, ensure_ascii=False, separators=(',', ':')),
             'subjects': deepcopy(row.get('subjects', [])),
+            **({'review_scope': {'purpose': scope.get('purpose', 'delivery'),
+                **{key: deepcopy(scope[key]) for key in ('claim', 'artifact_count', 'unfinished') if key in scope}}}
+               if scope.get('projection') == 'delivery_scope' else {}),
             'evidence_role': role + '; guidance only, not source evidence, current certification or permission.'})
     return projected
 

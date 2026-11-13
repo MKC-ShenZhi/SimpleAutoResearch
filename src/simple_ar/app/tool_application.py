@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from simple_ar.core.budget import BudgetLedger, completed_llm_usage_is_accounted
 from simple_ar.app.task_view import history_observation, saved_work_connection
-from simple_ar.core.working_context import history_view, RECEIPT_SUPPLY_POLICIES, TURN_SUPPLY_POLICY
+from simple_ar.core.working_context import history_view, input_capacity, RECEIPT_SUPPLY_POLICIES, TURN_SUPPLY_POLICY
 from simple_ar.core.capabilities import ArtifactRef, ArtifactStore, AttemptManifest, CapabilityContext, CapabilityRegistry, CapabilityResult
 from simple_ar.core.session import BudgetState, SessionController
 from simple_ar.integrations.llm import (
@@ -457,7 +457,7 @@ class ToolApplication:
         from simple_ar.app.professional_conversation import NATIVE_HISTORY_POLICY
         if config.get('native_history_policy') not in (None, NATIVE_HISTORY_POLICY):
             raise ValueError('Unsupported saved native history policy')
-        if config.get('document_context_policy') not in (None, 'working.v1'):
+        if config.get('document_context_policy') not in (None, 'working.v1', 'working.v2'):
             raise ValueError('Unsupported saved document context policy')
         if config.get('process_artifact_paths') not in (None, 'cwd.v1'):
             raise ValueError('Unsupported saved process artifact paths')
@@ -1985,7 +1985,7 @@ class ToolApplication:
                     config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
                     from simple_ar.app.professional_conversation import NATIVE_HISTORY_POLICY
                     config['native_history_policy'] = NATIVE_HISTORY_POLICY
-                    config['document_context_policy'] = 'working.v1'
+                    config['document_context_policy'] = 'working.v2'
                     config['process_artifact_paths'] = 'cwd.v1'
                     config['work_lifecycle'] = 'integrated.v3'
                     config['inspection_execution_protocol'] = 'shared.v2'
@@ -3063,11 +3063,9 @@ class ToolApplication:
         # to drop progress: archived turns remain available through read_history.
         client = client or self._client()
         output_reservation = client.effective_output_limit() or 0
-        input_target = client._settings.context_input_tokens
         remaining_requests = self._request_capacity()
         remaining_tokens = self.ledger.remaining('total_tokens')
-        if remaining_tokens is not None:
-            input_target = min(input_target, max(0, remaining_tokens - output_reservation))
+        input_target = input_capacity(client._settings.context_input_tokens, remaining_tokens, output_reservation)
         # Preserve a contiguous causal conversation, not only the last tool
         # result. Earlier decisions explain why a probe ran and what its result
         # changed. Drop complete oldest blocks only when capacity requires it;
@@ -3578,10 +3576,8 @@ class ToolApplication:
         boundary = max(native_history_start_turn, focus.get('native_history_start_turn', 0),
                        self._professional_boundary())
         output = client.effective_output_limit() or 0
-        target = client._settings.context_input_tokens
         remaining = self.ledger.remaining('total_tokens')
-        if remaining is not None:
-            target = min(target, max(0, remaining - output))
+        target = input_capacity(client._settings.context_input_tokens, remaining, output)
         requests = self._request_capacity()
         report = self._report_projection()
         plan = None if config.get('work_method') == GOAL_WORK_METHOD else self._work_plan()
@@ -4053,31 +4049,39 @@ class ToolApplication:
                 and row.get('tool') == 'read_file' and row.get('role') == 'historical_observation'
                 and row.get('record'))]))
             if (config.get('professional_operations') in RETAINED_PROFESSIONAL_CONTRACTS
-                    and config['context_protocol'] == 'working.v4' and current_artifacts):
-                # The native owner already has the actual client, schema and
-                # remaining allowance. Related checks compete as whole original
-                # results in that same selector, not in a byte-capped envelope.
-                # Requests and notes retain their existing single presentation.
+                    and config['context_protocol'] == 'working.v4'):
+                # All related checks, including those from an active retained
+                # professional work unit, share the same input selection.
+                # Their original receipts stay available through the journal.
                 from simple_ar.core.working_context import feedback_observations
-                targets = tuple(sorted(current_artifacts))
-                key = ('feedback', *targets)
-                if decision_views is None:
-                    feedback = self._work_feedback(list(targets))
-                else:
-                    if key not in decision_views:
-                        decision_views[key] = self._work_feedback(list(targets))
-                    feedback = decision_views[key]
-                related = feedback_observations(feedback)
+                related = []
+                professional = context.get('professional_work')
+                if isinstance(professional, dict) and isinstance(professional.get('original_feedback'), dict):
+                    feedback = professional['original_feedback']
+                    related.extend(feedback_observations(feedback))
+                    professional['original_feedback'] = {key: value for key, value in feedback.items()
+                        if key not in {'review_observations', 'professional_findings'}}
+                if current_artifacts:
+                    targets = tuple(sorted(current_artifacts))
+                    key = ('feedback', *targets)
+                    if decision_views is None:
+                        feedback = self._work_feedback(list(targets))
+                    else:
+                        if key not in decision_views:
+                            decision_views[key] = self._work_feedback(list(targets))
+                        feedback = decision_views[key]
+                    related.extend(feedback_observations(feedback))
                 additions = []
                 for row in related:
-                    same = next((existing for existing in working_rows
+                    same = next((existing for existing in [*working_rows, *additions]
                         if existing.get('record') == row['record']
                         and existing.get('kind') == 'operation_result'
                         and existing.get('text') == row['text']), None)
                     if same is None:
                         additions.append(row)
                     else:
-                        same.update(subjects=row['subjects'], evidence_role=row['evidence_role'], related_feedback=True)
+                        same.update({key: row[key] for key in ('subjects', 'evidence_role', 'review_scope') if key in row},
+                                    related_feedback=True)
                 working_rows = [*additions, *working_rows]
             journal_rows = [{'turn':number, 'record':'records/'+path.removeprefix('attempts/')}
                 for number, turn in enumerate(turns) if not turn.get('remaining')

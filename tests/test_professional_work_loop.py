@@ -475,6 +475,24 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertIn('Original large feedback.', read.data['text'])
         self.assertTrue(read.data['has_more'])
 
+    def test_retained_professional_feedback_uses_the_shared_view_once(self):
+        self._create(professional_contract='work.v11')
+        self._write('report.md', 'Current candidate.\n')
+        result = {'tool_name': 'inspect_images', 'status': 'ok',
+            'data': {'review': 'Correct the figure caption.'}}
+        feedback = {'review_observations': [{'record': 'records/review/result.json', 'result': result,
+            'subjects': [{'path': 'workspace/report.md', 'current_matches_review': True}]}]}
+        method = {'status': 'active', 'original_feedback': deepcopy(feedback)}
+        with patch.object(self.app.operations, 'method_context', return_value=method), \
+                patch.object(self.app, '_work_feedback', return_value=feedback):
+            messages = self.app._messages(client=self.app._client())
+        context = json.loads(messages[1]['content'])
+        self.assertNotIn('review_observations', context['professional_work']['original_feedback'])
+        rows = [row['observation'] for row in context['working_view']['observations']
+            if row['observation'].get('record') == 'records/review/result.json']
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(json.loads(rows[0]['text']), result)
+
     def setUp(self):
         self.directory = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.root = self.directory / 'task'

@@ -44,6 +44,65 @@ class _Client:
 
 
 class DocumentWorkTests(unittest.TestCase):
+    def test_shared_feedback_can_be_selected_and_recalled_without_becoming_evidence(self):
+        root, source, ledger, workspace = self.workspace()
+        (source / 'result.txt').write_text('Observed value: 2.\n', encoding='utf-8')
+        context = {'user_requests': ['Revise the result'], 'working_notes': [
+            {'text': 'Older working note. ' * 4000, 'records': []},
+            {'text': 'Retain the observed sample count.', 'records': []}], 'review_observations': [
+            {'record': 'records/review-large/result.json', 'subjects': [],
+             'result': {'message': 'Older guidance. ' * 5000}},
+            {'record': 'records/review-current/result.json',
+             'subjects': [{'current_matches_review': True}],
+             'result': {'message': 'Explain the observed value.'}}]}
+
+        def decide(view, count):
+            handoff = view['work_context']
+            self.assertEqual(handoff['user_requests'], context['user_requests'])
+            self.assertIn('records/review-large/result.json', json.dumps(view['material_supply']))
+            self.assertIn('records/review-current/result.json', json.dumps(view['material_supply']))
+            self.assertIn('Explain the observed value.', json.dumps(handoff))
+            self.assertIn('Retain the observed sample count.', json.dumps(handoff))
+            self.assertNotIn('Older guidance. ' * 5000, json.dumps(view))
+            self.assertNotIn('Older working note. ' * 4000, json.dumps(view))
+            if count == 1:
+                return {'action': 'investigate', 'read_windows': [
+                    {'path': handoff['work_context_archive']['record'], 'max_bytes': 512},
+                    {'path': 'source0/result.txt', 'max_bytes': 512}]}
+            observations = {row['kind']: row['id'] for row in view['observations']}
+            self.assertIn('work_context', observations)
+            self.assertIn('material_window', observations)
+            if count == 2:
+                return {'action': 'finish', 'manuscript_markdown': '# Result\nThe observed value is 2.\n',
+                    'selected_observation_ids': [observations['work_context'], observations['material_window']]}
+            self.assertEqual(view['read_results'][0]['status'], 'candidate_selection_rejected')
+            return {'action': 'finish', 'manuscript_markdown': '# Result\nThe observed value is 2.\n',
+                'selected_observation_ids': [observations['material_window']]}
+
+        gateway, clients = self.gateway(root, source, ledger, workspace, decide, context=context)
+        gateway.context_policy = 'working.v2'
+        result = gateway.call('work_document', {'goal': 'Revise the result'}, identity='handoff')
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(len(clients[0].calls), 3)
+        self.assertEqual(len(result.metadata['material_observations']), 1)
+        self.assertEqual(len(result.data['provenance']['evidence']), 1)
+        charges = ledger.to_dict()
+        self.assertTrue(gateway.call('work_document', {'goal': 'Revise the result'}, identity='handoff').ok)
+        self.assertEqual(ledger.to_dict(), charges)
+        self.assertEqual(len(clients[0].calls), 3)
+
+    def test_shared_document_input_respects_the_callers_remaining_ledger(self):
+        ledger = BudgetLedger({'total_tokens': 3200})
+        client = SimpleNamespace(_settings=SimpleNamespace(context_input_tokens=12000),
+            _budget_ledger=ledger, effective_output_limit=lambda: 500)
+        prompt = {'goal': 'Use the current result', 'work_context': {'user_requests': ['Summarize']},
+                  'coverage': 'Actual observations only.', 'read_results': [], 'observations': []}
+        with ledger.protect_remaining({'total_tokens': 400}):
+            view, selection = DocumentWorkToolGateway._working_input(
+                prompt, [], client, 'bounded', 'Work on the request.', project_feedback=True)
+        self.assertEqual(selection['input_token_target'], 2300)
+        self.assertEqual(view['work_context']['user_requests'], ['Summarize'])
+
     def test_large_related_feedback_is_admitted_by_the_consumers_model_capacity(self):
         from simple_ar.app.tool_application import ToolApplication
 
