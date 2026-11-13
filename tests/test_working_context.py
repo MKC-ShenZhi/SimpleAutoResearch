@@ -210,6 +210,67 @@ class WorkingContextTests(unittest.TestCase):
         self.assertFalse(navigation['subjects'][0]['current_matches_review'])
         self.assertNotIn('reviewed_sha256', navigation['subjects'][0])
 
+    def test_inspection_memory_can_cite_the_initial_offered_source(self):
+        from simple_ar.app.professional_conversation import ProfessionalConversation
+        from simple_ar.tools.inspection import InspectionToolGateway
+
+        owner = InspectionToolGateway.__new__(InspectionToolGateway)
+        saved = {'identity': 'initial-source', 'source_rounds': ['closed'],
+                 'initial_material_memory': 'provided.v1', 'native_supply_policy': TURN_SUPPLY_POLICY}
+        offered = {'record': owner._path(saved['identity'], 'input'), 'kind': 'source_text',
+            'subject': 'evidence-1', 'path': '/source/result.txt', 'sha256': 'a' * 64,
+            'offset_bytes': 0, 'next_offset_bytes': 7, 'size_bytes': 7, 'text': 'Result.'}
+        response = {'role': 'assistant', 'content': None, 'tool_calls': [
+            {'id': 'call-1', 'function': {'name': 'list_directory', 'arguments': '{}'}}]}
+        trace = {'offer': {'messages': [{}, {'content': json.dumps({'working_view': {'observations': [
+            {'observation': offered, 'version_status': 'matching'}]}})}]}, 'response': response,
+            'results': [{'call_id': 'call-1', 'arguments': {},
+                         'result': {'tool_name': 'list_directory', 'status': 'ok', 'data': {}}}]}
+        with patch.object(owner, '_closed_source_round', return_value=trace):
+            rows = owner._conversation_rows(saved)
+            self.assertEqual(len(rows), 2)
+            legacy = owner._conversation_rows({key: value for key, value in saved.items()
+                                              if key != 'initial_material_memory'})
+        self.assertEqual(len(legacy), 1)
+        self.assertEqual(rows[0]['result']['tool_name'], 'provided_source')
+        previous = {'notes': [], 'compacted_records': set()}
+        view = prepare_checkpoint_input(requests=['Check the result'], previous=previous, rows=rows,
+            target=30000, estimate_tokens=len, native_supply_policy=TURN_SUPPLY_POLICY)
+        originals = {row['record']: row for row in rows}
+        validate_checkpoint_sources(view, source=lambda row: originals[row['record']],
+            owner='inspection', before_turn=1)
+        notes = _bound_response({'notes': [{'text': 'The original says Result.', 'observations': ['o1']}]},
+            view, lambda values: owner._bind_conversation_notes(values, rows))
+        self.assertEqual(notes[0]['observed_versions'], {'/source/result.txt': 'a' * 64})
+        self.assertNotIn('source_integrity', notes[0])
+        memory = ProfessionalConversation.adopt(previous=previous, view=view,
+            snapshot={'notes': notes, 'through_turn': 1},
+            operations_for_turn=lambda turn: {row['record']: row['arguments'] for row in rows if row['turn'] == turn},
+            archive=True)
+        self.assertIn(rows[0]['record'], memory['compacted_records'])
+        self.assertNotIn(rows[1]['record'], memory['compacted_records'])
+        initial = offered['record']
+        current = [{**notes[0], 'current': True}]
+        self.assertEqual(owner._handoff_provided_sources([offered], rows, current,
+            memory['compacted_records'], initial), [])
+        # A changed or uncited source stays eligible; a note is not evidence.
+        stale = [{**notes[0], 'current': False}]
+        self.assertEqual(owner._handoff_provided_sources([offered], rows, stale,
+            memory['compacted_records'], initial), [offered])
+        changed = {**offered, 'text': 'Changed.'}
+        self.assertEqual(owner._handoff_provided_sources([changed], rows, current,
+            memory['compacted_records'], initial), [changed])
+        selection = {'selected_records': [{'source': offered}], 'required_input_tokens': 1,
+                     'compaction_turns': []}
+        owner._schedule_provided_source_memory(selection, rows, previous, [block(0, 'a'), block(1, 'b')], initial)
+        self.assertTrue(selection['compaction_needed'])
+        self.assertEqual(selection['compaction_turns'], [0])
+        attempted = {'attempted_records': {rows[0]['record']}}
+        selection = {'selected_records': [{'source': offered}], 'required_input_tokens': 1,
+                     'compaction_turns': []}
+        owner._schedule_provided_source_memory(selection, rows, attempted, [block(0, 'a'), block(1, 'b')], initial)
+        self.assertNotIn('compaction_needed', selection)
+
     def test_inspection_history_can_recover_nonfinite_numeric_results(self):
         from simple_ar.tools.inspection import InspectionToolGateway
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))

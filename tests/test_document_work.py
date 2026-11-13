@@ -87,12 +87,21 @@ class DocumentWorkTests(unittest.TestCase):
 
         gateway, clients = self.gateway(root, source, ledger, workspace, decide, context=context)
         gateway.context_policy = 'working.v2'
+        from simple_ar.core.capabilities import ArtifactStore
+        write = ArtifactStore.write_json
+        def interrupt_candidate(owner, path, *args, **kwargs):
+            if path == 'candidate.json':
+                raise KeyboardInterrupt('Stop after the accounted final response')
+            return write(owner, path, *args, **kwargs)
+        with patch.object(ArtifactStore, 'write_json', interrupt_candidate), self.assertRaises(KeyboardInterrupt):
+            gateway.call('work_document', {'goal': 'Revise the result'}, identity='handoff')
+        charges = ledger.to_dict()
         result = gateway.call('work_document', {'goal': 'Revise the result'}, identity='handoff')
         self.assertTrue(result.ok, result.error)
         self.assertEqual(len(clients[0].calls), 3)
         self.assertEqual(len(result.metadata['material_observations']), 1)
         self.assertEqual(len(result.data['provenance']['evidence']), 1)
-        charges = ledger.to_dict()
+        self.assertEqual(ledger.to_dict(), charges)
         self.assertTrue(gateway.call('work_document', {'goal': 'Revise the result'}, identity='handoff').ok)
         self.assertEqual(ledger.to_dict(), charges)
         self.assertEqual(len(clients[0].calls), 3)

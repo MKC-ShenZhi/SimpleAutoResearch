@@ -3394,6 +3394,9 @@ class InspectionToolGateway:
                 notes.append({**note, 'current':current,
                     **({'version_scope':'Source support is incomplete or indirect; reassess before reuse'}
                        if current is None else {})})
+            if saved.get('initial_material_memory') == 'provided.v1':
+                observations = self._handoff_provided_sources(observations, journal_rows, notes,
+                    memory['compacted_records'], self._path(saved['identity'], 'input'))
         else:
             observations = [{'record':self._path(saved['identity'], 'input'),
                 'chunk_id':f"{row['subject']}:{index}", 'subject':row['subject'],
@@ -3522,11 +3525,47 @@ class InspectionToolGateway:
                 } if continuity else {}),
             history_access=('read_history' if history else 'read_file at the recorded authorized source path and range'),
             trailing_messages=[finish] if finish is not None else [])
+        if continuity and saved.get('initial_material_memory') == 'provided.v1':
+            self._schedule_provided_source_memory(metadata, journal_rows, memory, blocks,
+                self._path(saved['identity'], 'input'))
         if validate_capacity and metadata['estimated_input_tokens'] > target:
             raise ValueError('Inspection working view cannot fit the available model input budget; '
                 'retain the requested delivery and observations, then continue with sufficient resources '
                 'or return an honest partial result')
         return messages, metadata
+
+    @staticmethod
+    def _handoff_provided_sources(observations: list[dict], rows: list[dict], notes: list[dict],
+                                  compacted: set[str], initial: str) -> list[dict]:
+        """Retire only supplied windows carried by an applicable cited note."""
+        def source_key(value):
+            return tuple(value.get(key) for key in ('subject', 'path', 'sha256',
+                'offset_bytes', 'next_offset_bytes', 'size_bytes', 'text'))
+        handed_off = {record for note in notes if note.get('current') is True
+                      for record in note.get('records', [])} & compacted
+        provided = {source_key(row['result']['data']): row['record'] for row in rows
+                    if row['result'].get('tool_name') == 'provided_source'}
+        return [row for row in observations
+                if row.get('record') != initial or provided.get(source_key(row)) not in handed_off]
+
+    @staticmethod
+    def _schedule_provided_source_memory(metadata: dict, rows: list[dict], memory: dict,
+                                         blocks: list, initial: str) -> None:
+        """Let the existing checkpoint carry costly, repeated initial sources."""
+        if sum(bool(block) for block in blocks) < 2:
+            return
+        keys = ('subject', 'path', 'sha256', 'offset_bytes', 'next_offset_bytes', 'size_bytes')
+        supplied = {tuple(item['source'].get(key) for key in keys)
+            for item in metadata['selected_records'] if item['source'].get('record') == initial
+            and item['source'].get('kind') == 'source_text'}
+        pending = [row for row in rows if row['result'].get('tool_name') == 'provided_source'
+            and row['record'] not in memory.get('attempted_records', ())
+            and tuple(row['result']['data'].get(key) for key in keys) in supplied]
+        if (pending and estimate_tokens(json.dumps([row['result'] for row in pending], ensure_ascii=False))
+                > metadata['required_input_tokens']):
+            metadata['compaction_needed'] = True
+            metadata['compaction_turns'] = sorted({*metadata.get('compaction_turns', []), 0})
+            metadata['economical_compaction'] = True
 
     def _accessible_history_record(self, row: dict) -> bool:
         try:
@@ -3817,6 +3856,26 @@ class InspectionToolGateway:
             path = self._path(saved['identity'], f'sources-{number}')
             response, results = trace['response'], trace['results']
             calls = response.get('tool_calls') or []
+            if number == 0 and saved.get('initial_material_memory') == 'provided.v1':
+                # The first offer is an actual model input, not a tool call.
+                # Give its supplied source windows the same checkpoint owner as
+                # later reads, while retaining their original offer and bytes.
+                offer = json.loads(trace['offer']['messages'][1]['content'])
+                initial = self._path(saved['identity'], 'input')
+                for index, entry in enumerate(offer.get('working_view', {}).get('observations', [])):
+                    observed = entry['observation']
+                    if (entry.get('version_status') != 'matching' or observed.get('kind') != 'source_text'
+                            or observed.get('record') != initial):
+                        continue
+                    data = {key: observed[key] for key in ('subject', 'path', 'sha256', 'offset_bytes',
+                        'next_offset_bytes', 'size_bytes', 'text') if key in observed}
+                    for key in ('offset_bytes', 'next_offset_bytes'):
+                        if 'supplied_' + key in observed:
+                            data[key] = observed['supplied_' + key]
+                    rows.append({'turn': number, 'record': path + f'#provided/{index}', 'arguments': {},
+                        'result': {'tool_name': 'provided_source', 'status': 'ok', 'data': data,
+                            'scope': 'Source window actually supplied in the initial offer, not a tool call.'},
+                        'decision': response, 'call_id': None, 'source_currentness': 'file_bytes'})
             for index, row in enumerate(results):
                 rows.append({'turn':number, 'record':path+f'#results/{index}',
                     'arguments':row['arguments'], 'result':row['result'],
@@ -3843,10 +3902,11 @@ class InspectionToolGateway:
                 if record not in originals:
                     raise ValueError('Inspection note references work outside its source journal')
                 result = originals[record]
-                if strict and observation_currentness(result) == 'unknown':
+                if (strict and result.get('tool_name') != 'provided_source'
+                        and observation_currentness(result) == 'unknown'):
                     unknown = True
                 data = result.get('data') or {}
-                if result.get('tool_name') == 'read_file' and result.get('status') == 'ok':
+                if result.get('tool_name') in {'read_file', 'provided_source'} and result.get('status') == 'ok':
                     path, digest = data['path'], data['sha256']
                     if strict and path in versions and versions[path] != digest:
                         unknown = True
@@ -3985,7 +4045,8 @@ class InspectionToolGateway:
                 'text':json.dumps(row['result'], ensure_ascii=False),
                 'scope':'Original own operation outcome, including failures; historical execution '
                     'or diagnostic, not current file contents or scientific certification.'}
-                for row in rows if row['result'].get('tool_name') not in {'read_file', 'assistant_reply'})
+                for row in rows if row['result'].get('tool_name') not in {
+                    'read_file', 'assistant_reply', 'provided_source'})
         if saved.get('inspection_material_policy') == 'operations.v3':
             parents = self._retained_inputs(saved) if retained_inputs is None else retained_inputs
             if execution_facts is None:
@@ -4001,7 +4062,8 @@ class InspectionToolGateway:
                         'scope':'Original independent outcome, not an adopted opinion or current file body. '
                             'A missing execution_record means diagnostic history only.'}, ensure_ascii=False)}
                     for row in self._conversation_rows(parent)
-                    if row['result'].get('tool_name') not in {'read_file', 'assistant_reply', 'record_inspection'}
+                    if row['result'].get('tool_name') not in {
+                        'read_file', 'assistant_reply', 'record_inspection', 'provided_source'}
                     and (relevant is None or row['record'] in relevant))
         return memory, observations, rows
 
@@ -5223,6 +5285,9 @@ class InspectionToolGateway:
                 saved['inspection_history_policy'] = 'receipts.v1'
                 if self.context_checkpoint_policy is not None:
                     saved['context_checkpoint_policy'] = self.context_checkpoint_policy
+                    if (self.material_policy == 'operations.v3'
+                            and self.native_supply_policy == TURN_SUPPLY_POLICY):
+                        saved['initial_material_memory'] = 'provided.v1'
             if delivery_context is not None:
                 if (not isinstance(delivery_context, dict)
                         or delivery_context.get('schema_version') not in

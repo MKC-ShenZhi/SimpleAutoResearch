@@ -173,6 +173,10 @@ def checkpoint_arguments(row: dict, decisions: dict[int, dict]) -> Any:
     reply = decisions[row['turn']]
     calls = reply.get('tool_calls') or []
     call_id = row.get('call_id')
+    if call_id is None and row.get('tool') == 'provided_source':
+        if 'recorded_arguments' in row:
+            raise ValueError('A supplied source cannot replace call arguments')
+        return {}  # Owner-projected input, not an executed tool call.
     if call_id is None and row.get('tool') == 'assistant_reply' and not calls:
         if 'recorded_arguments' in row:
             raise ValueError('A reply-only observation cannot replace call arguments')
@@ -244,10 +248,13 @@ def validate_checkpoint_sources(view: dict, *, source: Any, owner: str,
             same = lambda left, right: left == right
 
         truncated = row.get('truncated')
+        currentness = (original.get('source_currentness')
+            if not native and original['result'].get('tool_name') == 'provided_source'
+            else observation_currentness(original['result'], absolute=native)) if strict else None
         if ((type(truncated) is not bool if native else truncated is not False)
                 or not same(arguments, original['arguments'])
                 or strict and (row.get('source_sha256') != observation_digest(original['result'])
-                    or row.get('source_currentness') != observation_currentness(original['result'], absolute=native))):
+                    or row.get('source_currentness') != currentness)):
             raise ValueError(mismatch)
         if native and not truncated:
             present = json.loads(row['observation_text'])
