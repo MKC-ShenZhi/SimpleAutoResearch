@@ -1481,6 +1481,19 @@ class GoalWorkTests(unittest.TestCase):
         self.assertNotIn('work_selection', context)
         self.assertFalse(case.app.state['pending'])
 
+    def test_last_affordable_action_can_leave_work_for_continuation(self):
+        case = self.case
+        root = case.directory / 'one-action'
+        case.app = ToolApplication.create(root, 'Revise the existing note.', model='fixture',
+            services=case.services, sources={}, control_protocol='operations.v1',
+            max_turns=1, max_tokens=100000, max_attempts=12, tool_contracts='full')
+        case.decisions.append(_action('write_file', path='note.md', content='Useful work to continue.\n'))
+        case.app.run(progress=lambda _: None)
+        self.assertEqual((root/'workspace/note.md').read_text(), 'Useful work to continue.\n')
+        self.assertEqual(case.app.session.manifest.status, 'paused')
+        self.assertFalse((root/'delivery.json').exists())
+        self.assertEqual(case.send.call_count, 1)
+
     def test_terminal_json_opinion_uses_the_same_evidence_and_recovery_contract(self):
         from unittest.mock import patch
         case = self.case

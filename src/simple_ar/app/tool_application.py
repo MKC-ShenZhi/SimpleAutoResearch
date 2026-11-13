@@ -2686,7 +2686,8 @@ class ToolApplication:
                     'owner operations to resolve a concrete outstanding delivery condition when feasible; '
                     'their minimum resource estimates do not guarantee completion. Preserve capacity '
                     'for a truthful exit. Deliver useful existing work with actual unfinished requirements '
-                    'in unresolved when checking, publication or repair cannot finish. A candidate review '
+                    'in unresolved when checking, publication or repair cannot finish. If no honest '
+                    'delivery is ready, a useful final action can leave its result for continuation. A candidate review '
                     'is independent evidence, not formal delivery. Final acceptance remains unchanged.')
                 if (selection := getattr(self.operations, 'selection', None)) is not None and selection.policy == 'outcomes.v1':
                     exit_text = selection.closing_system
@@ -2775,7 +2776,7 @@ class ToolApplication:
         if queued:
             path = str(Path(self.state['turns'][-1]['reply']).with_name('decision_budget.json'))
             if (self.session.store.exists(path)
-                    and self.session.store.read_json(path).get('closing_action_contract') == 'single_terminal.v1'
+                    and self.session.store.read_json(path).get('closing_action_contract') in {'single_terminal.v1', 'single_action.v2'}
                     and len(queued) != 1):
                 return False
         if not queued or len(queued) > space:
@@ -2784,6 +2785,18 @@ class ToolApplication:
         exits = [self._terminal_intent(call) or scope_exit is not None and call['function']['name'] == scope_exit
                  for call in queued]
         return exits[-1] and sum(exits) == 1
+
+    def _last_available_action(self) -> bool:
+        """A final decision can leave one actual operation for later continuation."""
+        if not self.state['turns']:
+            return False
+        turn = self.state['turns'][-1]
+        path = str(Path(turn['reply']).with_name('decision_budget.json'))
+        if (not self.session.store.exists(path)
+                or self.session.store.read_json(path).get('closing_action_contract') != 'single_action.v2'):
+            return False
+        calls = self.session.store.read_json(turn['reply']).get('tool_calls') or []
+        return len(calls) == len(turn.get('remaining', [])) == 1
 
     def _owner_finishes_request(self, call: dict[str, Any]) -> bool:
         """A bounded owner may finish without a later coordinator decision.
@@ -4477,7 +4490,7 @@ class ToolApplication:
                         schemas = selector.offer([row for row in self._closing_operation_schemas(lifecycle=lifecycle)
                             if row['function']['name'] in {'ask_user', 'deliver_result'}])
                     elif self.state['config'].get('work_selection_policy') == 'native.v5':
-                        schemas = self._terminal_operation_schemas(self.operation_schemas, include_compound=True)
+                        schemas = self.operation_schemas
                     else:
                         schemas = [row for row in schemas
                             if row['function']['name'] in {'ask_user', 'deliver_result'}]
@@ -4488,7 +4501,7 @@ class ToolApplication:
                         decision_views=decision_views)
                     value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
                     if self.state['config'].get('work_selection_policy') == 'native.v5':
-                        value.closing_contract = 'single_terminal.v1'
+                        value.closing_contract = 'single_action.v2'
                 exit_value = value
             if not closing and handoff_evidence and {'review_result', 'load_tools'} <= {
                     row['function']['name'] for row in schemas}:
@@ -4768,7 +4781,7 @@ class ToolApplication:
             # An explicit caller action likewise needs no speculative model
             # reservation; any model it actually invokes still uses its owner,
             # saved connection and the original physical ledger.
-            needs_followup = not (self._terminal_batch() or self._owner_finishes_request(call)
+            needs_followup = not (self._terminal_batch() or self._last_available_action() or self._owner_finishes_request(call)
                 or self._caller_takeover()
                 or bool(self.state['turns'] and self.state['turns'][-1].get('origin') == 'caller'))
             client = (self._client(context.attempt.attempt_id)
@@ -6418,7 +6431,7 @@ class ToolApplication:
                 attempt_space = self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts
                 if turns and turns[-1].get("remaining"):
                     call = turns[-1]["remaining"][0]
-                    if self._closing_decision() and not self._terminal_batch():
+                    if self._closing_decision() and not (self._terminal_batch() or self._last_available_action()):
                         reason = ('Final decision requires one fitting explicit delivery/question as the '
                             'last action; proposed work retained without execution, not marked complete')
                         self._cancel_unstarted(reason)
