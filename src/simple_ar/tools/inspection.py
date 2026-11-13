@@ -2317,9 +2317,13 @@ class InspectionToolGateway:
                     if executed is None:
                         executed = (set(self._execution_facts(saved, current_inputs=current_inputs))
                             if mixed else self._executed_check_records(saved))
-                    if (not row.execution_records or len(set(row.execution_records)) != len(row.execution_records)
-                            or not set(row.execution_records) <= executed):
-                        raise ValueError('Executed investigations require actual own successful action records')
+                    invalid = set(row.execution_records) - executed
+                    if not row.execution_records or invalid or len(set(row.execution_records)) != len(row.execution_records):
+                        detail = ('no records were supplied' if not row.execution_records else
+                                  'records are repeated' if not invalid else
+                                  'unavailable or non-execution records: ' + ', '.join(sorted(invalid)))
+                        raise ValueError('Executed investigations require actual own successful action records; '
+                            f'investigation {i + 1}: {detail}. Select applicable records from executed_checks.')
                 findings = (row.findings if isinstance(decision, _ClaimDeliveryResponse) else
                     [f for f in decision.findings if f.investigation == i])
                 if row.necessary and row.outcome == 'contradicted' and not any(f.severity == 'required' for f in findings):
@@ -2517,7 +2521,8 @@ class InspectionToolGateway:
                 except (ValueError, OSError, KeyError, TypeError):
                     continue
                 facts[row['record']] = {'inspection':parent['identity'], 'dependencies':dependencies,
-                    'source_record':row['source_record']}
+                    'source_record':row['source_record'], 'argv':row['arguments'].get('argv', []),
+                    'cwd':row['arguments'].get('cwd', 'workspace')}
         return facts
 
     @staticmethod
@@ -3259,7 +3264,17 @@ class InspectionToolGateway:
                     and saved.get('inspection_material_policy') == 'operations.v3'):
                 facts = (execution_facts if execution_facts is not None else
                     self._execution_facts(saved, retained=retained_inputs))
-                base['executed_checks'] = sorted(self._review_execution_names(facts))
+                names = self._review_execution_names(facts)
+                base['executed_checks'] = sorted(names)
+                base['executed_check_details'] = {}
+                for name in base['executed_checks']:
+                    fact = facts[names[name]]
+                    command = json.dumps(fact['argv'], ensure_ascii=False)
+                    base['executed_check_details'][name] = {'cwd': fact['cwd'],
+                        'argv_preview': command if len(command) <= 320 else command[:160] + '…' + command[-160:]}
+                if names:
+                    base['executed_check_scope'] = ('Commands are previews of the accepted executions, '
+                        'not their outputs or proof of a claim. Read the original action for details.')
             else:
                 base['executed_checks'] = sorted(execution_facts if execution_facts is not None
                     else self._executed_check_records(saved))

@@ -212,7 +212,12 @@ class NativeGoalWorkTests(unittest.TestCase):
         self.assertIn('artifacts in the proposed delivery', admit(missing)[1])
         missing = deepcopy(response)
         missing['investigations'][0]['execution_records'] = ['tools/inspection/unknown']
-        self.assertIn('actual own successful action records', admit(missing)[1])
+        error = admit(missing)[1]
+        self.assertIn('actual own successful action records', error)
+        self.assertIn('investigation 1', error)
+        self.assertIn('tools/inspection/unknown', error)
+        missing['investigations'][0]['execution_records'] = []
+        self.assertIn('investigation 1: no records were supplied', admit(missing)[1])
 
         saved['prior_required'] = [{'id': 'a' * 64, 'severity': 'required', 'message': 'Check the result.'}]
         saved['prior_reference_policy'] = 'short.v1'
@@ -1277,6 +1282,10 @@ class GoalWorkTests(unittest.TestCase):
                 return [_action('run_process', cwd=work['path'], argv=[sys.executable, '-c', program,
                     str(case.inputs / 'observations.csv')], inputs=['measurements/observations.csv'],
                     outputs=[work['path'] + '/checked.json'], timeout_sec=5)]
+            details = view['executed_check_details']
+            self.assertEqual(set(details), set(view['executed_checks']))
+            self.assertEqual(next(iter(details.values()))['cwd'], work['path'])
+            self.assertIn('argv_preview', next(iter(details.values())))
             paths = ['measurements/observations.csv', work['path'] + '/checked.json', 'claim.md']
             sources = case._inspection_sources(view, *paths)
             missing = [_action('read_file', path=path) for path, source in zip(paths, sources) if source is None]
