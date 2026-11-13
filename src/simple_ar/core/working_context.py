@@ -623,7 +623,12 @@ def select_working_context(
                     'supplied_entry_ranges': ranges, 'omitted_entries': len(operations) - len(ordered_indices)}
             view['operation_overview'].update(prepared_overview)
         context['material_supply'] = {'native_context':[
-                state['source'] for state in states if state['status']=='native'],
+                {**state['source'], 'version_status': state['version_status'],
+                 **({'version_scope': 'The observed file version matched at selection; this is not a correctness check.'}
+                    if state['version_status'] == 'matching' else
+                    {'version_scope': 'The observed file version no longer matches the current file.'}
+                    if state['version_status'] == 'stale' else {})}
+                for state in states if state['status']=='native'],
             'omitted':[{'record':state['source'].get('record'),'status':state['status']}
                 for state in states if state['status'] not in {'native','working_view'}][-16:],
             'scope':'Native context lists observations in retained messages; other selected observations '

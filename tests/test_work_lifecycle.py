@@ -182,7 +182,7 @@ class WorkLifecycleTests(unittest.TestCase):
             config, _, _, _ = ToolApplication.preview_creation(Path('unused'), 'Do useful work',
                 model='fixture', sources={})
         self.assertEqual(config['work_lifecycle'], 'integrated.v3')
-        self.assertEqual(config['work_selection_policy'], 'native.v4')
+        self.assertEqual(config['work_selection_policy'], 'native.v5')
         app, _ = self.app()
         app.state['turns'] = [{'reply': 'attempts/decision/native_result.json'}]
         app.session.store = SimpleNamespace(exists=lambda _: True, read_json=Mock())

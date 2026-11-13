@@ -26,6 +26,7 @@ from simple_ar.research.workflow_contracts import ResearchBrief
 from simple_ar.research.contracts import DocumentRecord, SourcePlan
 from simple_ar.research.documents.ingest import DocumentBundle, build_document_bundle
 from simple_ar.research.store.retrieval import rank_source_chunks, source_chunk_views
+from simple_ar.research.store.chunking import bounded_document_coverage
 from simple_ar.research.preparation_assets import validate_public_url
 from simple_ar.research.sources.capability import SearchRequest, SearchResult, SearchSelectionPolicy, search_sources, select_search_result
 from simple_ar.research.sources.registry import SearchProviderRegistry, default_search_provider_registry
@@ -723,7 +724,7 @@ class SourceToolGateway:
             if bundle is not None:
                 if len(bundle.records) > policy.max_documents:
                     raise ValueError('Selected bundle exceeds document policy; narrow the material selection')
-                bundle.chunks[:] = bundle.chunks[:policy.max_chunks]
+                bundle.chunks[:] = bounded_document_coverage(bundle.chunks, policy.max_chunks)
                 context.store.write_json('document_bundle.json', bundle.to_handoff_dict())
                 if not any(ref.path == 'document_bundle.json' for ref in artifacts):
                     artifacts.append(context.store.ref('document_bundle.json', kind='document_bundle'))

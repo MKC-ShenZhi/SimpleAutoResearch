@@ -68,7 +68,7 @@ def build_text_chunks(
                     },
                 )
             )
-    return _bounded_document_coverage(chunks, max_chunks)
+    return bounded_document_coverage(chunks, max_chunks)
 
 
 def _chunks_from_sections(
@@ -111,10 +111,10 @@ def _chunks_from_sections(
                 )
             )
             per_document[section.document_id] = per_document.get(section.document_id, 0) + 1
-    return _bounded_document_coverage(chunks, max_chunks)
+    return bounded_document_coverage(chunks, max_chunks)
 
 
-def _bounded_document_coverage(chunks: list[TextChunk], max_chunks: int | None) -> list[TextChunk]:
+def bounded_document_coverage(chunks: list[TextChunk], max_chunks: int | None) -> list[TextChunk]:
     """Keep source order when possible; otherwise share the cap across documents.
 
     A long first PDF must not silently consume the entire reading budget while

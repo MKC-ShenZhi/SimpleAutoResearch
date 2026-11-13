@@ -14,6 +14,8 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Improved
 
 - Working-memory compaction omits duplicate provider reasoning metadata while retaining the original records.
+- When a new ordinary task cannot afford another decision, an authorized final operation can submit its actual delivery with the work; independent review and unfinished requirements still follow the recorded result.
+- Merging retained sources shares the existing text capacity across documents; supplied file observations show whether their versions still match.
 
 ### Fixed
 

@@ -32,7 +32,7 @@ from simple_ar.tools.openai_schema import compact_json_schema, export_openai_too
 from simple_ar.tools.permissions import ToolPermissionPolicy
 from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.extensions import LocalExtension, freeze_extensions
-from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, ToolCompletion, tool_completion, NATIVE_WORK_METHODS, CURRENT_WORK_METHOD, GOAL_WORK_METHOD
+from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, ToolCompletion, tool_completion, NATIVE_WORK_METHODS, CURRENT_WORK_METHOD, GOAL_WORK_METHOD, DIRECT_NATIVE_SELECTION_POLICIES
 from simple_ar.tools.professional_outcomes import (
     accepted_review_journal, check_professional_stop, related_feedback, stop_decision)
 from simple_ar.tools.workspace import (WorkspaceToolGateway, workspace_tool_specs,
@@ -482,7 +482,7 @@ class ToolApplication:
             raise ValueError('Unsupported saved inspection material policy')
         if config.get('inspection_material_policy') and config.get('work_method') != GOAL_WORK_METHOD:
             raise ValueError('Inspection work observations require the goal working contract')
-        if (config.get('work_selection_policy') not in {None, 'explicit.v2', 'native.v3', 'native.v4', 'outcomes.v1'}
+        if (config.get('work_selection_policy') not in {None, 'explicit.v2', 'native.v3', *DIRECT_NATIVE_SELECTION_POLICIES, 'outcomes.v1'}
                 or config.get('work_selection_policy') and config.get('work_method') != GOAL_WORK_METHOD):
             raise ValueError('Unsupported saved work selection policy')
         if config.get('context_checkpoint_policy') and config.get('memory_protocol') != 'journal.v1':
@@ -949,6 +949,7 @@ class ToolApplication:
         Selection is not permission or acceptance. Existing domain validation,
         approval and delivery checks still own every returned action.
         """
+        operations = self.operation_schemas
         if self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES:
             lifecycle = self.operations.delivery.lifecycle_requirements() if lifecycle is None else lifecycle
             needed = lifecycle['minimum_resources'].get('llm_requests', 0)
@@ -957,17 +958,26 @@ class ToolApplication:
             remaining = self.ledger.remaining('llm_requests')
             owner_tools = (set(lifecycle['next_tools']) if remaining is None
                 or remaining >= 2 + needed else set())
-            return [row for row in self.operation_schemas if row['function']['name']
+            if self.state['config'].get('work_selection_policy') == 'native.v5':
+                terminal = {row['function']['name']: row for row in
+                    self._terminal_operation_schemas(operations, include_compound=True)}
+                return [row if row['function']['name'] in owner_tools else terminal[row['function']['name']]
+                    for row in operations if row['function']['name'] in owner_tools | terminal.keys()]
+            return [row for row in operations if row['function']['name']
                 in {'ask_user', 'deliver_result', *owner_tools}]
         if (self.state['config'].get('completion_policy') == _OPERATION_EXIT
                 and self.state['config'].get('work_method') not in NATIVE_WORK_METHODS):
             return self.operation_schemas
         # Restrict the active contracts rather than loading deferred specialists:
         # expanding an on-demand catalog here can evict original input windows.
-        operations = self.operation_schemas
+        return self._terminal_operation_schemas(operations,
+            include_compound=self.state['config'].get('work_method') not in NATIVE_WORK_METHODS)
+
+    def _terminal_operation_schemas(self, operations: list[dict], *, include_compound: bool) -> list[dict]:
+        """Use the registered completion contract for one executable final action."""
         schemas = [row for row in operations
             if (contract := self._completion(row['function']['name'])) is not None and contract.closing
-                and (self.state['config'].get('work_method') not in NATIVE_WORK_METHODS or not contract.field)]
+                and (include_compound or not contract.field)]
         scope_exit = self.operations.scope_exit_tool() if self.operations is not None else None
         if scope_exit is not None:
             schemas.extend(row for row in operations if row['function']['name'] == scope_exit)
@@ -989,6 +999,10 @@ class ToolApplication:
                 if 'anyOf' in delivery:
                     delivery['anyOf'] = [row for row in delivery['anyOf'] if row.get('type') != 'null']
                 delivery.pop('default', None)
+                if include_compound and self.state['config'].get('work_selection_policy') == 'native.v5':
+                    description = delivery.get('description', '')
+                    delivery['description'] = description.removeprefix('Optional ').removeprefix('optional ') + (
+                        ' Required for this final-action offer; disclose unfinished work.')
                 parameters['required'] = list(dict.fromkeys([*parameters.get('required', []), contract.field]))
             result.append(schema)
         return result
@@ -1976,7 +1990,7 @@ class ToolApplication:
                     config['delivery_review_selection'] = 'model.v1'
                     config['working_set_policy'] = 'recent.v5'
                 config['inspection_material_policy'] = 'operations.v3'
-                config['work_selection_policy'] = ('native.v4'
+                config['work_selection_policy'] = ('native.v5'
                     if config.get('work_lifecycle') == 'integrated.v3' else 'native.v3')
         return config, reused, limits, attempts
 
@@ -2832,7 +2846,7 @@ class ToolApplication:
             error = 'This tool contract was not supplied to the decision; no operation executed. Use a currently supplied contract.'
             if 'load_tools' in projection['tool_names']:
                 error += ' To select an optional contract, use load_tools; selection does not grant permission or resources.'
-        elif (self.state['config'].get('work_selection_policy') == 'native.v4'
+        elif (self.state['config'].get('work_selection_policy') in DIRECT_NATIVE_SELECTION_POLICIES
                 and name in {'review_result', 'deliver_result'}
                 and len(self.session.store.read_json(turn['reply']).get('tool_calls', [])) != 1):
             error = ('Observe all selected work before a separate review or delivery decision. '
@@ -3616,6 +3630,14 @@ class ToolApplication:
                 offered = self._offered_operation_names(schemas)
                 context['delivery_conditions']['next_tools'] = [name for name in
                     context['delivery_conditions']['next_tools'] if name in offered]
+                if closing and config.get('work_selection_policy') == 'native.v5':
+                    for row in schemas:
+                        name = row['function']['name']
+                        contract = self._completion(name)
+                        if (contract is not None and contract.closing and contract.field
+                                and contract.field in row['function']['parameters'].get('required', [])
+                                and name not in context['delivery_conditions']['next_tools']):
+                            context['delivery_conditions']['next_tools'].append(name)
         if declared:
             # One operable directory; the resolver still owns exact OS paths
             # and independent file/parent grants. Never broaden a mount here.
@@ -3877,7 +3899,7 @@ class ToolApplication:
             supplies.append(supplied)
             if turn.get('origin') == 'caller' or not complete:
                 boundary = max(boundary, position + 1)
-        if config.get('work_selection_policy') != 'native.v4':
+        if config.get('work_selection_policy') not in DIRECT_NATIVE_SELECTION_POLICIES:
             from simple_ar.app.professional_conversation import continuation_blocks
             blocks = continuation_blocks(blocks, policy=config.get('native_history_policy'),
                 thinking_mode=getattr(client._settings, 'thinking_mode', ''))
@@ -4454,6 +4476,8 @@ class ToolApplication:
                     if selector is not None and selector.policy == 'outcomes.v1':
                         schemas = selector.offer([row for row in self._closing_operation_schemas(lifecycle=lifecycle)
                             if row['function']['name'] in {'ask_user', 'deliver_result'}])
+                    elif self.state['config'].get('work_selection_policy') == 'native.v5':
+                        schemas = self._terminal_operation_schemas(self.operation_schemas, include_compound=True)
                     else:
                         schemas = [row for row in schemas
                             if row['function']['name'] in {'ask_user', 'deliver_result'}]
@@ -4463,6 +4487,8 @@ class ToolApplication:
                         decision_observations=decision_observations, decision_guidance=decision_guidance,
                         decision_views=decision_views)
                     value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
+                    if self.state['config'].get('work_selection_policy') == 'native.v5':
+                        value.closing_contract = 'single_terminal.v1'
                 exit_value = value
             if not closing and handoff_evidence and {'review_result', 'load_tools'} <= {
                     row['function']['name'] for row in schemas}:
@@ -4609,9 +4635,10 @@ class ToolApplication:
                 if self.state['config'].get('professional_inputs') == 'owner.v3' else {}),
             **({'context_protocol': self.state['config']['context_protocol']}
                 if self.state['config'].get('context_protocol') in _CONVERSATION_CONTEXT_PROTOCOLS else {}),
-            **({'closing_action_contract': ('lifecycle_step.v1'
-                if self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES else 'terminal_batch.v1'
-                if self.state['config'].get('completion_policy') == _OPERATION_EXIT else 'single_terminal.v1')}
+            **({'closing_action_contract': (value.closing_contract if conversation and value.closing_contract else
+                'lifecycle_step.v1' if self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES
+                else 'terminal_batch.v1' if self.state['config'].get('completion_policy') == _OPERATION_EXIT
+                else 'single_terminal.v1')}
                 if closing else {}),
             'input_projection': {
                 'resources': projection['resources'],
@@ -4832,8 +4859,8 @@ class ToolApplication:
                 selected_work = self.operations.selected_work_service(call, self.state['turns'][-1],
                     self.session.store, self.state['requests'])
                 spec = self.gateway.registry.get(call['function']['name'])
-                if (selected_work and self.state['config'].get('work_selection_policy') == 'native.v4'
-                        and spec.domain == 'workspace' and self._terminal_intent(call)):
+                if (selected_work and self.operations.direct_completion_allowed(spec)
+                        and self._terminal_intent(call)):
                     selected_work = False
                 service_error = self.operations.service_result_error(
                     spec, payload.get('data') or {}, selected_work=selected_work)
@@ -5529,8 +5556,8 @@ class ToolApplication:
             return
         # A successful in-place output has a new recorded version; unrelated
         # command files and all other inputs still need their approved bytes.
-        outputs = self.workspace.resolved_versions(self.workspace._completed_process_outputs(
-            binding.get('artifacts'), pending['attempt']))
+        output_versions = self.workspace._completed_process_outputs(binding.get('artifacts'), pending['attempt'])
+        outputs = self.workspace.resolved_versions(output_versions)
         cwd = Path(binding.get('cwd', self.workspace.workspace))
         changed_files = [path for path, digest in binding['files'].items()
             if current['files'].get(path) != digest
@@ -5540,7 +5567,8 @@ class ToolApplication:
                 or changed_files):
             raise ValueError('Approved operation inputs changed before receipt recovery')
         if binding.get('artifacts') is not None:
-            self.workspace._check_process_inputs(binding['artifacts'], identity=pending['attempt'])
+            self.workspace._check_process_inputs(binding['artifacts'], identity=pending['attempt'],
+                completed_outputs=output_versions)
 
     def _action_recovery(self, pending: dict, perform: Callable | None) -> Callable | None:
         """Recover only an existing owner's closed receipt, never repeat its effect."""

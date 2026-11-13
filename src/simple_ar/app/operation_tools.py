@@ -12,7 +12,7 @@ from simple_ar.core.assessments import current_assessments
 from simple_ar.tools.gateway import CommonToolGateway
 from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.permissions import ToolPermissionPolicy
-from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS, GOAL_WORK_METHOD
+from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS, GOAL_WORK_METHOD, DIRECT_NATIVE_SELECTION_POLICIES
 from simple_ar.tools.workspace import WorkspaceToolGateway, workspace_tool_specs
 from simple_ar.tools.sources import SourceToolGateway, source_tool_specs
 from simple_ar.tools.publication import PublicationToolGateway, publication_tool_specs
@@ -472,7 +472,7 @@ class OperationTools:
         self.registry.register_package(coordination['specs'],coordination['owner'],request_visible=True)
         self.selection = None
         if config.get('work_method') == GOAL_WORK_METHOD:
-            if config.get('work_selection_policy') not in {'native.v3', 'native.v4'}:
+            if config.get('work_selection_policy') not in {'native.v3', *DIRECT_NATIVE_SELECTION_POLICIES}:
                 from simple_ar.app.work_selection import WorkSelection
                 self.selection = WorkSelection(config.get('work_selection_policy'))
                 self.registry.register_package([self.selection.spec()], self.selection, request_visible=True)
@@ -557,10 +557,10 @@ class OperationTools:
             return None
         from simple_ar.app.professional_conversation import (
             _working_view_encoder, prepare_recorded_work_messages, prepare_work_unit_messages)
-        if (self.config.get('work_selection_policy') != 'native.v4' and self.work is not None
+        if (self.config.get('work_selection_policy') not in DIRECT_NATIVE_SELECTION_POLICIES and self.work is not None
                 and self.work.source_work and self.work.selected() is not None):
             return None
-        prepare = (prepare_work_unit_messages if self.config.get('work_selection_policy') == 'native.v4'
+        prepare = (prepare_work_unit_messages if self.config.get('work_selection_policy') in DIRECT_NATIVE_SELECTION_POLICIES
                    else prepare_recorded_work_messages)
         encode = _working_view_encoder()
         return lambda messages: prepare(messages, encode_context=encode)
@@ -578,7 +578,7 @@ class OperationTools:
                 and self._source_scope() is not None else None)
 
     def _coordinator_eligible(self, spec: CommonToolSpec, scope: dict | None) -> bool:
-        if self.config.get('work_selection_policy') == 'native.v4' and spec.name == 'update_work_plan':
+        if self.config.get('work_selection_policy') in DIRECT_NATIVE_SELECTION_POLICIES and spec.name == 'update_work_plan':
             return False  # New work uses its actual unit and journal, not the saved agenda controller.
         contract = self.config.get('professional_operations')
         if contract in SOURCE_WORK_CONTRACTS:
@@ -607,18 +607,23 @@ class OperationTools:
         return (contract not in COORDINATED_OWNER_CONTRACTS
             or spec.domain != 'workspace' or spec.name in {'list_directory', 'ask_user', 'deliver_result'})
 
+    def direct_completion_allowed(self, spec: CommonToolSpec) -> bool:
+        """Whether this task's direct work may explicitly finish via the tool."""
+        policy, completion = self.config.get('work_selection_policy'), spec.completion
+        return bool(policy in DIRECT_NATIVE_SELECTION_POLICIES and completion and completion.field
+            and (spec.domain == 'workspace' or policy == 'native.v5' and completion.closing))
+
     def service_schemas(self, schemas: list[dict]) -> list[dict]:
         """Project one role snapshot, without rereading the journal per tool."""
-        if self.config.get('work_selection_policy') in {'outcomes.v1', 'native.v4'}:
+        policy = self.config.get('work_selection_policy')
+        if policy in {'outcomes.v1', *DIRECT_NATIVE_SELECTION_POLICIES}:
             result = []
             for row in schemas:
                 spec = self.registry.get(row['function']['name'])
                 # These owners supply outer decisions, never inner work actions.
-                if spec.name in {'select_work', 'review_result', 'deliver_result'} or (
-                        spec.completion is not None and spec.completion.kind == 'question') or (
-                        self.config.get('work_selection_policy') == 'native.v4'
-                        and spec.domain == 'workspace' and spec.completion is not None
-                        and spec.completion.field):
+                if (spec.name in {'select_work', 'review_result', 'deliver_result'}
+                        or spec.completion is not None and spec.completion.kind == 'question'
+                        or self.direct_completion_allowed(spec)):
                     result.append(row)
                     continue
                 schema = spec.service_parameters_schema()
@@ -639,8 +644,9 @@ class OperationTools:
 
     def service_error(self, spec: CommonToolSpec, arguments: dict, *, selected_work: bool = False) -> str:
         if ((selected_work and self.config.get('work_selection_policy') == 'outcomes.v1'
-                or self.config.get('work_selection_policy') == 'native.v4'
-                and spec.domain != 'workspace' and spec.name not in {'review_result', 'deliver_result'})
+                or self.config.get('work_selection_policy') in DIRECT_NATIVE_SELECTION_POLICIES
+                and spec.domain != 'workspace' and spec.name not in {'review_result', 'deliver_result'}
+                and not self.direct_completion_allowed(spec))
                 and spec.completion is not None and spec.completion.kind != 'question'):
             completion = spec.completion
             if (spec.service_parameters_schema() is None
@@ -657,7 +663,7 @@ class OperationTools:
     def selected_work_service(self, call: dict, turn: dict, store: Any, requests: list[str]) -> bool:
         """Recognize a proved outcome work call, never a caller or owner action."""
         policy = self.config.get('work_selection_policy')
-        if (policy not in {'outcomes.v1', 'native.v4'}
+        if (policy not in {'outcomes.v1', *DIRECT_NATIVE_SELECTION_POLICIES}
                 or turn.get('origin') in {'caller', 'professional'}):
             return False
         directory = Path(turn['reply']).parent
@@ -665,7 +671,7 @@ class OperationTools:
         if not store.exists(budget):
             return False
         binding = store.read_json(budget)
-        if policy == 'native.v4':
+        if policy in DIRECT_NATIVE_SELECTION_POLICIES:
             if binding.get('tool_admission') != 'offered.v1':
                 return False
             reply = store.read_json(turn['reply'])

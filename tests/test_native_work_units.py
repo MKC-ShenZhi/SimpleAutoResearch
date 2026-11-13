@@ -362,7 +362,8 @@ class NativeWorkQueueTests(unittest.TestCase):
             context = json.loads(request['messages'][1]['content'])
             self.assertNotIn('review_result', offered)
             self.assertIn('deliver_result', offered)
-            self.assertEqual(context['delivery_conditions']['next_tools'], ['deliver_result'])
+            self.assertIn('deliver_result', context['delivery_conditions']['next_tools'])
+            self.assertTrue(set(context['delivery_conditions']['next_tools']) <= offered)
             return fixture._action('deliver_result', summary='Candidate note', artifacts=['note.md'],
                 unresolved=['Independent review remains unfinished.'])
 
@@ -388,8 +389,8 @@ class NativeWorkQueueTests(unittest.TestCase):
 
         def choose():
             request = c.send.call_args.kwargs.get('request') or c.send.call_args.args[1]
-            offered = {row['function']['name'] for row in request['tools']}
-            self.assertNotIn('write_file', offered)
+            offered = {row['function']['name']: row['function']['parameters'] for row in request['tools']}
+            self.assertIn('delivery', offered['write_file']['required'])
             self.assertIn('deliver_result', offered)
             return fixture._action('deliver_result', **claim,
                 unresolved=['The revised note still needs independent review.'])
@@ -423,6 +424,60 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertEqual((c.root / 'workspace/note.md').read_text(), 'Available work.\n')
         self.assertEqual(c.app.session.store.read_json('delivery.json')['unresolved'],
             ['The requested analysis remains unfinished.'])
+
+    def test_final_decision_can_run_authorized_work_and_deliver_its_partial_result(self):
+        c = self.case
+        c.root = c.directory / 'final-process'
+        c.app = ToolApplication.create(c.root, 'Check the note and disclose unfinished review.',
+            model='fixture', sources={}, services=c.services, allow_execution=True,
+            max_turns=1, max_tokens=200000, max_attempts=20, tool_contracts='full')
+        c._write('note.md', 'Available work.\n')
+        c.decisions.append(fixture._action('run_process', argv=[sys.executable, '-c',
+            "from pathlib import Path; Path('checked.txt').write_text(Path('note.md').read_text())"],
+            inputs=['note.md'], outputs=['checked.txt'], delivery={
+                'summary': 'Checked copy', 'artifacts': ['note.md', 'checked.txt'],
+                'unresolved': ['Independent review remains unfinished.']}))
+        self.drain(approve=lambda *_: True)
+        self.assertEqual(c.app.session.manifest.status, 'partial', c.app.result_snapshot())
+        self.assertEqual((c.root / 'workspace/checked.txt').read_text(), 'Available work.\n')
+        turn = next(row for row in c.app.state['turns'] if row.get('origin') != 'caller')
+        decision = c.app.session.store.read_json(str(Path(turn['reply']).with_name('decision_budget.json')))
+        self.assertEqual(decision['closing_action_contract'], 'single_terminal.v1')
+        self.assertIn('run_process', decision['input_projection']['tool_names'])
+        self.assertEqual(c.app.session.store.read_json('delivery.json')['unresolved'],
+            ['Independent review remains unfinished.'])
+        self.assertFalse(c.inspection_requests)
+
+    def test_saved_native_contract_keeps_publication_as_a_service(self):
+        c = self.case
+        c.app.state['config']['work_selection_policy'] = 'native.v4'
+        c.app._save()
+        c._reload()
+        schemas = {row['function']['name']: row['function']['parameters'] for row in c.app.schemas}
+        self.assertNotIn('delivery', schemas['export_report']['properties'])
+
+    @unittest.skipUnless(os.environ.get('SAR_TEST_EXPORT_INTEGRATION') == '1',
+        'Real publication runs in the server integration phase')
+    def test_final_publication_can_deliver_its_actual_output(self):
+        if not shutil.which('pandoc'):
+            self.skipTest('Publication integration needs Pandoc')
+        c = self.case
+        c.root = c.directory / 'final-publication'
+        c.app = ToolApplication.create(c.root, 'Export the note and disclose unfinished review.',
+            model='fixture', sources={}, services=c.services, allow_execution=True,
+            max_turns=1, max_tokens=200000, max_attempts=20, tool_contracts='full')
+        c._write('note.md', '# Note\n\nAvailable work.\n')
+        c.decisions.append(fixture._action('export_report', markdown='note.md',
+            layout='article', compile_pdf=False, delivery={
+                'summary': 'Editable publication', 'artifacts': ['note.md'],
+                'unresolved': ['Independent review remains unfinished.']}))
+        self.drain(approve=lambda *_: True)
+        self.assertEqual(c.app.session.manifest.status, 'partial', c.app.result_snapshot())
+        exported = c._ok('export_report')
+        self.assertTrue((c.app.workspace.resolve(exported['data']['project']) / 'main.tex').is_file())
+        self.assertEqual(c.app.session.store.read_json('delivery.json')['unresolved'],
+            ['Independent review remains unfinished.'])
+        self.assertFalse(c.inspection_requests)
 
     def test_workspace_write_submits_actual_output_for_independent_review(self):
         c = self.case
@@ -535,6 +590,16 @@ class NativeServiceTests(unittest.TestCase):
         self.assertIn('secret_claim', result['data'])
         self.assertFalse((c.root/'delivery.json').exists())
         self.assertFalse(c.inspection_requests)
+
+    def test_new_native_service_cannot_claim_unrequested_completion(self):
+        c = self.case
+        c.app.state['config']['work_selection_policy'] = 'native.v5'
+        c.app._save()
+        c._reload()
+        c.decisions.append(fixture._action('service_demo__rogue'))
+        self.old.drain()
+        self.assertEqual(c._last('service_demo__rogue')['status'], 'blocked')
+        self.assertFalse((c.root/'delivery.json').exists())
 
 
 if __name__ == '__main__':

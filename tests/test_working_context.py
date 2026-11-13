@@ -1442,6 +1442,7 @@ class ReferencedWorkingContextTests(unittest.TestCase):
         self.assertEqual(budget['selected_records'][0]['status'], 'native')
         native = json.loads(messages[1]['content'])['material_supply']['native_context']
         self.assertEqual([row['record'] for row in native], [rows[1]['record']])
+        self.assertEqual(native[0]['version_status'], 'matching')
         supply = json.loads(messages[1]['content'])['material_supply']['references']
         self.assertEqual([entry['status'] for entry in supply], ['duplicate', 'native'])
 
@@ -1470,6 +1471,19 @@ class ReferencedWorkingContextTests(unittest.TestCase):
                 self.assertTrue(any(state['status'] == 'stale' and state['source']['sha256'] == 'earlier-version'
                     for state in states))
         self.assertEqual(originals, before)
+
+    def test_native_material_shows_when_its_observed_version_has_changed(self):
+        row = observation(0, 'Previously read source', kind='source_text',
+                          role='historical_observation', field='data.text')
+        visible = [{key: value for key, value in row.items() if key != 'text'}]
+        for version, expected in (('recorded-digest', 'matching'), ('new-digest', 'stale'), (None, 'unknown')):
+            with self.subTest(version=version):
+                messages, _ = select(material_policy='retained', observations=[row],
+                    turn_blocks=[block(0, row['text'])], native_observations=visible,
+                    version_resolver=lambda _: version, context_token_target=10000)
+                native = json.loads(messages[1]['content'])['material_supply']['native_context']
+                self.assertEqual(native[0]['version_status'], expected)
+                self.assertIn(row['text'], json.dumps(messages))
 
     def test_referenced_oversized_text_is_not_lexically_rewritten(self):
         row = observation(0, 'Compare source measurements. ' * 1000)

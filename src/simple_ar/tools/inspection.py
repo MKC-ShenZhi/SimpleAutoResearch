@@ -914,12 +914,13 @@ class InspectionToolGateway:
         """Validate relevant accepted input facts without deriving an approval."""
         accepted = self._accepted_execution_binding(receipt)
         artifacts = accepted.get('artifacts')
+        output_versions = self.workspace._completed_process_outputs(artifacts, receipt['attempt'])
         current_inputs = {}
         if artifacts is not None:
-            current_inputs = self.workspace._check_process_inputs(artifacts, identity=receipt['attempt'])
+            current_inputs = self.workspace._check_process_inputs(artifacts, identity=receipt['attempt'],
+                completed_outputs=output_versions)
         cwd = self.workspace.resolve(arguments['cwd'], write=True)
-        outputs = self.workspace.resolved_versions(self.workspace._completed_process_outputs(
-            artifacts, receipt['attempt']))
+        outputs = self.workspace.resolved_versions(output_versions)
         versions = {}
         for value, digest in accepted.get('files', {}).items():
             try:

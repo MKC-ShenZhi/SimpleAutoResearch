@@ -207,6 +207,7 @@ class ConversationInput:
     projection: dict
     closing: bool = False
     reserve: dict | None = None
+    closing_contract: str | None = None
 
 
 class ProfessionalConversation:

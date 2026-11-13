@@ -219,7 +219,7 @@ class RevisionInspectionFlowTests(unittest.TestCase):
         case.app = ToolApplication.create(case.root, 'Prepare a bounded note from the supplied observations.',
             model='fixture', sources={'measurements': case.inputs}, services=case.services,
             allow_execution=True, max_turns=8, max_tokens=900000, tool_contracts='on_demand')
-        self.assertEqual(case.app.state['config']['work_selection_policy'], 'native.v4')
+        self.assertEqual(case.app.state['config']['work_selection_policy'], 'native.v5')
         self.assertEqual(case.app.state['config']['work_lifecycle'], 'integrated.v3')
         case._write('note.md', 'The population is characterized.\n')
         owner = case.app.operations.inspection
