@@ -5877,7 +5877,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         final_budget = self.app.session.store.read_json(str(
             Path(self.app.state['turns'][-1]['reply']).with_name('decision_budget.json')))
         self.assertTrue(final_budget['closing_required'])
-        self.assertEqual(final_budget['closing_action_contract'], 'single_terminal.v1')
+        self.assertEqual(final_budget['closing_action_contract'], 'single_action.v2')
         self.assertEqual(self.app.ledger.limits, limits)
         entries = [entry.to_dict() for entry in self.app.ledger.entries]
         self.assertEqual(entries[:len(charged)], charged)

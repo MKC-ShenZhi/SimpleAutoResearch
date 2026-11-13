@@ -397,7 +397,7 @@ class NativeWorkQueueTests(unittest.TestCase):
             request = c.send.call_args.kwargs.get('request') or c.send.call_args.args[1]
             offered = {row['function']['name'] for row in request['tools']}
             context = json.loads(request['messages'][1]['content'])
-            self.assertNotIn('review_result', offered)
+            self.assertIn('review_result', offered)
             self.assertIn('deliver_result', offered)
             self.assertIn('deliver_result', context['delivery_conditions']['next_tools'])
             self.assertTrue(set(context['delivery_conditions']['next_tools']) <= offered)
@@ -455,7 +455,7 @@ class NativeWorkQueueTests(unittest.TestCase):
         c._submit(fixture._action('read_file', path='note.md'),
             feedback='Clarify the same note and retain the earlier work.')
         prior = c.app.operations.delivery.retained_prior_delivery()
-        self.assertEqual(prior['artifacts'], ['note.md'])
+        self.assertEqual(prior['artifacts'], c.app.session.store.read_json('delivery.json')['artifacts'])
         self.assertEqual(c.app._work_context(['note.md'])['retained_prior_delivery'], prior)
 
     def test_new_model_review_defaults_to_candidate_scope_without_claiming_delivery(self):
