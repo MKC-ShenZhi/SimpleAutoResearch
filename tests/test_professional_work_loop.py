@@ -112,6 +112,62 @@ def _assessments(result):
 
 
 class OperationsWorkLoopTests(unittest.TestCase):
+    def test_budget_denied_model_action_closes_without_replaying_unknown_work(self):
+        from simple_ar.core.budget import BudgetExceededError
+        from simple_ar.integrations.llm import LLMError
+
+        self._create()
+        registry = self.app.session.registry
+        original = registry.resolve('native_action')
+        message = 'LLM budget prevented provider attempt 1 for inspection: Budget exceeded'
+
+        def action(identity):
+            return {'attempt': identity, 'kind': 'model',
+                'origin': {'scope': 'inspection', 'position': identity, 'kind': 'model'}}
+
+        def old_owner(*, context, accepted, perform):
+            context.store.write_json('action.json', accepted, kind='operation_binding')
+            raise LLMError(message)
+
+        legacy = action('old-budget-denial')
+        registry.register('native_action', old_owner, replace=True)
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'Operation failed'):
+                self.app._attempt('native_action', legacy, perform=lambda _: self.fail('No model call'))
+        finally:
+            registry.register('native_action', original, replace=True)
+        original_failure = self.app.session.store.resolve(
+            'attempts/old-budget-denial/capability_result.json').read_bytes()
+        before = self.app.ledger.to_dict()
+        recovered = self.app._attempt('native_action', legacy, perform=lambda _: self.fail('No replay'))
+        result = self.app.session.store.read_json(recovered)
+        self.assertEqual(result['status'], 'blocked')
+        self.assertTrue(result['metadata']['budget_rejected_before_dispatch'])
+        self.assertEqual(self.app.ledger.to_dict(), before)
+        self.assertEqual(self.app.session.store.resolve(
+            'attempts/old-budget-denial/capability_result.json').read_bytes(), original_failure)
+
+        def denied(_):
+            try:
+                raise BudgetExceededError('No remaining requests')
+            except BudgetExceededError as exc:
+                raise LLMError(message) from exc
+
+        current = self.app._attempt('native_action', action('new-budget-denial'), perform=denied)
+        self.assertTrue(self.app.session.store.read_json(current)['metadata']['budget_rejected_before_dispatch'])
+
+        uncertain = action('uncertain-model')
+        registry.register('native_action', old_owner, replace=True)
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'Operation failed'):
+                self.app._attempt('native_action', uncertain, perform=lambda _: self.fail('No model call'))
+        finally:
+            registry.register('native_action', original, replace=True)
+        self.app.ledger.reserve('uncertain', {'llm_requests': 1}, attempt_id='uncertain-model')
+        self.app.ledger.mark_unknown('uncertain', reason='Provider response unavailable')
+        with self.assertRaisesRegex(RuntimeError, 'no replay'):
+            self.app._attempt('native_action', uncertain, perform=lambda _: self.fail('No replay'))
+
     def test_in_place_process_keeps_approval_and_recovers_without_reexecution(self):
         self._create()
         self._write('draft.md', 'before\n')

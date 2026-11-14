@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from simple_ar.core.budget import BudgetLedger, completed_llm_usage_is_accounted
+from simple_ar.core.budget import BudgetError, BudgetLedger, completed_llm_usage_is_accounted
 from simple_ar.app.task_view import history_observation, saved_work_connection
 from simple_ar.core.working_context import history_view, input_capacity, RECEIPT_SUPPLY_POLICIES, TURN_SUPPLY_POLICY
 from simple_ar.core.capabilities import ArtifactRef, ArtifactStore, AttemptManifest, CapabilityContext, CapabilityRegistry, CapabilityResult
@@ -5661,7 +5661,22 @@ class ToolApplication:
             return lambda: perform(pending['attempt'])
         if pending['kind'] == 'model':
             recovery = getattr(perform, 'recover', None)
-            return (lambda: recovery(pending['attempt'])) if recovery is not None else None
+            if recovery is not None:
+                return lambda: recovery(pending['attempt'])
+            # Earlier action owners persisted a pre-dispatch budget rejection as
+            # a failed attempt rather than a closed observation. Its exact
+            # diagnostic and absent reservation establish that no provider call
+            # occurred; retain the failure and publish only that fact.
+            store = ArtifactStore(self.session.store.root / 'attempts' / pending['attempt'])
+            if store.exists('capability_result.json') and not any(
+                    row.attempt_id == pending['attempt'] for row in self.ledger.entries):
+                result = store.read_capability_result()
+                if (result.status == 'failed' and result.provenance.get('capability') == 'native_action'
+                        and len(result.diagnostics) == 1
+                        and result.diagnostics[0].startswith('LLMError: LLM budget prevented provider attempt 1 for ')):
+                    return lambda: ToolResult(tool_name='native_action', status='blocked',
+                        error=result.diagnostics[0], metadata={'budget_rejected_before_dispatch': True}).model_dump(mode='json')
+            return None
         call = pending.get('call') or {}
         name = call.get('function', {}).get('name', '')
         if self.gateway.can_reconcile(ToolCall(tool_name=name, trace_id=pending['attempt'])):
@@ -6380,6 +6395,12 @@ class ToolApplication:
             observed = ToolResult(tool_name='native_action', status='blocked',
                 error='Caller stopped before provider dispatch; no independent opinion was produced',
                 metadata={'stopped_before_dispatch': True}).model_dump(mode='json')
+        except LLMError as exc:
+            if (accepted.get('kind') != 'model' or not isinstance(exc.__cause__, BudgetError)
+                    or any(row.attempt_id == context.attempt.attempt_id for row in self.ledger.entries)):
+                raise
+            observed = ToolResult(tool_name='native_action', status='blocked', error=str(exc),
+                metadata={'budget_rejected_before_dispatch': True}).model_dump(mode='json')
         if accepted.get('result_sha256') is not None and accepted['result_sha256'] != hashlib.sha256(
                 json.dumps(observed, sort_keys=True, ensure_ascii=False).encode()).hexdigest():
             raise ValueError('Operation result differs from its accepted conclusion')

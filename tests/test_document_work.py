@@ -173,7 +173,7 @@ class DocumentWorkTests(unittest.TestCase):
         result = gateway.call('work_document', {'goal': 'Explain the source'}, identity='backtrack')
         self.assertTrue(result.ok, result.error)
         self.assertIn('twelve days', result.data['markdown'])
-        record = root / result.data['provenance']['writer_source_reads']
+        record = workspace.resolve(result.data['provenance']['writer_source_reads'])
         observed = json.loads(record.read_text(encoding='utf-8'))['tool_results']
         lookup = next(row for row in observed if row['tool_name'] == 'search_source_chunks')
         self.assertEqual(lookup['content']['search_scope'], 'persisted_extracted_text')
