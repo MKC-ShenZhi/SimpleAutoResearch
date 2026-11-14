@@ -24,17 +24,22 @@ def freeze_report_requirement(settings: dict[str, Any], *, method: str | None = 
 
 
 def validate_report_requirement(value: dict[str, Any]) -> dict[str, Any]:
-    from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
-    from simple_ar.report.writing import validate_report_writing_config
+    from simple_ar.report.schema import ReportTemplateBundle
     if set(value) != {'method', 'config', 'template', 'outline'}:
         raise ValueError('Unknown frozen report requirement')
-    config = ReportRuntimeConfig.model_validate(value['config'])
-    validate_report_writing_config(config, method=value['method'])
+    validate_report_settings(value['config'], method=value['method'])
     ReportTemplateBundle.model_validate(value['template'])
     if any(set(row) != {'heading', 'required'} or type(row['required']) is not bool
            or not isinstance(row['heading'], str) or not row['heading'].strip() for row in value['outline']):
         raise ValueError('Invalid frozen report outline')
     return value
+
+
+def validate_report_settings(settings: dict[str, Any], *, method: str) -> None:
+    """Apply the same Writer configuration contract to both session recipes."""
+    from simple_ar.report.schema import ReportRuntimeConfig
+    from simple_ar.report.writing import validate_report_writing_config
+    validate_report_writing_config(ReportRuntimeConfig.model_validate(settings), method=method)
 
 
 def working_report_requirement(value: dict[str, Any], *, for_writing: bool = False) -> dict[str, Any]:

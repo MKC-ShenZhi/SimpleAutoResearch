@@ -77,7 +77,7 @@ def delivery_evidence(owner: Any, observations: list[dict], delivery: dict | Non
     validates/traverses its declared process edges; reuse its checked cache.
     """
     from simple_ar.tools.implementation_work import _accepted, _execution
-    from simple_ar.tools.writing import accepted_composition_receipt
+    from simple_ar.report.composition_receipts import accepted_composition_receipt
     from simple_ar.tools.workspace import DeliveryRequest
     preparations = [row for row in observations if row.get('tool_name') == 'prepare_implementation']
     executions = [row for row in observations if row.get('tool_name') == 'execute_implementation']
@@ -106,7 +106,7 @@ def delivery_evidence(owner: Any, observations: list[dict], delivery: dict | Non
             workspace=owner.workspace, session_id=owner.session_id, ledger=owner.ledger,
             observed=observed)
         if binding.get('delivery_review', {}).get('producer_completion') == 'goal_findings.v1':
-            from simple_ar.tools.writing import read_composition_review
+            from simple_ar.report.composition_receipts import read_composition_review
             from simple_ar.report.writing import validate_document_inspection
             review = read_composition_review(owner.workspace, data)
             if (review.get('review_status') != 'reviewed' or data.get('unresolved') or data.get('incomplete')
@@ -380,7 +380,7 @@ def freeze_producer_context(owner: Any, artifacts: list[dict]) -> dict:
 def delivery_adoptions(owner: Any, observations: list[dict], delivery: dict | None,
                        proposed: Any = None) -> list[dict]:
     """Writing owner's proof for the canonical manuscript actually delivered."""
-    from simple_ar.tools.writing import accepted_composition_receipt
+    from simple_ar.report.composition_receipts import accepted_composition_receipt
     from simple_ar.report.writing import validate_document_inspection
     if not delivery:
         return []

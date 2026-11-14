@@ -714,13 +714,12 @@ class ResearchApplication:
             updated_config["execution"] = requested_execution
         report_config_changed = False
         if revised_report_config is not None:
-            from simple_ar.report.schema import ReportRuntimeConfig
-            from simple_ar.report.writing import validate_report_writing_config
+            from simple_ar.report.requirements import validate_report_settings
             old_report = updated_config.get("report", {})
             old_report = dict(old_report) if isinstance(old_report, Mapping) else {}
             merged_report = {**old_report, **dict(revised_report_config)}
             try:
-                validate_report_writing_config(ReportRuntimeConfig.model_validate(merged_report),
+                validate_report_settings(merged_report,
                     method=str(self.services.config.get("report_writing_method", "sections")))
             except (TypeError, ValueError) as exc:
                 raise ResearchApplicationError(f"Invalid revised report configuration: {exc}") from exc
@@ -1028,10 +1027,9 @@ class ResearchApplication:
         saved = self.services.config.get("report", {})
         saved = saved if isinstance(saved, Mapping) else {}
         if self.services.config.get("report_writing_method", "sections") == "article":
-            from simple_ar.report.schema import ReportRuntimeConfig
-            from simple_ar.report.writing import validate_report_writing_config
+            from simple_ar.report.requirements import validate_report_settings
             try:
-                validate_report_writing_config(ReportRuntimeConfig.model_validate({**saved, **supplied}), method="article")
+                validate_report_settings({**saved, **supplied}, method="article")
             except (TypeError, ValueError) as exc:
                 raise ResearchApplicationError(str(exc)) from exc
         if not changes_only:
@@ -1062,11 +1060,10 @@ class ResearchApplication:
         updated_report_config = {**previous_report_config, **dict(report_config or {})}
         report_config_changed = updated_report_config != dict(previous_report_config)
         if report_config is not None:
-            from simple_ar.report.schema import ReportRuntimeConfig
-            from simple_ar.report.writing import validate_report_writing_config
+            from simple_ar.report.requirements import validate_report_settings
 
             try:
-                validate_report_writing_config(ReportRuntimeConfig.model_validate(updated_report_config),
+                validate_report_settings(updated_report_config,
                     method=str(self.services.config.get("report_writing_method", "sections")))
             except (TypeError, ValueError) as exc:
                 raise ResearchApplicationError(f"Invalid report configuration: {exc}") from exc

@@ -7,11 +7,26 @@ these historical composition requirements.
 from __future__ import annotations
 import json
 from typing import Any, Callable, Iterable
+from pydantic import BaseModel, ConfigDict, Field
 from simple_ar.report.requirements import freeze_report_requirement, validate_report_requirement
 from simple_ar.tools.specs import ToolResult
 
 _REPORT_PROTOCOL = 'canonical_report.v1'
 _DECLARED_INPUTS = 'declared_inputs.v1'
+
+BOUND_REPORT_REVISION = (
+    'For a bound report, every revision, including a review fix within the same request, '
+    'uses compose_document with prior_draft to create a new canonical composition. '
+    'Direct file edits or copies do not update its evidence/version receipt and cannot '
+    'serve as the current canonical report, even if an older receipt summary suggested editing. '
+    'Preserve prior versions and export the adopted version.'
+)
+
+
+class ProfessionalReview(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    max_revision_rounds: int = Field(default=0, ge=0, le=3,
+        description='Independent document inspection followed by at most this many existing editor revision rounds. Zero inspects only; unresolved findings remain explicit.')
 
 
 def material_report_binding(workspace: Any, requirement: dict[str, Any], *,
@@ -135,7 +150,6 @@ def declare_report(intent: Any, *, config: dict, requests: list[str], previous: 
         # Ordinary complete work includes one bounded correction, not an
         # inspection-only default that makes users configure the editor.
         # Explicit/frozen controls and all existing obligations prevail.
-        from simple_ar.tools.writing import ProfessionalReview
         requested_review = ProfessionalReview(max_revision_rounds=1)
     if requested_review is not None:
         if data['kind'] != 'report':

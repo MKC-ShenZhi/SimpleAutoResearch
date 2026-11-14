@@ -463,7 +463,7 @@ def delivery_issues(owner: Any, observations: list[dict], *, delivery: dict | No
             # carry this obligation; notes and evidence quotes do not accuse files.
             try:
                 from simple_ar.report.writing import validate_document_inspection
-                from simple_ar.tools.writing import accepted_composition_receipt, read_composition_review
+                from simple_ar.report.composition_receipts import accepted_composition_receipt, read_composition_review
                 delivered = owner.workspace.resolve_delivery(DeliveryRequest.model_validate(delivery))['artifacts']
                 hashes = owner.workspace.artifact_hashes(delivered)
                 current = {owner.workspace.resolve(path): digest for path, digest in hashes.items()}

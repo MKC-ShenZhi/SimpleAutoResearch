@@ -47,7 +47,7 @@ from simple_ar.tools.visual import VisualToolGateway, visual_tool_specs
 from simple_ar.tools.images import ImageToolGateway, image_tool_specs
 from simple_ar.tools.publication import (PublicationToolGateway, publication_tool_specs, ExportRequest,
     PUBLICATION_ASSET_PROTOCOL, PUBLICATION_CONSUMER_PROTOCOL)
-from simple_ar.tools.writing import BOUND_REPORT_REVISION, DocumentWorkRequest, ProfessionalReview, WritingToolGateway, writing_tool_specs
+from simple_ar.report.legacy_contract import BOUND_REPORT_REVISION, ProfessionalReview
 from simple_ar.tools.implementation import ExactCodeTask, ImplementationWorkRequest, ImplementationToolGateway, implementation_tool_specs
 from simple_ar.tools.analysis import AnalysisToolGateway, analysis_tool_specs
 from simple_ar.research.sources import SearchProviderRegistry
@@ -604,6 +604,7 @@ class ToolApplication:
         if config.get('control_protocol') is not None:
             self._configure_operations()
             return
+        from simple_ar.tools.writing import WritingToolGateway, writing_tool_specs
         from simple_ar.tools.materials import verify_source_snapshots
         verify_source_snapshots(config['sources'], config.get('source_snapshots', {}))
         if (type(config.get('tool_contracts', 'full')) is not str
@@ -891,6 +892,7 @@ class ToolApplication:
             if self.writing.document_work and row['function']['name'] == 'compose_document':
                 parameters = row['function']['parameters']
                 if self.state['config'].get('professional_inputs') == 'owner.v3':
+                    from simple_ar.tools.writing import DocumentWorkRequest
                     parameters = DocumentWorkRequest.model_json_schema()
                     parameters.setdefault('required', [])
                 elif (self.state['config'].get('tool_contracts', 'full') != 'full'
@@ -1424,11 +1426,20 @@ class ToolApplication:
             return self._collect_work_feedback(targets)
 
     def _collect_work_feedback(self, targets: list[str]) -> dict[str, Any]:
+        # The operations contract never exposed the historical document-review
+        # tool. Avoid rereading its whole journal when neither historical
+        # document reviews nor vision reviews can exist in this saved task.
+        owners = {}
+        if self.operations is None:
+            from simple_ar.report.composition_receipts import RetainedDocumentReview
+            owners['review_document'] = RetainedDocumentReview
+        if self.operations is None or self.state['config'].get('allow_vision'):
+            owners['inspect_images'] = VisualToolGateway
         context = {'review_observations': related_feedback(
             self.workspace, self.session.store, self.session.manifest.session_id,
-            self.state['turns'], targets,
-            {'inspect_images': VisualToolGateway, 'review_document': WritingToolGateway},
-            copy_lineage=self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES)}
+            self.state['turns'], targets, owners,
+            copy_lineage=self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES)
+            if owners else []}
         findings = self.gateway.professional_inputs(targets)
         if findings:
             context['professional_findings'] = findings
@@ -1805,7 +1816,7 @@ class ToolApplication:
             if any(row.get('before_implementation') for row in measurement_conditions(execution_contract)):
                 raise ValueError('Pre-implementation conditions require a frozen code task')
         if report_requirement is not None:
-            from simple_ar.tools.writing import validate_report_requirement
+            from simple_ar.report.requirements import validate_report_requirement
             report_requirement = validate_report_requirement(report_requirement)
         # Preflight connection/protocol before creating a session or making a call.
         dependencies = _runtime_bindings(services)
@@ -2887,6 +2898,7 @@ class ToolApplication:
             try:
                 if binding['document_request'] not in {'work.v1', 'work.v2'}:
                     raise ValueError('Unknown saved document request contract')
+                from simple_ar.tools.writing import DocumentWorkRequest
                 request = DocumentWorkRequest.model_validate_json(call['function']['arguments'])
                 if binding['document_request'] == 'work.v1' and request.prior_result:
                     raise ValueError('prior_result was not supplied by the historical document request contract')

@@ -1,7 +1,7 @@
 """Read-only historical research-session results.
 
-New sessions are created and advanced by research_application. This module
-does not own a second literature-to-experiment workflow.
+New research sessions use the common task entry. This module only reads the
+older research-to-experiment result contract; it does not advance a task.
 """
 
 from __future__ import annotations
@@ -155,9 +155,8 @@ def load_research_session_result(
             controller.store.read_json(document_ref)
         )
 
-        # New sessions expose Read and Synthesis as separate attempts. Keep
-        # the old aggregate handoff readable so historical sessions remain
-        # usable after this migration.
+        # Some historical sessions have separate Read and Synthesis attempts;
+        # earlier ones retain the aggregate handoff.
         if any(item.attempt_id == "read-001" for item in attempts):
             read_ref = controller.attempt_output_ref(
                 "read-001",

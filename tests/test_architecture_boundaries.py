@@ -96,6 +96,25 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
+    def test_common_research_report_setup_does_not_load_legacy_writing_gateway(self) -> None:
+        probe = (
+            "import sys, tempfile; from pathlib import Path; "
+            "from simple_ar.app.tool_application import ToolApplication; "
+            "from simple_ar.report.requirements import freeze_report_requirement; "
+            "root = tempfile.TemporaryDirectory(); "
+            "requirement = freeze_report_requirement({'max_cited_sources': 2}); "
+            "app = ToolApplication.create(Path(root.name) / 'task', 'Explain supplied research', "
+            "model=None, control_protocol='operations.v1', report_requirement=requirement); "
+            "assert app.operations is not None; "
+            "assert app._work_context([])['review_observations'] == []; "
+            "assert 'simple_ar.tools.writing' not in sys.modules"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True,
+            timeout=SUBPROCESS_TIMEOUT_SEC, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
     def test_embedded_code_task_spec_reads_large_edit_approval_from_toml(self) -> None:
         test_tmp_root = Path(__file__).resolve().parents[1] / ".tmp_tests"
         test_tmp_root.mkdir(exist_ok=True)

@@ -24,7 +24,7 @@ def _repair_view(owner: Any, locator: str, observed: dict,
                  originals: dict, windows: list[dict], *, dynamic_windows: bool = False) -> dict:
     """Project one verified diagnosis; retain the full inspection as authority."""
     import copy
-    from simple_ar.tools.writing import read_repair_review
+    from simple_ar.report.composition_receipts import read_repair_review
 
     record = owner.workspace.resolve(locator)
     # Review admission and material handoff must select the same diagnosis.
@@ -196,7 +196,7 @@ def _review_execution(owner: Any, locator: str) -> tuple[dict, dict]:
     if len(relative) != 2 or relative[1] != 'native_result.json':
         raise ValueError('Review repair needs records/<compose-attempt>/native_result.json')
     observed = ArtifactStore(record.parent).read_json(record.name)
-    from simple_ar.tools.writing import (
+    from simple_ar.report.composition_receipts import (
         accepted_composition_receipt, check_composition_inputs, read_repair_review, read_composition_candidate)
     writing, binding, data = accepted_composition_receipt(root=owner.root, workspace=owner.workspace,
         session_id=owner.session_id, ledger=owner.ledger, identity=relative[0], observed=observed)
@@ -350,7 +350,7 @@ def review_repair_outcome(owner: Any, observed: dict, source: str) -> tuple[dict
         raise ValueError('Producer diagnosis has no admitted document source')
     origin = diagnosis['origin']
     from simple_ar.tools.professional_outcomes import native_result_path
-    from simple_ar.tools.writing import accepted_composition_receipt
+    from simple_ar.report.composition_receipts import accepted_composition_receipt
     prior_path = native_result_path(owner.root, owner.workspace, diagnosis['source_result'])
     prior_id = prior_path.parent.name
     if (prior_id == identity
