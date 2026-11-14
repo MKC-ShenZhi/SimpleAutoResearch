@@ -42,6 +42,9 @@ class NativeWorkProjectionTests(unittest.TestCase):
         select = InspectionToolGateway._delivery_source_paths
         self.assertEqual(select(saved), [])
         self.assertEqual(select({**saved, 'source_priming_policy': 'priority.v3'}), [])
+        self.assertEqual(select({**saved, 'source_priming_policy': 'priority.v4'}), [])
+        self.assertEqual(select({**saved, 'source_priming_policy': 'priority.v4'},
+            include_artifacts=True), ['tool.py'])
         self.assertEqual(select({**saved, 'source_priming_policy': 'priority.v1'}), ['tool.py'])
         one = {**context, 'artifacts': {'tool.py': 'a' * 64}}
         self.assertEqual(select({**saved, 'delivery_context': one}), ['tool.py'])
@@ -361,7 +364,7 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertGreater(checked, 0)
         proof = c._last('review_result', reviewed=True)['metadata']['delivery_review']['identity']
         inspection = c.app.session.store.read_json(f'tools/inspection/{proof}/input.json')
-        self.assertEqual(inspection['source_priming_policy'], 'priority.v3')
+        self.assertEqual(inspection['source_priming_policy'], 'priority.v4')
         c._reload()
         c.decisions.append(fixture._action('deliver_result', **claim))
         self.drain()

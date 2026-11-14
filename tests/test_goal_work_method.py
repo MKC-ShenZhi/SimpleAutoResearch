@@ -1522,6 +1522,7 @@ class GoalWorkTests(unittest.TestCase):
         case._submit(_action('deliver_result', summary='Useful existing note', artifacts=['note.md']))
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
         self.assertEqual(case.send.call_count, 1)
+
         owner = case.app.operations.inspection
         inputs = list((root/'tools/inspection').glob('*/input.json'))
         self.assertEqual(len(inputs), 1)
@@ -1563,6 +1564,38 @@ class GoalWorkTests(unittest.TestCase):
         self.assertEqual(trace_path.read_bytes(), before)
         self.assertEqual(case.app.session.manifest.status, 'completed')
         self.assertEqual(case.send.call_count, 1)
+
+    def test_multifile_review_material_matches_available_investigation_resources(self):
+        case = self.case
+        for requests in (1, 6):
+            with self.subTest(requests=requests):
+                root = case.directory / f'multifile-review-{requests}'
+                case.app = ToolApplication.create(root, 'Review the supplied method and result.',
+                    model='fixture', services=case.services, sources={}, max_turns=requests,
+                    max_tokens=150000, max_attempts=12, tool_contracts='full')
+                case.root = root
+                files = {'method.py': 'def calculate():\n    return 17\n',
+                         'result.txt': 'Observed result: 17\n'}
+                for name, content in files.items():
+                    (root / 'workspace' / name).write_text(content, encoding='utf-8')
+                case.inspection_requests.clear()
+                case.review = lambda _: {'findings': [], 'limitations': []}
+                case._submit(_action('review_result', review_scope='delivery',
+                    summary='Method and its observed result.', artifacts=list(files)))
+                self.assertEqual(len(case.inspection_requests), 1)
+                request = case.inspection_requests[0]
+                offered = {tool['function']['name'] for tool in request['tools']}
+                view = json.loads(request['messages'][1]['content'])
+                visible = [row['observation'] for row in view.get('working_view', {}).get('observations', [])]
+                if requests == 1:
+                    self.assertEqual(offered, {'record_inspection'})
+                    for name, content in files.items():
+                        self.assertTrue(any(row.get('path') == str(root/'workspace'/name)
+                            and content in row.get('text', '') for row in visible), (name, visible))
+                else:
+                    self.assertIn('read_file', offered)
+                    self.assertFalse(any(row.get('path') in {str(root/'workspace'/name) for name in files}
+                        and row.get('kind') == 'source_text' for row in visible))
 
     def test_failed_opinion_retains_investigation_across_retry_feedback_and_input_change(self):
         case = self.case
