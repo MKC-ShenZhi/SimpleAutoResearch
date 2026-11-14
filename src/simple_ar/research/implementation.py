@@ -434,7 +434,7 @@ def _prepare_research_task(
         task += "Execution boundary and observed baseline are supplied facts, not model-selected targets.\n"
         task += "Baseline values below are observations, not target values to hardcode.\n"
     task += ("Implement and validate within this scope; the surrounding task owns separate measurements and delivery.\n\n"
-             if request.handoff_policy in {"shared.v1", "shared.v2"} else
+             if request.handoff_policy == "shared.v2" else
              "Implement and validate only; the research application owns benchmark execution.\n\n")
     presented = consumed
     if request.handoff_policy in {"shared.v1", "shared.v2"}:

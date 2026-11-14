@@ -14235,6 +14235,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         context = CapabilityContext(store, attempt)
         approval = {'token': 'approved', 'binding': owner.approval_binding({}, identity=attempt.attempt_id)}
         original = (project / 'model.py').read_bytes()
+        prepared_runs = []
 
         def interrupted(*, context, request):
             brief = context.read_input_json(context.inputs[0])
@@ -14261,6 +14262,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
             old = default_edit_scope(allowed_patterns=['tests/**'])
             self.assertFalse(is_edit_allowed_path('tests/test_model.py',
                 allowed_patterns=old['allowed_patterns'], protected_patterns=old['protected_patterns']))
+            prepared_runs.append(request.run_dir)
             task_ref, _ = _prepare_research_task(context, request, code_task_paths(request.run_dir).task_dir)
             task = context.store.read_text(task_ref.path)
             self.assertIn('Extend the scientific model', task)
@@ -14277,7 +14279,23 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                     owner.execute(context, {}, approval=approval)
         provider.assert_called_once_with([str(project.resolve())])
         self.assertEqual(store.read_json('inputs/code_work_context.json')['work_context'], supplied)
+        from simple_ar.code_task.editing.patching import PatchValidationError, apply_patch_edits
+        run = prepared_runs[-1]
+        proposal = run / 'code_task' / 'meta' / 'scope-test.json'
+        proposal.write_text(json.dumps({'edits': [{'path': 'check.py', 'old': 'assert True',
+            'new': 'assert False', 'reason': 'attempt to change validator'}]}), encoding='utf-8')
+        with self.assertRaises(PatchValidationError):
+            apply_patch_edits(run, edits_file=proposal, allow_unapproved_plan=True)
+        proposal.write_text(json.dumps({'edits': [
+            {'path': 'model.py', 'old': 'VALUE = 1', 'new': 'VALUE = 2', 'reason': 'change source'},
+            {'path': 'tests/test_model.py', 'old': 'assert True', 'new': 'assert 2 == 2', 'reason': 'update test'}]}),
+            encoding='utf-8')
+        apply_patch_edits(run, edits_file=proposal, allow_unapproved_plan=True)
+        candidate = code_task_paths(run).workspace_dir
+        self.assertEqual((candidate / 'tests/test_model.py').read_text(), 'assert 2 == 2\n')
+        self.assertEqual((candidate / 'check.py').read_text(), 'assert True\n')
         self.assertEqual((project / 'model.py').read_bytes(), original)
+        self.assertEqual((project / 'tests/test_model.py').read_text(), 'assert True\n')
 
     def test_exact_code_task_keeps_core_attempt_approval_and_domain_recovery(self) -> None:
         from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
