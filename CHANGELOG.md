@@ -9,7 +9,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
-- A selected independent review can use remaining capacity when reserving a later decision would prevent it from starting. Its result remains available if continuation needs more capacity.
+- A selected independent review can use remaining capacity when a forecast for a later decision would prevent its actual work; the review's own follow-up capacity and results are retained.
 - Workspace-isolated execution retains system alternatives links so standard tools using those links remain available.
 
 ## 2026-11-14
