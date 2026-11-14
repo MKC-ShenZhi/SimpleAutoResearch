@@ -1285,6 +1285,8 @@ class ImplementationToolGateway:
                     continue
                 remaining = self.ledger.remaining(key)
                 if remaining is None or remaining < required:
+                    if self.code_work_policy == 'shared.v2' and for_preparation:
+                        raise ValueError('Preparation requires its complete finite process budget before setup')
                     raise ValueError('Implementation preparation and validator require their complete finite process budget before setup')
         settings = ({'kind': 'existing_project', 'workspace_mode': 'copy', 'max_file_bytes': 0,
             'env_mode': 'external', 'python_executable': str(self.workspace.python), 'max_repairs': 1}

@@ -13621,13 +13621,15 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                 if mode == 'shared_limited':
                     self.assertEqual(ledger.remaining('process_invocations'), 0)
                     before = ledger.to_dict()
+                    limited = 'insufficient-formal'
+                    limited_approval = {'token': 'baseline', 'binding': science.approval_binding(arguments, identity=limited)}
                     refused = science.execute_tool('measure_experiment', CapabilityContext(
-                        ArtifactStore(root / 'attempts/baseline'), AttemptManifest('baseline')),
-                        arguments, approval=baseline_approval)
+                        ArtifactStore(root / 'attempts' / limited), AttemptManifest(limited)),
+                        arguments, approval=limited_approval)
                     self.assertEqual(refused.status, 'blocked')
                     self.assertIn('Insufficient or unknown shared process_invocations budget', refused.error)
                     self.assertEqual(ledger.to_dict(), before)
-                    self.assertFalse((root / 'attempts/baseline/scientific_request.json').exists())
+                    self.assertFalse((root / 'attempts' / limited / 'scientific_request.json').exists())
                     ledger.limits['process_invocations'] = 12
                 controller.execute_attempt('native_tool', attempt_id='baseline', tool_name='measure_experiment',
                     arguments=arguments, approval=baseline_approval)
