@@ -2805,7 +2805,8 @@ class ToolApplication:
 
     def _review_floor(self, client: Any, *, candidate: bool) -> dict:
         if self.state['turns'] and self.ledger.remaining('llm_requests') == 1:
-            if (candidate and self._last_available_action()
+            if (candidate and (self._last_available_action()
+                               or self.state['turns'][-1].get('origin') == 'caller')
                     or not candidate and self._terminal_batch()):
                 # A chosen final review can use the remaining call. If it does
                 # not itself finish the request, preserve the opinion and pause.
