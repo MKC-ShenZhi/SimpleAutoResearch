@@ -2455,7 +2455,8 @@ class InspectionToolGateway:
             except (ValueError, OSError):
                 continue
             for number in range(len(previous.get('source_rounds', []))):
-                if self._closed_source_round(previous, number, allow_final=True, model_only=True) is None:
+                if (self._closed_source_round(previous, number, allow_final=True, model_only=True) is None
+                        and not self._unissued_source_round(previous, number)):
                     raise ValueError('Retained investigation has unsettled source work')
             parents.append(previous)
         return parents
@@ -3658,6 +3659,21 @@ class InspectionToolGateway:
         if policy not in (None, 'receipts.v1'):
             raise ValueError('Unknown inspection history policy')
         return policy is not None
+
+    def _unissued_source_round(self, saved: dict, number: int) -> bool:
+        """A recorded budget refusal is closed without becoming a source observation."""
+        path = self._path(saved['identity'], f'sources-{number}')
+        trace = self._bound_json(path, saved['source_rounds'][number], None,
+            'Inspection source investigation record changed; no replay')
+        response, receipt = trace.get('response') or {}, trace.get('model_receipt')
+        if (not trace.get('completed') or trace.get('results') or not isinstance(receipt, dict)
+                or response.get('status') != 'blocked'
+                or not (response.get('metadata') or {}).get('budget_rejected_before_dispatch')):
+            return False
+        original, action = self._owned_receipt(receipt)
+        return (original == response and action.get('origin') == {
+            'scope': saved['identity'], 'kind': 'model', 'position': self._position(number, 'model')}
+            and not any(row.attempt_id == receipt['attempt'] for row in self.workspace.ledger.entries))
 
     def _closed_source_round(self, saved: dict, number: int, *, allow_final: bool = False,
                              model_only: bool = False,

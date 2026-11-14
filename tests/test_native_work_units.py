@@ -15,6 +15,24 @@ from tests import test_professional_work_loop as fixture
 
 
 class NativeWorkProjectionTests(unittest.TestCase):
+    def test_budget_refusal_is_closed_without_becoming_inspection_evidence(self):
+        from simple_ar.tools.inspection import InspectionToolGateway
+        owner = InspectionToolGateway.__new__(InspectionToolGateway)
+        result = {'status': 'blocked', 'metadata': {'budget_rejected_before_dispatch': True}}
+        receipt = {'attempt': 'model-action'}
+        origin = {'scope': 'inspection', 'kind': 'model', 'position': 'sources-0/model'}
+        trace = {'completed': True, 'response': result, 'model_receipt': receipt, 'results': []}
+        owner.workspace = SimpleNamespace(ledger=SimpleNamespace(entries=[]))
+        owner._bound_json = lambda *_: trace
+        owner._owned_receipt = lambda _: (result, {'origin': origin})
+        saved = {'identity': 'inspection', 'source_rounds': ['recorded']}
+        self.assertTrue(owner._unissued_source_round(saved, 0))
+        owner.workspace.ledger.entries = [SimpleNamespace(attempt_id='model-action')]
+        self.assertFalse(owner._unissued_source_round(saved, 0))
+        owner.workspace.ledger.entries = []
+        trace['results'] = [{'status': 'unknown'}]
+        self.assertFalse(owner._unissued_source_round(saved, 0))
+
     def test_unmarked_multiple_outputs_leave_source_choice_to_the_inspector(self):
         from simple_ar.tools.inspection import InspectionToolGateway
 
