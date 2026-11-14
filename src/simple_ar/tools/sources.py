@@ -84,7 +84,7 @@ class SourcePolicy(BaseModel):
         if not isinstance(value, dict):
             return value
         value = dict(value)
-        results, maximum = value.get('max_results'), value.get('max_documents', 20)
+        results, maximum = value.get('max_results'), value.get('max_documents')
         if ('max_fulltext_documents' not in value and type(results) is int and results > 0
                 and type(maximum) is int and maximum > 0):
             value['max_fulltext_documents'] = min(results, maximum)

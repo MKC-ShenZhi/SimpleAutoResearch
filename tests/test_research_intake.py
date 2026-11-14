@@ -69,6 +69,14 @@ class ResearchIntakeTests(unittest.TestCase):
         from simple_ar.research.documents.fulltext import build_fulltext_manifest
         from simple_ar.tools.sources import SourcePolicy
 
+        # A saved task without a source policy reconstructs the gateway default.
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / 'saved-task'
+            ToolApplication.create(root, 'Use the supplied work.', model=None, sources={})
+            resumed = ToolApplication.load(root)
+            self.assertIsNone(resumed.state['config']['research_policy'])
+            self.assertEqual((resumed.sources.policy.max_fulltext_documents,
+                resumed.sources.policy.max_fulltext_fetch_attempts), (1, 3))
         records = [DocumentRecord(document_id=str(index), title=f'Source {index}', source='test',
             url=f'https://example.org/{index}.html') for index in range(4)]
 
