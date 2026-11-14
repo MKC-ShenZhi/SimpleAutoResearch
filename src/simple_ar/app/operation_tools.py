@@ -446,11 +446,11 @@ class OperationTools:
         if (professional and config['model'] is not None
                 and (config.get('professional_operations') in PRODUCTION_OWNER_CONTRACTS | {'work.v1', 'work.v2', 'work.v12'}
                      or config.get('code_work_policy') in {'shared.v1', 'shared.v2'}
-                     or config.get('document_context_policy') == 'working.v2'
+                     or config.get('document_context_policy') in {'working.v2', 'working.v3'}
                         and config.get('report_requirement') is not None)):
             from simple_ar.tools.document_work import DocumentWorkToolGateway, document_work_tool_specs
             document_context = work_context
-            if config.get('document_context_policy') == 'working.v2' and config.get('report_requirement') is not None:
+            if config.get('document_context_policy') in {'working.v2', 'working.v3'} and config.get('report_requirement') is not None:
                 from simple_ar.report.requirements import working_report_requirement
                 def document_context(targets):
                     context = work_context(targets) if work_context is not None else {}
@@ -461,7 +461,9 @@ class OperationTools:
                 work_context=document_context, material_observations=material_observations,
                 material_roots=lambda: [str(path) for alias, path in self.workspace.mounts.items()
                     if alias not in {'workspace', 'records'}], sources=self.sources,
-                context_policy=config.get('document_context_policy'))
+                context_policy=config.get('document_context_policy'),
+                report_requirement=(config.get('report_requirement')
+                    if config.get('document_context_policy') == 'working.v3' else None))
             self.registry.register_package(document_work_tool_specs(), self.document, request_visible=True)
             self.system += (' For coherent manuscript drafting or substantive document revision, work_document '
                 'owns investigation of actual original materials and creates an editable candidate. Supply '

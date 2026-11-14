@@ -457,7 +457,7 @@ class ToolApplication:
         from simple_ar.app.professional_conversation import NATIVE_HISTORY_POLICY
         if config.get('native_history_policy') not in (None, NATIVE_HISTORY_POLICY):
             raise ValueError('Unsupported saved native history policy')
-        if config.get('document_context_policy') not in (None, 'working.v1', 'working.v2'):
+        if config.get('document_context_policy') not in (None, 'working.v1', 'working.v2', 'working.v3'):
             raise ValueError('Unsupported saved document context policy')
         if config.get('process_artifact_paths') not in (None, 'cwd.v1'):
             raise ValueError('Unsupported saved process artifact paths')
@@ -1987,6 +1987,8 @@ class ToolApplication:
             # Structured analysis/measurement tasks need the same frozen
             # report requirements at the actual document-work consumer.
             config['document_context_policy'] = 'working.v2'
+        if config.get('report_requirement') is not None:
+            config['document_context_policy'] = 'working.v3'
         config['inspection_protocol'] = 'subjects.v3'
         config['inspection_execution_protocol'] = 'shared.v1'
         config['inspection_coverage_policy'] = 'offered.v2'
@@ -2010,7 +2012,8 @@ class ToolApplication:
                     config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
                     from simple_ar.app.professional_conversation import NATIVE_HISTORY_POLICY
                     config['native_history_policy'] = NATIVE_HISTORY_POLICY
-                    config['document_context_policy'] = 'working.v2'
+                    config['document_context_policy'] = ('working.v3' if config.get('report_requirement')
+                        else 'working.v2')
                     config['process_artifact_paths'] = 'cwd.v1'
                     config['work_lifecycle'] = 'integrated.v3'
                     config['inspection_execution_protocol'] = 'shared.v2'

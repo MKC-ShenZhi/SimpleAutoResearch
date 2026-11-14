@@ -44,6 +44,130 @@ class _Client:
 
 
 class DocumentWorkTests(unittest.TestCase):
+    def test_common_report_runs_configured_section_review_and_revision(self):
+        from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
+        from tests.report_review_fixtures import draft_quotes, prompt_payload
+
+        root, source, ledger, workspace = self.workspace()
+        (source / 'result.txt').write_text('Observed value: 2.\n', encoding='utf-8')
+        config = ReportRuntimeConfig(outline_strategy='template', reviewer='llm',
+            document_review=True, review_scope='document', draft_scope='section',
+            max_review_iterations=1, max_section_tokens=128, allow_source_backtracking=False)
+        template = ReportTemplateBundle(name='controlled', mode='supplied_materials',
+            template_path='', criteria_path='', template_markdown='## Observations\n\n## Limits\n', criteria_markdown='')
+        requirement = {'method': 'sections', 'config': config.model_dump(mode='json'),
+            'template': template.model_dump(mode='json'), 'outline': [
+                {'heading': 'Observations', 'required': True}, {'heading': 'Limits', 'required': True}]}
+        calls = []
+
+        class Client(_Client):
+            def ask_json(self, system, prompt, *, label='', budget_call_id='', **options):
+                view = prompt_payload(prompt)
+                calls.append((label, options, view))
+                self._budget_ledger.reserve(budget_call_id, {'llm_requests': 1, 'total_tokens': 10},
+                    session_id='session', attempt_id=self._budget_attempt_id, purpose='document')
+                if label == 'document-work-1':
+                    response = {'action': 'investigate', 'read_windows': [{'path': 'source0/result.txt'}]}
+                elif label == 'document-work-2':
+                    response = {'action': 'write', 'title': 'Observed result',
+                        'selected_observation_ids': [view['observations'][0]['id']]}
+                elif label in {'report-writer-document', 'report-document-joint-reviser'}:
+                    response = {'sections': [{'section_id': row['section']['section_id'],
+                        'heading': row['section']['heading'], 'draft_markdown':
+                        ('Revised' if 'reviser' in label else 'Original') + ' observed value 2.'}
+                        for row in view['sections']]}
+                elif label.startswith('report-writer-'):
+                    response = {'section_id': view['section']['section_id'],
+                        'heading': view['section']['heading'], 'draft_markdown': 'Original observed value 2.'}
+                elif label in {'report-document-reviewer', 'report-document-verifier'}:
+                    revise = label == 'report-document-reviewer'
+                    response = {'section_reviews': [{'section_id': row['section_id'],
+                        'verdict': 'revise_required' if revise else 'pass',
+                        'findings': [{'finding_id': row['section_id'] + '-scope', 'type': 'style',
+                            'severity': 'major', 'required_action': 'revise', 'message': 'Clarify scope.',
+                            'draft_quotes': draft_quotes(prompt, row['section_id'])}] if revise else []}
+                        for row in view['sections']]}
+                else:
+                    raise AssertionError(label)
+                self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
+                return response
+
+        client = Client(ledger, 'report', None)
+        gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
+            material_roots=lambda: ['source0'], work_context=lambda _: {'user_requests': ['Explain the observed result']},
+            context_policy='working.v3', report_requirement=requirement)
+        from simple_ar.core.capabilities import ArtifactStore
+        write = ArtifactStore.write_json
+        def interrupt_assembly(owner, path, *args, **kwargs):
+            if path == 'decisions/2/authored.json':
+                raise KeyboardInterrupt('Stop after the completed writer, before candidate registration')
+            return write(owner, path, *args, **kwargs)
+        with patch.object(ArtifactStore, 'write_json', interrupt_assembly), self.assertRaises(KeyboardInterrupt):
+            gateway.call('work_document', {'goal': 'Explain the observation'}, identity='report')
+        saved_usage = ledger.to_dict()
+        saved_calls = len(calls)
+        self.assertTrue(gateway.can_reconcile('work_document', 'report'))
+        result = gateway.call('work_document', {'goal': 'Explain the observation'}, identity='report')
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(ledger.to_dict(), saved_usage)
+        self.assertEqual(len(calls), saved_calls)
+        self.assertIn('Revised observed value 2.', result.data['markdown'])
+        labels = [row[0] for row in calls]
+        self.assertEqual(labels.count('report-document-reviewer'), 1)
+        self.assertEqual(labels.count('report-document-joint-reviser'), 1)
+        self.assertEqual(labels.count('report-document-verifier'), 1)
+        self.assertTrue(all(row[1].get('max_output_tokens') == 128 for row in calls
+            if row[0].startswith('report-writer-') or row[0] == 'report-document-joint-reviser'))
+        self.assertEqual(len([row for row in calls if row[0].startswith('report-writer-')]), 2)
+        self.assertTrue(any('Observed value: 2.' in json.dumps(row[2]) for row in calls
+            if row[0].startswith('report-writer-')))
+        self.assertIn('workspace/document-work/report/references.bib', result.artifacts)
+        saved_usage = ledger.to_dict()
+        self.assertTrue(gateway.call('work_document', {'goal': 'Explain the observation'}, identity='report').ok)
+        self.assertEqual(ledger.to_dict(), saved_usage)
+        self.assertEqual([row[0] for row in calls], labels)
+
+    def test_common_article_feedback_keeps_unaffected_prior_work(self):
+        from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
+        from tests.report_review_fixtures import prompt_payload
+
+        root, source, ledger, workspace = self.workspace()
+        previous = source / 'draft.md'
+        previous.write_text('# Existing\n\nOld claim.\n\nUnaffected text.\n', encoding='utf-8')
+        config = ReportRuntimeConfig(reviewer='disabled', max_review_iterations=0, max_section_tokens=256)
+        template = ReportTemplateBundle(name='brief', mode='supplied_materials', template_path='',
+            criteria_path='', template_markdown='## Findings\n', criteria_markdown='')
+        requirement = {'method': 'article', 'config': config.model_dump(mode='json'),
+            'template': template.model_dump(mode='json'), 'outline': []}
+        calls = []
+
+        class Client(_Client):
+            def ask_json(self, system, prompt, *, label='', budget_call_id='', **options):
+                view = prompt_payload(prompt)
+                calls.append((label, view, options))
+                self._budget_ledger.reserve(budget_call_id, {'llm_requests': 1, 'total_tokens': 10},
+                    session_id='session', attempt_id=self._budget_attempt_id, purpose='document')
+                if label == 'document-work-1':
+                    response = {'action': 'write', 'title': 'Existing'}
+                elif label == 'composition-article':
+                    response = {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
+                        'replacements': [{'old_text': 'Old claim.', 'new_text': 'Qualified claim.'}]}
+                else:
+                    raise AssertionError(label)
+                self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
+                return response
+
+        client = Client(ledger, 'revision', None)
+        gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
+            material_roots=lambda: ['source0'], work_context=lambda _: {'user_requests': ['Qualify the claim']},
+            context_policy='working.v3', report_requirement=requirement)
+        result = gateway.call('work_document', {'goal': 'Qualify the claim', 'prior_draft': 'source0/draft.md',
+            'prior_sha256': sha(previous.read_bytes())}, identity='revision')
+        self.assertTrue(result.ok, result.error)
+        self.assertIn('Qualified claim.', result.data['markdown'])
+        self.assertIn('Unaffected text.', result.data['markdown'])
+        self.assertEqual(calls[1][2]['max_output_tokens'], 256)
+
     def test_shared_feedback_can_be_selected_and_recalled_without_becoming_evidence(self):
         root, source, ledger, workspace = self.workspace()
         (source / 'result.txt').write_text('Observed value: 2.\n', encoding='utf-8')

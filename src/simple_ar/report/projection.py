@@ -90,6 +90,21 @@ class ReportProjectionError(ValueError):
     """Raised when persisted research facts are insufficient for a report."""
 
 
+def selected_material_window(*, document_id: str, path: str, view: Mapping[str, Any],
+                             selection: Mapping[str, Any], start_line: int | None = None):
+    """Project only the file window actually read by a writing consumer."""
+    from simple_ar.research.contracts import TextChunk
+
+    record = DocumentRecord(document_id=document_id, title=path, source='local_analysis',
+        content_hash=view['sha256'], extraction_status='parsed',
+        abstract=f'Selected file window: {json.dumps(dict(selection), ensure_ascii=False)}. Full-file digest may be unavailable; only this window was read.',
+        metadata={'kind': 'selected_artifact', 'evidence_role': 'selected_file_content_not_independently_verified',
+            'fulltext_extraction': {'coverage': dict(selection)}})
+    chunk = TextChunk(chunk_id=document_id, document_id=document_id, text=view['text'],
+        source_path=path, line_start=start_line, metadata={'selection': dict(selection)})
+    return record, chunk
+
+
 def build_implementation_report_inputs(*, topic: str, store: ArtifactStore,
         implementation_ref: ArtifactRef | None = None, lineage_refs: Sequence[ArtifactRef] = (),
         measurement_refs: Sequence[ArtifactRef] = (),
@@ -529,6 +544,7 @@ def build_research_report_inputs(
 def build_material_report_inputs(
     *, topic: str, documents: DocumentBundle, documents_ref: ArtifactRef,
     assets: Sequence[Any], selected_evidence: bool = False, include_memory: bool = True,
+    max_selected_characters: int | None = 96000,
 ) -> tuple[ReportContext, ReportMemory | None]:
     """Use extracted user material directly, without invented research state.
 
@@ -573,7 +589,8 @@ def build_material_report_inputs(
     chunks_by_document: dict[str, list[Any]] = {}
     for chunk in documents.chunks:
         chunks_by_document.setdefault(chunk.document_id, []).append(chunk)
-    if selected_evidence and sum(len(chunk.text) for chunk in documents.chunks) > 96000:
+    if (selected_evidence and max_selected_characters is not None
+            and sum(len(chunk.text) for chunk in documents.chunks) > max_selected_characters):
         raise ReportProjectionError("Explicit evidence exceeds the composition window; narrow the selection.")
     handles = []
     for record in documents.records:

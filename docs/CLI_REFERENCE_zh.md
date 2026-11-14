@@ -596,14 +596,13 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 
 #### 报告控制
 
-下表中的详细 Writer 控制适用于已保存的历史会话。新共同任务会保存这些设置，
-但尚不执行旧的分节起草、审阅循环及其单节 token／修订轮次限制。固定提纲和
-引用数量上限会在交付时检查；任务级独立检查另行负责。显式模板也会在共同文稿
-工具可用时提供给写作者。
+新共同任务请求报告时，文稿工具按下列设置选择整稿或分节写作，并执行相应的
+审阅、修订和单次输出限制。固定提纲和引用数量上限也会在交付时检查；任务级
+独立检查另行负责。已保存的历史会话保留原写作合同。
 
 | 参数 | 说明 | 默认值或使用条件 |
 | --- | --- | --- |
-| `--report-writing-method CHOICE` | 历史 Writer 方法；恢复保留已存方法。可选：`article`, `sections`。 | 历史 article；显式分节控制为 sections |
+| `--report-writing-method CHOICE` | 报告写作方法。可选：`article`, `sections`。 | article；显式分节控制为 sections |
 | `--max-section-tokens N` | 每个写作单元输出上限；0／未设表示不加此上限。 | 未设置 |
 | `--with-report` | 显式请求模型撰写报告；数据分析默认仅交付分析。 | 关闭 |
 | `--no-report` | 模型会话跳过报告撰写。 | 关闭 |

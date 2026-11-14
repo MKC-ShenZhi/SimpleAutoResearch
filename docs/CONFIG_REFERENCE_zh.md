@@ -376,12 +376,11 @@ observation_unit = "一次运行"
 
 结构化写作使用 kind writing、仅 report、模型与本地 assets.papers/materials。路径不能同时占两种角色。支持文本、Markdown、HTML、PDF；写作材料还接受 JSON 与已校验分析包。table_analysis.v1 须与复制数据相邻，两者各限 20 MiB，导入重新检查。普通 JSON 是未核实材料。体裁／长度／预期图形写在目标中。
 
-字段属于研究 `[report]`，不是原生 `[task]`。下表的 Writer 控制适用于已保存的
-历史会话。新共同任务会保存配置，并在交付时检查固定提纲和引用上限，但尚不执行
-旧的分节起草、审阅／修订循环及单次 token 限制；任务级独立检查另行负责。显式
-模板文本会在共同文稿工具可用时提供给写作者。
+字段属于研究 `[report]`，不是原生 `[task]`。共同文稿工具对请求的报告使用下列
+写作配置，任务级独立检查另行负责；交付时也检查固定提纲和引用上限。已保存的
+历史会话保留原写作合同。
 
-| 字段 | 含义 | 类型与默认值 | 历史会话何时生效 |
+| 字段 | 含义 | 类型与默认值 | 修改后何时生效 |
 | --- | --- | --- | --- |
 | `writing_method` | 整稿／章节 | 可选 article / sections；通常 article，除非控制要求 sections | 新写作；保留已存方法 |
 | `template` | 内置／自定义 Markdown 提纲 | 字符串 auto；source_review、survey、material_report、experiment、reproduction、analysis_report | 新计划 |
@@ -397,7 +396,7 @@ observation_unit = "一次运行"
 | `max_document_review_prompt_chars` | 完整审阅请求上限 | 非负整数 0，无额外上限 | 新审阅；超限拒绝，不截断 |
 | `figures` | 确定性图形设置 | 下表 | 新组装 |
 
-历史 article 独立检查须显式 reviewer=llm、document_review=true、review_scope=document。零轮只检查一次，正数限制整稿纠正。sections 的 draft_scope=auto 仅在所有章节有正长度目标且总计不超过 2,000 词时联合起草，否则按章节。
+article 独立检查须显式 reviewer=llm、document_review=true、review_scope=document。零轮只检查一次，正数限制整稿纠正。sections 的 draft_scope=auto 仅在所有章节有正长度目标且总计不超过 2,000 词时联合起草，否则按章节。
 
 `[report.figures]` 字段：
 

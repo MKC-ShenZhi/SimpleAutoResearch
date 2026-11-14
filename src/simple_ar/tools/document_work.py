@@ -72,7 +72,8 @@ selection errors return your draft and actual observations in this same work
 unit; correct the selection while preserving useful prose and investigation.
 """
 
-_WORKING_CONTRACTS = frozenset({'document_work_operation.v4', 'document_work_operation.v5'})
+_REPORT_CONTRACT = 'document_work_operation.v6'
+_WORKING_CONTRACTS = frozenset({'document_work_operation.v4', 'document_work_operation.v5', _REPORT_CONTRACT})
 _MATERIAL_ID_CONTRACTS = frozenset({'document_work_operation.v3', *_WORKING_CONTRACTS})
 
 
@@ -86,7 +87,13 @@ def _system_for(binding: dict) -> str:
         'document_work_operation.v4': _MATERIAL_ID_SYSTEM,
         'document_work_operation.v5': (_MATERIAL_ID_SYSTEM + '\nRelated feedback and working notes are guidance. '
             'The work context archive identifies the frozen complete context; use read_windows when '
-            'omitted context is needed. That context is not original research evidence.')}
+            'omitted context is needed. That context is not original research evidence.'),
+        _REPORT_CONTRACT: ('Investigate the originals needed for the requested report. Context, prior prose and '
+            'filenames are guidance, not evidence. Read original file windows or query retained source bundles; '
+            'select the observation IDs actually needed, a concise report title and any attachment delivery_path IDs. '
+            'A separate report writer will draft and, when configured, review and revise the report using the selected '
+            'observations and feedback. Use write when ready; request further original reads when needed. '
+            'Report actual gaps and do not invent evidence or claim independent task acceptance.')}
     if binding['contract'] not in systems:
         raise ValueError('Unknown saved document work contract')
     return systems[binding['contract']]
@@ -163,6 +170,27 @@ class _Decision(BaseModel):
         return self
 
 
+class _ReportDecision(BaseModel):
+    """Select the evidence for the existing report Writer, without writing twice."""
+    model_config = ConfigDict(extra='forbid', strict=True)
+    action: Literal['investigate', 'write']
+    read_windows: list[FileWindow] = Field(default_factory=list, max_length=12)
+    source_queries: list[_SourceQuery] = Field(default_factory=list, max_length=12)
+    selected_observation_ids: list[str] = Field(default_factory=list, max_length=128)
+    attachments: list[str] = Field(default_factory=list, max_length=12)
+    title: str = Field(default='', max_length=400)
+    gaps: list[str] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode='after')
+    def action_shape(self) -> '_ReportDecision':
+        if self.action == 'investigate':
+            if not (self.read_windows or self.source_queries) or self.selected_observation_ids or self.attachments or self.title or self.gaps:
+                raise ValueError('Investigation needs reads; select report inputs in the write decision')
+        elif self.read_windows or self.source_queries or not self.title.strip() or any(not row.strip() for row in self.gaps):
+            raise ValueError('Writing needs a title and no pending reads')
+        return self
+
+
 def document_work_tool_specs() -> list[CommonToolSpec]:
     """Register this package on new ordinary operation contracts only."""
     return [CommonToolSpec(name='work_document', domain='document_work',
@@ -203,10 +231,12 @@ class DocumentWorkToolGateway:
                  work_context: Callable[[list[str]], dict] | None = None,
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
                  material_roots: Callable[[], list[str]] | None = None,
-                 sources: Any | None = None, context_policy: str | None = None) -> None:
-        if context_policy not in (None, 'working.v1', 'working.v2'):
+                 sources: Any | None = None, context_policy: str | None = None,
+                 report_requirement: dict | None = None) -> None:
+        if context_policy not in (None, 'working.v1', 'working.v2', 'working.v3'):
             raise ValueError('Unknown document context policy')
         self.context_policy = context_policy
+        self.report_requirement = report_requirement
         self.root, self.workspace, self.ledger, self.session_id = Path(root), workspace, ledger, session_id
         self.client_factory, self.work_context = client_factory, work_context
         self.material_observations, self.material_roots, self.sources = material_observations, material_roots, sources
@@ -227,7 +257,45 @@ class DocumentWorkToolGateway:
         if name != 'work_document':
             return False
         store = self._store(identity)
-        return store.exists('candidate.json') or self._retained_final(store, identity) is not None
+        return (store.exists('candidate.json') or self._retained_final(store, identity) is not None
+            or self._retained_report_selection(store, identity) is not None)
+
+    def _retained_report_selection(self, store: ArtifactStore, identity: str):
+        """A completed Writer can finish assembly without another model call."""
+        if store.exists('failure.json') or not store.exists('report-writer-result.json'):
+            return None
+        try:
+            binding = store.read_json('input.json')
+            if binding['contract'] != _REPORT_CONTRACT:
+                return None
+            observations = store.read_json('observations.json')
+            steps = [int(path.name) for path in (store.root / 'decisions').iterdir()
+                if path.is_dir() and path.name.isdecimal()]
+            step = max(steps)
+            snapshot = store.read_json(f'decisions/{step}/request.json')
+            record = store.read_json(f'decisions/{step}/response.json')
+            decision = _ReportDecision.model_validate(record['response'])
+            if (decision.action != 'write' or not record['accounting_known']
+                    or record['request_sha256'] != _digest(snapshot)
+                    or record['response_sha256'] != _digest(record['response'])
+                    or snapshot['system'] != _system_for(binding)
+                    or snapshot['budget_call_id'] != f'{identity}:document:{step}'
+                    or not self._context_matches(binding, snapshot['input'], identity)):
+                return None
+            presented = []
+            for number in range(1, step + 1):
+                actual = store.read_json(f'decisions/{number}/request.json')
+                reply = store.read_json(f'decisions/{number}/response.json')
+                if (reply.get('request_sha256') != _digest(actual) or not reply.get('accounting_known')
+                        or reply.get('response_sha256') != _digest(reply.get('response'))):
+                    return None
+                presented.extend(actual['input']['observations'])
+            if (any(row not in observations for row in presented)
+                    or any(not any(row['id'] == item for row in presented) for item in decision.selected_observation_ids)):
+                return None
+            return binding, observations, decision, step, snapshot['input']['work_context']
+        except (ValueError, TypeError, KeyError, OSError):
+            return None
 
     def _retained_final(self, store: ArtifactStore, identity: str) -> tuple[dict, list[dict], _Decision, int] | None:
         if store.exists('failure.json') or not store.exists('input.json') or not store.exists('observations.json'):
@@ -247,7 +315,7 @@ class DocumentWorkToolGateway:
             snapshot = store.read_json(f'decisions/{step}/request.json')
             record = store.read_json(f'decisions/{step}/response.json')
             observations = store.read_json('observations.json')
-            decision = _Decision.model_validate(record['response'])
+            decision = self._saved_decision(store, binding, record['response'], step)
             if (decision.action != 'finish' or not record['accounting_known']
                     or record['response_sha256'] != _digest(record['response'])
                     or record['request_sha256'] != _digest(snapshot)
@@ -261,6 +329,20 @@ class DocumentWorkToolGateway:
             return binding, observations, decision, step
         except (ValueError, TypeError, KeyError, OSError):
             return None
+
+    @staticmethod
+    def _saved_decision(store: ArtifactStore, binding: dict, response: dict, step: int) -> _Decision:
+        if binding['contract'] != _REPORT_CONTRACT:
+            return _Decision.model_validate(response)
+        selected = _ReportDecision.model_validate(response)
+        if selected.action != 'write':
+            raise ValueError('Report evidence selection is not a finished candidate')
+        authored = store.read_json(f'decisions/{step}/authored.json')
+        if authored['markdown'] != ArtifactStore(store.root / 'assembly').read_text('report_body.md'):
+            raise ValueError('Saved report body differs from its assembly')
+        return _Decision(action='finish', selected_observation_ids=selected.selected_observation_ids,
+            attachments=selected.attachments, manuscript_markdown=authored['markdown'],
+            gaps=[*selected.gaps, *authored['gaps']])
 
     @staticmethod
     def _material_observations(rows: list[dict]) -> list[dict]:
@@ -333,9 +415,16 @@ class DocumentWorkToolGateway:
                 if not store.exists('candidate.json'):
                     retained = self._retained_final(store, identity)
                     if retained is None:
-                        raise ValueError('Document work stopped before a complete candidate; inspect its records and ledger, no blind replay')
-                    binding, observations, decision, step = retained
-                    store.write_json('candidate.json', self._candidate(store, binding, observations, decision, step, identity))
+                        report = self._retained_report_selection(store, identity)
+                        if report is None:
+                            raise ValueError('Document work stopped before a complete candidate; inspect its records and ledger, no blind replay')
+                        binding, observations, selection, step, work_context = report
+                        self._complete_report(store, binding, observations, selection, step, identity, work_context, client=None)
+                    else:
+                        binding, observations, decision, step = retained
+                        generated = self._generated_report_assets(store, binding, step, identity)
+                        store.write_json('candidate.json', self._candidate(store, binding, observations, decision, step, identity,
+                            generated=generated))
                 return self._finish(store, identity)
             store.write_json('request.json', normalized)
             self._produce(store, request, identity)
@@ -429,11 +518,15 @@ class DocumentWorkToolGateway:
             excluded_paths=source_paths | ({prior_path} if prior_path else set()),
             **({'remaining_bytes': context_input_tokens * 4}
                if self.context_policy else {}))
-        contract = ('document_work_operation.v5' if self.context_policy == 'working.v2' else
+        contract = (_REPORT_CONTRACT if self.context_policy == 'working.v3' and self.report_requirement is not None else
+                    'document_work_operation.v5' if self.context_policy in {'working.v2', 'working.v3'} else
                     'document_work_operation.v4' if self.context_policy else 'document_work_operation.v3')
         binding = {'contract': contract,
             'request_sha256': _digest(request.model_dump(mode='json')),
             'context': base, 'inventories': inventories, 'seed': seed}
+        if contract == _REPORT_CONTRACT:
+            from simple_ar.report.requirements import validate_report_requirement
+            binding['report_requirement'] = validate_report_requirement(self.report_requirement)
         store.write_json('input.json', binding)
         return binding
 
@@ -571,12 +664,13 @@ class DocumentWorkToolGateway:
         preview = None
         system = _system_for(binding)
         feedback_projection = (self._feedback_context(context['work_context'], identity)
-            if binding['contract'] == 'document_work_operation.v5' else None)
+            if binding['contract'] in {'document_work_operation.v5', _REPORT_CONTRACT} else None)
         step = 0
+        presented_ids = set()
         while True:
             step += 1
             prompt = {**context, 'observations': observations, 'read_results': feedback,
-                'response_schema': _Decision.model_json_schema(),
+                'response_schema': (_ReportDecision if binding['contract'] == _REPORT_CONTRACT else _Decision).model_json_schema(),
                 'coverage': ('Only actual observation bodies are evidence; file candidates and '
                     'unread ranges are not. Source passage lookup is not exhaustive.')}
             if preview is not None:
@@ -584,8 +678,9 @@ class DocumentWorkToolGateway:
             projection = None
             if binding['contract'] in _WORKING_CONTRACTS:
                 prompt, projection = self._working_input(prompt, observations, client, identity, system,
-                    project_feedback=binding['contract'] == 'document_work_operation.v5',
+                    project_feedback=binding['contract'] in {'document_work_operation.v5', _REPORT_CONTRACT},
                     feedback_projection=feedback_projection)
+            presented_ids.update(row['id'] for row in prompt['observations'])
             serialized = json.dumps(prompt, ensure_ascii=False, allow_nan=False)
             if projection is None and len(serialized.encode('utf-8')) > 512000:
                 raise ValueError('Document investigation context exceeds 512 KB; preserve the records and narrow the work unit')
@@ -609,7 +704,7 @@ class DocumentWorkToolGateway:
             if not complete['accounting_known']:
                 raise ValueError('Document response has unresolved physical usage; retain the response and ledger, no continuation')
             try:
-                decision = _Decision.model_validate(response)
+                decision = (_ReportDecision if binding['contract'] == _REPORT_CONTRACT else _Decision).model_validate(response)
             except ValueError as exc:
                 # This was a complete accounted response, so a format
                 # correction may use the ordinary shared budget. Preserve the
@@ -622,6 +717,25 @@ class DocumentWorkToolGateway:
                 feedback = [{'status': 'invalid_decision', 'error': str(exc),
                     'scope': 'Correct the decision schema; this prior response is not evidence.'}]
                 continue
+            if decision.action == 'write':
+                try:
+                    if any(item not in presented_ids for item in decision.selected_observation_ids):
+                        raise _CandidateSelectionError('Select only observation IDs presented to the report organizer')
+                    preliminary = _Decision(action='finish', selected_observation_ids=decision.selected_observation_ids,
+                        attachments=decision.attachments, manuscript_markdown='Report drafting is pending.', gaps=decision.gaps)
+                    self._candidate(store, binding, observations, preliminary, step, identity)
+                except _CandidateSelectionError as exc:
+                    store.write_json(f'{path}/selection-error.json', {'error': str(exc)})
+                    signature = _digest({'selection': response, 'error': str(exc)})
+                    if signature in no_progress:
+                        raise ValueError('Repeated invalid report evidence selection') from exc
+                    no_progress.add(signature)
+                    feedback = [{'status': 'candidate_selection_rejected', 'error': str(exc),
+                        'scope': 'Choose actually presented observation and attachment IDs.'}]
+                    continue
+                self._complete_report(store, binding, observations, decision, step, identity,
+                    prompt['work_context'], client=client)
+                return
             if decision.action == 'preview':
                 measurements = manuscript_measurements(decision.manuscript_markdown)
                 signature = _digest({'preview': measurements['sha256']})
@@ -669,6 +783,28 @@ class DocumentWorkToolGateway:
                     raise ValueError('Repeated investigation made no progress; inspect retained read failures')
                 no_progress.add(signature)
 
+    def _complete_report(self, store: ArtifactStore, binding: dict, observations: list[dict],
+                         decision: _ReportDecision, step: int, identity: str,
+                         work_context: dict, *, client: Any) -> None:
+        preliminary = _Decision(action='finish', selected_observation_ids=decision.selected_observation_ids,
+            attachments=decision.attachments, manuscript_markdown='Report drafting is pending.', gaps=decision.gaps)
+        selected = self._candidate(store, binding, observations, preliminary, step, identity)['selected']
+        context = binding['context']
+        from simple_ar.report.document_writer import write_observed_report
+        authored = write_observed_report(store=store, identity=identity,
+            requirement=binding['report_requirement'], title=decision.title, goal=context['goal'],
+            work_context=work_context, observations=selected, attachments=decision.attachments,
+            prior_draft=context['prior_draft']['text'] if context['prior_draft'] else '', client=client)
+        if context['prior_draft'] and context['prior_draft'].get('bibliography'):
+            authored['outputs'] = [name for name in authored['outputs'] if name not in {'references.bib', 'citation_map.json'}]
+            if (store.root / 'assembly' / 'references.bib').read_text(encoding='utf-8').strip():
+                authored['gaps'].append('Retained the previous bibliography; reconcile it with any newly cited sources.')
+        store.write_json(f'decisions/{step}/authored.json', authored)
+        finished = self._saved_decision(store, binding, decision.model_dump(mode='json'), step)
+        generated = self._generated_report_assets(store, binding, step, identity)
+        store.write_json('candidate.json', self._candidate(store, binding, observations, finished, step, identity,
+            generated=generated))
+
     @staticmethod
     def _feedback_context(context: dict, identity: str) -> tuple[dict, list[dict]]:
         """Project feedback and notes through the shared working view."""
@@ -703,7 +839,7 @@ class DocumentWorkToolGateway:
         context = binding['context']
         if any(prompt.get(key) != value for key, value in context.items() if key != 'work_context'):
             return False
-        if binding['contract'] != 'document_work_operation.v5':
+        if binding['contract'] not in {'document_work_operation.v5', _REPORT_CONTRACT}:
             return prompt.get('work_context') == context['work_context']
         expected, rows = DocumentWorkToolGateway._feedback_context(context['work_context'], identity)
         actual = prompt.get('work_context')
@@ -867,8 +1003,19 @@ class DocumentWorkToolGateway:
             raise _CandidateSelectionError('Attachments must be distinct authorized inventory files')
         return sources
 
+    def _generated_report_assets(self, store: ArtifactStore, binding: dict, step: int, identity: str) -> list[dict]:
+        if binding['contract'] != _REPORT_CONTRACT:
+            return []
+        outputs = store.read_json(f'decisions/{step}/authored.json')['outputs']
+        rows = []
+        for name in outputs:
+            source = f'records/{identity}/document_work/assembly/{name}'
+            rows.append({'source': source, 'source_sha256': self.workspace.artifact_hashes([source])[source],
+                'path': f'workspace/document-work/{identity}/{name}'})
+        return rows
+
     def _candidate(self, store: ArtifactStore, binding: dict, observations: list[dict],
-                   decision: _Decision, step: int, identity: str) -> dict:
+                   decision: _Decision, step: int, identity: str, *, generated: list[dict] | None = None) -> dict:
         by_id = {row['id']: row for row in observations}
         ids = decision.selected_observation_ids
         if len(ids) != len(set(ids)) or any(item not in by_id for item in ids):
@@ -885,9 +1032,10 @@ class DocumentWorkToolGateway:
                 raise ValueError('Attachment changed since inventory')
             target = f"workspace/document-work/{identity}/{visible[source]['delivery_path']}"
             assets.append({'source': source, 'source_sha256': observation['data']['sha256'], 'path': target})
-        inherited = self._inherited_assets(binding, decision.manuscript_markdown, identity, assets)
+        generated = generated or []
+        inherited = self._inherited_assets(binding, decision.manuscript_markdown, identity, [*assets, *generated])
         manuscript = f'workspace/document-work/{identity}/manuscript.md'
-        targets = [manuscript, *(row['path'] for row in [*assets, *inherited])]
+        targets = [manuscript, *(row['path'] for row in [*assets, *generated, *inherited])]
         if len(targets) != len(set(targets)):
             raise _CandidateSelectionError('Selected and retained document assets have conflicting paths')
         self._check_asset_links(binding, decision.manuscript_markdown, identity, targets)
@@ -898,6 +1046,8 @@ class DocumentWorkToolGateway:
             'input_sha256': _digest(binding), 'decision': step, 'response_sha256': _digest(decision.model_dump(mode='json')),
             'manuscript': manuscript, 'markdown': decision.manuscript_markdown,
             'selected': selected, 'assets': assets, 'inherited_assets': inherited, 'gaps': decision.gaps}
+        if binding['contract'] == _REPORT_CONTRACT:
+            candidate['generated_assets'] = generated
         self._check_inputs(binding, candidate, identity)
         return candidate
 
@@ -918,7 +1068,7 @@ class DocumentWorkToolGateway:
                     raise ValueError('Selected original source changed')
             else:
                 raise ValueError('Unknown document evidence kind')
-        for asset in [*candidate['assets'], *candidate['inherited_assets']]:
+        for asset in [*candidate['assets'], *candidate.get('generated_assets', []), *candidate['inherited_assets']]:
             path = str(self.workspace.resolve_material_root(asset['source']))
             if self.workspace.artifact_hashes([path])[path] != asset['source_sha256']:
                 raise ValueError('Selected attachment changed')
@@ -928,7 +1078,7 @@ class DocumentWorkToolGateway:
         request = store.read_json('request.json')
         record = store.read_json(f"decisions/{candidate['decision']}/response.json")
         snapshot = store.read_json(f"decisions/{candidate['decision']}/request.json")
-        decision = _Decision.model_validate(record['response'])
+        decision = self._saved_decision(store, binding, record['response'], candidate['decision'])
         if (candidate['contract'] != 'document_work_candidate.v1'
                 or candidate['request_sha256'] != _digest(request)
                 or candidate['input_sha256'] != _digest(binding)
@@ -963,14 +1113,17 @@ class DocumentWorkToolGateway:
             raise ValueError('Selected original observation record changed')
         visible = {row['path']: row for row in binding['context']['candidates']}
         selected_sources = self._selected_sources(binding, decision.attachments)
+        generated = self._generated_report_assets(store, binding, candidate['decision'], identity)
         if (len(selected_sources) != len(set(selected_sources))
                 or selected_sources != [asset['source'] for asset in candidate['assets']]
                 or any(source not in visible for source in selected_sources)
                 or any(asset['path'] != f"workspace/document-work/{identity}/{visible[asset['source']]['delivery_path']}"
                     for asset in candidate['assets'])
-                or candidate['inherited_assets'] != self._inherited_assets(binding, candidate['markdown'], identity, candidate['assets'])):
+                or candidate.get('generated_assets', []) != generated
+                or candidate['inherited_assets'] != self._inherited_assets(binding, candidate['markdown'], identity,
+                    [*candidate['assets'], *generated])):
             raise ValueError('Document attachment selection or destination changed')
-        targets = [candidate['manuscript'], *(row['path'] for row in [*candidate['assets'], *candidate['inherited_assets']])]
+        targets = [candidate['manuscript'], *(row['path'] for row in [*candidate['assets'], *generated, *candidate['inherited_assets']])]
         if len(targets) != len(set(targets)):
             raise ValueError('Document asset destinations conflict')
         self._check_asset_links(binding, candidate['markdown'], identity, targets)
@@ -983,7 +1136,7 @@ class DocumentWorkToolGateway:
                     or self.workspace.artifact_hashes(previous['result']['artifacts'])
                         != previous['result']['data']['artifact_sha256']):
                 raise ValueError('Recorded document output changed; use a new work attempt')
-        all_assets = [*candidate['assets'], *candidate['inherited_assets']]
+        all_assets = [*candidate['assets'], *generated, *candidate['inherited_assets']]
         for asset in all_assets:
             self._materialize('copy_file', asset['path'], asset['source_sha256'], identity,
                 {'source': asset['source'], 'source_sha256': asset['source_sha256']})

@@ -3707,13 +3707,10 @@ class WritingToolGateway:
                     raise ValueError('Selected material identity conflicts with a retained source')
                 # Reading an artifact neither establishes a literature identity
                 # nor upgrades saved results into current verified measurements.
-                records[document_id] = DocumentRecord(document_id=document_id, title=window.path,
-                    source='local_analysis', content_hash=view['sha256'], extraction_status='parsed',
-                    abstract=f'Selected file window: {json.dumps(selection, ensure_ascii=False)}. Full-file digest may be unavailable; only this window was read.',
-                    metadata={'kind': 'selected_artifact', 'evidence_role': 'selected_file_content_not_independently_verified',
-                        'fulltext_extraction': {'coverage': selection}})
-                chunks[document_id] = TextChunk(chunk_id=document_id, document_id=document_id,
-                    text=text, source_path=window.path, line_start=window.start_line, metadata={'selection': selection})
+                from simple_ar.report.projection import selected_material_window
+                records[document_id], chunks[document_id] = selected_material_window(
+                    document_id=document_id, path=window.path, view=view, selection=selection,
+                    start_line=window.start_line)
             if reuse_linkage is not None and bindings != reuse_linkage['inputs']:
                 raise ValueError('Prior composition selected inputs changed; use fresh selection for changed evidence')
             if reuse_linkage is not None:

@@ -375,14 +375,12 @@ Paired differences use complete same-row pairs, candidate minus baseline; margin
 
 Structured writing uses kind writing, report-only output, a model and local assets.papers/materials. Paths cannot occupy both roles. Text, Markdown, HTML and PDF are supported; writing materials also accept JSON and validated analysis packages. Keep table_analysis.v1 beside its copied data; both have 20 MiB limits and are rechecked on import. Ordinary JSON is unverified material. State genre/length/intended figures in the goal.
 
-Fields belong to research `[report]`, not native `[task]`. Saved legacy sessions
-use the Writer controls below. New common tasks retain the configuration and
-check a frozen outline and citation ceiling at delivery, but do not execute the
-legacy sectional drafting, review/revision loops or their individual token
-limits. Task-level independent inspection is separate. Explicit template text
-is supplied to the common document worker when available.
+Fields belong to research `[report]`, not native `[task]`. The common document
+worker uses these controls for requested reports; task-level independent
+inspection is separate. Delivery also checks the frozen outline and citation
+ceiling. Saved sessions retain their original writing contract.
 
-| Field | Meaning | Type and default | Legacy change effect |
+| Field | Meaning | Type and default | Change effect |
 | --- | --- | --- | --- |
 | `writing_method` | Whole article / sections | Optional article / sections; normally article unless controls require sections | New writing; saved method retained |
 | `template` | Built-in/custom Markdown outline | String auto; source_review, survey, material_report, experiment, reproduction, analysis_report | New plan |
@@ -398,7 +396,7 @@ is supplied to the common document worker when available.
 | `max_document_review_prompt_chars` | Complete review-request ceiling | Nonnegative integer 0 = no extra ceiling | New review; excess refused, not truncated |
 | `figures` | Deterministic figure settings | Table below | New assembly |
 
-For legacy article inspection explicitly set reviewer=llm, document_review=true, review_scope=document. Zero rounds inspects once; positive rounds bound complete corrections. Section draft_scope=auto drafts jointly only with positive length targets for every section totaling at most 2,000 words; otherwise sectional.
+For article inspection explicitly set reviewer=llm, document_review=true, review_scope=document. Zero rounds inspects once; positive rounds bound complete corrections. Section draft_scope=auto drafts jointly only with positive length targets for every section totaling at most 2,000 words; otherwise sectional.
 
 Fields under `[report.figures]`:
 

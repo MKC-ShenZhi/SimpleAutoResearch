@@ -597,16 +597,14 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 
 #### Report controls
 
-The detailed Writer controls below apply to saved legacy sessions. New common
-tasks retain these settings, but do not run the legacy sectional drafting and
-review loops or enforce their per-section token and revision bounds. A frozen
-outline and citation ceiling are checked at delivery; task-level independent
-inspection is separate. An explicitly selected template is also supplied to
-the common document worker when that worker is available.
+When a new common task requests a report, its document worker uses the selected
+writing method, template, review and per-call output limits below. A frozen
+outline and citation ceiling are also checked at delivery; task-level independent
+inspection remains separate. Saved sessions retain their original writing contract.
 
 | Parameter | Meaning | Default or conditions |
 | --- | --- | --- |
-| `--report-writing-method CHOICE` | Legacy Writer method; saved sessions retain it. Choices: `article`, `sections`. | Legacy article, or sections for explicit sectional controls |
+| `--report-writing-method CHOICE` | Report writing method. Choices: `article`, `sections`. | article, or sections for explicit sectional controls |
 | `--max-section-tokens N` | Output cap per writing unit; zero/unset omits this extra cap. | Unset |
 | `--with-report` | Explicitly request a model-authored report; data analysis otherwise delivers analysis only. | Off |
 | `--no-report` | Skip report writing in a model-backed session. | Off |
