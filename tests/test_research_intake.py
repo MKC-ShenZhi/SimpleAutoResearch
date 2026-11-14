@@ -628,15 +628,13 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(exact['preparation']['workspace_mode'], defaults['workspace_mode'])
             self.assertEqual(exact['preparation']['max_repairs'], defaults['max_repairs'])
             self.assertEqual(exact['allowed_patterns'], defaults['allowed_patterns'] or ['**'])
-            from simple_ar.code_task.editing.scope import is_edit_allowed_path
-            for path in ('adapter.py', 'src/model.py', 'README.md', 'tests/test_adapter.py', '.env'):
-                self.assertEqual(is_edit_allowed_path(path, allowed_patterns=exact['allowed_patterns'],
-                    protected_patterns=exact['protected_patterns']),
-                    is_edit_allowed_path(path, allowed_patterns=defaults['allowed_patterns'],
-                        protected_patterns=defaults['protected_patterns']), path)
+            self.assertEqual(exact['protected_patterns'], defaults['protected_patterns'])
             self.assertEqual(exact['project_path'], 'source0')
             self.assertEqual(exact['validation_command'], ['python', 'check.py'])
             self.assertEqual(saved['code_work_policy'], 'shared.v2')
+            self.assertIn('implement_code_task', app.operations.system_text())
+            self.assertNotIn('write_file and run_process', app.operations.system_text())
+            self.assertFalse(app.gateway.policy.is_allowed(app.gateway.registry.get('write_file'))[0])
             self.assertEqual(app.operations.implementation.work_context([str(project)])['user_requests'],
                 app.state['requests'])
             self.assertIs(app.operations.document.ledger, app.ledger)
