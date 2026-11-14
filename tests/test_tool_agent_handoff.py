@@ -721,7 +721,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         _, _, _, _, app, _ = self._native_fixture(
             report_requirement=requirement, measurement_command=['python', 'measure.py'])
         self.assertEqual(app.state['config']['professional_operations'], 'work.v5')
+        self.assertEqual(app.state['config']['document_context_policy'], 'working.v3')
         self.assertIn('work_document', {row['function']['name'] for row in app.operation_schemas})
+        self.assertEqual(app.operations.document.report_requirement, requirement)
         context = app.operations.document.work_context([])
         self.assertEqual(context['requested_report']['outline'], requirement['outline'])
         self.assertEqual(context['requested_report']['max_cited_sources'], 2)

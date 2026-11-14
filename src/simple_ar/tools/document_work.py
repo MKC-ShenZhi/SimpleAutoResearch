@@ -280,18 +280,8 @@ class DocumentWorkToolGateway:
                     or record['response_sha256'] != _digest(record['response'])
                     or snapshot['system'] != _system_for(binding)
                     or snapshot['budget_call_id'] != f'{identity}:document:{step}'
+                    or any(row not in observations for row in snapshot['input']['observations'])
                     or not self._context_matches(binding, snapshot['input'], identity)):
-                return None
-            presented = []
-            for number in range(1, step + 1):
-                actual = store.read_json(f'decisions/{number}/request.json')
-                reply = store.read_json(f'decisions/{number}/response.json')
-                if (reply.get('request_sha256') != _digest(actual) or not reply.get('accounting_known')
-                        or reply.get('response_sha256') != _digest(reply.get('response'))):
-                    return None
-                presented.extend(actual['input']['observations'])
-            if (any(row not in observations for row in presented)
-                    or any(not any(row['id'] == item for row in presented) for item in decision.selected_observation_ids)):
                 return None
             return binding, observations, decision, step, snapshot['input']['work_context']
         except (ValueError, TypeError, KeyError, OSError):

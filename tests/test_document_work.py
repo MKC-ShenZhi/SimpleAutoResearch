@@ -44,14 +44,38 @@ class _Client:
 
 
 class DocumentWorkTests(unittest.TestCase):
-    def test_common_report_runs_configured_section_review_and_revision(self):
+    def test_report_receives_only_selected_source_passage_and_its_real_range(self):
+        from simple_ar.core.capabilities import ArtifactStore
+        from simple_ar.report.document_writer import _observed_documents
+        from simple_ar.report.projection import build_material_report_inputs
+
+        root, _, _, _ = self.workspace()
+        original = DocumentBundle([DocumentRecord(document_id='paper', title='Paper', source='test',
+            metadata={'paper_id': 'paper'}, extraction_status='parsed')], {}, {}, [], [
+                TextChunk(chunk_id='paper-1', document_id='paper', text='Unread before. Read this. Unread after.')])
+        path = root / 'source.json'
+        path.write_text(json.dumps(original.to_handoff_dict()), encoding='utf-8')
+        selected = _observed_documents([{'id': 'o1', 'kind': 'source_passages', 'data': {
+            'document_path': str(path), 'matches': [{'document_id': 'paper', 'chunk_id': 'paper-1',
+                'text': 'Read this.', 'character_start': 15, 'character_end': 25,
+                'total_characters': 39, 'truncated': True}]}}])
+        store = ArtifactStore(root / 'report')
+        ref = store.write_json('documents.json', selected.to_handoff_dict(), kind='documents', schema='document_bundle.v1')
+        context, _ = build_material_report_inputs(topic='Question', documents=selected,
+            documents_ref=ref, assets=[], selected_evidence=True)
+        passage = context.source_handles[0].metadata['evidence_passages'][0]
+        self.assertEqual((passage['text'], passage['character_start'], passage['character_end'],
+            passage['total_characters'], passage['truncated']), ('Read this.', 15, 25, 39, True))
+        self.assertNotIn('Unread after.', json.dumps(context.model_dump(mode='json')))
+
+    def test_common_report_runs_configured_review_revision_and_recovery(self):
         from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
         from tests.report_review_fixtures import draft_quotes, prompt_payload
 
         root, source, ledger, workspace = self.workspace()
         (source / 'result.txt').write_text('Observed value: 2.\n', encoding='utf-8')
         config = ReportRuntimeConfig(outline_strategy='template', reviewer='llm',
-            document_review=True, review_scope='document', draft_scope='section',
+            document_review=True, review_scope='document', draft_scope='document',
             max_review_iterations=1, max_section_tokens=128, allow_source_backtracking=False)
         template = ReportTemplateBundle(name='controlled', mode='supplied_materials',
             template_path='', criteria_path='', template_markdown='## Observations\n\n## Limits\n', criteria_markdown='')
@@ -118,7 +142,7 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertEqual(labels.count('report-document-verifier'), 1)
         self.assertTrue(all(row[1].get('max_output_tokens') == 128 for row in calls
             if row[0].startswith('report-writer-') or row[0] == 'report-document-joint-reviser'))
-        self.assertEqual(len([row for row in calls if row[0].startswith('report-writer-')]), 2)
+        self.assertEqual(len([row for row in calls if row[0].startswith('report-writer-')]), 1)
         self.assertTrue(any('Observed value: 2.' in json.dumps(row[2]) for row in calls
             if row[0].startswith('report-writer-')))
         self.assertIn('workspace/document-work/report/references.bib', result.artifacts)
@@ -127,6 +151,47 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertEqual(ledger.to_dict(), saved_usage)
         self.assertEqual([row[0] for row in calls], labels)
 
+    def test_common_report_uses_configured_section_writer_and_output_limit(self):
+        from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
+        from tests.report_review_fixtures import prompt_payload
+
+        root, source, ledger, workspace = self.workspace()
+        config = ReportRuntimeConfig(outline_strategy='template', reviewer='disabled',
+            max_review_iterations=0, max_section_tokens=96, allow_source_backtracking=False)
+        template = ReportTemplateBundle(name='sections', mode='supplied_materials', template_path='',
+            criteria_path='', template_markdown='## Observations\n\n## Limits\n', criteria_markdown='')
+        requirement = {'method': 'sections', 'config': config.model_dump(mode='json'),
+            'template': template.model_dump(mode='json'), 'outline': [
+                {'heading': 'Observations', 'required': True}, {'heading': 'Limits', 'required': True}]}
+        calls = []
+
+        class Client(_Client):
+            def ask_json(self, system, prompt, *, label='', budget_call_id='', **options):
+                view = prompt_payload(prompt)
+                calls.append((label, options))
+                self._budget_ledger.reserve(budget_call_id, {'llm_requests': 1, 'total_tokens': 10},
+                    session_id='session', attempt_id=self._budget_attempt_id, purpose='document')
+                if label == 'document-work-1':
+                    response = {'action': 'write', 'title': 'Brief'}
+                elif label.startswith('report-writer-'):
+                    response = {'section_id': view['section']['section_id'], 'heading': view['section']['heading'],
+                        'draft_markdown': 'Bounded information.'}
+                else:
+                    raise AssertionError(label)
+                self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
+                return response
+
+        client = Client(ledger, 'sections', None)
+        gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
+            material_roots=lambda: ['source0'], context_policy='working.v3', report_requirement=requirement)
+        result = gateway.call('work_document', {'goal': 'Write the requested brief'}, identity='sections')
+        self.assertTrue(result.ok, result.error)
+        self.assertIn('## Observations', result.data['markdown'])
+        self.assertIn('## Limits', result.data['markdown'])
+        writers = [row for row in calls if row[0].startswith('report-writer-')]
+        self.assertEqual(len(writers), 2)
+        self.assertTrue(all(options['max_output_tokens'] == 96 for _, options in writers))
+
     def test_common_article_feedback_keeps_unaffected_prior_work(self):
         from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
         from tests.report_review_fixtures import prompt_payload
@@ -134,7 +199,8 @@ class DocumentWorkTests(unittest.TestCase):
         root, source, ledger, workspace = self.workspace()
         previous = source / 'draft.md'
         previous.write_text('# Existing\n\nOld claim.\n\nUnaffected text.\n', encoding='utf-8')
-        config = ReportRuntimeConfig(reviewer='disabled', max_review_iterations=0, max_section_tokens=256)
+        config = ReportRuntimeConfig(reviewer='disabled', max_review_iterations=0,
+            max_section_tokens=256, allow_source_backtracking=False)
         template = ReportTemplateBundle(name='brief', mode='supplied_materials', template_path='',
             criteria_path='', template_markdown='## Findings\n', criteria_markdown='')
         requirement = {'method': 'article', 'config': config.model_dump(mode='json'),

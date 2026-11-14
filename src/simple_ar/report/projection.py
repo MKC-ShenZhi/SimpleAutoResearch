@@ -603,6 +603,17 @@ def build_material_report_inputs(
         passages = ([view for chunk in chunks if chunk.text
                      for view in source_chunk_views([chunk], max_chars=len(chunk.text))]
                     if selected_evidence else material_overview_views(chunks, topic))
+        if selected_evidence:
+            for chunk, passage in zip((item for item in chunks if item.text), passages, strict=True):
+                window = chunk.metadata.get('observed_window')
+                if window:
+                    passage.update({key: window[key] for key in
+                        ('character_start', 'character_end', 'total_characters', 'truncated') if key in window})
+                    passage['source_chunk_id'] = window['chunk_id']
+                elif chunk.metadata.get('selection'):
+                    selection = chunk.metadata['selection']
+                    passage['source_selection'] = selection
+                    passage['truncated'] = bool(selection.get('offset_bytes') or selection.get('has_more'))
         # A bounded overview is not the source's table of contents. Expose
         # retained section locations so readers can choose a specific lookup
         # instead of inferring that an unselected experiment does not exist.
