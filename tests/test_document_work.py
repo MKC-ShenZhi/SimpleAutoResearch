@@ -70,6 +70,51 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertNotIn('Unread after.', json.dumps(context.model_dump(mode='json')))
         self.assertNotIn('Unread metadata finding.', json.dumps(context.model_dump(mode='json')))
 
+    def test_common_report_retains_cited_original_and_bibliography(self):
+        from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
+        from tests.report_review_fixtures import prompt_payload
+
+        root, source, ledger, workspace = self.workspace()
+        bundle = DocumentBundle([DocumentRecord(document_id='paper', title='Original paper', source='local_files',
+            authors=['Researcher Example'], extraction_status='parsed', metadata={'paper_id': 'paper'})], {}, {}, [], [
+                TextChunk('chunk-1', 'paper', 'Calibration depends on the observed population.')])
+        (source / 'original.json').write_text(json.dumps(bundle.to_handoff_dict()), encoding='utf-8')
+        config = ReportRuntimeConfig(reviewer='disabled', max_review_iterations=0, allow_source_backtracking=False)
+        template = ReportTemplateBundle(name='brief', mode='supplied_materials', template_path='',
+            criteria_path='', template_markdown='## Findings\n', criteria_markdown='')
+        requirement = {'method': 'article', 'config': config.model_dump(mode='json'),
+            'template': template.model_dump(mode='json'), 'outline': []}
+
+        class Client(_Client):
+            def ask_json(self, system, prompt, *, label='', budget_call_id='', **options):
+                self._budget_ledger.reserve(budget_call_id, {'llm_requests': 1, 'total_tokens': 10},
+                    session_id='session', attempt_id=self._budget_attempt_id, purpose='document')
+                if label == 'document-work-1':
+                    response = {'action': 'investigate', 'source_queries': [
+                        {'document_record': 'source0/original.json', 'query': 'calibration population'}]}
+                elif label == 'document-work-2':
+                    response = {'action': 'write', 'title': 'Calibration', 'selected_observation_ids': ['o1']}
+                elif label == 'composition-article':
+                    view = prompt_payload(prompt)
+                    self_test.assertIn('observed population', json.dumps(view))
+                    response = {'draft_markdown': '# Calibration\n\nThe observed population matters [@P1].'}
+                else:
+                    raise AssertionError(label)
+                self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
+                return response
+
+        self_test = self
+        client = Client(ledger, 'citation', None)
+        gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
+            material_roots=lambda: ['source0'], sources=SourceToolGateway(root, workspace, ledger),
+            context_policy='working.v3', report_requirement=requirement)
+        result = gateway.call('work_document', {'goal': 'Explain the source'}, identity='citation')
+        self.assertTrue(result.ok, result.error)
+        bibliography = workspace.resolve('workspace/document-work/citation/references.bib').read_text(encoding='utf-8')
+        self.assertIn('Original paper', bibliography)
+        self.assertIn('Researcher Example', bibliography)
+        self.assertFalse(any('citation references were removed' in gap for gap in result.data['gaps']))
+
     def test_common_report_runs_configured_review_revision_and_recovery(self):
         from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
         from tests.report_review_fixtures import draft_quotes, prompt_payload
