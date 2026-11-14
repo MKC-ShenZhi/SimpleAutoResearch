@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from simple_ar.experiment.metrics import parse_metric_lines
-from simple_ar.core.process import ProcessSpec, run_process, with_process_outputs
+from simple_ar.core.process import ProcessSpec, confine_process, run_process, with_process_outputs
+from simple_ar.core.process_sandbox import ProcessSandbox
 from simple_ar.core.process_output import ProcessOutput
 from simple_ar.core.budget import BudgetLedger
 
@@ -68,6 +69,8 @@ class LocalExecutionBackend:
     name: str = "local"
     budget_ledger: BudgetLedger | None = field(default=None, repr=False)
     message_callback: Callable[[str], None] | None = field(default=None, repr=False)
+    sandbox: ProcessSandbox | None = field(default=None, repr=False)
+    accounting_purpose: str = 'local_process'
 
     def run(self, request: RunRequest) -> RunResult:
         if request.timeout_sec < 1:
@@ -85,6 +88,8 @@ class LocalExecutionBackend:
             session_id=request.session_id, attempt_id=request.attempt_id,
         )
         spec = with_process_outputs(spec)
+        if self.sandbox is not None:
+            spec = confine_process(spec, self.sandbox)
         if self.message_callback:
             self.message_callback(f"Experiment {request.label}: cwd={request.cwd}; timeout={request.timeout_sec}s")
             if spec.output_dir:
@@ -92,7 +97,9 @@ class LocalExecutionBackend:
         output = ProcessOutput(self.message_callback) if self.message_callback else None
         try:
             result = run_process(spec, budget_ledger=self.budget_ledger,
-                                 output_callback=output.feed if output else None)
+                                 output_callback=output.feed if output else None,
+                                 **({'accounting_purpose': self.accounting_purpose}
+                                    if self.accounting_purpose != 'local_process' else {}))
         finally:
             if output:
                 output.finish()

@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from simple_ar.core.artifacts import write_json
+from simple_ar.core.budget import BudgetExceededError
+from simple_ar.experiment.execution.backend import ExecutionError
 from simple_ar.code_task.editing.attempts import (
     load_latest_code_task_batch,
     update_code_task_batch_state,
@@ -81,6 +83,7 @@ def validate_code_task(
     *,
     strict: bool = False,
     max_file_bytes: int = 500_000,
+    process_scope: Any | None = None,
 ) -> CodeTaskValidationResult:
     """Validate Python files in a code-task workspace.
 
@@ -120,7 +123,8 @@ def validate_code_task(
                     names.update(name for name, _ in _imports(ast.parse(path.read_bytes(), filename=str(path))))
                 except SyntaxError:
                     pass  # Reported by the ordinary syntax pass below.
-        import_availability = _external_import_availability(str(external_python), names)
+        import_availability = _external_import_availability(str(external_python), names,
+            **({'process_scope': process_scope, 'cwd': paths.workspace_dir} if process_scope is not None else {}))
         if import_availability is None:
             issues.append(_issue(severity="warning", code="dependency_check_unavailable", path="",
                 message="Could not inspect the configured external interpreter; dependency availability is unknown."))
@@ -360,7 +364,8 @@ def _import_available(name: str, workspace_dir: Path, *, current_file: Path | No
         return False
 
 
-def _external_import_availability(executable: str, names: set[str]) -> dict[str, bool] | None:
+def _external_import_availability(executable: str, names: set[str], *,
+                                  process_scope: Any | None = None, cwd: Path | None = None) -> dict[str, bool] | None:
     """One bounded stdlib-only probe; never import project or training modules."""
     script = (
         "import importlib.util,json,sys; "
@@ -368,13 +373,18 @@ def _external_import_availability(executable: str, names: set[str]) -> dict[str,
         "print(json.dumps({n: importlib.util.find_spec(n) is not None for n in names}))"
     )
     try:
-        result = subprocess.run([executable, "-I", "-c", script],
-            input=json.dumps(sorted(names)), capture_output=True, text=True, timeout=10, check=False)
+        if process_scope is not None:
+            scoped_script = script.replace('json.load(sys.stdin)', 'json.loads(sys.argv[1])')
+            result = process_scope.probe([executable, '-I', '-c', scoped_script, json.dumps(sorted(names))],
+                cwd=cwd, timeout_sec=10)
+        else:
+            result = subprocess.run([executable, "-I", "-c", script],
+                input=json.dumps(sorted(names)), capture_output=True, text=True, timeout=10, check=False)
         if result.returncode != 0:
             return None
         data = json.loads(result.stdout)
         return data if isinstance(data, dict) and all(type(v) is bool for v in data.values()) else None
-    except (OSError, subprocess.TimeoutExpired, ValueError):
+    except (OSError, subprocess.TimeoutExpired, ValueError, BudgetExceededError, ExecutionError):
         return None
 
 

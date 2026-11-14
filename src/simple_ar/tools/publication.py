@@ -312,6 +312,9 @@ def _publication_artifacts(workspace: Any, project: str, manifest: dict,
 
 
 class PublicationToolGateway:
+    def within_task_scope(self, name: str, binding: dict[str, Any]) -> bool:
+        return name == 'export_report' and self.workspace.sandbox_execution
+
     @property
     def context_tools(self) -> set[str]:
         return {'export_report'} if self.owned_execution else set()

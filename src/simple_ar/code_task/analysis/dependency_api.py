@@ -8,6 +8,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from simple_ar.core.budget import BudgetExceededError
+from simple_ar.experiment.execution.backend import ExecutionError
+
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_]\w*$")
 _MODULE = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
@@ -43,6 +46,7 @@ def inspect_dependency_api(
     python_executable: str,
     workspace_dir: Path,
     timeout_sec: int = 12,
+    process_scope: Any | None = None,
 ) -> dict[str, Any]:
     """Resolve an explicit, limited API request against the configured interpreter.
 
@@ -80,18 +84,14 @@ def inspect_dependency_api(
     if not accepted:
         return {"status": "invalid_request", "interfaces": []}
     try:
-        completed = subprocess.run(
-            [python_executable, "-I", "-c", _PROBE, json.dumps(accepted)],
-            cwd=workspace_dir,
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
-            check=False,
-        )
+        argv = [python_executable, "-I", "-c", _PROBE, json.dumps(accepted)]
+        completed = (process_scope.probe(argv, cwd=workspace_dir, timeout_sec=timeout_sec)
+            if process_scope is not None else subprocess.run(argv, cwd=workspace_dir,
+                capture_output=True, text=True, timeout=timeout_sec, check=False))
         interfaces = json.loads(completed.stdout) if completed.returncode == 0 else None
         if not isinstance(interfaces, list):
             raise ValueError("Dependency probe did not return a JSON list")
-    except (OSError, subprocess.TimeoutExpired, ValueError):
+    except (OSError, subprocess.TimeoutExpired, ValueError, BudgetExceededError, ExecutionError):
         return {"status": "unavailable", "request": accepted, "interfaces": []}
     return {
         "status": "observed" if any(

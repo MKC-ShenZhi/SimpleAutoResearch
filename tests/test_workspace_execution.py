@@ -105,6 +105,128 @@ class WorkspaceExecutionTests(unittest.TestCase):
         self.assertEqual(restored.ledger.to_dict(), before)
         self.assertEqual(restored.state['requests'][0], 'Old task')
         self.assertIn('Authorize workspace execution', restored.state['requests'][-1])
+        self.assertEqual(restored.state['config']['sandbox_operations'], 'workspace.v1')
+
+    def test_scientific_measurement_uses_the_task_scope_and_owned_outputs(self):
+        app = ToolApplication.create(self.base / 'science', 'Measure a workspace result', model=None,
+            sources={'source': self.source}, allow_execution=True, sandbox_execution=True,
+            process_limits={'process_invocations': 3, 'process_wall_seconds': 60})
+        program = ('import json,os,socket; from pathlib import Path; '
+            's=socket.socket(); s.settimeout(1); '
+            f'facts={{"source_visible":os.path.exists({str(self.source)!r}), '
+            '"secret_visible":bool(os.getenv("SIMPLE_AR_TEST_SECRET")), '
+            '"network_result":s.connect_ex(("1.1.1.1",53))}; '
+            'Path(os.environ["SIMPLE_AR_OUTPUT_DIR"],"observed.json").write_text(json.dumps(facts)); '
+            'print("score: 1")')
+        with patch.dict('os.environ', {'SIMPLE_AR_TEST_SECRET': 'not available to task'}):
+            app.run(actions=[action('measure_experiment', command=['python', '-c', program],
+                timeout_sec=10, result_schema={'required_metrics': ['score'],
+                    'output_files': {'observation': 'observed.json'}})],
+                progress=lambda _: None, approve=lambda *_: self.fail('Workspace measurement should not pause'))
+        observed = app.session.store.read_json(app.state['turns'][-1]['tools'][-1]['result'])
+        self.assertEqual(observed['status'], 'ok', observed)
+        outputs = list((app.session.store.root / 'attempts').glob('*/execution/process/*/outputs/observed.json'))
+        self.assertEqual(len(outputs), 1)
+        facts = json.loads(outputs[0].read_text())
+        self.assertFalse(facts['source_visible'])
+        self.assertFalse(facts['secret_visible'])
+        self.assertNotEqual(facts['network_result'], 0)
+        receipt = json.loads((outputs[0].parent.parent / 'invocation.json').read_text())
+        self.assertEqual(receipt['execution_scope'], 'workspace')
+        self.assertEqual(app.ledger.entries[-1].status, 'settled')
+
+    def test_specialized_scope_preserves_old_tasks_and_requires_approval_for_setup(self):
+        def make(name):
+            return ToolApplication.create(self.base / name, 'Measure', model=None, sources={},
+                allow_execution=True, sandbox_execution=True,
+                process_limits={'process_invocations': 3, 'process_wall_seconds': 60})
+        legacy = make('legacy-science')
+        legacy.state['config'].pop('sandbox_operations')
+        legacy._save()
+        legacy = ToolApplication.load(legacy.session.store.root)
+        request = action('measure_experiment', command=['python', '-c', 'print("score: 1")'],
+            timeout_sec=5, result_schema={'required_metrics': ['score']})
+        result = legacy.run(actions=[request], progress=lambda _: None)
+        self.assertEqual(result['status'], 'paused')
+        self.assertIn('explicit approval', legacy.session.manifest.status_reason)
+        self.assertFalse(legacy.ledger.entries)
+
+        setup = make('environment-science')
+        request['arguments']['environment'] = {'mode': 'current', 'timeout_sec': 5,
+            'check_command': ['python', '-c', 'print("checked")']}
+        result = setup.run(actions=[request], progress=lambda _: None)
+        self.assertEqual(result['status'], 'paused')
+        self.assertIn('explicit approval', setup.session.manifest.status_reason)
+        self.assertFalse(setup.ledger.entries)
+
+    def test_scoped_code_probes_and_validator_use_the_same_workspace_boundary(self):
+        from simple_ar.code_task.analysis.dependency_api import inspect_dependency_api
+        from simple_ar.code_task.execution.runner import run_code_task_benchmark
+        from simple_ar.code_task.execution.validation import validate_code_task
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        project = self.source
+        (project / 'main.py').write_text('import json\nVALUE = 1\n')
+        outside = self.base / 'outside.txt'
+        other_result = self.base / 'code/workspace/other-result.txt'
+        (project / 'check.py').write_text(
+            'from pathlib import Path\n'
+            f'paths = [{str(outside)!r}, {str(other_result)!r}]\n'
+            'for name in paths:\n'
+            ' try:\n  Path(name).write_text("changed")\n'
+            ' except OSError:\n  print("outside blocked")\n')
+        contract = {'project_path': 'source', 'goal': 'Change the model',
+            'allowed_patterns': ['main.py'], 'validation_command': ['python', 'check.py'],
+            'timeout_sec': 5, 'preparation': {'kind': 'existing_project', 'workspace_mode': 'copy'}}
+        app = ToolApplication.create(self.base / 'code', 'Change the model', model=None,
+            sources={'source': project}, allow_execution=True, sandbox_execution=True,
+            code_task=contract, process_limits={'process_invocations': 5, 'process_wall_seconds': 60})
+        other_result.write_text('retained')
+        call = {'function': {'name': 'implement_code_task', 'arguments': '{}'}}
+        pending = {'attempt': 'code-scope', 'call': call}
+        app.state['pending'] = pending
+        self.assertTrue(app._approve_action(pending, '', lambda *_: self.fail('Scoped code should not pause'),
+                                            lambda _: None, scoped=True))
+        self.assertEqual(pending['execution_approval']['binding']['execution_scope'], 'workspace.v1')
+        context = CapabilityContext(ArtifactStore(app.session.store.root / 'attempts/code-scope'),
+                                    AttemptManifest('code-scope'))
+        checked = []
+        def exercise(*, context, request):
+            scope = request.process_scope
+            self.assertIs(scope.ledger, app.ledger)
+            index = {'files': [{'path': 'main.py', 'python': {'imports': ['json']}}]}
+            api = inspect_dependency_api([{'module': 'json', 'symbols': ['loads']}], index, ['main.py'],
+                python_executable=str(app.workspace.python), workspace_dir=request.cwd, process_scope=scope)
+            self.assertEqual(api['status'], 'observed')
+            validate_code_task(request.run_dir, process_scope=scope)
+            validation = run_code_task_benchmark(request.run_dir, command='python check.py',
+                timeout_sec=5, skip_validation=True, budget_ledger=app.ledger,
+                session_id=app.session.manifest.session_id, attempt_id='code-scope', process_scope=scope)
+            self.assertEqual(validation.status, 'passed')
+            self.assertIn('outside blocked', validation.stdout_path.read_text())
+            self.assertFalse(outside.exists())
+            self.assertEqual(other_result.read_text(), 'retained')
+            checked.append(True)
+            raise RuntimeError('Stop after exercising the actual isolated processes')
+        with patch.object(app.implementation, '_client', return_value=object()), patch(
+                'simple_ar.research.implementation.run_implementation_capability', side_effect=exercise):
+            with self.assertRaisesRegex(RuntimeError, 'actual isolated processes'):
+                app.implementation.execute(context, {}, approval=pending['execution_approval'])
+        self.assertTrue(checked)
+        self.assertTrue(any(row.purpose == 'code_probe' and row.status == 'settled' for row in app.ledger.entries))
+        self.assertTrue(any(row.purpose == 'local_process' and row.status == 'settled' for row in app.ledger.entries))
+        self.assertFalse(outside.exists())
+        self.assertEqual(other_result.read_text(), 'retained')
+
+        setup_contract = {**contract, 'environment': {'mode': 'current', 'timeout_sec': 5,
+            'check_command': ['python', '-c', 'print("checked")']}}
+        setup = ToolApplication.create(self.base / 'code-setup', 'Change the model', model=None,
+            sources={'source': project}, allow_execution=True, sandbox_execution=True,
+            code_task=setup_contract, process_limits={'process_invocations': 5, 'process_wall_seconds': 60})
+        pending_setup = {'attempt': 'code-setup', 'call': call}
+        setup.state['pending'] = pending_setup
+        self.assertFalse(setup._approve_action(pending_setup, '', None, lambda _: None, scoped=True))
+        self.assertIn('explicit approval', setup.session.manifest.status_reason)
+        self.assertFalse(setup.ledger.entries)
 
     @unittest.skipUnless(shutil.which('pandoc') and shutil.which('xelatex'), 'Pandoc and XeLaTeX required')
     def test_publication_uses_the_same_scope_and_records_each_process(self):

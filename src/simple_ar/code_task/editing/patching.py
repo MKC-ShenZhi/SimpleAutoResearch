@@ -144,6 +144,7 @@ def propose_patch_edits(
     edit_budget_overrides: dict[str, Any] | None = None,
     message_callback: MessageCallback | None = None,
     llm_client: LLMClient | None = None,
+    process_scope: Any | None = None,
 ) -> ProposedEditsResult:
     """Generate controlled old/new text edits from an approved patch plan.
 
@@ -384,6 +385,7 @@ def propose_patch_edits(
                             request["dependency_symbols"], index,
                             [item["path"] for item in supplied],
                             python_executable=interpreter, workspace_dir=workspace_dir,
+                            **({'process_scope': process_scope} if process_scope is not None else {}),
                         ) if isinstance(interpreter, str) and interpreter else
                         {"status": "unavailable", "interfaces": [], "reason": "project_python_not_configured"}
                     )

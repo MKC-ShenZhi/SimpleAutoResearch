@@ -98,6 +98,7 @@ def probe_code_task_environment(
     *,
     env_mode: str | None = None,
     python_executable: str | Path | None = None,
+    process_scope: Any | None = None,
 ) -> CodeTaskEnvironmentResult:
     """Probe runtime and project environment for a code-task workspace.
 
@@ -124,6 +125,7 @@ def probe_code_task_environment(
         run_dir,
         env_mode=env_mode,
         python_executable=python_executable,
+        **({'process_scope': process_scope} if process_scope is not None else {}),
     )
 
 
@@ -216,6 +218,7 @@ def _probe_code_task_environment(
     *,
     env_mode: str | None = None,
     python_executable: str | Path | None = None,
+    process_scope: Any | None = None,
 ) -> CodeTaskEnvironmentResult:
     manifest = load_code_task_manifest(run_dir)
     paths = code_task_paths(run_dir)
@@ -231,7 +234,8 @@ def _probe_code_task_environment(
     )
     manifest = load_code_task_manifest(run_dir)
     codebase_index = _load_codebase_index(paths.meta_dir / "codebase_index.json")
-    report = _build_environment_report(paths.workspace_dir, manifest, codebase_index, policy)
+    report = _build_environment_report(paths.workspace_dir, manifest, codebase_index, policy,
+        **({'scoped': True} if process_scope is not None else {}))
     report_path = paths.meta_dir / "environment_report.json"
     write_json(report_path, report)
     resource_probe, resource_decision = _resource_artifacts(report)
@@ -254,6 +258,7 @@ def _build_environment_report(
     manifest: dict[str, Any],
     codebase_index: dict[str, Any],
     policy: dict[str, Any],
+    *, scoped: bool = False,
 ) -> dict[str, Any]:
     warnings: list[str] = []
     if not codebase_index:
@@ -262,13 +267,17 @@ def _build_environment_report(
     if not (isinstance(benchmark, dict) and benchmark.get("command")):
         warnings.append("benchmark_command_missing")
 
-    gpu = _gpu_summary(warnings)
+    gpu = ({'available': False, 'count': 0, 'backend': None, 'devices': [],
+            'probe': 'task_scope_no_gpu'} if scoped else _gpu_summary(warnings))
     project = _project_summary(workspace_dir, codebase_index)
     if not project["dependency_files"]:
         warnings.append("dependency_file_not_found")
     if not project["test_dirs"]:
         warnings.append("test_directory_not_found")
 
+    tools = _tools_summary()
+    if scoped:
+        tools['nvidia-smi'] = {'available': False, 'path': None}
     return {
         "schema_version": 1,
         "generated_at": utcnow_iso(),
@@ -276,7 +285,7 @@ def _build_environment_report(
         "platform": _platform_summary(),
         "python": _python_summary(),
         "execution_policy": policy,
-        "tools": _tools_summary(),
+        "tools": tools,
         "python_modules": _python_modules_summary(),
         "execution_context": _execution_context_summary(),
         "gpu": gpu,

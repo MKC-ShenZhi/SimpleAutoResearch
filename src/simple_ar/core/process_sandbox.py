@@ -13,6 +13,7 @@ class ProcessSandbox:
     writable: Path
     python: Path
     extra_read: tuple[Path, ...] = ()
+    extra_write: tuple[Path, ...] = ()
 
 
 def sandbox_command(sandbox: ProcessSandbox, cwd: Path, argv: list[str]) -> list[str]:
@@ -55,4 +56,6 @@ def sandbox_command(sandbox: ProcessSandbox, cwd: Path, argv: list[str]) -> list
     command += ['--bind', str(writable), str(writable)]
     for path in sandbox.extra_read:
         command += ['--ro-bind', str(path), str(path)]
+    for path in sandbox.extra_write:
+        command += ['--bind', str(path), str(path)]
     return [*command, '--chdir', str(cwd), '--', *argv]

@@ -110,12 +110,14 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--max-processes N` | 原生累计进程次数，含检索后端；0 禁止进程。 | 没有合同设置时为 10 × max-turns |
 | `--max-process-seconds N` | 累计进程实际耗时（秒）；不是单命令超时。 | 没有合同设置时为 300 × max-turns |
 | `--allow-execution` | 允许提出进程命令；未开启工作区执行时，每条命令仍需精确批准。 | 关闭 |
-| `--sandbox-execution` | 在任务工作区内自动执行普通命令和报告构建，无需逐条批准。进程不能访问外网、宿主机 GPU 或原始材料挂载，所需材料须先复制到工作区；超出范围可请求宿主机执行并经明确批准。 | 需同时设置 `--allow-execution`、Linux 和 bubblewrap |
+| `--sandbox-execution` | 在任务工作区内自动执行普通命令、报告构建及符合范围的代码／测量操作，无需逐条批准。进程不能访问外网、宿主机 GPU 或原始材料挂载，所需材料须先复制到工作区；环境准备、外部输入等超出范围的工作仍须批准。 | 需同时设置 `--allow-execution`、Linux 和 bubblewrap |
 | `--allow-network` | 授权公开来源检索／获取；不授权安装软件包或任意命令。 | 关闭 |
 | `--allow-vision` | 将挂载的 PNG/JPEG/WebP 渲染图发往 vision 路由；共用模型预算。 | 关闭 |
 | `--max-images N` | 通过 image 路由生成／编辑图片的提交额度；与视觉检查分开。 | 0 |
 | `--max-turns N` | 原生任务累计模型请求额度，含反馈。 | 30 |
 | `--max-tokens N` | 原生任务累计模型 token 额度，含反馈。请求前输入量为估算，实际结算可能超出额度。 | 600000 |
+
+范围内代码工作使用复制的项目，任务解释器须与框架当前 Python 一致，且不包含环境准备或外部验证输入；范围内测量使用工作区材料且无需额外环境准备。其他专业操作仍须明确批准。
 
 #### 显式结构化兼容
 

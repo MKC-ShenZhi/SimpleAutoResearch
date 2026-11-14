@@ -5,6 +5,7 @@ from pathlib import Path
 import hashlib
 import json
 import re
+import sys
 from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
@@ -236,7 +237,8 @@ class ExactCodeWork(BaseModel):
 
 def implementation_tool_specs(*, exact: bool = False,
                               preparation_only: bool = False,
-                              source_owner_contract: str | None = None) -> list[CommonToolSpec]:
+                              source_owner_contract: str | None = None,
+                              sandboxed_execution: bool = False) -> list[CommonToolSpec]:
     _source_owner_options(source_owner_contract, preparation_only=preparation_only, exact=exact)
     if exact and preparation_only:
         raise ValueError('Preparation-only source generation cannot use the exact code-task contract')
@@ -248,7 +250,10 @@ def implementation_tool_specs(*, exact: bool = False,
             CommonToolSpec(name='implement_code_task', domain='implementation',
             permission_level='execution', risk_level='high',
             input_schema=ExactCodeWork.model_json_schema(),
-            description='Implement the frozen scoped code task using its approved isolated-workspace preparation, CodeTask investigation, edit/protected-file gates, independent review and declared validator. Uses this task budget and attempt. Optional instruction/prior_result support feedback on the existing candidate; no arguments change scope, preparation or validator. Requires explicit approval of the displayed work and current source/environment identity. Only the saved technical-repair ceiling is authorized (one for legacy contracts); no scientific measurement. Installation is allowed only by an explicitly frozen environment preparation contract; it shares this attempt and process budget. Inspect the retained result before delivery. Interrupted work without a complete domain result is never replayed automatically.')]
+            description='Implement the frozen scoped code task using its approved isolated-workspace preparation, CodeTask investigation, edit/protected-file gates, independent review and declared validator. Uses this task budget and attempt. Optional instruction/prior_result support feedback on the existing candidate; no arguments change scope, preparation or validator. '
+                + ('Work contained by the task workspace isolation uses its grant; other source or environment work requires explicit approval. '
+                   if sandboxed_execution else 'Requires explicit approval of the displayed work and current source/environment identity. ')
+                + 'Only the saved technical-repair ceiling is authorized (one for legacy contracts); no scientific measurement. Installation is allowed only by an explicitly frozen environment preparation contract; it shares this attempt and process budget. Inspect the retained result before delivery. Interrupted work without a complete domain result is never replayed automatically.')]
     if preparation_only:
         specs = [CommonToolSpec(name='prepare_implementation', domain='implementation',
             permission_level='write_patch', risk_level='medium',
@@ -571,6 +576,7 @@ class ImplementationToolGateway:
                  work_context: Callable[[list[str]], dict] | None = None,
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
                  code_work_policy: str | None = None,
+                 sandboxed_execution: bool = False,
                  declaration_review: bool = False,
                  professional_requests: bool = False,
                  preparation_only: bool = False,
@@ -620,6 +626,7 @@ class ImplementationToolGateway:
         self.research_inputs = research_inputs
         self.work_context = work_context
         self.code_work_policy = code_work_policy
+        self.sandboxed_execution = sandboxed_execution
         self.material_observations = material_observations
         self.exact = ExactCodeTask.model_validate(exact) if exact is not None else None
         if measurement_supplier is not None and self.exact is None:
@@ -790,7 +797,25 @@ class ImplementationToolGateway:
             research = self.research_inputs()
             if research:
                 binding['research_inputs'] = research
+        preparation_modes = set(binding.get('process_environments', {'copy': {}}))
+        if (self.sandboxed_execution and self.workspace.sandbox_execution and self.code_work_policy == 'shared.v2'
+                and (preparation is None or preparation.kind == 'existing_project'
+                    and not preparation.workspace_reuse_source_venv)
+                and preparation_modes <= {'copy', 'sparse_copy'}
+                and not binding.get('external_inputs') and not binding.get('environment_preparations')
+                and Path(binding['python_executable']).absolute() == self.workspace.python.absolute()
+                and Path(binding['python_executable']).resolve() == Path(sys.executable).resolve()):
+            binding['execution_scope'] = 'workspace.v1'
+            if 'environment' in binding:
+                binding['environment']['HOME'] = str(cwd)
+            for process in binding.get('process_environments', {}).values():
+                process['environment']['HOME'] = process['cwd']
         return binding
+
+    def within_task_scope(self, name: str, binding: dict[str, Any]) -> bool:
+        return (self.sandboxed_execution and self.workspace.sandbox_execution
+            and name in {'prepare_code_task', 'implement_code_task'}
+            and binding.get('execution_scope') == 'workspace.v1')
 
     def _environment_plan(self, cwd: Path, origin: Path, identity: str, python: str) -> dict[str, Any]:
         from simple_ar.code_task.execution.environment import project_command
@@ -1236,6 +1261,17 @@ class ImplementationToolGateway:
                 inputs=(brief, research_ref) if research_ref is not None else (brief,), input_store=context.store)
             manifest = load_code_task_manifest(run)
             from simple_ar.code_task.execution.environment import native_validation_command
+            process_scope = None
+            if binding.get('execution_scope') == 'workspace.v1':
+                from simple_ar.code_task.execution.scope import CodeTaskProcessScope
+                candidate = code_task_paths(run).workspace_dir
+                sandbox = self.workspace.process_sandbox(candidate, python=Path(binding['python_executable']),
+                                                         writable=candidate)
+                if sandbox is None:
+                    raise ValueError('The approved workspace isolation is no longer available; no process was launched')
+                process_scope = CodeTaskProcessScope(sandbox, self.ledger, self.session_id, identity,
+                    context.store.root / 'code-probes', native_workspace_binding(manifest, candidate)['environment'],
+                    contract.timeout_sec)
             run_implementation_capability(context=domain_context, request=CodeRequest(
                 run_dir=run, cwd=code_task_paths(run).workspace_dir, approval_note='Explicit native approval: ' + approval['token'],
                 llm_client=self._client(identity), validation_command=tuple(native_validation_command(manifest, code_task_paths(run).workspace_dir)),
@@ -1243,6 +1279,7 @@ class ImplementationToolGateway:
                 max_repairs=contract.preparation.max_repairs if contract.preparation is not None else 1,
                 protocol=manifest['code_task']['native_protocol'],
                 handoff_policy=self.code_work_policy,
+                **({'process_scope': process_scope} if process_scope is not None else {}),
                 **(contract.edit_policy or {}),
                 budget_ledger=self.ledger, session_id=self.session_id, attempt_id=identity))
             payload = context.store.read_json('implementation.json')

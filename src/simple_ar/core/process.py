@@ -127,6 +127,12 @@ def with_process_outputs(spec: ProcessSpec) -> ProcessSpec:
                    argv=[arg.replace("{output_dir}", str(outputs_dir)) for arg in spec.argv])
 
 
+def confine_process(spec: ProcessSpec, sandbox: ProcessSandbox) -> ProcessSpec:
+    """Expose this invocation's output directory without exposing its receipts."""
+    outputs = (spec.output_dir / 'outputs',) if spec.output_dir is not None else ()
+    return replace(spec, sandbox=replace(sandbox, extra_write=(*sandbox.extra_write, *outputs)))
+
+
 class _Capture:
     def __init__(self, spec: ProcessSpec, name: str) -> None:
         self.tail = bytearray()

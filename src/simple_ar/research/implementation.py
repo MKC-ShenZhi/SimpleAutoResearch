@@ -38,6 +38,7 @@ class ImplementationRequest:
     budget_ledger: Any | None = field(default=None, repr=False, compare=False)
     session_id: str = ""
     attempt_id: str = ""
+    process_scope: Any | None = field(default=None, repr=False, compare=False)
     budget_profile: str | None = None
     edit_budget_overrides: dict[str, int] | None = None
     allow_large_edits: bool = False
@@ -101,6 +102,7 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
             budget_ledger=request.budget_ledger, session_id=request.session_id,
             attempt_id=request.attempt_id,
             message_callback=request.message_callback,
+            **({'process_scope': request.process_scope} if request.process_scope is not None else {}),
         )
         outcome = implement_code_task(request.run_dir, proposal_corrections=1, **options)
         stop_reason, next_action = outcome.stop_reason, outcome.next_action
@@ -121,7 +123,8 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
             stop_reason, next_action = "empty_repair", "Inspect the failed measurement and repair proposal."
         else:
             apply_verified_repair(request.run_dir, repair, approval_note=request.approval_note,
-                                  llm_client=request.llm_client, message_callback=request.message_callback)
+                llm_client=request.llm_client, message_callback=request.message_callback,
+                **({'process_scope': request.process_scope} if request.process_scope is not None else {}))
             stop_reason, next_action = "stop_point", "Measure the repaired candidate separately."
     integrity = reconcile_protocol_assets(before)
     if (
@@ -138,6 +141,7 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
             asset_guard=lambda: reconcile_protocol_assets(before),
             budget_ledger=request.budget_ledger, session_id=request.session_id,
             attempt_id=request.attempt_id, message_callback=request.message_callback,
+            **({'process_scope': request.process_scope} if request.process_scope is not None else {}),
         )
         validation = verified.validation
         validation_repairs = list(verified.repairs)

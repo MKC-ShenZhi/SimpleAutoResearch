@@ -182,6 +182,7 @@ def execute_code_task(
     budget_ledger: BudgetLedger | None = None,
     session_id: str = "",
     attempt_id: str = "",
+    process_scope: Any | None = None,
 ) -> CodeTaskExecuteResult:
     """Run a conservative state-aware code-task workflow.
 
@@ -363,6 +364,7 @@ def execute_code_task(
             root,
             env_mode=env_mode,
             python_executable=python_executable,
+            **({'process_scope': process_scope} if process_scope is not None else {}),
         )
         _record(steps, "probe", "done", f"wrote {result.report_path}")
         _memory_event(
@@ -632,6 +634,7 @@ def execute_code_task(
             budget_profile=budget_profile,
             edit_budget_overrides=edit_budget_overrides,
             message_callback=message_callback,
+            **({'process_scope': process_scope} if process_scope is not None else {}),
         )
         if patch_recovery:
             record_review_finding(
@@ -775,6 +778,7 @@ def execute_code_task(
         root,
         strict=strict_validation,
         max_file_bytes=validation_max_file_bytes,
+        **({'process_scope': process_scope} if process_scope is not None else {}),
     )
     _record(steps, "validate", "done", f"status {validation.status}")
     _memory_event(

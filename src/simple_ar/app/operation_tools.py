@@ -418,6 +418,8 @@ class OperationTools:
                 execution_observations=execution_observations if not exact else None,
                 work_context=work_context if not exact or config.get('code_work_policy') in {'shared.v1', 'shared.v2'} else None,
                 code_work_policy=config.get('code_work_policy') if exact else None,
+                sandboxed_execution=(config.get('sandbox_execution', False)
+                    and config.get('sandbox_operations') == 'workspace.v1'),
                 material_observations=material_observations if not exact else None,
                 measurement=config.get('execution_contract') if exact else None,
                 measurement_supplier=(lambda:self.scientific.execution_contract)
@@ -428,7 +430,7 @@ class OperationTools:
                 candidate_outputs=(lambda record:self.scientific.candidate_outputs(record) if self.scientific else {})
                     if exact else None)
             self.registry.register_package(implementation_tool_specs(exact=exact,preparation_only=not exact,
-                source_owner_contract=source_owner),
+                source_owner_contract=source_owner, sandboxed_execution=self.implementation.sandboxed_execution),
                 self.implementation,request_visible=True)
             if source_owner == 'source_owner.v3':
                 # The common queue invokes this primitive for the admitted source
@@ -468,12 +470,14 @@ class OperationTools:
                 'common publication operation only for requested formats; no compulsory PDF or work sequence.')
         if config.get('scientific_tools'):
             from simple_ar.tools.scientific import ScientificToolGateway, scientific_tool_specs
+            sandboxed = (config.get('sandbox_execution', False)
+                and config.get('sandbox_operations') == 'workspace.v1')
             self.scientific = ScientificToolGateway(root,self.workspace,ledger,session_id,
                 implementation=self.implementation if exact and config.get('scientific_lineage') else None,
                 execution_contract=config.get('execution_contract'),
                 research_contract=self.sources.accepted_execution_contract,
-                research_requirements=self.sources.execution_issues)
-            self.registry.register_package(scientific_tool_specs(),self.scientific,
+                research_requirements=self.sources.execution_issues, sandboxed_execution=sandboxed)
+            self.registry.register_package(scientific_tool_specs(sandboxed_execution=sandboxed),self.scientific,
                 request_visible=config.get('execution_contract') is not None)
         if config.get('allow_vision'):
             from simple_ar.tools.visual import VisualToolGateway, visual_tool_specs

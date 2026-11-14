@@ -110,12 +110,14 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--max-processes N` | Cumulative native process count, including search backends; zero disables processes. | 10 × max-turns unless a contract sets it |
 | `--max-process-seconds N` | Cumulative process wall time in seconds; not a per-command timeout. | 300 × max-turns unless a contract sets it |
 | `--allow-execution` | Allow process proposals; without workspace execution each command still needs exact approval. | Off |
-| `--sandbox-execution` | Run ordinary commands and report rendering within the task workspace without per-command approval. Processes have no external network, host GPU or direct access to original source mounts; copy needed inputs first. A command can request host access for explicit approval. | Requires `--allow-execution`, Linux and bubblewrap |
+| `--sandbox-execution` | Run workspace commands, report rendering and eligible code/measurement operations without per-command approval. Processes have no external network, host GPU or direct access to original source mounts; copy needed inputs first. Setup, external inputs and other work outside this scope still require approval. | Requires `--allow-execution`, Linux and bubblewrap |
 | `--allow-network` | Authorize public-source search/acquisition; not package installation or arbitrary commands. | Off |
 | `--allow-vision` | Send mounted rendered PNG/JPEG/WebP to the vision route; shares the model budget. | Off |
 | `--max-images N` | Image generation/edit submissions through the image route; separate from visual inspection. | 0 |
 | `--max-turns N` | Cumulative native model-request allowance, including feedback. | 30 |
 | `--max-tokens N` | Cumulative native model-token allowance, including feedback. Input is estimated before a request; actual settled usage may exceed the allowance. | 600000 |
+
+Scoped code work uses a copied project and a task interpreter matching the framework's running Python, without environment setup or external validator inputs. Scoped measurements use workspace inputs and no additional environment preparation; other specialized operations still require explicit approval.
 
 #### Explicit structured compatibility
 

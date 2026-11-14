@@ -107,13 +107,15 @@ class MeasurementAnalysisRequest(BaseModel):
         return self
 
 
-def scientific_tool_specs() -> list[CommonToolSpec]:
+def scientific_tool_specs(*, sandboxed_execution: bool = False) -> list[CommonToolSpec]:
     return [
         CommonToolSpec(name='measure_experiment', domain='scientific',
             completion={'field': 'delivery'},
             permission_level='execution', risk_level='high',
             input_schema=MeasurementRequest.model_json_schema(),
-            description='Measure one explicitly approved argv with the shared finite process budget. Ordinary work uses the task workspace/interpreter; a verified producing candidate uses its actual environment, while a caller-frozen execution contract preserves its exact cwd/argv and inherited environment. Saves canonical results, logs, declared outputs, metric selectors, guard and observed integrity. Protocol fields are declarations, not verified facts. Optional delivery interprets the measured result locally and delivers actual outputs; no unrequested experiment or model call. Interrupted requests are blocked, never replayed.'),
+            description=(('Measure one authorized argv with the shared finite process budget. Ordinary work uses the task workspace/interpreter; a verified producing candidate uses its actual environment. Measurements contained by the task workspace isolation use its grant; other measurements require explicit process approval. '
+                if sandboxed_execution else 'Measure one explicitly approved argv with the shared finite process budget. Ordinary work uses the task workspace/interpreter; a verified producing candidate uses its actual environment, while a caller-frozen execution contract preserves its exact cwd/argv and inherited environment. ')
+                + 'Saves canonical results, logs, declared outputs, metric selectors, guard and observed integrity. Protocol fields are declarations, not verified facts. Optional delivery interprets the measured result locally and delivers actual outputs; no unrequested experiment or model call. Interrupted requests are blocked, never replayed.')),
         CommonToolSpec(name='analyze_measurements', domain='scientific',
             completion={'field': 'delivery'},
             permission_level='write_patch', risk_level='low',
@@ -282,7 +284,8 @@ class ScientificToolGateway:
                  execution_contract: dict[str, Any] | None = None,
                  current_attempts: Any | None = None,
                  research_contract: Any | None = None,
-                 research_requirements: Any | None = None) -> None:
+                 research_requirements: Any | None = None,
+                 sandboxed_execution: bool = False) -> None:
         self.root = Path(root).resolve()
         if workspace.root != self.root or workspace.ledger is not ledger or not session_id:
             raise ValueError('Scientific tools require the task workspace, shared ledger and session identity')
@@ -292,6 +295,38 @@ class ScientificToolGateway:
         self._declared_execution_contract = measurement_contract(execution_contract) if execution_contract is not None else None
         self._research_contract = research_contract
         self._research_requirements = research_requirements
+        self.sandboxed_execution = sandboxed_execution
+
+    def _workspace_execution(self, request: MeasurementRequest, cwd: Path,
+                             protocol: dict[str, Any] | None, source: dict[str, Any] | None,
+                             executable: Path | str | None, command: list[str]) -> bool:
+        """Admit only work the existing workspace sandbox can actually contain."""
+        if not self.sandboxed_execution or not self.workspace.sandbox_execution or executable is None:
+            return False
+        workspace = self.workspace.workspace.resolve()
+        interpreter = Path(source['python_executable']).absolute() if source is not None else self.workspace.python
+        task_interpreter = (interpreter == self.workspace.python.absolute()
+            or interpreter.is_relative_to(workspace) or interpreter.is_relative_to(self.root / 'attempts'))
+        program = Path(executable).absolute()
+        visible = (program.resolve().is_relative_to('/usr') or program.is_relative_to(workspace)
+            or program.is_relative_to(interpreter.parent.parent))
+        for argument in command[1:]:
+            value = argument.split('=', 1)[1] if argument.startswith('-') and '=' in argument else argument
+            path = Path(value)
+            path = path if path.is_absolute() else cwd / path
+            if path.exists() and not (path.resolve().is_relative_to(workspace)
+                    or path.resolve().is_relative_to('/usr')
+                    or path.absolute().is_relative_to(interpreter.parent.parent)):
+                return False
+        return (task_interpreter and visible
+            and request.environment is None and cwd.resolve().is_relative_to(workspace)
+            and all(Path(row['path']).resolve().is_relative_to(workspace)
+                    for row in (protocol or {}).get('protected_assets', [])))
+
+    def within_task_scope(self, name: str, binding: dict[str, Any]) -> bool:
+        """The execution owner, not a command name, identifies an isolated action."""
+        return (self.sandboxed_execution and self.workspace.sandbox_execution
+            and name == 'measure_experiment' and binding.get('execution_scope') == 'workspace.v1')
 
     def execution_issues(self) -> list[str]:
         issues = self._research_requirements() if self._research_requirements is not None else []
@@ -521,6 +556,13 @@ class ScientificToolGateway:
                 asset['path'] = str(path)
             if source is not None and any(by_id[row['asset_id']] != row for row in source['protected_assets']):
                 raise ValueError('Declared protocol conflicts with producing-source protection')
+        if self._workspace_execution(parsed, cwd, protocol, source, executable, config['command']):
+            if environment is not None:
+                environment = {**environment, 'HOME': str(cwd)}
+            else:
+                environment = self.workspace.process_environment()
+                if fixed:
+                    environment['PATH'] = os.environ.get('PATH', '')
         request = execution_request(config)
         return parsed, replace(request, run=replace(request.run, env=environment)), source
 
@@ -569,6 +611,9 @@ class ScientificToolGateway:
                 'rule': 'LocalExecutionBackend invocation_id/outputs replaces {output_dir} in argv and SIMPLE_AR_OUTPUT_DIR in env; actual values retained in invocation.json'},
             'limits': {key: self.ledger.limits.get(key) for key in
                 ('process_invocations', 'process_wall_seconds')}}
+        if self._workspace_execution(parsed, request.run.cwd, protocol, source,
+                                     binding['interpreter'], request.run.command):
+            binding['execution_scope'] = 'workspace.v1'
         if plan is not None:
             if 'conditions' in (self.execution_contract or {}):
                 binding['shared_environment_inputs'] = self._shared_environment_inputs()
@@ -1331,8 +1376,15 @@ class ScientificToolGateway:
                     source_refs = tuple(ArtifactRef.from_dict(source[key]) for key in
                         ('implementation_ref', 'prepared_ref') if source.get(key) is not None)
                     domain_context = replace(context, inputs=source_refs, input_store=ArtifactStore(self.root))
+                sandbox = None
+                if binding.get('execution_scope') == 'workspace.v1':
+                    sandbox = self.workspace.process_sandbox(request.run.cwd,
+                        python=Path(source['python_executable']) if source is not None else None,
+                        writable=request.run.cwd if source is not None else None)
+                    if sandbox is None:
+                        raise ValueError('The approved workspace isolation is no longer available; no process was launched')
                 capability = run_experiment_capability(context=domain_context, request=request,
-                    backend=LocalExecutionBackend(budget_ledger=self.ledger))
+                    backend=LocalExecutionBackend(budget_ledger=self.ledger, sandbox=sandbox))
                 if preparation is not None:
                     capability = replace(capability, artifacts=(*preparation.artifacts, *capability.artifacts))
                 canonical = store.read_json('results.json')

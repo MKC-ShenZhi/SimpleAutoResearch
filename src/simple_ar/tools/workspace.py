@@ -921,7 +921,8 @@ class WorkspaceToolGateway:
         self.record_artifacts = record_artifacts
         self.sandbox_execution = sandbox_execution
 
-    def process_sandbox(self, cwd: Path, *, extra_read: tuple[Path, ...] = ()):
+    def process_sandbox(self, cwd: Path, *, extra_read: tuple[Path, ...] = (),
+                        python: Path | None = None, writable: Path | None = None):
         if not self.sandbox_execution:
             return None
         from simple_ar.core.process_sandbox import ProcessSandbox
@@ -930,10 +931,17 @@ class WorkspaceToolGateway:
         relative = working.relative_to(workspace) if working.is_relative_to(workspace) else Path('.')
         # Independent inspection owns only its own scratch directory. It can
         # read the task workspace but cannot change the candidate under review.
-        writable = (workspace.joinpath(*relative.parts[:2])
+        permitted = (writable.resolve() if writable is not None else
+            workspace.joinpath(*relative.parts[:2])
             if len(relative.parts) >= 2 and relative.parts[0] == 'inspection-work' else workspace)
-        return ProcessSandbox(workspace=workspace, writable=writable, python=self.python,
+        return ProcessSandbox(workspace=workspace, writable=permitted, python=python or self.python,
                               extra_read=extra_read)
+
+    def within_task_scope(self, name: str, binding: dict[str, Any]) -> bool:
+        if not self.sandbox_execution or name != 'run_process':
+            return False
+        arguments = json.loads(binding['call']['function']['arguments'])
+        return not arguments.get('host_access', False)
 
     def resolve(self, value: str, *, write: bool = False) -> Path:
         diagnostic = self._process_diagnostic_path(value, write=write)

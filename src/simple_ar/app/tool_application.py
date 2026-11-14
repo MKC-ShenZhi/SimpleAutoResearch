@@ -465,6 +465,8 @@ class ToolApplication:
             raise ValueError('Unsupported saved work lifecycle policy')
         if config.get('code_work_policy') not in (None, 'shared.v1', 'shared.v2'):
             raise ValueError('Unsupported saved code work policy')
+        if config.get('sandbox_operations') not in (None, 'workspace.v1'):
+            raise ValueError('Unsupported saved specialized execution scope')
         if config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES and (
                 config.get('professional_operations') != 'work.v12'
                 or config.get('memory_protocol') != 'journal.v1'):
@@ -1964,6 +1966,10 @@ class ToolApplication:
         if options.get('creation_declarations') is not None and context_protocol not in _CONVERSATION_CONTEXT_PROTOCOLS:
             raise ValueError('Declared inputs require a journal-backed conversation context')
         config, reused, limits, attempts = cls._configuration(root, goal, **options)
+        if config.get('sandbox_execution'):
+            # New specialized actions can adopt the same task execution scope.
+            # Saved tasks without this contract retain their original approval.
+            config['sandbox_operations'] = 'workspace.v1'
         if config.get('code_task') is not None:
             config['code_work_policy'] = 'shared.v2'
             config['document_context_policy'] = 'working.v2'
@@ -2305,12 +2311,17 @@ class ToolApplication:
                           'delivery_review_protocol', 'publication_assets', 'professional_operations', 'memory_protocol',
                           'context_checkpoint_policy', 'work_method', 'work_selection_policy', 'native_supply_policy', 'context_authority',
                           'native_history_policy', 'document_context_policy', 'process_artifact_paths', 'work_lifecycle', 'code_work_policy',
+                          'sandbox_operations',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
                     if field in old:
                         config[field] = old[field]
                     else:
                         config.pop(field, None)
+            if supplied.get('sandbox_execution') is True and old.get('control_protocol') == 'operations.v1':
+                # Explicitly granting isolation is a new execution contract;
+                # supply cancels unstarted work and never rewrites started work.
+                config['sandbox_operations'] = 'workspace.v1'
             if (old.get('control_protocol') == 'operations.v1' and supplied.get('code_task') is not None
                     and supplied['code_task'] != old.get('code_task')):
                 # An explicitly supplied new code contract is new work, not a
@@ -6289,7 +6300,8 @@ class ToolApplication:
             try:
                 work_blocked = (self.operations is not None and self.operations.work is not None
                     and self.operations.work.protect_prior(name, json.loads(call['function']['arguments'])))
-                token = None if work_blocked else self.approval_token(call)
+                offered = None if work_blocked else self.execution_approval(call)
+                token = offered['token'] if offered is not None else None
             except (ValueError, TypeError, KeyError, OSError):
                 token = None  # The ordinary validator returns the invalid proposal, without execution.
             started = self.gateway.has_started(ToolCall(tool_name=name, trace_id=pending['attempt']))
@@ -6297,15 +6309,16 @@ class ToolApplication:
             reusable = name in {'run_process', 'export_report'}
             grant = None
             if token is not None and not started and reusable and (grants or remember_execution):
-                current = self.execution_approval(call)
+                current = offered
                 binding = {key: value for key, value in current['binding'].items() if key != 'call'}
                 if current['token'] == token and (name == 'export_report'
                         or (binding.get('artifacts') or {}).get('inputs')):
                     grant = self.workspace.approval_digest({
                         'name': name, 'arguments': json.loads(call['function']['arguments']), 'binding': binding})
-            task_scope = (self.state['config'].get('sandbox_execution') and name in {'run_process', 'export_report'}
-                and not (name == 'run_process' and token is not None
-                         and json.loads(call['function']['arguments']).get('host_access') is True))
+            owner = self.gateway.domain_owner(name)
+            scope_check = getattr(owner, 'within_task_scope', None)
+            task_scope = bool(token is not None and scope_check is not None
+                              and scope_check(name, offered['binding']))
             if token is not None and not started and not task_scope and approved_execution != token and grant not in grants:
                 decision = approve(call, token) if approve else False
                 if isinstance(decision, ExecutionRejection):

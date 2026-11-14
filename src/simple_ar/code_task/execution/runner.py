@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from simple_ar.core.artifacts import read_json, write_json, write_text
-from simple_ar.core.process import ProcessResult, ProcessSpec, run_process, with_process_outputs
+from simple_ar.core.process import ProcessResult, ProcessSpec, confine_process, run_process, with_process_outputs
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.code_task.editing.attempts import (
     load_latest_code_task_batch,
@@ -212,6 +212,7 @@ def run_code_task_benchmark(
     budget_ledger: BudgetLedger | None = None,
     session_id: str = "",
     attempt_id: str = "",
+    process_scope: Any | None = None,
 ) -> CodeTaskRunResult:
     """Run the recorded benchmark command inside the copied workspace.
 
@@ -308,6 +309,7 @@ def run_code_task_benchmark(
         output_callback=output_callback,
         output_dir=paths.run_artifact_dir / label / "process",
         budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+        **({'process_scope': process_scope} if process_scope is not None else {}),
         **({'environment': native_workspace_binding(manifest, paths.workspace_dir)['environment'],
             'input_binding': {'native_binding': binding,
                 'implementation_file_hashes': implementation_file_hashes(run_dir),
@@ -636,6 +638,7 @@ def _run_command(
     watchdog: _OutputWatchdog | None = None,
     environment: dict[str, str] | None = None,
     input_binding: dict[str, Any] | None = None,
+    process_scope: Any | None = None,
 ) -> ProcessResult:
     mode = normalize_stream_output_mode(stream_output)
     if watchdog is None:
@@ -649,6 +652,8 @@ def _run_command(
     spec = ProcessSpec(command_args, cwd, timeout_sec, env=environment if environment is not None else _safe_env(cwd), output_dir=output_dir,
                        session_id=session_id, attempt_id=attempt_id, input_binding=input_binding)
     spec = with_process_outputs(spec)
+    if process_scope is not None:
+        spec = confine_process(spec, process_scope.sandbox)
 
     def finish_output() -> None:
         for relay in relays.values():
