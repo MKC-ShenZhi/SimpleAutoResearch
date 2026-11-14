@@ -47,7 +47,7 @@ class WorkLifecycleTests(unittest.TestCase):
                 return_value=offered):
             return app._professional_model_input(SimpleNamespace(), client)
 
-    def test_selected_review_can_use_tokens_reserved_for_an_unaffordable_exit(self):
+    def test_selected_review_can_use_capacity_reserved_for_an_unaffordable_exit(self):
         app, client = self.app(requests=3, tokens=1500)
         app.state['turns'] = [{'origin': 'model'}]
         app._completion_floor = Mock(return_value={'llm_requests': 1, 'total_tokens': 1450})
@@ -56,6 +56,9 @@ class WorkLifecycleTests(unittest.TestCase):
         app.ledger.limits['total_tokens'] = 2000
         self.assertEqual(app._review_floor(client, candidate=True),
             {'llm_requests': 1, 'total_tokens': 1450})
+        app.ledger.limits['llm_requests'] = 1
+        self.assertEqual(app._review_floor(client, candidate=True), {})
+        self.assertEqual(app._review_floor(client, candidate=False), {})
 
     def test_work_decision_leaves_owner_and_truthful_exit_on_one_ledger(self):
         app, client = self.app(4)

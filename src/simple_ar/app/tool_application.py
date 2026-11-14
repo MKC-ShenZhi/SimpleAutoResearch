@@ -2804,24 +2804,19 @@ class ToolApplication:
                 requests * decision['total_tokens'])}
 
     def _review_floor(self, client: Any, *, candidate: bool) -> dict:
-        if self.state['turns'] and self.ledger.remaining('llm_requests') == 1:
-            if (candidate and (self._last_available_action()
-                               or self.state['turns'][-1].get('origin') == 'caller')
-                    or not candidate and self._terminal_batch()):
-                # A chosen final review can use the remaining call. If it does
-                # not itself finish the request, preserve the opinion and pause.
-                return {}
         if (not candidate and self.state['turns'] and self._terminal_batch()
                 and self.state['turns'][-1].get('origin') == 'caller'):
             return {}
         floor = self._completion_floor(client, dispatch=True)
-        remaining = self.ledger.remaining('total_tokens')
+        requests = self.ledger.remaining('llm_requests')
+        tokens = self.ledger.remaining('total_tokens')
         output = client.effective_output_limit() or 0
-        if (self.state['turns'] and remaining is not None
-                and remaining - floor.get('total_tokens', 0) < output):
-            # A selected review cannot issue even an empty-input request after
-            # this speculative exit. Let it use the actual allowance; retain
-            # its opinion and pause if another decision is unaffordable.
+        if (self.state['turns'] and (
+                requests is not None and requests - floor.get('llm_requests', 0) < 1
+                or tokens is not None and tokens - floor.get('total_tokens', 0) < output)):
+            # The selected review takes precedence over a speculative exit if
+            # that exit would prevent even the review's first model request.
+            # Preserve its opinion and pause if no later decision is affordable.
             return {}
         return floor
 
