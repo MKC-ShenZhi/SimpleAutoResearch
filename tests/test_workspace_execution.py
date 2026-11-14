@@ -50,6 +50,16 @@ class WorkspaceExecutionTests(unittest.TestCase):
         self.assertTrue(loaded.state['config']['sandbox_execution'])
         self.assertEqual(loaded.ledger.to_dict(), self.app.ledger.to_dict())
 
+    @unittest.skipUnless(Path('/etc/alternatives/awk').exists() and shutil.which('awk'),
+                         'System awk alternatives link required')
+    def test_system_alternatives_remain_available_in_workspace_scope(self):
+        self.app.run(actions=[action('run_process', argv=['awk', 'BEGIN {print 42}'])],
+            progress=lambda _: None, approve=lambda *_: self.fail('A scoped command should not pause'))
+        tool = self.app.state['turns'][-1]['tools'][-1]
+        observed = self.app.session.store.read_json(tool['result'])
+        self.assertEqual(observed['status'], 'ok', observed)
+        self.assertEqual(observed['data']['stdout'].strip(), '42')
+
     def test_independent_work_writes_only_its_scratch_area(self):
         workspace = self.app.workspace.workspace
         (workspace / 'candidate.txt').write_text('original')

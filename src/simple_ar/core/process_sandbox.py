@@ -41,7 +41,7 @@ def sandbox_command(sandbox: ProcessSandbox, cwd: Path, argv: list[str]) -> list
         elif path.exists():
             command += ['--ro-bind', str(path), str(path)]
     command += ['--dir', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--dir', '/etc']
-    for path in ('/etc/fonts', '/etc/texmf', '/var/lib/texmf', '/var/cache/fontconfig'):
+    for path in ('/etc/alternatives', '/etc/fonts', '/etc/texmf', '/var/lib/texmf', '/var/cache/fontconfig'):
         command += ['--ro-bind-try', path, path]
     # Virtualenv and Conda interpreters need their environment, not the entire
     # operator home or task root. System interpreters already live under /usr.
