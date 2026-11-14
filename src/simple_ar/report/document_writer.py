@@ -88,8 +88,10 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
     else:
         context, projected = ReportContext(topic=title, report_mode='supplied_materials'), None
     writer = ArtifactStore(store.root / 'writer')
+    snapshot = writer.read_json('report_inputs.json') if writer.exists('report_inputs.json') else None
+    previous = (snapshot.get('context', {}) if requirement['method'] == 'sections' else
+        snapshot.get('inputs', {}).get('binding', {}).get('context', {})) if snapshot is not None else None
     if requirement['method'] == 'sections' and source_bindings:
-        previous = writer.read_json('report_inputs.json').get('context', {}) if writer.exists('report_inputs.json') else None
         saved = {row['handle']: row for row in previous.get('source_handles', [])} if previous is not None else {}
         handles = []
         for handle in context.source_handles:
@@ -98,8 +100,9 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
                 if previous is not None else bool(binding and binding[3]) or handle.metadata.get('evidence_passages_truncated'))
             handles.append(handle.model_copy(update={'metadata': {**handle.metadata, 'evidence_passages_truncated': truncated}}))
         context.source_handles = handles
-    context.goal_markdown = json.dumps({'goal': goal, 'work_context': work_context,
-        'available_attachments': attachments}, ensure_ascii=False)
+    writer_context = {key: value for key, value in work_context.items() if key != 'requested_report'}
+    context.goal_markdown = (previous['goal_markdown'] if previous is not None and 'goal_markdown' in previous else
+        json.dumps({'goal': goal, 'work_context': writer_context, 'available_attachments': attachments}, ensure_ascii=False))
     if prior_draft:
         context.source_handles.append(SourceHandle(handle='prior_draft', kind='prior_draft',
             title='Previous version', summary='Earlier prose to revise, not primary evidence.',

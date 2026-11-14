@@ -231,7 +231,8 @@ class DocumentWorkTests(unittest.TestCase):
 
         client = Client(ledger, 'report', None)
         gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
-            material_roots=lambda: ['source0'], work_context=lambda _: {'user_requests': ['Explain the observed result']},
+            material_roots=lambda: ['source0'], work_context=lambda _: {'user_requests': ['Explain the observed result'],
+                'requested_report': {'template': template.template_markdown}},
             context_policy='working.v3', report_requirement=requirement)
         from simple_ar.core.capabilities import ArtifactStore
         write = ArtifactStore.write_json
@@ -246,6 +247,9 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertTrue(gateway.can_reconcile('work_document', 'report'))
         result = gateway.call('work_document', {'goal': 'Explain the observation'}, identity='report')
         self.assertTrue(result.ok, result.error)
+        inputs = json.loads((root / 'attempts/report/document_work/writer/report_inputs.json').read_text(encoding='utf-8'))
+        self.assertNotIn('requested_report', json.loads(inputs['context']['goal_markdown'])['work_context'])
+        self.assertEqual(inputs['template']['template_markdown'], template.template_markdown)
         self.assertEqual(ledger.to_dict(), saved_usage)
         self.assertEqual(len(calls), saved_calls)
         self.assertIn('Revised observed value 2.', result.data['markdown'])

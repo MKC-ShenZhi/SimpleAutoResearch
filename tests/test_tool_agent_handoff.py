@@ -727,8 +727,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         context = app.operations.document.work_context([])
         self.assertEqual(context['requested_report']['outline'], requirement['outline'])
         self.assertEqual(context['requested_report']['max_cited_sources'], 2)
-        self.assertNotIn('template', context['requested_report'])
-        self.assertEqual(app.operations.document.report_requirement['template'], requirement['template'])
+        self.assertEqual(context['requested_report']['template'], requirement['template']['template_markdown'])
 
     def _historical_native_fixture(self, **options):
         """Explicit saved native control/projection; current tools use _native_fixture."""
