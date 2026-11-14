@@ -1579,7 +1579,8 @@ class GoalWorkTests(unittest.TestCase):
                 for name, content in files.items():
                     (root / 'workspace' / name).write_text(content, encoding='utf-8')
                 case.inspection_requests.clear()
-                case.review = lambda _: {'findings': [], 'limitations': []}
+                case.review = lambda _: {'conclusion': 'incomplete', 'findings': [], 'evidence': [],
+                    'limitations': ['Controlled fixture has not independently judged the work.']}
                 case._submit(_action('review_result', review_scope='delivery',
                     summary='Method and its observed result.', artifacts=list(files)))
                 self.assertEqual(len(case.inspection_requests), 1)

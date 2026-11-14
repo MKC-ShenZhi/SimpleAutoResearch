@@ -3253,7 +3253,7 @@ class InspectionToolGateway:
 
     def _working_messages(self, saved: dict, request: InspectionRequest, history: list | None,
                           offered: list, client: Any, *, finish: dict | None = None,
-                          validate_capacity: bool = True) -> tuple[list, dict]:
+                          validate_capacity: bool = True, prioritize_delivery: bool = False) -> tuple[list, dict]:
         """Project actual turns; admission uses the owner's closed journal.
 
         ``None`` requests that journal for a capacity probe. An empty live prefix
@@ -3511,7 +3511,7 @@ class InspectionToolGateway:
             context_token_target=target,estimate_tokens=estimate_tokens,
             priority_source_paths=(
                 [*self._delivery_source_paths(saved,
-                    include_artifacts=saved.get('source_priming_policy') == 'priority.v4'),
+                    include_artifacts=prioritize_delivery),
                  *saved.get('production_receipts', ())]
                 if applicable else ()),
             material_policy='working' if economic else 'retained' if retained else 'ranked',
@@ -4134,7 +4134,8 @@ class InspectionToolGateway:
         def project(closing):
             offered = [terminal] if closing else [*tools, terminal]
             projected, metadata = self._working_messages(saved, request, messages, offered, client,
-                finish=finish if closing else None)
+                finish=finish if closing else None,
+                prioritize_delivery=closing and saved.get('source_priming_policy') == 'priority.v4')
             if (response_model is not None and self._delivery_scope(saved)
                     and saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES):
                 # A retained source descriptor is navigation, not a body the
@@ -4558,7 +4559,7 @@ class InspectionToolGateway:
             and saved.get('source_priming_policy') in _PRIORITY_SOURCE_POLICIES else 0)
         while pending and remaining[0] > reserve:
             _, projection = self._working_messages(saved, request, None, offered, client,
-                validate_capacity=False)
+                validate_capacity=False, prioritize_delivery=not leave_read_window)
             if projection['required_input_tokens'] >= projection['input_token_target']:
                 break  # Source reads cannot repair required-input overflow.
             observed_batch = []
@@ -4616,7 +4617,7 @@ class InspectionToolGateway:
             # Evaluate the whole round once instead of rebuilding the complete
             # context and rechecking every file after each decoded window.
             messages, projection = self._working_messages(saved, request, None, offered, client,
-                validate_capacity=False)
+                validate_capacity=False, prioritize_delivery=not leave_read_window)
             visible = json.loads(messages[1]['content']).get('working_view', {}).get('observations', [])
             following = []
             for path, digest, gaps, owners, observed in observed_batch:
@@ -4869,7 +4870,8 @@ class InspectionToolGateway:
         def project(closing):
             offered = [terminal] if closing else [*tools, terminal]
             messages, projection = self._working_messages(saved, request, None, offered, client,
-                finish=finish if closing else None)
+                finish=finish if closing else None,
+                prioritize_delivery=closing and saved.get('source_priming_policy') == 'priority.v4')
             return ConversationInput(messages, offered, projection)
 
         value = conversation.prepare(project,
