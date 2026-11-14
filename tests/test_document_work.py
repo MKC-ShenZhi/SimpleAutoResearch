@@ -160,7 +160,7 @@ class DocumentWorkTests(unittest.TestCase):
                     test.assertIn('twelve days', evidence)
                     test.assertNotIn('ninety days', evidence)
                     response = {'section_id': view['section']['section_id'],
-                        'heading': view['section']['heading'], 'draft_markdown': 'The treatment lasted twelve days.'}
+                        'heading': view['section']['heading'], 'draft_markdown': 'The treatment lasted twelve days [@P1].'}
                 else:
                     raise AssertionError(label)
                 self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
