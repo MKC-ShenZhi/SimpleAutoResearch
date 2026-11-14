@@ -113,7 +113,7 @@ def scientific_tool_specs(*, sandboxed_execution: bool = False) -> list[CommonTo
             completion={'field': 'delivery'},
             permission_level='execution', risk_level='high',
             input_schema=MeasurementRequest.model_json_schema(),
-            description=(('Measure one authorized argv with the shared finite process budget. Ordinary work uses the task workspace/interpreter; a verified producing candidate uses its actual environment. Measurements contained by the task workspace isolation use its grant; other measurements require explicit process approval. '
+            description=(('Measure one authorized argv with the shared finite process budget. Ordinary work uses the task workspace/interpreter; a verified producing candidate uses its interpreter and recorded environment. Measurements contained by the task workspace isolation use its grant and set HOME to their workspace; other measurements require explicit process approval. '
                 if sandboxed_execution else 'Measure one explicitly approved argv with the shared finite process budget. Ordinary work uses the task workspace/interpreter; a verified producing candidate uses its actual environment, while a caller-frozen execution contract preserves its exact cwd/argv and inherited environment. ')
                 + 'Saves canonical results, logs, declared outputs, metric selectors, guard and observed integrity. Protocol fields are declarations, not verified facts. Optional delivery interprets the measured result locally and delivers actual outputs; no unrequested experiment or model call. Interrupted requests are blocked, never replayed.')),
         CommonToolSpec(name='analyze_measurements', domain='scientific',

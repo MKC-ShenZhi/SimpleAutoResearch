@@ -13460,8 +13460,12 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.core.session import SessionController, BudgetState
         from simple_ar.code_task.runtime.state import code_task_paths, implementation_file_hashes, load_code_task_manifest
         from simple_ar.code_task.execution.runner import run_code_task_benchmark
+        import shutil
         import shlex
-        for mode in ('current', 'venv', 'same_argv', 'shared_limited'):
+        modes = ['current', 'venv', 'same_argv', 'shared_limited']
+        if sys.platform.startswith('linux') and shutil.which('bwrap'):
+            modes.append('isolated')
+        for mode in modes:
             with self.subTest(environment=mode):
                 # The mode name is not the input's location: a parent literally
                 # named ``venv`` is excluded by the shared private-path policy.
@@ -13473,12 +13477,15 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                 (project / 'evaluate.py').write_text('from main import VALUE\nprint("score: " + str(VALUE))\n')
                 ledger = BudgetLedger({'llm_requests': 4, 'total_tokens': 20000,
                     'process_invocations': 12, 'process_wall_seconds': 180})
-                workspace = WorkspaceToolGateway(root, {'input': project, 'records': root / 'attempts'}, ledger)
+                workspace = WorkspaceToolGateway(root, {'input': project, 'records': root / 'attempts'}, ledger,
+                    sandbox_execution=mode == 'isolated')
                 contract = {'project_path': 'input', 'goal': 'Improve value and retain the declared scientific checker',
                     'allowed_patterns': ['main.py'], 'validation_command': ['python', 'check.py'], 'timeout_sec': 5,
                     'preparation': {'kind': 'existing_project', 'workspace_mode': 'copy'},
                     'environment': {'mode': 'venv' if mode == 'venv' else 'current', 'timeout_sec': 20,
                         'check_command': ['python', '-c', 'import decimal; print("score: 999")']}}
+                if mode == 'isolated':
+                    contract.pop('environment')
                 if mode == 'current':
                     contract['new_files'] = ['helper.py']
                     contract['allowed_patterns'].append('helper.py')
@@ -13491,10 +13498,11 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                     **({'before_implementation': True} if role == 'baseline' and mode != 'venv' else {}),
                     'execution': formal} for role, source in (('baseline', 'preparation'), ('candidate', 'implementation'))]}
                 shared = ({'code_work_policy': 'shared.v2', 'work_context': lambda _: {'user_requests': [contract['goal']]}}
-                    if mode == 'shared_limited' else {})
+                    if mode in ('shared_limited', 'isolated') else {})
                 owner = ImplementationToolGateway(root, workspace, ledger, 'test-model', 'unit', exact=contract,
-                    measurement=conditions, **shared)
-                science = ScientificToolGateway(root, workspace, ledger, 'unit', implementation=owner, execution_contract=conditions)
+                    measurement=conditions, sandboxed_execution=mode == 'isolated', **shared)
+                science = ScientificToolGateway(root, workspace, ledger, 'unit', implementation=owner,
+                    execution_contract=conditions, sandboxed_execution=mode == 'isolated')
                 measured_locators = []
                 owner.measurement_inputs = lambda origin, required: science.implementation_inputs(
                     measured_locators, origin, required=required)
@@ -13567,7 +13575,8 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                     if mode == 'current':
                         (paths.workspace_dir / 'helper.py').write_text('from main import VALUE as RESULT\n')
                     validation = run_code_task_benchmark(request.run_dir, command=shlex.join(request.validation_command),
-                        skip_validation=True, timeout_sec=5, budget_ledger=ledger, session_id='unit', attempt_id=request.run_dir.name)
+                        skip_validation=True, timeout_sec=5, budget_ledger=ledger, session_id='unit',
+                        attempt_id=request.run_dir.name, process_scope=request.process_scope)
                     self.assertEqual(validation.status, 'passed')
                     report = context.store.write_text('code_task/validation.json', validation.report_path.read_text(encoding='utf-8'))
                     refs = {'validation_report': report.to_dict()}
@@ -13585,6 +13594,8 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                 # Model/code generation is substituted; preparation, actual
                 # validators, measurement, lineage and original accounting are not.
                 approval = {'token': 'prepare', 'binding': owner.approval_binding({}, identity='prepared')}
+                if mode == 'isolated':
+                    self.assertEqual(approval['binding']['execution_scope'], 'workspace.v1')
                 if mode == 'shared_limited':
                     plan = next(iter(approval['binding']['environment_preparations'].values()))['environment_preparation']
                     # Exactly enough for this setup, but not its later validator
@@ -13605,7 +13616,8 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertEqual(ledger.to_dict(), before)
                 self.assertIsNone(prepared['implementation_ref'])
                 self.assertIsNone(prepared['validation_command'])
-                self.assertTrue(ArtifactStore(root / 'attempts/prepared').exists('environment_observation.json'))
+                self.assertEqual(ArtifactStore(root / 'attempts/prepared').exists('environment_observation.json'),
+                    mode != 'isolated')
                 first_python = prepared['python_executable']
                 original_prepared = read_json(root / 'attempts/prepared/execution.json')
                 if mode == 'venv':
@@ -13631,6 +13643,8 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertFalse((root / 'attempts' / limited / 'scientific_request.json').exists())
                     ledger.limits['process_invocations'] = 12
                 baseline_approval = {'token': 'baseline', 'binding': science.approval_binding(arguments, identity='baseline')}
+                if mode == 'isolated':
+                    self.assertEqual(baseline_approval['binding']['execution_scope'], 'workspace.v1')
                 controller.execute_attempt('native_tool', attempt_id='baseline', tool_name='measure_experiment',
                     arguments=arguments, approval=baseline_approval)
                 self.assertEqual(read_json(root / 'attempts/baseline/results.json')['metrics']['score'], 1)
@@ -13645,6 +13659,8 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                         'instruction': 'Improve the same candidate without reinstalling or rerunning its prior measurement'})):
                     ledger.limits['process_invocations'] = len(ledger.entries) + 2 if identity == 'initial' else 12
                     approval = {'token': 'confirmed', 'binding': owner.approval_binding(work, identity=identity)}
+                    if mode == 'isolated':
+                        self.assertEqual(approval['binding']['execution_scope'], 'workspace.v1')
                     with patch('simple_ar.research.implementation.run_implementation_capability', side_effect=domain):
                         controller.execute_attempt('native_tool', attempt_id=identity, tool_name='implement_code_task',
                             arguments=work, approval=approval)
@@ -13660,6 +13676,8 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                     arguments = {**formal, 'cwd': source['cwd'], 'condition_id': 'candidate',
                         'implementation_ref': f'records/{identity}/implementation.json'}
                     token = {'token': 'measure', 'binding': science.approval_binding(arguments, identity='formal-' + identity)}
+                    if mode == 'isolated':
+                        self.assertEqual(token['binding']['execution_scope'], 'workspace.v1')
                     controller.execute_attempt('native_tool', attempt_id='formal-' + identity, tool_name='measure_experiment',
                         arguments=arguments, approval=token)
                     measured = ArtifactStore(root / 'attempts' / ('formal-' + identity)).read_json('results.json')
@@ -13702,12 +13720,13 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertIn('attempts/formal-feedback/results.json', evidence['measurement_refs'])
                 original_manifest = code_task_paths(workspace.workspace / 'code_tasks/prepared').manifest_path
                 original_bytes = original_manifest.read_bytes()
-                changed = read_json(original_manifest)
-                changed['code_task']['native_binding']['binding']['environment_preparations']['copy']['interpreter'] = '/forged/interpreter'
-                write_json(original_manifest, changed)
-                with self.assertRaisesRegex(ValueError, 'Prepared source differs'):
-                    owner.check_delivery(result['data'], [result['data']['project_path']])
-                original_manifest.write_bytes(original_bytes)
+                if mode != 'isolated':
+                    changed = read_json(original_manifest)
+                    changed['code_task']['native_binding']['binding']['environment_preparations']['copy']['interpreter'] = '/forged/interpreter'
+                    write_json(original_manifest, changed)
+                    with self.assertRaisesRegex(ValueError, 'Prepared source differs'):
+                        owner.check_delivery(result['data'], [result['data']['project_path']])
+                    original_manifest.write_bytes(original_bytes)
                 self.assertEqual((project / 'main.py').read_text(), 'VALUE = 1\n')
                 ledger.reserve('unexpected-preparation-process', {'process_invocations': 1, 'process_wall_seconds': 1},
                     session_id='unit', attempt_id='prepared', logical_call_id='unproven-process', purpose='local_process')
