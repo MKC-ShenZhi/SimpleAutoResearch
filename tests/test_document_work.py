@@ -130,8 +130,8 @@ class DocumentWorkTests(unittest.TestCase):
             TextChunk('foreign', 'other', 'The treatment condition was ninety days.'),
         ])
         (source / 'original.json').write_text(json.dumps(bundle.to_handoff_dict()), encoding='utf-8')
-        config = ReportRuntimeConfig(outline_strategy='template', reviewer='disabled', document_review=True, max_review_iterations=0,
-            draft_scope='document', review_scope='document', source_strategy='full', allow_source_backtracking=True)
+        config = ReportRuntimeConfig(outline_strategy='template', reviewer='disabled', max_review_iterations=0,
+            allow_source_backtracking=True)
         template = ReportTemplateBundle(name='brief', mode='supplied_materials', template_path='',
             criteria_path='', template_markdown='## Findings\n', criteria_markdown='')
         requirement = {'method': 'sections', 'config': config.model_dump(mode='json'),
@@ -149,17 +149,18 @@ class DocumentWorkTests(unittest.TestCase):
                         {'document_record': 'source0/original.json', 'query': 'calibration'}]}
                 elif label == 'document-work-2':
                     response = {'action': 'write', 'title': 'Findings', 'selected_observation_ids': ['o1']}
-                elif label == 'report-writer-document':
+                elif label == 'report-source-selection':
                     test.assertNotIn('twelve days', json.dumps(view))
-                    response = {'context_requests': [{'tool_name': 'search_source_chunks', 'arguments': {
-                        'handle': view['source_handles'][0]['handle'], 'query': 'treatment condition'}}]}
-                elif label == 'report-writer-document-evidence':
-                    evidence = json.dumps(view['extra_tool_context'])
+                    handle = view['sources'][0]['handle']
+                    response = {'context_requests': [
+                        {'tool_name': 'search_source_chunks', 'arguments': {'handle': handle, 'query': 'treatment condition'}},
+                        {'tool_name': 'get_neighbor_chunks', 'arguments': {'handle': handle}}]}
+                elif label.startswith('report-writer-'):
+                    evidence = json.dumps(view)
                     test.assertIn('twelve days', evidence)
                     test.assertNotIn('ninety days', evidence)
-                    response = {'sections': [{'section_id': row['section']['section_id'],
-                        'heading': row['section']['heading'], 'draft_markdown': 'The treatment lasted twelve days.'}
-                        for row in view['sections']]}
+                    response = {'section_id': view['section']['section_id'],
+                        'heading': view['section']['heading'], 'draft_markdown': 'The treatment lasted twelve days.'}
                 else:
                     raise AssertionError(label)
                 self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
@@ -177,6 +178,8 @@ class DocumentWorkTests(unittest.TestCase):
         lookup = next(row for row in observed if row['tool_name'] == 'search_source_chunks')
         self.assertEqual(lookup['content']['search_scope'], 'persisted_extracted_text')
         self.assertEqual([row['chunk_id'] for row in lookup['content']['chunks']], ['conditions'])
+        neighbor = next(row for row in observed if row['tool_name'] == 'get_neighbor_chunks')
+        self.assertEqual(neighbor['content']['anchor_chunk_id'], 'initial')
 
     def test_common_report_runs_configured_review_revision_and_recovery(self):
         from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle

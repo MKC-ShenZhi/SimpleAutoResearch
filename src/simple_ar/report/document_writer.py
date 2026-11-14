@@ -38,7 +38,7 @@ def _observed_documents(observations: list[dict]) -> tuple[DocumentBundle, dict]
             for number, match in enumerate(data.get('matches', []), 1):
                 source = original[match['document_id']]
                 document_id = f"source-{list(sources).index(path) + 1}-{source.document_id}"
-                bindings[document_id] = (data['document_record'], source.document_id, data['document_sha256'])
+                bindings[document_id] = (data['document_record'], source.document_id, data['document_sha256'], path)
                 if document_id not in records:
                     metadata = {'evidence_role': 'selected_source_passages_not_independently_verified',
                         'fulltext_extraction': {'coverage': {'content_scope': 'selected_passages', 'truncated': True}}}
@@ -54,6 +54,14 @@ def _observed_documents(observations: list[dict]) -> tuple[DocumentBundle, dict]
                     metadata={'observed_window': {key: match[key] for key in
                         ('chunk_id', 'character_start', 'character_end', 'total_characters', 'truncated') if key in match},
                         **{key: match[key] for key in ('section', 'section_id', 'heading') if key in match}}))
+    for document_id, (_, original_id, _, path) in list(bindings.items()):
+        complete = {row.metadata['observed_window']['chunk_id'] for row in chunks
+            if row.document_id == document_id and row.metadata.get('observed_window')
+            and row.metadata['observed_window'].get('character_start') == 0
+            and row.metadata['observed_window'].get('character_end') == row.metadata['observed_window'].get('total_characters')
+            and not row.metadata['observed_window'].get('truncated')}
+        has_more = any(row.chunk_id not in complete for row in sources[path].chunks if row.document_id == original_id)
+        bindings[document_id] = (*bindings[document_id][:3], has_more)
     return DocumentBundle(list(records.values()), {}, {}, [], chunks), bindings
 
 
@@ -71,7 +79,7 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
 
     def read_source(document_id: str):
         binding = source_bindings.get(document_id)
-        return sources.bound_document_chunks(*binding) if binding is not None and sources is not None else None
+        return sources.bound_document_chunks(*binding[:3]) if binding is not None and sources is not None else None
     documents_ref = store.write_json('documents.json', documents.to_handoff_dict(),
         kind='documents', schema='document_bundle.v1')
     if documents.chunks:
@@ -79,6 +87,17 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
             documents_ref=documents_ref, assets=[], selected_evidence=True, max_selected_characters=None)
     else:
         context, projected = ReportContext(topic=title, report_mode='supplied_materials'), None
+    writer = ArtifactStore(store.root / 'writer')
+    if requirement['method'] == 'sections' and source_bindings:
+        previous = writer.read_json('report_inputs.json').get('context', {}) if writer.exists('report_inputs.json') else None
+        saved = {row['handle']: row for row in previous.get('source_handles', [])} if previous is not None else {}
+        handles = []
+        for handle in context.source_handles:
+            binding = source_bindings.get(handle.metadata.get('document_id'))
+            truncated = (saved.get(handle.handle, {}).get('metadata', {}).get('evidence_passages_truncated')
+                if previous is not None else bool(binding and binding[3]) or handle.metadata.get('evidence_passages_truncated'))
+            handles.append(handle.model_copy(update={'metadata': {**handle.metadata, 'evidence_passages_truncated': truncated}}))
+        context.source_handles = handles
     context.goal_markdown = json.dumps({'goal': goal, 'work_context': work_context,
         'available_attachments': attachments}, ensure_ascii=False)
     if prior_draft:
@@ -92,7 +111,6 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
         memory.limitations.extend(projected.limitations)
         memory.key_decisions.extend(projected.key_decisions)
         memory.claims_evidence_matrix.extend(projected.claims_evidence_matrix)
-    writer = ArtifactStore(store.root / 'writer')
     if store.exists('report-writer-result.json'):
         completed = store.read_json('report-writer-result.json')
     else:
