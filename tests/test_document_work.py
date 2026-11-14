@@ -130,7 +130,7 @@ class DocumentWorkTests(unittest.TestCase):
             TextChunk('foreign', 'other', 'The treatment condition was ninety days.'),
         ])
         (source / 'original.json').write_text(json.dumps(bundle.to_handoff_dict()), encoding='utf-8')
-        config = ReportRuntimeConfig(outline_strategy='template', reviewer='disabled', max_review_iterations=0,
+        config = ReportRuntimeConfig(outline_strategy='template', reviewer='disabled', document_review=True, max_review_iterations=0,
             draft_scope='document', review_scope='document', source_strategy='full', allow_source_backtracking=True)
         template = ReportTemplateBundle(name='brief', mode='supplied_materials', template_path='',
             criteria_path='', template_markdown='## Findings\n', criteria_markdown='')
