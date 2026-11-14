@@ -1423,9 +1423,9 @@ class ToolApplication:
         """
         inspection = self.operations.inspection if self.operations is not None else None
         with inspection.presentation_scope() if inspection is not None else nullcontext():
-            return self._collect_work_feedback(targets)
+            return self._collect_work_feedback(targets, observations=observations)
 
-    def _collect_work_feedback(self, targets: list[str]) -> dict[str, Any]:
+    def _collect_work_feedback(self, targets: list[str], *, observations: list[dict] | None = None) -> dict[str, Any]:
         # The operations contract never exposed the historical document-review
         # tool. Avoid rereading its whole journal when neither historical
         # document reviews nor vision reviews can exist in this saved task.
