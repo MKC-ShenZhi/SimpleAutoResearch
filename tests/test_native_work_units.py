@@ -565,7 +565,7 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertEqual((c.root / 'workspace/checked.txt').read_text(), 'Available work.\n')
         turn = next(row for row in c.app.state['turns'] if row.get('origin') != 'caller')
         decision = c.app.session.store.read_json(str(Path(turn['reply']).with_name('decision_budget.json')))
-        self.assertEqual(decision['closing_action_contract'], 'single_action.v2')
+        self.assertEqual(decision['closing_action_contract'], 'batch_actions.v3')
         self.assertIn('run_process', decision['input_projection']['tool_names'])
         self.assertEqual(c.app.session.store.read_json('delivery.json')['unresolved'],
             ['Independent review remains unfinished.'])
@@ -587,6 +587,13 @@ class NativeWorkQueueTests(unittest.TestCase):
         results = [c.app.session.store.read_json(row['result']) for row in turn['tools']]
         self.assertEqual([row['status'] for row in results], ['ok', 'ok'])
         self.assertFalse(c.app.session.store.exists('delivery.json'))
+        budget_path = str(Path(turn['reply']).with_name('decision_budget.json'))
+        budget = c.app.session.store.read_json(budget_path)
+        self.assertEqual(budget['closing_action_contract'], 'batch_actions.v3')
+        turn['remaining'] = c.app.session.store.read_json(turn['reply'])['tool_calls']
+        budget['closing_action_contract'] = 'single_action.v2'
+        c.app.session.store.write_json(budget_path, budget)
+        self.assertFalse(c.app._last_available_action())  # A saved older decision keeps its contract.
 
     def test_saved_native_contract_keeps_publication_as_a_service(self):
         c = self.case

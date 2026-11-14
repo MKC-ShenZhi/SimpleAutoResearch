@@ -2728,7 +2728,7 @@ class ToolApplication:
                     'their minimum resource estimates do not guarantee completion. Preserve capacity '
                     'for a truthful exit. Deliver useful existing work with actual unfinished requirements '
                     'in unresolved when checking, publication or repair cannot finish. If no honest '
-                    'delivery is ready, a useful final action can leave its result for continuation. A candidate review '
+                    'delivery is ready, useful final actions can leave their results for continuation. A candidate review '
                     'is independent evidence, not formal delivery. Final acceptance remains unchanged.')
                 if (selection := getattr(self.operations, 'selection', None)) is not None and selection.policy == 'outcomes.v1':
                     exit_text = selection.closing_system
@@ -2828,8 +2828,13 @@ class ToolApplication:
             return False
         turn = self.state['turns'][-1]
         path = str(Path(turn['reply']).with_name('decision_budget.json'))
-        if (not self.session.store.exists(path)
-                or self.session.store.read_json(path).get('closing_action_contract') != 'single_action.v2'):
+        if not self.session.store.exists(path):
+            return False
+        contract = self.session.store.read_json(path).get('closing_action_contract')
+        if contract == 'single_action.v2':
+            calls = self.session.store.read_json(turn['reply']).get('tool_calls') or []
+            return len(calls) == len(turn.get('remaining', [])) == 1
+        if contract != 'batch_actions.v3':
             return False
         # Each proposed operation still passes the normal offered-tool,
         # permission and resource checks. Do not discard an otherwise usable
@@ -4556,7 +4561,7 @@ class ToolApplication:
                         decision_views=decision_views)
                     value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
                     if self.state['config'].get('work_selection_policy') == 'native.v5':
-                        value.closing_contract = 'single_action.v2'
+                        value.closing_contract = 'batch_actions.v3'
                 exit_value = value
             if not closing and handoff_evidence and {'review_result', 'load_tools'} <= {
                     row['function']['name'] for row in schemas}:
