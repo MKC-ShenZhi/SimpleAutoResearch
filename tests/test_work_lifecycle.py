@@ -51,14 +51,10 @@ class WorkLifecycleTests(unittest.TestCase):
         app, client = self.app(requests=3, tokens=1500)
         app.state['turns'] = [{'origin': 'model'}]
         app._completion_floor = Mock(return_value={'llm_requests': 1, 'total_tokens': 1450})
-        self.assertEqual(app._review_floor(client, candidate=True), {})
-        self.assertEqual(app._review_floor(client, candidate=False), {})
-        app.ledger.limits['total_tokens'] = 2000
-        self.assertEqual(app._review_floor(client, candidate=True),
-            {'llm_requests': 1, 'total_tokens': 1450})
-        app.ledger.limits['llm_requests'] = 1
-        self.assertEqual(app._review_floor(client, candidate=True), {})
-        self.assertEqual(app._review_floor(client, candidate=False), {})
+        floor = app._review_floor(client, candidate=True)
+        with app.ledger.protect_remaining(floor, yield_to_work=True):
+            app.ledger.reserve('review', {'llm_requests': 1, 'total_tokens': 100})
+            self.assertEqual(app.ledger.remaining('total_tokens'), 1400)
 
     def test_work_decision_leaves_owner_and_truthful_exit_on_one_ledger(self):
         app, client = self.app(4)

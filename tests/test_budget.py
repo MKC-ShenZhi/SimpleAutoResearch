@@ -14,6 +14,33 @@ from simple_ar.core.budget import (
 
 
 class BudgetLedgerTests(unittest.TestCase):
+    def test_selected_work_can_use_a_forecast_floor_without_waiving_real_limits(self):
+        ledger = BudgetLedger({'llm_requests': 2, 'total_tokens': 1000})
+        with ledger.protect_remaining({'total_tokens': 200}):
+            with ledger.protect_remaining({'llm_requests': 1, 'total_tokens': 700}, yield_to_work=True):
+                self.assertFalse(ledger.yield_protection_for({'llm_requests': 1, 'total_tokens': 250}))
+                self.assertTrue(ledger.yield_protection_for({'llm_requests': 1, 'total_tokens': 600}))
+                ledger.reserve('inspection', {'llm_requests': 1, 'total_tokens': 600})
+                with self.assertRaises(BudgetExceededError):
+                    ledger.reserve('too-much', {'total_tokens': 201})
+                ledger.settle('inspection', {'llm_requests': 1, 'total_tokens': 550})
+        self.assertEqual(ledger.remaining('total_tokens'), 450)
+        self.assertFalse(ledger.has_yieldable_protection)
+
+        # Dropping a forecast is pointless when a real enclosing floor or an
+        # unknown charge still prevents the measured request.
+        with ledger.protect_remaining({'total_tokens': 300}):
+            with ledger.protect_remaining({'total_tokens': 400}, yield_to_work=True):
+                self.assertFalse(ledger.yield_protection_for({'total_tokens': 250}))
+                self.assertEqual(ledger.remaining('total_tokens'), 50)
+        unknown = BudgetLedger({'total_tokens': 1000})
+        unknown.reserve('lost', {'total_tokens': 100})
+        unknown.mark_unknown('lost', reason='No provider usage')
+        with unknown.protect_remaining({'total_tokens': 500}, yield_to_work=True):
+            self.assertFalse(unknown.yield_protection_for({'total_tokens': 600}))
+            with self.assertRaises(BudgetUnknownError):
+                unknown.reserve('another-call', {'total_tokens': 1})
+
     def test_completed_response_adopts_only_paired_bounded_attempts_without_releasing_them(self):
         from types import SimpleNamespace
         from simple_ar.code_task.generation.agent_step import response_accounting_known, response_accounting_snapshot

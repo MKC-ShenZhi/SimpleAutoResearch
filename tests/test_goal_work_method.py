@@ -1364,6 +1364,21 @@ class GoalWorkTests(unittest.TestCase):
             old_messages, _ = owner._working_messages(legacy, request, None, [],
                 case.services.llm_client, validate_capacity=False)
             self.assertNotIn('RETAINED_OWN_CHECK=', json.dumps(old_messages))
+            from simple_ar.core.budget import BudgetLedger
+            ledger = BudgetLedger({'llm_requests': 2, 'total_tokens': 1000000})
+            client = case.services.llm_client.with_budget(ledger)
+            _, measured = owner._working_messages(saved, request, None, [], client, validate_capacity=False)
+            output = client.effective_output_limit() or 0
+            total = measured['estimated_input_tokens'] + output + 100
+            ledger.limits['total_tokens'] = total
+            # Output alone fits, but the actual retained input does not fit
+            # until the optional caller forecast yields to this inspection.
+            with ledger.protect_remaining({'total_tokens': total - output - 8}, yield_to_work=True):
+                selected_messages, selected = owner._working_messages(saved, request, None, [], client)
+                cost = selected['estimated_input_tokens'] + output
+                ledger.reserve('actual-review', {'llm_requests': 1, 'total_tokens': cost})
+                self.assertIn('RETAINED_OWN_CHECK=', json.dumps(selected_messages))
+                self.assertLessEqual(cost, total)
         self.assertEqual(len(case._process_receipts()), 1)
         self.assertEqual(case.send.call_count, calls)
         self.assertEqual(protected, {name:(case.root/name).read_bytes() for name in protected})

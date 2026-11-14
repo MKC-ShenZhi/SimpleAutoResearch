@@ -376,12 +376,15 @@ class Delivery:
     def review_delivery(self, delivery: dict, identity: str, *, may_start: bool,
                         current_result: dict | None = None,
                         current_outputs: tuple[Path, ...] = (), candidate: bool = False,
-                        review_scope: str | None = None) -> dict | None:
+                        review_scope: str | None = None,
+                        observations: list[dict] | None = None) -> dict | None:
         if self.review_owner is None:
             return None
         request = DeliveryRequest.model_validate(delivery)
         if request.unresolved and not candidate:
             return None  # The executor still binds and commits actual partial files.
+        if observations is None:
+            observations = self.observations()
         if candidate and review_scope == 'delivery':
             if request.unresolved:
                 raise ValueError('A complete delivery review cannot claim unfinished work')
@@ -390,9 +393,9 @@ class Delivery:
             # A fully eligible claim keeps the normal reusable final binding.
             # Retain this historical inference for saved decisions; new model
             # decisions select their scope explicitly or default to candidate.
-            observations = [*self.observations(), *([current_result] if current_result is not None else [])]
+            admission = [*observations, *([current_result] if current_result is not None else [])]
             try:
-                self.validate_actual(request, observations, current_outputs=current_outputs)
+                self.validate_actual(request, admission, current_outputs=current_outputs)
             except ValueError as exc:
                 if may_start and request.report is not None and request.report.status == 'canonical':
                     raise ValueError('Candidate declared ready for delivery but is incomplete: ' + str(exc)) from exc
@@ -403,17 +406,17 @@ class Delivery:
         if may_start:
             # Reconsider prior opinions only in the independent review. Actual
             # content and publication obligations must hold before paid work.
-            observations = [*self.observations(), *([current_result] if current_result is not None else [])]
+            admission = [*observations, *([current_result] if current_result is not None else [])]
             try:
                 resolved = (self.workspace.resolve_delivery(request, current_outputs=current_outputs)
-                    if candidate else self.validate_actual(request, observations, current_outputs=current_outputs))
+                    if candidate else self.validate_actual(request, admission, current_outputs=current_outputs))
             except ValueError as exc:
                 raise ValueError('Delivery review not started: ' + str(exc)) from exc
         else:
             resolved = self.workspace.resolve_delivery(request, current_outputs=current_outputs)
         binding = prepare_delivery_review(self.workspace, request, resolved['artifacts'],
             self.user_requests, protocol=self.review_owner.protocol, candidate=candidate)
-        return self.review_owner.review(binding, identity, may_start=may_start)
+        return self.review_owner.review(binding, identity, may_start=may_start, observations=observations)
 
     def bind_result(self, request: DeliveryRequest, payload: dict, identity: str, *,
                     current_outputs: tuple[Path, ...], current_result: dict,
@@ -445,14 +448,15 @@ class Delivery:
             if may_start and self.review_owner is not None:
                 metadata['delivery_hashes'] = hashes
                 retain()  # Pin production before paid work; recovery never reruns it.
+            observations = self.observations()
             review = self.review_delivery(delivery, identity, may_start=False,
                 current_result=current_result, current_outputs=current_outputs, candidate=candidate,
-                review_scope=review_scope)
+                review_scope=review_scope, observations=observations)
             if review is None and may_start:
                 with review_capacity() if candidate or self.requires_review(request) else nullcontext():
                     review = self.review_delivery(delivery, identity, may_start=True,
                         current_result=current_result, current_outputs=current_outputs, candidate=candidate,
-                        review_scope=review_scope)
+                        review_scope=review_scope, observations=observations)
             if review is not None:
                 if metadata.get('delivery_review', review) != review:
                     raise ValueError('Retained delivery review differs from its actual receipt')

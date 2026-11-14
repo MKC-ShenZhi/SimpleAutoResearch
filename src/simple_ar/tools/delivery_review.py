@@ -301,10 +301,11 @@ class DeliveryReview:
         scope = getattr(self.inspector, 'presentation_scope', None)
         return scope() if scope is not None else nullcontext()
 
-    def work_inputs(self, targets: list[str], *, include_observations: bool = False) -> list[dict]:
+    def work_inputs(self, targets: list[str], *, include_observations: bool = False,
+                    observations: list[dict] | None = None) -> list[dict]:
         if include_observations:
             return []
-        feedback = self.inspection_feedback(targets)
+        feedback = self.inspection_feedback(targets, observations=observations)
         if not self.compact_work_feedback:
             return feedback
         latest = next((i for i, row in enumerate(feedback)
@@ -350,7 +351,7 @@ class DeliveryReview:
                 **({'guidance_only': True} if guidance_only else {}))
         return None
 
-    def inspection_feedback(self, targets: list[str]) -> list[dict]:
+    def inspection_feedback(self, targets: list[str], *, observations: list[dict] | None = None) -> list[dict]:
         """Project original owner-verified opinions through the shared work-input port.
 
         Changed subjects keep guidance with explicit old/current versions, never
@@ -362,7 +363,8 @@ class DeliveryReview:
         selected = None
         copy_cache = {}
         result, concluded, repeated = [], set(), {}
-        for observed in reversed(self.observations() if self.observations is not None else []):
+        rows = (self.observations() if self.observations is not None else []) if observations is None else observations
+        for observed in reversed(rows):
             feedback = self.feedback_from_observation(observed, guidance_only=True)
             if feedback is None:
                 continue
@@ -961,7 +963,8 @@ class DeliveryReview:
         return {**feedback, 'delivery_context': deepcopy(original),
             'reviewed_inventory': dict(original.get('artifacts', {}))}
 
-    def review(self, binding: dict | None, identity: str, *, may_start: bool) -> dict | None:
+    def review(self, binding: dict | None, identity: str, *, may_start: bool,
+               observations: list[dict] | None = None) -> dict | None:
         """Review a freshly prepared owner scope; it is not an acceptance receipt."""
         if binding is None:
             return None
@@ -976,8 +979,8 @@ class DeliveryReview:
                     return self._envelope(binding, identity, result)
                 result = self._verified(identity, binding)
                 return self._envelope(binding, identity, result)
-            prior = self.observations
-            observations = prior() if prior is not None else []
+            if observations is None:
+                observations = self.observations() if self.observations is not None else []
             pending = (self.pending_concerns(binding['artifacts'], observations)
                        if self.track_findings else [])
             for observed in reversed(observations):
@@ -1030,7 +1033,8 @@ class DeliveryReview:
                 delivery_context=deepcopy(binding),
                 **({'retained_from':retained} if retained is not None else {}),
                 **({'prior_required': deepcopy(pending)} if self.track_findings else {}),
-                **({'prior_work_opinions': self.inspection_feedback(sorted(binding['artifacts']))}
+                **({'prior_work_opinions': self.inspection_feedback(sorted(binding['artifacts']),
+                    observations=observations)}
                    if self.supply_work_feedback and not self.track_findings
                       and binding.get('schema_version') == 'delivery_review.v3' else {}))
             if result.ok and result.data.get('inspection_pending') == identity:

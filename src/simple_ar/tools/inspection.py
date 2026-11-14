@@ -3295,6 +3295,7 @@ class InspectionToolGateway:
         target = getattr(getattr(client, '_settings', None), 'context_input_tokens', LLMSettings.context_input_tokens)
         if type(target) is not int or target <= 0:
             target = LLMSettings.context_input_tokens
+        model_target = target
         if saved.get('memory_protocol') == 'journal.v1' and client._budget_ledger is not None:
             remaining = client._budget_ledger.remaining('total_tokens')
             target = input_capacity(target, remaining, client.effective_output_limit() or 0)
@@ -3546,15 +3547,32 @@ class InspectionToolGateway:
                 } if continuity else {}),
             history_access=('read_history' if history else 'read_file at the recorded authorized source path and range'),
             trailing_messages=[finish] if finish is not None else [])
-        messages, metadata = fit_working_context(**fit_options)
-        if original_observations is not None and handoff_size != len(original_observations):
-            supplied_notes = json.loads(messages[1]['content'])['working_view']['notes']
-            visible = self._handoff_provided_sources(original_observations, journal_rows, supplied_notes,
-                memory['compacted_records'], self._path(saved['identity'], 'input'))
-            if len(visible) != handoff_size:
-                # A capacity-omitted note cannot replace the original source.
-                fit_options['observations'] = [*original_observations, *observations[handoff_size:]]
-                messages, metadata = fit_working_context(**fit_options)
+        def fit():
+            fit_options['observations'] = observations
+            messages, metadata = fit_working_context(**fit_options)
+            if original_observations is not None and handoff_size != len(original_observations):
+                supplied_notes = json.loads(messages[1]['content'])['working_view']['notes']
+                visible = self._handoff_provided_sources(original_observations, journal_rows, supplied_notes,
+                    memory['compacted_records'], self._path(saved['identity'], 'input'))
+                if len(visible) != handoff_size:
+                    # A capacity-omitted note cannot replace the original source.
+                    fit_options['observations'] = [*original_observations, *observations[handoff_size:]]
+                    messages, metadata = fit_working_context(**fit_options)
+            return messages, metadata
+
+        messages, metadata = fit()
+        ledger = client._budget_ledger
+        if (validate_capacity and ledger is not None and ledger.has_yieldable_protection
+                and ledger.yield_protection_for({'llm_requests': 1,
+                    'total_tokens': metadata['estimated_input_tokens'] + (client.effective_output_limit() or 0)})):
+            # The retained caller exit is only a forecast. Fit the actual
+            # review against the remaining ledger before sending any request.
+            target = input_capacity(model_target, ledger.remaining('total_tokens'), client.effective_output_limit() or 0)
+            fit_options['context_token_target'] = target
+            if 'resource_handoff' in base:
+                base['resource_handoff']['spendable_after_caller_protection'] = {
+                    key: ledger.remaining(key) for key in ledger.limits}
+            messages, metadata = fit()
         if continuity and saved.get('initial_material_memory') == 'provided.v1':
             self._schedule_provided_source_memory(metadata, journal_rows, memory, blocks,
                 self._path(saved['identity'], 'input'))
@@ -4946,6 +4964,20 @@ class InspectionToolGateway:
             'Source gathering has ended; no additional reads will execute. Submit record_inspection now. '
             'For necessary claims not supported by the observed evidence, record concrete required '
             'findings; disclose other remaining scope in limitations. Do not claim unread sources were checked.')}
+        ledger = client._budget_ledger
+        if saved.get('memory_protocol') == 'journal.v1' and ledger is not None and ledger.has_yieldable_protection:
+            slots, capacity = ledger.remaining('llm_requests'), ledger.remaining('total_tokens')
+            target = getattr(client._settings, 'context_input_tokens', LLMSettings.context_input_tokens)
+            if type(target) is not int or target <= 0:
+                target = LLMSettings.context_input_tokens
+            if ((slots is not None and slots < 2) or (capacity is not None
+                    and capacity < target + (client.effective_output_limit() or 0))):
+                # Fit the minimum actual opinion before deciding which originals
+                # can be supplied. The same selector owns later requests.
+                final = deepcopy(terminal)
+                if package:
+                    final['function']['parameters'] = self._delivery_schema(saved, response_model)
+                self._working_messages(saved, request, None, [final], client, finish=finish)
         if not shared or not saved.get('source_rounds'):
             if saved.get('source_priming_policy') in _PRIORITY_SOURCE_POLICIES:
                 self._prime_targets(saved, request, identity, remaining, client, [*tools, terminal])

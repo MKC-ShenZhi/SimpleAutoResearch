@@ -1415,7 +1415,7 @@ class ToolApplication:
         return ([{**row, 'copy_lineage_required': True} for row in references]
             if self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES else references)
 
-    def _work_feedback(self, targets: list[str]) -> dict[str, Any]:
+    def _work_feedback(self, targets: list[str], *, observations: list[dict] | None = None) -> dict[str, Any]:
         """Find related original feedback for the requesting work owner.
 
         Only accepted checks with an intact owner/input binding are eligible.
@@ -1440,14 +1440,17 @@ class ToolApplication:
             self.state['turns'], targets, owners,
             copy_lineage=self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES)
             if owners else []}
-        findings = self.gateway.professional_inputs(targets)
+        findings = self.gateway.professional_inputs(targets, observations=observations)
         if findings:
             context['professional_findings'] = findings
         return context
 
     def _work_context(self, targets: list[str]) -> dict[str, Any]:
         """Freeze the original requests, related feedback and working understanding for an owner."""
-        feedback = self._work_feedback(targets)
+        observations = (self._operation_observations()
+                        if self.operations is not None and self.operations.professional else None)
+        feedback = (self._work_feedback(targets, observations=observations)
+                    if observations is not None else self._work_feedback(targets))
         context = {'user_requests': list(self.state['requests']), 'review_observations': feedback['review_observations'],
             'scope': 'Original requests and related accepted checks, not permission, scientific proof or verification of changed files. Historical checks without bound inputs are not inferred.'}
         if 'professional_findings' in feedback:
@@ -1455,7 +1458,7 @@ class ToolApplication:
         if self.state['config'].get('input_contract') == _DECLARED_INPUTS:
             context['creation_declarations'] = self.state['config']['creation_declarations']
         if self.operations is not None and self.operations.professional:
-            context['working_notes'] = self._working_memory()['notes']
+            context['working_notes'] = self._working_memory(observations=observations)['notes']
             prior = self.operations.delivery.retained_prior_delivery()
             if prior is not None:
                 context['retained_prior_delivery'] = prior
@@ -2807,18 +2810,7 @@ class ToolApplication:
         if (not candidate and self.state['turns'] and self._terminal_batch()
                 and self.state['turns'][-1].get('origin') == 'caller'):
             return {}
-        floor = self._completion_floor(client, dispatch=True)
-        requests = self.ledger.remaining('llm_requests')
-        tokens = self.ledger.remaining('total_tokens')
-        output = client.effective_output_limit() or 0
-        if (self.state['turns'] and (
-                requests is not None and requests - floor.get('llm_requests', 0) < 1
-                or tokens is not None and tokens - floor.get('total_tokens', 0) < output)):
-            # The selected review takes precedence over a speculative exit if
-            # that exit would prevent even the review's first model request.
-            # Preserve its opinion and pause if no later decision is affordable.
-            return {}
-        return floor
+        return self._completion_floor(client, dispatch=True)
 
     def _terminal_batch(self) -> bool:
         """A fitting task exit or professional return needs no later decision."""
@@ -5007,7 +4999,8 @@ class ToolApplication:
                         retain=lambda: store.write_json('native_result.json', payload, kind='native_observation'),
                         review_capacity=lambda: self.ledger.protect_remaining(
                             self._review_floor(self._client(store.root.name),
-                                candidate=self._completion(call['function']['name']).kind == 'review')),
+                                candidate=self._completion(call['function']['name']).kind == 'review'),
+                            yield_to_work=True),
                         may_start=start_review,
                         **({'candidate': True, 'review_scope': review_scope} if self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES
                             and self._completion(call['function']['name']).kind == 'review' else {}))
@@ -6492,7 +6485,7 @@ class ToolApplication:
             floor = ({} if direct and (self._terminal_batch() or self._caller_takeover())
                 else self._review_floor(self._client(scope), candidate=not direct
                     and self._completion(pending['call']['function']['name']).kind == 'review'))
-            with self.ledger.protect_remaining(floor):
+            with self.ledger.protect_remaining(floor, yield_to_work=True):
                 final = self.operations.inspection.advance(scope, dispatch)
             opinion = dispatch('opinion', 'final-opinion', None,
                 lambda _identity: final.model_dump(mode='json'))

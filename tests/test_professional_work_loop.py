@@ -3100,7 +3100,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
             'status':'pending'}]), feedback='Keep the calculation; clarify interpretation.')
         self.assertTrue(self.app._working_memory()['notes'][0]['current'])
         self.assertIn('Three recorded', self.app._working_memory()['notes'][0]['text'])
-        professional = self.app._work_context(['measurements'])
+        with patch.object(self.app, '_operation_observations', wraps=self.app._operation_observations) as journal:
+            professional = self.app._work_context(['measurements'])
+        self.assertEqual(journal.call_count, 1)
         self.assertEqual(professional['working_notes'], self.app._working_memory()['notes'])
         self._submit(_action('update_work_plan', notes=[{'text':'Invented source',
             'records':['records/not-an-observation/native_result.json']}]))

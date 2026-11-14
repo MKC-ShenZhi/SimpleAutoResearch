@@ -146,10 +146,11 @@ class BudgetLedger:
         self._entries: dict[str, BudgetEntry] = {}
         self._lock = threading.RLock()
         self._remaining_protections: dict[object, dict[str, BudgetNumber]] = {}
+        self._yieldable_protections: set[object] = set()
 
     @contextmanager
     def protect_remaining(self, amounts: Mapping[str, BudgetNumber], *,
-                          additional: bool = False) -> Iterator[None]:
+                          additional: bool = False, yield_to_work: bool = False) -> Iterator[None]:
         """Temporarily withhold capacity from new reservations on this ledger.
 
         Active scopes protect the maximum requested floor per dimension.
@@ -158,6 +159,8 @@ class BudgetLedger:
         Floors are in-memory only: they neither grant capacity nor change
         accounting, unknown consumption, or unlimited dimensions. The lock
         guards scope changes, not the caller's entire context body.
+        A yieldable floor is a forecast for later work, not a reservation; the
+        active owner may give it up when its measured request otherwise cannot fit.
         """
 
         normalized = _normalize_amounts(amounts, field="protection")
@@ -167,17 +170,56 @@ class BudgetLedger:
                 normalized = {key: value + self._remaining_floor(key)
                               for key, value in normalized.items()}
             self._remaining_protections[token] = normalized
+            if yield_to_work:
+                self._yieldable_protections.add(token)
         try:
             yield
         finally:
             with self._lock:
                 del self._remaining_protections[token]
+                self._yieldable_protections.discard(token)
+
+    def yield_protection_for(self, amounts: Mapping[str, BudgetNumber]) -> bool:
+        """Give up forecast floors only if doing so admits this actual request.
+
+        Hard floors, actual charges, unknown usage and limits remain in force.
+        The owner supplies measured request costs before dispatch; this does not
+        reserve resources or retry any operation.
+        """
+        required = _normalize_amounts(amounts, field='request')
+        with self._lock:
+            if not self._yieldable_protections:
+                return False
+            if any(self._has_unknown(name) for name in required):
+                return False
+            short = False
+            for name, amount in required.items():
+                limit = self.limits.get(name)
+                if limit is None:
+                    continue
+                available = limit - self._committed(name) - self._reserved(name)
+                protected = self._remaining_floor(name)
+                hard = max((floor.get(name, 0) for token, floor in self._remaining_protections.items()
+                            if token not in self._yieldable_protections), default=0)
+                if available - hard < amount:
+                    return False
+                short |= available - protected < amount
+            if not short:
+                return False
+            for token in self._yieldable_protections:
+                self._remaining_protections[token] = {}
+            return True
 
     def _remaining_floor(self, dimension: str) -> BudgetNumber:
         return max(
             (amounts.get(dimension, 0) for amounts in self._remaining_protections.values()),
             default=0,
         )
+
+    @property
+    def has_yieldable_protection(self) -> bool:
+        with self._lock:
+            return any(self._remaining_protections[token] for token in self._yieldable_protections)
 
     @property
     def entries(self) -> tuple[BudgetEntry, ...]:
@@ -244,6 +286,9 @@ class BudgetLedger:
                     )
                 return existing
 
+            # Selected work may spend a speculative later-work floor only
+            # when this actual reservation fits every real limit and hard floor.
+            self.yield_protection_for(normalized)
             for dimension, amount in normalized.items():
                 self._check_available(dimension, amount)
 
