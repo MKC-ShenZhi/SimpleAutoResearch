@@ -5,6 +5,17 @@ from pathlib import PurePosixPath
 from typing import Any, Iterable
 
 
+_PRIVATE_EDIT_PATTERNS = (
+    ".env",
+    ".env.*",
+    "**/.env",
+    "**/.env.*",
+    "*secret*",
+    "**/*secret*",
+    "*credential*",
+    "**/*credential*",
+)
+
 DEFAULT_PROTECTED_EDIT_PATTERNS = (
     "tests/**",
     "**/tests/**",
@@ -20,14 +31,7 @@ DEFAULT_PROTECTED_EDIT_PATTERNS = (
     "**/bench.py",
     "*benchmark*.py",
     "**/*benchmark*.py",
-    ".env",
-    ".env.*",
-    "**/.env",
-    "**/.env.*",
-    "*secret*",
-    "**/*secret*",
-    "*credential*",
-    "**/*credential*",
+    *_PRIVATE_EDIT_PATTERNS,
 )
 
 DEFAULT_EDIT_SCOPE_MODE = "source_only_default"
@@ -39,19 +43,18 @@ def default_edit_scope(
     mode: str | None = None,
     allowed_patterns: Iterable[str] | None = None,
     protected_patterns: Iterable[str] | None = None,
+    respect_allowed_paths: bool = False,
 ) -> dict[str, Any]:
     """Return the default code-task edit policy stored in manifests.
 
-    The policy keeps benchmark and test files available as read-only evidence
-    while preventing automated patches from changing validation targets.
-    User supplied protected patterns are additive so local configs cannot
-    accidentally remove the default safety baseline.
+    Standalone and historical tasks retain the default read-only test and
+    benchmark policy. A task with its own explicit edit authority may instead
+    allow those paths; its caller still supplies protected validation inputs.
     """
 
     allowed = _normalized_unique(allowed_patterns or DEFAULT_ALLOWED_EDIT_PATTERNS)
-    protected = _normalized_unique(
-        [*DEFAULT_PROTECTED_EDIT_PATTERNS, *(protected_patterns or ())]
-    )
+    defaults = _PRIVATE_EDIT_PATTERNS if respect_allowed_paths else DEFAULT_PROTECTED_EDIT_PATTERNS
+    protected = _normalized_unique([*defaults, *(protected_patterns or ())])
     return {
         "mode": mode or DEFAULT_EDIT_SCOPE_MODE,
         "allowed_patterns": list(allowed),

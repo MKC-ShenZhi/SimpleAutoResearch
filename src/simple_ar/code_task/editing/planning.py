@@ -477,7 +477,7 @@ def _plan_user_prompt(
         "already answered by baseline metrics, environment policy, validation "
         "status, or recorded artifacts.\n"
         "- Name risks, rollback steps, and any missing information.\n"
-        "- Require human approval before patch application.\n\n"
+        "- Record whether the proposed patch needs approval under the supplied task authorization.\n\n"
         f"Task:\n{task_text}\n\n"
         f"Benchmark command recorded for later validation:\n{benchmark_command or 'None'}\n\n"
         f"Run context JSON:\n{json.dumps(run_context, separators=(',', ':'), ensure_ascii=False)}\n\n"

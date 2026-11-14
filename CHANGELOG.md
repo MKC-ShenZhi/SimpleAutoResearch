@@ -9,6 +9,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
+- New scoped code work can update authorized tests alongside source, while retaining the validator and explicitly protected files as read-only.
 - New tasks keep reused delivery files and completed review evidence accessible without automatically treating the entire previous delivery as new work. Actionable review findings retain their supporting observations.
 
 ### Fixed

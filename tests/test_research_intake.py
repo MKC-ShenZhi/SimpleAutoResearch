@@ -636,7 +636,7 @@ class ResearchIntakeTests(unittest.TestCase):
                         protected_patterns=defaults['protected_patterns']), path)
             self.assertEqual(exact['project_path'], 'source0')
             self.assertEqual(exact['validation_command'], ['python', 'check.py'])
-            self.assertEqual(saved['code_work_policy'], 'shared.v1')
+            self.assertEqual(saved['code_work_policy'], 'shared.v2')
             self.assertEqual(app.operations.implementation.work_context([str(project)])['user_requests'],
                 app.state['requests'])
             self.assertIs(app.operations.document.ledger, app.ledger)
@@ -665,7 +665,7 @@ class ResearchIntakeTests(unittest.TestCase):
             before_ledger = continuing.ledger.to_dict()
             continuing.supply(supply_id='code-work', reason='The caller provided the code scope and validator',
                 changes={'allow_execution': True, 'code_task': exact})
-            self.assertEqual(continuing.state['config']['code_work_policy'], 'shared.v1')
+            self.assertEqual(continuing.state['config']['code_work_policy'], 'shared.v2')
             self.assertEqual(continuing.ledger.to_dict(), before_ledger)
             self.assertEqual(continuing.operations.implementation.work_context([str(project)])['user_requests'],
                 continuing.state['requests'])

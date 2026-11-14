@@ -463,7 +463,7 @@ class ToolApplication:
             raise ValueError('Unsupported saved process artifact paths')
         if config.get('work_lifecycle') not in (None, *INTEGRATED_WORK_LIFECYCLES):
             raise ValueError('Unsupported saved work lifecycle policy')
-        if config.get('code_work_policy') not in (None, 'shared.v1'):
+        if config.get('code_work_policy') not in (None, 'shared.v1', 'shared.v2'):
             raise ValueError('Unsupported saved code work policy')
         if config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES and (
                 config.get('professional_operations') != 'work.v12'
@@ -1965,7 +1965,7 @@ class ToolApplication:
             raise ValueError('Declared inputs require a journal-backed conversation context')
         config, reused, limits, attempts = cls._configuration(root, goal, **options)
         if config.get('code_task') is not None:
-            config['code_work_policy'] = 'shared.v1'
+            config['code_work_policy'] = 'shared.v2'
             config['document_context_policy'] = 'working.v2'
         config['inspection_protocol'] = 'subjects.v3'
         config['inspection_execution_protocol'] = 'shared.v1'
@@ -2315,7 +2315,7 @@ class ToolApplication:
                     and supplied['code_task'] != old.get('code_task')):
                 # An explicitly supplied new code contract is new work, not a
                 # change to an already running historical code operation.
-                config['code_work_policy'] = 'shared.v1'
+                config['code_work_policy'] = 'shared.v2'
             if old.get('source_snapshots'):
                 config['source_snapshots'] = {name: value for name, value in old['source_snapshots'].items()
                     if old['sources'][name] == config['sources'].get(name)}

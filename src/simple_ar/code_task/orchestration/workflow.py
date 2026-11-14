@@ -86,6 +86,7 @@ def initialize_code_task(
     edit_scope_mode: str | None = None,
     edit_scope_allowed_patterns: tuple[str, ...] = (),
     edit_scope_protected_patterns: tuple[str, ...] = (),
+    respect_allowed_paths: bool = False,
     data_inputs: tuple[str, ...] = (),
     initial_files: tuple[str, ...] = (),
 ) -> CodeTaskInitResult:
@@ -123,6 +124,8 @@ def initialize_code_task(
             glob patterns. Empty means any non-protected workspace path.
         edit_scope_protected_patterns: Additional workspace-relative glob
             patterns that are read-only for patch proposals and applications.
+        respect_allowed_paths: Use the caller's explicit scope for test and
+            benchmark files; protected validation inputs remain read-only.
         data_inputs: Explicit project-relative data files/directories. Independent
             copies retain their runtime paths and become protected edit inputs;
             incidental file-size limits do not apply to this selection.
@@ -174,11 +177,12 @@ def initialize_code_task(
     workspace_dir = workspace.project_root
     copy_report = workspace.copy_report
     edit_scope = default_edit_scope(
-        mode=edit_scope_mode,
+        mode=edit_scope_mode or ('authorized_scope.v1' if respect_allowed_paths else None),
         allowed_patterns=edit_scope_allowed_patterns,
         protected_patterns=(*edit_scope_protected_patterns,
                             *(pattern for name in data_inputs
                               for pattern in (escape(name), escape(name.rstrip("/")) + "/**"))),
+        respect_allowed_paths=respect_allowed_paths,
     )
     allowed_patterns = tuple(str(item) for item in edit_scope["allowed_patterns"])
     protected_patterns = tuple(str(item) for item in edit_scope["protected_patterns"])

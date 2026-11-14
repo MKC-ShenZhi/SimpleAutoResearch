@@ -407,7 +407,7 @@ class OperationTools:
                 decision_protocol=('native.v1' if config.get('professional_operations') in PRODUCTION_OWNER_CONTRACTS
                     else config.get('source_decision_protocol')) if not exact else None,
                 execution_observations=execution_observations if not exact else None,
-                work_context=work_context if not exact or config.get('code_work_policy') == 'shared.v1' else None,
+                work_context=work_context if not exact or config.get('code_work_policy') in {'shared.v1', 'shared.v2'} else None,
                 code_work_policy=config.get('code_work_policy') if exact else None,
                 material_observations=material_observations if not exact else None,
                 measurement=config.get('execution_contract') if exact else None,
@@ -434,7 +434,7 @@ class OperationTools:
         self.document = None
         if (professional and config['model'] is not None
                 and (config.get('professional_operations') in PRODUCTION_OWNER_CONTRACTS | {'work.v1', 'work.v2', 'work.v12'}
-                     or config.get('code_work_policy') == 'shared.v1')):
+                     or config.get('code_work_policy') in {'shared.v1', 'shared.v2'})):
             from simple_ar.tools.document_work import DocumentWorkToolGateway, document_work_tool_specs
             document_context = work_context
             if config.get('document_context_policy') == 'working.v2' and config.get('report_requirement') is not None:

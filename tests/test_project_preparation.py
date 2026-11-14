@@ -1066,7 +1066,7 @@ class ProjectDataPreparationTests(unittest.TestCase):
                 self.assertEqual(recovered._effective_config()['execution'], prepared)
                 self.assertEqual(len(backend.requests), 3)  # Recovery performs no setup.
                 impl = replace(implementation_request(prepared, object(), require_validation=True),
-                    budget_ledger=app.budget_ledger)
+                    budget_ledger=app.budget_ledger, session_id='fixture-session', attempt_id='fixture-attempt')
                 self.assertEqual(impl.validation_command, (python, 'check.py'))
                 proposal = run_dir / 'code_task/meta/fixture_edits.json'
                 proposal.write_text(json.dumps({'edits': [{'path': 'adapter.py', 'old': INITIAL_ADAPTER_SOURCE,
@@ -1076,9 +1076,14 @@ class ProjectDataPreparationTests(unittest.TestCase):
                     return SimpleNamespace(stop_reason='stop_point', next_action='Validate', steps=())
                 context = CapabilityContext(ArtifactStore(root / 'implementation'), AttemptManifest('implement-fixture'),
                     inputs=app._input_refs('brief', 'runtime_config'), input_store=app.controller.store)
-                with patch('simple_ar.research.implementation.implement_code_task', side_effect=implement):
+                with patch('simple_ar.research.implementation.implement_code_task', side_effect=implement) as implementation:
                     result = run_implementation_capability(context=context, request=impl)
+                self.assertIs(implementation.call_args.kwargs['budget_ledger'], app.budget_ledger)
+                self.assertEqual(implementation.call_args.kwargs['session_id'], impl.session_id)
+                self.assertEqual(implementation.call_args.kwargs['attempt_id'], impl.attempt_id)
                 self.assertEqual(result.status, 'completed', result.diagnostics)
+                self.assertTrue(any(row.session_id == 'fixture-session' and row.attempt_id == 'fixture-attempt'
+                    and row.status == 'settled' for row in app.budget_ledger.entries))
                 formal = execution_request(prepared).run
                 observed = backend.local.run(replace(formal, output_dir=root / 'measurement'))
                 self.assertEqual(observed.status, 'passed', observed.stderr)

@@ -14206,18 +14206,30 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         project.mkdir()
         (project / 'model.py').write_text('VALUE = 1\n', encoding='utf-8')
         (project / 'check.py').write_text('assert True\n', encoding='utf-8')
+        (project / 'tests').mkdir()
+        (project / 'tests' / 'test_model.py').write_text('assert True\n', encoding='utf-8')
         (self.run_dir / 'attempts').mkdir(exist_ok=True)
         workspace = WorkspaceToolGateway(self.run_dir,
             {'source0': project, 'records': self.run_dir / 'attempts'}, self.ledger)
         contract = {'project_path': 'source0', 'goal': 'Extend the scientific model',
-            'allowed_patterns': ['model.py'], 'protected_patterns': [],
+            'allowed_patterns': ['model.py', 'tests/**', 'check.py'], 'protected_patterns': [],
             'validation_command': ['python', 'check.py'], 'timeout_sec': 20}
         supplied = {'user_requests': ['Extend the model.', 'Preserve the previous result.'],
             'review_observations': [{'record': 'records/review/result.json',
-                'result': {'summary': 'The current result needs a clearer boundary.'}}]}
+                'arguments': {'goal': 'Review the requested change', 'targets': ['model.py']},
+                'delivery_context': {'requests': ['Extend the model.']},
+                'result': {'summary': 'The current result needs a clearer boundary.'}},
+                {'record': 'records/review-two/result.json',
+                 'arguments': {'goal': 'Review the requested change', 'targets': ['model.py', 'check.py']},
+                 'delivery_context': {'requests': ['Extend the model.', 'Preserve the previous result.']},
+                 'result': {'summary': 'The validator also needs attention.'}}],
+            'professional_findings': [{'record': 'records/review-three/result.json',
+                'arguments': {'goal': 'Check the overall claim', 'targets': []},
+                'delivery_context': {'requests': ['An earlier distinct request']},
+                'subjects': [], 'result': {'summary': 'The overall claim lacks independent support.'}}]}
         provider = Mock(return_value=supplied)
         owner = ImplementationToolGateway(self.run_dir, workspace, self.ledger, 'test-model', 'unit',
-            exact=contract, code_work_policy='shared.v1', work_context=provider)
+            exact=contract, code_work_policy='shared.v2', work_context=provider)
         store = ArtifactStore(self.run_dir / 'attempts' / 'native-code')
         attempt = AttemptManifest('native-code', capability='native_tool')
         context = CapabilityContext(store, attempt)
@@ -14226,13 +14238,36 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
 
         def interrupted(*, context, request):
             brief = context.read_input_json(context.inputs[0])
-            self.assertEqual(brief['work_context']['work_context'], supplied)
-            self.assertEqual(request.handoff_policy, 'shared.v1')
+            view = brief['work_context']['work_context']
+            self.assertEqual(view['user_requests'], supplied['user_requests'])
+            self.assertEqual(view['shared_review_goals'], ['Review the requested change'])
+            self.assertEqual(view['professional_findings'], supplied['professional_findings'])
+            for index, row in enumerate(view['review_observations']):
+                original = supplied['review_observations'][index]
+                self.assertEqual(row['arguments']['goal_ref'], 'shared_review_goals[0]')
+                self.assertEqual(row['arguments']['targets'], original['arguments']['targets'])
+                self.assertEqual(row['delivery_context']['requests_ref'],
+                    {'source': 'user_requests', 'count': index + 1})
+                self.assertEqual(row['result'], original['result'])
+            self.assertEqual(request.handoff_policy, 'shared.v2')
+            from simple_ar.code_task.editing.scope import default_edit_scope, is_edit_allowed_path
+            from simple_ar.code_task.runtime.state import load_code_task_manifest
+            scope = load_code_task_manifest(request.run_dir)['edit_scope']
+            allowed = lambda path: is_edit_allowed_path(path, allowed_patterns=scope['allowed_patterns'],
+                                                       protected_patterns=scope['protected_patterns'])
+            self.assertTrue(allowed('tests/test_model.py'))
+            self.assertFalse(allowed('check.py'))  # The actual validator remains protected.
+            self.assertFalse(allowed('other.py'))
+            old = default_edit_scope(allowed_patterns=['tests/**'])
+            self.assertFalse(is_edit_allowed_path('tests/test_model.py',
+                allowed_patterns=old['allowed_patterns'], protected_patterns=old['protected_patterns']))
             task_ref, _ = _prepare_research_task(context, request, code_task_paths(request.run_dir).task_dir)
             task = context.store.read_text(task_ref.path)
             self.assertIn('Extend the scientific model', task)
             self.assertIn('Preserve the previous result', task)
             self.assertIn('The current result needs a clearer boundary', task)
+            self.assertIn('The validator also needs attention', task)
+            self.assertIn('The overall claim lacks independent support', task)
             self.assertNotIn('Bug-fix CodeTask', task)
             raise RuntimeError('stopped before model dispatch')
 
@@ -14241,6 +14276,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'stopped before model dispatch'):
                     owner.execute(context, {}, approval=approval)
         provider.assert_called_once_with([str(project.resolve())])
+        self.assertEqual(store.read_json('inputs/code_work_context.json')['work_context'], supplied)
         self.assertEqual((project / 'model.py').read_bytes(), original)
 
     def test_exact_code_task_keeps_core_attempt_approval_and_domain_recovery(self) -> None:

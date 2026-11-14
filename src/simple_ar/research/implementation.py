@@ -98,6 +98,8 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
             allow_large_edits=request.allow_large_edits,
             max_files=IMPLEMENTATION_CONTEXT_MAX_FILES,
             max_source_chars_per_file=IMPLEMENTATION_CONTEXT_MAX_SOURCE_CHARS,
+            budget_ledger=request.budget_ledger, session_id=request.session_id,
+            attempt_id=request.attempt_id,
             message_callback=request.message_callback,
         )
         outcome = implement_code_task(request.run_dir, proposal_corrections=1, **options)
@@ -292,7 +294,7 @@ def _prepare_research_task(
         for ref in context.inputs
     )
     consumed = {
-        "task_kind": ("code_work" if request.handoff_policy == "shared.v1" else
+        "task_kind": ("code_work" if request.handoff_policy in {"shared.v1", "shared.v2"} else
             "research" if design is not None else "reproduction" if reproduction else "bug_fix"),
         "brief": None if brief_ref is None else context.read_input_json(brief_ref),
         "design": None if design is None else design.to_handoff_dict(),
@@ -321,7 +323,7 @@ def _prepare_research_task(
             raise ValueError("CodeTask already has a plan without this research handoff; use a fresh initialized run.")
         original = task_path.read_text(encoding="utf-8")
         write_json(snapshot, {"consumed": consumed, "original_task": original})
-    if request.handoff_policy == "shared.v1":
+    if request.handoff_policy in {"shared.v1", "shared.v2"}:
         task = (
             "# Scoped code work\n\n"
             "Implement the actual requested change in the isolated workspace, using the approved "
@@ -431,9 +433,11 @@ def _prepare_research_task(
     if design is not None:
         task += "Execution boundary and observed baseline are supplied facts, not model-selected targets.\n"
         task += "Baseline values below are observations, not target values to hardcode.\n"
-    task += "Implement and validate only; the research application owns benchmark execution.\n\n"
+    task += ("Implement and validate within this scope; the surrounding task owns separate measurements and delivery.\n\n"
+             if request.handoff_policy in {"shared.v1", "shared.v2"} else
+             "Implement and validate only; the research application owns benchmark execution.\n\n")
     presented = consumed
-    if request.handoff_policy == "shared.v1":
+    if request.handoff_policy in {"shared.v1", "shared.v2"}:
         presented = {key: value for key, value in consumed.items() if key != "brief"}
         brief = consumed.get("brief")
         if isinstance(brief, Mapping) and "work_context" in brief:

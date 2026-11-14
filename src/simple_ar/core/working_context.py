@@ -1,6 +1,7 @@
 """Pure selection of recorded working material; no I/O, state or summarizer."""
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from itertools import zip_longest
@@ -96,6 +97,37 @@ def feedback_observations(context: Mapping[str, Any]) -> list[dict[str, Any]]:
                 **{key: deepcopy(scope[key]) for key in ('claim', 'artifact_count', 'unfinished') if key in scope}}}
                if scope.get('projection') == 'delivery_scope' else {}),
             'evidence_role': role + '; guidance only, not source evidence, current certification or permission.'})
+    return projected
+
+
+def compact_feedback_handoff(context: Mapping[str, Any]) -> dict[str, Any]:
+    """Share repeated review inputs without discarding any opinion or its scope.
+
+    Some professional consumers receive the same user requests and review goal
+    once per historical opinion. Keep those inputs once in the handoff and let
+    each opinion reference them. This is only a presentation of the frozen
+    context; the complete owner records and their acceptance are unchanged.
+    """
+    projected = deepcopy(dict(context))
+    feedback = [row for key in ('review_observations', 'professional_findings')
+                for row in projected.get(key, []) if isinstance(row, dict)]
+    goals = [row.get('arguments', {}).get('goal') for row in feedback
+             if isinstance(row.get('arguments'), dict)]
+    goal_counts = Counter(goal for goal in goals if isinstance(goal, str))
+    shared_goals = [goal for goal, count in goal_counts.items() if count > 1]
+    if shared_goals:
+        projected['shared_review_goals'] = shared_goals
+    requests = projected.get('user_requests')
+    for row in feedback:
+        arguments = row.get('arguments')
+        if isinstance(arguments, dict) and arguments.get('goal') in shared_goals:
+            arguments['goal_ref'] = f"shared_review_goals[{shared_goals.index(arguments.pop('goal'))}]"
+        scope = row.get('delivery_context')
+        if isinstance(scope, dict) and isinstance(requests, list):
+            original = scope.get('requests')
+            if isinstance(original, list) and original == requests[:len(original)]:
+                scope.pop('requests')
+                scope['requests_ref'] = {'source': 'user_requests', 'count': len(original)}
     return projected
 
 

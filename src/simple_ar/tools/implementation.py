@@ -596,9 +596,9 @@ class ImplementationToolGateway:
             raise ValueError('Unknown source edit contract')
         if decision_protocol not in (None, 'native.v1'):
             raise ValueError('Unknown source decision protocol')
-        if code_work_policy not in (None, 'shared.v1'):
+        if code_work_policy not in (None, 'shared.v1', 'shared.v2'):
             raise ValueError('Unknown code work policy')
-        if code_work_policy == 'shared.v1' and (exact is None or work_context is None):
+        if code_work_policy in {'shared.v1', 'shared.v2'} and (exact is None or work_context is None):
             raise ValueError('Shared code work requires an exact contract and its task context')
         if decision_protocol is not None and not preparation_only and source_owner_contract != 'source_owner.v3':
             raise ValueError('Native source decisions require ordinary source preparation')
@@ -1190,7 +1190,7 @@ class ImplementationToolGateway:
             elif work.prepared_result:
                 _, project = self._prior_preparation(work.prepared_result, identity=identity)
             working_context = None
-            if self.code_work_policy == 'shared.v1':
+            if self.code_work_policy in {'shared.v1', 'shared.v2'}:
                 from simple_ar.tools.materials import freeze_work_context
                 context_path = 'inputs/code_work_context.json'
                 if context.store.exists(context_path):
@@ -1218,10 +1218,20 @@ class ImplementationToolGateway:
                 from simple_ar.code_task.orchestration.execute import implementation_resume_allowed
                 if not implementation_resume_allowed(run, ledger=self.ledger, attempt_id=identity):
                     raise ValueError('Interrupted CodeTask has uncommitted or unknown operations; inspect its manifest and original ledger without replay')
-            brief = context.store.write_json('inputs/brief.json',
-                {'request_text': task_text, 'objective': task_text, 'hard_constraints': [],
-                 **({'work_context': working_context} if working_context is not None else {})},
-                kind='research_brief')
+            brief_path = 'inputs/brief.json'
+            if self.code_work_policy == 'shared.v2' and context.store.exists(brief_path):
+                # A resumed action keeps exactly the presentation its earlier
+                # planning and editing stages used, including older contracts.
+                brief = context.store.ref(brief_path, kind='research_brief')
+            else:
+                if self.code_work_policy == 'shared.v2' and working_context is not None:
+                    from simple_ar.core.working_context import compact_feedback_handoff
+                    working_context = {**working_context, 'work_context':
+                        compact_feedback_handoff(working_context['work_context'])}
+                brief = context.store.write_json(brief_path,
+                    {'request_text': task_text, 'objective': task_text, 'hard_constraints': [],
+                     **({'work_context': working_context} if working_context is not None else {})},
+                    kind='research_brief')
             domain_context = CapabilityContext(context.store, context.attempt,
                 inputs=(brief, research_ref) if research_ref is not None else (brief,), input_store=context.store)
             manifest = load_code_task_manifest(run)
@@ -1302,7 +1312,8 @@ class ImplementationToolGateway:
         run_preparation_capability(context=context, request=PreparationRequest(
             execution, task_text, RunRequest(contract.validation_command, root, contract.timeout_sec),
             run_dir=run, source_project=origin if contract.project_path else None,
-            data_paths=tuple(origin / name for name in data_inputs), generation_source=generation_source))
+            data_paths=tuple(origin / name for name in data_inputs), generation_source=generation_source,
+            respect_allowed_paths=self.code_work_policy == 'shared.v2'))
         manifest = load_code_task_manifest(run)
         manifest['code_task']['native_binding'] = approval
         initialized = native_workspace_binding(manifest, code_task_paths(run).workspace_dir)

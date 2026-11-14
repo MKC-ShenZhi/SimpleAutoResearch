@@ -135,6 +135,7 @@ class PreparationRequest:
     source_project: Path | None = None
     data_paths: tuple[Path, ...] = ()
     generation_source: Mapping[str, Any] | None = None
+    respect_allowed_paths: bool = False
 
 
 def inspect_project_preparation(
@@ -531,6 +532,7 @@ def run_preparation_capability(*, context: CapabilityContext, request: Preparati
         workspace_mode=workspace_mode,
         **workspace_options,
         env_mode=env_mode, python_executable=python_executable,
+        respect_allowed_paths=request.respect_allowed_paths,
         edit_scope_allowed_patterns=tuple(allowed or ()),
         edit_scope_protected_patterns=tuple(protected),
         data_inputs=data_inputs,
