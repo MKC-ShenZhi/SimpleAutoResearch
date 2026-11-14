@@ -14585,6 +14585,9 @@ class ConversationContextTests(unittest.TestCase):
 
     def _fixture(self):
         root, inputs, fake, binding, app, _ = self._historical_native_fixture()
+        fake.estimate_native_input_tokens.side_effect = lambda messages, tools: (
+            estimate_tokens(json.dumps(messages, ensure_ascii=False))
+            + estimate_tokens(json.dumps(tools, ensure_ascii=False)))
         # Projection-only saved receipts have no current operation envelopes.
         app = load_native_history(root / 'conversation', 'Use original measurements; preserve unknowns.',
             config={'model':'fixture','model_connection':binding,
