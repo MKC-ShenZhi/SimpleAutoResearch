@@ -1550,6 +1550,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
         section = ReportSectionDraft(section_id='document', heading=request.report_context.topic,
             draft_markdown=body_visuals)
         client = Mock()
+        client.prepared_publication_for_review = None
         client.ask_json.return_value = {'section_reviews': [{'section_id': 'document', 'verdict': 'pass'}]}
         arguments = dict(client=client, template=request.template,
             memory=ReportMemory(objective='Inspect supplied prose'), sections=[section], config=request.config,
