@@ -16,6 +16,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- Structured research tasks with a declared report can pass its selected template to common document work, including when they also have an execution or analysis contract.
 - Research source bundles produced from supplied documents can be queried and passed to document work through the same source owner.
 
 ## 2026-11-13
