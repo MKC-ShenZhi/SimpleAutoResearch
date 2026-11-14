@@ -243,6 +243,13 @@ def run_code_task_benchmark(
     """
     if timeout_sec < 1:
         raise CodeTaskRunError("timeout_sec must be at least 1")
+    if process_scope is not None:
+        if (budget_ledger is not None and budget_ledger is not process_scope.ledger
+                or session_id and session_id != process_scope.session_id
+                or attempt_id and attempt_id != process_scope.attempt_id):
+            raise ValueError('Scoped code execution must use its task ledger and identity')
+        budget_ledger, session_id, attempt_id = (
+            process_scope.ledger, process_scope.session_id, process_scope.attempt_id)
     label = _normalize_run_label(run_label)
 
     manifest = load_code_task_manifest(run_dir)
@@ -266,7 +273,8 @@ def run_code_task_benchmark(
     command_args = _split_command(command_text, environment_policy=environment_policy)
 
     if not skip_validation:
-        validation = validate_code_task(run_dir)
+        validation = validate_code_task(run_dir,
+            **({'process_scope': process_scope} if process_scope is not None else {}))
         if validation.error_count:
             return _write_blocked_result(
                 run_dir,
@@ -421,6 +429,7 @@ def run_code_task_baseline(
     budget_ledger: BudgetLedger | None = None,
     session_id: str = "",
     attempt_id: str = "",
+    process_scope: Any | None = None,
 ) -> CodeTaskRunResult:
     """Run the recorded benchmark as the pre-patch baseline.
 
@@ -447,6 +456,7 @@ def run_code_task_baseline(
         skip_validation=skip_validation,
         run_label="baseline",
         budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+        **({'process_scope': process_scope} if process_scope is not None else {}),
         env_mode=env_mode,
         python_executable=python_executable,
         stream_output=stream_output,
@@ -651,7 +661,8 @@ def _run_command(
         name: _OutputRelay(name, callback, mode, watchdog, cancel)
         for name in ("stdout", "stderr")
     }
-    spec = ProcessSpec(command_args, cwd, timeout_sec, env=environment if environment is not None else _safe_env(cwd), output_dir=output_dir,
+    env = environment if environment is not None else (process_scope.environment if process_scope is not None else _safe_env(cwd))
+    spec = ProcessSpec(command_args, cwd, timeout_sec, env=env, output_dir=output_dir,
                        session_id=session_id, attempt_id=attempt_id, input_binding=input_binding)
     spec = with_process_outputs(spec)
     if process_scope is not None:

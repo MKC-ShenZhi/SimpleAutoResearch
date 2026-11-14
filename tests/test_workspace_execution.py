@@ -163,7 +163,6 @@ class WorkspaceExecutionTests(unittest.TestCase):
         from types import SimpleNamespace
         from simple_ar.code_task.analysis.dependency_api import inspect_dependency_api
         from simple_ar.code_task.execution.runner import run_code_task_benchmark
-        from simple_ar.code_task.execution.validation import validate_code_task
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
         project = self.source
         (project / 'main.py').write_text('import json\nVALUE = 1\n')
@@ -205,9 +204,8 @@ class WorkspaceExecutionTests(unittest.TestCase):
             api = inspect_dependency_api([{'module': 'json', 'symbols': ['loads']}], index, ['main.py'],
                 python_executable=str(app.workspace.python), workspace_dir=request.cwd, process_scope=scope)
             self.assertEqual(api['status'], 'observed')
-            validate_code_task(request.run_dir, process_scope=scope)
             validation = run_code_task_benchmark(request.run_dir, command='python check.py',
-                timeout_sec=5, skip_validation=True, budget_ledger=app.ledger,
+                timeout_sec=5, skip_validation=False, budget_ledger=app.ledger,
                 session_id=app.session.manifest.session_id, attempt_id='code-scope', process_scope=scope)
             self.assertEqual(validation.status, 'passed')
             self.assertIn('outside blocked', validation.stdout_path.read_text())
@@ -235,6 +233,50 @@ class WorkspaceExecutionTests(unittest.TestCase):
         self.assertFalse(setup._approve_action(pending_setup, '', None, lambda _: None, scoped=True))
         self.assertIn('explicit approval', setup.session.manifest.status_reason)
         self.assertFalse(setup.ledger.entries)
+
+    def test_scoped_code_task_baseline_uses_the_same_boundary_and_accounting(self):
+        from simple_ar.code_task import execute_code_task, initialize_code_task
+        from simple_ar.code_task.execution.scope import CodeTaskProcessScope
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.core.process_sandbox import ProcessSandbox
+
+        source = self.base / 'baseline-project'
+        source.mkdir()
+        outside = self.base / 'outside-baseline.txt'
+        (source / 'check.py').write_text(
+            'from pathlib import Path\n'
+            f'target = Path({str(outside)!r})\n'
+            'try:\n target.write_text("outside")\n'
+            'except OSError:\n print("outside blocked")\n'
+            'print("score: 1")\n')
+        task = self.base / 'baseline-task.txt'
+        task.write_text('Check the existing project')
+        run = initialize_code_task(run_dir=self.base / 'baseline-run', code_root=source,
+            task_file=task, benchmark_command='python check.py',
+            env_mode='external', python_executable=sys.executable)
+        workspace = run.workspace_dir.resolve()
+        ledger = BudgetLedger({'process_invocations': 4, 'process_wall_seconds': 60})
+        sandbox = ProcessSandbox(workspace, workspace, Path(sys.executable))
+        scope = CodeTaskProcessScope(sandbox, ledger, 'unit', 'baseline',
+            self.base / 'baseline-probes', {'PATH': '/usr/bin:/bin', 'HOME': str(workspace)}, 5)
+        result = execute_code_task(run.run_dir, to_step='baseline', use_llm=False,
+            baseline_policy='run', timeout_sec=5, process_scope=scope)
+        self.assertEqual(result.stop_reason, 'stop_point')
+        report = json.loads((run.run_dir / 'code_task/run/baseline/execution_report.json').read_text())
+        self.assertEqual(report['status'], 'passed')
+        self.assertEqual(report['process']['execution_scope'], 'workspace')
+        self.assertFalse(outside.exists())
+        self.assertTrue(any(entry.purpose == 'code_probe' and entry.status == 'settled'
+                            for entry in ledger.entries))
+        self.assertTrue(any(entry.purpose == 'local_process' and entry.status == 'settled'
+                            for entry in ledger.entries))
+
+        greenfield = initialize_code_task(run_dir=self.base / 'greenfield-run', code_root=None,
+            task_file=task, kind='greenfield', workspace_mode='empty', benchmark_command='python main.py')
+        before = ledger.to_dict()
+        with self.assertRaisesRegex(ValueError, 'Scoped greenfield orchestration is not supported'):
+            execute_code_task(greenfield.run_dir, to_step='baseline', use_llm=False, process_scope=scope)
+        self.assertEqual(ledger.to_dict(), before)
 
     @unittest.skipUnless(shutil.which('pandoc') and shutil.which('xelatex'), 'Pandoc and XeLaTeX required')
     def test_publication_uses_the_same_scope_and_records_each_process(self):

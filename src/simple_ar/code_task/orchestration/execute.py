@@ -284,6 +284,8 @@ def execute_code_task(
     steps: list[ExecuteStepRecord] = []
     if (_code_task_kind(manifest) == "greenfield"
             and manifest.get('implementation', {}).get('mode') != 'controlled_patch'):
+        if process_scope is not None:
+            raise ValueError('Scoped greenfield orchestration is not supported; use explicit execution approval')
         return _execute_greenfield_code_task(
             root,
             paths,
@@ -434,6 +436,7 @@ def execute_code_task(
             stream_output=stream_benchmark_output,
             output_callback=_benchmark_output_callback(message_callback),
             budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+            **({'process_scope': process_scope} if process_scope is not None else {}),
         )
         _record(steps, "baseline", "done", f"status {result.status}")
         _memory_event(
@@ -842,6 +845,7 @@ def execute_code_task(
         stream_output=stream_benchmark_output,
         output_callback=_benchmark_output_callback(message_callback),
         budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+        **({'process_scope': process_scope} if process_scope is not None else {}),
     )
     _record(steps, "run", "done", f"status {result.status}")
     _memory_event(
