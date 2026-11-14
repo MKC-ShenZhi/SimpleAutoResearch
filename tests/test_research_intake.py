@@ -632,6 +632,8 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(exact['project_path'], 'source0')
             self.assertEqual(exact['validation_command'], ['python', 'check.py'])
             self.assertEqual(saved['code_work_policy'], 'shared.v2')
+            self.assertEqual(app.operations.implementation.code_work_policy, 'shared.v2')
+            self.assertIs(app.operations.implementation.ledger, app.ledger)
             self.assertIn('implement_code_task', app.operations.system_text())
             self.assertNotIn('write_file and run_process', app.operations.system_text())
             self.assertFalse(app.gateway.policy.is_allowed(app.gateway.registry.get('write_file'))[0])
@@ -639,6 +641,8 @@ class ResearchIntakeTests(unittest.TestCase):
                 app.state['requests'])
             self.assertIs(app.operations.document.ledger, app.ledger)
             restored = ToolApplication.load(base / 'task', services=services)
+            self.assertEqual(restored.operations.implementation.code_work_policy, 'shared.v2')
+            self.assertIs(restored.operations.implementation.ledger, restored.ledger)
             self.assertEqual(restored.operations.implementation.work_context([str(project)])['user_requests'],
                 app.state['requests'])
             self.assertEqual(saved['execution_contract']['conditions'][0]['source'], 'implementation')
@@ -664,6 +668,8 @@ class ResearchIntakeTests(unittest.TestCase):
             continuing.supply(supply_id='code-work', reason='The caller provided the code scope and validator',
                 changes={'allow_execution': True, 'code_task': exact})
             self.assertEqual(continuing.state['config']['code_work_policy'], 'shared.v2')
+            self.assertEqual(continuing.operations.implementation.code_work_policy, 'shared.v2')
+            self.assertIs(continuing.operations.implementation.ledger, continuing.ledger)
             self.assertEqual(continuing.ledger.to_dict(), before_ledger)
             self.assertEqual(continuing.operations.implementation.work_context([str(project)])['user_requests'],
                 continuing.state['requests'])

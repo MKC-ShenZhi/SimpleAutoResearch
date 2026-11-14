@@ -13617,7 +13617,6 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertEqual(ledger.to_dict(), before)
                 arguments = {**formal, 'cwd': prepared['cwd'], 'condition_id': 'baseline',
                     'preparation_ref': 'records/prepared/execution.json'}
-                baseline_approval = {'token': 'baseline', 'binding': science.approval_binding(arguments, identity='baseline')}
                 if mode == 'shared_limited':
                     self.assertEqual(ledger.remaining('process_invocations'), 0)
                     before = ledger.to_dict()
@@ -13631,6 +13630,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertEqual(ledger.to_dict(), before)
                     self.assertFalse((root / 'attempts' / limited / 'scientific_request.json').exists())
                     ledger.limits['process_invocations'] = 12
+                baseline_approval = {'token': 'baseline', 'binding': science.approval_binding(arguments, identity='baseline')}
                 controller.execute_attempt('native_tool', attempt_id='baseline', tool_name='measure_experiment',
                     arguments=arguments, approval=baseline_approval)
                 self.assertEqual(read_json(root / 'attempts/baseline/results.json')['metrics']['score'], 1)
