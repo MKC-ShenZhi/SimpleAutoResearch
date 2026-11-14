@@ -1966,6 +1966,7 @@ class ToolApplication:
         config, reused, limits, attempts = cls._configuration(root, goal, **options)
         if config.get('code_task') is not None:
             config['code_work_policy'] = 'shared.v1'
+            config['document_context_policy'] = 'working.v2'
         config['inspection_protocol'] = 'subjects.v3'
         config['inspection_execution_protocol'] = 'shared.v1'
         config['inspection_coverage_policy'] = 'offered.v2'

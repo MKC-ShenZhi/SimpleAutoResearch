@@ -639,6 +639,7 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(saved['code_work_policy'], 'shared.v1')
             self.assertEqual(app.operations.implementation.work_context([str(project)])['user_requests'],
                 app.state['requests'])
+            self.assertIs(app.operations.document.ledger, app.ledger)
             restored = ToolApplication.load(base / 'task', services=services)
             self.assertEqual(restored.operations.implementation.work_context([str(project)])['user_requests'],
                 app.state['requests'])
@@ -670,7 +671,7 @@ class ResearchIntakeTests(unittest.TestCase):
                 continuing.state['requests'])
             paper = base / 'method.md'
             paper.write_text('A supplied method description, not verified implementation evidence.', encoding='utf-8')
-            for outputs in (('code_task', 'summary'), ('code_task', 'experiments')):
+            for outputs in (('code_task', 'summary'), ('code_task', 'experiments'), ('code_task', 'report')):
                 combined = create_research_task(ResearchBrief(request_text='Use the supplied method and implement it.',
                     requested_outputs=outputs, asset_requests=({'locator': str(paper), 'role': 'paper'},)),
                     root=base / '-'.join(outputs), services=services)
@@ -680,6 +681,8 @@ class ResearchIntakeTests(unittest.TestCase):
                 self.assertEqual(combined.sources.policy.require_summary, 'summary' in outputs)
                 self.assertEqual(combined.state['config'].get('execution_contract') is not None,
                     'experiments' in outputs)
+                if 'report' in outputs:
+                    self.assertIn('requested_report', combined.operations.document.work_context([]))
                 self.assertEqual(combined.session.list_attempts(), ())
             with self.assertRaisesRegex(ValueError, 'execution.code_task'):
                 create_research_task(ResearchBrief(request_text='Do not claim code work from a bare command.',
