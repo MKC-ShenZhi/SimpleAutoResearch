@@ -201,8 +201,9 @@ def document_work_tool_specs() -> list[CommonToolSpec]:
             'are supplied by the application. Return a candidate, current version, provenance and gaps. '
             'The coordinator receives the actual candidate text and measured size for choosing revision '
             'or delivery without a separate inspection merely to view the draft. '
-            'Use independent operations for inspection, publication and delivery; direct simple edits need '
-            'not use this operation. No network or execution.'))]
+            'Configured report writing may include its own review; independent task inspection, publication '
+            'and delivery remain separate operations. Direct simple edits need not use this operation. '
+            'No network or execution.'))]
 
 
 def _digest(value: Any) -> str:
@@ -261,10 +262,17 @@ class DocumentWorkToolGateway:
             or self._retained_report_selection(store, identity) is not None)
 
     def _retained_report_selection(self, store: ArtifactStore, identity: str):
-        """A completed Writer can finish assembly without another model call."""
-        if store.exists('failure.json') or not store.exists('report-writer-result.json'):
+        """Resume a completed Writer or a checkpoint with complete recorded calls."""
+        writer = ArtifactStore(store.root / 'writer')
+        if (store.exists('failure.json') or not (store.exists('report-writer-result.json')
+                or writer.exists('sections.json'))):
             return None
         try:
+            if not store.exists('report-writer-result.json'):
+                from simple_ar.report.writing import _retained_response
+                for path in (writer.root / 'model_calls').glob('*/request.json'):
+                    call = ArtifactStore(path.parent)
+                    _retained_response(call, 'request.json', call.read_json('request.json'))
             binding = store.read_json('input.json')
             if binding['contract'] != _REPORT_CONTRACT:
                 return None
@@ -409,7 +417,8 @@ class DocumentWorkToolGateway:
                         if report is None:
                             raise ValueError('Document work stopped before a complete candidate; inspect its records and ledger, no blind replay')
                         binding, observations, selection, step, work_context = report
-                        self._complete_report(store, binding, observations, selection, step, identity, work_context, client=None)
+                        client = None if store.exists('report-writer-result.json') else self._bound_client(identity)
+                        self._complete_report(store, binding, observations, selection, step, identity, work_context, client=client)
                     else:
                         binding, observations, decision, step = retained
                         generated = self._generated_report_assets(store, binding, step, identity)
@@ -631,8 +640,16 @@ class DocumentWorkToolGateway:
                 + json.dumps(missing, ensure_ascii=False)
                 + '. Use the supplied delivery_path IDs, retain referenced prior assets, or remove the unsupported link.')
 
+    def _bound_client(self, identity: str) -> Any:
+        client = self.client_factory(identity)
+        if (getattr(client, '_budget_ledger', None) is not self.ledger
+                or getattr(client, '_budget_session_id', None) != self.session_id
+                or getattr(client, '_budget_attempt_id', None) != identity):
+            raise ValueError('Document client must use the original physical ledger, session and attempt')
+        return client
+
     def _produce(self, store: ArtifactStore, request: WorkDocumentRequest, identity: str) -> None:
-        client = self.client_factory(identity) if self.context_policy else None
+        client = self._bound_client(identity) if self.context_policy else None
         binding = self._admit(store, request, identity,
             context_input_tokens=client._settings.context_input_tokens if client else None)
         context = binding['context']
@@ -642,11 +659,7 @@ class DocumentWorkToolGateway:
         for row in (binding['seed'] or {}).get('observations', []):
             observations.append({'id': f'o{len(observations) + 1}', 'kind': 'material_window', 'observation': row})
         store.write_json('observations.json', observations)
-        client = client if client is not None else self.client_factory(identity)
-        if (getattr(client, '_budget_ledger', None) is not self.ledger
-                or getattr(client, '_budget_session_id', None) != self.session_id
-                or getattr(client, '_budget_attempt_id', None) != identity):
-            raise ValueError('Document client must use the original physical ledger, session and attempt')
+        client = client if client is not None else self._bound_client(identity)
         seen_reads, seen_queries, no_progress = set(), set(), set()
         for row in observations:
             seen_reads.add(window_key(self.workspace, FileWindow.model_validate(row['observation']['request'])))

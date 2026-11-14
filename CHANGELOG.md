@@ -16,7 +16,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
-- Structured research tasks with a declared report can pass its selected template to common document work, including when they also have an execution or analysis contract.
+- Common document work for structured reports applies the selected article or section method, template, review and writing limits, including alongside execution or analysis work. Saved sessions retain their original contract.
 - Research source bundles produced from supplied documents can be queried and passed to document work through the same source owner.
 
 ## 2026-11-13

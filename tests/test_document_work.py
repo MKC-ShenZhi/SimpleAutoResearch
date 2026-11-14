@@ -51,7 +51,8 @@ class DocumentWorkTests(unittest.TestCase):
 
         root, _, _, _ = self.workspace()
         original = DocumentBundle([DocumentRecord(document_id='paper', title='Paper', source='test',
-            metadata={'paper_id': 'paper'}, extraction_status='parsed')], {}, {}, [], [
+            metadata={'paper_id': 'paper', 'unobserved_analysis': 'Unread metadata finding.'},
+            extraction_status='parsed')], {}, {}, [], [
                 TextChunk(chunk_id='paper-1', document_id='paper', text='Unread before. Read this. Unread after.')])
         path = root / 'source.json'
         path.write_text(json.dumps(original.to_handoff_dict()), encoding='utf-8')
@@ -67,6 +68,7 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertEqual((passage['text'], passage['character_start'], passage['character_end'],
             passage['total_characters'], passage['truncated']), ('Read this.', 15, 25, 39, True))
         self.assertNotIn('Unread after.', json.dumps(context.model_dump(mode='json')))
+        self.assertNotIn('Unread metadata finding.', json.dumps(context.model_dump(mode='json')))
 
     def test_common_report_runs_configured_review_revision_and_recovery(self):
         from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
@@ -184,8 +186,20 @@ class DocumentWorkTests(unittest.TestCase):
         client = Client(ledger, 'sections', None)
         gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
             material_roots=lambda: ['source0'], context_policy='working.v3', report_requirement=requirement)
+        from simple_ar.core.capabilities import ArtifactStore
+        write = ArtifactStore.write_json
+        def interrupt_checkpoint(owner, path, payload, **options):
+            result = write(owner, path, payload, **options)
+            if path == 'sections.json' and len(payload.get('completed', {}).get('sections', [])) == 1:
+                raise KeyboardInterrupt('Stop after the first complete section checkpoint')
+            return result
+        with patch.object(ArtifactStore, 'write_json', interrupt_checkpoint), self.assertRaises(KeyboardInterrupt):
+            gateway.call('work_document', {'goal': 'Write the requested brief'}, identity='sections')
+        self.assertTrue(gateway.can_reconcile('work_document', 'sections'))
+        initial_labels = [row[0] for row in calls]
         result = gateway.call('work_document', {'goal': 'Write the requested brief'}, identity='sections')
         self.assertTrue(result.ok, result.error)
+        self.assertEqual([row[0] for row in calls[:len(initial_labels)]], initial_labels)
         self.assertIn('## Observations', result.data['markdown'])
         self.assertIn('## Limits', result.data['markdown'])
         writers = [row for row in calls if row[0].startswith('report-writer-')]

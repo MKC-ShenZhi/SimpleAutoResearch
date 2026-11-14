@@ -39,10 +39,12 @@ def _observed_documents(observations: list[dict]) -> DocumentBundle:
                 source = original[match['document_id']]
                 document_id = f"source-{list(sources).index(path) + 1}-{source.document_id}"
                 if document_id not in records:
-                    metadata = dict(source.metadata)
+                    metadata = {'evidence_role': 'selected_source_passages_not_independently_verified',
+                        'fulltext_extraction': {'coverage': {'content_scope': 'selected_passages', 'truncated': True}}}
                     if source.is_original_source:
-                        metadata['paper_id'] = metadata.get('paper_id') or source.document_id
-                    metadata['fulltext_extraction'] = {'coverage': {'content_scope': 'selected_passages', 'truncated': True}}
+                        metadata['paper_id'] = source.metadata.get('paper_id') or source.document_id
+                        if source.metadata.get('bibliographic_notes'):
+                            metadata['bibliographic_notes'] = source.metadata['bibliographic_notes']
                     records[document_id] = replace(source, document_id=document_id, local_path=None,
                         abstract='', metadata=metadata)
                 chunks.append(TextChunk(chunk_id=f"{observation['id']}-{number}", document_id=document_id,
@@ -91,10 +93,12 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
     else:
         writer_client = (retained_writing_client(store=writer, identity=identity, client=client,
             contract='atomic_complete.v2') if requirement['method'] == 'sections' else client)
+        resume = (store.ref('writer/sections.json', kind='report_checkpoint', schema='report_checkpoint.v1')
+            if writer.exists('sections.json') else None)
         result = run_report_writing_capability(context=CapabilityContext(writer, AttemptManifest(identity),
-            inputs=(documents_ref,), input_store=store), request=ReportWritingRequest(report_context=context,
+            inputs=(documents_ref, *((resume,) if resume else ())), input_store=store), request=ReportWritingRequest(report_context=context,
                 memory=memory, config=config, template=template, llm_client=writer_client,
-                method=requirement['method'], prior_draft=prior_draft, output_outline=requirement['outline']))
+                method=requirement['method'], prior_draft=prior_draft, output_outline=requirement['outline'], resume_ref=resume))
         writer_ref = next((row for row in reversed(result.artifacts) if row.kind == 'report_writer_result'), None)
         if writer_ref is None:
             raise ValueError('Report writing has no complete candidate; retain its checkpoint: ' + '; '.join(result.diagnostics))
@@ -121,6 +125,10 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
             section_headings={row.section_id: row.heading for row in planned}))
     if assembled.status != 'completed':
         gaps.extend(assembled.diagnostics or ('Report assembly is incomplete.',))
+    removed_citations = assembly.read_json('citation_cleanup.json')['removed_citations']
+    if removed_citations:
+        gaps.append('Unresolved citation references were removed during assembly: '
+            + ', '.join(map(str, removed_citations)))
     outputs = ['references.bib', 'citation_map.json']
     outputs.extend(row.path for row in assembled.artifacts
         if row.kind == 'figure' and row.status == 'available')
