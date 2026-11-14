@@ -6,7 +6,6 @@ from simple_ar.research.prompts import (
     paper_note_user_prompt,
     read_coarse_screening_user_prompt,
     read_rerank_user_prompt,
-    read_screening_user_prompt,
     research_planner_user_prompt,
     synthesize_user_prompt,
 )
@@ -51,20 +50,6 @@ class PromptTests(unittest.TestCase):
         self.assertIn("arXiv", prompt)
         self.assertIn("paper title and abstract fields", prompt)
         self.assertIn("not browser questions", prompt)
-
-    def test_read_screening_prompt_separates_review_from_search(self) -> None:
-        prompt = read_screening_user_prompt(
-            topic="coding agents",
-            problem_markdown="# Problem\nStudy evaluation.",
-            papers_json='[{"id": "paper-1", "title": "Known Paper"}]',
-            research_plan_json='{"query_plan": {"queries": ["coding agents"]}}',
-            max_shortlist=5,
-        )
-
-        self.assertIn("decisions", prompt)
-        self.assertIn("keep", prompt)
-        self.assertIn("drop", prompt)
-        self.assertIn("read-stage screening", prompt)
 
     def test_two_step_read_prompts_bound_coarse_and_rerank_tasks(self) -> None:
         coarse = read_coarse_screening_user_prompt(

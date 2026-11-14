@@ -324,45 +324,6 @@ def read_rerank_user_prompt(
     )
 
 
-def read_screening_user_prompt(
-    *,
-    topic: str,
-    problem_markdown: str,
-    papers_json: str,
-    research_plan_json: str,
-    max_shortlist: int,
-    min_shortlist: int = 0,
-) -> str:
-    """Build the prompt for read-stage paper screening and prioritization."""
-    return (
-        "Review the retrieved paper metadata for the current research problem. "
-        "Return JSON with one field `decisions`, a list of objects. Each object "
-        "must contain `paper_id`, `decision` (`keep` or `drop`), "
-        "`reading_priority` (1 is highest priority), `relevance_score` (0-5), "
-        "`quality_score` (0-5), `reason`, and `confidence`.\n\n"
-        "Rules:\n"
-        "- Keep only papers that are useful for answering the research questions "
-        "or designing a bounded follow-up experiment.\n"
-        "- Prefer papers with methods, benchmarks, datasets, limitations, or code "
-        "signals relevant to the topic.\n"
-        "- Do not invent facts that are not in metadata or the research plan.\n"
-        "- If metadata is thin but potentially relevant, keep it with lower "
-        "confidence rather than pretending certainty.\n"
-        "- Keep at most `max_shortlist` papers unless all retrieved papers are "
-        "clearly necessary.\n"
-        "- If `min_shortlist` is greater than zero and the batch contains enough "
-        "potentially useful papers, avoid over-pruning. Keep borderline but "
-        "relevant papers with lower confidence so the reranker can decide.\n"
-        "- This is read-stage screening, not novelty review.\n\n"
-        f"Topic:\n{topic}\n\n"
-        f"Problem artifact:\n{problem_markdown}\n\n"
-        f"Research Plan JSON:\n{research_plan_json}\n\n"
-        f"Retrieved Papers JSON:\n{papers_json}\n\n"
-        f"max_shortlist: {max_shortlist}\n"
-        f"min_shortlist: {min_shortlist}\n"
-    )
-
-
 def synthesize_user_prompt(
     notes_markdown: str,
     paper_notes_json: str,
