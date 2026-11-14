@@ -644,7 +644,7 @@ simple-ar research-report --session-root PATH --model SELECTOR [OPTIONS]
 | 参数 | 说明 | 默认值或使用条件 |
 | --- | --- | --- |
 | `--session-root PATH` | 有可供撰写的已有研究工作的会话。 | 必填 |
-| `--refresh` | 用已有证据新建报告／审计尝试；保留旧报告，不重复实验。 | 关闭 |
+| `--refresh` | 请求根据已有证据生成新报告，并保留旧报告。 | 关闭 |
 | `--model SELECTOR` | 模型选择器：env、profile:NAME 或 route:NAME；共同会话保留已保存的选择器。 | 必填 |
 | `--template NAME_OR_PATH` | 报告模板名称或 Markdown 路径。 | experiment |
 | `--reviewer CHOICE` | 报告审阅器；disabled 保留审计。 可选：`llm`, `disabled`. | llm |

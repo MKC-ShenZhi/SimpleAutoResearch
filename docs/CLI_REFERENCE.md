@@ -646,7 +646,7 @@ simple-ar research-report --session-root PATH --model SELECTOR [OPTIONS]
 | Parameter | Meaning | Default or conditions |
 | --- | --- | --- |
 | `--session-root PATH` | Saved research session with work available for the report. | Required |
-| `--refresh` | New report/audit attempts from saved evidence; keeps old reports without repeating experiments. | Off |
+| `--refresh` | Request new report work from saved evidence and keep old reports. | Off |
 | `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME; a shared session retains its saved selector. | Required |
 | `--template NAME_OR_PATH` | Report template name or Markdown path. | experiment |
 | `--reviewer CHOICE` | Report reviewer; disabled retains audit. Choices: `llm`, `disabled`. | llm |

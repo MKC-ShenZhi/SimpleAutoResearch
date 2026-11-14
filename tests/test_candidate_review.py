@@ -211,6 +211,29 @@ class CandidateReviewTests(unittest.TestCase):
 
 
 class IntegratedCandidateFlowTests(unittest.TestCase):
+    def test_last_decision_can_spend_the_remaining_call_on_chosen_review(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
+
+        case = OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.app = ToolApplication.create(case.root, 'Review the editable note before delivery.',
+            model='fixture', sources={}, services=case.services, max_turns=10,
+            max_tokens=900000, max_attempts=100, tool_contracts='full')
+        case._write('note.md', 'An editable research note.\n')
+        case.app.ledger.limits['llm_requests'] = 2
+        case.app.ledger.save()
+        case.review = lambda view: {'conclusion': 'incomplete', 'findings': [], 'evidence': [],
+            'limitations': ['The independent check still needs more evidence.']}
+        case.decisions.append(_action('review_result', summary='Inspect this draft',
+            artifacts=['note.md'], unresolved=['The note still needs a check.']))
+        case._run(should_stop=lambda: False)
+        self.assertEqual(len(case.inspection_requests), 1)
+        self.assertEqual(case.app.ledger.remaining('llm_requests'), 0)
+        self.assertEqual(case.app.session.manifest.status, 'paused')
+        self.assertFalse((case.root / 'delivery.json').exists())
+
     def test_review_can_observe_parent_execution_without_certifying_changed_inputs(self):
         from simple_ar.app.tool_application import ToolApplication
         from tests.test_professional_work_loop import OperationsWorkLoopTests, _action, _assessments, _digest

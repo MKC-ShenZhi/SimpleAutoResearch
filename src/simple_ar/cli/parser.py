@@ -335,7 +335,7 @@ def build_parser(
     )
     report_parser.add_argument(
         "--refresh", action="store_true",
-        help="Write new report attempts from existing evidence; retain old reports and do not rerun experiments.",
+        help="Request a new report from existing evidence and retain old reports.",
     )
     report_parser.add_argument(
         "--model",

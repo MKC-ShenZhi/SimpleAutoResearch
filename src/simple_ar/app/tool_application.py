@@ -2804,11 +2804,15 @@ class ToolApplication:
                 requests * decision['total_tokens'])}
 
     def _review_floor(self, client: Any, *, candidate: bool) -> dict:
-        if (not candidate and self.state['turns']
-                and self._terminal_batch()
-                and (self.state['turns'][-1].get('origin') == 'caller'
-                     or self.ledger.remaining('llm_requests') == 1)):
-            return {}  # The accepted terminal submission may use the last request for its review.
+        if self.state['turns'] and self.ledger.remaining('llm_requests') == 1:
+            if (candidate and self._last_available_action()
+                    or not candidate and self._terminal_batch()):
+                # A chosen final review can use the remaining call. If it does
+                # not itself finish the request, preserve the opinion and pause.
+                return {}
+        if (not candidate and self.state['turns'] and self._terminal_batch()
+                and self.state['turns'][-1].get('origin') == 'caller'):
+            return {}
         return self._completion_floor(client, dispatch=True)
 
     def _terminal_batch(self) -> bool:
