@@ -797,7 +797,8 @@ class DocumentWorkToolGateway:
         authored = write_observed_report(store=store, identity=identity,
             requirement=binding['report_requirement'], title=decision.title, goal=context['goal'],
             work_context=work_context, observations=selected, attachments=decision.attachments,
-            prior_draft=context['prior_draft']['text'] if context['prior_draft'] else '', client=client)
+            prior_draft=context['prior_draft']['text'] if context['prior_draft'] else '',
+            client=client, sources=self.sources)
         if context['prior_draft'] and context['prior_draft'].get('bibliography'):
             authored['outputs'] = [name for name in authored['outputs'] if name not in {'references.bib', 'citation_map.json'}]
             if (store.root / 'assembly' / 'references.bib').read_text(encoding='utf-8').strip():
@@ -1184,6 +1185,12 @@ class DocumentWorkToolGateway:
             'coverage': {'omitted_files': binding['context']['omitted_files'],
                 'scope': 'Inventory and observed windows are bounded; unread content is not evidence of absence.'},
             'gaps': gaps, 'receipt': f'records/{identity}/document_work/receipt.json'}
+        if binding['contract'] == _REPORT_CONTRACT:
+            authored = store.read_json(f"decisions/{candidate['decision']}/authored.json")
+            if authored.get('source_reads_record'):
+                data['provenance']['writer_source_reads'] = authored['source_reads_record']
+                data['provenance']['scope'] = ('Selected original observations and recorded Writer source reads; '
+                    'no independent verification.')
         if binding['contract'] == 'document_work_operation.v2' or binding['contract'] in _MATERIAL_ID_CONTRACTS:
             data['measurements'] = manuscript_measurements(markdown)
         result = ToolResult(tool_name='work_document', data=data, artifacts=artifacts,

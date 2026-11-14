@@ -316,6 +316,17 @@ class SourceToolGateway:
             retained.append(window)
         return retained
 
+    def bound_document_chunks(self, document_record: str, document_id: str, expected_sha256: str):
+        """Read retained chunks for one previously selected, authorized source."""
+        path = self.resolve_source_handoff(document_record)
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != expected_sha256:
+            raise ValueError('Selected original source changed')
+        bundle = DocumentBundle.from_handoff_dict(json.loads(raw))
+        if self.resolve_source_handoff(document_record) != path or path.read_bytes() != raw:
+            raise ValueError('Source record changed during passage selection')
+        return [row for row in bundle.chunks[:self.policy.max_chunks] if row.document_id == document_id]
+
     def __init__(self, root: Path, workspace: Any, ledger: BudgetLedger, *,
                  policy: SourcePolicy | dict[str, Any] | None = None,
                  registry: SearchProviderRegistry | None = None,

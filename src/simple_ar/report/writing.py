@@ -1100,6 +1100,7 @@ class ReportWritingRequest:
     candidate_source: dict[str, Any] | None = None
     output_outline: Sequence[dict[str, Any]] = ()
     publication_view: Callable[[dict], dict] | None = None
+    source_reader: Callable[[str], list | None] | None = None
 
 
 def _fixed_section_memory(memory: ReportMemory, outline: Sequence[dict[str, Any]],
@@ -1537,7 +1538,8 @@ def run_report_writing_capability(*, context: CapabilityContext, request: Report
 
     result = run_report_agent(client=request.llm_client, context=request.report_context, memory=memory,
                               config=request.config, template=request.template,
-                              gateway=ReportToolGateway(request.report_context, documents=documents, output_reader=read_output),
+                              gateway=ReportToolGateway(request.report_context, documents=documents,
+                                  output_reader=read_output, source_reader=request.source_reader),
                               emit=request.emit, completed_checkpoint=completed,
                               checkpoint_sink=save_checkpoint, assemble_body=False,
                               publication_view=request.publication_view,

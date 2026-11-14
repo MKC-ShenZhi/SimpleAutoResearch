@@ -17,9 +17,9 @@ from simple_ar.research.contracts import TextChunk
 from simple_ar.research.documents.ingest import DocumentBundle
 
 
-def _observed_documents(observations: list[dict]) -> DocumentBundle:
+def _observed_documents(observations: list[dict]) -> tuple[DocumentBundle, dict]:
     """Join selected read windows, preserving the exact excerpts actually seen."""
-    records, chunks, sources = {}, [], {}
+    records, chunks, sources, bindings = {}, [], {}, {}
     for observation in observations:
         if observation['kind'] == 'material_window':
             request, view = observation['observation']['request'], observation['observation']['data']
@@ -38,6 +38,7 @@ def _observed_documents(observations: list[dict]) -> DocumentBundle:
             for number, match in enumerate(data.get('matches', []), 1):
                 source = original[match['document_id']]
                 document_id = f"source-{list(sources).index(path) + 1}-{source.document_id}"
+                bindings[document_id] = (data['document_record'], source.document_id, data['document_sha256'])
                 if document_id not in records:
                     metadata = {'evidence_role': 'selected_source_passages_not_independently_verified',
                         'fulltext_extraction': {'coverage': {'content_scope': 'selected_passages', 'truncated': True}}}
@@ -53,12 +54,12 @@ def _observed_documents(observations: list[dict]) -> DocumentBundle:
                     metadata={'observed_window': {key: match[key] for key in
                         ('chunk_id', 'character_start', 'character_end', 'total_characters', 'truncated') if key in match},
                         **{key: match[key] for key in ('section', 'section_id', 'heading') if key in match}}))
-    return DocumentBundle(list(records.values()), {}, {}, [], chunks)
+    return DocumentBundle(list(records.values()), {}, {}, [], chunks), bindings
 
 
 def write_observed_report(*, store: ArtifactStore, identity: str, requirement: dict,
                           title: str, goal: str, work_context: dict, observations: list[dict],
-                          attachments: list[str], prior_draft: str, client: Any) -> dict:
+                          attachments: list[str], prior_draft: str, client: Any, sources: Any = None) -> dict:
     """Draft, review and assemble using the existing Writer and shared ledger client."""
     from simple_ar.report.capability import ReportAssemblyRequest, run_report_capability
     from simple_ar.report.assembler import ReportAssemblyMode
@@ -66,7 +67,11 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
     from simple_ar.report.ports import DeterministicFigureRenderer
     from simple_ar.report.writing import ReportWritingRequest, retained_writing_client, run_report_writing_capability
 
-    documents = _observed_documents(observations)
+    documents, source_bindings = _observed_documents(observations)
+
+    def read_source(document_id: str):
+        binding = source_bindings.get(document_id)
+        return sources.bound_document_chunks(*binding) if binding is not None and sources is not None else None
     documents_ref = store.write_json('documents.json', documents.to_handoff_dict(),
         kind='documents', schema='document_bundle.v1')
     if documents.chunks:
@@ -98,7 +103,8 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
         result = run_report_writing_capability(context=CapabilityContext(writer, AttemptManifest(identity),
             inputs=(documents_ref, *((resume,) if resume else ())), input_store=store), request=ReportWritingRequest(report_context=context,
                 memory=memory, config=config, template=template, llm_client=writer_client,
-                method=requirement['method'], prior_draft=prior_draft, output_outline=requirement['outline'], resume_ref=resume))
+                method=requirement['method'], prior_draft=prior_draft, output_outline=requirement['outline'],
+                resume_ref=resume, source_reader=read_source))
         writer_ref = next((row for row in reversed(result.artifacts) if row.kind == 'report_writer_result'), None)
         if writer_ref is None:
             raise ValueError('Report writing has no complete candidate; retain its checkpoint: ' + '; '.join(result.diagnostics))
@@ -132,5 +138,9 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
     outputs = ['references.bib', 'citation_map.json']
     outputs.extend(row.path for row in assembled.artifacts
         if row.kind == 'figure' and row.status == 'available')
-    return {'markdown': assembly.read_text('report_body.md'), 'gaps': gaps,
+    authored = {'markdown': assembly.read_text('report_body.md'), 'gaps': gaps,
         'outputs': list(dict.fromkeys(outputs)), 'writer_result': completed['path']}
+    if any(row.get('tool_name') in {'search_source_chunks', 'get_neighbor_chunks'}
+           and row.get('status') == 'ok' for row in written.get('tool_results', [])):
+        authored['source_reads_record'] = f"records/{identity}/document_work/writer/{completed['path']}"
+    return authored

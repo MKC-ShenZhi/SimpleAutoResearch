@@ -455,7 +455,7 @@ class OperationTools:
                 def document_context(targets):
                     context = work_context(targets) if work_context is not None else {}
                     return {**context, 'requested_report': working_report_requirement(
-                        config['report_requirement'], for_writing=True)}
+                        config['report_requirement'], for_writing=config.get('document_context_policy') == 'working.v2')}
             self.document = DocumentWorkToolGateway(root, self.workspace, ledger, session_id,
                 client_factory=lambda identity: client_factory(identity, 'writing'),
                 work_context=document_context, material_observations=material_observations,

@@ -56,8 +56,9 @@ class DocumentWorkTests(unittest.TestCase):
                 TextChunk(chunk_id='paper-1', document_id='paper', text='Unread before. Read this. Unread after.')])
         path = root / 'source.json'
         path.write_text(json.dumps(original.to_handoff_dict()), encoding='utf-8')
-        selected = _observed_documents([{'id': 'o1', 'kind': 'source_passages', 'data': {
-            'document_path': str(path), 'matches': [{'document_id': 'paper', 'chunk_id': 'paper-1',
+        selected, _ = _observed_documents([{'id': 'o1', 'kind': 'source_passages', 'data': {
+            'document_path': str(path), 'document_record': str(path), 'document_sha256': sha(path.read_bytes()),
+            'matches': [{'document_id': 'paper', 'chunk_id': 'paper-1',
                 'text': 'Read this.', 'character_start': 15, 'character_end': 25,
                 'total_characters': 39, 'truncated': True}]}}])
         store = ArtifactStore(root / 'report')
@@ -114,6 +115,68 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertIn('Original paper', bibliography)
         self.assertIn('Researcher Example', bibliography)
         self.assertFalse(any('citation references were removed' in gap for gap in result.data['gaps']))
+
+    def test_common_section_writer_can_read_an_unselected_passage_of_selected_source(self):
+        from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
+        from tests.report_review_fixtures import prompt_payload
+
+        root, source, ledger, workspace = self.workspace()
+        bundle = DocumentBundle([
+            DocumentRecord(document_id='paper', title='Paper', source='local_files', extraction_status='parsed'),
+            DocumentRecord(document_id='other', title='Other', source='local_files', extraction_status='parsed'),
+        ], {}, {}, [], [
+            TextChunk('initial', 'paper', 'Calibration is described here.'),
+            TextChunk('conditions', 'paper', 'The treatment condition was twelve days.'),
+            TextChunk('foreign', 'other', 'The treatment condition was ninety days.'),
+        ])
+        (source / 'original.json').write_text(json.dumps(bundle.to_handoff_dict()), encoding='utf-8')
+        config = ReportRuntimeConfig(outline_strategy='template', reviewer='disabled', max_review_iterations=0,
+            draft_scope='document', review_scope='document', source_strategy='full', allow_source_backtracking=True)
+        template = ReportTemplateBundle(name='brief', mode='supplied_materials', template_path='',
+            criteria_path='', template_markdown='## Findings\n', criteria_markdown='')
+        requirement = {'method': 'sections', 'config': config.model_dump(mode='json'),
+            'template': template.model_dump(mode='json'),
+            'outline': [{'heading': 'Findings', 'required': True}]}
+        test = self
+
+        class Client(_Client):
+            def ask_json(self, system, prompt, *, label='', budget_call_id='', **options):
+                view = prompt_payload(prompt)
+                self._budget_ledger.reserve(budget_call_id, {'llm_requests': 1, 'total_tokens': 10},
+                    session_id='session', attempt_id=self._budget_attempt_id, purpose='document')
+                if label == 'document-work-1':
+                    response = {'action': 'investigate', 'source_queries': [
+                        {'document_record': 'source0/original.json', 'query': 'calibration'}]}
+                elif label == 'document-work-2':
+                    response = {'action': 'write', 'title': 'Findings', 'selected_observation_ids': ['o1']}
+                elif label == 'report-writer-document':
+                    test.assertNotIn('twelve days', json.dumps(view))
+                    response = {'context_requests': [{'tool_name': 'search_source_chunks', 'arguments': {
+                        'handle': view['source_handles'][0]['handle'], 'query': 'treatment condition'}}]}
+                elif label == 'report-writer-document-evidence':
+                    evidence = json.dumps(view['extra_tool_context'])
+                    test.assertIn('twelve days', evidence)
+                    test.assertNotIn('ninety days', evidence)
+                    response = {'sections': [{'section_id': row['section']['section_id'],
+                        'heading': row['section']['heading'], 'draft_markdown': 'The treatment lasted twelve days.'}
+                        for row in view['sections']]}
+                else:
+                    raise AssertionError(label)
+                self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
+                return response
+
+        client = Client(ledger, 'backtrack', None)
+        gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
+            material_roots=lambda: ['source0'], sources=SourceToolGateway(root, workspace, ledger),
+            context_policy='working.v3', report_requirement=requirement)
+        result = gateway.call('work_document', {'goal': 'Explain the source'}, identity='backtrack')
+        self.assertTrue(result.ok, result.error)
+        self.assertIn('twelve days', result.data['markdown'])
+        record = root / result.data['provenance']['writer_source_reads']
+        observed = json.loads(record.read_text(encoding='utf-8'))['tool_results']
+        lookup = next(row for row in observed if row['tool_name'] == 'search_source_chunks')
+        self.assertEqual(lookup['content']['search_scope'], 'persisted_extracted_text')
+        self.assertEqual([row['chunk_id'] for row in lookup['content']['chunks']], ['conditions'])
 
     def test_common_report_runs_configured_review_revision_and_recovery(self):
         from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle

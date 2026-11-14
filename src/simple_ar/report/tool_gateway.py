@@ -46,12 +46,25 @@ class ReportToolGateway:
     """Local report tool executor with OpenAI-style schema export."""
 
     def __init__(self, context: ReportContext, *, documents: DocumentBundle | None = None,
-                 output_reader: Callable[[str, int, int, str, dict], dict] | None = None) -> None:
+                 output_reader: Callable[[str, int, int, str, dict], dict] | None = None,
+                 source_reader: Callable[[str], list | None] | None = None) -> None:
         self.set_context(context)
         self.specs = {spec.name: spec for spec in report_tool_specs()}
         self.call_counts = {name: 0 for name in self.specs}
         self.documents = documents
         self.output_reader = output_reader
+        self.source_reader = source_reader
+
+    def _source_chunks(self, handle: SourceHandle) -> tuple[list | None, str]:
+        document_id = str(handle.metadata.get('document_id') or handle.paper_id)
+        original = self.source_reader(document_id) if self.source_reader is not None else None
+        if original is not None:
+            return original, 'persisted_extracted_text'
+        if self.documents is None:
+            return None, 'unavailable'
+        scope = ('selected_retained_passages' if handle.metadata.get('evidence_selection') == 'explicit_retained_chunks'
+                 else 'persisted_extracted_text')
+        return [row for row in self.documents.chunks if row.document_id == document_id], scope
 
     def set_context(self, context: ReportContext) -> None:
         """Reproject accepted citation fields without resetting tool allowance."""
@@ -100,17 +113,16 @@ class ReportToolGateway:
             handle = self.resolver.get(args.handle)
             if handle is None:
                 return ReportToolResult(tool_name=name, status="not_found", summary="Registered source handle not found.")
-            if self.documents is None:
+            chunks, scope = self._source_chunks(handle)
+            if chunks is None:
                 return ReportToolResult(tool_name=name, status="not_found",
                     summary="Persisted text unavailable; no source search was performed.",
                     content={"search_performed": False}, source_handles=[handle.handle])
-            document_id = str(handle.metadata.get("document_id") or handle.paper_id)
-            chunks = [row for row in self.documents.chunks if row.document_id == document_id]
             selected = rank_source_chunks(chunks, args.query, limit=args.limit)
             return ReportToolResult(tool_name=name, status="ok" if selected else "not_found",
                 summary="Lexical matches in retained text; reread neighboring passages before judging support." if selected else
                     "No lexical match in retained text. This is not proof that the original source omits the claim.",
-                content={"search_performed": True, "search_scope": "persisted_extracted_text",
+                content={"search_performed": True, "search_scope": scope,
                     "query": args.query, "document_chunk_count": len(chunks),
                     "semantic_verification": "not_performed",
                     "chunks": _chunk_views(selected, query=args.query)}, source_handles=[handle.handle])
@@ -138,13 +150,16 @@ class ReportToolGateway:
             handle = self.resolver.get(args.handle)
             if handle is None:
                 return ReportToolResult(tool_name=name, status="not_found", summary="Chunk handle not found.")
-            if self.documents is not None:
-                document_id = str(handle.metadata.get("document_id") or handle.paper_id)
-                chunks = order_source_chunks([item for item in self.documents.chunks if item.document_id == document_id])
+            source_chunks, scope = self._source_chunks(handle)
+            if source_chunks is not None:
+                chunks = order_source_chunks(source_chunks)
                 anchor = args.chunk_id or handle.chunk_id
                 if not anchor:
                     passages = handle.metadata.get("evidence_passages", [])
                     anchor = next((item.get("chunk_id", "") for item in passages if isinstance(item, dict)), "")
+                if scope == 'persisted_extracted_text':
+                    anchor = next((item.get('source_chunk_id', anchor) for item in
+                        handle.metadata.get('evidence_passages', []) if item.get('chunk_id') == anchor), anchor)
                 index = next((i for i, item in enumerate(chunks) if item.chunk_id == anchor), None)
                 if index is None:
                     return ReportToolResult(tool_name=name, status="not_found",
@@ -157,7 +172,7 @@ class ReportToolGateway:
                 selected = chunks[max(0, index - args.before):index + args.after + 1]
                 rows = _chunk_views(selected)
                 return ReportToolResult(tool_name=name, summary=f"Read {len(rows)} retained passages around {anchor}; retained neighbors do not guarantee contiguous original text.",
-                    content={"source_kind": "persisted_extracted_text", "anchor_chunk_id": anchor,
+                    content={"source_kind": scope, "anchor_chunk_id": anchor,
                              "chunks": rows, "document_chunk_count": len(chunks)}, source_handles=[handle.handle])
             related = self.resolver.find_by_paper(handle.paper_id) if handle.paper_id else [handle]
             index = next((i for i, item in enumerate(related) if item.handle == handle.handle), 0)
