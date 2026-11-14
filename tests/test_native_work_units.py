@@ -402,6 +402,26 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertEqual(c.app.session.manifest.status, 'completed', c.app.result_snapshot())
         self.assertEqual(c._last('deliver_result', reviewed=True)['metadata']['delivery_review']['identity'], reviewed)
 
+    def test_selected_review_uses_last_call_after_an_ordinary_decision(self):
+        c = self.case
+        c.root = c.directory / 'last-call-review'
+        c.app = ToolApplication.create(c.root, 'Inspect the supplied note and retain any gaps.',
+            model='fixture', sources={'measurements': c.inputs}, services=c.services,
+            max_turns=3, max_tokens=500000, tool_contracts='on_demand')
+        c._write('note.md', 'The supplied observations are bounded.\n')
+        c.decisions.append(fixture._action('read_file', path='note.md'))
+        self.drain()
+        c.decisions.append(fixture._action('review_result', review_scope='candidate',
+            summary='Inspect the note', artifacts=['note.md']))
+        self.drain()
+        turn = c.app.state['turns'][-1]
+        decision = c.app.session.store.read_json(str(Path(turn['reply']).with_name('decision_budget.json')))
+        self.assertFalse(decision['closing_required'])
+        self.assertEqual(c._last('review_result')['status'], 'ok')
+        self.assertEqual(len(c.inspection_requests), 1)
+        self.assertEqual(c.app.ledger.remaining('llm_requests'), 0)
+        self.assertNotEqual(c.app.session.manifest.status, 'completed')
+
     def test_candidate_review_is_offered_with_one_measured_followup_remaining(self):
         c = self.case
         c.root = c.directory / 'review-with-followup'
