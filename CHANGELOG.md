@@ -18,6 +18,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- When resources allow only a final independent opinion, the review receives delivery source text within its available capacity; follow-up reviews retain execution results associated with relevant materials.
 - Common document work for structured reports applies the selected article or section method, template, review and writing limits, including alongside execution or analysis work. Saved sessions retain their original contract.
 - Research source bundles produced from supplied documents can be queried and passed to document work through the same source owner.
 - Section writing can retrieve additional retained passages from selected sources and preserve those reads across recovery.
