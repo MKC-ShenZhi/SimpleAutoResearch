@@ -54,6 +54,12 @@ def history_observation(call: dict, result: dict, record: str, *, navigation: bo
         and not (name == 'focus_work' and key == 'inputs')
         and not (key in indexed_arguments and value == indexed_arguments[key])
         and not (key == 'absolute_path' and value == indexed_arguments.get('path'))}
+    if navigation and 'returncode' in data:
+        for stream in ('stdout', 'stderr'):
+            text = data.get(stream)
+            if isinstance(text, str) and stream not in observed:
+                observed[stream + '_tail'] = {'text': text[-512:],
+                    'omitted_characters': max(0, len(text) - 512)}
     if result.get('status') == 'ok' and not result.get('error'):
         observed.update(SourceToolGateway.history_identity(name, data)
             or workspace_history_identity(name, data))

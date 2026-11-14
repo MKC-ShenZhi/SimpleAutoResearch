@@ -912,10 +912,18 @@ def select_working_context(
     def admit_navigation() -> None:
         cited = explicit_references | {record for note in view['notes'] if active(note)
                                        for record in note.get('records', ())} if focused_working_set else set()
+        # Feedback may reuse a previous request's executions even when no
+        # note cites them. Keep their compact receipts navigable, not their
+        # historical results as proof about changed inputs.
+        prior_execution = max((op.get('request_count', 1) for op in operations
+            if op.get('request_count', 1) < len(user_requests)
+            and type(op['observation'].get('observed', {}).get('returncode')) is int), default=None)
         ordered = [i for i in sorted(range(len(operations)), key=operation_priority, reverse=True)
             if not (retained_records and operations[i].get('turn') in recent)
             and not (focused_working_set and operations[i].get('request_count', 1) < len(user_requests)
-                     and operations[i]['observation'].get('record') not in cited)]
+                     and operations[i]['observation'].get('record') not in cited
+                     and not (operations[i].get('request_count', 1) == prior_execution
+                         and type(operations[i]['observation'].get('observed', {}).get('returncode')) is int))]
 
         def admit_batch(indices: list[int]) -> None:
             if not indices:

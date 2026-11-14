@@ -1197,6 +1197,36 @@ class RetainedWorkingContextTests(unittest.TestCase):
         self.assertGreater(overview['omitted_entries'], 0)
         self.assertIn('Use the recorded research', json.dumps(limited))
 
+    def test_feedback_can_navigate_recent_prior_execution_without_replaying_it(self):
+        from simple_ar.app.task_view import history_observation
+
+        def operation(turn, count, tool, data):
+            call = {'id': str(turn), 'function': {'name': tool,
+                'arguments': json.dumps({'argv': ['python', 'check.py'], 'cwd': 'workspace'})}}
+            record = f'attempts/{turn}/native_result.json'
+            return {'turn': turn, 'turn_complete': True, 'request_count': count,
+                'call_id': str(turn), 'reply': f'records/{turn}/reply.json',
+                'observation': history_observation(call, {'tool_name': tool, 'status': 'ok',
+                    'data': data}, record, navigation=True)}
+
+        operations = [operation(0, 1, 'run_process', {'returncode': 0, 'stdout': 'Old run'}),
+            operation(1, 2, 'run_process', {'returncode': 0,
+                'stdout': 'earlier output\n' * 200 + '18 checks passed'}),
+            operation(2, 2, 'read_file', {'text': 'Private original remains available'}),
+            operation(3, 3, 'search_files', {'text': 'Current search'})]
+        messages, _ = select(user_requests=['Research', 'Revise', 'Review the revised work'],
+            material_policy='working', require_work_notes=True, fit_work_notes=True,
+            processed_turns=[], sparse_handoffs=True, working_set_policy='recent.v5',
+            operation_history=operations, context_token_target=20000)
+        overview = json.loads(messages[1]['content'])['working_view']['operation_overview']
+        entries = [item for group in expand_history_view(overview['entries']) for item in group['observations']]
+        records = {row['record']: row for row in entries}
+        self.assertIn('records/1/native_result.json', records)
+        self.assertIn('18 checks passed', records['records/1/native_result.json']['observed']['stdout_tail']['text'])
+        self.assertNotIn('records/0/native_result.json', records)
+        self.assertNotIn('records/2/native_result.json', records)
+        self.assertIn('not original text', overview['scope'])
+
     def test_journal_native_uses_available_capacity_beyond_half_the_window(self):
         blocks = [block(0, 'Earlier native work. ' * 500), block(1, 'Latest native work. ' * 500)]
         messages, budget = select(material_policy='retained', require_work_notes=True,
