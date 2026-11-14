@@ -138,10 +138,12 @@ class DocumentWorkTests(unittest.TestCase):
             'template': template.model_dump(mode='json'),
             'outline': [{'heading': 'Findings', 'required': True}]}
         test = self
+        labels = []
 
         class Client(_Client):
             def ask_json(self, system, prompt, *, label='', budget_call_id='', **options):
                 view = prompt_payload(prompt)
+                labels.append(label)
                 self._budget_ledger.reserve(budget_call_id, {'llm_requests': 1, 'total_tokens': 10},
                     session_id='session', attempt_id=self._budget_attempt_id, purpose='document')
                 if label == 'document-work-1':
@@ -170,8 +172,20 @@ class DocumentWorkTests(unittest.TestCase):
         gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
             material_roots=lambda: ['source0'], sources=SourceToolGateway(root, workspace, ledger),
             context_policy='working.v3', report_requirement=requirement)
+        from simple_ar.core.capabilities import ArtifactStore
+        write = ArtifactStore.write_json
+        def interrupt_after_reads(owner, path, payload, **options):
+            result = write(owner, path, payload, **options)
+            if path == 'sections.json' and any(row['action'] == 'writer_context' and row['status'] == 'completed'
+                    for row in payload.get('completed', {}).get('iterations', [])):
+                raise KeyboardInterrupt('Stop after the source reads were recorded')
+            return result
+        with patch.object(ArtifactStore, 'write_json', interrupt_after_reads), self.assertRaises(KeyboardInterrupt):
+            gateway.call('work_document', {'goal': 'Explain the source'}, identity='backtrack')
+        self.assertTrue(gateway.can_reconcile('work_document', 'backtrack'))
         result = gateway.call('work_document', {'goal': 'Explain the source'}, identity='backtrack')
         self.assertTrue(result.ok, result.error)
+        self.assertEqual(labels.count('report-source-selection'), 1)
         self.assertIn('twelve days', result.data['markdown'])
         record = workspace.resolve(result.data['provenance']['writer_source_reads'])
         observed = json.loads(record.read_text(encoding='utf-8'))['tool_results']
