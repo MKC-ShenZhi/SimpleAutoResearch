@@ -439,7 +439,8 @@ class OperationTools:
                 from simple_ar.report.requirements import working_report_requirement
                 def document_context(targets):
                     context = work_context(targets) if work_context is not None else {}
-                    return {**context, 'requested_report': working_report_requirement(config['report_requirement'])}
+                    return {**context, 'requested_report': working_report_requirement(
+                        config['report_requirement'], for_writing=True)}
             self.document = DocumentWorkToolGateway(root, self.workspace, ledger, session_id,
                 client_factory=lambda identity: client_factory(identity, 'writing'),
                 work_context=document_context, material_observations=material_observations,

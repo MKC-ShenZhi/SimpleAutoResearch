@@ -37,11 +37,15 @@ def validate_report_requirement(value: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
-def working_report_requirement(value: dict[str, Any]) -> dict[str, Any]:
+def working_report_requirement(value: dict[str, Any], *, for_writing: bool = False) -> dict[str, Any]:
     """Expose the existing output requirements to the coordinator and author."""
     config = value['config']
-    return {'outline': value['outline'],
+    result = {'outline': value['outline'],
         'target_words': config.get('longform', {}).get('target_words', 0),
         'max_cited_sources': config.get('max_cited_sources', 0),
         'scope': 'These apply to the final report; use the relevant parts for this work unit. '
                  'The fixed outline and citation ceiling remain in force; length is a preference.'}
+    if for_writing and (config.get('outline_strategy') == 'template'
+                        or config.get('template') not in (None, '', 'auto')):
+        result['template'] = value['template']['template_markdown']
+    return result

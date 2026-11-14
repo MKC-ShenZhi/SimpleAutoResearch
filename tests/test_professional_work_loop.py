@@ -7579,6 +7579,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.operations.document.work_context([])['requested_report']['outline'],
             requirement['outline'])
         self.assertEqual(self.app.operations.document.work_context([])['requested_report']['max_cited_sources'], 1)
+        self.assertEqual(self.app.operations.document.work_context([])['requested_report']['template'],
+            requirement['template']['template_markdown'])
         self._write('report.md','# Observations\n\n## Unrequested heading\n\n'+_SCOPE+'\n')
         delivery = {'summary':'Supplied observations','artifacts':['report.md']}
         self._reload()
