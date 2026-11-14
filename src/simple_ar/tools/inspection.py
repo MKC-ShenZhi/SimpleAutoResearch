@@ -2558,7 +2558,15 @@ class InspectionToolGateway:
         paths.update(row['path'] for row in saved.get('evidence', [])
             if row.get('path') and not row.get('retained_from'))
         paths.update(saved.get('delivery_context', {}).get('artifacts', {}))
-        return {fact['source_record'] for fact in facts.values() if paths.intersection(fact['dependencies'])}
+        retained = {}
+        if saved.get('source_priming_policy') == 'priority.v4':
+            for row in saved.get('evidence', []):
+                source = row.get('retained_from') or {}
+                if row.get('path') and source.get('inspection'):
+                    retained.setdefault(source['inspection'], set()).add(row['path'])
+        return {fact['source_record'] for fact in facts.values()
+            if paths.intersection(fact['dependencies'])
+            or retained.get(fact.get('inspection'), set()).intersection(fact['dependencies'])}
 
     @staticmethod
     def _review_execution_names(facts: dict[str, dict]) -> dict[str, str]:
@@ -4118,15 +4126,10 @@ class InspectionToolGateway:
                     and (relevant is None or row['record'] in relevant))
         return memory, observations, rows
 
-    def _prepare_conversation_round(self, saved, request, messages, tools, terminal, finish,
-                                    client, number, remaining, *, dispatch=None, record=None, save_round=None,
-                                    response_model=None):
-        from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
-        from simple_ar.app.work_memory import (checkpoint_artifacts, compact_work, prepare_checkpoint_input,
-                                               validate_checkpoint_sources)
-        conversation = ProfessionalConversation(client)
-        trace = self._path(saved['identity'], f'sources-{number}')
-        last_floor = {}
+    def _inspection_projector(self, saved, request, messages, tools, terminal, finish, client, response_model):
+        """Build both investigation and final offers with the same evidence contract."""
+        from simple_ar.app.professional_conversation import ConversationInput
+
         previously_supplied = (self._offered_text_ranges(saved)
             if response_model is not None and self._delivery_scope(saved)
             and saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES else {})
@@ -4155,6 +4158,19 @@ class InspectionToolGateway:
                 final['function']['parameters'] = self._delivery_schema(saved, response_model, subjects=subjects)
                 offered = [final] if closing else [*tools, final]
             return ConversationInput(projected, offered, metadata)
+
+        return project
+
+    def _prepare_conversation_round(self, saved, request, messages, tools, terminal, finish,
+                                    client, number, remaining, *, dispatch=None, record=None, save_round=None,
+                                    response_model=None):
+        from simple_ar.app.professional_conversation import ProfessionalConversation
+        from simple_ar.app.work_memory import (checkpoint_artifacts, compact_work, prepare_checkpoint_input,
+                                               validate_checkpoint_sources)
+        conversation = ProfessionalConversation(client)
+        trace = self._path(saved['identity'], f'sources-{number}')
+        last_floor = {}
+        project = self._inspection_projector(saved, request, messages, tools, terminal, finish, client, response_model)
 
         def followup(value):
             nonlocal last_floor
@@ -4860,20 +4876,23 @@ class InspectionToolGateway:
 
     def _opinion_only(self, saved, request, tools, terminal, finish, client, remaining, response_model):
         """Use the conversation owner's resource decision for the first review offer."""
-        from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
+        from simple_ar.app.professional_conversation import ProfessionalConversation
 
         conversation = ProfessionalConversation(client)
         terminal = deepcopy(terminal)
         if self._delivery_scope(saved):
             terminal['function']['parameters'] = self._delivery_schema(saved, response_model)
-
-        def project(closing):
-            offered = [terminal] if closing else [*tools, terminal]
-            messages, projection = self._working_messages(saved, request, None, offered, client,
-                finish=finish if closing else None,
-                prioritize_delivery=closing and saved.get('source_priming_policy') == 'priority.v4')
-            return ConversationInput(messages, offered, projection)
-
+        ledger = conversation.ledger
+        slots = ledger.remaining('llm_requests')
+        if remaining[0] <= 0 or slots is not None and slots < 2:
+            return True
+        capacity = ledger.remaining('total_tokens')
+        target = getattr(client._settings, 'context_input_tokens', None)
+        if not ledger.unknown_dimensions(unbounded_only=True, current_allowance_only=True) and (
+                capacity is None or type(target) is int and
+                capacity >= 2 * (target + (client.effective_output_limit() or 0))):
+            return False
+        project = self._inspection_projector(saved, request, None, tools, terminal, finish, client, response_model)
         value = conversation.prepare(project,
             followup=lambda _: conversation.request_resources(project(True)),
             force_close=remaining[0] <= 0, additional=True, exit_first=True)

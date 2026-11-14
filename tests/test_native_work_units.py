@@ -111,6 +111,13 @@ class NativeWorkProjectionTests(unittest.TestCase):
                                ('open', 'open.txt'), ('paper', 'paper.pdf'), ('other', 'other.txt'))}
         self.assertEqual(InspectionToolGateway._relevant_execution_sources(saved, facts),
                          {'target', 'output', 'open', 'paper'})
+        current = {**saved, 'source_priming_policy': 'priority.v4'}
+        related = {**facts, 'other': {**facts['other'], 'inspection': 'old'}}
+        self.assertEqual(InspectionToolGateway._relevant_execution_sources(current, related),
+                         {'target', 'output', 'open', 'paper', 'other'})
+        unrelated = {**facts, 'other': {**facts['other'], 'inspection': 'another'}}
+        self.assertEqual(InspectionToolGateway._relevant_execution_sources(current, unrelated),
+                         {'target', 'output', 'open', 'paper'})
 
     def test_units_keep_statements_arguments_results_and_feedback_order_without_double_encoding(self):
         original = [{'role':'system', 'content':'Original permissions'},
