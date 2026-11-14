@@ -463,6 +463,8 @@ class ToolApplication:
             raise ValueError('Unsupported saved process artifact paths')
         if config.get('work_lifecycle') not in (None, *INTEGRATED_WORK_LIFECYCLES):
             raise ValueError('Unsupported saved work lifecycle policy')
+        if config.get('code_work_policy') not in (None, 'shared.v1'):
+            raise ValueError('Unsupported saved code work policy')
         if config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES and (
                 config.get('professional_operations') != 'work.v12'
                 or config.get('memory_protocol') != 'journal.v1'):
@@ -1962,6 +1964,8 @@ class ToolApplication:
         if options.get('creation_declarations') is not None and context_protocol not in _CONVERSATION_CONTEXT_PROTOCOLS:
             raise ValueError('Declared inputs require a journal-backed conversation context')
         config, reused, limits, attempts = cls._configuration(root, goal, **options)
+        if config.get('code_task') is not None:
+            config['code_work_policy'] = 'shared.v1'
         config['inspection_protocol'] = 'subjects.v3'
         config['inspection_execution_protocol'] = 'shared.v1'
         config['inspection_coverage_policy'] = 'offered.v2'
@@ -2299,7 +2303,7 @@ class ToolApplication:
                           'inspection_coverage_policy', 'inspection_finding_policy',
                           'delivery_review_protocol', 'publication_assets', 'professional_operations', 'memory_protocol',
                           'context_checkpoint_policy', 'work_method', 'work_selection_policy', 'native_supply_policy', 'context_authority',
-                          'native_history_policy', 'document_context_policy', 'process_artifact_paths', 'work_lifecycle',
+                          'native_history_policy', 'document_context_policy', 'process_artifact_paths', 'work_lifecycle', 'code_work_policy',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
                     if field in old:
@@ -3679,11 +3683,8 @@ class ToolApplication:
                     'max_review_iterations') if key in controls}}
             context['report_delivery'] = BOUND_REPORT_REVISION
         elif report['requirement'] is not None:
-            requirement = report['requirement']
-            context['requested_report'] = {'outline':requirement['outline'],
-                'target_words':requirement['config'].get('longform',{}).get('target_words',0),
-                'max_cited_sources':requirement['config'].get('max_cited_sources',0),
-                'scope':'Preserve any fixed outline and citation ceiling. Length is a preference; use direct operations, current evidence inspection and same-version publication.'}
+            from simple_ar.report.requirements import working_report_requirement
+            context['requested_report'] = working_report_requirement(report['requirement'])
         if self.operations is not None:
             for name in ('report_protocol','work_focus','work_focus_authority','work_inputs'):
                 context.pop(name,None)

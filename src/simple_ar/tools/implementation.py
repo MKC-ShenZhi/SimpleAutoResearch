@@ -570,6 +570,7 @@ class ImplementationToolGateway:
                  research_inputs: Callable[[], dict[str, Any]] | None = None,
                  work_context: Callable[[list[str]], dict] | None = None,
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
+                 code_work_policy: str | None = None,
                  declaration_review: bool = False,
                  professional_requests: bool = False,
                  preparation_only: bool = False,
@@ -595,6 +596,10 @@ class ImplementationToolGateway:
             raise ValueError('Unknown source edit contract')
         if decision_protocol not in (None, 'native.v1'):
             raise ValueError('Unknown source decision protocol')
+        if code_work_policy not in (None, 'shared.v1'):
+            raise ValueError('Unknown code work policy')
+        if code_work_policy == 'shared.v1' and (exact is None or work_context is None):
+            raise ValueError('Shared code work requires an exact contract and its task context')
         if decision_protocol is not None and not preparation_only and source_owner_contract != 'source_owner.v3':
             raise ValueError('Native source decisions require ordinary source preparation')
         if input_contract is not None and not preparation_only and source_owner_contract != 'source_owner.v3':
@@ -614,6 +619,7 @@ class ImplementationToolGateway:
         self.measurement_inputs = measurement_inputs
         self.research_inputs = research_inputs
         self.work_context = work_context
+        self.code_work_policy = code_work_policy
         self.material_observations = material_observations
         self.exact = ExactCodeTask.model_validate(exact) if exact is not None else None
         if measurement_supplier is not None and self.exact is None:
@@ -1183,6 +1189,17 @@ class ImplementationToolGateway:
                 _, project = self._prior_candidate(work.prior_result, identity=identity)
             elif work.prepared_result:
                 _, project = self._prior_preparation(work.prepared_result, identity=identity)
+            working_context = None
+            if self.code_work_policy == 'shared.v1':
+                from simple_ar.tools.materials import freeze_work_context
+                context_path = 'inputs/code_work_context.json'
+                if context.store.exists(context_path):
+                    working_context = context.store.read_json(context_path)
+                else:
+                    targets = [str(project)] if project is not None else []
+                    working_context = freeze_work_context(self.work_context, targets)
+                    context.store.write_json(context_path, working_context, kind='work_context',
+                        schema='work_context.v1', producer='implementation')
             task_text = contract.goal + (
                 '\n\nApproved work within the original scope:\n' + work.instruction if work.instruction else '')
             if binding.get('measurement_inputs'):
@@ -1202,7 +1219,8 @@ class ImplementationToolGateway:
                 if not implementation_resume_allowed(run, ledger=self.ledger, attempt_id=identity):
                     raise ValueError('Interrupted CodeTask has uncommitted or unknown operations; inspect its manifest and original ledger without replay')
             brief = context.store.write_json('inputs/brief.json',
-                {'request_text': task_text, 'objective': task_text, 'hard_constraints': []},
+                {'request_text': task_text, 'objective': task_text, 'hard_constraints': [],
+                 **({'work_context': working_context} if working_context is not None else {})},
                 kind='research_brief')
             domain_context = CapabilityContext(context.store, context.attempt,
                 inputs=(brief, research_ref) if research_ref is not None else (brief,), input_store=context.store)
@@ -1214,6 +1232,7 @@ class ImplementationToolGateway:
                 validation_timeout_sec=contract.timeout_sec,
                 max_repairs=contract.preparation.max_repairs if contract.preparation is not None else 1,
                 protocol=manifest['code_task']['native_protocol'],
+                handoff_policy=self.code_work_policy,
                 **(contract.edit_policy or {}),
                 budget_ledger=self.ledger, session_id=self.session_id, attempt_id=identity))
             payload = context.store.read_json('implementation.json')

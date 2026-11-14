@@ -407,7 +407,8 @@ class OperationTools:
                 decision_protocol=('native.v1' if config.get('professional_operations') in PRODUCTION_OWNER_CONTRACTS
                     else config.get('source_decision_protocol')) if not exact else None,
                 execution_observations=execution_observations if not exact else None,
-                work_context=work_context if not exact else None,
+                work_context=work_context if not exact or config.get('code_work_policy') == 'shared.v1' else None,
+                code_work_policy=config.get('code_work_policy') if exact else None,
                 material_observations=material_observations if not exact else None,
                 measurement=config.get('execution_contract') if exact else None,
                 measurement_supplier=(lambda:self.scientific.execution_contract)
@@ -433,9 +434,15 @@ class OperationTools:
         self.document = None
         if professional and config.get('professional_operations') in PRODUCTION_OWNER_CONTRACTS | {'work.v1', 'work.v2', 'work.v12'} and config['model'] is not None:
             from simple_ar.tools.document_work import DocumentWorkToolGateway, document_work_tool_specs
+            document_context = work_context
+            if config.get('document_context_policy') == 'working.v2' and config.get('report_requirement') is not None:
+                from simple_ar.report.requirements import working_report_requirement
+                def document_context(targets):
+                    context = work_context(targets) if work_context is not None else {}
+                    return {**context, 'requested_report': working_report_requirement(config['report_requirement'])}
             self.document = DocumentWorkToolGateway(root, self.workspace, ledger, session_id,
                 client_factory=lambda identity: client_factory(identity, 'writing'),
-                work_context=work_context, material_observations=material_observations,
+                work_context=document_context, material_observations=material_observations,
                 material_roots=lambda: [str(path) for alias, path in self.workspace.mounts.items()
                     if alias not in {'workspace', 'records'}], sources=self.sources,
                 context_policy=config.get('document_context_policy'))

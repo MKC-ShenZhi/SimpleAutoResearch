@@ -108,7 +108,7 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
                           max_no_progress: int = 3):
     from simple_ar.app.tool_application import ToolApplication
     from simple_ar.tools.sources import SourcePolicy
-    from simple_ar.tools.writing import freeze_report_requirement
+    from simple_ar.report.requirements import freeze_report_requirement
 
     if type(allow_vision) is not bool:
         raise ValueError('allow_vision must be a bool')

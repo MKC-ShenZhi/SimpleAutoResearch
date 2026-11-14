@@ -7576,6 +7576,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.app = ToolApplication.create(self.root,'Report the supplied observations in the fixed outline',
             model='fixture',services=self.services,sources={'measurements':self.inputs},
             report_requirement=requirement,max_attempts=60,tool_contracts='full')
+        self.assertEqual(self.app.operations.document.work_context([])['requested_report']['outline'],
+            requirement['outline'])
+        self.assertEqual(self.app.operations.document.work_context([])['requested_report']['max_cited_sources'], 1)
         self._write('report.md','# Observations\n\n## Unrequested heading\n\n'+_SCOPE+'\n')
         delivery = {'summary':'Supplied observations','artifacts':['report.md']}
         self._reload()

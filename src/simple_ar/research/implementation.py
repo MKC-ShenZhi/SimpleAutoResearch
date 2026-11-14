@@ -31,6 +31,7 @@ class ImplementationRequest:
     protocol: Mapping[str, Any] | None = None
     failure_ref: ArtifactRef | None = None
     revision_instruction: str = ""
+    handoff_policy: str | None = None
     validation_command: tuple[str, ...] | None = None
     validation_timeout_sec: int | None = None
     max_repairs: int = 0
@@ -291,7 +292,8 @@ def _prepare_research_task(
         for ref in context.inputs
     )
     consumed = {
-        "task_kind": "research" if design is not None else "reproduction" if reproduction else "bug_fix",
+        "task_kind": ("code_work" if request.handoff_policy == "shared.v1" else
+            "research" if design is not None else "reproduction" if reproduction else "bug_fix"),
         "brief": None if brief_ref is None else context.read_input_json(brief_ref),
         "design": None if design is None else design.to_handoff_dict(),
         "protocol": request.protocol,
@@ -319,7 +321,18 @@ def _prepare_research_task(
             raise ValueError("CodeTask already has a plan without this research handoff; use a fresh initialized run.")
         original = task_path.read_text(encoding="utf-8")
         write_json(snapshot, {"consumed": consumed, "original_task": original})
-    if design is not None:
+    if request.handoff_policy == "shared.v1":
+        task = (
+            "# Scoped code work\n\n"
+            "Implement the actual requested change in the isolated workspace, using the approved "
+            "edit scope and validator. The surrounding task owns any formal measurement and "
+            "overall delivery. The work context below contains original requests and related "
+            "feedback, not additional permission or proof; inspect the actual project and evidence.\n\n"
+            + original + "\n"
+        )
+        if request.revision_instruction.strip():
+            task += "\n## Revision instruction\n\n" + request.revision_instruction.strip() + "\n"
+    elif design is not None:
         task = (
             "# Implementation-only CodeTask\n\n"
             "This action only proposes and validates the selected code change in the "
@@ -419,7 +432,13 @@ def _prepare_research_task(
         task += "Execution boundary and observed baseline are supplied facts, not model-selected targets.\n"
         task += "Baseline values below are observations, not target values to hardcode.\n"
     task += "Implement and validate only; the research application owns benchmark execution.\n\n"
-    task += "```json\n" + json.dumps(consumed, ensure_ascii=False, separators=(",", ":")) + "\n```\n"
+    presented = consumed
+    if request.handoff_policy == "shared.v1":
+        presented = {key: value for key, value in consumed.items() if key != "brief"}
+        brief = consumed.get("brief")
+        if isinstance(brief, Mapping) and "work_context" in brief:
+            presented["work_context"] = brief["work_context"]
+    task += "```json\n" + json.dumps(presented, ensure_ascii=False, separators=(",", ":")) + "\n```\n"
     write_text(task_path, task)
     task_ref = context.store.write_text("inputs/research_code_task.md", task, kind="task_input",
                                         schema="markdown.v1", producer="research.implementation")

@@ -636,6 +636,12 @@ class ResearchIntakeTests(unittest.TestCase):
                         protected_patterns=defaults['protected_patterns']), path)
             self.assertEqual(exact['project_path'], 'source0')
             self.assertEqual(exact['validation_command'], ['python', 'check.py'])
+            self.assertEqual(saved['code_work_policy'], 'shared.v1')
+            self.assertEqual(app.operations.implementation.work_context([str(project)])['user_requests'],
+                app.state['requests'])
+            restored = ToolApplication.load(base / 'task', services=services)
+            self.assertEqual(restored.operations.implementation.work_context([str(project)])['user_requests'],
+                app.state['requests'])
             self.assertEqual(saved['execution_contract']['conditions'][0]['source'], 'implementation')
             self.assertEqual(saved['execution_contract']['conditions'][0]['execution']['command'][1], 'measure.py')
             self.assertIs(app.services, services)

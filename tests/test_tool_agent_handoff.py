@@ -14196,6 +14196,53 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'must not replace an original'):
             owner.approval_binding({}, identity='new-authority')
 
+    def test_exact_code_work_receives_shared_feedback_and_retains_it_on_resume(self) -> None:
+        from simple_ar.tools.implementation import ImplementationToolGateway
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        from simple_ar.code_task.runtime.state import code_task_paths
+        from simple_ar.research.implementation import _prepare_research_task
+
+        project = self.run_dir / 'scientific-project'
+        project.mkdir()
+        (project / 'model.py').write_text('VALUE = 1\n', encoding='utf-8')
+        (project / 'check.py').write_text('assert True\n', encoding='utf-8')
+        (self.run_dir / 'attempts').mkdir(exist_ok=True)
+        workspace = WorkspaceToolGateway(self.run_dir,
+            {'source0': project, 'records': self.run_dir / 'attempts'}, self.ledger)
+        contract = {'project_path': 'source0', 'goal': 'Extend the scientific model',
+            'allowed_patterns': ['model.py'], 'protected_patterns': [],
+            'validation_command': ['python', 'check.py'], 'timeout_sec': 20}
+        supplied = {'user_requests': ['Extend the model.', 'Preserve the previous result.'],
+            'review_observations': [{'record': 'records/review/result.json',
+                'result': {'summary': 'The current result needs a clearer boundary.'}}]}
+        provider = Mock(return_value=supplied)
+        owner = ImplementationToolGateway(self.run_dir, workspace, self.ledger, 'test-model', 'unit',
+            exact=contract, code_work_policy='shared.v1', work_context=provider)
+        store = ArtifactStore(self.run_dir / 'attempts' / 'native-code')
+        attempt = AttemptManifest('native-code', capability='native_tool')
+        context = CapabilityContext(store, attempt)
+        approval = {'token': 'approved', 'binding': owner.approval_binding({}, identity=attempt.attempt_id)}
+        original = (project / 'model.py').read_bytes()
+
+        def interrupted(*, context, request):
+            brief = context.read_input_json(context.inputs[0])
+            self.assertEqual(brief['work_context']['work_context'], supplied)
+            self.assertEqual(request.handoff_policy, 'shared.v1')
+            task_ref, _ = _prepare_research_task(context, request, code_task_paths(request.run_dir).task_dir)
+            task = context.store.read_text(task_ref.path)
+            self.assertIn('Extend the scientific model', task)
+            self.assertIn('Preserve the previous result', task)
+            self.assertIn('The current result needs a clearer boundary', task)
+            self.assertNotIn('Bug-fix CodeTask', task)
+            raise RuntimeError('stopped before model dispatch')
+
+        with patch('simple_ar.research.implementation.run_implementation_capability', side_effect=interrupted):
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, 'stopped before model dispatch'):
+                    owner.execute(context, {}, approval=approval)
+        provider.assert_called_once_with([str(project.resolve())])
+        self.assertEqual((project / 'model.py').read_bytes(), original)
+
     def test_exact_code_task_keeps_core_attempt_approval_and_domain_recovery(self) -> None:
         from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext

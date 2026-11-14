@@ -5,11 +5,75 @@ existing writing/publication validators. New operation tasks do not acquire
 these historical composition requirements.
 """
 from __future__ import annotations
+import json
 from typing import Any, Callable, Iterable
-from simple_ar.tools.writing import ProfessionalReview
+from simple_ar.report.requirements import freeze_report_requirement, validate_report_requirement
+from simple_ar.tools.specs import ToolResult
 
 _REPORT_PROTOCOL = 'canonical_report.v1'
 _DECLARED_INPUTS = 'declared_inputs.v1'
+
+
+def material_report_binding(workspace: Any, requirement: dict[str, Any], *,
+                            mounts: Iterable[str] = (),
+                            observations: Iterable[dict[str, Any] | ToolResult] = (),
+                            requests: Iterable[str] = ()) -> dict[str, Any]:
+    """Bind authorized material provenance, not a second fact projection.
+
+    The caller supplies accepted successful tool results, mounted material
+    locators and actual user requests. Selection/interpretation belongs to the
+    existing source and material report owners. Rebuild for delivery/feedback;
+    changed bytes, observations or requests invalidate a canonical receipt.
+    """
+    requirement = validate_report_requirement(requirement)
+    mount_paths = list(dict.fromkeys(mounts))
+    inventories, hashes, material_paths = [], {}, []
+    selection_paths = list(mount_paths)
+    for locator in mount_paths:
+        path = workspace.resolve(locator)
+        if path.is_dir():
+            inventory = workspace.bind_inventory(path, identity='material-report-binding', material_candidates=True)
+            inventories.append({'path': locator, 'inventory': inventory})
+            material_paths.extend(workspace.locator(file) for file in inventory['candidate_files'])
+        else:
+            hashes.update(workspace.artifact_hashes([locator]))
+            material_paths.append(locator)
+    accepted = []
+    for observation in observations:
+        row = observation.model_dump(mode='json') if isinstance(observation, ToolResult) else observation
+        if not isinstance(row, dict) or row.get('status', 'ok') != 'ok' or not row.get('tool_name'):
+            raise ValueError('Material report observations must be accepted successful tool results')
+        current = workspace.artifact_hashes(row.get('artifacts', []))
+        recorded = (row.get('data') or {}).get('artifact_sha256')
+        if recorded is not None and recorded != current:
+            raise ValueError('Material report observation artifacts changed')
+        hashes.update(current)
+        material_paths.extend(current)
+        data = row.get('data') or {}
+        record = data.get('document_record')
+        if record:
+            # Source receipts commonly expose the bundle as data rather than
+            # an artifact list. Preserve its actual identity and current bytes.
+            hashes.update(workspace.artifact_hashes([record]))
+            material_paths.append(record)
+            selection_paths.append(record)
+        elif row['tool_name'] == 'analyze_table' and data.get('report') in current:
+            # The existing portable package owns source/results/figure roles.
+            # Select within that package, not anonymous JSON interpretation.
+            selection_paths.append(str(workspace.resolve(data['report']).parent))
+        else:
+            selection_paths.extend(current)
+        accepted.append(row)
+    feedback = list(requests)
+    if any(not isinstance(row, str) or not row.strip() for row in feedback):
+        raise ValueError('Material report feedback must contain actual nonempty user requests')
+    # JSON roundtrip detaches nested mutable caller state and rejects non-JSON
+    # observations; these exact bytes also participate in normal replay checks.
+    return json.loads(json.dumps({'evidence_contract': 'materials.v1', 'requirement': requirement,
+        'mount_paths': mount_paths, 'material_paths': list(dict.fromkeys(material_paths)),
+        'selection_paths': list(dict.fromkeys(selection_paths)),
+        'mounts': inventories, 'evidence_sha256': hashes, 'observations': accepted,
+        'requests': feedback}, ensure_ascii=False, allow_nan=False))
 
 def project_report(config: dict, observations: Iterable[dict]) -> dict[str, Any]:
     """Effective obligation from frozen configuration and accepted plan receipts."""
@@ -71,6 +135,7 @@ def declare_report(intent: Any, *, config: dict, requests: list[str], previous: 
         # Ordinary complete work includes one bounded correction, not an
         # inspection-only default that makes users configure the editor.
         # Explicit/frozen controls and all existing obligations prevail.
+        from simple_ar.tools.writing import ProfessionalReview
         requested_review = ProfessionalReview(max_revision_rounds=1)
     if requested_review is not None:
         if data['kind'] != 'report':
@@ -83,7 +148,6 @@ def declare_report(intent: Any, *, config: dict, requests: list[str], previous: 
     if not requirement and data['kind'] == 'conversion':
         requirement = previous['requirement']
     if not requirement and data['kind'] == 'report':
-        from simple_ar.tools.writing import freeze_report_requirement
         requirement = (previous['requirement'] if old and not intent.replace else None) or freeze_report_requirement(
             {'reviewer': 'llm' if requested_review is not None else 'disabled',
              'document_review': requested_review is not None,
@@ -158,7 +222,6 @@ def bind_report_inputs(*, config: dict, report: dict, workspace: Any, requests: 
     if report['requirement'] is None:
         return None
     if report['evidence_contract'] == 'materials.v1':
-        from simple_ar.tools.writing import material_report_binding
         observations = material_observations()
         mounts = config['sources']
         table = config.get('table_analysis')

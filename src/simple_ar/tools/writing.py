@@ -8,11 +8,13 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import Any, Callable, Iterable, Literal
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
 from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+from simple_ar.report.requirements import freeze_report_requirement, validate_report_requirement
+from simple_ar.report.legacy_contract import material_report_binding
 from simple_ar.tools.specs import CommonToolSpec, ToolResult, tool_result_payload
 from simple_ar.tools.workspace import DeliveryRequest, FileWindow
 from simple_ar.tools.sources import SourceToolGateway
@@ -33,101 +35,6 @@ _DOCUMENT_WORK_CONTRACT = 'document_work.v2'
 _DOCUMENT_WORK_CONTRACTS = {'document_work.v1', 'document_work.v2'}
 _DELIVERY_SUBJECT_CONTRACT = 'declared_delivery_subjects.v1'
 _FIGURE_SELECTION_CONTRACT = 'compose_figure.v1'
-
-
-def freeze_report_requirement(settings: dict[str, Any], *, method: str | None = None) -> dict[str, Any]:
-    """Freeze resolved report demands and template bytes at task creation."""
-    from simple_ar.report.writing import resolve_report_writing_config
-    from simple_ar.report.schema import ReportRuntimeConfig, ReportContext
-    from simple_ar.report.templates import load_report_template_bundle, is_builtin_template
-    from simple_ar.report.memory import initialize_report_memory
-    if method is None:
-        method, settings = resolve_report_writing_config(settings)
-    config = ReportRuntimeConfig.model_validate(settings)
-    template = load_report_template_bundle(report_mode='supplied_materials', config=config)
-    fixed = config.outline_strategy == 'template' or not is_builtin_template(template, config)
-    memory = initialize_report_memory(context=ReportContext(topic='Implementation report',
-        report_mode='supplied_materials'), template=template)
-    return validate_report_requirement({'method': method, 'config': config.model_dump(mode='json'),
-        'template': template.model_dump(mode='json'),
-        'outline': [{'heading': row.heading, 'required': row.required}
-            for row in sorted(memory.section_plan, key=lambda row: row.final_order)] if fixed else []})
-
-
-def validate_report_requirement(value: dict[str, Any]) -> dict[str, Any]:
-    from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
-    from simple_ar.report.writing import validate_report_writing_config
-    if set(value) != {'method', 'config', 'template', 'outline'}:
-        raise ValueError('Unknown frozen report requirement')
-    config = ReportRuntimeConfig.model_validate(value['config'])
-    validate_report_writing_config(config, method=value['method'])
-    ReportTemplateBundle.model_validate(value['template'])
-    if any(set(row) != {'heading', 'required'} or type(row['required']) is not bool
-           or not isinstance(row['heading'], str) or not row['heading'].strip() for row in value['outline']):
-        raise ValueError('Invalid frozen report outline')
-    return value
-
-
-def material_report_binding(workspace: Any, requirement: dict[str, Any], *,
-                            mounts: Iterable[str] = (),
-                            observations: Iterable[dict[str, Any] | ToolResult] = (),
-                            requests: Iterable[str] = ()) -> dict[str, Any]:
-    """Bind authorized material provenance, not a second fact projection.
-
-    The caller supplies accepted successful tool results, mounted material
-    locators and actual user requests. Selection/interpretation belongs to the
-    existing source and material report owners. Rebuild for delivery/feedback;
-    changed bytes, observations or requests invalidate a canonical receipt.
-    """
-    requirement = validate_report_requirement(requirement)
-    mount_paths = list(dict.fromkeys(mounts))
-    inventories, hashes, material_paths = [], {}, []
-    selection_paths = list(mount_paths)
-    for locator in mount_paths:
-        path = workspace.resolve(locator)
-        if path.is_dir():
-            inventory = workspace.bind_inventory(path, identity='material-report-binding', material_candidates=True)
-            inventories.append({'path': locator, 'inventory': inventory})
-            material_paths.extend(workspace.locator(file) for file in inventory['candidate_files'])
-        else:
-            hashes.update(workspace.artifact_hashes([locator]))
-            material_paths.append(locator)
-    accepted = []
-    for observation in observations:
-        row = observation.model_dump(mode='json') if isinstance(observation, ToolResult) else observation
-        if not isinstance(row, dict) or row.get('status', 'ok') != 'ok' or not row.get('tool_name'):
-            raise ValueError('Material report observations must be accepted successful tool results')
-        current = workspace.artifact_hashes(row.get('artifacts', []))
-        recorded = (row.get('data') or {}).get('artifact_sha256')
-        if recorded is not None and recorded != current:
-            raise ValueError('Material report observation artifacts changed')
-        hashes.update(current)
-        material_paths.extend(current)
-        data = row.get('data') or {}
-        record = data.get('document_record')
-        if record:
-            # Source receipts commonly expose the bundle as data rather than
-            # an artifact list. Preserve its actual identity and current bytes.
-            hashes.update(workspace.artifact_hashes([record]))
-            material_paths.append(record)
-            selection_paths.append(record)
-        elif row['tool_name'] == 'analyze_table' and data.get('report') in current:
-            # The existing portable package owns source/results/figure roles.
-            # Select within that package, not anonymous JSON interpretation.
-            selection_paths.append(str(workspace.resolve(data['report']).parent))
-        else:
-            selection_paths.extend(current)
-        accepted.append(row)
-    feedback = list(requests)
-    if any(not isinstance(row, str) or not row.strip() for row in feedback):
-        raise ValueError('Material report feedback must contain actual nonempty user requests')
-    # JSON roundtrip detaches nested mutable caller state and rejects non-JSON
-    # observations; these exact bytes also participate in normal replay checks.
-    return json.loads(json.dumps({'evidence_contract': 'materials.v1', 'requirement': requirement,
-        'mount_paths': mount_paths, 'material_paths': list(dict.fromkeys(material_paths)),
-        'selection_paths': list(dict.fromkeys(selection_paths)),
-        'mounts': inventories, 'evidence_sha256': hashes, 'observations': accepted,
-        'requests': feedback}, ensure_ascii=False, allow_nan=False))
 
 
 class SelectedSource(BaseModel):
