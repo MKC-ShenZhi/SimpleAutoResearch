@@ -1181,7 +1181,7 @@ class RetainedWorkingContextTests(unittest.TestCase):
                 'record': f'records/{i}/result.json', 'status': 'ok'}} for i in range(200)]
         estimate = Mock(side_effect=len)
         options = dict(user_requests=['Use the recorded research'], material_policy='working',
-            require_work_notes=True, fit_work_notes=True, processed_turns=[],
+            require_work_notes=True, fit_work_notes=True, processed_turns=[], sparse_handoffs=True,
             working_set_policy='recent.v5', operation_history=operations,
             context_token_target=150000, estimate_tokens=estimate)
         messages, budget = select(**options)

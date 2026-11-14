@@ -125,6 +125,9 @@ class WorkLifecycleTests(unittest.TestCase):
         item = next(item for turn in reversed(app.state['turns']) for item in turn['tools']
                     if item.get('review_result'))
         review = 'records/' + item['review_result'].removeprefix('attempts/')
+        # The saved v5 contract presents completed review windows; v6 leaves a
+        # clean completed opinion navigable without resending its original text.
+        app.state['config']['working_set_policy'] = 'recent.v5'
         with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select:
             app._messages(client=app._client())
         rows = [row for row in select.call_args.kwargs['observations']
