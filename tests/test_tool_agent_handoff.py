@@ -13458,7 +13458,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.code_task.runtime.state import code_task_paths, implementation_file_hashes, load_code_task_manifest
         from simple_ar.code_task.execution.runner import run_code_task_benchmark
         import shlex
-        for mode in ('current', 'venv', 'same_argv'):
+        for mode in ('current', 'venv', 'same_argv', 'shared_limited'):
             with self.subTest(environment=mode):
                 # The mode name is not the input's location: a parent literally
                 # named ``venv`` is excluded by the shared private-path policy.
@@ -13487,7 +13487,10 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                 conditions = {'conditions': [{'id': role, 'role': role, 'seed': None, 'source': source,
                     **({'before_implementation': True} if role == 'baseline' and mode != 'venv' else {}),
                     'execution': formal} for role, source in (('baseline', 'preparation'), ('candidate', 'implementation'))]}
-                owner = ImplementationToolGateway(root, workspace, ledger, 'test-model', 'unit', exact=contract, measurement=conditions)
+                shared = ({'code_work_policy': 'shared.v2', 'work_context': lambda _: {'user_requests': [contract['goal']]}}
+                    if mode == 'shared_limited' else {})
+                owner = ImplementationToolGateway(root, workspace, ledger, 'test-model', 'unit', exact=contract,
+                    measurement=conditions, **shared)
                 science = ScientificToolGateway(root, workspace, ledger, 'unit', implementation=owner, execution_contract=conditions)
                 measured_locators = []
                 owner.measurement_inputs = lambda origin, required: science.implementation_inputs(
@@ -13579,6 +13582,11 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                 # Model/code generation is substituted; preparation, actual
                 # validators, measurement, lineage and original accounting are not.
                 approval = {'token': 'prepare', 'binding': owner.approval_binding({}, identity='prepared')}
+                if mode == 'shared_limited':
+                    plan = next(iter(approval['binding']['environment_preparations'].values()))['environment_preparation']
+                    # Exactly enough for this setup, but not its later validator
+                    # or the two independent formal measurements.
+                    ledger.limits['process_invocations'] = len(plan['steps'])
                 with patch.object(owner, '_client') as model:
                     controller.execute_attempt('native_tool', attempt_id='prepared', tool_name='prepare_code_task',
                         arguments={}, approval=approval)
@@ -13607,6 +13615,16 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                 arguments = {**formal, 'cwd': prepared['cwd'], 'condition_id': 'baseline',
                     'preparation_ref': 'records/prepared/execution.json'}
                 baseline_approval = {'token': 'baseline', 'binding': science.approval_binding(arguments, identity='baseline')}
+                if mode == 'shared_limited':
+                    self.assertEqual(ledger.remaining('process_invocations'), 0)
+                    before = ledger.to_dict()
+                    with self.assertRaisesRegex(ValueError, 'Insufficient or unknown shared process_invocations budget'):
+                        science.execute_tool('measure_experiment', CapabilityContext(
+                            ArtifactStore(root / 'attempts/baseline'), AttemptManifest('baseline')),
+                            arguments, approval=baseline_approval)
+                    self.assertEqual(ledger.to_dict(), before)
+                    self.assertFalse((root / 'attempts/baseline/scientific_request.json').exists())
+                    ledger.limits['process_invocations'] = 12
                 controller.execute_attempt('native_tool', attempt_id='baseline', tool_name='measure_experiment',
                     arguments=arguments, approval=baseline_approval)
                 self.assertEqual(read_json(root / 'attempts/baseline/results.json')['metrics']['score'], 1)

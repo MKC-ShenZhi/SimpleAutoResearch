@@ -1266,15 +1266,23 @@ class ImplementationToolGateway:
         if contract.environment is not None:
             plan = next(iter(binding['environment_preparations'].values()))['environment_preparation'] if binding.get('environment_preparations') else None
             steps = len(plan['steps']) if plan else 0
-            from simple_ar.tools.scientific import measurement_conditions
-            conditions = measurement_conditions(self.measurement) if self.measurement is not None else []
-            inputs = (self.measurement_inputs(self._preparation_origin(approval, identity=identity), False)
-                if conditions and self.measurement_inputs and (work.prior_result or work.prepared_result) else {})
-            completed = {row['condition_id'] for row in inputs.get('observations', [])}
-            conditions = [row for row in conditions if row['id'] not in completed and not row.get('reuse_ref')]
-            for key, required in (('process_invocations', steps + 1 + len(conditions)),
+            conditions = []
+            validation = 0 if self.code_work_policy == 'shared.v2' and for_preparation else 1
+            if self.code_work_policy != 'shared.v2':
+                # Preserve the budget contract of already-running legacy tasks.
+                from simple_ar.tools.scientific import measurement_conditions
+                conditions = measurement_conditions(self.measurement) if self.measurement is not None else []
+                inputs = (self.measurement_inputs(self._preparation_origin(approval, identity=identity), False)
+                    if conditions and self.measurement_inputs and (work.prior_result or work.prepared_result) else {})
+                completed = {row['condition_id'] for row in inputs.get('observations', [])}
+                conditions = [row for row in conditions if row['id'] not in completed and not row.get('reuse_ref')]
+            # Formal measurements are separate operations, admitted by their
+            # own executor against the same ledger when actually requested.
+            for key, required in (('process_invocations', steps + validation + len(conditions)),
                     ('process_wall_seconds', (steps * plan['profile']['timeout_sec'] if plan else 0)
-                        + contract.timeout_sec + sum(row['execution']['timeout_sec'] for row in conditions))):
+                        + validation * contract.timeout_sec + sum(row['execution']['timeout_sec'] for row in conditions))):
+                if not required:
+                    continue
                 remaining = self.ledger.remaining(key)
                 if remaining is None or remaining < required:
                     raise ValueError('Implementation preparation and validator require their complete finite process budget before setup')
