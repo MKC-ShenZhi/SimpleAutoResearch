@@ -60,8 +60,7 @@ def create_structured_research_task(brief: ResearchBrief, *, root: str | Path,
     if values.get('execution') is None:
         defaults = dict(research_use_fulltext=False, research_allow_pdf_download=False,
             research_keep_raw_pdf=False, research_max_pdf_mb=20, research_max_pdf_pages=100,
-            research_read_max_shortlist=max_results, research_max_iterations=0,
-            research_max_fulltext_documents=min(values.get('research_max_documents', max_results), max_results))
+            research_read_max_shortlist=max_results, research_max_iterations=0)
         values = {**defaults, **values}
         values['research_execution_boundary'] = {'timeout_sec': timeout_sec if timeout_sec is not None else 300}
         attempts = max(30, _creation_model_limits(limits, model_enabled=model_enabled)['llm_requests'] * 10)

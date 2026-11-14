@@ -127,6 +127,8 @@ class ResearchIntakeTests(unittest.TestCase):
                 services=SimpleNamespace(llm_client=_JSONClient()))
             self.assertEqual(collection.ledger.remaining('llm_requests'), 30)
             self.assertEqual(collection.session.manifest.budget.max_attempts, 300)
+            policy = collection.state['config']['research_policy']
+            self.assertEqual((policy['max_fulltext_documents'], policy['max_fulltext_fetch_attempts']), (10, 20))
 
     def test_direct_creation_keeps_runtime_bindings_and_legacy_creation_equivalent(self):
         from types import SimpleNamespace
