@@ -52,6 +52,7 @@ class WorkLifecycleTests(unittest.TestCase):
         app.state['turns'] = [{'origin': 'model'}]
         app._completion_floor = Mock(return_value={'llm_requests': 1, 'total_tokens': 1450})
         self.assertEqual(app._review_floor(client, candidate=True), {})
+        self.assertEqual(app._review_floor(client, candidate=False), {})
         app.ledger.limits['total_tokens'] = 2000
         self.assertEqual(app._review_floor(client, candidate=True),
             {'llm_requests': 1, 'total_tokens': 1450})
