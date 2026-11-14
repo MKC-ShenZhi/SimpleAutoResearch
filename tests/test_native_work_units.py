@@ -553,6 +553,23 @@ class NativeWorkQueueTests(unittest.TestCase):
             ['Independent review remains unfinished.'])
         self.assertFalse(c.inspection_requests)
 
+    def test_last_decision_retains_each_offered_read_without_claiming_delivery(self):
+        c = self.case
+        c.root = c.directory / 'final-reads'
+        c.app = ToolApplication.create(c.root, 'Inspect the two existing notes.',
+            model='fixture', sources={}, services=c.services, max_turns=1,
+            max_tokens=200000, max_attempts=20, tool_contracts='full')
+        c._write('one.txt', 'First observation.\n')
+        c._write('two.txt', 'Second observation.\n')
+        c.decisions.append([fixture._action('read_file', path='one.txt'),
+                            fixture._action('read_file', path='two.txt')])
+        self.drain()
+        turn = next(row for row in c.app.state['turns'] if row.get('origin') != 'caller')
+        self.assertEqual(len(turn['tools']), 2)
+        results = [c.app.session.store.read_json(row['result']) for row in turn['tools']]
+        self.assertEqual([row['status'] for row in results], ['ok', 'ok'])
+        self.assertFalse(c.app.session.store.exists('delivery.json'))
+
     def test_saved_native_contract_keeps_publication_as_a_service(self):
         c = self.case
         c.app.state['config']['work_selection_policy'] = 'native.v4'

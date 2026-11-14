@@ -2823,7 +2823,7 @@ class ToolApplication:
         return exits[-1] and sum(exits) == 1
 
     def _last_available_action(self) -> bool:
-        """A final decision can leave one actual operation for later continuation."""
+        """A final decision may leave offered work for later continuation."""
         if not self.state['turns']:
             return False
         turn = self.state['turns'][-1]
@@ -2831,8 +2831,10 @@ class ToolApplication:
         if (not self.session.store.exists(path)
                 or self.session.store.read_json(path).get('closing_action_contract') != 'single_action.v2'):
             return False
-        calls = self.session.store.read_json(turn['reply']).get('tool_calls') or []
-        return len(calls) == len(turn.get('remaining', [])) == 1
+        # Each proposed operation still passes the normal offered-tool,
+        # permission and resource checks. Do not discard an otherwise usable
+        # batch merely because the model returned more than one action.
+        return bool(turn.get('remaining'))
 
     def _owner_finishes_request(self, call: dict[str, Any]) -> bool:
         """A bounded owner may finish without a later coordinator decision.
