@@ -5,6 +5,12 @@
 User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-11-15
+
+### Fixed
+
+- A selected independent review can use remaining capacity when reserving a later decision would prevent it from starting. Its result remains available if continuation needs more capacity.
+
 ## 2026-11-14
 
 ### Improved

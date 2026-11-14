@@ -2814,7 +2814,16 @@ class ToolApplication:
         if (not candidate and self.state['turns'] and self._terminal_batch()
                 and self.state['turns'][-1].get('origin') == 'caller'):
             return {}
-        return self._completion_floor(client, dispatch=True)
+        floor = self._completion_floor(client, dispatch=True)
+        remaining = self.ledger.remaining('total_tokens')
+        output = client.effective_output_limit() or 0
+        if (self.state['turns'] and (candidate or self._terminal_batch())
+                and remaining is not None and remaining - floor.get('total_tokens', 0) < output):
+            # A selected review cannot issue even an empty-input request after
+            # this speculative exit. Let it use the actual allowance; retain
+            # its opinion and pause if another decision is unaffordable.
+            return {}
+        return floor
 
     def _terminal_batch(self) -> bool:
         """A fitting task exit or professional return needs no later decision."""
