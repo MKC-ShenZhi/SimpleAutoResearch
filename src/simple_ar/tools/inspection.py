@@ -4800,6 +4800,11 @@ class InspectionToolGateway:
             if row.get('readable') and row.get('sha256') and row.get('windows')
             and (subjects is None or row['subject'] in subjects)]
         nested = issubclass(response_model, _ClaimDeliveryResponse)
+        if nested:
+            schema['properties']['investigations']['description'] = (
+                'Place every required or advisory finding in the findings list of the investigation '
+                'that establishes it. Use an empty list when that investigation found no defect. '
+                'There is no separate top-level findings field; the owner collects these opinions.')
 
         def choices(field: dict, values: list) -> None:
             field['uniqueItems'] = True

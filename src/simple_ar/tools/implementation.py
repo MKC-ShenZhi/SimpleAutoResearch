@@ -735,12 +735,12 @@ class ImplementationToolGateway:
                     raise ValueError('Workspace policy omits a declared validator file; correct it before approval')
                 validators[relative] = self.workspace.artifact_hashes([str(candidate)])[str(candidate)]
                 protected.append(relative)
-        from simple_ar.code_task.execution.runner import _safe_env
+        from simple_ar.code_task.execution.environment import code_task_process_environment
         binding = {'contract': self.exact.model_dump(),
             'source': {'project_path': str(project) if project else '', 'file_hashes': source},
             'validator_files': validators, 'protected_patterns': sorted(set(protected)),
             'python_executable': python,
-            'environment': _safe_env(cwd)}
+            'environment': code_task_process_environment(cwd)}
         if self.measurement is not None:
             binding['measurement_contract'] = self.measurement
         if work.instruction or work.prior_result or work.prepared_result:
@@ -766,7 +766,7 @@ class ImplementationToolGateway:
                 relative = (snapshot['git']['project_relative_path']
                     if mode == 'git_worktree' else '.')
                 actual = cwd / relative
-                binding['process_environments'][mode] = {'cwd': str(actual), 'environment': _safe_env(actual)}
+                binding['process_environments'][mode] = {'cwd': str(actual), 'environment': code_task_process_environment(actual)}
             binding.pop('environment')  # The selected mode owns its actual project PYTHONPATH.
             if external_inputs:
                 binding['external_inputs'] = external_inputs
@@ -818,9 +818,8 @@ class ImplementationToolGateway:
             and binding.get('execution_scope') == 'workspace.v1')
 
     def _environment_plan(self, cwd: Path, origin: Path, identity: str, python: str) -> dict[str, Any]:
-        from simple_ar.code_task.execution.environment import project_command
+        from simple_ar.code_task.execution.environment import project_command, code_task_process_environment
         from simple_ar.research.project_environment import project_environment_plan, environment_preparation_identity, project_environment_process_env
-        from simple_ar.code_task.execution.runner import _safe_env
         formal = self._formal_execution()
         command = project_command(formal['command'], origin, cwd,
             python_executable=python if self.exact.environment['mode'] == 'current' else None)
@@ -830,7 +829,7 @@ class ImplementationToolGateway:
                 python_executable=python if profile['mode'] == 'current' else None)
         plan = project_environment_plan(profile, cwd, self.root / 'attempts' / identity / 'environment',
             command, input_project=origin)
-        environment = project_environment_process_env(profile, _safe_env(cwd))
+        environment = project_environment_process_env(profile, code_task_process_environment(cwd))
         protocol = formal.get('protocol')
         if protocol is not None:
             protocol = {**protocol, 'protected_assets': [{**row,

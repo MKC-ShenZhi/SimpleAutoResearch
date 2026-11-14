@@ -912,17 +912,38 @@ def select_working_context(
     def admit_navigation() -> None:
         cited = explicit_references | {record for note in view['notes'] if active(note)
                                        for record in note.get('records', ())} if focused_working_set else set()
-        for i in sorted(range(len(operations)), key=operation_priority, reverse=True):
-            if retained_records and operations[i].get('turn') in recent:
-                continue  # Its native block is already present in the input.
-            if focused_working_set and operations[i].get('request_count', 1) < len(user_requests):
-                if operations[i]['observation'].get('record') not in cited:
-                    continue  # The original work is available through read_history.
-            operation_indices.append(i)
-            if project()[1] > context_token_target:
-                operation_indices.pop()  # Never excerpt a serialized operation.
-            else:
-                admissions.append(('navigation', i))
+        ordered = [i for i in sorted(range(len(operations)), key=operation_priority, reverse=True)
+            if not (retained_records and operations[i].get('turn') in recent)
+            and not (focused_working_set and operations[i].get('request_count', 1) < len(user_requests)
+                     and operations[i]['observation'].get('record') not in cited)]
+
+        def admit_batch(indices: list[int]) -> None:
+            if not indices:
+                return
+            operation_indices.extend(indices)
+            if project()[1] <= context_token_target:
+                admissions.extend(('navigation', i) for i in indices)
+                return
+            del operation_indices[-len(indices):]
+            if len(indices) > 1:
+                middle = len(indices) // 2
+                admit_batch(indices[:middle])
+                admit_batch(indices[middle:])
+
+        if focused_working_set:
+            # Navigation is optional, whole-record material. Measure a group
+            # once when it fits; divide only groups that do not. The final
+            # projection is still measured and the journal remains readable.
+            admit_batch(ordered)
+        else:
+            # Retained historical presentation keeps its original ordering
+            # and individual admission decisions.
+            for i in ordered:
+                operation_indices.append(i)
+                if project()[1] > context_token_target:
+                    operation_indices.pop()
+                else:
+                    admissions.append(('navigation', i))
 
     if not scoped_records and not retained_records:
         admit_navigation()

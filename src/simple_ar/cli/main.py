@@ -1149,11 +1149,61 @@ def _print_report_writing_plan(method: str, settings: dict) -> None:
     print_line(f"Report writing: {method}; {plan}")
 
 
+def _print_common_research_report(args: argparse.Namespace) -> None:
+    """Continue the saved shared task using its existing Writer and budget."""
+    from simple_ar.app.tool_application import ToolApplication
+    from simple_ar.cli.research_config import report_settings
+    from simple_ar.report.requirements import freeze_report_requirement
+
+    root = Path(args.session_root)
+    try:
+        app = ToolApplication.load(root)
+        if args.model != app.state['config'].get('model'):
+            raise ValueError('The common session retains its saved model; research-report cannot switch it.')
+        if app.state['config'].get('control_protocol') != 'operations.v1':
+            raise ValueError('This saved task uses an earlier work contract; continue it through its saved task entry.')
+        saved = app.state['config'].get('report_requirement')
+        explicit = getattr(args, '_explicit_resume_destinations', set())
+        if saved is None:
+            requirement = freeze_report_requirement(report_settings(args), method='sections')
+        else:
+            settings = {**saved['config'], **report_settings(args, explicit_destinations=explicit)}
+            if settings == saved['config']:
+                requirement = saved
+            else:
+                template = saved['template'] if settings.get('template') == saved['config'].get('template') else None
+                requirement = freeze_report_requirement(settings, method=saved['method'], template=template)
+        delivery = (app.session.store.read_json('delivery.json')
+                    if app.session.store.exists('delivery.json') else {})
+        report = delivery.get('report') or {}
+        delivered = bool(report.get('manuscript') and report.get('status') in {'candidate', 'canonical'}
+                         and not delivery.get('unresolved'))
+        status = app.session.manifest.status
+        request_report = (saved != requirement or args.refresh
+            or status in {'completed', 'partial'} and not delivered)
+        if request_report:
+            if app.state['pending'] is not None:
+                raise ValueError('Finish or reconcile the pending task operation before changing its report request.')
+            reason = ('Generate a report from the retained research and results. Reuse existing work; '
+                'do not rerun the experiments merely to prepare the report.')
+            app.supply(supply_id=f"research-report-{len(app.state['requests']) + 1}", reason=reason,
+                changes={'report_requirement': requirement}, replace_existing=saved is not None)
+        result = app.run(progress=print_line) if request_report or status not in {'completed', 'partial'} else app.result_snapshot()
+        _render_native_result(app, result)
+        _ensure_research_cli_success(result['status'], operation='Research report', root=root)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+
+
 def _print_research_report(args: argparse.Namespace) -> None:
     """Generate a report from an existing research-session handoff."""
 
     if args.max_review_iterations < 0:
         raise SystemExit("--max-review-iterations cannot be negative.")
+    manifest = Path(args.session_root) / 'session_manifest.json'
+    if manifest.is_file() and read_json(manifest).get('transition_recipe') == 'native-tools-v1':
+        _print_common_research_report(args)
+        return
     from simple_ar.cli.research_config import report_settings
     report_settings(args)
     session_root = Path(args.session_root)

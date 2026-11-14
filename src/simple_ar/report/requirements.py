@@ -4,16 +4,18 @@ from __future__ import annotations
 from typing import Any
 
 
-def freeze_report_requirement(settings: dict[str, Any], *, method: str | None = None) -> dict[str, Any]:
-    """Freeze resolved report demands and template bytes at task creation."""
+def freeze_report_requirement(settings: dict[str, Any], *, method: str | None = None,
+                              template: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Freeze report demands, retaining an already accepted template when supplied."""
     from simple_ar.report.writing import resolve_report_writing_config
-    from simple_ar.report.schema import ReportRuntimeConfig, ReportContext
+    from simple_ar.report.schema import ReportRuntimeConfig, ReportContext, ReportTemplateBundle
     from simple_ar.report.templates import load_report_template_bundle, is_builtin_template
     from simple_ar.report.memory import initialize_report_memory
     if method is None:
         method, settings = resolve_report_writing_config(settings)
     config = ReportRuntimeConfig.model_validate(settings)
-    template = load_report_template_bundle(report_mode='supplied_materials', config=config)
+    template = (ReportTemplateBundle.model_validate(template) if template is not None else
+        load_report_template_bundle(report_mode='supplied_materials', config=config))
     fixed = config.outline_strategy == 'template' or not is_builtin_template(template, config)
     memory = initialize_report_memory(context=ReportContext(topic='Implementation report',
         report_mode='supplied_materials'), template=template)

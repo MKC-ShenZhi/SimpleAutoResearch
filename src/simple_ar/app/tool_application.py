@@ -2335,6 +2335,12 @@ class ToolApplication:
                         config[field] = old[field]
                     else:
                         config.pop(field, None)
+            if (supplied.get('report_requirement') is not None
+                    and old.get('control_protocol') == 'operations.v1'):
+                # Supplying a report is an explicit new request: route its new
+                # document work to the same Writer used at task creation.
+                # Started operations retain their own saved document contract.
+                config['document_context_policy'] = 'working.v3'
             if supplied.get('sandbox_execution') is True and old.get('control_protocol') == 'operations.v1':
                 # Explicitly granting isolation is a new execution contract;
                 # supply cancels unstarted work and never rewrites started work.

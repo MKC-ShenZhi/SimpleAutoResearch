@@ -121,7 +121,7 @@ class CodeTaskTests(unittest.TestCase):
     @contextlib.contextmanager
     def _orphan_validator(self, *, after_archive=False, returncode=0, watchdog=False, preparation=False):
         from simple_ar.code_task.runtime.state import load_code_task_manifest, save_code_task_manifest
-        from simple_ar.code_task.execution.runner import _safe_env
+        from simple_ar.code_task.execution.environment import code_task_process_environment
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             project = root / 'source'
@@ -137,7 +137,7 @@ class CodeTaskTests(unittest.TestCase):
             manifest = load_code_task_manifest(run)
             manifest['code_task']['native_binding'] = {'token': 'original-approved-contract', 'binding': {
                 'contract': {'validation_command': ['python', 'check.py'], 'timeout_sec': 5},
-                'python_executable': sys.executable, 'environment': _safe_env(initialized.workspace_dir)}}
+                'python_executable': sys.executable, 'environment': code_task_process_environment(initialized.workspace_dir)}}
             if preparation:
                 store_root = root / 'attempts/native-tool-001'
                 manifest['code_task']['native_binding']['binding']['environment_preparations'] = {

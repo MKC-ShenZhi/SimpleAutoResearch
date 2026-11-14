@@ -96,6 +96,8 @@ class NativeGoalWorkTests(unittest.TestCase):
                 {'subject': 'evidence-1', 'readable': True, 'sha256': 'version', 'windows': [{}]}]}
         model = owner._claim_response_model(saved)
         schema = owner._delivery_schema(saved, model)
+        self.assertNotIn('findings', schema['properties'])
+        self.assertIn('no separate top-level findings', schema['properties']['investigations']['description'])
         investigations = schema['$defs']['_PresentedClaimInvestigationV3']['properties']
         self.assertNotIn('evidence_windows', investigations)
         response = {'conclusion': 'incomplete', 'applicability': 'Check the report and its calculations.',

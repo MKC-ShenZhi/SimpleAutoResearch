@@ -137,6 +137,27 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertIn('review_result',status['next_tools'])
         self.assertFalse((self.root/'delivery.json').exists())
 
+    def test_optional_review_has_room_after_work_and_feedback_without_becoming_mandatory(self):
+        self.owner.config.update(delivery_review_selection='model.v1',
+            candidate_review_protocol='candidate.v1')
+        self.owner.gateway.registry.get = lambda name: (
+            SimpleNamespace(permission_level='write_patch') if name == 'edit_file' else None)
+        self.assertEqual(self.owner.lifecycle_requirements()['minimum_resources']['llm_requests'], 0)
+        self.observations.append({'tool_name': 'edit_file', 'status': 'ok', 'current_request': True})
+        self.assertEqual(self.owner.lifecycle_requirements()['minimum_resources']['llm_requests'], 1)
+        self.assertFalse(self.owner.requires_review(DeliveryRequest.model_validate({
+            'summary': 'A small note', 'artifacts': ['draft.md'], 'independent_review': False})))
+
+        self.owner.config['tool_completions']['deliver_result'] = {'kind': 'delivery'}
+        previous = {'summary': 'Earlier explanation', 'artifacts': ['draft.md']}
+        self.observations[:] = [{'tool_name': 'deliver_result', 'status': 'ok', 'data': previous,
+                                 'current_request': False}]
+        self.assertEqual(self.owner.lifecycle_requirements(accepted_delivery=previous)
+                         ['minimum_resources']['llm_requests'], 1)
+        self.observations[0]['current_request'] = True
+        self.assertEqual(self.owner.lifecycle_requirements(accepted_delivery=previous)
+                         ['minimum_resources']['llm_requests'], 0)
+
     def test_feedback_keeps_prior_delivery_without_rechecking_it_as_a_new_candidate(self):
         self.owner.config['tool_completions']['deliver_result'] = {'kind': 'delivery'}
         delivered = {'summary': 'Earlier explanation', 'artifacts': ['draft.md']}

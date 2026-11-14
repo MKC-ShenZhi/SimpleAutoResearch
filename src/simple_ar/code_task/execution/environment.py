@@ -37,6 +37,21 @@ DEPENDENCY_FILE_NAMES = {
 SUPPORTED_ENV_MODES = {"current", "external"}
 
 
+def code_task_process_environment(workspace_dir: Path) -> dict[str, str]:
+    """Use the same task-local process environment for both code entry points."""
+    allowed = {
+        "APPDATA", "COMSPEC", "HOME", "LOCALAPPDATA", "PATH", "PATHEXT",
+        "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "WINDIR",
+    }
+    env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+    env["PYTHONPATH"] = os.pathsep.join((str(workspace_dir), str(workspace_dir / "src")))
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env["SIMPLE_AR_CODE_TASK"] = "1"
+    return env
+
+
 def project_command(argv: Sequence[str], origin: Path, candidate: Path, *, python_executable: str | None = None) -> list[str]:
     """Relocate whole project paths, never shell text or arbitrary substrings.
 

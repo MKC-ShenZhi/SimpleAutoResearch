@@ -9,6 +9,8 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
+- Saved shared research sessions can request or refresh reports through the same Writer, authorization and budget used by their ordinary work.
+- Working views prepare retained navigation in groups, and preserve an opportunity for an independent check once useful work exists.
 - New scoped code work can update authorized tests alongside source, while retaining the validator and explicitly protected files as read-only.
 - Task-isolated execution now covers eligible copied-code work and workspace measurements, with the same process ledger and retained approvals for work outside that scope.
 - Shared code preparation checks its own process budget; later measurements use the same ledger when actually requested.

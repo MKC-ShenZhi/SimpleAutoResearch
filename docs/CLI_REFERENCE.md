@@ -30,7 +30,7 @@ Look up syntax, parameters and recovery limits here. Prefix examples with `uv ru
 | Need | Command |
 | --- | --- |
 | Use exact structured inputs or continue saved research work | [`simple-ar research-session`](#simple-ar-research-session) |
-| Generate or refresh a report for a saved legacy session with ready analysis | [`simple-ar research-report`](#simple-ar-research-report) |
+| Generate or refresh a report using a saved research session | [`simple-ar research-report`](#simple-ar-research-report) |
 | Compatibility spelling for a new summary-only session; inherits research-session parameters with the limits below. | [`simple-ar research-brief`](#simple-ar-research-brief) |
 | Run one corrected explicit experiment after a failed/timed-out simple experiment in a saved canonical session. | [`simple-ar research-session-continue`](#simple-ar-research-session-continue) |
 | Create a successor from a read-only v1 session, importing only named small artifacts without changing the source. | [`simple-ar research-session-migrate`](#simple-ar-research-session-migrate) |
@@ -637,7 +637,7 @@ simple-ar research-session --topic "Summarize local sources" --local-document pa
 
 ### `simple-ar research-report`
 
-Generate or refresh a report for a saved legacy session with ready analysis. Common native tasks request writing through start feedback or supply.
+Generate or refresh a report using retained research work in a shared or historical session.
 
 ```text
 simple-ar research-report --session-root PATH --model SELECTOR [OPTIONS]
@@ -645,9 +645,9 @@ simple-ar research-report --session-root PATH --model SELECTOR [OPTIONS]
 
 | Parameter | Meaning | Default or conditions |
 | --- | --- | --- |
-| `--session-root PATH` | Saved research session; follow its printed resume command. Common tasks resume with start --resume-task. | Required |
+| `--session-root PATH` | Saved research session with work available for the report. | Required |
 | `--refresh` | New report/audit attempts from saved evidence; keeps old reports without repeating experiments. | Off |
-| `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME. | Required |
+| `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME; a shared session retains its saved selector. | Required |
 | `--template NAME_OR_PATH` | Report template name or Markdown path. | experiment |
 | `--reviewer CHOICE` | Report reviewer; disabled retains audit. Choices: `llm`, `disabled`. | llm |
 | `--max-review-iterations N` | Report revision/correction bound; failed proposals count too. | 1 |
@@ -659,7 +659,7 @@ simple-ar research-report --session-root PATH --model SELECTOR [OPTIONS]
 | `--data-tables CHOICE` | Link complete copied analysis records, or also repeat full tables in the report. Choices: `linked`, `full`. | linked for sections; retained on resume |
 | `--max-section-tokens N` | Output cap per writing unit; zero/unset omits this extra cap. | Unset |
 
-Requires a ready-for-report legacy session; v1 is read-only. Existing reports are idempotent unless --refresh is supplied. Omitted options retain saved settings. Refresh consumes saved attempt/API budgets without rerunning experiments; authorize resources separately if exhausted. Disabled reviewer retains audit.
+Historical sessions require a ready-for-report handoff; v1 is read-only. Shared operation sessions continue through the same task and request reuse of existing research and results; earlier shared-task contracts keep their saved entry. An already delivered report is reused unless --refresh or changed settings request new work. Omitted options and an unchanged template retain their saved values. Writing and any checks use the original authorization and budget; authorize resources separately if exhausted. Disabling the Writer reviewer does not replace an independent task review.
 
 Examples:
 

@@ -1520,6 +1520,49 @@ code = "daily"
             run.assert_called_once()
             client.chat_turn.assert_not_called()
 
+    def test_research_report_continues_common_session_with_the_saved_writer_and_budget(self):
+        from simple_ar.app.tool_application import ToolApplication
+
+        client = MagicMock()
+        client._settings = SimpleNamespace(api_mode='chat')
+        client.connection_binding.return_value = {'profile': 'fixture',
+            'settings': {'model': 'fixture', 'api_mode': 'chat'}}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch('simple_ar.app.tool_application.LLMClient.from_env', return_value=client), \
+                patch.object(ToolApplication, 'run', return_value={'status': 'completed'}) as run, \
+                patch('simple_ar.cli.main._render_native_result'), \
+                contextlib.redirect_stdout(io.StringIO()):
+            root = Path(tmp) / 'session'
+            app = ToolApplication.create(root, 'Analyze the supplied observations',
+                model='fixture', sources={}, max_turns=8, max_tokens=400000)
+            prior = app.workspace.workspace / 'analysis.txt'
+            prior.write_text('Retained analysis result.\n', encoding='utf-8')
+            original_ledger = app.ledger.to_dict()
+            self.assertEqual(app.state['config']['document_context_policy'], 'working.v2')
+            main(['research-report', '--session-root', str(root), '--model', 'fixture',
+                  '--reviewer', 'disabled', '--max-section-tokens', '123'])
+            restored = ToolApplication.load(root)
+            requirement = restored.state['config']['report_requirement']
+            self.assertEqual(restored.state['config']['document_context_policy'], 'working.v3')
+            self.assertEqual((requirement['method'], requirement['config']['max_section_tokens']), ('sections', 123))
+            self.assertEqual(restored.operations.document.report_requirement, requirement)
+            self.assertEqual(restored.ledger.to_dict(), original_ledger)
+            self.assertEqual(prior.read_text(encoding='utf-8'), 'Retained analysis result.\n')
+            self.assertEqual(len(restored.state['requests']), 2)
+            self.assertEqual(run.call_count, 1)
+
+            with patch('simple_ar.report.templates.load_report_template_bundle',
+                       side_effect=AssertionError('The accepted template must be retained')):
+                main(['research-report', '--session-root', str(root), '--model', 'fixture',
+                      '--max-section-tokens', '199'])
+            revised = ToolApplication.load(root)
+            self.assertEqual(revised.state['config']['report_requirement']['template'], requirement['template'])
+            self.assertEqual(revised.state['config']['report_requirement']['config']['max_section_tokens'], 199)
+            self.assertEqual(revised.ledger.to_dict(), original_ledger)
+            with self.assertRaisesRegex(SystemExit, 'retains its saved model'):
+                main(['research-report', '--session-root', str(root), '--model', 'other'])
+            client.chat_turn.assert_not_called()
+
     def test_structured_report_preflight_precedes_model_and_creation(self):
         with patch("simple_ar.cli.main._optional_research_llm_client") as client, \
                 patch("simple_ar.cli.start.migrate_structured_creation") as migrate:

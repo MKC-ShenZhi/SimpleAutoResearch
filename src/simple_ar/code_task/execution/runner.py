@@ -21,6 +21,7 @@ from simple_ar.code_task.editing.attempts import (
 from simple_ar.code_task.execution.comparison import CodeTaskComparisonResult, compare_code_task_runs
 from simple_ar.code_task.execution.environment import (
     apply_code_task_environment_policy,
+    code_task_process_environment,
     ensure_code_task_environment_policy,
     policy_python_executable,
 )
@@ -662,7 +663,7 @@ def _run_command(
         name: _OutputRelay(name, callback, mode, watchdog, cancel)
         for name in ("stdout", "stderr")
     }
-    env = environment if environment is not None else (process_scope.environment if process_scope is not None else _safe_env(cwd))
+    env = environment if environment is not None else (process_scope.environment if process_scope is not None else code_task_process_environment(cwd))
     spec = ProcessSpec(command_args, cwd, timeout_sec, env=env, output_dir=output_dir,
                        session_id=session_id, attempt_id=attempt_id, input_binding=input_binding)
     spec = with_process_outputs(spec)
@@ -1039,32 +1040,6 @@ def _execution_environment_record(environment_policy: dict[str, Any]) -> dict[st
         ),
         "dependency_install": environment_policy.get("dependency_install", "disabled"),
     }
-
-
-def _safe_env(workspace_dir: Path) -> dict[str, str]:
-    allowed = {
-        "APPDATA",
-        "COMSPEC",
-        "HOME",
-        "LOCALAPPDATA",
-        "PATH",
-        "PATHEXT",
-        "SYSTEMROOT",
-        "TEMP",
-        "TMP",
-        "USERPROFILE",
-        "WINDIR",
-    }
-    env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
-    # Execute against the task's sources and selected interpreter, not packages
-    # injected into the controller (including an installed framework candidate).
-    python_paths = [str(workspace_dir), str(workspace_dir / "src")]
-    env["PYTHONPATH"] = os.pathsep.join(python_paths)
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env.setdefault("PYTHONIOENCODING", "utf-8")
-    env["SIMPLE_AR_CODE_TASK"] = "1"
-    return env
 
 
 def _clip_output(text: str) -> tuple[str, bool]:

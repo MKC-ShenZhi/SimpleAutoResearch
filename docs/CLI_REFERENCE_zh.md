@@ -30,7 +30,7 @@
 | 用途 | 命令 |
 | --- | --- |
 | 使用精确结构化输入或继续已有研究 | [`simple-ar research-session`](#simple-ar-research-session) |
-| 为分析已就绪的历史会话生成或刷新报告 | [`simple-ar research-report`](#simple-ar-research-report) |
+| 使用已有研究会话生成或刷新报告 | [`simple-ar research-report`](#simple-ar-research-report) |
 | 新建仅摘要会话的兼容名称；继承 research-session 参数，受下述限制约束 | [`simple-ar research-brief`](#simple-ar-research-brief) |
 | 在已有 canonical 会话的简单实验失败／超时后运行一次修正的显式实验 | [`simple-ar research-session-continue`](#simple-ar-research-session-continue) |
 | 从只读 v1 会话创建后继，仅导入具名小成果，不修改源会话 | [`simple-ar research-session-migrate`](#simple-ar-research-session-migrate) |
@@ -635,7 +635,7 @@ simple-ar research-session --topic "总结本地资料" --local-document paper.m
 
 ### `simple-ar research-report`
 
-为分析已就绪的历史会话生成或刷新报告。共用原生任务通过 start 反馈或补齐请求写作。
+使用共同或历史会话中已有的研究工作生成或刷新报告。
 
 ```text
 simple-ar research-report --session-root PATH --model SELECTOR [OPTIONS]
@@ -643,9 +643,9 @@ simple-ar research-report --session-root PATH --model SELECTOR [OPTIONS]
 
 | 参数 | 说明 | 默认值或使用条件 |
 | --- | --- | --- |
-| `--session-root PATH` | 已有研究会话；遵循显示的恢复命令。共用原生任务用 start --resume-task 恢复。 | 必填 |
+| `--session-root PATH` | 有可供撰写的已有研究工作的会话。 | 必填 |
 | `--refresh` | 用已有证据新建报告／审计尝试；保留旧报告，不重复实验。 | 关闭 |
-| `--model SELECTOR` | 模型选择器：env、profile:NAME 或 route:NAME。 | 必填 |
+| `--model SELECTOR` | 模型选择器：env、profile:NAME 或 route:NAME；共同会话保留已保存的选择器。 | 必填 |
 | `--template NAME_OR_PATH` | 报告模板名称或 Markdown 路径。 | experiment |
 | `--reviewer CHOICE` | 报告审阅器；disabled 保留审计。 可选：`llm`, `disabled`. | llm |
 | `--max-review-iterations N` | 报告修订／纠正上限；失败提案也计数。 | 1 |
@@ -657,7 +657,7 @@ simple-ar research-report --session-root PATH --model SELECTOR [OPTIONS]
 | `--data-tables CHOICE` | 链接完整复制的分析记录，或同时在报告列出完整表格。 可选：`linked`, `full`. | linked（sections）；恢复保留 |
 | `--max-section-tokens N` | 每个写作单元输出上限；0／未设表示不加此上限。 | 未设置 |
 
-要求历史会话的报告交接已就绪；v1 只读。除非传 --refresh，已有报告幂等返回。省略参数保留已有设置。刷新消耗保存的尝试／API 预算，不重跑实验；耗尽时另行授权资源。关闭审阅器保留审计。
+历史会话要求报告交接已就绪；v1 只读。共同操作会话沿原任务继续，并请求复用已有研究和结果；更早的共同任务合同仍使用其原入口。除非传 --refresh 或改变设置，已交付报告直接复用。省略参数和未变更的模板保留原设置。撰写及检查使用原授权与预算；额度耗尽时另行授权。关闭 Writer 审阅不等于完成任务级独立复核。
 
 示例：
 

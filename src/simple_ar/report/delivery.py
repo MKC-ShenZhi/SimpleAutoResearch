@@ -249,11 +249,15 @@ class Delivery:
             candidate_only = (completion.kind == 'review'
                 and review.get('binding', {}).get('purpose') == 'candidate')
             break
-        # A new request still needs the saved final-review contract. A delivery
-        # already accepted for this request has no outstanding review floor.
+        # Preserve an opportunity to check actual work even when the model may
+        # choose direct delivery. This is a planning floor, not a new review
+        # requirement: the model can still deliver without one when appropriate.
+        # A previous delivery also supplies work for a new feedback request.
+        possible_candidate = (self.config.get('candidate_review_protocol') == 'candidate.v1'
+            and (previously_delivered or work_after_review))
         needs_review = (self.review_owner is not None
-            and self.config.get('delivery_review_selection') != 'model.v1'
-            and not (previously_delivered and delivered_current_request))
+            and not (previously_delivered and delivered_current_request)
+            and (self.config.get('delivery_review_selection') != 'model.v1' or possible_candidate))
         if proposal is None:
             conditions.append({'kind': 'candidate_submission',
                 'message': ('The previous delivery is recorded. Submit a new candidate when the '
@@ -285,7 +289,8 @@ class Delivery:
             'review_followup': review_followup,
             'scope': 'Conditions are current owner checks; prior_unresolved is the previous producer\'s '
                 'statement, not a current obligation. Reconsider it against the request and actual work. '
-                'This is not a pass or an exact cost forecast. '
+                'The planning floor may preserve an opportunity for an optional check; '
+                'it does not require one. This is not a pass or an exact cost forecast. '
                 'Final acceptance rechecks the actual inventory, publication and applicable opinion.'}
 
     def _actual_issues(self, observations: list[dict], request: DeliveryRequest,

@@ -1175,6 +1175,28 @@ class RetainedWorkingContextTests(unittest.TestCase):
         self.assertTrue(all(text not in json.dumps(messages) for text in texts))
         self.assertLess(selection['estimated_input_tokens'] - bare['estimated_input_tokens'], sum(map(len,texts)))
 
+    def test_long_navigation_is_packed_without_reprojecting_every_receipt(self):
+        operations = [{'turn': i, 'turn_complete': True, 'request_count': 1, 'call_id': str(i),
+            'reply': f'records/{i}/reply.json', 'observation': {'tool': 'read_file',
+                'record': f'records/{i}/result.json', 'status': 'ok'}} for i in range(200)]
+        estimate = Mock(side_effect=len)
+        options = dict(user_requests=['Use the recorded research'], material_policy='working',
+            require_work_notes=True, fit_work_notes=True, processed_turns=[],
+            working_set_policy='recent.v5', operation_history=operations,
+            context_token_target=150000, estimate_tokens=estimate)
+        messages, budget = select(**options)
+        overview = json.loads(messages[1]['content'])['working_view']['operation_overview']
+        entries = [item for group in expand_history_view(overview['entries']) for item in group['observations']]
+        self.assertEqual(len(entries), len(operations))
+        self.assertEqual(overview['omitted_entries'], 0)
+        self.assertLess(estimate.call_count, len(operations))
+        self.assertLessEqual(budget['estimated_input_tokens'], options['context_token_target'])
+
+        limited, _ = select(**{**options, 'context_token_target': 6000, 'estimate_tokens': len})
+        overview = json.loads(limited[1]['content'])['working_view']['operation_overview']
+        self.assertGreater(overview['omitted_entries'], 0)
+        self.assertIn('Use the recorded research', json.dumps(limited))
+
     def test_journal_native_uses_available_capacity_beyond_half_the_window(self):
         blocks = [block(0, 'Earlier native work. ' * 500), block(1, 'Latest native work. ' * 500)]
         messages, budget = select(material_policy='retained', require_work_notes=True,
