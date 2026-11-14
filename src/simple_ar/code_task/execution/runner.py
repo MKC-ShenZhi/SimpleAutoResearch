@@ -269,6 +269,7 @@ def run_code_task_benchmark(
         manifest,
         env_mode=env_mode,
         python_executable=python_executable,
+        **({'process_scope': process_scope} if process_scope is not None else {}),
     )
     command_args = _split_command(command_text, environment_policy=environment_policy)
 

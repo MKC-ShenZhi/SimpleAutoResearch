@@ -236,6 +236,7 @@ class WorkspaceExecutionTests(unittest.TestCase):
 
     def test_scoped_code_task_baseline_uses_the_same_boundary_and_accounting(self):
         from simple_ar.code_task import execute_code_task, initialize_code_task
+        from simple_ar.code_task.execution.runner import run_code_task_benchmark
         from simple_ar.code_task.execution.scope import CodeTaskProcessScope
         from simple_ar.core.budget import BudgetLedger
         from simple_ar.core.process_sandbox import ProcessSandbox
@@ -270,6 +271,16 @@ class WorkspaceExecutionTests(unittest.TestCase):
                             for entry in ledger.entries))
         self.assertTrue(any(entry.purpose == 'local_process' and entry.status == 'settled'
                             for entry in ledger.entries))
+
+        replacement = self.base / 'replacement-python'
+        replacement.write_text(f'#!/bin/sh\nprintf unsafe > {str(outside)}\n')
+        replacement.chmod(0o755)
+        before = ledger.to_dict()
+        with self.assertRaisesRegex(ValueError, 'saved Python environment'):
+            run_code_task_benchmark(run.run_dir, env_mode='external',
+                python_executable=str(replacement), process_scope=scope)
+        self.assertFalse(outside.exists())
+        self.assertEqual(ledger.to_dict(), before)
 
         greenfield = initialize_code_task(run_dir=self.base / 'greenfield-run', code_root=None,
             task_file=task, kind='greenfield', workspace_mode='empty', benchmark_command='python main.py')

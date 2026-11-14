@@ -135,8 +135,20 @@ def ensure_code_task_environment_policy(
     *,
     env_mode: str | None = None,
     python_executable: str | Path | None = None,
+    process_scope: Any | None = None,
 ) -> dict[str, Any]:
     """Return a normalized environment policy and persist it if needed."""
+    if process_scope is not None:
+        # The scope was granted for the saved interpreter. Do not probe a
+        # replacement executable on the host while resolving that policy.
+        saved = manifest_section(manifest, 'environment').get('policy', {})
+        if (not _policy_is_supported(saved)
+                or Path(saved['python_executable']).absolute() != process_scope.sandbox.python.absolute()
+                or env_mode is not None and _normalize_env_mode(env_mode) != saved['mode']
+                or python_executable is not None
+                    and _resolve_policy_python('external', python_executable) != saved['python_executable']):
+            raise ValueError('Scoped execution requires its saved Python environment')
+        return dict(saved)
     policy = _resolved_environment_policy(
         manifest,
         env_mode=env_mode,
@@ -231,6 +243,7 @@ def _probe_code_task_environment(
         manifest,
         env_mode=env_mode,
         python_executable=python_executable,
+        **({'process_scope': process_scope} if process_scope is not None else {}),
     )
     manifest = load_code_task_manifest(run_dir)
     codebase_index = _load_codebase_index(paths.meta_dir / "codebase_index.json")
