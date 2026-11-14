@@ -2310,6 +2310,11 @@ class ToolApplication:
                         config[field] = old[field]
                     else:
                         config.pop(field, None)
+            if (old.get('control_protocol') == 'operations.v1' and supplied.get('code_task') is not None
+                    and supplied['code_task'] != old.get('code_task')):
+                # An explicitly supplied new code contract is new work, not a
+                # change to an already running historical code operation.
+                config['code_work_policy'] = 'shared.v1'
             if old.get('source_snapshots'):
                 config['source_snapshots'] = {name: value for name, value in old['source_snapshots'].items()
                     if old['sources'][name] == config['sources'].get(name)}

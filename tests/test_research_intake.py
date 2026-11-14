@@ -655,6 +655,19 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(reviewer.calls, [])
             self.assertEqual(execution, original)
             self.assertEqual((project / 'check.py').read_text(), 'pass\n')
+            supplied_services = replace(services, config={'research_materials_only': True})
+            continuing = create_research_task(ResearchBrief(request_text='Inspect the supplied project.',
+                requested_outputs=('summary',),
+                asset_requests=({'locator': str(project), 'role': 'code'},)),
+                root=base / 'continued-task', services=supplied_services)
+            self.assertNotIn('code_work_policy', continuing.state['config'])
+            before_ledger = continuing.ledger.to_dict()
+            continuing.supply(supply_id='code-work', reason='The caller provided the code scope and validator',
+                changes={'allow_execution': True, 'code_task': exact})
+            self.assertEqual(continuing.state['config']['code_work_policy'], 'shared.v1')
+            self.assertEqual(continuing.ledger.to_dict(), before_ledger)
+            self.assertEqual(continuing.operations.implementation.work_context([str(project)])['user_requests'],
+                continuing.state['requests'])
             paper = base / 'method.md'
             paper.write_text('A supplied method description, not verified implementation evidence.', encoding='utf-8')
             for outputs in (('code_task', 'summary'), ('code_task', 'experiments')):
