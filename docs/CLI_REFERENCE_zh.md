@@ -596,9 +596,14 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 
 #### 报告控制
 
+下表中的详细 Writer 控制适用于已保存的历史会话。新共同任务会保存这些设置，
+但尚不执行旧的分节起草、审阅循环及其单节 token／修订轮次限制。固定提纲和
+引用数量上限会在交付时检查；任务级独立检查另行负责。显式模板也会在共同文稿
+工具可用时提供给写作者。
+
 | 参数 | 说明 | 默认值或使用条件 |
 | --- | --- | --- |
-| `--report-writing-method CHOICE` | 新报告使用 article；显式分节控制选择 sections。恢复保留已存方法。 可选：`article`, `sections`. | 新建 article；显式分节控制为 sections |
+| `--report-writing-method CHOICE` | 历史 Writer 方法；恢复保留已存方法。可选：`article`, `sections`。 | 历史 article；显式分节控制为 sections |
 | `--max-section-tokens N` | 每个写作单元输出上限；0／未设表示不加此上限。 | 未设置 |
 | `--with-report` | 显式请求模型撰写报告；数据分析默认仅交付分析。 | 关闭 |
 | `--no-report` | 模型会话跳过报告撰写。 | 关闭 |
@@ -618,7 +623,7 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 
 新任务采用 start 的决定／批准规则。历史会话保留已有里程碑策略：assisted 确认协议／交付／后续选择；checkpoints 确认首个协议／候选修订／交付变更，允许有界同协议补充；autonomous 在保存限额内选择。--session-root 保留证据／账目。仅在旧进程停止后用 --recover-interrupted，与输入修订分开。--reanalyze 与修订／授权／报告刷新分开；仅复用兼容测量。
 
-恢复时省略的报告参数保留已有选择。新 article 报告以完整文章为单元；显式分节控制选择 sections。分节默认逐节撰写／审阅、关闭全文审阅、auto 提纲、linked 表格。联合撰写要求全文审阅／范围及兼容的完整来源设置。关闭审阅仍保留审计。报告刷新前另行授权资源；授权本身不重开已完成工作。
+历史会话恢复时，省略的报告参数保留已有选择。article 报告以完整文章为单元；显式分节控制选择 sections。分节默认逐节撰写／审阅、关闭全文审阅、auto 提纲、linked 表格。联合撰写要求全文审阅／范围及兼容的完整来源设置。关闭审阅仍保留审计。报告刷新前另行授权资源；授权本身不重开已完成工作。
 
 示例：
 

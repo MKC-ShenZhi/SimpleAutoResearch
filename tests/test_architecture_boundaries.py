@@ -104,7 +104,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             "root = tempfile.TemporaryDirectory(); "
             "requirement = freeze_report_requirement({'max_cited_sources': 2}); "
             "app = ToolApplication.create(Path(root.name) / 'task', 'Explain supplied research', "
-            "model=None, control_protocol='operations.v1', report_requirement=requirement); "
+            "model=None, sources={}, control_protocol='operations.v1', report_requirement=requirement); "
             "assert app.operations is not None; "
             "assert app._work_context([])['review_observations'] == []; "
             "assert 'simple_ar.tools.writing' not in sys.modules"

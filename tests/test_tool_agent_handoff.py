@@ -713,6 +713,20 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             app = ToolApplication.load(app.session.store.root)
         return run_dir, inputs, fake, binding, app, code
 
+    def test_structured_measurement_report_supplies_template_to_document_work(self):
+        from simple_ar.report.requirements import freeze_report_requirement
+
+        requirement = freeze_report_requirement({
+            'template': 'analysis_report', 'outline_strategy': 'template', 'max_cited_sources': 2})
+        _, _, _, _, app, _ = self._native_fixture(
+            report_requirement=requirement, measurement_command=['python', 'measure.py'])
+        self.assertEqual(app.state['config']['professional_operations'], 'work.v5')
+        self.assertIn('work_document', {row['function']['name'] for row in app.operation_schemas})
+        context = app.operations.document.work_context([])
+        self.assertEqual(context['requested_report']['outline'], requirement['outline'])
+        self.assertEqual(context['requested_report']['max_cited_sources'], 2)
+        self.assertEqual(context['requested_report']['template'], requirement['template']['template_markdown'])
+
     def _historical_native_fixture(self, **options):
         """Explicit saved native control/projection; current tools use _native_fixture."""
         return self._native_fixture(operation_control=False, **options)

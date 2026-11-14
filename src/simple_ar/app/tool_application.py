@@ -1983,6 +1983,9 @@ class ToolApplication:
             config['sandbox_operations'] = 'workspace.v1'
         if config.get('code_task') is not None:
             config['code_work_policy'] = 'shared.v2'
+        if config.get('code_task') is not None or config.get('report_requirement') is not None:
+            # Structured analysis/measurement tasks need the same frozen
+            # report requirements at the actual document-work consumer.
             config['document_context_policy'] = 'working.v2'
         config['inspection_protocol'] = 'subjects.v3'
         config['inspection_execution_protocol'] = 'shared.v1'

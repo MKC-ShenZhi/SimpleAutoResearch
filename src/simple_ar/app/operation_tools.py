@@ -445,7 +445,9 @@ class OperationTools:
         self.document = None
         if (professional and config['model'] is not None
                 and (config.get('professional_operations') in PRODUCTION_OWNER_CONTRACTS | {'work.v1', 'work.v2', 'work.v12'}
-                     or config.get('code_work_policy') in {'shared.v1', 'shared.v2'})):
+                     or config.get('code_work_policy') in {'shared.v1', 'shared.v2'}
+                     or config.get('document_context_policy') == 'working.v2'
+                        and config.get('report_requirement') is not None)):
             from simple_ar.tools.document_work import DocumentWorkToolGateway, document_work_tool_specs
             document_context = work_context
             if config.get('document_context_policy') == 'working.v2' and config.get('report_requirement') is not None:

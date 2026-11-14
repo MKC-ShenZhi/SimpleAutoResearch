@@ -597,9 +597,16 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 
 #### Report controls
 
+The detailed Writer controls below apply to saved legacy sessions. New common
+tasks retain these settings, but do not run the legacy sectional drafting and
+review loops or enforce their per-section token and revision bounds. A frozen
+outline and citation ceiling are checked at delivery; task-level independent
+inspection is separate. An explicitly selected template is also supplied to
+the common document worker when that worker is available.
+
 | Parameter | Meaning | Default or conditions |
 | --- | --- | --- |
-| `--report-writing-method CHOICE` | New reports use article; explicit sectional controls select sections. Resume retains the saved method. Choices: `article`, `sections`. | New article; sections with explicit sectional controls |
+| `--report-writing-method CHOICE` | Legacy Writer method; saved sessions retain it. Choices: `article`, `sections`. | Legacy article, or sections for explicit sectional controls |
 | `--max-section-tokens N` | Output cap per writing unit; zero/unset omits this extra cap. | Unset |
 | `--with-report` | Explicitly request a model-authored report; data analysis otherwise delivers analysis only. | Off |
 | `--no-report` | Skip report writing in a model-backed session. | Off |
@@ -619,7 +626,7 @@ Model-backed sessions normally request a report, except data analysis needs an e
 
 New tasks use start decision/approval rules. Legacy sessions retain saved milestone policies: assisted confirms protocol/delivery/follow-ups; checkpoints confirms first protocol/candidate revisions/delivery changes while allowing bounded same-protocol supplements; autonomous chooses within saved limits. --session-root preserves evidence/accounting. Use --recover-interrupted only after the old worker stops, separately from input revisions. --reanalyze is separate from revisions/authorization/report refresh; only compatible measurements are reused.
 
-Omitted report options on resume retain saved choices. New article reports use complete-article work units; explicit sectional controls select sections. Section defaults are section drafting/review, document review off, auto outline and linked tables. Joint drafting needs document review/scope and compatible full-source settings. Disabled review retains audit. Authorize resources separately before report refresh; authorization alone does not reopen completed work.
+For legacy sessions, omitted report options on resume retain saved choices. Article reports use complete-article work units; explicit sectional controls select sections. Section defaults are section drafting/review, document review off, auto outline and linked tables. Joint drafting needs document review/scope and compatible full-source settings. Disabled review retains audit. Authorize resources separately before report refresh; authorization alone does not reopen completed work.
 
 Examples:
 
