@@ -588,6 +588,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         fake = Mock()
         fake.ask_json = _LegacyArticleFixtureResponses()
         fake.effective_output_limit.return_value = None
+        fake.estimate_native_input_tokens.side_effect = lambda messages, tools: (
+            estimate_tokens(json.dumps(messages, ensure_ascii=False))
+            + estimate_tokens(json.dumps(tools, ensure_ascii=False)))
         fake._settings = SimpleNamespace(api_mode='chat', context_input_tokens=context_target)
         if review_delivery:
             def inspect_supplied_material(messages, *, tools, budget_call_id, **_):
@@ -13618,10 +13621,11 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                 if mode == 'shared_limited':
                     self.assertEqual(ledger.remaining('process_invocations'), 0)
                     before = ledger.to_dict()
-                    with self.assertRaisesRegex(ValueError, 'Insufficient or unknown shared process_invocations budget'):
-                        science.execute_tool('measure_experiment', CapabilityContext(
-                            ArtifactStore(root / 'attempts/baseline'), AttemptManifest('baseline')),
-                            arguments, approval=baseline_approval)
+                    refused = science.execute_tool('measure_experiment', CapabilityContext(
+                        ArtifactStore(root / 'attempts/baseline'), AttemptManifest('baseline')),
+                        arguments, approval=baseline_approval)
+                    self.assertEqual(refused.status, 'blocked')
+                    self.assertIn('Insufficient or unknown shared process_invocations budget', refused.error)
                     self.assertEqual(ledger.to_dict(), before)
                     self.assertFalse((root / 'attempts/baseline/scientific_request.json').exists())
                     ledger.limits['process_invocations'] = 12
@@ -14657,9 +14661,6 @@ class ConversationContextTests(unittest.TestCase):
 
     def _fixture(self):
         root, inputs, fake, binding, app, _ = self._historical_native_fixture()
-        fake.estimate_native_input_tokens.side_effect = lambda messages, tools: (
-            estimate_tokens(json.dumps(messages, ensure_ascii=False))
-            + estimate_tokens(json.dumps(tools, ensure_ascii=False)))
         # Projection-only saved receipts have no current operation envelopes.
         app = load_native_history(root / 'conversation', 'Use original measurements; preserve unknowns.',
             config={'model':'fixture','model_connection':binding,
