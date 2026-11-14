@@ -160,6 +160,7 @@ class WorkspaceExecutionTests(unittest.TestCase):
         self.assertFalse(setup.ledger.entries)
 
     def test_scoped_code_probes_and_validator_use_the_same_workspace_boundary(self):
+        from types import SimpleNamespace
         from simple_ar.code_task.analysis.dependency_api import inspect_dependency_api
         from simple_ar.code_task.execution.runner import run_code_task_benchmark
         from simple_ar.code_task.execution.validation import validate_code_task
@@ -177,7 +178,14 @@ class WorkspaceExecutionTests(unittest.TestCase):
         contract = {'project_path': 'source', 'goal': 'Change the model',
             'allowed_patterns': ['main.py'], 'validation_command': ['python', 'check.py'],
             'timeout_sec': 5, 'preparation': {'kind': 'existing_project', 'workspace_mode': 'copy'}}
-        app = ToolApplication.create(self.base / 'code', 'Change the model', model=None,
+        class UncalledClient:
+            model, context_input_tokens = 'fixture', 128000
+            def with_budget(self, *_args, **_kwargs):
+                return self
+            def ask_json(self, *_args, **_kwargs):
+                raise AssertionError('This engineering check must not call a model')
+        services = SimpleNamespace(llm_client=UncalledClient())
+        app = ToolApplication.create(self.base / 'code', 'Change the model', model='fixture', services=services,
             sources={'source': project}, allow_execution=True, sandbox_execution=True,
             code_task=contract, process_limits={'process_invocations': 5, 'process_wall_seconds': 60})
         other_result.write_text('retained')
@@ -219,7 +227,7 @@ class WorkspaceExecutionTests(unittest.TestCase):
 
         setup_contract = {**contract, 'environment': {'mode': 'current', 'timeout_sec': 5,
             'check_command': ['python', '-c', 'print("checked")']}}
-        setup = ToolApplication.create(self.base / 'code-setup', 'Change the model', model=None,
+        setup = ToolApplication.create(self.base / 'code-setup', 'Change the model', model='fixture', services=services,
             sources={'source': project}, allow_execution=True, sandbox_execution=True,
             code_task=setup_contract, process_limits={'process_invocations': 5, 'process_wall_seconds': 60})
         pending_setup = {'attempt': 'code-setup', 'call': call}

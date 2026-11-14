@@ -558,6 +558,8 @@ def native_validation_process(
             or record.get('argv') != expected_argv or record.get('cwd') != str(paths.workspace_dir.resolve())
             or record.get('environment_policy') != 'caller_supplied' or record.get('environment') != expected_env
             or record.get('timeout_sec') != contract['timeout_sec']
+            or (binding['binding'].get('execution_scope') == 'workspace.v1'
+                and record.get('execution_scope') != 'workspace')
             or manifest['environment']['policy'].get('python_executable') != binding['binding']['python_executable']
             or original.get('native_binding') != binding or 'runtime_watchdog' not in original
             or contract.get('new_files') and original.get('required_new_file_issues') != []

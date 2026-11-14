@@ -753,6 +753,8 @@ class ScientificToolGateway:
                 or process['timeout_sec'] != binding['timeout_sec']
                 or process['session_id'] != self.session_id or process['attempt_id'] != identity
                 or process['environment_policy'] != 'caller_supplied'
+                or (binding.get('execution_scope') == 'workspace.v1'
+                    and process.get('execution_scope') != 'workspace')
                 or canonical['execution']['label'] != binding['label']
                 or canonical.get('experiment_contract') != binding['protocol']
                 or canonical['result_schema'] != binding['result_schema']):
