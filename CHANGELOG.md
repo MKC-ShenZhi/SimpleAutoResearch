@@ -18,6 +18,8 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 - Common document work for structured reports applies the selected article or section method, template, review and writing limits, including alongside execution or analysis work. Saved sessions retain their original contract.
 - Research source bundles produced from supplied documents can be queried and passed to document work through the same source owner.
+- Section writing can retrieve additional retained passages from selected sources and preserve those reads across recovery.
+- Independent inspection can continue from its original records after a model request is refused before dispatch; authorized work in a final decision is no longer discarded solely because the batch contains multiple actions.
 
 ## 2026-11-13
 
