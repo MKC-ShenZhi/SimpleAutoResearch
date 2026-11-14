@@ -145,8 +145,9 @@ class BudgetLedger:
         self.storage_path = Path(storage_path) if storage_path is not None else None
         self._entries: dict[str, BudgetEntry] = {}
         self._lock = threading.RLock()
-        self._remaining_protections: dict[object, dict[str, BudgetNumber]] = {}
-        self._yieldable_protections: set[object] = set()
+        # Each active floor retains its ordinary value and, for nested work,
+        # the value that remains if an outer forecast is yielded.
+        self._remaining_protections: dict[object, tuple[dict[str, BudgetNumber], dict[str, BudgetNumber] | None]] = {}
 
     @contextmanager
     def protect_remaining(self, amounts: Mapping[str, BudgetNumber], *,
@@ -166,18 +167,18 @@ class BudgetLedger:
         normalized = _normalize_amounts(amounts, field="protection")
         token = object()
         with self._lock:
+            hard = dict(normalized)
             if additional:
+                hard = {key: value + self._remaining_floor(key, hard_only=True)
+                        for key, value in normalized.items()}
                 normalized = {key: value + self._remaining_floor(key)
                               for key, value in normalized.items()}
-            self._remaining_protections[token] = normalized
-            if yield_to_work:
-                self._yieldable_protections.add(token)
+            self._remaining_protections[token] = (normalized, None if yield_to_work else hard)
         try:
             yield
         finally:
             with self._lock:
                 del self._remaining_protections[token]
-                self._yieldable_protections.discard(token)
 
     def yield_protection_for(self, amounts: Mapping[str, BudgetNumber]) -> bool:
         """Give up forecast floors only if doing so admits this actual request.
@@ -188,38 +189,41 @@ class BudgetLedger:
         """
         required = _normalize_amounts(amounts, field='request')
         with self._lock:
-            if not self._yieldable_protections:
-                return False
-            if any(self._has_unknown(name) for name in required):
+            if not self.has_yieldable_protection:
                 return False
             short = False
             for name, amount in required.items():
                 limit = self.limits.get(name)
                 if limit is None:
                     continue
+                if self._has_unknown(name):
+                    return False
+                if not amount:
+                    continue
                 available = limit - self._committed(name) - self._reserved(name)
                 protected = self._remaining_floor(name)
-                hard = max((floor.get(name, 0) for token, floor in self._remaining_protections.items()
-                            if token not in self._yieldable_protections), default=0)
+                hard = self._remaining_floor(name, hard_only=True)
                 if available - hard < amount:
                     return False
                 short |= available - protected < amount
             if not short:
                 return False
-            for token in self._yieldable_protections:
-                self._remaining_protections[token] = {}
+            for token, (_, hard) in self._remaining_protections.items():
+                self._remaining_protections[token] = (hard or {}, hard)
             return True
 
-    def _remaining_floor(self, dimension: str) -> BudgetNumber:
+    def _remaining_floor(self, dimension: str, *, hard_only: bool = False) -> BudgetNumber:
         return max(
-            (amounts.get(dimension, 0) for amounts in self._remaining_protections.values()),
+            ((hard if hard_only else amounts or {}).get(dimension, 0)
+             for amounts, hard in self._remaining_protections.values()
+             if not hard_only or hard is not None),
             default=0,
         )
 
     @property
     def has_yieldable_protection(self) -> bool:
         with self._lock:
-            return any(self._remaining_protections[token] for token in self._yieldable_protections)
+            return any(amounts for amounts, hard in self._remaining_protections.values() if hard is None)
 
     @property
     def entries(self) -> tuple[BudgetEntry, ...]:

@@ -14,6 +14,20 @@ from simple_ar.core.budget import (
 
 
 class BudgetLedgerTests(unittest.TestCase):
+    def test_nested_review_keeps_its_own_floor_when_caller_forecast_yields(self):
+        ledger = BudgetLedger({'llm_requests': 2, 'total_tokens': 1000})
+        with ledger.protect_remaining({'llm_requests': 1, 'total_tokens': 400}, yield_to_work=True):
+            with ledger.protect_remaining({'llm_requests': 1, 'total_tokens': 200}, additional=True):
+                # The caller forecast and reviewer follow-up cannot both fit,
+                # but the actual call and reviewer follow-up can.
+                ledger.reserve('review', {'llm_requests': 1, 'total_tokens': 300})
+                self.assertEqual(ledger.remaining('llm_requests'), 0)
+                self.assertEqual(ledger.remaining('total_tokens'), 500)
+                with self.assertRaises(BudgetExceededError):
+                    ledger.reserve('too-early', {'llm_requests': 1})
+                ledger.settle('review', {'llm_requests': 1, 'total_tokens': 300})
+            ledger.reserve('review-followup', {'llm_requests': 1, 'total_tokens': 200})
+
     def test_selected_work_can_use_a_forecast_floor_without_waiving_real_limits(self):
         ledger = BudgetLedger({'llm_requests': 2, 'total_tokens': 1000})
         with ledger.protect_remaining({'total_tokens': 200}):
