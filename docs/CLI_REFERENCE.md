@@ -531,8 +531,8 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 | `--provider NAME` | Override search provider; repeatable. | [] |
 | `--max-results N` | Search result count limit. | 10 |
 | `--max-chunks N` | Ingestion chunk count limit. | 300 |
-| `--max-fulltext-documents N` | Remote full-text document count cap. | No count cap if omitted |
-| `--max-pdf-mb N` | Per-fetched-PDF size cap in MiB. | No size cap if omitted |
+| `--max-fulltext-documents N` | Remote full-text document count cap. | New task: up to `--max-results`; saved policy on resume |
+| `--max-pdf-mb N` | Per-fetched-PDF size cap in MiB. | New task: 20 for source-only, 8 with execution; saved policy on resume |
 | `--web-extract-backend CHOICE` | Public-page extraction backend; separate from PDF acquisition. Choices: `direct`, `tavily_basic`. | Unset |
 | `--idea-limit N` | Structured idea candidate limit. | 3 |
 | `--max-research-iterations N` | Additional rounds after first analysis; zero stops after first analysis. | 1 |
@@ -697,8 +697,8 @@ simple-ar research-brief --topic TEXT [OPTIONS]
 | `--provider NAME` | Override search provider; repeatable. | [] |
 | `--max-results N` | Search result count limit. | 10 |
 | `--max-chunks N` | Ingestion chunk count limit. | 300 |
-| `--max-fulltext-documents N` | Remote full-text document count cap. | No count cap if omitted |
-| `--max-pdf-mb N` | Per-fetched-PDF size cap in MiB. | No size cap if omitted |
+| `--max-fulltext-documents N` | Remote full-text document count cap. | New task: up to `--max-results`; saved policy on resume |
+| `--max-pdf-mb N` | Per-fetched-PDF size cap in MiB. | New task: 20 for source-only; saved policy on resume |
 | `--web-extract-backend CHOICE` | Public-page extraction backend; separate from PDF acquisition. Choices: `direct`, `tavily_basic`. | Unset |
 | `--idea-limit N` | Structured idea candidate limit. | 3 |
 | `--max-research-iterations N` | Additional rounds after first analysis; zero stops after first analysis. | 1 |

@@ -64,6 +64,31 @@ def _reply(name, arguments):
 
 
 class ResearchIntakeTests(unittest.TestCase):
+    def test_collection_budget_allows_multiple_sources_and_preserves_explicit_limit(self):
+        from simple_ar.research.contracts import DocumentRecord
+        from simple_ar.research.documents.fulltext import build_fulltext_manifest
+        from simple_ar.tools.sources import SourcePolicy
+
+        records = [DocumentRecord(document_id=str(index), title=f'Source {index}', source='test',
+            url=f'https://example.org/{index}.html') for index in range(4)]
+
+        def acquired(hint, **_kwargs):
+            return replace(hint, status='cached', local_path='/recorded/source.html')
+
+        with TemporaryDirectory() as directory, patch(
+                'simple_ar.research.documents.fulltext._cache_selected_hint', side_effect=acquired):
+            for attempts, expected in ((None, 4), (2, 2), (0, 0)):
+                options = {'max_results': 4, 'max_documents': 4}
+                if attempts is not None:
+                    options['max_fulltext_fetch_attempts'] = attempts
+                policy = SourcePolicy.model_validate(options)
+                manifest = build_fulltext_manifest(records=records, source_plan=policy.source_plan(),
+                    cache_dir=Path(directory))
+                self.assertEqual(manifest['cached_count'], expected)
+                self.assertEqual(manifest['fetch_attempt_count'], expected)
+                self.assertEqual(SourcePolicy.model_validate(policy.model_dump()).source_plan().budget,
+                    policy.source_plan().budget)
+
     def test_structured_creation_recognizes_named_and_injected_models(self):
         import sys
         from types import SimpleNamespace

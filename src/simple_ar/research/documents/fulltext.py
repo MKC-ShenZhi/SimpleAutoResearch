@@ -75,7 +75,7 @@ def build_fulltext_manifest(
         resource, including cache reuse; zero/unset retains the unlimited default.
     """
     max_documents = _positive_int(source_plan.budget.get("max_fulltext_documents"), default=0)
-    max_fetch_attempts = _fulltext_fetch_attempt_cap(source_plan.budget, target=max_documents)
+    max_fetch_attempts = fulltext_fetch_attempt_cap(source_plan.budget, target=max_documents)
     reserve = min(_positive_int(source_plan.budget.get("reserved_fulltext_documents"), default=0),
                   max(0, max_documents - 1))
     document_limit = max_documents - reserve if max_documents else 0
@@ -241,7 +241,7 @@ def _plan_hint(
     return _replace_hint(hint, status="hint_only", reason="unsupported_remote_fulltext_kind")
 
 
-def _fulltext_fetch_attempt_cap(budget: dict[str, Any], *, target: int) -> int:
+def fulltext_fetch_attempt_cap(budget: dict[str, Any], *, target: int) -> int:
     configured = _positive_int(budget.get("max_fulltext_fetch_attempts"), default=0)
     if configured:
         return configured

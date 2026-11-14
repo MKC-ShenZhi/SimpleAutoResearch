@@ -160,9 +160,9 @@ def build_parser(
     session_parser.add_argument("--max-results", type=int, default=10)
     session_parser.add_argument("--max-chunks", type=int, default=300)
     session_parser.add_argument("--max-fulltext-documents", dest="research_max_fulltext_documents", type=int,
-                                default=None, help="Maximum remote full-text documents to fetch; omit for no document count cap.")
+                                default=None, help="Maximum remote full-text documents to fetch; omit for the creation default or saved policy.")
     session_parser.add_argument("--max-pdf-mb", dest="research_max_pdf_mb", type=int,
-                                default=None, help="Maximum size of each fetched PDF in MiB; omit for no PDF size cap.")
+                                default=None, help="Maximum size of each fetched PDF in MiB; omit for the creation default or saved policy.")
     session_parser.add_argument("--web-extract-backend", dest="research_web_extract_backend",
                                 choices=("direct", "tavily_basic"), default=None)
     session_parser.add_argument("--idea-limit", type=int, default=3)

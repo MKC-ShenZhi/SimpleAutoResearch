@@ -260,7 +260,7 @@ Fields belong to `[research]`. Search snippets/metadata are discovery material, 
 | `cache_dir` | Shared full-text cache | Optional path string | New cache choice; not safe resume override |
 | `use_fulltext`, `allow_pdf_download`, `keep_raw_pdf` | Full-text use / remote PDF permission / raw retention | Booleans false | New source work |
 | `materials_only` | Disable online search | Boolean false; writing local regardless | New task; model reading still possible |
-| `max_fulltext_documents`, `max_pdf_mb` | Remote count / per-PDF MiB ceiling | Optional positive integers; no explicit caps if absent; guided full-text setup 6 / 20 | New acquisition |
+| `max_fulltext_documents`, `max_pdf_mb` | Remote count / per-PDF MiB ceiling | Optional positive integers; new structured tasks default to at most `max_results` documents and 20 MiB for source-only or 8 MiB with execution; guided full-text setup 6 / 20 | New acquisition |
 | `web_extract_backend` | Extraction service | direct / tavily_basic; direct default | New extraction; Tavily key required |
 | `max_iterations` | Additional source-collection bound | Nonnegative integer 1 | New task; historical policy retained |
 | `interaction` | Confirmation policy | checkpoints / assisted / autonomous; checkpoints default | New task; saved changes use continuation |

@@ -260,7 +260,7 @@ survey 用于文献；writing 要求本地材料且仅报告。data_analysis 可
 | `cache_dir` | 共享全文缓存 | 可选路径 | 新缓存选择；不是安全恢复覆盖项 |
 | `use_fulltext`、`allow_pdf_download`、`keep_raw_pdf` | 全文使用／远程 PDF 权限／原件保留 | 布尔 false | 新来源工作 |
 | `materials_only` | 禁止在线检索 | 布尔 false；写作始终本地 | 新任务；仍可模型阅读 |
-| `max_fulltext_documents`、`max_pdf_mb` | 远程篇数／单 PDF MiB 上限 | 可选正整数；省略无显式上限；引导全文设置为 6／20 | 新获取 |
+| `max_fulltext_documents`、`max_pdf_mb` | 远程篇数／单 PDF MiB 上限 | 可选正整数；新结构化任务默认篇数不超过 `max_results`，纯来源工作为 20 MiB、含执行工作为 8 MiB；引导全文设置为 6／20 | 新获取 |
 | `web_extract_backend` | 提取服务 | direct / tavily_basic；默认 direct | 新提取；Tavily 需密钥 |
 | `max_iterations` | 额外收集来源上限 | 非负整数 1 | 新任务；旧任务保留策略 |
 | `interaction` | 确认策略 | checkpoints / assisted / autonomous；默认 checkpoints | 新任务；已有变化走续接 |

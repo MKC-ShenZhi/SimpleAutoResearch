@@ -25,6 +25,7 @@ from simple_ar.research.summary import render_summary
 from simple_ar.research.workflow_contracts import ResearchBrief
 from simple_ar.research.contracts import DocumentRecord, SourcePlan
 from simple_ar.research.documents.ingest import DocumentBundle, build_document_bundle
+from simple_ar.research.documents.fulltext import fulltext_fetch_attempt_cap
 from simple_ar.research.store.retrieval import rank_source_chunks, source_chunk_views
 from simple_ar.research.store.chunking import bounded_document_coverage
 from simple_ar.research.preparation_assets import validate_public_url
@@ -75,6 +76,23 @@ class SourcePolicy(BaseModel):
     execution_boundary: dict[str, Any] = Field(default_factory=dict)
     entry_facts: dict[str, Any] = Field(default_factory=dict)
     source_workspace: str = ''
+
+    @model_validator(mode='before')
+    @classmethod
+    def acquisition_attempts(cls, value: Any) -> Any:
+        # Resolve related defaults together; explicit and saved limits win.
+        if not isinstance(value, dict):
+            return value
+        value = dict(value)
+        results, maximum = value.get('max_results'), value.get('max_documents', 20)
+        if ('max_fulltext_documents' not in value and type(results) is int and results > 0
+                and type(maximum) is int and maximum > 0):
+            value['max_fulltext_documents'] = min(results, maximum)
+        documents = value.get('max_fulltext_documents')
+        if ('max_fulltext_fetch_attempts' not in value and type(documents) is int and documents > 1):
+            value['max_fulltext_fetch_attempts'] = min(1000,
+                fulltext_fetch_attempt_cap({}, target=documents))
+        return value
 
     @field_validator('queries', 'providers', 'materials', mode='before')
     @classmethod

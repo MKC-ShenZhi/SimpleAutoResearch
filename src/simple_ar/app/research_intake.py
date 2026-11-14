@@ -190,7 +190,7 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
         raise ValueError('execution_confirmation requires a fixed scientific measurement contract')
     policy = SourcePolicy.model_validate({'max_results': max_results,
         'max_documents': max_results, 'max_chunks': max_chunks,
-        'idea_limit': idea_limit, 'max_fulltext_documents': min(max_results, 1),
+        'idea_limit': idea_limit,
         'cache_dir': str(Path(cache_dir).resolve()) if cache_dir else None,
         'providers': providers, **policy_values,
         'materials': policy_values.get('materials', materials), 'allow_network': not local_only,

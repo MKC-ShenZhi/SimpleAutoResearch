@@ -530,8 +530,8 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 | `--provider NAME` | 覆盖检索提供商，可重复。 | [] |
 | `--max-results N` | 检索结果数量限制。 | 10 |
 | `--max-chunks N` | 摄取分块数量限制。 | 300 |
-| `--max-fulltext-documents N` | 远程全文文档数量上限。 | 省略时不设数量上限 |
-| `--max-pdf-mb N` | 每份获取 PDF 的大小上限，单位 MiB。 | 省略时不设大小上限 |
+| `--max-fulltext-documents N` | 远程全文文档数量上限。 | 新任务默认不超过 `--max-results`；续接沿用保存策略 |
+| `--max-pdf-mb N` | 每份获取 PDF 的大小上限，单位 MiB。 | 新任务纯来源工作默认 20，含执行工作默认 8；续接沿用保存策略 |
 | `--web-extract-backend CHOICE` | 公开网页提取后端；与 PDF 获取分开。 可选：`direct`, `tavily_basic`. | 未设置 |
 | `--idea-limit N` | 结构化想法候选数量上限。 | 3 |
 | `--max-research-iterations N` | 首次分析后的新增轮数；0 表示首次分析后停止。 | 1 |
@@ -695,8 +695,8 @@ simple-ar research-brief --topic TEXT [OPTIONS]
 | `--provider NAME` | 覆盖检索提供商，可重复。 | [] |
 | `--max-results N` | 检索结果数量限制。 | 10 |
 | `--max-chunks N` | 摄取分块数量限制。 | 300 |
-| `--max-fulltext-documents N` | 远程全文文档数量上限。 | 省略时不设数量上限 |
-| `--max-pdf-mb N` | 每份获取 PDF 的大小上限，单位 MiB。 | 省略时不设大小上限 |
+| `--max-fulltext-documents N` | 远程全文文档数量上限。 | 新任务默认不超过 `--max-results`；续接沿用保存策略 |
+| `--max-pdf-mb N` | 每份获取 PDF 的大小上限，单位 MiB。 | 新任务纯来源工作默认 20；续接沿用保存策略 |
 | `--web-extract-backend CHOICE` | 公开网页提取后端；与 PDF 获取分开。 可选：`direct`, `tavily_basic`. | 未设置 |
 | `--idea-limit N` | 结构化想法候选数量上限。 | 3 |
 | `--max-research-iterations N` | 首次分析后的新增轮数；0 表示首次分析后停止。 | 1 |
