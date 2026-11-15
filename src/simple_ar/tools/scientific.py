@@ -652,7 +652,8 @@ class ScientificToolGateway:
             binding['execution_scope'] = 'workspace.v1'
         if plan is not None:
             current = self._current_attempts() if self._current_attempts is not None else None
-            if 'conditions' in (self.execution_contract or {}) or isinstance(current, dict):
+            if (self.preparation_contract(self.execution_contract) is not None
+                    and ('conditions' in self.execution_contract or isinstance(current, dict))):
                 binding['shared_environment_inputs'] = self._shared_environment_inputs()
             if shared:
                 owner, original, receipt = shared
