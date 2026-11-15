@@ -563,6 +563,7 @@ class ToolApplication:
             work_context=self._work_context,
             material_observations=self._material_observations,
             user_requests=self._inspection_requests,
+            user_request_count=lambda: len(self.state['requests']),
             native_route_validator=self._validate_professional_route,
             search_registry=getattr(self.services,'search_registry',None))
         self.workspace, self.gateway = self.operations.workspace, self.operations.gateway

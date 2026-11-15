@@ -258,7 +258,7 @@ class OperationTools:
                  record_artifacts, coordination, extension_host, observations, search_registry=None,
                  execution_observations=None, execution_history=None, artifact_changes=None,
                  work_context=None, material_observations=None,
-                 user_requests=None, native_route_validator=None):
+                 user_requests=None, user_request_count=None, native_route_validator=None):
         from simple_ar.tools.inspection import (
             InspectionToolGateway, SHARED_INSPECTION_OPERATIONS, inspection_tool_specs)
         self.root, self.config = root, config
@@ -548,7 +548,7 @@ class OperationTools:
         from simple_ar.report.delivery import Delivery
         self.delivery = Delivery(workspace=self.workspace, gateway=self.gateway,
             publication=self.publication, review_owner=self.delivery_review, config=config,
-            observations=observations, user_requests=user_requests)
+            observations=observations, user_requests=user_requests, user_request_count=user_request_count)
         self.session_id = session_id
         self.ledger = ledger
 

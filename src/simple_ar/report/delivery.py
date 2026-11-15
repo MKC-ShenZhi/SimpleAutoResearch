@@ -93,10 +93,12 @@ class Delivery:
     def __init__(self, *, workspace: Any, gateway: Any, publication: Any,
                  review_owner: Any, config: dict,
                  observations: Callable[[], list[dict]],
-                 user_requests: Callable[[], list[str]] | None) -> None:
+                 user_requests: Callable[[], list[str]] | None,
+                 user_request_count: Callable[[], int] | None = None) -> None:
         self.workspace, self.gateway = workspace, gateway
         self.publication, self.review_owner = publication, review_owner
         self.config, self.observations, self.user_requests = config, observations, user_requests
+        self.user_request_count = user_request_count
         self.legacy_report_status = config.get('delivery_review_protocol') not in {'task.v4', 'task.v5'}
 
     def _committed_review(self, observations: list[dict]) -> bool:
@@ -133,8 +135,11 @@ class Delivery:
         """Present the last retained complete delivery for a continuing request."""
         if self.user_requests is None:
             return None
+        count = self.user_request_count() if self.user_request_count is not None else len(self.user_requests())
+        if count < 2:
+            return None
         from simple_ar.tools.delivery_versions import DeliveryVersions
-        row = DeliveryVersions(self.workspace.root).latest_prior()
+        row = DeliveryVersions(self.workspace.root).latest_prior(count)
         if row is None:
             return None
         delivery = row['delivery']
