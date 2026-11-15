@@ -341,7 +341,7 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
             changes={'independent_review_required': False}, replace_existing=True)
         previous = case.app.operations.delivery.retained_prior_delivery()
         self.assertIsNotNone(previous)
-        self.assertIn('note.md', previous['artifacts'])
+        self.assertEqual([Path(path).name for path in previous['artifacts']], ['note.md'])
 
     def test_caller_can_spend_the_last_call_on_an_explicit_review(self):
         from simple_ar.app.tool_application import ToolApplication
