@@ -12,12 +12,12 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - The research retry API and CLI use the same saved task and ledger, including validated CodeTask sources; explicit resource-only continuations also retain the original ledger. Historical sessions retain their original continuation contract.
 - New standalone CodeTask runs created by the CLI or Python use their task ledger for planning, edits, repair, review and execution; embedded work keeps the parent ledger.
 - CodeTask reuses the running Python version and recorded initial syntax findings. Environment and dependency probes use the task process ledger, leaving necessary execution capacity intact.
-- Retained work hands original observations to the material owner for current admission without an extra handoff read; writing and independent review can use those observations without inheriting an opinion.
+- Retained work hands original observations to the material owner without an extra handoff read. Research and writing derive source previews and their versions from the same read; independent review can use observations without inheriting an opinion.
 - Common article revisions can return either local replacements or a complete revised draft, using the existing writing and review flow.
 
 ### Fixed
 
-- Common research work carries the original request and feedback into planning, reading, synthesis and design. Source selection retains an explicit publication range; reading can combine a retained bundle with additional materials, and idea assessment can reuse that reading without replacing the initial assessment with the subsequent design review.
+- Common research work carries the original request and feedback into planning, reading, synthesis and design, and honors older callers' deterministic planning and planning limits. Source selection retains an explicit publication range; reading can combine a retained bundle with additional materials, and idea assessment can reuse that reading without replacing the initial assessment with the subsequent design review.
 - Research feasibility review uses the caller's saved reviewer connection and the same task ledger.
 - Structured data analysis can request independent review of its results and supporting materials without also requesting a report.
 - A connection or resource failure before review starts is reported without inventing an interrupted inspection.
@@ -25,7 +25,8 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - Document and article responses bound to their recorded inputs can recover after later instruction changes without another authoring call.
 - Structured research can request other supported outcomes alongside a declared measurement; deterministic work no longer marks those outcomes complete merely because collection or measurement finished.
 - Ad hoc environment checks in ordinary tasks can reach the appropriate execution approval without a fixed experiment contract.
-- An explicitly selected final independent review remains required for the same work, including text-only delivery and an expanded or narrowed artifact inventory, when preparation, resources or execution prevent it from completing.
+- An explicitly selected final independent review remains required for the same work, including text-only delivery and an expanded or narrowed artifact inventory, when preparation, resources or execution prevent it from completing. New shared tasks do not treat permission-only updates as changed research claims.
+- Historical research sessions using planned edits retain that mode instead of silently switching to direct editing.
 - Structured chat setup can carry a confirmed request for independent review into the existing delivery condition.
 
 ## 2026-11-15
