@@ -1405,7 +1405,7 @@ class ToolApplication:
         """Original requests, without a review-only administrative supply notice."""
         requests = list(self.state['requests'])
         for supply in reversed(self.state.get('supplies', [])):
-            if set(supply.get('changes', {})) != {'independent_review_required'} or supply.get('resource_allowances'):
+            if set(supply.get('changes', {})) != {'independent_review_required'}:
                 continue
             index = supply.get('request_count', 0) - 1
             prefix = ('Caller explicitly replaced task contracts: ' if supply.get('replace_existing')

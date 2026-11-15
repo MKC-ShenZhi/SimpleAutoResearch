@@ -13,7 +13,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
-- An explicitly configured independent review cannot be waived by the producer; the common and structured research entries both accept the requirement. New tasks also retain a selected final review; applicable reviews can be reused, local candidate checks stay optional and unfinished work can be delivered as partial.
+- An explicitly configured independent review cannot be waived by the producer; the common and structured research entries both accept the requirement. New tasks also retain a selected final review; applicable reviews remain reusable when the requirement and resources are supplied together, local candidate checks stay optional and unfinished work can be delivered as partial.
 - Structured source collection aligns its default fetch attempts with the permitted document count, so a multi-source request is not cut short by a single-document default.
 - A selected independent review can use remaining capacity when a forecast for a later decision would prevent its actual work; the review's own follow-up capacity and results are retained.
 - Workspace-isolated execution retains system alternatives links so standard tools using those links remain available.

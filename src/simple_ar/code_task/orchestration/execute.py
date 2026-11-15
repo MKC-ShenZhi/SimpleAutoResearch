@@ -730,7 +730,8 @@ def execute_code_task(
     elif dry_run:
         return _dry_result(paths, steps, "apply-edits", "apply reviewed proposed edits")
     else:
-        _emit(message_callback, "Applying reviewed edit proposal.")
+        _emit(message_callback, "Applying authorized edit proposal." if direct_without_plan
+              else "Applying reviewed edit proposal.")
         try:
             result = apply_patch_edits(root, allow_large_edits=allow_large_edits,
                 **({'allow_unapproved_plan': True} if direct_without_plan else {}))
@@ -768,7 +769,8 @@ def execute_code_task(
         record_edit_history(
             root,
             changed_files=list(result.changed_files),
-            reason=f"Applied reviewed edit proposal to {len(result.changed_files)} file(s).",
+            reason=(f"Applied {'authorized' if direct_without_plan else 'reviewed'} edit proposal "
+                    f"to {len(result.changed_files)} file(s)."),
             proposal="code_task/meta/proposed_edits.json",
             patch_diff=_relative_to_run(root, result.patch_diff_path),
             metadata={"applied_edits": _relative_to_run(root, result.applied_edits_path)},

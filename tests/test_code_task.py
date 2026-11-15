@@ -638,7 +638,7 @@ class CodeTaskTests(unittest.TestCase):
                 self.assertEqual(call.call_count, 1)
                 self.assertFalse((run_dir / 'code_task/patch_plan.md').exists())
                 candidate = code_task_paths(run_dir).workspace_dir / 'spam_model.py'
-                self.assertIn('prize', candidate.read_text(encoding='utf-8'))
+                self.assertIn("('win', 'prize')", candidate.read_text(encoding='utf-8'))
                 self.assertEqual((project / 'spam_model.py').read_bytes(), original)
                 self.assertEqual(ledger.remaining('llm_requests'), 3)
                 resumed = implement_code_task(run_dir, approval_note='Existing task grants isolated edits',
