@@ -5856,10 +5856,6 @@ class ToolApplication:
             return lambda: perform(pending['attempt'])
         return None
 
-    def _active_action(self) -> dict:
-        pending = self.state.get('pending') or {}
-        return pending.get('action') or pending
-
     def execution_binding(self, call: dict[str, Any]) -> dict[str, Any]:
         """Describe the actual inputs bound to a pending execution approval."""
         return self.execution_approval(call)['binding']

@@ -23,28 +23,6 @@ from simple_ar.code_task.execution.summary import write_code_task_summary
 
 TRACEBACK_RE = re.compile(r"Traceback \(most recent call last\):[\s\S]*", re.MULTILINE)
 FILE_LINE_RE = re.compile(r'File "([^"]+)", line (\d+)(?:, in ([^\n]+))?')
-SIGNAL_LINES = (
-    "Experiment failed",
-    "AssertionError",
-    "AttributeError",
-    "ModuleNotFoundError",
-    "ImportError",
-    "SyntaxError",
-    "NameError",
-    "TypeError",
-    "ValueError",
-    "has no attribute",
-    "FAILED",
-    "ERROR",
-    "Timed out",
-    "below benchmark floor",
-    "exceeded local benchmark budget",
-    "accuracy:",
-    "macro_f1:",
-    "train_time_sec:",
-)
-
-
 @dataclass(frozen=True)
 class FailureAnalysisResult:
     """Result returned after writing deterministic failure analysis.
@@ -407,17 +385,6 @@ def _implicated_files(text: str, workspace_dir: Path) -> list[str]:
         if rel not in files:
             files.append(rel)
     return files
-
-
-def _signal_lines(stdout: str, stderr: str) -> list[str]:
-    found: list[str] = []
-    for line in (stderr + "\n" + stdout).splitlines():
-        stripped = " ".join(line.strip().split())
-        if not stripped:
-            continue
-        if any(signal in stripped for signal in SIGNAL_LINES):
-            found.append(_clip(stripped, max_chars=240))
-    return found
 
 
 def _stderr_fallback_signal_lines(stderr: str) -> list[str]:

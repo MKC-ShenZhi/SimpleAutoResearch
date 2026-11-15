@@ -1233,17 +1233,6 @@ def _non_resource_metric_names(manifest: dict[str, Any], metrics: dict[str, floa
     return names
 
 
-def _greenfield_results_artifact_path(workspace_dir: Path) -> Path:
-    candidates = [
-        workspace_dir / "generated_project" / "artifacts" / "results.json",
-        workspace_dir / "artifacts" / "results.json",
-    ]
-    for path in candidates:
-        if path.is_file():
-            return path
-    return candidates[0]
-
-
 def _update_manifest_after_run(
     run_dir: Path,
     manifest: dict[str, Any],

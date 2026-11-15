@@ -1861,14 +1861,8 @@ def _print_code_task_init(args: argparse.Namespace) -> None:
             edit_scope_mode=options.edit_scope_mode,
             edit_scope_allowed_patterns=options.edit_scope_allowed_patterns,
             edit_scope_protected_patterns=options.edit_scope_protected_patterns,
+            direct_edit=True,
         )
-        if result.kind == 'existing_project':
-            # New standalone runs use the shared editor. Saved runs keep their
-            # existing plan and approval contract.
-            from simple_ar.code_task.runtime.state import load_code_task_manifest, save_code_task_manifest
-            saved = load_code_task_manifest(result.run_dir)
-            saved['code_task']['auto_edit_policy'] = 'direct.v1'
-            save_code_task_manifest(result.run_dir, saved)
     except (
         FileExistsError,
         FileNotFoundError,

@@ -89,6 +89,7 @@ def initialize_code_task(
     respect_allowed_paths: bool = False,
     data_inputs: tuple[str, ...] = (),
     initial_files: tuple[str, ...] = (),
+    direct_edit: bool = False,
 ) -> CodeTaskInitResult:
     """Initialize a local code-task run without modifying the source project.
 
@@ -131,6 +132,8 @@ def initialize_code_task(
             incidental file-size limits do not apply to this selection.
         initial_files: Explicit new Python adapters, never inferred from edit scope.
             Fail-closed placeholders are created only in the isolated workspace.
+        direct_edit: New existing-project tasks may propose edits without a
+            separate plan; applying them remains subject to caller approval.
 
     Returns:
         Paths and metadata for the initialized code-task run.
@@ -261,6 +264,7 @@ def initialize_code_task(
             edit_scope=edit_scope,
             environment_policy=environment_policy,
             kind=normalized_kind,
+            direct_edit=direct_edit,
         ),
     )
     if normalized_kind != "greenfield":
@@ -316,6 +320,7 @@ def _manifest(
     edit_scope: dict[str, Any],
     environment_policy: dict[str, Any],
     kind: str,
+    direct_edit: bool,
 ) -> dict[str, Any]:
     project = codebase_index.get("project", {})
     repo_project = repo_map.get("project", {})
@@ -327,6 +332,7 @@ def _manifest(
         "status": "initialized",
         "code_task": {
             "kind": kind,
+            **({"auto_edit_policy": "direct.v1"} if direct_edit and kind == "existing_project" else {}),
         },
         "created_at": _utcnow_iso(),
         "run_dir": str(run_dir),
