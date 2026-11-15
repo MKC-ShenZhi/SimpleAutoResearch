@@ -34,6 +34,7 @@ def _legacy_creation_options(services: Any) -> dict:
 
 
 _DEFAULT_RESEARCH_PROVIDERS = ('openalex', 'semantic_scholar', 'arxiv')
+_SOURCE_POLICY_ALIASES = {'research_sources': 'providers', 'research_use_fulltext': 'require_fulltext'}
 _OUTPUT_ALIASES = {'experiment': 'experiments', 'code': 'code_task', 'code_patch': 'code_task',
     'patch': 'code_task', 'bug_repair': 'bug_fix'}
 _SUPPORTED_RESEARCH_OUTPUTS = frozenset({'summary', 'research_summary', 'report', 'paper', 'full_paper',
@@ -159,8 +160,7 @@ def revise_research_task(app: Any, *, research_settings: Mapping[str, Any] | Non
     changes: dict[str, Any] = {}
     if mounts != saved['sources']:
         changes['sources'] = mounts
-    aliases = {'research_use_fulltext': 'require_fulltext',
-        'max_research_iterations': 'max_iterations'}
+    aliases = {**_SOURCE_POLICY_ALIASES, 'max_research_iterations': 'max_iterations'}
     for name, value in (research_settings or {}).items():
         if name == 'research_materials_only':
             policy['allow_network'] = not value
@@ -363,8 +363,7 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
         raise ValueError('Research application budgets must be positive.')
     config = dict(config or {})
     limits = dict(budget_limits or {})
-    aliases = {'research_sources': 'providers', 'research_use_fulltext': 'require_fulltext',
-        'research_selected_idea_id': 'selected_idea_id', 'feasibility_review_model': 'feasibility_connection'}
+    aliases = {**_SOURCE_POLICY_ALIASES, 'feasibility_review_model': 'feasibility_connection'}
     policy_values, unhandled = {}, []
     auxiliary = {'research_task_kind', 'research_materials_only', 'research_local_documents', 'report', 'report_writing_method',
         'independent_review_required',

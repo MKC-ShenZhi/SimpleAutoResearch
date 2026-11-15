@@ -48,7 +48,7 @@ class SourcePolicy(BaseModel):
     queries: tuple[str, ...] = ()
     providers: tuple[str, ...] = ('arxiv', 'openalex', 'semantic_scholar', 'web')
     materials: tuple[str, ...] = ()
-    plan_mode: Literal['deterministic', 'llm'] | None = Field(default=None, exclude_if=lambda value: value is None)
+    plan_mode: str | None = Field(default=None, exclude_if=lambda value: value is None)
     max_queries: int | None = Field(default=None, ge=1, exclude_if=lambda value: value is None)
     planning_max_output_tokens: int | None = Field(default=None, ge=1, exclude_if=lambda value: value is None)
     max_results: int = Field(default=5, ge=1, le=1000)

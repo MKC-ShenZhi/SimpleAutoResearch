@@ -334,9 +334,11 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(restored.session.manifest.budget.attempts, previous_attempts)
             self.assertEqual(restored.session.manifest.budget.max_attempts, previous_limit + 3)
             self.assertEqual(restored.ledger.remaining('source_operations'), 20)
-            self.assertTrue(revise_research_task(restored, research_settings={'max_results': 7}))
+            self.assertTrue(revise_research_task(restored,
+                research_settings={'max_results': 7, 'research_sources': ['arxiv']}))
             restored = ToolApplication.load(base / 'task')
             self.assertEqual(restored.state['config']['research_policy']['max_results'], 7)
+            self.assertEqual(restored.state['config']['research_policy']['providers'], ['arxiv'])
             self.assertFalse(restored._operation_observations(domain='sources')[0]['contract_current'])
 
     def test_plain_resume_does_not_rewrite_an_older_source_policy(self):
