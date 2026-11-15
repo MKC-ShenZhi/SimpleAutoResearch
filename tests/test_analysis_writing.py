@@ -41,7 +41,8 @@ class AnalysisWritingTests(unittest.TestCase):
             self.assertEqual(defaults['local_document'], [str(paper.resolve())])
             self.assertTrue(defaults['research_materials_only'])
             self.assertFalse(defaults['research_allow_pdf_download'])
-            with patch('sys.stdin.isatty', return_value=False), contextlib.redirect_stdout(io.StringIO()):
+            with patch('sys.stdin.isatty', return_value=False), \
+                    patch('simple_ar.cli.start.select_start_model'), contextlib.redirect_stdout(io.StringIO()):
                 review_config = prepare_start(parser.parse_args([
                     *common, '--independent-review-required', '--model', 'review-model']))
             reviewed = research_defaults(['research-session', '--config', str(review_config)])

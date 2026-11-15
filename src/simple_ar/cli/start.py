@@ -1162,7 +1162,7 @@ def prepare_start(args: argparse.Namespace, *, for_execution: bool = False) -> P
         if (documents or materials or sources) and not data_model:
             raise ValueError("Data documentation and references require a report or independent review.")
         if any(path.suffix.lower() not in {".md", ".markdown", ".txt", ".pdf"} for path in [*documents, *materials]):
-            raise ValueError("Data report documentation must be local text/PDF; supply the table through --data-file.")
+            raise ValueError("Data documentation must be local text/PDF; supply the table through --data-file.")
         if len(set([*documents, *materials])) != len(documents) + len(materials):
             raise ValueError("Each supplied file must have one role; use --material for data documentation and --document for references.")
         sources = "materials"
@@ -1261,6 +1261,8 @@ def prepare_start(args: argparse.Namespace, *, for_execution: bool = False) -> P
         print_line("The analysis itself makes no model/API calls or project-code execution and does not verify experiments. Descriptive statistics only; copied data may be sensitive. Optional chat setup has separate model usage.")
         if args.with_report:
             print_line("A model will write and review a report from this session's copied data, computed results and figures; no new experiments or online search.")
+        elif getattr(args, 'independent_review_required', False):
+            print_line("Independent review uses the selected model and the shared task budget; no report is required.")
     else:
         print_line(f"Sources: {sources}; papers: {len(documents)}; materials: {len(materials)}. " +
                    ("One declared reproduction command requested." if kind == "reproduction" else "No code execution requested."))
