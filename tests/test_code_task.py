@@ -200,12 +200,14 @@ class CodeTaskTests(unittest.TestCase):
                 client = Mock()
                 with patch('simple_ar.core.process.subprocess.Popen') as launch, \
                         patch('simple_ar.research.implementation.implement_code_task', return_value=SimpleNamespace(
-                            stop_reason='stop_point', next_action='Inspect', steps=())):
+                            stop_reason='stop_point', next_action='Inspect', steps=())) as implementation:
                     result = run_implementation_capability(context=context, request=ImplementationRequest(
                         run, initialized.workspace_dir, 'Original approval', client,
                         validation_command=('python', 'check.py'), validation_timeout_sec=5,
-                        budget_ledger=ledger, session_id='same-session', attempt_id='native-tool-001'))
+                        budget_ledger=ledger, session_id='same-session', attempt_id='native-tool-001',
+                        defer_model_review=after_archive))
                     self.assertEqual(result.status, 'completed')
+                    self.assertEqual(implementation.call_args.kwargs['review_use_llm'], not after_archive)
                     launch.assert_not_called()
                     client.ask_json.assert_not_called()
                 domain = store.read_json('implementation.json')

@@ -502,7 +502,8 @@ class ToolApplication:
                 or config.get('code_review_policy') == 'delivery.v1' and (
                     config.get('code_work_policy') != 'shared.v2'
                     or config.get('delivery_review_protocol') != 'task.v5'
-                    or config.get('delivery_review_selection') == 'model.v1')):
+                    or config.get('delivery_review_selection') == 'model.v1'
+                       and not config.get('independent_review_required'))):
             raise ValueError('Shared code review requires the whole-delivery review owner')
         if ('independent_review_required' in config
                 and (type(config['independent_review_required']) is not bool
@@ -2396,6 +2397,17 @@ class ToolApplication:
                 # An explicitly supplied new code contract is new work, not a
                 # change to an already running historical code operation.
                 config['code_work_policy'] = 'shared.v2'
+                if (config.get('delivery_review_protocol') == 'task.v5'
+                        and (old.get('delivery_review_selection') != 'model.v1'
+                             or config.get('independent_review_required'))):
+                    config['code_review_policy'] = 'delivery.v1'
+                else:
+                    config['code_review_policy'] = None
+            elif 'code_task' in supplied and supplied['code_task'] is None:
+                config['code_work_policy'] = config['code_review_policy'] = None
+            if (supplied.get('independent_review_required') is False
+                    and old.get('delivery_review_selection') == 'model.v1'):
+                config['code_review_policy'] = None
             if old.get('source_snapshots'):
                 config['source_snapshots'] = {name: value for name, value in old['source_snapshots'].items()
                     if old['sources'][name] == config['sources'].get(name)}

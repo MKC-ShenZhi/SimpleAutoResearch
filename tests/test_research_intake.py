@@ -712,6 +712,20 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(continuing.ledger.to_dict(), before_ledger)
             self.assertEqual(continuing.operations.implementation.work_context([str(project)])['user_requests'],
                 continuing.state['requests'])
+            reviewed = create_research_task(ResearchBrief(request_text='Inspect and independently check the project.',
+                requested_outputs=('summary',), asset_requests=({'locator': str(project), 'role': 'code'},)),
+                root=base / 'continued-reviewed-task', services=supplied_services)
+            before = reviewed.ledger.to_dict()
+            reviewed.supply(supply_id='reviewed-code', reason='The caller supplied code scope and required review',
+                changes={'allow_execution': True, 'code_task': exact, 'independent_review_required': True})
+            self.assertTrue(reviewed.operations.implementation.defer_code_review)
+            self.assertEqual(reviewed.ledger.to_dict(), before)
+            reviewed = ToolApplication.load(base / 'continued-reviewed-task', services=supplied_services)
+            self.assertTrue(reviewed.operations.implementation.defer_code_review)
+            reviewed.supply(supply_id='optional-review', reason='The caller revised the review requirement',
+                changes={'independent_review_required': False}, replace_existing=True)
+            self.assertFalse(reviewed.operations.implementation.defer_code_review)
+            self.assertEqual(reviewed.ledger.to_dict(), before)
             paper = base / 'method.md'
             paper.write_text('A supplied method description, not verified implementation evidence.', encoding='utf-8')
             for outputs in (('code_task', 'summary'), ('code_task', 'experiments'), ('code_task', 'report')):
