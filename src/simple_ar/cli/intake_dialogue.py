@@ -511,9 +511,10 @@ def _read_materials(requests: list[dict[str, str]], state: dict[str, Any], root:
             bundle = DocumentBundle.from_handoff_dict(read_json(root / entry["bundle"]))
             chunks = rank_source_chunks(bundle.chunks, row["query"], limit=3)
             selected = source_chunk_views(chunks, query=row["query"], max_chars=max(1, remaining // len(requests)))
+            from simple_ar.research.documents.ingest import document_report_rows
             result.update(status="matched" if selected else "no_match" if bundle.chunks else "unavailable", coverage=[
                 {"status": doc.get("status"), "coverage": doc.get("coverage", {})}
-                for doc in bundle.fulltext_extraction.get("documents", [])])
+                for doc in document_report_rows(bundle.fulltext_extraction)])
             for view in selected:
                 view.update(path=row["path"], query=row["query"])
                 remaining -= len(view["text"])

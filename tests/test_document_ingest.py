@@ -595,6 +595,9 @@ class DocumentIngestTests(unittest.TestCase):
             self.assertEqual([row.document_id for row in imported.records], [row.document_id for row in bundle.records])
             self.assertEqual([row.to_row() for row in imported.chunks], [row.to_row() for row in bundle.chunks])
             self.assertEqual(imported.records[1].metadata["retained_source_role"], "paper")
+            self.assertEqual(imported.fulltext_manifest['document_count'], 0)
+            self.assertEqual(imported.fulltext_manifest['retained_reports'][0]['report'], bundle.fulltext_manifest)
+            self.assertEqual(imported.fulltext_extraction['retained_reports'][0]['report'], bundle.fulltext_extraction)
             self.assertEqual(saved.read_bytes(), before)
             repeated = Paper(id="p1", title="Metadata Paper", authors=[], abstract="New metadata.",
                              url="https://example.test/p1", source="fixture")
@@ -604,6 +607,7 @@ class DocumentIngestTests(unittest.TestCase):
             merged = DocumentBundle.from_handoff_dict(store.read_json(repeated_result.artifacts[0]))
             self.assertEqual(len(merged.records), len(bundle.records))
             self.assertEqual({r.document_id for r in merged.records}, {r.document_id for r in bundle.records})
+            self.assertEqual(merged.fulltext_manifest['document_count'], 1)
             self.assertTrue(all(row in merged.chunks for row in bundle.chunks))
             self.assertEqual(len({row.chunk_id for row in merged.chunks}), len(merged.chunks))
             with self.assertRaisesRegex(ValueError, "identities conflict"):

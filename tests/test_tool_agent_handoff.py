@@ -8395,8 +8395,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         documents = combined['documents']
         self.assertEqual(len(documents), 2)
         self.assertIn('original', {row['document_id'] for row in documents})
-        self.assertIn(acquisition, combined['fulltext_manifest']['batches'])
-        self.assertIn(extraction, combined['fulltext_extraction']['batches'])
+        self.assertEqual(combined['fulltext_manifest']['retained_reports'][0]['report'], acquisition)
+        self.assertEqual(combined['fulltext_extraction']['retained_reports'][0]['report'], extraction)
         lookup = owner.call('find_source_passages',
             {'document_record': result.data['document_record'], 'query': 'cancellation'}, identity='lookup')
         self.assertTrue(lookup.ok, lookup.error)

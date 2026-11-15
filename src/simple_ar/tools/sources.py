@@ -24,7 +24,7 @@ from simple_ar.research.design import ResearchDesignRequest, run_research_design
 from simple_ar.research.summary import render_summary
 from simple_ar.research.workflow_contracts import ResearchBrief
 from simple_ar.research.contracts import DocumentRecord, SourcePlan
-from simple_ar.research.documents.ingest import DocumentBundle, build_document_bundle, merge_document_bundles
+from simple_ar.research.documents.ingest import DocumentBundle, build_document_bundle, document_report_rows, merge_document_bundles
 from simple_ar.research.documents.fulltext import fulltext_fetch_attempt_cap
 from simple_ar.research.store.retrieval import rank_source_chunks, source_chunk_views
 from simple_ar.research.store.chunking import bounded_document_coverage
@@ -198,7 +198,7 @@ def _source_identity(record: DocumentRecord, bundle: DocumentBundle) -> dict[str
         row['hint_kind'] = extraction['hint_kind']
     # Older saved bundles retain this qualification only in the acquisition
     # manifest. Use the selected cached resource, never a failed alternative.
-    hint = next((hint for document in bundle.fulltext_manifest.get('documents', [])
+    hint = next((hint for document in document_report_rows(bundle.fulltext_manifest)
         if document.get('document_id') == record.document_id
         for hint in document.get('hints', [])
         if record.extraction_status == 'parsed' and hint.get('status') == 'cached'
@@ -798,13 +798,13 @@ class SourceToolGateway:
                 else:
                     local.append(str(path))
             incoming = (self._bundle(papers, [], context.store.root, network=network, local_documents=local)
-                if papers or local or not retained else retained.pop(0))
+                if papers or local or not retained else None)
             for saved in retained:
                 incoming = merge_document_bundles(incoming, saved)
             return incoming
 
         def add_materials(existing: DocumentBundle | None, incoming: DocumentBundle) -> DocumentBundle:
-            return merge_document_bundles(existing, incoming)
+            return incoming if existing is None else merge_document_bundles(incoming, existing, prepend=True)
 
         op, bundle, read = request.operation, None, None
         plan = ResearchPlanResult.from_handoff_dict(self._handoff(request.plan_record, 'research_plan.v1')) if request.plan_record else None

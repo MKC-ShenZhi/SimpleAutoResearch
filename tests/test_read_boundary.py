@@ -25,22 +25,25 @@ from simple_ar.research.evidence.reader import (
 
 
 class ReadBoundaryTests(unittest.TestCase):
-    def test_independent_source_histories_survive_combination_and_further_reading(self):
+    def test_retained_source_history_does_not_spend_current_acquisition_budget(self):
+        from simple_ar.research.documents.ingest import document_report_rows
         def bundle(name, size):
             report = {'schema_version': 'research_fulltext_manifest.v1',
-                'budget': {'max_pdf_mb': size},
+                'budget': {'max_pdf_mb': size}, 'document_count': 1,
+                'cached_count': 1, 'fetch_attempt_count': 1,
                 'documents': [{'document_id': name, 'hints': [{'status': 'cached'}]}]}
             return DocumentBundle(records=[DocumentRecord(document_id=name, title=name, source='local_files')],
                 fulltext_manifest=report, fulltext_extraction={}, sections=[],
                 chunks=[TextChunk(chunk_id=f'{name}-chunk', document_id=name, text=f'Observation from {name}.')])
 
-        first, second, third = bundle('first', 8), bundle('second', 20), bundle('third', 5)
-        combined = merge_document_bundles(first, second)
+        first, second, third = bundle('first', 8), bundle('second', 20), bundle('third', 20)
+        combined = merge_document_bundles(second, first, prepend=True)
         merged = merge_read_results(read_documents(ReadRequest(combined)), read_documents(ReadRequest(third)))
         history = merged.bundle.fulltext_manifest
-        self.assertEqual([item['budget']['max_pdf_mb'] for item in history['batches']], [8, 20, 5])
-        self.assertEqual({row['document_id'] for row in history['documents']}, {'first', 'second', 'third'})
-        self.assertNotIn('budget', history)  # No synthetic shared allowance.
+        self.assertEqual(history['budget']['max_pdf_mb'], 20)
+        self.assertEqual((history['document_count'], history['cached_count'], history['fetch_attempt_count']), (2, 2, 2))
+        self.assertEqual(history['retained_reports'][0]['report'], first.fulltext_manifest)
+        self.assertEqual({row['document_id'] for row in document_report_rows(history)}, {'first', 'second', 'third'})
 
     def test_question_gaps_survive_empty_or_context_shortlist_without_extra_model_call(self):
         plan = json.dumps({"research_questions": {"questions": [

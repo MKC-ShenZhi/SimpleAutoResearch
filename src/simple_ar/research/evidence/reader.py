@@ -26,7 +26,7 @@ from simple_ar.research.contracts import (
     PaperCard,
     TextChunk,
 )
-from simple_ar.research.documents.ingest import DocumentBundle, merge_document_reports
+from simple_ar.research.documents.ingest import DocumentBundle
 from simple_ar.research.evidence.bibliography import front_matter_view
 from simple_ar.research.store.chunking import DEFAULT_CHUNK_CHARS
 from simple_ar.research.store.retrieval import order_source_chunks, rank_source_chunks, source_chunk_views, source_query_terms
@@ -367,12 +367,10 @@ def _merge_fulltext(previous: dict, fresh: dict) -> dict:
     """Merge the existing fulltext manifest/extraction formats, not arbitrary keys."""
     if not previous or not fresh or previous == fresh:
         return dict(previous or fresh)
-    if 'batches' in previous or 'batches' in fresh:
-        return merge_document_reports(previous, fresh)
     rows = _append_unique(previous.get("documents", []), fresh.get("documents", []), "document_id")
     counts = {"document_count", "hint_count", "selected_count", "fetch_attempt_count",
               "cached_count", "parsed_count", "status_counts"}
-    metadata = (previous.keys() | fresh.keys()) - counts - {"documents", "notes"}
+    metadata = (previous.keys() | fresh.keys()) - counts - {"documents", "notes", "retained_reports"}
     merged = {}
     for key in metadata:
         if key == "budget":
@@ -390,6 +388,12 @@ def _merge_fulltext(previous: dict, fresh: dict) -> dict:
         merged[key] = previous[key] if key in previous else fresh[key]
     merged.update(documents=rows, notes=list(dict.fromkeys(
         previous.get("notes", []) + fresh.get("notes", []))))
+    retained = []
+    for report in (*previous.get('retained_reports', []), *fresh.get('retained_reports', [])):
+        if report not in retained:
+            retained.append(report)
+    if retained:
+        merged['retained_reports'] = retained
     if "budget" in merged:
         note = ("Cumulative manifest budget retains the original total limits, not the fresh batch's "
                 "remaining allowance; each ingest attempt retains its own effective budget.")

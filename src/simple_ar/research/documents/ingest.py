@@ -95,35 +95,48 @@ class DocumentBundle:
         )
 
 
-def merge_document_reports(previous: dict[str, Any], fresh: dict[str, Any]) -> dict[str, Any]:
-    """Keep independent acquisition/extraction reports and their document rows."""
-    if not previous or not fresh or previous == fresh:
-        return dict(previous or fresh)
-    batches = []
-    for report in (previous, fresh):
-        for batch in report.get('batches', [report]):
-            if batch not in batches:
-                batches.append(batch)
-    documents = []
-    for batch in batches:
-        for row in batch.get('documents', []):
-            if row not in documents:
-                documents.append(row)
-    # Budgets and fetch counts belong to their original attempts, not to this
-    # newly assembled view. Keep them in the unmodified individual reports.
-    return {'schema_version': previous.get('schema_version') or fresh.get('schema_version'),
-        'document_count': len({row.get('document_id') for row in documents}),
-        'documents': documents, 'batches': batches}
+def retain_document_report(current: dict[str, Any], retained: dict[str, Any],
+                           document_ids: set[str]) -> dict[str, Any]:
+    """Keep selected original reports apart from this task's acquisition counters."""
+    result = dict(current)
+    if not retained or not document_ids:
+        return result
+    reports = list(result.get('retained_reports', []))
+    primary = {key: value for key, value in retained.items() if key != 'retained_reports'}
+    sources = [{'document_ids': sorted(document_ids), 'report': primary}]
+    for row in retained.get('retained_reports', []):
+        selected = document_ids.intersection(row['document_ids'])
+        if selected:
+            sources.append({'document_ids': sorted(selected), 'report': row['report']})
+    for row in sources:
+        if row['report'] and row not in reports:
+            reports.append(row)
+    if reports:
+        result['retained_reports'] = reports
+    return result
 
 
-def merge_document_bundles(previous: DocumentBundle | None, fresh: DocumentBundle) -> DocumentBundle:
-    """Combine retained source content with its actual acquisition provenance."""
-    if previous is None:
-        return fresh
-    return DocumentBundle(records=[*previous.records, *fresh.records],
-        sections=[*previous.sections, *fresh.sections], chunks=[*previous.chunks, *fresh.chunks],
-        fulltext_manifest=merge_document_reports(previous.fulltext_manifest, fresh.fulltext_manifest),
-        fulltext_extraction=merge_document_reports(previous.fulltext_extraction, fresh.fulltext_extraction))
+def document_report_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expose current and selected retained source observations together."""
+    rows = list(report.get('documents', []))
+    for retained in report.get('retained_reports', []):
+        selected = set(retained['document_ids'])
+        rows.extend(row for row in retained['report'].get('documents', [])
+                    if row.get('document_id') in selected and row not in rows)
+    return rows
+
+
+def merge_document_bundles(current: DocumentBundle | None, retained: DocumentBundle,
+                           *, prepend: bool = False) -> DocumentBundle:
+    """Reuse source content and provenance without charging old retrievals again."""
+    if current is None:
+        current = DocumentBundle([], {'document_count': 0}, {'document_count': 0}, [], [])
+    ids = {record.document_id for record in retained.records}
+    first, second = (retained, current) if prepend else (current, retained)
+    return DocumentBundle(records=[*first.records, *second.records],
+        sections=[*first.sections, *second.sections], chunks=[*first.chunks, *second.chunks],
+        fulltext_manifest=retain_document_report(current.fulltext_manifest, retained.fulltext_manifest, ids),
+        fulltext_extraction=retain_document_report(current.fulltext_extraction, retained.fulltext_extraction, ids))
 
 
 def analysis_material_paths(paths: Iterable[Path]) -> tuple[Path, ...]:
@@ -465,6 +478,9 @@ def run_document_ingest_capability(
             for record in saved.records if record.document_id in keep_saved)
         bundle.sections.extend(row for row in saved.sections if row.document_id in keep_saved)
         bundle.chunks.extend(row for row in saved.chunks if row.document_id in keep_saved)
+        bundle = replace(bundle,
+            fulltext_manifest=retain_document_report(bundle.fulltext_manifest, saved.fulltext_manifest, keep_saved),
+            fulltext_extraction=retain_document_report(bundle.fulltext_extraction, saved.fulltext_extraction, keep_saved))
     output = context.store.write_json(
         "document_bundle.json",
         bundle.to_handoff_dict(),
