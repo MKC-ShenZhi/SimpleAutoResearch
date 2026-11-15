@@ -377,6 +377,7 @@ def execute_code_task(
             review = review_code_task_changes(
                 root, phase=phase, llm_client=task_client(use_llm if review_use_llm is None
                     else use_llm and review_use_llm, reviewer_model or model),
+                budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
                 model=reviewer_model or model,
                 use_llm=use_llm if review_use_llm is None else use_llm and review_use_llm,
                 max_source_chars_per_file=max_source_chars_per_file,
@@ -496,6 +497,7 @@ def execute_code_task(
             try:
                 result = generate_code_task_work_plan(
                     root,
+                    budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
                     llm_client=task_client(use_llm, planner_model or model),
                     model=planner_model or model,
                     use_llm=use_llm,
@@ -571,6 +573,7 @@ def execute_code_task(
         try:
             result = generate_patch_plan(
                 root,
+                budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
                 llm_client=task_client(use_llm, planner_model or model),
                 model=planner_model or model,
                 use_llm=use_llm,
@@ -649,6 +652,7 @@ def execute_code_task(
         _emit(message_callback, "Generating controlled edit proposal.")
         result = propose_patch_edits(
             root,
+            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
             llm_client=task_client(use_llm, editor_model or model),
             model=editor_model or model,
             use_llm=use_llm,
@@ -832,6 +836,7 @@ def execute_code_task(
             max_batches=max_batches,
             cost_cap_usd=cost_cap_usd,
             client_supplier=task_client,
+            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
             model=model,
             repair_model=repair_model,
             use_llm=use_llm,
@@ -860,6 +865,7 @@ def execute_code_task(
             max_batches=max_batches,
             cost_cap_usd=cost_cap_usd,
             client_supplier=task_client,
+            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
             model=model,
             repair_model=repair_model,
             use_llm=use_llm,
@@ -1242,6 +1248,7 @@ def _handle_failure(
     max_batches: int | None,
     cost_cap_usd: float | None,
     client_supplier: Callable[[bool, str | None], LLMClient | None],
+    budget_ledger: BudgetLedger | None, session_id: str, attempt_id: str,
     model: str | None,
     repair_model: str | None,
     use_llm: bool,
@@ -1300,6 +1307,7 @@ def _handle_failure(
     _emit(message_callback, "Generating bounded repair proposal.")
     repair = propose_repair_edits(
         run_dir,
+        budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
         llm_client=client_supplier(use_llm, repair_model or model),
         model=repair_model or model,
         use_llm=use_llm,

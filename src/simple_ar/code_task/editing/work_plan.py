@@ -32,6 +32,8 @@ from simple_ar.code_task.runtime.state import (
     utcnow_iso,
 )
 from simple_ar.code_task.analysis.interfaces import render_source_snippets, snippet_api_contract
+from simple_ar.core.budget import BudgetLedger
+from simple_ar.code_task.runtime.accounting import account_code_task
 from simple_ar.integrations.llm import LLMClient
 
 
@@ -69,6 +71,7 @@ class CodeTaskWorkPlanResult:
     pending_approval: bool
 
 
+@account_code_task
 def generate_code_task_work_plan(
     run_dir: Path,
     *,
@@ -81,6 +84,7 @@ def generate_code_task_work_plan(
     max_source_chars_per_file: int = 2500,
     message_callback: MessageCallback | None = None,
     llm_client: LLMClient | None = None,
+    budget_ledger: BudgetLedger | None = None, session_id: str = "", attempt_id: str = "",
 ) -> CodeTaskWorkPlanResult:
     """Generate a staged implementation plan for an initialized code-task run.
 
@@ -140,10 +144,11 @@ def generate_code_task_work_plan(
     if new_files:
         inputs["run_context"]["new_files"] = new_files
     plan_data, mode = _generate_plan_data(
-        paths.meta_dir, run_dir=root, inputs=inputs, selected_files=selected,
+        paths.meta_dir, inputs=inputs, selected_files=selected,
         ask=_ask_llm_for_work_plan, offline=_offline_work_plan,
         plan_name="work", usage_stage="code_task.work_plan",
         model=model, use_llm=use_llm, llm_client=llm_client,
+        budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
         llm_retry_attempts=llm_retry_attempts,
         allow_llm_fallback=allow_llm_fallback, message_callback=message_callback,
     )

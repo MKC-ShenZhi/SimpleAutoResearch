@@ -26,7 +26,7 @@ from simple_ar.code_task.editing.scope import (
     prompt_file_inventory,
 )
 from simple_ar.code_task.editing.snapshots import FileSnapshotSet, create_file_snapshot_set
-from simple_ar.code_task.runtime.accounting import task_model_accounting
+from simple_ar.code_task.runtime.accounting import account_code_task
 from simple_ar.code_task.runtime.state import (
     code_task_paths, read_required_json as _read_required_json,
     utcnow_iso as _utcnow_iso, workspace_file as _workspace_file,
@@ -47,6 +47,7 @@ from simple_ar.code_task.editing.planning import select_relevant_files, patch_pl
 from simple_ar.code_task.analysis.repo_map import build_repo_map
 from simple_ar.code_task.memory import task_memory_context
 from simple_ar.code_task.analysis.interfaces import render_source_snippets, snippet_api_contract, source_snippet_views
+from simple_ar.core.budget import BudgetLedger
 from simple_ar.integrations.llm import LLMClient, LLMError, LLMResponseError
 from simple_ar.integrations.usage import record_usage
 
@@ -132,6 +133,7 @@ class _PreparedEdit:
 
 
 
+@account_code_task
 def propose_patch_edits(
     run_dir: Path,
     *,
@@ -147,6 +149,7 @@ def propose_patch_edits(
     llm_client: LLMClient | None = None,
     process_scope: Any | None = None,
     task_only: bool = False,
+    budget_ledger: BudgetLedger | None = None, session_id: str = "", attempt_id: str = "",
 ) -> ProposedEditsResult:
     """Generate controlled old/new edits from the task and any approved plan.
 
@@ -311,163 +314,162 @@ def propose_patch_edits(
     context_followup = None
     dependency_api = None
     if use_llm:
-        with task_model_accounting(root, llm_client) as accounting:
-            try:
-                _emit(message_callback, "Calling LLM for controlled edit proposal.")
-                client = LLMClient.for_task(
-                    client=llm_client,
-                    model=model,
-                    **accounting,
-                    usage_callback=lambda usage: record_usage(
-                        meta_dir,
-                        usage,
-                        stage="code_task.propose_edits",
-                        batch_dir=batch_dir,
-                        message_callback=message_callback,
-                    ),
+        try:
+            _emit(message_callback, "Calling LLM for controlled edit proposal.")
+            client = LLMClient.for_task(
+                client=llm_client,
+                model=model,
+                budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+                usage_callback=lambda usage: record_usage(
+                    meta_dir,
+                    usage,
+                    stage="code_task.propose_edits",
+                    batch_dir=batch_dir,
+                    message_callback=message_callback,
+                ),
+            )
+            proposal = _ask_llm_for_edits(
+                client,
+                task_text=task_text,
+                patch_plan=patch_plan,
+                index=index,
+                snippets=snippets,
+                reference_snippets=reference_snippets,
+                read_only_context=read_only_context,
+                allowed_patterns=allowed_patterns,
+                protected_patterns=protected_patterns,
+                budget=budget,
+                allowed_edit_files=proposal_allowed_files,
+                batch_work_item=batch_constraints.get("work_item", {}),
+                memory_context=memory_context,
+                allow_new_files=bool(allowed_patterns) and not allowed_edit_files,
+                diagnostics_dir=meta_dir,
+            )
+            # Evidence acquisition is bounded independently of edit approval.
+            # One request may reveal another missing interface; do not force a
+            # proposal from incomplete source or grow context without a limit.
+            acquired_snippets = list(snippets)
+            acquired_references = list(reference_snippets)
+            evidence_rounds: list[dict[str, Any]] = []
+            inspected_apis: set[str] = set()
+            total_chars = 2 * max_files * max_source_chars_per_file
+            if loaded_context is not None:
+                total_chars = int(loaded_context.context_pack.get("budget", {}).get("max_total_chars", total_chars))
+            for round_number in range(1, MAX_EDIT_EVIDENCE_ROUNDS + 1):
+                if _implementation_feedback(proposal.get("implementation_feedback")) is not None:
+                    break
+                raw_request = proposal.get("context_request")
+                request = _normalize_context_request(
+                    raw_request if isinstance(raw_request, dict) else {}, _known_paths(index),
                 )
-                proposal = _ask_llm_for_edits(
-                    client,
-                    task_text=task_text,
-                    patch_plan=patch_plan,
-                    index=index,
-                    snippets=snippets,
-                    reference_snippets=reference_snippets,
-                    read_only_context=read_only_context,
-                    allowed_patterns=allowed_patterns,
-                    protected_patterns=protected_patterns,
-                    budget=budget,
-                    allowed_edit_files=proposal_allowed_files,
-                    batch_work_item=batch_constraints.get("work_item", {}),
-                    memory_context=memory_context,
-                    allow_new_files=bool(allowed_patterns) and not allowed_edit_files,
-                    diagnostics_dir=meta_dir,
+                if proposal.get("edits") and not any(request[key] for key in
+                        ("files", "query", "symbols", "dependency_symbols")):
+                    break
+                source_fallback = False
+                if not any(request[key] for key in ("files", "query", "symbols", "dependency_symbols")):
+                    request = inferred_source_request([*acquired_snippets, *acquired_references], proposal_allowed_files, max_files,
+                                                        index=index, proposal=proposal)
+                    source_fallback = bool(request["files"])
+                # Coverage comes from retained observations. Prompt capacity is
+                # a working window, not a lifetime read quota: early unrelated
+                # selection must not prevent a later required interface read.
+                supplied = [*snippets, *reference_snippets,
+                    *(item for evidence in evidence_rounds for item in evidence["snippets"])]
+                extra = _requested_source_context(
+                    workspace_dir, index, request, supplied=supplied,
+                    max_files=max_files, max_chars=max_source_chars_per_file,
+                    max_total_chars=total_chars, max_windows_per_file=2 if source_fallback else 1,
                 )
-                # Evidence acquisition is bounded independently of edit approval.
-                # One request may reveal another missing interface; do not force a
-                # proposal from incomplete source or grow context without a limit.
-                acquired_snippets = list(snippets)
-                acquired_references = list(reference_snippets)
-                evidence_rounds: list[dict[str, Any]] = []
-                inspected_apis: set[str] = set()
-                total_chars = 2 * max_files * max_source_chars_per_file
-                if loaded_context is not None:
-                    total_chars = int(loaded_context.context_pack.get("budget", {}).get("max_total_chars", total_chars))
-                for round_number in range(1, MAX_EDIT_EVIDENCE_ROUNDS + 1):
-                    if _implementation_feedback(proposal.get("implementation_feedback")) is not None:
-                        break
-                    raw_request = proposal.get("context_request")
-                    request = _normalize_context_request(
-                        raw_request if isinstance(raw_request, dict) else {}, _known_paths(index),
+                api_key = json.dumps(request["dependency_symbols"], sort_keys=True)
+                new_api = bool(request["dependency_symbols"] and api_key not in inspected_apis)
+                if new_api:
+                    inspected_apis.add(api_key)
+                    policy = manifest.get("environment", {}).get("policy", {})
+                    interpreter = policy.get("python_executable") if isinstance(policy, dict) else None
+                    dependency_api = (
+                        inspect_dependency_api(
+                            request["dependency_symbols"], index,
+                            [item["path"] for item in supplied],
+                            python_executable=interpreter, workspace_dir=workspace_dir,
+                            **({'process_scope': process_scope} if process_scope is not None else {}),
+                        ) if isinstance(interpreter, str) and interpreter else
+                        {"status": "unavailable", "interfaces": [], "reason": "project_python_not_configured"}
                     )
-                    if proposal.get("edits") and not any(request[key] for key in
-                            ("files", "query", "symbols", "dependency_symbols")):
-                        break
-                    source_fallback = False
-                    if not any(request[key] for key in ("files", "query", "symbols", "dependency_symbols")):
-                        request = inferred_source_request([*acquired_snippets, *acquired_references], proposal_allowed_files, max_files,
-                                                            index=index, proposal=proposal)
-                        source_fallback = bool(request["files"])
-                    # Coverage comes from retained observations. Prompt capacity is
-                    # a working window, not a lifetime read quota: early unrelated
-                    # selection must not prevent a later required interface read.
-                    supplied = [*snippets, *reference_snippets,
-                        *(item for evidence in evidence_rounds for item in evidence["snippets"])]
-                    extra = _requested_source_context(
-                        workspace_dir, index, request, supplied=supplied,
-                        max_files=max_files, max_chars=max_source_chars_per_file,
-                        max_total_chars=total_chars, max_windows_per_file=2 if source_fallback else 1,
-                    )
-                    api_key = json.dumps(request["dependency_symbols"], sort_keys=True)
-                    new_api = bool(request["dependency_symbols"] and api_key not in inspected_apis)
-                    if new_api:
-                        inspected_apis.add(api_key)
-                        policy = manifest.get("environment", {}).get("policy", {})
-                        interpreter = policy.get("python_executable") if isinstance(policy, dict) else None
-                        dependency_api = (
-                            inspect_dependency_api(
-                                request["dependency_symbols"], index,
-                                [item["path"] for item in supplied],
-                                python_executable=interpreter, workspace_dir=workspace_dir,
-                                **({'process_scope': process_scope} if process_scope is not None else {}),
-                            ) if isinstance(interpreter, str) and interpreter else
-                            {"status": "unavailable", "interfaces": [], "reason": "project_python_not_configured"}
+                    write_json(meta_dir / "dependency_api.json", dependency_api)
+                if not extra and not new_api and not source_fallback:
+                    # A requested symbol may already be visible or unresolvable.
+                    # Use the bounded current window for an unfinished editable
+                    # file before returning the evidence gap to the caller.
+                    fallback = inferred_source_request([*acquired_snippets, *acquired_references], proposal_allowed_files, max_files,
+                                                         index=index, proposal=proposal)
+                    if fallback["files"]:
+                        request, source_fallback = fallback, True
+                        extra = _requested_source_context(
+                            workspace_dir, index, request, supplied=supplied,
+                            max_files=max_files, max_chars=max_source_chars_per_file,
+                            max_total_chars=total_chars, max_windows_per_file=2,
                         )
-                        write_json(meta_dir / "dependency_api.json", dependency_api)
-                    if not extra and not new_api and not source_fallback:
-                        # A requested symbol may already be visible or unresolvable.
-                        # Use the bounded current window for an unfinished editable
-                        # file before returning the evidence gap to the caller.
-                        fallback = inferred_source_request([*acquired_snippets, *acquired_references], proposal_allowed_files, max_files,
-                                                             index=index, proposal=proposal)
-                        if fallback["files"]:
-                            request, source_fallback = fallback, True
-                            extra = _requested_source_context(
-                                workspace_dir, index, request, supplied=supplied,
-                                max_files=max_files, max_chars=max_source_chars_per_file,
-                                max_total_chars=total_chars, max_windows_per_file=2,
-                            )
-                    if not extra and not new_api:
-                        break
-                    initial_summary = proposal.get("summary", "")
-                    initial_validation = proposal.get("validation", [])
-                    for item in extra:
-                        editable = is_edit_allowed_path(item["path"], allowed_patterns=allowed_patterns,
-                            protected_patterns=protected_patterns) and (
-                                not allowed_edit_files or item["path"] in allowed_edit_files)
-                        item["access_role"] = "editable" if editable else "read_only"
-                        if editable and item["path"] not in proposal_allowed_files:
-                            # Reading does not grant permission. The existing scope
-                            # already authorizes this path; selection is not a batch.
-                            proposal_allowed_files.append(item["path"])
-                    preferred = set(request["files"]) | {
-                        str(edit.get("path", "")) for edit in proposal.get("edits", []) if isinstance(edit, dict)}
-                    current = refresh_source_snippets([*acquired_snippets, *acquired_references], extra,
-                        preferred_paths=preferred, max_total_chars=total_chars)
-                    acquired_snippets = [item for item in current if item.get("access_role", "editable") == "editable"]
-                    acquired_references = [item for item in current if item.get("access_role") != "editable"]
-                    evidence_rounds.append({
-                        "round": round_number, "request": request, "snippets": extra,
-                        "dependency_api": dependency_api if new_api else None,
-                        "initial_summary": initial_summary, "initial_validation": initial_validation,
-                        "prompt_window": {"max_chars": total_chars, "used_chars": sum(len(item["text"]) for item in current),
-                            "spans": [{"path": item["path"], "source_offset": item.get("source_offset", 0),
-                                       "chars": len(item["text"]), "access_role": item.get("access_role", "editable")}
-                                      for item in current]},
-                    })
-                    context_followup = {**evidence_rounds[-1], "rounds": evidence_rounds}
-                    # Persist before the model call so a provider failure retains
-                    # both the exact request and the bounded observed evidence.
-                    write_json(meta_dir / "edit_context_followup.json", context_followup)
-                    _emit(message_callback, f"Resolving requested evidence ({round_number}/{MAX_EDIT_EVIDENCE_ROUNDS}) before edit-proposal retry.")
-                    proposal = client.ask_json(
-                        CODE_TASK_EDIT_SYSTEM,
-                        _edit_user_prompt(
-                            task_text=task_text, patch_plan=patch_plan, index=index,
-                            snippets=acquired_snippets, reference_snippets=acquired_references,
-                            read_only_context=list(dict.fromkeys([
-                                *read_only_context, *(item["path"] for item in acquired_references),
-                            ])),
-                            allowed_patterns=allowed_patterns, protected_patterns=protected_patterns,
-                            budget=budget, allowed_edit_files=proposal_allowed_files,
-                            batch_work_item=batch_constraints.get("work_item", {}),
-                            memory_context=memory_context, dependency_api=dependency_api,
-                            allow_new_files=bool(allowed_patterns) and not allowed_edit_files,
-                        ) + "\nUnapplied draft edits (not changes in the workspace):\n"
-                        + json.dumps(proposal.get("edits", []), ensure_ascii=False)
-                        + "\nReturn one complete replacement proposal, retaining or correcting useful draft edits "
-                        "along with the newly resolved changes. Requested evidence is included above where available; an unavailable "
-                        "interface is not a verified signature. Resolve implementation details "
-                        "delegated by the accepted design. If algorithmic requirements remain "
-                        "undefined, return no edits and implementation_feedback with kind=design_gap. "
-                        "Do not invent a different method or request unchanged context repeatedly.",
-                        label="code-task-propose-edits-context",
-                    )
-                mode = "llm"
-            except LLMError as exc:
-                # Let the execution boundary record the failure and recovery point.
-                # An unavailable model is not an offline or empty edit proposal.
-                raise LLMError(f"CodeTask edit proposal failed: {exc}") from exc
+                if not extra and not new_api:
+                    break
+                initial_summary = proposal.get("summary", "")
+                initial_validation = proposal.get("validation", [])
+                for item in extra:
+                    editable = is_edit_allowed_path(item["path"], allowed_patterns=allowed_patterns,
+                        protected_patterns=protected_patterns) and (
+                            not allowed_edit_files or item["path"] in allowed_edit_files)
+                    item["access_role"] = "editable" if editable else "read_only"
+                    if editable and item["path"] not in proposal_allowed_files:
+                        # Reading does not grant permission. The existing scope
+                        # already authorizes this path; selection is not a batch.
+                        proposal_allowed_files.append(item["path"])
+                preferred = set(request["files"]) | {
+                    str(edit.get("path", "")) for edit in proposal.get("edits", []) if isinstance(edit, dict)}
+                current = refresh_source_snippets([*acquired_snippets, *acquired_references], extra,
+                    preferred_paths=preferred, max_total_chars=total_chars)
+                acquired_snippets = [item for item in current if item.get("access_role", "editable") == "editable"]
+                acquired_references = [item for item in current if item.get("access_role") != "editable"]
+                evidence_rounds.append({
+                    "round": round_number, "request": request, "snippets": extra,
+                    "dependency_api": dependency_api if new_api else None,
+                    "initial_summary": initial_summary, "initial_validation": initial_validation,
+                    "prompt_window": {"max_chars": total_chars, "used_chars": sum(len(item["text"]) for item in current),
+                        "spans": [{"path": item["path"], "source_offset": item.get("source_offset", 0),
+                                   "chars": len(item["text"]), "access_role": item.get("access_role", "editable")}
+                                  for item in current]},
+                })
+                context_followup = {**evidence_rounds[-1], "rounds": evidence_rounds}
+                # Persist before the model call so a provider failure retains
+                # both the exact request and the bounded observed evidence.
+                write_json(meta_dir / "edit_context_followup.json", context_followup)
+                _emit(message_callback, f"Resolving requested evidence ({round_number}/{MAX_EDIT_EVIDENCE_ROUNDS}) before edit-proposal retry.")
+                proposal = client.ask_json(
+                    CODE_TASK_EDIT_SYSTEM,
+                    _edit_user_prompt(
+                        task_text=task_text, patch_plan=patch_plan, index=index,
+                        snippets=acquired_snippets, reference_snippets=acquired_references,
+                        read_only_context=list(dict.fromkeys([
+                            *read_only_context, *(item["path"] for item in acquired_references),
+                        ])),
+                        allowed_patterns=allowed_patterns, protected_patterns=protected_patterns,
+                        budget=budget, allowed_edit_files=proposal_allowed_files,
+                        batch_work_item=batch_constraints.get("work_item", {}),
+                        memory_context=memory_context, dependency_api=dependency_api,
+                        allow_new_files=bool(allowed_patterns) and not allowed_edit_files,
+                    ) + "\nUnapplied draft edits (not changes in the workspace):\n"
+                    + json.dumps(proposal.get("edits", []), ensure_ascii=False)
+                    + "\nReturn one complete replacement proposal, retaining or correcting useful draft edits "
+                    "along with the newly resolved changes. Requested evidence is included above where available; an unavailable "
+                    "interface is not a verified signature. Resolve implementation details "
+                    "delegated by the accepted design. If algorithmic requirements remain "
+                    "undefined, return no edits and implementation_feedback with kind=design_gap. "
+                    "Do not invent a different method or request unchanged context repeatedly.",
+                    label="code-task-propose-edits-context",
+                )
+            mode = "llm"
+        except LLMError as exc:
+            # Let the execution boundary record the failure and recovery point.
+            # An unavailable model is not an offline or empty edit proposal.
+            raise LLMError(f"CodeTask edit proposal failed: {exc}") from exc
 
     if proposal is None:
         proposal = _offline_proposal(selected, read_only_context=read_only_context)

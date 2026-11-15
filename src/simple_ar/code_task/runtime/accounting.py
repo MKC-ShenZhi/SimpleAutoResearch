@@ -28,16 +28,6 @@ def standalone_task_accounting(run_dir: Path, *, active: bool = True):
                'session_id': str(root.resolve()), 'attempt_id': 'standalone'}
 
 
-@contextmanager
-def task_model_accounting(run_dir: Path | None, client):
-    """Supply the saved ledger to the existing model-client factory."""
-    if run_dir is None or isinstance(getattr(client, '_budget_ledger', None), BudgetLedger):
-        yield {}
-        return
-    with standalone_task_accounting(run_dir) as accounting:
-        yield accounting
-
-
 def account_code_task(action):
     """Use the enclosing scope or the saved standalone ledger for a task action."""
     @wraps(action)

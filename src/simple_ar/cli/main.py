@@ -348,8 +348,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             'execute': _print_code_task_execute,
         }
         if handler := accounted.get(args.code_task_command):
-            with _code_task_accounting(Path(args.run_dir), active=not getattr(args, 'dry_run', False)) as accounting:
-                handler(args, accounting)
+            if args.code_task_command == 'execute' and args.interactive:
+                with _code_task_accounting(Path(args.run_dir), active=not args.dry_run) as accounting:
+                    handler(args, accounting)
+            else:
+                handler(args)
             return
         if args.code_task_command == "probe":
             _print_code_task_probe(args)
@@ -1829,14 +1832,6 @@ def _print_code_task_init(args: argparse.Namespace) -> None:
     print_line(f"Resource ledger: {run_dir / 'budget_ledger.json'}")
 
 
-def _code_task_client(accounting: dict, model: str | None, *, enabled: bool):
-    if not accounting or not enabled:
-        return None
-    from simple_ar.integrations.llm import bind_task_budget
-    return bind_task_budget(None, accounting['budget_ledger'],
-        session_id=accounting['session_id'], attempt_id=accounting['attempt_id'], model=model)
-
-
 def _code_task_init_error_message(
     exc: Exception,
     *,
@@ -1995,10 +1990,9 @@ def _print_code_task_context(args: argparse.Namespace) -> None:
         print_line(read_text(result.prompt_context_path))
 
 
-def _print_code_task_work_plan(args: argparse.Namespace, accounting: dict) -> None:
+def _print_code_task_work_plan(args: argparse.Namespace) -> None:
     """Generate a batch-oriented work plan and print artifact paths."""
     try:
-        client = _code_task_client(accounting, args.model, enabled=not args.no_llm)
         result = generate_code_task_work_plan(
             Path(args.run_dir),
             model=args.model,
@@ -2009,7 +2003,6 @@ def _print_code_task_work_plan(args: argparse.Namespace, accounting: dict) -> No
             max_files=args.max_files,
             max_source_chars_per_file=args.max_source_chars_per_file,
             message_callback=lambda message: print_line(f"  - {message}"),
-            **({'llm_client': client} if client is not None else {}),
         )
     except LLMError as exc:
         raise SystemExit(str(exc)) from exc
@@ -2041,10 +2034,9 @@ def _print_code_task_batch(args: argparse.Namespace) -> None:
     print_line(f"Batch state: {result.batch_state_path}")
 
 
-def _print_code_task_plan(args: argparse.Namespace, accounting: dict) -> None:
+def _print_code_task_plan(args: argparse.Namespace) -> None:
     """Generate a code-task patch plan and print a compact summary."""
     try:
-        client = _code_task_client(accounting, args.model, enabled=not args.no_llm)
         result = generate_patch_plan(
             Path(args.run_dir),
             model=args.model,
@@ -2055,7 +2047,6 @@ def _print_code_task_plan(args: argparse.Namespace, accounting: dict) -> None:
             max_files=args.max_files,
             max_source_chars_per_file=args.max_source_chars_per_file,
             message_callback=lambda message: print_line(f"  - {message}"),
-            **({'llm_client': client} if client is not None else {}),
         )
     except LLMError as exc:
         raise SystemExit(str(exc)) from exc
@@ -2081,9 +2072,8 @@ def _print_code_task_decision(args: argparse.Namespace) -> None:
     print_line("Decision log: code_task/meta/hitl_decisions.jsonl")
 
 
-def _print_code_task_propose_edits(args: argparse.Namespace, accounting: dict) -> None:
+def _print_code_task_propose_edits(args: argparse.Namespace) -> None:
     """Generate controlled edits and print a compact proposal summary."""
-    client = _code_task_client(accounting, args.model, enabled=not args.no_llm)
     result = propose_patch_edits(
         Path(args.run_dir),
         model=args.model,
@@ -2093,7 +2083,6 @@ def _print_code_task_propose_edits(args: argparse.Namespace, accounting: dict) -
         max_source_chars_per_file=args.max_source_chars_per_file,
         allow_large_edits=args.allow_large_edits,
         message_callback=lambda message: print_line(f"  - {message}"),
-        **({'llm_client': client} if client is not None else {}),
     )
     print_line(f"Code task run: {result.run_dir}")
     print_line(f"Proposed edits: {result.proposal_path}")
@@ -2139,7 +2128,7 @@ def _print_code_task_validate(args: argparse.Namespace) -> None:
     print_line(f"Warnings: {result.warning_count}")
 
 
-def _print_code_task_run(args: argparse.Namespace, accounting: dict) -> None:
+def _print_code_task_run(args: argparse.Namespace) -> None:
     """Run a code-task benchmark and print execution artifacts."""
     result = run_code_task_benchmark(
         Path(args.run_dir),
@@ -2148,7 +2137,6 @@ def _print_code_task_run(args: argparse.Namespace, accounting: dict) -> None:
         skip_validation=args.skip_validation,
         env_mode=args.env_mode,
         python_executable=args.python_executable,
-        **accounting,
     )
     print_line(f"Code task run: {result.run_dir}")
     print_line(f"Run label: {result.label}")
@@ -2164,7 +2152,7 @@ def _print_code_task_run(args: argparse.Namespace, accounting: dict) -> None:
             print_line(f"- {key}: {value}")
 
 
-def _print_code_task_baseline(args: argparse.Namespace, accounting: dict) -> None:
+def _print_code_task_baseline(args: argparse.Namespace) -> None:
     """Run the pre-patch benchmark and print execution artifacts."""
     result = run_code_task_baseline(
         Path(args.run_dir),
@@ -2173,7 +2161,6 @@ def _print_code_task_baseline(args: argparse.Namespace, accounting: dict) -> Non
         skip_validation=args.skip_validation,
         env_mode=args.env_mode,
         python_executable=args.python_executable,
-        **accounting,
     )
     print_line(f"Code task run: {result.run_dir}")
     print_line(f"Baseline report: {result.report_path}")
@@ -2200,9 +2187,8 @@ def _print_code_task_analyze_failure(args: argparse.Namespace) -> None:
         print_line(f"- {path}")
 
 
-def _print_code_task_repair(args: argparse.Namespace, accounting: dict) -> None:
+def _print_code_task_repair(args: argparse.Namespace) -> None:
     """Generate a bounded repair proposal and print the review path."""
-    client = _code_task_client(accounting, args.model, enabled=not args.no_llm)
     result = propose_repair_edits(
         Path(args.run_dir),
         model=args.model,
@@ -2210,7 +2196,6 @@ def _print_code_task_repair(args: argparse.Namespace, accounting: dict) -> None:
         max_files=args.max_files,
         max_source_chars_per_file=args.max_source_chars_per_file,
         message_callback=lambda message: print_line(f"  - {message}"),
-        **({'llm_client': client} if client is not None else {}),
     )
     print_line(f"Code task run: {result.run_dir}")
     print_line(f"Repair directory: {result.repair_dir}")
@@ -2222,8 +2207,9 @@ def _print_code_task_repair(args: argparse.Namespace, accounting: dict) -> None:
         print_line(f"- {path}")
 
 
-def _print_code_task_execute(args: argparse.Namespace, accounting: dict) -> None:
+def _print_code_task_execute(args: argparse.Namespace, accounting: dict | None = None) -> None:
     """Run the state-aware code-task orchestrator and render progress."""
+    accounting = accounting or {}
     try:
         options = load_code_task_execute_options(config_path=args.config)
     except CodeTaskConfigError as exc:

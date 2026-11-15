@@ -22,6 +22,7 @@ def validate_repair_patch(
     run_dir: Path, *, llm_client: LLMClient | None = None, model: str | None = None,
     use_llm: bool = True, message_callback: MessageCallback | None = None,
     process_scope: Any | None = None,
+    budget_ledger: BudgetLedger | None = None, session_id: str = "", attempt_id: str = "",
 ) -> None:
     """Review and statically validate an applied repair without measuring it."""
     _emit(message_callback, "Reviewing embedded code-task repair before validation.")
@@ -30,7 +31,8 @@ def validate_repair_patch(
     retained = report.is_file() and code_task_paths(run_dir).manifest_path.is_file() and load_code_task_manifest(run_dir).get('code_task', {}).get('native_binding')
     review_status = read_json(report)['status'] if retained else review_code_task_changes(
         run_dir, llm_client=llm_client, phase="post_repair", model=model,
-        use_llm=use_llm, message_callback=message_callback).status
+        use_llm=use_llm, message_callback=message_callback,
+        budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id).status
     if review_status == "failed":
         raise RuntimeError(
             "Embedded code-task review blocked the repair patch. "
@@ -64,6 +66,7 @@ def apply_verified_repair(
     process_scope: Any | None = None,
     review_use_llm: bool = True,
     direct_edit: bool = False,
+    budget_ledger: BudgetLedger | None = None, session_id: str = "", attempt_id: str = "",
 ) -> None:
     """Apply an already authorized proposal; proposal-only entry points do not call this."""
     if not approval_note.strip():
@@ -78,6 +81,7 @@ def apply_verified_repair(
         **({'allow_unapproved_plan': True} if direct_without_plan else {}))
     validate_repair_patch(run_dir, llm_client=llm_client, message_callback=message_callback,
         use_llm=review_use_llm,
+        budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
         **({'process_scope': process_scope} if process_scope is not None else {}))
 
 
@@ -147,6 +151,7 @@ def verify_implementation(
             recovered = None  # Validate the already applied repair, not the old candidate again.
             validate_repair_patch(run_dir, llm_client=task_client(review_use_llm), message_callback=message_callback,
                 use_llm=review_use_llm,
+                budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
                 **({'process_scope': process_scope} if process_scope is not None else {}))
         elif repair_state.get('status') == 'repair_proposed':
             proposal_path = Path(run_dir) / repair_state['latest_proposed_edits']
@@ -156,6 +161,7 @@ def verify_implementation(
             apply_verified_repair(run_dir, repair, approval_note=approval_note,
                 llm_client=task_client(review_use_llm), message_callback=message_callback,
                 review_use_llm=review_use_llm,
+                budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
                 **({'direct_edit': True} if direct_edit else {}),
                 **({'process_scope': process_scope} if process_scope is not None else {}))
             recovered = None
@@ -201,6 +207,7 @@ def verify_implementation(
         _emit(message_callback, f"Bug validation failed; proposing bounded technical repair {index + 1}/{max_repairs}.")
         repair = propose_repair_edits(
             run_dir, llm_client=task_client(), max_files=max_files,
+            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
             max_source_chars_per_file=max_source_chars_per_file, message_callback=message_callback,
             failure_evidence=RepairEvidence(str(archived), {
                 "execution_status": validation.status, "returncode": validation.returncode,
@@ -216,6 +223,7 @@ def verify_implementation(
         apply_verified_repair(run_dir, repair, approval_note=approval_note,
                               llm_client=task_client(review_use_llm), message_callback=message_callback,
                               review_use_llm=review_use_llm,
+                              budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
                               **({'direct_edit': True} if direct_edit else {}),
                               **({'process_scope': process_scope} if process_scope is not None else {}))
         if asset_guard()["status"] == "changed":

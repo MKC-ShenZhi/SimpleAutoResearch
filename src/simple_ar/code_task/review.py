@@ -10,12 +10,13 @@ from simple_ar.code_task.editing.scope import (
     protected_patterns_from_manifest,
 )
 from simple_ar.code_task.generation.task_contract import load_task_contract
-from simple_ar.code_task.runtime.accounting import task_model_accounting
+from simple_ar.code_task.runtime.accounting import account_code_task
 from simple_ar.code_task.memory import record_review_finding, task_memory_context
 from simple_ar.code_task.analysis.interfaces import find_local_api_mismatches, project_api_contract
 from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest, code_task_workspace_boundary, review_workspace_boundary
 from simple_ar.core.artifacts import read_json, read_text
 from simple_ar.reviewing.schema import ReviewFinding
+from simple_ar.core.budget import BudgetLedger
 from simple_ar.integrations.llm import LLMClient
 from simple_ar.code_task.reviewing import review_prompt, run_project_review
 
@@ -31,6 +32,7 @@ class CodeTaskReviewResult:
     warning_count: int
 
 
+@account_code_task
 def review_code_task_changes(
     run_dir: Path,
     *,
@@ -40,6 +42,7 @@ def review_code_task_changes(
     use_llm: bool = True,
     max_source_chars_per_file: int = 3000,
     message_callback: MessageCallback | None = None,
+    budget_ledger: BudgetLedger | None = None, session_id: str = "", attempt_id: str = "",
 ) -> CodeTaskReviewResult:
     """Review the current code-task patch and write structured findings.
 
@@ -64,39 +67,39 @@ def review_code_task_changes(
     )[:20]
     local_api_contract = project_api_contract(paths.workspace_dir, relevant_paths=interface_paths) if model_review else {}
     suffix = "" if phase == "post_apply" else f"_{phase}"
-    with task_model_accounting(root if model_review else None, llm_client) as accounting:
-        report = run_project_review(
-            project_dir=paths.workspace_dir, result_schema=_result_schema_from_manifest(manifest),
-            access_boundary=boundary,
-            contract=_contract_from_run(paths), deterministic=deterministic,
-            reviewer="code-task-reviewer", subject=phase, meta_dir=paths.meta_dir,
-            artifact_suffix=suffix, cluster_metadata={"phase": phase}, save_report=True,
-            cluster_options={"max_clusters": 4, "max_files_per_cluster": 5, "relevant_paths": changed_files},
-            snippet_options={"chars_per_file": max_source_chars_per_file,
-                             "patch_diff": _read_optional_text(paths.task_dir / "patch.diff")},
-            use_llm=model_review, total_findings=16,
-            request_options={
-                "client": llm_client, "record_injected_usage": True, "model": model, **accounting,
-                "message_callback": message_callback, "max_findings": 5,
-                "label": f"code-task-review-{phase}-{{cluster_id}}",
-                "source": "code-task.llm-reviewer.{cluster_id}", "default_category": "llm_review",
-                "default_evidence": ["code_task/patch.diff", _relative_meta_path(phase, "review_index")],
-            },
-            prompt=lambda index, cluster, snippets: _review_prompt(
-                root, manifest=manifest, phase=phase, changed_files=changed_files,
-                review_index=index, review_cluster=cluster, interface_mismatches=interface_mismatches,
-                local_api_contract=local_api_contract, snippets=snippets),
-            metadata=lambda clusters: {
-                "phase": phase, "changed_files": changed_files,
-                "changed_files_outside_review_clusters": [path for path in changed_files
-                    if not any(path in cluster.get("files", []) for cluster in clusters)],
-                "patch_diff": "code_task/patch.diff" if (paths.task_dir / "patch.diff").is_file() else "",
-                "review_mode": "deterministic_blocked" if use_llm and not model_review else "layered",
-                "review_index": _relative_meta_path(phase, "review_index"),
-                "review_clusters": _relative_meta_path(phase, "review_clusters"),
-                "review_cluster_count": len(clusters),
-            },
-        )
+    report = run_project_review(
+        project_dir=paths.workspace_dir, result_schema=_result_schema_from_manifest(manifest),
+        access_boundary=boundary,
+        contract=_contract_from_run(paths), deterministic=deterministic,
+        reviewer="code-task-reviewer", subject=phase, meta_dir=paths.meta_dir,
+        artifact_suffix=suffix, cluster_metadata={"phase": phase}, save_report=True,
+        cluster_options={"max_clusters": 4, "max_files_per_cluster": 5, "relevant_paths": changed_files},
+        snippet_options={"chars_per_file": max_source_chars_per_file,
+                         "patch_diff": _read_optional_text(paths.task_dir / "patch.diff")},
+        use_llm=model_review, total_findings=16,
+        request_options={
+            "client": llm_client, "record_injected_usage": True, "model": model,
+            "budget_ledger": budget_ledger, "session_id": session_id, "attempt_id": attempt_id,
+            "message_callback": message_callback, "max_findings": 5,
+            "label": f"code-task-review-{phase}-{{cluster_id}}",
+            "source": "code-task.llm-reviewer.{cluster_id}", "default_category": "llm_review",
+            "default_evidence": ["code_task/patch.diff", _relative_meta_path(phase, "review_index")],
+        },
+        prompt=lambda index, cluster, snippets: _review_prompt(
+            root, manifest=manifest, phase=phase, changed_files=changed_files,
+            review_index=index, review_cluster=cluster, interface_mismatches=interface_mismatches,
+            local_api_contract=local_api_contract, snippets=snippets),
+        metadata=lambda clusters: {
+            "phase": phase, "changed_files": changed_files,
+            "changed_files_outside_review_clusters": [path for path in changed_files
+                if not any(path in cluster.get("files", []) for cluster in clusters)],
+            "patch_diff": "code_task/patch.diff" if (paths.task_dir / "patch.diff").is_file() else "",
+            "review_mode": "deterministic_blocked" if use_llm and not model_review else "layered",
+            "review_index": _relative_meta_path(phase, "review_index"),
+            "review_clusters": _relative_meta_path(phase, "review_clusters"),
+            "review_cluster_count": len(clusters),
+        },
+    )
     report_path = paths.meta_dir / f"review_report{suffix}.json"
     findings = report.get("findings", [])
     for row in findings:
