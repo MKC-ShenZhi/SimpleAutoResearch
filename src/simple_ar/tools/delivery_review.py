@@ -1053,6 +1053,10 @@ class DeliveryReview:
             return self._envelope(binding, identity, verified)
         except _ERRORS as exc:
             if result is None:
+                # A capacity or connection failure before the inspector opens
+                # its input is a delivery failure, not an unfinished inspection.
+                if not self.inspector.has_started(identity):
+                    raise
                 try:
                     result = self._retained(identity)
                 except _ERRORS:

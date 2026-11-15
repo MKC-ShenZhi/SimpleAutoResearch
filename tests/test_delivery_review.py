@@ -2268,6 +2268,8 @@ class IndependentDeliveryApplicabilityTests(unittest.TestCase):
         client.assert_called_once()
         self.assertNotIn('delivery_review', other['metadata'])
         self.assertIn('Connection unavailable', other['metadata']['delivery_review_error'])
+        self.assertFalse(owner.inspector.has_started('changed-probe'))
+        self.assertEqual(self.case.app.ledger.to_dict(), before_ledger)
 
     def test_unfinished_delivery_inspection_rebinds_without_starting_or_replaying_work(self):
         from tests.test_professional_work_loop import _action
