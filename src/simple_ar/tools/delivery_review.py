@@ -964,7 +964,8 @@ class DeliveryReview:
             'reviewed_inventory': dict(original.get('artifacts', {}))}
 
     def review(self, binding: dict | None, identity: str, *, may_start: bool,
-               observations: list[dict] | None = None) -> dict | None:
+               observations: list[dict] | None = None, repeat_identical: bool = True,
+               review_capacity: Callable[[], Any] | None = None) -> dict | None:
         """Review a freshly prepared owner scope; it is not an acceptance receipt."""
         if binding is None:
             return None
@@ -1005,6 +1006,8 @@ class DeliveryReview:
                 # A fresh explicit delivery may complete unfinished investigation
                 # or reconsider required findings. No old call is replayed and
                 # no incomplete opinion clears the retained findings.
+                if not repeat_identical:
+                    return None
                 break
             if not may_start:
                 return None
@@ -1029,14 +1032,15 @@ class DeliveryReview:
                         break
                     if retained is None:
                         retained = reference
-            result = self.inspector.call('inspect_artifacts', self._arguments(binding), identity,
-                delivery_context=deepcopy(binding),
-                **({'retained_from':retained} if retained is not None else {}),
-                **({'prior_required': deepcopy(pending)} if self.track_findings else {}),
-                **({'prior_work_opinions': self.inspection_feedback(sorted(binding['artifacts']),
-                    observations=observations)}
-                   if self.supply_work_feedback and not self.track_findings
-                      and binding.get('schema_version') == 'delivery_review.v3' else {}))
+            with review_capacity() if review_capacity is not None else nullcontext():
+                result = self.inspector.call('inspect_artifacts', self._arguments(binding), identity,
+                    delivery_context=deepcopy(binding),
+                    **({'retained_from':retained} if retained is not None else {}),
+                    **({'prior_required': deepcopy(pending)} if self.track_findings else {}),
+                    **({'prior_work_opinions': self.inspection_feedback(sorted(binding['artifacts']),
+                        observations=observations)}
+                       if self.supply_work_feedback and not self.track_findings
+                          and binding.get('schema_version') == 'delivery_review.v3' else {}))
             if result.ok and result.data.get('inspection_pending') == identity:
                 return self._envelope(binding, identity, result)
             if not result.ok:

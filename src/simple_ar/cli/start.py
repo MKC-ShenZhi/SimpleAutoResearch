@@ -125,6 +125,8 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     native.add_argument("--switch-id", help="Stable id for an idempotent --switch-model record in the original task journal.")
     native.add_argument("--switch-reason", help="Explicit human-readable reason for --switch-model.")
     native.add_argument("--authorize-remaining", action="append", default=None, metavar="DIMENSION=AMOUNT", help="Native resume: explicitly authorize a new remaining resource allowance after confirmation; repeat for multiple dimensions.")
+    native.add_argument("--additional-attempts", type=int, default=0, help="Increase the saved task's attempt limit without clearing previous attempts.")
+    native.add_argument("--additional-no-progress", type=int, default=0, help="Increase the saved task's consecutive no-progress limit.")
     native.add_argument("--authorization-id", default=None, help="Native resume: stable idempotency key required for explicit continuation allowances.")
     native.add_argument("--authorization-reason", default=None, help="Native resume: human-readable reason recorded with a continuation allowance.")
     native.add_argument("--source", action="append", default=[], type=Path, help="Native task: read-only file/directory mount, repeatable; on resume, explicitly add materials after confirmation.")
@@ -485,63 +487,24 @@ def migrate_structured_creation(args: argparse.Namespace, *, request: str, outpu
         max_output_tokens=getattr(args, 'max_output_tokens', None) if model else None)
     if review_model:
         config['feasibility_review_model'] = review_model
-    app = create_structured_research_task(ResearchBrief(request_text=request, objective=args.topic,
-        requested_outputs=outputs, asset_requests=sources), root=root, model=model,
+    brief = ResearchBrief(request_text=request, objective=args.topic,
+        requested_outputs=outputs, asset_requests=sources)
+    app = create_structured_research_task(brief, root=root, model=model,
         config=config, budget_limits={**limits, **{name: getattr(args, name, None)
             for name in ('process_invocations', 'process_wall_seconds')}},
         input_base_dir=Path.cwd(), timeout_sec=args.timeout_sec,
         max_results=args.max_results, max_chunks=args.max_chunks, idea_limit=args.idea_limit,
         cache_dir=Path(args.cache_dir).resolve() if args.cache_dir else None)
-    _run_created_research(app, request=request, root=root, outputs=outputs,
-        question=args.topic, data_analysis=data_analysis)
+    _run_created_research(app, root=root)
 
 
-def _run_created_research(app, *, request: str, root: Path, outputs: tuple,
-                          question: str, data_analysis: dict | None = None) -> None:
+def _run_created_research(app, *, root: Path) -> None:
     """Run or collect for the same task without inventing completion of later work."""
     from simple_ar.cli.main import _render_native_result, _ensure_research_cli_success
-    saved = app.state['config']
+    from simple_ar.app.research_intake import start_research_task
     print_line(f'Structured inputs use the common task owner. Task session: {root}')
     print_line(f'Resume: simple-ar start --resume-task "{root}"')
-    deferred = False
-    if saved['model']:
-        status = app.run(progress=print_line)
-    else:
-        action = ({'tool_name': 'analyze_table', 'arguments': saved['table_analysis']} if data_analysis is not None else
-            {'tool_name': 'research_collect' if saved['allow_network'] else 'research', 'arguments': {
-                'operation': 'summary', 'question': question,
-                'materials': saved['research_policy']['materials'], 'use_llm': False}})
-        actions = [action]
-        if saved.get('report_protocol') == 'canonical_report.v1' and not saved.get('report_requirement'):
-            # Structured outputs are already the caller's explicit contract;
-            # deterministic analysis/material owners need no model classifier.
-            actions.insert(0, {'tool_name': 'update_work_plan', 'arguments': {'report_intent': {
-                'kind': 'none', 'request_index': len(app.state['requests']) - 1,
-                'quote': app.state['requests'][-1][:8000]}}})
-        status = app.run(actions=actions, progress=print_line)
-        turn = app.state['turns'][-1]
-        result = app.session.store.read_json(turn['tools'][-1]['result']) if turn['tools'] else {}
-        if result.get('status') == 'ok' and result.get('artifacts'):
-            deferred = bool('experiments' in outputs or saved.get('report_requirement')
-                or saved['research_policy']['require_design'])
-            contract = saved.get('execution_contract')
-            if contract is not None:
-                from simple_ar.tools.scientific import measurement_conditions
-                app.request_execution_confirmation()
-                actions = [{'tool_name': 'measure_experiment', 'arguments': {**row['execution'],
-                    **({'condition_id': row['id']} if 'conditions' in contract else {}),
-                    **({'delivery': {'summary': request, 'artifacts': []}}
-                        if 'conditions' not in contract and not saved.get('report_requirement') else {})}}
-                    for row in measurement_conditions(contract) if not row.get('reuse_ref')]
-                status = app.run(actions=actions, progress=print_line)
-            else:
-                completion = ({'tool_name': 'ask_user', 'arguments': {'question':
-                    'Materials are retained, but the requested design, execution or authored report is not complete. '
-                    'Continue this task with an authorized model and execution contract/approval as needed.'}}
-                    if deferred else {'tool_name': 'deliver_result', 'arguments': {
-                    'summary': request, 'artifacts': result['artifacts'],
-                    'unresolved': result.get('data', {}).get('unresolved', [])}})
-                status = app.run(actions=[completion], progress=print_line)
+    status = start_research_task(app, progress=print_line)
     _render_native_result(app, status)
     _ensure_research_cli_success(status['status'], operation='Research task', root=root)
 
@@ -549,35 +512,73 @@ def _run_created_research(app, *, request: str, root: Path, outputs: tuple,
 def resume_structured_task(args: argparse.Namespace) -> None:
     """Compatibility spelling selects the saved common owner, never legacy load."""
     from simple_ar.cli.parser import build_parser
-    from simple_ar.cli.main import _run_native_start
+    from simple_ar.cli.main import _continuation_parameters, _resume_research_settings, _run_native_start
+    from simple_ar.cli.research_config import FIELDS, report_settings
+    from simple_ar.app.research_intake import revise_research_task
+    from simple_ar.app.tool_application import ToolApplication
+
     native = build_parser().parse_args(['start'])
+    explicit = set(getattr(args, '_explicit_resume_destinations', ()))
+    research_fields = {destination for destination, _ in FIELDS['research'].values()}
+    report_fields = {destination for destination, _ in FIELDS['report'].values()}
     supported = {'session_root', 'topic', 'model', 'config', 'decision_id', 'decision_response',
-        'decision_guidance', 'authorization_id', 'authorization_reason', 'authorize_remaining'}
-    unsupported = set(getattr(args, '_explicit_resume_destinations', ())) - supported
+        'decision_guidance', 'authorization_id', 'authorization_reason', 'authorize_remaining',
+        'additional_attempts', 'additional_no_progress', 'local_document', 'material', 'data_path',
+        'with_report', 'no_report', 'independent_review_required'} | research_fields | report_fields
+    unsupported = explicit - supported
     if unsupported:
         raise ValueError('This common task retains frozen domain contracts. Use start --resume-task for feedback; '
                          'cannot reinterpret saved controls: ' + ', '.join(sorted(unsupported)))
+    continuation = _continuation_parameters(args)
+    attempts = continuation['additional_attempts'] if 'additional_attempts' in explicit else None
+    no_progress = continuation['additional_no_progress'] if 'additional_no_progress' in explicit else None
+    allowances = continuation['authorize_remaining']
+    authorization_id = continuation['authorization_id'] or ''
+    authorization_reason = continuation['authorization_reason'] or ''
+    capacity = bool(allowances or attempts or no_progress)
+    if (capacity and (not authorization_id.strip() or not authorization_reason.strip())
+            or not capacity and (authorization_id or authorization_reason)):
+        raise ValueError('Explicit continuation allowances require an authorization id and reason')
+    settings = _resume_research_settings(args)
+    if 'interaction' in explicit:
+        settings['interaction'] = args.interaction
+    documents = [(path, 'paper') for path in args.local_document]
+    documents += [(path, 'material') for path in args.material]
+    documents += [(path, 'dataset') for path in args.data_path]
+    report_options = report_settings(args, explicit_destinations=explicit & report_fields)
+    report_requested = False if args.no_report else True if args.with_report else None
+    if args.no_report and (args.with_report or report_options or 'report_writing_method' in explicit):
+        raise ValueError('Cannot request and remove a report in the same continuation')
+    if any(getattr(args, name, None) is not None for name in ('decision_id', 'decision_response', 'decision_guidance')) and (
+            settings or documents or report_options or report_requested is not None
+            or 'report_writing_method' in explicit or 'independent_review_required' in explicit):
+        raise ValueError('Respond to the retained design decision separately from changing its research inputs')
+    changed = False
+    if (settings or documents or report_options or report_requested is not None
+            or 'report_writing_method' in explicit or 'independent_review_required' in explicit):
+        app = ToolApplication.load(Path(args.session_root))
+        if 'model' in explicit and args.model != app.state['config'].get('model'):
+            raise ValueError('Resume retains its saved model; use the existing explicit connection-change operation')
+        changed = revise_research_task(app, research_settings=settings, materials=documents,
+            report_settings=report_options if report_options else None, report_requested=report_requested,
+            report_method=args.report_writing_method if 'report_writing_method' in explicit else None,
+            independent_review_required=args.independent_review_required if 'independent_review_required' in explicit else None,
+            resource_allowances=allowances, additional_attempts=attempts, additional_no_progress=no_progress,
+            authorization_id=authorization_id, authorization_reason=authorization_reason)
     native.resume_task, native.yes = Path(args.session_root), True
-    if 'topic' in getattr(args, '_explicit_resume_destinations', ()):
+    if 'topic' in explicit:
         native.request = args.topic
-    native._explicit_start_destinations = set(getattr(args, '_explicit_resume_destinations', ())) & {'model'}
+    native._explicit_start_destinations = explicit & {
+        'model', 'additional_attempts', 'additional_no_progress'}
     for name in ('model', 'decision_id', 'decision_response', 'decision_guidance',
-                 'authorization_id', 'authorization_reason', 'authorize_remaining'):
+                 'authorization_id', 'authorization_reason', 'authorize_remaining',
+                 'additional_attempts', 'additional_no_progress'):
         setattr(native, name, getattr(args, name, None))
+    if changed and capacity:
+        native.authorize_remaining = native.authorization_id = native.authorization_reason = None
+        native.additional_attempts = native.additional_no_progress = 0
+        native._explicit_start_destinations -= {'additional_attempts', 'additional_no_progress'}
     _run_native_start(native)
-
-
-def _fixed_execution_research(args: argparse.Namespace, sources: tuple, outputs: tuple,
-                              research_config: dict | None, research_fields: set[str]) -> bool:
-    """Detect source/design obligations from inputs, independently of CLI labels."""
-    # Bare fixed-run mounts can carry notes without requesting source work.
-    # A supplied research configuration makes those material roles actionable.
-    return ('summary' in outputs
-        or (research_config is not None
-            and any(row['role'] in {'paper', 'material'} for row in sources))
-        or bool(set(getattr(args, '_explicit_resume_destinations', ()))
-                & ((research_fields - {'interaction'}) | {'selected_idea_id', 'feasibility_review_model'}))
-        or bool((research_config or {}).get('research_selected_idea_id')))
 
 
 def _create_declared_execution(args: argparse.Namespace, *, execution: dict, request: str,
@@ -624,11 +625,13 @@ def create_declared_research(args: argparse.Namespace, *, execution: dict,
     """
     from simple_ar.cli.research_config import FIELDS
     from simple_ar.cli.main import _render_native_result, _ensure_research_cli_success
-    from simple_ar.tools.scientific import measurement_conditions
+    from simple_ar.app.research_intake import declared_research_work, start_declared_measurements
 
     scientific = 'experiments' in outputs
     research_fields = {destination for destination, _ in FIELDS['research'].values()}
-    research_work = _fixed_execution_research(args, sources, outputs, research_config, research_fields)
+    explicit_research = bool(set(getattr(args, '_explicit_resume_destinations', ()))
+        & ((research_fields - {'interaction'}) | {'selected_idea_id', 'feasibility_review_model'}))
+    research_work = declared_research_work(outputs, sources, research_config, explicit_research=explicit_research)
     if scientific and execution.get('code_task') is not None and args.task_kind == 'reproduction':
         from simple_ar.app.research_execution import code_task_validation
         code_task_validation(execution, required=True)
@@ -642,57 +645,17 @@ def create_declared_research(args: argparse.Namespace, *, execution: dict,
     if confirm:
         _print_execution_confirmation(app, root)
     if execution.get('code_task') is not None or research_work:
-        _run_created_research(app, request=request, root=root, outputs=outputs, question=args.topic)
+        _run_created_research(app, root=root)
         return True
 
     # Only this caller's initial literal conditions carry one-use execution
     # intent. A model proposal, retry or later identical command still needs
     # separate approval. This is not an OS sandbox.
-    contract = app.state['config']['execution_contract']
-    conditions = [row for row in measurement_conditions(contract) if not row.get('reuse_ref')]
-    grouped = 'conditions' in contract
-    actions = [{'tool_name': 'measure_experiment', 'arguments':
-        {**row['execution'], 'condition_id': row['id']} if grouped else
-        row['execution'] if args.model else {**row['execution'], 'delivery': {'summary': request, 'artifacts': []}}}
-        for row in conditions]
-    if (not args.model and app.state['config'].get('report_protocol') == 'canonical_report.v1'
-            and not app.state['config'].get('report_requirement')):
-        actions.insert(0, {'tool_name': 'update_work_plan', 'arguments': {'report_intent': {
-            'kind': 'none', 'request_index': len(app.state['requests']) - 1,
-            'quote': app.state['requests'][-1][:8000]}}})
     print_line('Declared measurement uses the common task owner and original cwd/argv. '
         + ('Accept the bound protocol, then approve each process separately.' if confirm else
            'Each initial literal condition carries one-use caller intent; later proposals require approval.'))
     print_line(f'Task session: {root}\nResume: simple-ar start --resume-task "{root}" --approve-execution TOKEN')
-    remaining = {f'caller-0-{index}': row['arguments'] for index, row in enumerate(actions)
-        if row['tool_name'] == 'measure_experiment'}
-
-    def approve(call: dict, token: str) -> bool:
-        print_line(f"Execution proposal: {call['function']['arguments']}\nApproval token: {token}")
-        arguments = json.loads(call['function']['arguments'])
-        if (len(app.state['turns']) != 1 or app.state['turns'][0].get('origin') != 'caller'
-                or call['id'] not in remaining or call['function']['name'] != 'measure_experiment'
-                or arguments != remaining[call['id']]):
-            return False
-        if arguments.get('environment') is not None:
-            binding = app.scientific.approval_binding(arguments, identity=app.state['pending']['attempt'])
-            if preparation := binding.get('environment_preparation'):
-                steps = preparation['steps']
-                wall = len(steps) * preparation['profile']['timeout_sec'] + sum(
-                    row['execution']['timeout_sec'] for row in conditions)
-                print_line('Environment preparation steps (literal argv): ' + json.dumps(steps, ensure_ascii=False))
-                print_line(f"Preparation once + {len(conditions)} formal measurements: {len(steps) + len(conditions)} invocations; <= {wall}s declared wall reservation. "
-                           f"Shared process limits: {json.dumps(binding['limits'], sort_keys=True)}")
-            else:
-                print_line('Reuse verified shared environment: ' + json.dumps(binding['shared_environment'], sort_keys=True))
-        del remaining[call['id']]
-        return True
-
-    status = app.run(actions=actions, approve=None if confirm else approve, progress=print_line)
-    if grouped and not args.model:
-        completion = app.measurement_completion_actions()
-        if completion:
-            status = app.run(actions=completion, progress=print_line)
+    status = start_declared_measurements(app, request=request, confirm=confirm, progress=print_line)
     _render_native_result(app, status)
     _ensure_research_cli_success(status['status'], operation='Measurement', root=root)
     return True

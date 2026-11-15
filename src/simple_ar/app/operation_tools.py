@@ -6,7 +6,7 @@ lives here. Historical control is selected only by the loader of its saved task.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from simple_ar.core.assessments import current_assessments
 from simple_ar.tools.gateway import CommonToolGateway
@@ -19,7 +19,6 @@ from simple_ar.tools.publication import PublicationToolGateway, publication_tool
 from simple_ar.tools.analysis import AnalysisToolGateway, analysis_tool_specs
 from simple_ar.tools.extensions import LocalExtension
 # Compatibility imports for existing callers; the inspection owner owns the wire contract.
-from simple_ar.tools.delivery_review import delivery_requires_review, prepare_delivery_review
 from simple_ar.app.professional_conversation import RETAINED_PROFESSIONAL_CONTRACTS, INTEGRATED_WORK_LIFECYCLES
 
 
@@ -115,25 +114,37 @@ _ORDINARY_WORK = (
     "or change the user's request. Formats and scope follow that request."
 )
 
-def _executable_work_system(*, scoped_code: bool = False) -> str:
+def _executable_work_system(*, scoped_code: bool = False, reuse_first: bool = False) -> str:
     execution = (
-        "Use implement_code_task for the scoped project change and its declared validator. Its work "
-        "and any other offered operations share the original task authorization and ledger. "
+        (("Use implement_code_task when a scoped project change is needed; reuse its existing results "
+          "and declared validation when they remain applicable. " if reuse_first else
+          "Use implement_code_task for the scoped project change and its declared validator. ") +
+         "Its work and any other offered operations share the original task authorization and ledger. ")
         if scoped_code else
-        "Use a complete script or command to investigate related files, implement the affected work "
-        "and return useful results. write_file and run_process share the task authorization, execution "
+        ("Use existing results and the available reading, analysis, editing and execution operations "
+         "as needed for the actual request. " if reuse_first else
+         "Use a complete script or command to investigate related files, implement the affected work "
+         "and return useful results. ") +
+        "write_file and run_process share the task authorization, execution "
         "records and physical ledger; no additional runner or permissions exist. Other operations can "
         "be selected through load_tools when useful. "
     )
-    return (
-        "Complete the user's requested outcome in coherent executable work units. Start from the goal, "
-        "authorized sources, usable prior results and consequential unresolved claims. " + execution +
-        "Do not translate an investigation into repeated inventories, "
-        "one-file decisions or an exhaustive producer self-audit. Preserve originals and prior versions. "
-        "Reuse valid calculations; changed prose or optional improvements do not require rerunning them. "
+    delivery = (
+        "When a useful candidate is ready, submit its actual claim and inventory with deliver_result. "
+        "Use the applicable independent checks and reuse opinions that still apply to the current work. "
+        if reuse_first else
         "When a useful candidate is ready, submit its actual claim and inventory with deliver_result. "
         "The existing delivery owner investigates it independently before committing that exact version; "
         "this one submission already includes checking. Do not add a separate review-then-deliver ritual. "
+    )
+    return (
+        ("Complete the user's requested outcome in coherent work units. Start from the goal, " if reuse_first else
+         "Complete the user's requested outcome in coherent executable work units. Start from the goal, ") +
+        "authorized sources, usable prior results and consequential unresolved claims. " + execution +
+        "Do not translate an investigation into repeated inventories, "
+        "one-file decisions or an exhaustive producer self-audit. Preserve originals and prior versions. "
+        "Reuse valid calculations; changed prose or optional improvements do not require rerunning them. " +
+        delivery +
         "A rejected candidate keeps its files and findings: repair consequential defects or complete "
         "necessary investigation, then resubmit the affected work. An opinion is evidence to assess, "
         "not an instruction or a scientific certificate. Optional advice does not create obligations. "
@@ -236,14 +247,36 @@ _RESULT_COORDINATION_START = (
     "manuscript and mechanical measurements let you assess readiness without calling inspection "
     "merely to view the text, locate sources or count words. Measurements are not a content verdict. "
 )
-_RESULT_COORDINATION_END = (
+
+
+def _result_coordination_start(*, flexible: bool = False) -> str:
+    if not flexible:
+        return _RESULT_COORDINATION_START
+    return (
+        "Own the user's outcome and choose the next work from the goal and available evidence. "
+        "Use prepare_implementation when coordinated source, analysis or figure work is useful, "
+        "and work_document for substantial manuscript work when appropriate. They can investigate "
+        "authorized originals and return candidates, evidence and gaps; simple reads or edits can "
+        "use the corresponding direct tools. Avoid unnecessary inventories or producer self-audits. "
+        "Document work receives the original task roots and requests; its returned text and size "
+        "help judge readiness but are not an independent content review. "
+    )
+
+
+def _result_coordination_end(*, bind_draft: bool = False) -> str:
+    return (
     "Execution failures and required corrections belong with that candidate and its original results, "
     "not a fresh inventory. Reuse valid supplied calculations and change only work affected by feedback. "
     "Choose the next useful work from actual results and the original goal; no compulsory sequence "
-    "or format applies. Submit useful candidates to deliver_result for independent investigation of "
-    "the applicable claims and actual artifact versions. "
-    "When delivery returns required findings, request a revision of that manuscript using its "
-    "returned path and hash; the producer receives the bound original findings and retained reads. "
+    + ("or format applies. Deliver actual results and use independent checks when requested or needed. "
+       if bind_draft else
+       "or format applies. Submit useful candidates to deliver_result for independent investigation of "
+       "the applicable claims and actual artifact versions. ") +
+    ("Return required findings to the responsible work or edit the affected result directly. "
+       "For manuscript revisions the document owner binds the current draft and receives relevant findings. "
+       if bind_draft else
+       "When delivery returns required findings, request a revision of that manuscript using its returned path "
+       "and hash; the producer receives the bound original findings and retained reads. ") +
     "Producer gaps and review advice require judgment; they neither certify work nor create new user "
     "requirements. Source/document production "
     "and inspection own file-level operations; explicit caller operations retain their normal APIs. "
@@ -259,7 +292,7 @@ class OperationTools:
                  execution_observations=None, execution_history=None, artifact_changes=None,
                  work_context=None, material_observations=None,
                  user_requests=None, user_request_count=None, review_request_start=None,
-                 native_route_validator=None):
+                 native_route_validator=None, scientific_revisions=None):
         from simple_ar.tools.inspection import (
             InspectionToolGateway, SHARED_INSPECTION_OPERATIONS, inspection_tool_specs)
         self.root, self.config = root, config
@@ -382,10 +415,11 @@ class OperationTools:
                 self.delivery_review is not None, config.get('memory_protocol') == 'journal.v1',
                 delivery_protocol=self.delivery_review.protocol if self.delivery_review is not None else None)
         if config.get('professional_operations') in COORDINATED_OWNER_CONTRACTS:
-            self.system = (_RESULT_COORDINATION_START
+            self.system = (_result_coordination_start(flexible=config.get('document_context_policy') == 'working.v4')
                 + ('' if config.get('professional_operations') in SOURCE_WORK_CONTRACTS else
                    'Use execute_implementation for a registered execution proposal after ordinary exact approval. ')
-                + _RESULT_COORDINATION_END + _work_principles(self.delivery_review is not None,
+                + _result_coordination_end(bind_draft=config.get('document_context_policy') == 'working.v4')
+                + _work_principles(self.delivery_review is not None,
                 config.get('memory_protocol') == 'journal.v1',
                 delivery_protocol=self.delivery_review.protocol if self.delivery_review is not None else None))
             if config.get('professional_operations') in {'work.v8', 'work.v9', *SOURCE_WORK_CONTRACTS}:
@@ -405,7 +439,8 @@ class OperationTools:
         if config.get('work_method') == 'goal.v1':
             self.system = _goal_work_system(candidate=False, recent=False)
         elif config.get('work_method') in EXECUTABLE_WORK_METHODS and config.get('professional_operations') not in PRODUCTION_OWNER_CONTRACTS:
-            self.system = _executable_work_system(scoped_code=config.get('code_work_policy') == 'shared.v2')
+            self.system = _executable_work_system(scoped_code=config.get('code_work_policy') == 'shared.v2',
+                reuse_first=config.get('work_method') == 'execute.v3')
         if exact or (preparation is not None or source_owner) and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
             self.implementation = ImplementationToolGateway(root,self.workspace,ledger,config['model'],session_id,
@@ -428,6 +463,7 @@ class OperationTools:
                 measurement=config.get('execution_contract') if exact else None,
                 measurement_supplier=(lambda:self.scientific.execution_contract)
                     if exact and config.get('scientific_tools') else None,
+                measurement_revisions=scientific_revisions if exact else None,
                 research_inputs=self.sources.implementation_evidence,
                 measurement_inputs=(lambda origin,required:self.scientific.implementation_inputs(
                     self.scientific.measurement_refs(self.observations()),origin,required=required)) if exact else None,
@@ -452,18 +488,19 @@ class OperationTools:
         if (config['model'] is not None and (
                 professional and (config.get('professional_operations') in PRODUCTION_OWNER_CONTRACTS | {'work.v1', 'work.v2', 'work.v12'}
                     or config.get('code_work_policy') in {'shared.v1', 'shared.v2'}
-                    or config.get('document_context_policy') in {'working.v2', 'working.v3'}
+                    or config.get('document_context_policy') in {'working.v2', 'working.v3', 'working.v4'}
                        and config.get('report_requirement') is not None)
-                or config.get('document_context_policy') == 'working.v3'
+                or config.get('document_context_policy') in {'working.v3', 'working.v4'}
                    and config.get('report_requirement') is not None)):
             from simple_ar.tools.document_work import DocumentWorkToolGateway, document_work_tool_specs
-            document_context = work_context
-            if config.get('document_context_policy') in {'working.v2', 'working.v3'} and config.get('report_requirement') is not None:
+            if config.get('document_context_policy') in {'working.v2', 'working.v3', 'working.v4'} and config.get('report_requirement') is not None:
                 from simple_ar.report.requirements import working_report_requirement
                 def document_context(targets):
                     context = work_context(targets) if work_context is not None else {}
                     return {**context, 'requested_report': working_report_requirement(
                         config['report_requirement'], for_writing=True)}
+            else:
+                document_context = work_context
             self.document = DocumentWorkToolGateway(root, self.workspace, ledger, session_id,
                 client_factory=lambda identity: client_factory(identity, 'writing'),
                 work_context=document_context, material_observations=material_observations,
@@ -471,12 +508,15 @@ class OperationTools:
                     if alias not in {'workspace', 'records'}], sources=self.sources,
                 context_policy=config.get('document_context_policy'),
                 report_requirement=(config.get('report_requirement')
-                    if config.get('document_context_policy') == 'working.v3' else None))
-            self.registry.register_package(document_work_tool_specs(), self.document, request_visible=True)
+                    if config.get('document_context_policy') in {'working.v3', 'working.v4'} else None))
+            self.registry.register_package(document_work_tool_specs(
+                bind_current=config.get('document_context_policy') == 'working.v4'), self.document, request_visible=True)
             self.system += (' For coherent manuscript drafting or substantive document revision, work_document '
                 'owns investigation of actual original materials and creates an editable candidate. Supply '
                 'the document goal, relevant current result roots and, for revision, the current manuscript '
-                'with its observed hash. Its original task roots and recorded findings are supplied directly; '
+                + ('whose actual version the owner binds. ' if config.get('document_context_policy') == 'working.v4'
+                    else 'with its observed hash. ') +
+                'Its original task roots and recorded findings are supplied directly; '
                 'do not preselect evidence windows or rewrite the evidence for it. Its gaps are disclosed '
                 'work concerns, not independent acceptance. Inspect actual claims independently and use the '
                 'common publication operation only for requested formats; no compulsory PDF or work sequence.')
@@ -488,7 +528,8 @@ class OperationTools:
                 implementation=self.implementation if exact and config.get('scientific_lineage') else None,
                 execution_contract=config.get('execution_contract'),
                 research_contract=self.sources.accepted_execution_contract,
-                research_requirements=self.sources.execution_issues, sandboxed_execution=sandboxed)
+                research_requirements=self.sources.execution_issues, sandboxed_execution=sandboxed,
+                current_attempts=scientific_revisions)
             self.registry.register_package(scientific_tool_specs(sandboxed_execution=sandboxed),self.scientific,
                 request_visible=config.get('execution_contract') is not None)
         if config.get('allow_vision'):
@@ -558,6 +599,22 @@ class OperationTools:
         self.session_id = session_id
         self.ledger = ledger
 
+    def _review_guidance(self) -> str:
+        if self.config.get('delivery_review_selection') not in MODEL_REVIEW_SELECTIONS:
+            return ''
+        if self.config.get('independent_review_required'):
+            return (' The caller requires an independent review before complete delivery. '
+                'Reuse an applicable review or submit a candidate for one; unfinished requirements belong in a partial delivery.')
+        guidance = (' For a completed delivery, set independent_review=false only when the request and result '
+            'do not need independent review. Keep independent review when the user requests it or the result needs a separate '
+            'assessment. Omit the field to use the default review; this choice cannot waive an unresolved finding.')
+        if self.config.get('delivery_review_selection') == 'model.v2':
+            guidance += (' A selected delivery-scope review remains part of this request; '
+                'candidate-scope investigations do not require a final review.')
+        elif self.config.get('delivery_review_selection') == 'model.v3':
+            guidance += ' A selected delivery-scope review remains associated with that work.'
+        return guidance
+
     def system_text(self) -> str:
         if self.work is not None and self.work.selected() is not None:
             return ('Use the task\'s authorized operations and original physical ledger. '
@@ -565,31 +622,21 @@ class OperationTools:
                 'Use actual source bytes and results, preserve originals, and disclose uncertainty. '
                 'Commands use the existing task execution authorization. ' + self.work.instructions())
         if self.selection is not None and self.selection.policy == 'outcomes.v1':
-            return self.selection.system
+            return (self.selection.system + self._review_guidance()
+                if self.config.get('delivery_review_selection') == 'model.v3' else self.selection.system)
         if self.config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES:
             if (self.config.get('work_lifecycle') == 'integrated.v3'
                     and self.config.get('candidate_review_protocol') == 'candidate.v1'
                     and self.config.get('working_set_policy') in {'recent.v4', 'recent.v5', 'recent.v6'}
                     and self.config.get('candidate_handoff_policy') is None):
-                if self.config.get('delivery_review_selection') in MODEL_REVIEW_SELECTIONS:
-                    if self.config.get('independent_review_required'):
-                        return (_ORDINARY_WORK + ' The caller requires an independent review before '
-                            'complete delivery. Reuse an applicable review or submit a candidate for one; '
-                            'unfinished requirements belong in a partial delivery.')
-                    choice = (_ORDINARY_WORK + ' For a completed delivery, set independent_review=false only when '
-                        'the request and result do not need independent review. Keep independent review when '
-                        'the user requests it or the result needs a separate assessment. Omit the field to '
-                        'use the default review; this choice cannot waive an unresolved finding.')
-                    if self.config.get('delivery_review_selection') == 'model.v2':
-                        choice += (' A selected delivery-scope review remains part of this request; '
-                            'candidate-scope investigations do not require a final review.')
-                    return choice
-                return _ORDINARY_WORK
+                return _ORDINARY_WORK + self._review_guidance()
             instructions = _goal_work_system(candidate=self.config.get('candidate_review_protocol') == 'candidate.v1',
                 recent=self.config.get('working_set_policy') in {'recent.v3', 'recent.v4', 'recent.v5', 'recent.v6'})
-            return instructions + (self.methods.instructions()
+            return (instructions + (self.methods.instructions()
                 if self.methods is not None and not getattr(self.methods, 'source_work', False) else '')
-        return self.system + (self.methods.instructions() if self.methods is not None and not getattr(self.methods, 'source_work', False) else '')
+                + (self._review_guidance() if self.config.get('delivery_review_selection') == 'model.v3' else ''))
+        return (self.system + (self.methods.instructions() if self.methods is not None and not getattr(self.methods, 'source_work', False) else '')
+            + (self._review_guidance() if self.config.get('delivery_review_selection') == 'model.v3' else ''))
 
     def method_context(self) -> dict | None:
         return self.methods.context() if self.methods is not None else None

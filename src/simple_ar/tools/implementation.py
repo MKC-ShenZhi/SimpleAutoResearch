@@ -596,6 +596,7 @@ class ImplementationToolGateway:
                  decision_protocol: str | None = None,
                  measurement: dict[str, Any] | None = None,
                  measurement_supplier: Callable[[], dict[str, Any] | None] | None = None,
+                 measurement_revisions: Callable[[], dict[str, bool]] | None = None,
                  exact: dict[str, Any] | None = None) -> None:
         _source_owner_options(source_owner_contract, preparation_only=preparation_only, exact=exact is not None)
         if source_owner_contract:
@@ -645,6 +646,7 @@ class ImplementationToolGateway:
         if measurement_supplier is not None and self.exact is None:
             raise ValueError('A producing measurement supplier requires the exact implementation owner')
         self._measurement_supplier = measurement_supplier
+        self._measurement_revisions = measurement_revisions
         self._declared_measurement = self._validate_measurement(measurement)
 
     def _validate_measurement(self, measurement: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -665,6 +667,14 @@ class ImplementationToolGateway:
         if self._declared_measurement is not None:
             return self._declared_measurement
         return self._validate_measurement(self._measurement_supplier()) if self._measurement_supplier else None
+
+    def _measurement_revised(self, attempt: str) -> bool:
+        return bool(self._measurement_revisions and self._measurement_revisions().get(attempt, False))
+
+    def _measurement_matches(self, approval: dict[str, Any], attempt: str) -> bool:
+        """Adopt validated source after an explicit measurement-only revision."""
+        return (approval['binding'].get('measurement_contract') == self.measurement
+            or self._measurement_revised(attempt))
 
     def _formal_execution(self) -> dict[str, Any]:
         from simple_ar.experiment.execution.measurement import representative_measurement_execution
@@ -903,8 +913,7 @@ class ImplementationToolGateway:
         if Path(payload['code_task_run_dir']).resolve() != run:
             raise ValueError('Prior implementation belongs to a different candidate')
         binding = load_code_task_manifest(run)['code_task']['native_binding']
-        if (payload.get('status') != 'validated' or binding['binding']['contract'] != self.exact.model_dump()
-                or binding['binding'].get('measurement_contract') != self.measurement):
+        if payload.get('status') != 'validated' or binding['binding']['contract'] != self.exact.model_dump():
             raise ValueError('Prior candidate is incomplete or has a different scope/validator contract')
         self._check_retained_result(store, payload, run, binding)
         return record, code_task_paths(run).workspace_dir
@@ -930,7 +939,7 @@ class ImplementationToolGateway:
         if (payload.get('schema_version') != 'prepared_execution.v1'
                 or payload.get('native_binding') != approval or not approval.get('token')
                 or approval['binding']['contract'] != self.exact.model_dump()
-                or not pre_design and approval['binding'].get('measurement_contract') != measurement
+                or not pre_design and not self._measurement_matches(approval, store.root.name)
                 or Path(payload['workspace']).resolve() != candidate
                 or Path(payload['execution']['cwd']).resolve() != candidate
                 or Path(task['run_dir']).resolve() != run.resolve()
@@ -1142,7 +1151,12 @@ class ImplementationToolGateway:
                     or task.get('validation_timeout_sec') != self.exact.timeout_sec
                     or task.get('python_executable') not in (None, python)):
                 raise ValueError('Registered preparation does not describe this actual candidate')
-            expected = {**self._formal_execution(), 'cwd': str(cwd)} if self.measurement is not None else {}
+            saved_measurement = bound.get('measurement_contract')
+            if saved_measurement is not None:
+                from simple_ar.experiment.execution.measurement import representative_measurement_execution
+                expected = {**representative_measurement_execution(saved_measurement), 'cwd': str(cwd)}
+            else:
+                expected = {}
             if bound.get('environment_preparations'):
                 view = bound['environment_preparations'][manifest['workspace']['selected_mode']]
                 expected = {'command': view['argv'], 'cwd': view['cwd'], **{
@@ -1724,7 +1738,8 @@ class ImplementationToolGateway:
         if {key: value for key, value in result.items() if key != 'project_path'} != payload:
             raise ValueError('Exact delivery observation differs from its saved domain result')
         self._check_retained_result(store, payload, run, binding)
-        if require_current_origin and binding['binding'] != self.approval_binding(binding['binding'].get('work', {}), identity=run.name):
+        if (require_current_origin and not self._measurement_revised(run.name)
+                and binding['binding'] != self.approval_binding(binding['binding'].get('work', {}), identity=run.name)):
             raise ValueError('Approved source or predecessor changed; inspect before completed delivery')
         if (self.exact is None or binding['binding']['contract'] != self.exact.model_dump()
                 or payload.get('status') != 'validated'):
@@ -1753,7 +1768,7 @@ class ImplementationToolGateway:
                 raise ValueError('Retained implementation evidence changed; no replay')
         expected = payload.get('implementation_file_hashes')
         if (payload.get('native_binding') != approval or not isinstance(expected, dict)
-                or approval['binding'].get('measurement_contract') != self.measurement):
+                or not self._measurement_matches(approval, store.root.name)):
             raise ValueError('Retained domain result does not match its approved execution and candidate')
         outputs = self.candidate_outputs(store.root / 'implementation.json') if self.candidate_outputs else {}
         retained_implementation_inventory(run, expected, outputs)

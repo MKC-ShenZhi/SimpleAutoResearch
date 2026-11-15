@@ -40,7 +40,7 @@ from simple_ar.code_task.generation.task_contract import (
 from simple_ar.code_task.generation.writer import write_generated_project
 from simple_ar.code_task.generation.implementation_memory import initial_implementation_memory
 from simple_ar.code_task.generation.review import review_generated_project
-from simple_ar.integrations.llm import LLMClient, LLMError
+from simple_ar.integrations.llm import LLMClient, LLMError, bind_task_budget, task_budget_identity
 
 from .agent_backend import (
     check_agent_budget,
@@ -249,12 +249,9 @@ def generate_greenfield_code_task(
             generated_files=tuple(str(row["path"]) for row in artifacts.get("generated_files", [])
                                   if isinstance(row, dict) and row.get("path")),
         )
+    budget_ledger, session_id, attempt_id = task_budget_identity(llm_client, budget_ledger,
+        session_id=session_id, attempt_id=attempt_id)
     if should_use_agent_backend(implementation_provider):
-        client_ledger = llm_client.budget_ledger if isinstance(llm_client, LLMClient) else None
-        if budget_ledger is None:
-            budget_ledger = client_ledger
-        elif client_ledger is not None and client_ledger is not budget_ledger:
-            raise ValueError('Code task and model client must use the same budget ledger')
         check_agent_budget(root, implementation_provider, enabled=implementation_allow_external_agent,
                            binary=implementation_agent_binary, mode=implementation_agent_mode, ledger=budget_ledger)
     boundary = review_workspace_boundary(paths.workspace_dir / 'generated_project',
@@ -308,6 +305,7 @@ def generate_greenfield_code_task(
     writer_client = _llm_client(
         paths.meta_dir,
         llm_client=llm_client,
+        budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
         model=writer_model or model,
         use_llm=use_llm,
         allow_fallback=allow_planning_fallback,
@@ -317,6 +315,7 @@ def generate_greenfield_code_task(
     reviewer_client = _llm_client(
         paths.meta_dir,
         llm_client=llm_client,
+        budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
         model=reviewer_model or model,
         use_llm=model_review,
         allow_fallback=allow_planning_fallback,
@@ -348,6 +347,7 @@ def generate_greenfield_code_task(
         planner_client = _llm_client(
             paths.meta_dir,
             llm_client=llm_client,
+            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
             model=planner_model or model,
             use_llm=use_llm,
             allow_fallback=allow_planning_fallback,
@@ -389,10 +389,11 @@ def generate_greenfield_code_task(
                 raise PatchValidationError(f'Generated plan file `{path}` rejected: {rejection}')
         budget = edit_budget_for_profile(policy.get('budget_profile'),
             overrides=policy.get('edit_budget_overrides')) if explicit_budget else None
-        def validate_candidate(candidate: Path) -> None:
+        def validate_scoped_candidate(candidate: Path) -> None:
             validate_generated_project(paths.workspace_dir, candidate, prefix='generated_project',
                 allowed_patterns=allowed, protected_patterns=protected, budget=budget,
                 allow_large_edits=policy.get('allow_large_edits', False))
+        validate_candidate = validate_scoped_candidate
     implementation_plan_path = paths.meta_dir / "implementation_plan.json"
     architecture_plan_path = paths.meta_dir / "architecture_plan.json"
     file_plan_path = paths.meta_dir / "file_plan.json"
@@ -551,6 +552,9 @@ def _llm_client(
     meta_dir: Path,
     *,
     llm_client: LLMClient | None = None,
+    budget_ledger: BudgetLedger | None = None,
+    session_id: str = '',
+    attempt_id: str = '',
     model: str | None,
     use_llm: bool,
     allow_fallback: bool,
@@ -560,7 +564,8 @@ def _llm_client(
         return None
     try:
         return LLMClient.for_task(
-            client=llm_client,
+            client=bind_task_budget(llm_client, budget_ledger, session_id=session_id,
+                attempt_id=attempt_id, model=model),
             model=model,
             usage_callback=lambda usage: record_usage(
                 meta_dir,

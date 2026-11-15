@@ -54,6 +54,7 @@ class SourcePolicy(BaseModel):
     idea_limit: int = Field(default=3, ge=1, le=20)
     cache_enabled: bool = True
     cache_dir: str | None = None
+    extraction_dir: str | None = Field(default=None, exclude_if=lambda value: value is None)
     read_max_shortlist: int = Field(default=20, ge=1, le=1000)
     max_iterations: int = Field(default=1, ge=0, le=100)
     require_fulltext: bool = True
@@ -106,8 +107,10 @@ class SourcePolicy(BaseModel):
                 raise ValueError('Source policy lists require unique nonempty values')
         if self.max_fulltext_documents > self.max_documents:
             raise ValueError('Fulltext document limit exceeds document limit')
-        if self.cache_dir is not None and (not self.cache_dir.strip() or not Path(self.cache_dir).is_absolute()):
-            raise ValueError('cache_dir must preserve an explicit absolute cache path')
+        for name in ('cache_dir', 'extraction_dir'):
+            path = getattr(self, name)
+            if path is not None and (not path.strip() or not Path(path).is_absolute()):
+                raise ValueError(f'{name} must preserve an explicit absolute path')
         # Reject non-JSON execution contracts at admission, without filesystem IO.
         json.dumps(self.model_dump(mode='json'), allow_nan=False)
         return self
@@ -535,7 +538,8 @@ class SourceToolGateway:
         if not network:
             plan = replace(plan, require_fulltext=False)
         return build_document_bundle(papers=papers, supporting_records=records, source_plan=plan,
-            cache_dir=self._cache_dir() or directory / 'raw', extraction_dir=directory / 'parsed',
+            cache_dir=self._cache_dir() or directory / 'raw',
+            extraction_dir=Path(self.policy.extraction_dir) if self.policy.extraction_dir else directory / 'parsed',
             max_chunks=self.policy.max_chunks)
 
     def _validate_providers(self, providers: list[str] | tuple[str, ...]) -> None:

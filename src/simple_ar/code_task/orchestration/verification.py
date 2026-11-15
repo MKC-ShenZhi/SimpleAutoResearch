@@ -14,7 +14,7 @@ from simple_ar.code_task.execution.repair import RepairEvidence, RepairProposalR
 from simple_ar.code_task.execution.runner import CodeTaskRunResult, recover_implementation_process, run_code_task_benchmark
 from simple_ar.code_task.execution.validation import validate_code_task
 from simple_ar.code_task.review import review_code_task_changes
-from simple_ar.integrations.llm import LLMClient
+from simple_ar.integrations.llm import LLMClient, bind_task_budget, task_budget_identity
 
 MessageCallback = Callable[[str], None]
 def validate_repair_patch(
@@ -101,6 +101,13 @@ def verify_implementation(
         raise ValueError("Verification requires an approved nonempty command.")
     if type(max_repairs) is not int or max_repairs < 0:
         raise ValueError("max_repairs must be a non-negative integer")
+    budget_ledger, session_id, attempt_id = task_budget_identity(llm_client, budget_ledger,
+        session_id=session_id, attempt_id=attempt_id)
+
+    def task_client(enabled: bool = True) -> LLMClient:
+        if not enabled:
+            return llm_client
+        return bind_task_budget(llm_client, budget_ledger, session_id=session_id, attempt_id=attempt_id)
     command_text = subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
     from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest, implementation_file_hashes
     paths = code_task_paths(run_dir)
@@ -136,7 +143,7 @@ def verify_implementation(
             if repair_state.get('status') != 'repair_applied' or completed_repairs > max_repairs:
                 raise ValueError('Saved validator targets a different candidate without a committed authorized repair')
             recovered = None  # Validate the already applied repair, not the old candidate again.
-            validate_repair_patch(run_dir, llm_client=llm_client, message_callback=message_callback,
+            validate_repair_patch(run_dir, llm_client=task_client(review_use_llm), message_callback=message_callback,
                 use_llm=review_use_llm,
                 **({'process_scope': process_scope} if process_scope is not None else {}))
         elif repair_state.get('status') == 'repair_proposed':
@@ -145,7 +152,7 @@ def verify_implementation(
             repair = RepairProposalResult(run_dir, proposal_path.parent, proposal_path,
                 'llm', len(proposal['edits']), tuple(repair_state.get('selected_files', [])))
             apply_verified_repair(run_dir, repair, approval_note=approval_note,
-                llm_client=llm_client, message_callback=message_callback,
+                llm_client=task_client(review_use_llm), message_callback=message_callback,
                 review_use_llm=review_use_llm,
                 **({'direct_edit': True} if direct_edit else {}),
                 **({'process_scope': process_scope} if process_scope is not None else {}))
@@ -191,7 +198,7 @@ def verify_implementation(
         details = "\n\n".join(f"{name}:\n{text[-limit:]}" for name, text in streams)
         _emit(message_callback, f"Bug validation failed; proposing bounded technical repair {index + 1}/{max_repairs}.")
         repair = propose_repair_edits(
-            run_dir, llm_client=llm_client, max_files=max_files,
+            run_dir, llm_client=task_client(), max_files=max_files,
             max_source_chars_per_file=max_source_chars_per_file, message_callback=message_callback,
             failure_evidence=RepairEvidence(str(archived), {
                 "execution_status": validation.status, "returncode": validation.returncode,
@@ -205,7 +212,7 @@ def verify_implementation(
             repairs[-1]["outcome"] = "no_repair_edits"
             break
         apply_verified_repair(run_dir, repair, approval_note=approval_note,
-                              llm_client=llm_client, message_callback=message_callback,
+                              llm_client=task_client(review_use_llm), message_callback=message_callback,
                               review_use_llm=review_use_llm,
                               **({'direct_edit': True} if direct_edit else {}),
                               **({'process_scope': process_scope} if process_scope is not None else {}))

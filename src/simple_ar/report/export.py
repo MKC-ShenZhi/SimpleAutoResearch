@@ -898,7 +898,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         plan = article_rendering_plan(*visible_text, bibliography, version=policy['schema_version'])
         article_rendering = plan
         engine = plan['engine']
-    keys = set(re.findall(r"@\w+\s*\{\s*([^,\s]+)\s*,", bibliography))
+    from simple_ar.literature.bibtex import bibtex_keys
+    keys = bibtex_keys(bibliography)
     if citations - keys:
         raise ReportExportError("Unresolved bibliography keys: " + ", ".join(sorted(citations - keys)))
     image_sources = {node["c"][-1][0]: _asset_path(root, node["c"][-1][0], resolve_image=resolve_image)

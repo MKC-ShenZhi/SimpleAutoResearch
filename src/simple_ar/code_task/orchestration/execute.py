@@ -67,7 +67,7 @@ from simple_ar.code_task.runtime.state import (
 from simple_ar.code_task.execution.summary import write_code_task_summary
 from simple_ar.code_task.execution.validation import validate_code_task
 from simple_ar.code_task.editing.work_plan import generate_code_task_work_plan
-from simple_ar.integrations.llm import LLMClient, LLMError
+from simple_ar.integrations.llm import LLMClient, LLMError, bind_task_budget, task_budget_identity
 from simple_ar.code_task.runtime.config import EXECUTE_STEPS, normalize_review_gate
 
 
@@ -281,6 +281,15 @@ def execute_code_task(
         raise ValueError("llm_retry_attempts must be at least 1")
     baseline_policy = normalize_baseline_policy(baseline_policy)
 
+    budget_ledger, session_id, attempt_id = task_budget_identity(llm_client, budget_ledger,
+        session_id=session_id, attempt_id=attempt_id)
+
+    def task_client(enabled: bool = True, selected_model: str | None = None) -> LLMClient | None:
+        if not enabled:
+            return llm_client
+        return bind_task_budget(llm_client, budget_ledger, session_id=session_id,
+            attempt_id=attempt_id, model=selected_model or model)
+
     root = Path(run_dir)
     paths = code_task_paths(root)
     manifest = load_code_task_manifest(root)
@@ -319,7 +328,7 @@ def execute_code_task(
             process_scope=process_scope,
             to_step=to_step,
             dry_run=dry_run,
-            llm_client=llm_client,
+            llm_client=llm_client, client_supplier=task_client,
             model=model,
             planner_model=planner_model,
             writer_model=writer_model,
@@ -364,7 +373,8 @@ def execute_code_task(
         else:
             _emit(message_callback, f"Running {phase} code review.")
             review = review_code_task_changes(
-                root, phase=phase, llm_client=llm_client,
+                root, phase=phase, llm_client=task_client(use_llm if review_use_llm is None
+                    else use_llm and review_use_llm, reviewer_model or model),
                 model=reviewer_model or model,
                 use_llm=use_llm if review_use_llm is None else use_llm and review_use_llm,
                 max_source_chars_per_file=max_source_chars_per_file,
@@ -484,7 +494,7 @@ def execute_code_task(
             try:
                 result = generate_code_task_work_plan(
                     root,
-                    llm_client=llm_client,
+                    llm_client=task_client(use_llm, planner_model or model),
                     model=planner_model or model,
                     use_llm=use_llm,
                     allow_llm_fallback=allow_planning_fallback,
@@ -559,7 +569,7 @@ def execute_code_task(
         try:
             result = generate_patch_plan(
                 root,
-                llm_client=llm_client,
+                llm_client=task_client(use_llm, planner_model or model),
                 model=planner_model or model,
                 use_llm=use_llm,
                 allow_llm_fallback=allow_planning_fallback,
@@ -637,7 +647,7 @@ def execute_code_task(
         _emit(message_callback, "Generating controlled edit proposal.")
         result = propose_patch_edits(
             root,
-            llm_client=llm_client,
+            llm_client=task_client(use_llm, editor_model or model),
             model=editor_model or model,
             use_llm=use_llm,
             force=proposal_exists,
@@ -819,7 +829,7 @@ def execute_code_task(
             repair_rounds=repair_rounds,
             max_batches=max_batches,
             cost_cap_usd=cost_cap_usd,
-            llm_client=llm_client,
+            client_supplier=task_client,
             model=model,
             repair_model=repair_model,
             use_llm=use_llm,
@@ -833,32 +843,10 @@ def execute_code_task(
 
     if _patch_status(load_code_task_manifest(root)) != "applied":
         return _result(paths, steps, "patch_not_applied", "Apply reviewed edits before running benchmark.")
-    _emit(message_callback, "Running patched benchmark.")
-    result = run_code_task_benchmark(
-        root,
-        timeout_sec=timeout_sec,
-        # The execute path runs static validation immediately before this
-        # benchmark step, so avoid recording the same validation twice.
-        skip_validation=True,
-        env_mode=env_mode,
-        python_executable=python_executable,
-        stream_output=stream_benchmark_output,
-        output_callback=_benchmark_output_callback(message_callback),
-        budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
-        **({'process_scope': process_scope} if process_scope is not None else {}),
-    )
-    _record(steps, "run", "done", f"status {result.status}")
-    _memory_event(
-        root,
-        "patched_run",
-        f"Patched benchmark finished with status {result.status}.",
-        status=result.status,
-        artifacts=[
-            _relative_to_run(root, result.report_path),
-            _relative_to_run(root, result.metrics_path),
-        ],
-        metadata={"metrics": result.metrics},
-    )
+    result = _run_validated_candidate(root, steps, timeout_sec=timeout_sec, env_mode=env_mode,
+        python_executable=python_executable, stream_output=stream_benchmark_output,
+        message_callback=message_callback, budget_ledger=budget_ledger,
+        session_id=session_id, attempt_id=attempt_id, process_scope=process_scope)
     if result.status != "passed":
         return _handle_failure(
             root,
@@ -869,7 +857,7 @@ def execute_code_task(
             repair_rounds=repair_rounds,
             max_batches=max_batches,
             cost_cap_usd=cost_cap_usd,
-            llm_client=llm_client,
+            client_supplier=task_client,
             model=model,
             repair_model=repair_model,
             use_llm=use_llm,
@@ -999,6 +987,7 @@ def _execute_greenfield_code_task(
     to_step: str,
     dry_run: bool,
     llm_client: LLMClient | None = None,
+    client_supplier: Callable[[bool, str | None], LLMClient | None],
     model: str | None,
     planner_model: str | None,
     writer_model: str | None,
@@ -1054,6 +1043,7 @@ def _execute_greenfield_code_task(
             return True
         return _attempt_greenfield_review_repair(
             root, paths, steps, llm_client=llm_client, model=model,
+            client_supplier=client_supplier,
             repair_model=repair_model or model, use_llm=use_llm,
             repair_rounds=repair_rounds, max_files=max_files,
             max_generated_lines=max_generated_lines,
@@ -1181,34 +1171,11 @@ def _execute_greenfield_code_task(
 
     after_repair = False
     while True:
-        _emit(message_callback, "Running generated project benchmark after repair." if after_repair else "Running generated project benchmark.")
-        result = run_code_task_benchmark(
-            root,
-            timeout_sec=timeout_sec,
-            # Static validation just ran in this execute path unless the user
-            # stopped earlier, so do not duplicate it inside the runner.
-            skip_validation=True,
-            run_label="patched",
-            env_mode=env_mode,
-            python_executable=python_executable,
-            stream_output=stream_benchmark_output,
-            output_callback=_benchmark_output_callback(message_callback),
-            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
-            **({'process_scope': process_scope} if process_scope is not None else {}),
-        )
-        _record(steps, "run", "done", f"status {result.status}")
-        _memory_event(
-            root,
-            "generated_run_repair" if after_repair else "generated_run",
-            f"Generated project benchmark{' after repair' if after_repair else ''} finished with status {result.status}.",
-            status=result.status,
-            artifacts=[
-                _relative_to_run(root, result.report_path),
-                _relative_to_run(root, result.metrics_path),
-                *(["code_task/meta/run_repair.json"] if after_repair else []),
-            ],
-            metadata={"metrics": result.metrics},
-        )
+        result = _run_validated_candidate(root, steps, timeout_sec=timeout_sec, env_mode=env_mode,
+            python_executable=python_executable, stream_output=stream_benchmark_output,
+            message_callback=message_callback, budget_ledger=budget_ledger,
+            session_id=session_id, attempt_id=attempt_id, process_scope=process_scope,
+            generated=True, after_repair=after_repair)
         if result.status == "passed":
             break
         repaired = _attempt_greenfield_run_repair(
@@ -1217,6 +1184,7 @@ def _execute_greenfield_code_task(
             steps,
             repair_rounds=repair_rounds,
             llm_client=llm_client,
+            client_supplier=client_supplier,
             model=model,
             repair_model=repair_model or model,
             use_llm=use_llm,
@@ -1243,13 +1211,8 @@ def _execute_greenfield_code_task(
                     "Review code_task/meta/review_report.json after generated project run repair.",
                 )
         _emit(message_callback, "Run repair patched generated project; rerunning static validation.")
-        validation = validate_code_task(
-            root,
-            strict=strict_validation,
-            max_file_bytes=validation_max_file_bytes,
-            **({'process_scope': process_scope} if process_scope is not None else {}),
-        )
-        _record(steps, "validate", "done", f"post-repair status {validation.status}")
+        validation = _validate_candidate(root, steps, strict=strict_validation,
+            max_file_bytes=validation_max_file_bytes, process_scope=process_scope, message_callback=message_callback)
         if validation.status == "failed":
             return _result(
                 paths,
@@ -1276,7 +1239,7 @@ def _handle_failure(
     repair_rounds: int,
     max_batches: int | None,
     cost_cap_usd: float | None,
-    llm_client: LLMClient | None = None,
+    client_supplier: Callable[[bool, str | None], LLMClient | None],
     model: str | None,
     repair_model: str | None,
     use_llm: bool,
@@ -1335,7 +1298,7 @@ def _handle_failure(
     _emit(message_callback, "Generating bounded repair proposal.")
     repair = propose_repair_edits(
         run_dir,
-        llm_client=llm_client,
+        llm_client=client_supplier(use_llm, repair_model or model),
         model=repair_model or model,
         use_llm=use_llm,
         max_files=max_files,
@@ -1367,6 +1330,29 @@ def _handle_failure(
         "repair_review_required",
         "Review the repair proposal, then apply it explicitly with code-task apply-edits --edits-file.",
     )
+
+
+def _run_validated_candidate(root: Path, steps: list[ExecuteStepRecord], *, timeout_sec: int,
+                             env_mode: str | None, python_executable: str | Path | None,
+                             stream_output: bool | str, message_callback: MessageCallback | None,
+                             budget_ledger: BudgetLedger | None, session_id: str, attempt_id: str,
+                             process_scope: Any | None, generated: bool = False, after_repair: bool = False):
+    """Execute and record either candidate through the same process and ledger owner."""
+    label = 'Generated project' if generated else 'Patched'
+    suffix = ' after repair' if after_repair else ''
+    _emit(message_callback, f'Running {label.lower()} benchmark{suffix}.')
+    result = run_code_task_benchmark(root, timeout_sec=timeout_sec, skip_validation=True,
+        env_mode=env_mode, python_executable=python_executable, stream_output=stream_output,
+        output_callback=_benchmark_output_callback(message_callback), budget_ledger=budget_ledger,
+        session_id=session_id, attempt_id=attempt_id,
+        **({'process_scope': process_scope} if process_scope is not None else {}))
+    _record(steps, 'run', 'done', f'status {result.status}')
+    _memory_event(root, ('generated_run_repair' if after_repair else 'generated_run') if generated else 'patched_run',
+        f'{label} benchmark{suffix} finished with status {result.status}.', status=result.status,
+        artifacts=[_relative_to_run(root, result.report_path), _relative_to_run(root, result.metrics_path),
+            *(['code_task/meta/run_repair.json'] if generated and after_repair else [])],
+        metadata={'metrics': result.metrics})
+    return result
 
 
 def _validate_candidate(root: Path, steps: list[ExecuteStepRecord], *, strict: bool,
@@ -1562,6 +1548,7 @@ def _greenfield_repair_client(
     meta_dir: Path,
     *,
     llm_client: LLMClient | None = None,
+    client_supplier: Callable[[bool, str | None], LLMClient | None] | None = None,
     model: str | None,
     use_llm: bool,
     message_callback: MessageCallback | None,
@@ -1570,7 +1557,7 @@ def _greenfield_repair_client(
         return None
     try:
         return LLMClient.for_task(
-            client=llm_client,
+            client=client_supplier(use_llm, model) if client_supplier else llm_client,
             model=model,
             usage_callback=lambda usage: record_usage(
                 meta_dir,
@@ -1592,6 +1579,7 @@ def _attempt_greenfield_review_repair(
     steps: list[ExecuteStepRecord],
     *,
     llm_client: LLMClient | None = None,
+    client_supplier: Callable[[bool, str | None], LLMClient | None] | None = None,
     model: str | None,
     repair_model: str | None,
     use_llm: bool,
@@ -1608,7 +1596,7 @@ def _attempt_greenfield_review_repair(
     repair = _repair_greenfield_review_failure(
         run_dir,
         paths,
-        llm_client=llm_client,
+        llm_client=llm_client, client_supplier=client_supplier,
         model=repair_model or model,
         use_llm=use_llm,
         message_callback=message_callback,
@@ -1652,6 +1640,7 @@ def _attempt_greenfield_run_repair(
     *,
     repair_rounds: int,
     llm_client: LLMClient | None = None,
+    client_supplier: Callable[[bool, str | None], LLMClient | None] | None = None,
     model: str | None,
     repair_model: str | None,
     use_llm: bool,
@@ -1682,7 +1671,7 @@ def _attempt_greenfield_run_repair(
     )
     client = _greenfield_repair_client(
         paths.meta_dir,
-        llm_client=llm_client,
+        llm_client=llm_client, client_supplier=client_supplier,
         model=repair_model or model,
         use_llm=use_llm,
         message_callback=message_callback,
@@ -1759,6 +1748,7 @@ def _repair_greenfield_review_failure(
     paths: object,
     *,
     llm_client: LLMClient | None = None,
+    client_supplier: Callable[[bool, str | None], LLMClient | None] | None = None,
     model: str | None,
     use_llm: bool,
     message_callback: MessageCallback | None,
@@ -1774,7 +1764,7 @@ def _repair_greenfield_review_failure(
     )
     client = _greenfield_repair_client(
         paths.meta_dir,
-        llm_client=llm_client,
+        llm_client=llm_client, client_supplier=client_supplier,
         model=model,
         use_llm=use_llm,
         message_callback=message_callback,

@@ -442,15 +442,16 @@ def _print_research_session(args: argparse.Namespace) -> None:
 
     saved_outputs = ()
     if getattr(args, "session_root", None) is not None:
-        if 'independent_review_required' in getattr(args, '_explicit_resume_destinations', ()):
-            raise SystemExit('This option creates a new task. For an existing common task, use '
-                'start --resume-task with --supply-task to revise the review requirement; '
-                'historical research sessions retain their saved review contract.')
         manifest = Path(args.session_root) / 'session_manifest.json'
         if manifest.is_file() and read_json(manifest).get('transition_recipe') == 'native-tools-v1':
             from simple_ar.cli.start import resume_structured_task
-            resume_structured_task(args)
+            try:
+                resume_structured_task(args)
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise SystemExit(f"Cannot continue this research task: {exc}") from exc
             return
+        if 'independent_review_required' in getattr(args, '_explicit_resume_destinations', ()):
+            raise SystemExit('This option requires an existing common task; historical research sessions retain their saved review contract.')
         from simple_ar.app.research_application import load_session
 
         try:
@@ -528,21 +529,18 @@ def _print_research_session(args: argparse.Namespace) -> None:
         raise SystemExit("Use either --with-report or --no-report for research-session, not both.")
     analysis_only = task_kind == "data_analysis" and not (args.with_report or
         ("report" in (outputs if outputs is not None else saved_outputs) and not args.no_report))
-    llm_client = None if analysis_only else _optional_research_llm_client(args.model, "research session", max_output_tokens=getattr(args, "max_output_tokens", None))
+    model_enabled = bool(args.model) and not analysis_only
     review_model = (getattr(args, "feasibility_review_model", None) or "").strip()
-    if review_model and llm_client is None:
+    if review_model and not model_enabled:
         raise SystemExit("--feasibility-review-model requires --model for research design.")
-    feasibility_client = None if task_kind == "data_analysis" else _optional_research_llm_client(
-        review_model or None, "feasibility review", max_output_tokens=getattr(args, "max_output_tokens", None),
-    )
     if task_kind == "data_analysis":
         report_requested = not analysis_only
     else:
         report_requested = bool(args.with_report or (task_kind != "bug_fix" and
-                                (task_kind == "writing" or (llm_client is not None and not args.no_report))))
+                                (task_kind == "writing" or (model_enabled and not args.no_report))))
     if outputs is not None:
         report_requested = "report" in outputs
-    if report_requested and llm_client is None:
+    if report_requested and not model_enabled:
         raise SystemExit("--with-report requires --model for report generation.")
     resume_root = getattr(args, "session_root", None)
     session_root = resume_root or new_research_session_root(args.output_root, args.topic)
@@ -759,6 +757,10 @@ def _print_research_session(args: argparse.Namespace) -> None:
         else:
             from simple_ar.app.research_application import ResearchApplicationServices, load_session
             from dataclasses import replace
+            llm_client = (None if analysis_only else _optional_research_llm_client(
+                args.model, "research session", max_output_tokens=getattr(args, "max_output_tokens", None)))
+            feasibility_client = (None if task_kind == "data_analysis" else _optional_research_llm_client(
+                review_model or None, "feasibility review", max_output_tokens=getattr(args, "max_output_tokens", None)))
             display = ResearchConsole()
             validation_runs = 1 + execute_options.repair_rounds if task_kind == "bug_fix" and code_task_spec is not None else 1
             process_count = validation_runs if task_kind == 'bug_fix' else 8 if execution is not None else 0
@@ -987,16 +989,15 @@ def _print_research_session_continue(args: argparse.Namespace) -> None:
     """Retry an experiment through the canonical application lifecycle."""
 
     session_root = Path(args.session_root)
-    manifest = session_root / 'session_manifest.json'
-    if manifest.is_file() and read_json(manifest).get('transition_recipe') == 'native-tools-v1':
-        from simple_ar.app.tool_application import ToolApplication
-        try:
-            result = ToolApplication.load(session_root).retry_experiment(
-                command=tuple(args.command_argv or ()), cwd=Path(args.cwd), timeout_sec=args.timeout_sec,
-                result_schema=_experiment_result_schema(args), label=args.label,
-                parent_attempt_id=args.parent_attempt_id, progress=print_line)
-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
-            raise SystemExit(str(exc)) from exc
+    from simple_ar.app.research_application import ResearchApplicationError, retry_experiment
+    try:
+        result = retry_experiment(session_root,
+            command=tuple(args.command_argv or ()), cwd=Path(args.cwd) if args.cwd else None, timeout_sec=args.timeout_sec,
+            result_schema=_experiment_result_schema(args), label=args.label,
+            parent_attempt_id=args.parent_attempt_id, progress=print_line)
+    except (ResearchApplicationError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    if isinstance(result, dict):
         observed = result['observation'] or {}
         data = observed.get('data') or {}
         print_line(f'Research session: {session_root}')
@@ -1009,32 +1010,15 @@ def _print_research_session_continue(args: argparse.Namespace) -> None:
         analysis = result.get('analysis') or {}
         if analysis.get('data', {}).get('analysis_ref'):
             print_line(f"Analysis: {analysis['data']['analysis_ref']}")
+        if result.get('missing_conditions'):
+            print_line('Current comparison lacks applicable measurements: ' + ', '.join(result['missing_conditions'])
+                + '. Earlier results remain in task history.')
+        elif data.get('execution_status') == 'passed' and not analysis:
+            print_line('Measurements are retained; deterministic analysis remains pending.')
         if observed.get('status') != 'ok' or data.get('execution_status') != 'passed':
             raise SystemExit(observed.get('error') or 'Experiment retry did not pass; inspect the retained task evidence.')
         return
-    from simple_ar.app.research_application import (
-        ResearchApplicationError,
-        load_session,
-    )
-
-    try:
-        view = load_session(session_root).retry_experiment(
-            command=tuple(args.command_argv or ()),
-            cwd=Path(args.cwd),
-            timeout_sec=args.timeout_sec,
-            result_schema=_experiment_result_schema(args),
-            label=args.label,
-            parent_attempt_id=args.parent_attempt_id,
-            reason="Retry the failed canonical experiment from research-session-continue.",
-        )
-    except (
-        ResearchApplicationError,
-        OSError,
-        RuntimeError,
-        TypeError,
-        ValueError,
-    ) as exc:
-        raise SystemExit(str(exc)) from exc
+    view = result
     print_line(f"Research session: {view.session_root}")
     print_line(f"Status: {view.status}")
     print_line("Mode: deterministic")
@@ -1131,12 +1115,11 @@ def _explicit_session_option_destinations(
 def _report_config_overrides(args: argparse.Namespace, app: Any) -> dict[str, object]:
     """Compatibility projection for research-report; semantics belong to the application."""
     from simple_ar.cli.research_config import report_settings
-    from simple_ar.app.research_application import ResearchApplication
+    from simple_ar.report.requirements import report_config_overrides
 
     supplied = report_settings(args, explicit_destinations=getattr(args, "_explicit_resume_destinations", set()))
-    return ResearchApplication.report_config_overrides(
-        app, supplied, session_resume=args.command == "research-session",
-    )
+    return report_config_overrides(supplied, app.services.config,
+        session_resume=args.command == "research-session")
 
 
 def _resume_research_settings(args: argparse.Namespace) -> dict[str, object]:
@@ -2781,6 +2764,11 @@ def _run_native_start(args: argparse.Namespace) -> None:
         if args.approve_execution and not args.resume_task:
             raise ValueError("--approve-execution requires --resume-task and its saved pending command")
         allowances = continuation["authorize_remaining"]
+        additional_attempts = continuation["additional_attempts"]
+        additional_no_progress = continuation["additional_no_progress"]
+        if min(additional_attempts, additional_no_progress) < 0:
+            raise ValueError('Additional attempt allowances must be non-negative')
+        capacity = bool(allowances or additional_attempts or additional_no_progress)
         authorization_id = continuation["authorization_id"] or ""
         authorization_reason = continuation["authorization_reason"] or ""
         switching = bool(args.switch_model)
@@ -2792,7 +2780,7 @@ def _run_native_start(args: argparse.Namespace) -> None:
                 raise ValueError('--switch-model requires a named profile:NAME or route:NAME')
             if (args.request or args.goal or args.retry_model or args.supply_task or decision
                     or args.approve_execution or args.source or args.allow_execution or args.allow_network
-                    or args.allow_vision or allowances or authorization_id or authorization_reason
+                    or args.allow_vision or capacity or authorization_id or authorization_reason
                     or 'model' in getattr(args, '_explicit_start_destinations', set())):
                 raise ValueError('Use --switch-model separately from feedback, retry, supply, --model or authorization')
         if args.retry_model:
@@ -2800,15 +2788,15 @@ def _run_native_start(args: argparse.Namespace) -> None:
                 raise ValueError('--retry-model requires --resume-task')
             if (args.request or args.goal or args.approve_execution or args.source
                     or args.allow_execution or args.allow_network or args.allow_vision
-                    or allowances or authorization_id or authorization_reason):
+                    or capacity or authorization_id or authorization_reason):
                 raise ValueError('Use --retry-model separately from feedback, access, resource or tool authorization')
-        if allowances or continuation["authorization_id"] is not None or continuation["authorization_reason"] is not None:
+        if capacity or continuation["authorization_id"] is not None or continuation["authorization_reason"] is not None:
             if not args.resume_task:
                 raise ValueError("Resource authorization requires --resume-task")
-            if not allowances:
-                raise ValueError("--authorization-id/--authorization-reason require --authorize-remaining")
+            if not capacity:
+                raise ValueError("--authorization-id/--authorization-reason require an explicit allowance")
             if not authorization_id.strip() or not authorization_reason.strip():
-                raise ValueError("--authorize-remaining requires --authorization-id and --authorization-reason")
+                raise ValueError("Continuation allowances require --authorization-id and --authorization-reason")
             if args.approve_execution:
                 raise ValueError("Confirm resource authorization separately from --approve-execution")
         if args.resume_task:
@@ -2822,14 +2810,15 @@ def _run_native_start(args: argparse.Namespace) -> None:
             if args.supply_task:
                 if (args.request or args.goal or args.retry_model or args.approve_execution or decision
                         or args.source or args.allow_execution or args.allow_network or args.allow_vision
-                        or allowances or authorization_id or authorization_reason
+                        or capacity or authorization_id or authorization_reason
                         or 'model' in getattr(args, '_explicit_start_destinations', set())):
                     raise ValueError('Use --supply-task separately; declare new contracts and resources in its TOML')
                 import tomllib
                 path = args.supply_task.resolve()
                 with path.open('rb') as stream:
                     supply = tomllib.load(stream)
-                if (set(supply) - {'supply_id', 'reason', 'changes', 'resource_allowances', 'replace_existing'}
+                if (set(supply) - {'supply_id', 'reason', 'changes', 'resource_allowances', 'replace_existing',
+                                   'additional_attempts', 'additional_no_progress'}
                         or not {'supply_id', 'reason', 'changes'}.issubset(supply)
                         or not isinstance(supply['changes'], dict)):
                     raise ValueError('Supply TOML requires supply_id, reason and [changes]; optional [resource_allowances]')
@@ -2845,6 +2834,8 @@ def _run_native_start(args: argparse.Namespace) -> None:
                     f"Contract fields: {', '.join(sorted(supply['changes']))}\n"
                     f"Replace existing contracts: {supply.get('replace_existing', False)}\n"
                     f"New remaining allowances: {supply.get('resource_allowances', {})}\n"
+                    f"Additional attempts: {supply.get('additional_attempts', 0)}; "
+                    f"additional no-progress: {supply.get('additional_no_progress', 0)}\n"
                     "Original records and usage remain. Replacement retires old authority, not old evidence; "
                     "no model call or process runs, and commands still require separate approval."),
                     title='Confirm task supply / 确认补齐任务条件'))
@@ -2892,7 +2883,7 @@ def _run_native_start(args: argparse.Namespace) -> None:
             if args.retry_model:
                 print_line("Explicit model continuation: one new decision attempt, not a task or tool replay. "
                            "Old failures and unknown charges remain; original budgets, access and output cap are retained.")
-            if allowances:
+            if capacity:
                 entries = app.ledger.entries
                 recorded_usage = {dimension: sum(entry.actual.get(dimension, 0) for entry in entries
                     if entry.status in {"settled", "unknown"}) for dimension in allowances}
@@ -2901,6 +2892,7 @@ def _run_native_start(args: argparse.Namespace) -> None:
                     f"Recorded cumulative usage (requested dimensions): {recorded_usage}\n"
                     f"Unknown usage dimensions: {app.ledger.unknown_dimensions()}\n"
                     f"New remaining allowance: {allowances}\n"
+                    f"Additional attempts: {additional_attempts}; additional no-progress: {additional_no_progress}\n"
                     "Original cumulative usage is not cleared / 原累计用量不清零. "
                     "New remaining is not a total historical limit / 新 remaining 不是总历史限额.\n"
                     "Reusing the same authorization ID does not replenish spent capacity. "
@@ -2998,10 +2990,12 @@ def _run_native_start(args: argparse.Namespace) -> None:
                 allow_network=args.allow_network if args.resume_task else False,
                 allow_vision=args.allow_vision if args.resume_task else False,
                 resource_allowances=allowances or None,
+                additional_attempts=additional_attempts if 'additional_attempts' in getattr(args, '_explicit_start_destinations', ()) else None,
+                additional_no_progress=additional_no_progress if 'additional_no_progress' in getattr(args, '_explicit_start_destinations', ()) else None,
                 authorization_id=authorization_id, authorization_reason=authorization_reason,
                 decision=decision, approve=approve if interactive else None, progress=print_line)
             if (not conversation and args.resume_task and app.state['config'].get('model') is None
-                    and not feedback and not args.retry_model and not allowances
+                    and not feedback and not args.retry_model and not capacity
                     and not (args.source or args.allow_execution or args.allow_network or args.allow_vision)):
                 completion = app.measurement_completion_actions()
                 if completion:

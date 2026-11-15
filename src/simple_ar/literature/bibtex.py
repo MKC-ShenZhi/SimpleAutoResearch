@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import re
+
 from simple_ar.literature.models import Paper, bibliographic_details
+
+
+def bibtex_keys(bibliography: str) -> set[str]:
+    """Return the entry keys used by the publication and reuse owners."""
+    return set(re.findall(r'@\w+\s*\{\s*([^,\s]+)\s*,', bibliography))
 
 
 def papers_to_bibtex(papers: list[Paper]) -> str:

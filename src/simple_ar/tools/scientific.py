@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import re
 import traceback
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -282,7 +282,7 @@ class ScientificToolGateway:
     def __init__(self, root: Path, workspace: Any, ledger: Any, session_id: str,
                  *, implementation: Any | None = None,
                  execution_contract: dict[str, Any] | None = None,
-                 current_attempts: Any | None = None,
+                 current_attempts: Callable[[], set[str] | dict[str, bool]] | None = None,
                  research_contract: Any | None = None,
                  research_requirements: Any | None = None,
                  sandboxed_execution: bool = False) -> None:
@@ -415,22 +415,41 @@ class ScientificToolGateway:
         ref = source.get('implementation_ref') or source['prepared_ref']
         return self.workspace.workspace / 'code_tasks' / Path(ref['path']).parent.name
 
+    @staticmethod
+    def preparation_contract(contract: dict[str, Any] | None) -> tuple[str, dict] | None:
+        """A measurement revision need not replace an unchanged environment."""
+        if not isinstance(contract, dict):
+            return None
+        rows = measurement_conditions(contract)
+        if not rows or not rows[0]['execution'].get('environment'):
+            return None
+        execution = rows[0]['execution']
+        return execution['cwd'], execution['environment']
+
     def _shared_environment(self, identity: str) -> tuple[ArtifactStore, dict, dict] | None:
         """Find the sole durable preparation owner; an unfinished owner blocks reuse."""
-        if 'conditions' not in (self.execution_contract or {}) or not any(
-                row['execution'].get('environment') for row in self.execution_contract['conditions']):
+        contract = self.execution_contract or {}
+        # Older controllers provide a set; the common session also indicates
+        # which retained preparations predate a measurement revision.
+        current = self._current_attempts() if self._current_attempts is not None else None
+        if (self.preparation_contract(contract) is None
+                or 'conditions' not in contract and not isinstance(current, dict)):
             return None
         owners = []
-        current = self._current_attempts() if self._current_attempts is not None else None
-        for path in sorted((self.root / 'attempts').glob('*/scientific_request.json')):
-            if path.parent.name == identity or current is not None and path.parent.name not in current:
+        attempts = (sorted(current) if current is not None else
+            [path.parent.name for path in sorted((self.root / 'attempts').glob('*/scientific_request.json'))])
+        for attempt in attempts:
+            if attempt == identity:
                 continue
-            store = self._store(path.parent.name)
+            store = self._store(attempt)
+            if not store.exists('scientific_request.json'):
+                continue
             saved = store.read_json('scientific_request.json')
             binding = saved.get('execution_approval', {}).get('binding', {})
             if saved.get('tool_name') != 'measure_experiment' or not binding.get('environment_preparation'):
                 continue
-            self._condition(MeasurementRequest.model_validate(saved['arguments']))
+            if not isinstance(current, dict) or not current[attempt]:
+                self._condition(MeasurementRequest.model_validate(saved['arguments']))
             owners.append((store, binding))
         if len(owners) > 1:
             raise ValueError('Shared environment has multiple preparation owners; no execution or replay')
@@ -444,6 +463,23 @@ class ScientificToolGateway:
         if _hash(executable) != store.read_json('environment_observation.json')['executable_sha256']:
             raise ValueError('Shared environment interpreter changed after preparation')
         return store, binding, receipt
+
+    @staticmethod
+    def _preparation_inputs_unchanged(binding: dict[str, Any]) -> bool:
+        """Check setup inputs from the original approval, not other measurements."""
+        preparation, cwd = binding['environment_preparation'], Path(binding['cwd'])
+        paths = set()
+        for argv in preparation['steps']:
+            for argument in argv[1:]:
+                value = argument.split('=', 1)[1] if argument.startswith('-') and '=' in argument else argument
+                path = Path(value)
+                paths.add(str((path if path.is_absolute() else cwd / path).absolute()))
+        if preparation['profile']['install_project']:
+            paths.update(str(cwd / name) for name in ('pyproject.toml', 'setup.py', 'setup.cfg'))
+        for path, digest in binding['source_hashes'].items():
+            if path in paths and (not Path(path).is_file() or _hash(Path(path)) != digest):
+                return False
+        return True
 
     def _shared_environment_inputs(self) -> dict[str, Any]:
         """Freeze all formal source/asset identities before any setup code runs."""
@@ -615,19 +651,26 @@ class ScientificToolGateway:
                                      binding['interpreter'], request.run.command):
             binding['execution_scope'] = 'workspace.v1'
         if plan is not None:
-            if 'conditions' in (self.execution_contract or {}):
+            current = self._current_attempts() if self._current_attempts is not None else None
+            if 'conditions' in (self.execution_contract or {}) or isinstance(current, dict):
                 binding['shared_environment_inputs'] = self._shared_environment_inputs()
             if shared:
                 owner, original, receipt = shared
-                if (binding['shared_environment_inputs'] != original.get('shared_environment_inputs')
+                revised = isinstance(current, dict) and current.get(owner.root.name, False)
+                inputs_match = (self._preparation_inputs_unchanged(original) if revised else
+                    binding['shared_environment_inputs'] == original.get('shared_environment_inputs')
+                    and all(Path(path).is_file() and _hash(Path(path)) == digest
+                        for path, digest in original['source_hashes'].items()))
+                if (not inputs_match or 'shared_environment_inputs' not in original
                         or binding['environment'] != original['environment']
-                        or any(not Path(path).is_file() or _hash(Path(path)) != digest
-                            for path, digest in original['source_hashes'].items())
                         or {key: value for key, value in environment_preparation_identity(
                             plan, request.run.cwd, request.run.env).items() if key != 'command'} !=
                             {key: value for key, value in original['environment_preparation'].items()
                                 if key not in {'command', 'prepared_ref'}}):
                     raise ValueError('Shared environment source, preparation inputs or inherited environment changed')
+                # These are the inputs observed when the environment was prepared;
+                # the new measurement's own inputs remain in source_hashes above.
+                binding['shared_environment_inputs'] = original['shared_environment_inputs']
                 binding['shared_environment'] = {'attempt_id': owner.root.name,
                     'receipt_sha256': _hash(owner.root / 'scientific_result.json'),
                     'prepared_ref': original['environment_preparation']['prepared_ref']}
@@ -994,10 +1037,15 @@ class ScientificToolGateway:
     def _condition_results(self, locators: list[str], *, implementation_refs: list[str] | None = None) -> dict[str, str]:
         """Select actual observations and frozen imports through the same source reader."""
         selected, sources, pending = {}, {}, []
+        current = self._current_attempts() if self._current_attempts is not None else None
         reused = [row['reuse_ref'] for row in measurement_conditions(self.execution_contract or {}) if row.get('reuse_ref')]
         for locator in dict.fromkeys([*locators, *reused]):
             request = self._measurement_request(locator)
             source = request.get('execution_approval', request.get('implementation_approval', {})).get('binding', {}).get('source')
+            attempt = self.workspace.resolve(locator).parent.name
+            if (isinstance(current, dict) and current.get(attempt, False)
+                    and not self._recorded_condition_inputs_current(request)):
+                continue  # The old observation remains history, not the current condition.
             implementation = ((source or {}).get('implementation_ref') or {}).get('path')
             if implementation_refs is not None and (
                     implementation and (not implementation_refs or implementation != implementation_refs[-1])
@@ -1032,6 +1080,29 @@ class ScientificToolGateway:
         if len(physicals) != len(set(physicals)):
             raise ValueError('A physical measurement cannot satisfy multiple frozen conditions')
         return selected
+
+    @staticmethod
+    def _recorded_condition_inputs_current(request: dict[str, Any]) -> bool:
+        """Compare only the condition's recorded direct inputs when adopting an old result."""
+        binding = request.get('execution_approval', request.get('implementation_approval', {})).get('binding', {})
+        cwd = Path(binding['cwd'])
+        recorded = binding['source_hashes']
+        executable = Path(binding['interpreter'])
+        if binding.get('executable_sha256') and (
+                not executable.is_file() or _hash(executable) != binding['executable_sha256']):
+            return False
+        for argument in binding['argv'][1:]:
+            value = argument.split('=', 1)[1] if argument.startswith('-') and '=' in argument else argument
+            path = Path(value)
+            path = (path if path.is_absolute() else cwd / path).absolute()
+            digest = recorded.get(str(path))
+            if digest is not None and (not path.is_file() or _hash(path) != digest):
+                return False
+        for asset in binding['protected_assets'].values():
+            path = Path(asset['path'])
+            if not path.is_file() or _hash(path) != asset['sha256']:
+                return False
+        return True
 
     def _check_preparation_ancestry(self, sources: list[dict[str, Any] | None]) -> None:
         prepared = [source.get('preparation_origin') for source in sources
@@ -1205,19 +1276,77 @@ class ScientificToolGateway:
             if row.get('contract_current', True)
             and row.get('tool_name') == 'measure_experiment' and row.get('status') == 'ok']
 
-    def retry_source(self, observations: list[dict[str, Any]], *, parent_attempt_id: str | None = None) -> dict[str, Any]:
+    @staticmethod
+    def unchanged_measurement_condition(condition_id: str | None, contracts: list[dict[str, Any] | None], *,
+                                        allow_owned: bool = False) -> bool:
+        """Whether each saved contract still names the same independent measurement."""
+        if not condition_id:
+            return False
+        selected = []
+        for contract in contracts:
+            if not isinstance(contract, dict) or not isinstance(contract.get('conditions'), list):
+                return False
+            row = next((item for item in contract['conditions'] if item['id'] == condition_id), None)
+            if (row is None or row.get('reuse_ref')
+                    or not allow_owned and row.get('source', 'declared') != 'declared'):
+                return False
+            selected.append(row)
+        return bool(selected) and all(row == selected[0] for row in selected[1:])
+
+    @classmethod
+    def unchanged_condition_observation(cls, condition_id: str | None, configurations: list[dict[str, Any]]) -> bool:
+        """Keep a recorded condition when unrelated materials or research guidance change."""
+        for previous, current in zip(configurations, configurations[1:]):
+            if previous.get('code_task') != current.get('code_task'):
+                return False
+            if any(current.get('sources', {}).get(name) != path
+                   for name, path in previous.get('sources', {}).items()):
+                return False
+        return cls.unchanged_measurement_condition(condition_id,
+            [config.get('execution_contract') for config in configurations], allow_owned=True)
+
+    def retry_source(self, observations: list[dict[str, Any]], *, parent_attempt_id: str | None = None,
+                     allow_reuse: bool = False) -> dict[str, Any]:
         """Select a completed failed execution and its caller-declared contract."""
         contract = self._declared_execution_contract
-        if (not isinstance(contract, dict) or 'conditions' in contract
-                or self.implementation is not None and self.implementation.exact is not None
-                or contract.get('environment') is not None):
-            raise ValueError('Experiment retry requires a simple caller-declared measurement; '
-                'paired, prepared and CodeTask work use their existing operation boundaries')
+        scoped = self.implementation is not None and self.implementation.exact is not None
+        if (not isinstance(contract, dict) or ('conditions' in contract and not allow_reuse)
+                or scoped and not allow_reuse
+                or not allow_reuse and self.preparation_contract(contract) is not None):
+            raise ValueError('Experiment retry requires an eligible caller-declared measurement; '
+                'older saved contracts retain their own operation boundaries')
         measurements = [row for row in observations if row.get('tool_name') == 'measure_experiment']
-        if not measurements or measurements[-1].get('status') != 'ok':
+        previous = measurements[-1] if measurements else None
+        if allow_reuse and 'conditions' in contract and parent_attempt_id is not None:
+            previous = next((row for row in reversed(measurements)
+                if isinstance((row.get('data') or {}).get('result_ref'), str)
+                and Path(row['data']['result_ref']).parent.name == parent_attempt_id), None)
+        elif allow_reuse and 'conditions' in contract:
+            seen, retained = set(), None
+            for row in reversed(measurements):
+                condition = row.get('arguments', {}).get('condition_id')
+                if condition in seen:
+                    continue
+                seen.add(condition)
+                if row.get('status') == 'ok' and (row.get('data') or {}).get('execution_status') in {'failed', 'timed_out'}:
+                    if row.get('contract_current', True):
+                        previous = row
+                        break
+                    if retained is None:
+                        retained = row
+            else:
+                if retained is not None:
+                    previous = retained  # The caller may be completing an already-supplied retry.
+        if previous is None or previous.get('status') != 'ok':
             raise ValueError('No completed scientific measurement is available to retry; '
                 'reconcile any interrupted operation first')
-        previous = measurements[-1]
+        condition_id = previous.get('arguments', {}).get('condition_id')
+        if 'conditions' in contract and not self.unchanged_measurement_condition(
+                condition_id, [contract], allow_owned=allow_reuse and scoped):
+            raise ValueError('Retry requires a local condition; imported results retain their existing origin')
+        if condition_id and any(row.get('arguments', {}).get('condition_id') == condition_id
+                for row in measurements[measurements.index(previous) + 1:]):
+            raise ValueError('A newer measurement exists for this condition; use its retained outcome')
         locator = previous.get('data', {}).get('result_ref')
         if not isinstance(locator, str):
             raise ValueError('The last measurement has no retained result')
@@ -1226,13 +1355,16 @@ class ScientificToolGateway:
             raise ValueError('A reused baseline is not a failed local measurement')
         parent = Path(ref.path).parent.name
         if parent_attempt_id is not None and parent_attempt_id != parent:
-            raise ValueError('The retry parent must identify the latest measurement attempt')
+            raise ValueError('The retry parent must identify the retained measurement attempt')
         actual = ArtifactStore(self.root).read_json(ref)
         if actual.get('execution_status') not in {'failed', 'timed_out'}:
             raise ValueError('Only a failed or timed-out execution can be retried; '
                 'scientific results and missing metrics remain evidence')
-        return {'contract': contract, 'parent_attempt_id': parent,
-                'contract_current': previous.get('contract_current', True)}
+        arguments = previous.get('arguments') or {}
+        source = {name: arguments[name] for name in ('implementation_ref', 'preparation_ref') if arguments.get(name)}
+        return {'contract': contract, 'parent_attempt_id': parent, 'condition_id': condition_id,
+                'contract_current': previous.get('contract_current', True),
+                'source': source, 'source_cwd': arguments.get('cwd') if source else None}
 
     @staticmethod
     def analysis_records(observations: list[dict[str, Any]]) -> list[str]:
@@ -1424,6 +1556,10 @@ class ScientificToolGateway:
                     'execution_status': canonical['execution_status'],
                     'canonical_status': canonical['status'], 'metrics': canonical['metrics'],
                     'capability_status': capability.status, 'diagnostics': list(capability.diagnostics)}
+                if (binding.get('shared_environment') and self._current_attempts is not None
+                        and isinstance(self._current_attempts(), dict)):
+                    data['preparation_reuse'] = {'attempt_id': binding['shared_environment']['attempt_id'],
+                        'scope': 'Uses the retained prepared environment; project or dependency changes are not reinstalled automatically.'}
                 if source is not None:
                     data['lineage_limitations'] = source.get('limitations', [])
                     from simple_ar.code_task.runtime.state import retained_implementation_inventory

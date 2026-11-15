@@ -465,6 +465,46 @@ code = "daily"
             with self.assertRaisesRegex(SystemExit, 'existing common task'):
                 main(['research-session', '--session-root', str(root / 'saved'), '--independent-review-required'])
 
+    def test_new_structured_research_does_not_create_a_legacy_model_client(self):
+        with patch('simple_ar.cli.start.migrate_structured_creation') as create, \
+                patch('simple_ar.cli.main._optional_research_llm_client',
+                    side_effect=AssertionError('New work uses the common model owner')), \
+                contextlib.redirect_stdout(io.StringIO()):
+            main(['research-session', '--topic', 'Compare supplied evidence', '--model', 'fixture'])
+        create.assert_called_once()
+        self.assertEqual(create.call_args.args[0].model, 'fixture')
+
+    def test_structured_resume_adopts_materials_and_capacity_in_the_original_task(self):
+        from simple_ar.app.research_application import ResearchApplicationServices
+        from simple_ar.app.research_intake import create_research_task
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.research.workflow_contracts import ResearchBrief
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            first, second = root / 'first.md', root / 'second.md'
+            first.write_text('Original source.', encoding='utf-8')
+            second.write_text('Additional source.', encoding='utf-8')
+            app = create_research_task(ResearchBrief(request_text='Compare the sources.',
+                asset_requests=({'locator': str(first), 'role': 'paper'},)), root=root / 'task',
+                services=ResearchApplicationServices(config={'research_materials_only': True}))
+            original_limit = app.session.manifest.budget.max_attempts
+            with patch('simple_ar.cli.main._run_native_start') as run:
+                main(['research-session', '--session-root', str(root / 'task'),
+                    '--local-document', str(second), '--max-results', '7',
+                    '--additional-attempts', '3', '--authorization-id', 'revise-1',
+                    '--authorization-reason', 'Continue with the added source.'])
+            resumed = ToolApplication.load(root / 'task')
+            self.assertEqual(resumed.state['config']['sources']['source1'], str(second))
+            self.assertEqual(resumed.state['config']['research_policy']['max_results'], 7)
+            self.assertEqual(resumed.state['config']['research_policy']['materials'], ['source0', 'source1'])
+            self.assertEqual(resumed.session.manifest.budget.max_attempts, original_limit + 3)
+            self.assertEqual(resumed.session.manifest.session_id, app.session.manifest.session_id)
+            forwarded = run.call_args.args[0]
+            self.assertEqual(forwarded.resume_task, root / 'task')
+            self.assertEqual(forwarded.additional_attempts, 0)
+            self.assertIsNone(forwarded.authorization_id)
+
     def test_structured_new_routes_outputs_roles_and_table_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1159,7 +1199,7 @@ code = "daily"
                         self.assertIsNotNone(app.state['pending'])
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
-                    main(['research-session-continue', '--session-root', str(root), '--cwd', str(base),
+                    main(['research-session-continue', '--session-root', str(root),
                         '--timeout-sec', '5', '--parent-attempt-id', parent, '--command', *corrected])
                 resumed = ToolApplication.load(root)
                 results = [row for row in resumed._operation_observations()
@@ -1184,6 +1224,151 @@ code = "daily"
                     main(['research-session-continue', '--session-root', str(root), '--cwd', str(base),
                         '--timeout-sec', '5', '--command', *corrected])
                 self.assertEqual(ToolApplication.load(root).ledger.to_dict()['entries'], entries)
+
+    def test_common_research_retry_reuses_unchanged_comparison_condition(self) -> None:
+        from simple_ar.app.research_application import retry_experiment
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.tools.scientific import ScientificToolGateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            def execution(command, label):
+                return {'command': command, 'cwd': str(base), 'timeout_sec': 5, 'label': label,
+                    'result_schema': {'primary_metric': 'score', 'required_metrics': ['score']}}
+            contract = {'conditions': [
+                {'id': 'baseline', 'role': 'baseline', 'seed': None,
+                    'execution': execution([sys.executable, '-c', "print('score: 0.5')"], 'baseline')},
+                {'id': 'candidate', 'role': 'candidate', 'seed': None,
+                    'execution': execution([sys.executable, '-c', 'raise SystemExit(4)'], 'candidate')},
+            ]}
+            app = ToolApplication.create(base / 'session', 'Compare the supplied conditions', model=None,
+                sources={}, allow_execution=True, execution_contract=contract, max_attempts=30,
+                process_limits={'process_invocations': 4, 'process_wall_seconds': 30},
+                context_protocol='conversation.v1')
+            rows = app.state['config']['execution_contract']['conditions']
+            initial = app.state['config']['execution_contract']
+            changed_baseline = {'conditions': [{**rows[0], 'execution': {
+                **rows[0]['execution'], 'label': 'changed'}}, rows[1]]}
+            self.assertTrue(ScientificToolGateway.unchanged_declared_condition('baseline', [initial, initial]))
+            self.assertFalse(ScientificToolGateway.unchanged_declared_condition('baseline', [initial, changed_baseline]))
+            app.run(actions=[{'tool_name': 'measure_experiment',
+                'arguments': {**row['execution'], 'condition_id': row['id']}} for row in reversed(rows)],
+                approve=lambda *_: True, progress=lambda _: None,
+                should_stop=lambda: app.state['pending'] is None
+                    and not any(turn['remaining'] for turn in app.state['turns']))
+            before = app._operation_observations()
+            failed, baseline = [row for row in before if row['tool_name'] == 'measure_experiment']
+            original = app.workspace.resolve(baseline['data']['result_ref']).read_bytes()
+            ledger = app.ledger.to_dict()['entries']
+            result = retry_experiment(base / 'session', command=(sys.executable, '-c', "print('score: 0.8')"),
+                cwd=base, timeout_sec=5,
+                parent_attempt_id=app.workspace.resolve(failed['data']['result_ref']).parent.name,
+                reason='Correct the failed candidate.', progress=lambda _: None)
+            self.assertEqual(result['observation']['data']['execution_status'], 'passed')
+            self.assertEqual(result['analysis']['status'], 'ok')
+            app = ToolApplication.load(base / 'session')
+            self.assertEqual(app.state['supplies'][-1]['reason'], 'Correct the failed candidate.')
+            measurements = [row for row in app._operation_observations() if row['tool_name'] == 'measure_experiment']
+            self.assertEqual([row['contract_current'] for row in measurements], [False, True, True])
+            self.assertEqual(app.workspace.resolve(baseline['data']['result_ref']).read_bytes(), original)
+            self.assertEqual(app.ledger.to_dict()['entries'][:len(ledger)], ledger)
+            self.assertEqual(sum(row['purpose'] == 'local_process' for row in app.ledger.to_dict()['entries']), 3)
+            self.assertEqual(failed['data']['execution_status'], 'failed')
+
+            # Changing the other condition while adding unrelated materials does
+            # not turn the retained baseline measurement into a new experiment.
+            extra = base / 'additional-context.txt'
+            extra.write_text('A new note, not a changed measurement.', encoding='utf-8')
+            revised = json.loads(json.dumps(app.state['config']['execution_contract']))
+            next(row for row in revised['conditions'] if row['id'] == 'candidate')['execution']['label'] = 'revised'
+            before_supply = app.ledger.to_dict()['entries']
+            app.supply(supply_id='add-context-and-revise', reason='Update the candidate and supply additional context',
+                changes={'sources': {'extra': str(extra)}, 'execution_contract': revised}, replace_existing=True)
+            measurements = [row for row in app._operation_observations(domain='scientific')
+                if row['tool_name'] == 'measure_experiment']
+            self.assertEqual([row['contract_current'] for row in measurements], [False, True, False])
+            self.assertEqual(app.scientific.measurement_refs(app._scientific_observations()),
+                [baseline['data']['result_ref']])
+            self.assertEqual(app.ledger.to_dict()['entries'], before_supply)
+
+    def test_corrected_measurement_reuses_its_preparation_and_other_conditions(self) -> None:
+        from simple_ar.app.tool_application import ToolApplication
+
+        for paired in (False, True):
+            with self.subTest(paired=paired), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp).resolve()
+                check = base / 'check.py'
+                check.write_text("from pathlib import Path\np = Path('check-count')\n"
+                    "p.write_text(str(int(p.read_text()) + 1) if p.exists() else '1')\n", encoding='utf-8')
+                candidate = base / 'candidate.py'
+                candidate.write_text('raise SystemExit(2)\n', encoding='utf-8')
+                baseline = base / 'baseline.py'
+                baseline.write_text("print('score: 0.5')\n", encoding='utf-8')
+                environment = {'mode': 'current', 'timeout_sec': 5,
+                    'check_command': [sys.executable, 'check.py']}
+
+                def execution(script, label):
+                    return {'command': [sys.executable, script], 'cwd': str(base),
+                        'timeout_sec': 5, 'label': label, 'environment': environment,
+                        'result_schema': {'primary_metric': 'score', 'required_metrics': ['score']}}
+
+                contract = ({'conditions': [
+                    {'id': 'candidate', 'role': 'candidate', 'seed': None,
+                     'execution': execution('candidate.py', 'candidate')},
+                    {'id': 'baseline', 'role': 'baseline', 'seed': None,
+                     'execution': execution('baseline.py', 'baseline')},
+                ]} if paired else execution('candidate.py', 'candidate'))
+                app = ToolApplication.create(base / 'session', 'Measure the supplied work', model=None,
+                    sources={}, allow_execution=True, execution_contract=contract, max_attempts=30,
+                    process_limits={'process_invocations': 5, 'process_wall_seconds': 60})
+                saved = app.state['config']['execution_contract']
+                rows = saved['conditions'] if paired else [{'execution': saved}]
+                app.run(actions=[{'tool_name': 'measure_experiment', 'arguments': {
+                    **row['execution'], **({'condition_id': row['id']} if paired else {})}} for row in rows],
+                    approve=lambda *_: True, progress=lambda _: None,
+                    should_stop=lambda: app.state['pending'] is None
+                        and not any(turn['remaining'] for turn in app.state['turns']))
+                measurements = [row for row in app._operation_observations(domain='scientific')
+                    if row['tool_name'] == 'measure_experiment']
+                failed = measurements[0]
+                self.assertEqual(failed['data']['execution_status'], 'failed')
+                original = app.workspace.resolve(failed['data']['result_ref']).read_bytes()
+                entries = app.ledger.to_dict()['entries']
+                candidate.write_text("print('score: 0.8')\n", encoding='utf-8')
+                result = app.retry_experiment(command=(sys.executable, 'candidate.py'), cwd=base,
+                    timeout_sec=5, parent_attempt_id=None if paired else app.workspace.resolve(
+                        failed['data']['result_ref']).parent.name, progress=lambda _: None)
+                self.assertEqual(result['observation']['data']['execution_status'], 'passed')
+                self.assertIn('not reinstalled automatically',
+                    result['observation']['data']['preparation_reuse']['scope'])
+                self.assertEqual(result['analysis']['status'], 'ok')
+                restored = ToolApplication.load(base / 'session')
+                self.assertEqual((base / 'check-count').read_text(), '1')
+                self.assertEqual(app.workspace.resolve(failed['data']['result_ref']).read_bytes(), original)
+                self.assertEqual(restored.ledger.to_dict()['entries'][:len(entries)], entries)
+                self.assertEqual(sum(row['purpose'] == 'local_process'
+                    for row in restored.ledger.to_dict()['entries']), len(entries) + 1)
+                self.assertEqual(len(list((base / 'session/attempts').glob('*/environment_setup.json'))), 1)
+                if paired:
+                    current = [row for row in restored._operation_observations(domain='scientific')
+                        if row['tool_name'] == 'measure_experiment' and row['contract_current']]
+                    self.assertEqual({row['arguments']['condition_id'] for row in current},
+                        {'baseline', 'candidate'})
+                    baseline.write_text("print('score: 0.6')\n", encoding='utf-8')
+                    refs = restored.scientific.measurement_refs(current)
+                    selected = restored.scientific._condition_results(refs)
+                    self.assertEqual(set(selected), {'candidate'})
+                    self.assertIsNone(restored.scientific.analysis_arguments(refs)['baseline_ref'])
+                    retained = next(row for row in current if row['arguments']['condition_id'] == 'baseline')
+                    self.assertTrue(restored.workspace.resolve(retained['data']['result_ref']).is_file())
+
+                # A changed preparation is not silently treated as the old one.
+                check.write_text(check.read_text(encoding='utf-8') + '# changed setup\n', encoding='utf-8')
+                active = restored.state['config']['execution_contract']
+                row = active['conditions'][0] if paired else {'execution': active}
+                with self.assertRaisesRegex(ValueError, 'preparation inputs'):
+                    restored.scientific.approval_binding({**row['execution'],
+                        **({'condition_id': row['id']} if paired else {})}, identity='changed-setup')
 
     def test_legacy_session_continue_does_not_execute_or_rewrite_history(self) -> None:
         from tests.legacy_session_fixture import historical_session
@@ -1627,12 +1812,12 @@ code = "daily"
             prior = app.workspace.workspace / 'analysis.txt'
             prior.write_text('Retained analysis result.\n', encoding='utf-8')
             original_ledger = app.ledger.to_dict()
-            self.assertEqual(app.state['config']['document_context_policy'], 'working.v2')
+            self.assertEqual(app.state['config']['document_context_policy'], 'working.v4')
             main(['research-report', '--session-root', str(root),
                   '--reviewer', 'disabled', '--max-section-tokens', '123'])
             restored = ToolApplication.load(root)
             requirement = restored.state['config']['report_requirement']
-            self.assertEqual(restored.state['config']['document_context_policy'], 'working.v3')
+            self.assertEqual(restored.state['config']['document_context_policy'], 'working.v4')
             self.assertEqual((requirement['method'], requirement['config']['max_section_tokens']), ('sections', 123))
             self.assertEqual(restored.operations.document.report_requirement, requirement)
             self.assertEqual(restored.ledger.to_dict(), original_ledger)

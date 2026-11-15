@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from simple_ar.core.budget import BudgetLedger
-from simple_ar.integrations.llm import LLMClient
+from simple_ar.integrations.llm import LLMClient, bind_task_budget, task_budget_identity
 
 from .base import AgentBackend
 from .external_cli import (
@@ -36,8 +36,11 @@ def create_agent_backend(
     args = tuple(extra_args)
     if normalized in {"fake", "dry_run", "dryrun"}:
         return FakeAgentBackend()
+    budget_ledger, session_id, attempt_id = task_budget_identity(client, budget_ledger,
+        session_id=session_id, attempt_id=attempt_id)
     if normalized in {"local_llm", "llm"}:
-        return LocalLlmAgentBackend(client)
+        return LocalLlmAgentBackend(bind_task_budget(client, budget_ledger,
+            session_id=session_id, attempt_id=attempt_id) if client is not None else None)
     if normalized == "codex":
         return CodexCliBackend(binary=binary or "codex", model=model or "", enabled=enabled, timeout_sec=timeout_sec, extra_args=args,
                                ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id)

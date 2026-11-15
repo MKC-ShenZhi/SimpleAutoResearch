@@ -7,7 +7,6 @@ operation delivery eligibility without scheduling work or storing acceptance sta
 """
 from __future__ import annotations
 
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
 
@@ -103,16 +102,38 @@ class Delivery:
         self.review_request_start = review_request_start
         self.legacy_report_status = config.get('delivery_review_protocol') not in {'task.v4', 'task.v5'}
 
-    def _committed_review(self, observations: list[dict]) -> bool:
-        """A selected final review remains work in this user request."""
-        if self.config.get('delivery_review_selection') != 'model.v2':
+    def _committed_review(self, request: DeliveryRequest | None, observations: list[dict]) -> bool:
+        """Keep a selected whole-delivery review with the work it actually covered."""
+        selection = self.config.get('delivery_review_selection')
+        if selection not in {'model.v2', 'model.v3'}:
             return False
         first = self.review_request_start() if self.review_request_start is not None else None
+        selected = None
         for row in reversed(observations):
-            completion = tool_completion(row.get('tool_name', ''), self.config.get('tool_completions'))
             current = row.get('current_request', True) if first is None else row.get('request_count', 1) >= first
-            if (current and completion is not None and completion.kind == 'review'
-                    and (row.get('arguments') or {}).get('review_scope') == 'delivery'):
+            if not current:
+                continue
+            if selection == 'model.v2':
+                completion = tool_completion(row.get('tool_name', ''), self.config.get('tool_completions'))
+                if (completion is not None and completion.kind == 'review'
+                        and (row.get('arguments') or {}).get('review_scope') == 'delivery'):
+                    return True  # Preserve the saved request-wide contract.
+                continue
+            if request is None:
+                return False
+            review = (row.get('metadata') or {}).get('delivery_review') or {}
+            if review.get('error'):
+                continue  # A failed review is an observation, not a new task-wide requirement.
+            binding = review.get('binding') or {}
+            if binding.get('purpose') or not isinstance(binding.get('artifacts'), dict):
+                continue
+            if selected is None:
+                try:
+                    resolved = self.workspace.resolve_delivery(request)
+                    selected = {str(self.workspace.resolve(path)) for path in resolved['artifacts']}
+                except (ValueError, OSError):
+                    return False  # The normal delivery owner reports invalid or unfinished outputs.
+            if selected and selected == set(binding['artifacts']):
                 return True
         return False
 
@@ -130,8 +151,8 @@ class Delivery:
         # checked candidate merely because its spelling changed.
         if (request.independent_review is not None and (
                 self.config.get('independent_review_required')
-                or self.config.get('delivery_review_selection') == 'model.v2' and (
-                    request.independent_review is True or self._committed_review(observations)))):
+                or self.config.get('delivery_review_selection') in {'model.v2', 'model.v3'} and (
+                    request.independent_review is True or self._committed_review(request, observations)))):
             request = request.model_copy(update={'independent_review': None})
         return request
 
@@ -229,7 +250,7 @@ class Delivery:
                 return False
             if observations is None:
                 observations = self.observations()
-            if not self._committed_review(observations):
+            if not self._committed_review(request, observations):
                 return False
         return delivery_requires_review(request, self.review_owner.protocol)
 
@@ -288,7 +309,7 @@ class Delivery:
         # A previous delivery also supplies work for a new feedback request.
         possible_candidate = (self.config.get('candidate_review_protocol') == 'candidate.v1'
             and (previously_delivered or work_after_review))
-        committed_review = self._committed_review(observations)
+        committed_review = self._committed_review(proposal, observations)
         needs_review = (self.review_owner is not None
             and not (previously_delivered and delivered_current_request)
             and (self.config.get('independent_review_required')
@@ -327,7 +348,9 @@ class Delivery:
                 'statement, not a current obligation. Reconsider it against the request and actual work. '
                 + ('The caller requires an independent review before complete delivery. '
                    if self.config.get('independent_review_required') else
-                   'The selected delivery-scope review remains part of this request. '
+                   ('The selected delivery-scope review remains part of this request. '
+                    if self.config.get('delivery_review_selection') == 'model.v2' else
+                    'The selected delivery-scope review remains applicable to this work. ')
                    if committed_review else
                    'The planning floor may preserve an opportunity for an optional check; it does not require one. ')
                 + 'This is not a pass or an exact cost forecast. '
@@ -417,7 +440,9 @@ class Delivery:
                         current_result: dict | None = None,
                         current_outputs: tuple[Path, ...] = (), candidate: bool = False,
                         review_scope: str | None = None,
-                        observations: list[dict] | None = None) -> dict | None:
+                        observations: list[dict] | None = None,
+                        repeat_identical: bool = True,
+                        review_capacity: Callable[[], Any] | None = None) -> dict | None:
         if self.review_owner is None:
             return None
         if observations is None:
@@ -429,7 +454,8 @@ class Delivery:
             if request.unresolved:
                 raise ValueError('A complete delivery review cannot claim unfinished work')
             candidate = False
-        elif candidate and review_scope is None and not request.unresolved:
+        elif (candidate and review_scope is None and not request.unresolved
+              and self.config.get('delivery_review_selection') != 'model.v3'):
             # A fully eligible claim keeps the normal reusable final binding.
             # Retain this historical inference for saved decisions; new model
             # decisions select their scope explicitly or default to candidate.
@@ -456,7 +482,9 @@ class Delivery:
             resolved = self.workspace.resolve_delivery(request, current_outputs=current_outputs)
         binding = prepare_delivery_review(self.workspace, request, resolved['artifacts'],
             self.user_requests, protocol=self.review_owner.protocol, candidate=candidate)
-        return self.review_owner.review(binding, identity, may_start=may_start, observations=observations)
+        return self.review_owner.review(binding, identity, may_start=may_start, observations=observations,
+            **({'repeat_identical': False} if not repeat_identical else {}),
+            **({'review_capacity': review_capacity} if review_capacity is not None else {}))
 
     def bind_result(self, request: DeliveryRequest, payload: dict, identity: str, *,
                     current_outputs: tuple[Path, ...], current_result: dict,
@@ -469,12 +497,14 @@ class Delivery:
         this owner alone interprets summary, inventory and review applicability.
         Neither an inspection opinion nor this projection commits the task.
         """
-        observations = (self.observations() if self.config.get('delivery_review_selection') == 'model.v2'
+        producer_declined = request.independent_review is False
+        observations = (self.observations() if self.config.get('delivery_review_selection') in {'model.v2', 'model.v3'}
             and request.independent_review is False else None)
-        # A rejected attempt to waive a selected final review can reuse a pass,
-        # but must not silently spend another review while the producer asked
-        # to skip one. Existing feedback remains available for the next action.
-        if observations is not None and self._committed_review(observations):
+        # An optional review can reuse a pass without starting a new review
+        # against the producer's choice. An explicit caller requirement owns
+        # that choice and may inspect a changed claim using authorized capacity.
+        if (observations is not None and not self.config.get('independent_review_required')
+                and self._committed_review(request, observations)):
             may_start = False
         request = self.resolve_request(request, observations or [])
         delivery = self.workspace.resolve_delivery(request, current_outputs=current_outputs)
@@ -498,18 +528,18 @@ class Delivery:
                 retain()  # Pin production before paid work; recovery never reruns it.
             if observations is None:
                 observations = self.observations()
-            review = self.review_delivery(delivery, identity, may_start=False,
+            review = self.review_delivery(delivery, identity, may_start=may_start,
                 current_result=current_result, current_outputs=current_outputs, candidate=candidate,
-                review_scope=review_scope, observations=observations)
-            if review is None and may_start:
-                with review_capacity() if candidate or self.requires_review(request, observations=observations) else nullcontext():
-                    review = self.review_delivery(delivery, identity, may_start=True,
-                        current_result=current_result, current_outputs=current_outputs, candidate=candidate,
-                        review_scope=review_scope, observations=observations)
+                review_scope=review_scope, observations=observations,
+                review_capacity=review_capacity if candidate or self.requires_review(request, observations=observations) else None,
+                repeat_identical=not (self.config.get('independent_review_required')
+                    and producer_declined and not candidate))
             if review is not None:
                 if metadata.get('delivery_review', review) != review:
                     raise ValueError('Retained delivery review differs from its actual receipt')
                 metadata['delivery_review'] = review
+                if review.get('error'):
+                    metadata['delivery_review_error'] = review['error']
                 if not review.get('error'):
                     reviewed = review['result']['metadata']
                     for key in (('inspection_binding',) if package_review

@@ -57,6 +57,7 @@ from simple_ar.report.schema import (
     ReportToolCall,
     ReportToolResult,
     ReviewerFinding,
+    bind_finding_actions,
 )
 from simple_ar.report.survey import (
     _bounded_int as _coerce_int, _survey_draft_order,
@@ -2328,6 +2329,7 @@ def _section_response(
                 _retain_bibliography_notes(memory, response, source_front_matter)
                 return written
             review = ReportSectionReview.model_validate(resolve_review_evidence(_normalize_review_response(response, section), view))
+            review.findings = bind_finding_actions(review.findings, config.review_action_contract if config else None)
             current = review_draft_quote_sources(view)
             validate_finding_anchors(review, current, view)
             if revision_review is not None and previous_draft is not None and config is not None:

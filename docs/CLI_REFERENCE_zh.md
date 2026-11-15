@@ -32,7 +32,7 @@
 | 使用精确结构化输入或继续已有研究 | [`simple-ar research-session`](#simple-ar-research-session) |
 | 使用已有研究会话生成或刷新报告 | [`simple-ar research-report`](#simple-ar-research-report) |
 | 新建仅摘要会话的兼容名称；继承 research-session 参数，受下述限制约束 | [`simple-ar research-brief`](#simple-ar-research-brief) |
-| 在原研究会话的简单实验失败／超时后运行一次修正的显式实验 | [`simple-ar research-session-continue`](#simple-ar-research-session-continue) |
+| 在原研究会话中修正一次失败或超时的显式测量 | [`simple-ar research-session-continue`](#simple-ar-research-session-continue) |
 | 从只读 v1 会话创建后继，仅导入具名小成果，不修改源会话 | [`simple-ar research-session-migrate`](#simple-ar-research-session-migrate) |
 | 为显式已有项目或从零创建合同准备隔离工作区 | [`simple-ar code-task init`](#simple-ar-code-task-init) |
 | 继续已有 CodeTask 的有界规划、审阅、编辑及基准 | [`simple-ar code-task execute`](#simple-ar-code-task-execute) |
@@ -165,6 +165,8 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--switch-id NAME` | --switch-model 的稳定幂等 ID。 | 未设置 |
 | `--switch-reason TEXT` | --switch-model 的人类可读原因。 | 未设置 |
 | `--authorize-remaining DIMENSION=AMOUNT` | 以 DIMENSION=AMOUNT 授权新的剩余额度，可重复；保留历史用量／未知预留。 | 未设置 |
+| `--additional-attempts N` | 提高原任务的尝试上限，须提供授权 ID 和原因。 | 0 |
+| `--additional-no-progress N` | 提高原任务的连续无进展上限，须提供授权 ID 和原因。 | 0 |
 | `--authorization-id NAME` | 稳定幂等 ID；相同 ID／条款不会补回已用额度。 | 未设置 |
 | `--authorization-reason TEXT` | 变更剩余额度的人类可读原因。 | 未设置 |
 | `--approve-execution VALUE` | 待执行命令显示的精确令牌；要求 --resume-task。 | 要求 --resume-task 及精确令牌 |
@@ -527,7 +529,7 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 | `--outputs CHOICE ...` | 请求的成果；不能与 --with-report 或 --no-report 同用。 可选：`summary`, `report`, `experiments`, `bug_fix`, `code_task`, `data_analysis`. | 未设置 |
 | `--material PATH` | 笔记、草稿或分析包，可重复。普通材料未经核验，不等同文献论文。 | [] |
 | `--model SELECTOR` | 模型选择器：env、profile:NAME 或 route:NAME。 | 直接 CLI：无；TOML 通常 env；恢复保留模型 |
-| `--independent-review-required` | 正式交付前需要独立复核，允许如实部分交付。 | 新建模型任务；默认关闭 |
+| `--independent-review-required` | 正式交付前需要独立复核，允许如实部分交付。 | 模型驱动的共同任务；默认关闭 |
 | `--feasibility-review-model SELECTOR` | 用于有来源依据的可行性审阅的独立模型。 | 未设置 |
 | `--output-root PATH` | 新任务／运行目录的父目录。 | runs/research-session |
 | `--cache-dir PATH` | 可选共享全文缓存位置。 | 会话本地缓存 |
@@ -570,8 +572,8 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 | `--authorization-id NAME` | 稳定幂等 ID；相同 ID／条款不会补回已用额度。 | 未设置 |
 | `--authorization-reason TEXT` | 变更剩余额度的人类可读原因。 | 未设置 |
 | `--authorize-remaining DIMENSION=AMOUNT` | 以 DIMENSION=AMOUNT 授权新的剩余额度，可重复；保留历史用量／未知预留。 | 未设置 |
-| `--additional-attempts N` | 提高历史总尝试上限，不清除已有尝试。 | 0 |
-| `--additional-no-progress N` | 提高历史连续无进展次数上限。 | 0 |
+| `--additional-attempts N` | 提高原任务总尝试上限，不清除已有尝试。 | 0 |
+| `--additional-no-progress N` | 提高原任务连续无进展次数上限。 | 0 |
 | `--decision-id NAME` | 待处理设计／协议决定的精确 ID；原生回复要求 --resume-task。 | 未设置 |
 | `--decision-response CHOICE` | 回复待处理决定；接受设计不等同批准进程。 可选：`accept`, `reject`, `revise`. | 未设置 |
 | `--decision-guidance TEXT` | --decision-response revise 时提供的事实或修订方向。 | 未设置 |
@@ -735,8 +737,8 @@ simple-ar research-brief --topic TEXT [OPTIONS]
 | `--authorization-id NAME` | 稳定幂等 ID；相同 ID／条款不会补回已用额度。 | 未设置 |
 | `--authorization-reason TEXT` | 变更剩余额度的人类可读原因。 | 未设置 |
 | `--authorize-remaining DIMENSION=AMOUNT` | 以 DIMENSION=AMOUNT 授权新的剩余额度，可重复；保留历史用量／未知预留。 | 未设置 |
-| `--additional-attempts N` | 提高历史总尝试上限，不清除已有尝试。 | 0 |
-| `--additional-no-progress N` | 提高历史连续无进展次数上限。 | 0 |
+| `--additional-attempts N` | 提高原任务总尝试上限，不清除已有尝试。 | 0 |
+| `--additional-no-progress N` | 提高原任务连续无进展次数上限。 | 0 |
 | `--decision-id NAME` | 待处理设计／协议决定的精确 ID；原生回复要求 --resume-task。 | 未设置 |
 | `--decision-response CHOICE` | 回复待处理决定；接受设计不等同批准进程。 可选：`accept`, `reject`, `revise`. | 未设置 |
 | `--decision-guidance TEXT` | --decision-response revise 时提供的事实或修订方向。 | 未设置 |
@@ -794,7 +796,7 @@ simple-ar research-brief --topic "总结本地资料" --local-document paper.md
 
 ### `simple-ar research-session-continue`
 
-在原研究会话的简单实验失败／超时后运行一次修正的显式实验。
+在原研究会话中修正一次失败或超时的显式测量。
 
 ```text
 simple-ar research-session-continue --session-root PATH [OPTIONS] --command ARGV...
@@ -803,9 +805,9 @@ simple-ar research-session-continue --session-root PATH [OPTIONS] --command ARGV
 | 参数 | 说明 | 默认值或使用条件 |
 | --- | --- | --- |
 | `--session-root PATH` | 已有研究会话，包括共同创建的结构化任务。 | 必填 |
-| `--parent-attempt-id NAME` | 分支起点的失败实验；默认最新 canonical 实验，旧布局为 experiment-001。 | 最新实验；旧布局为 experiment-001 |
+| `--parent-attempt-id NAME` | 分支起点的失败实验。 | 共同任务对照中最近的失败条件；其他情况为最近实验 |
 | `--model SELECTOR` | 兼容参数；此命令不更换保存的模型，也不请求模型决策。 | 未设置 |
-| `--cwd PATH` | 声明命令的工作目录。 | . |
+| `--cwd PATH` | 声明命令的工作目录。 | 共同任务沿用原工作区；历史会话使用当前目录 |
 | `--timeout-sec N` | 单进程超时限制（秒）。 | 300 |
 | `--label NAME` | 声明实验的标签。 | research-session-recovery |
 | `--primary-metric NAME` | 主要比较指标。 | 未设置 |
@@ -813,7 +815,7 @@ simple-ar research-session-continue --session-root PATH [OPTIONS] --command ARGV
 | `--metric-direction NAME=DIRECTION` | NAME=DIRECTION，可重复；方向包括 higher、lower、resource、ignore。 | [] |
 | `--command ARGV...` | 显式 argv；放最后，后续 token 均属于命令。research／start 的 argv 不作 shell 解释。 | 必填 |
 
-仅支持修正简单显式实验。科学阴性结果不是技术失败。配对／预处理数据／CodeTask 失败使用各自续接路径。保留原任务、父实验依据和进程账本，未显式覆盖的指标设置沿用原值。共同任务测量通过后，若还有执行机会则进行确定性分析，不启动模型决策；后续工作使用原任务的正常恢复命令。v1 会话保持只读。
+可修正最近一次失败的简单测量；新建共同任务也可修正对照中的一个显式条件，复用未变条件及适用的预备环境或已验证的 CodeTask 工作区。旧条件记录的直接输入或声明保护的材料发生变化时，不再将其作为当前条件。复用不会自动重新安装变更后的项目代码或依赖。科学阴性结果不是技术失败。保留原任务、父实验依据和进程账本，未显式覆盖的指标设置沿用原值。完整测量结果齐备且还有执行机会时，系统进行确定性分析，不启动模型决策；后续工作使用原任务的正常恢复命令。v1 会话保持只读。
 
 示例：
 

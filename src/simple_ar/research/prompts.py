@@ -502,15 +502,3 @@ def _evidence_block(evidence_snippets: str) -> str:
         "Each snippet is labelled as `[evidence_id | path:line_start-line_end | query=...]`.\n"
         f"{stripped}"
     )
-
-
-def _research_evidence_block(summary: str) -> str:
-    """Format compact research evidence cards for report drafting."""
-    stripped = summary.strip()
-    if not stripped:
-        return ""
-    return (
-        "\n\nResearch Evidence Summary:\n"
-        "This summary is generated from structured search-stage evidence artifacts.\n"
-        f"{stripped}"
-    )

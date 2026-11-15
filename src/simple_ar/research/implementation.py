@@ -16,6 +16,7 @@ from simple_ar.code_task.analysis.context import load_latest_code_task_context_p
 from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest, save_code_task_manifest, workspace_file
 from simple_ar.code_task.editing.scope import protected_patterns_from_manifest
 from simple_ar.experiment.execution.measurement import snapshot_protocol_assets, reconcile_protocol_assets
+from simple_ar.integrations.llm import bind_task_budget
 
 
 IMPLEMENTATION_CONTEXT_MAX_FILES = 6
@@ -126,14 +127,16 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
         stderr_path = failure_dir / failed["artifacts"]["stderr"]
         details = store.read_text(store.ref(stderr_path))
         evidence = RepairEvidence(request.failure_ref.path, failed, details or json.dumps(failed["diagnosis"]))
-        repair = propose_repair_edits(request.run_dir, llm_client=request.llm_client, failure_evidence=evidence)
+        client = bind_task_budget(request.llm_client, request.budget_ledger,
+            session_id=request.session_id, attempt_id=request.attempt_id)
+        repair = propose_repair_edits(request.run_dir, llm_client=client, failure_evidence=evidence)
         repair_paths = {"repair_proposal": repair.proposal_path,
                         "failure_evidence": repair.repair_dir / "failure_evidence.json"}
         if repair.mode != "llm" or not repair.edit_count:
             stop_reason, next_action = "empty_repair", "Inspect the failed measurement and repair proposal."
         else:
             apply_verified_repair(request.run_dir, repair, approval_note=request.approval_note,
-                llm_client=request.llm_client, message_callback=request.message_callback,
+                llm_client=client, message_callback=request.message_callback,
                 review_use_llm=review_with_llm,
                 **({'direct_edit': True} if direct_edit else {}),
                 **({'process_scope': request.process_scope} if request.process_scope is not None else {}))

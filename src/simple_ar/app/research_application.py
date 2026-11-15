@@ -20,7 +20,7 @@ from typing import Any, Callable, Sequence
 from uuid import uuid4
 from simple_ar.integrations.model_profiles import model_connections_compatible
 
-from simple_ar.app.research_intake import normalize_assets, validate_brief, write_intake_artifacts
+from simple_ar.app.research_intake import brief_input_base, normalize_assets, validate_brief, write_intake_artifacts
 from simple_ar.app.research_execution import (
     code_task_validation,
     analysis_contract_context,
@@ -228,7 +228,7 @@ class ResearchApplication:
         settings = services or ResearchApplicationServices()
         if settings.max_attempts is None:
             settings = replace(settings, max_attempts=16)
-        assets = _normalize_assets(brief, settings)
+        assets = normalize_assets(brief, input_base_dir=brief_input_base(brief, settings.input_base_dir))
         diagnostics = validate_brief(brief, assets)
         _raise_on_errors(diagnostics)
         session_root = Path(root).expanduser().absolute()
@@ -1020,22 +1020,12 @@ class ResearchApplication:
         self, supplied: Mapping[str, object], *, session_resume: bool = True, changes_only: bool = True,
     ) -> dict[str, object]:
         """Validate explicit settings with the retained Writer owner, then diff."""
-        supplied = dict(supplied)
-        if (session_resume and supplied.get("template") == "experiment"
-                and not self.services.config.get("execution")
-                and self.services.config.get("research_task_kind") != "writing"):
-            supplied["template"] = "survey"
-        saved = self.services.config.get("report", {})
-        saved = saved if isinstance(saved, Mapping) else {}
-        if self.services.config.get("report_writing_method", "sections") == "article":
-            from simple_ar.report.requirements import validate_report_settings
-            try:
-                validate_report_settings({**saved, **supplied}, method="article")
-            except (TypeError, ValueError) as exc:
-                raise ResearchApplicationError(str(exc)) from exc
-        if not changes_only:
-            return supplied
-        return {key: value for key, value in supplied.items() if key not in saved or saved[key] != value}
+        from simple_ar.report.requirements import report_config_overrides
+        try:
+            return report_config_overrides(supplied, self.services.config,
+                session_resume=session_resume, changes_only=changes_only)
+        except (TypeError, ValueError) as exc:
+            raise ResearchApplicationError(str(exc)) from exc
 
     def request_report(
         self,
@@ -4161,7 +4151,7 @@ class ResearchApplication:
             brief, revision=self.brief.revision + 1,
             parent_revision=self.brief.revision,
         )
-        assets = _normalize_assets(candidate, self.services)
+        assets = normalize_assets(candidate, input_base_dir=brief_input_base(candidate, self.services.input_base_dir))
         diagnostics = validate_brief(candidate, assets)
         _raise_on_errors(diagnostics)
         return candidate, assets, diagnostics
@@ -5643,15 +5633,25 @@ def continue_session(
 
 
 def retry_experiment(
-    root: str | Path, *, command: Sequence[str], cwd: str | Path, timeout_sec: int,
+    root: str | Path, *, command: Sequence[str], cwd: str | Path | None = None, timeout_sec: int,
     result_schema: Mapping[str, object] | None = None, label: str = "experiment-retry",
     parent_attempt_id: str | None = None,
-    reason: str = "Retry the failed explicit experiment with a caller-supplied correction.",
+    reason: str | None = None,
     services: ResearchApplicationServices | None = None,
-) -> ResearchApplicationView:
+    progress: Callable[[str], None] | None = None,
+) -> ResearchApplicationView | dict[str, Any]:
+    manifest = Path(root) / 'session_manifest.json'
+    if manifest.is_file() and json.loads(manifest.read_text(encoding='utf-8')).get('transition_recipe') == 'native-tools-v1':
+        from simple_ar.app.tool_application import ToolApplication
+        return ToolApplication.load(Path(root), services=services).retry_experiment(
+            command=tuple(command), cwd=cwd, timeout_sec=timeout_sec,
+            result_schema=dict(result_schema) if result_schema is not None else None,
+            label=label, parent_attempt_id=parent_attempt_id, reason=reason,
+            progress=progress or (services.message_callback if services is not None else None) or print)
     return load_session(root, services=services).retry_experiment(
-        command=command, cwd=cwd, timeout_sec=timeout_sec, result_schema=result_schema,
-        label=label, parent_attempt_id=parent_attempt_id, reason=reason,
+        command=command, cwd=cwd if cwd is not None else Path.cwd(), timeout_sec=timeout_sec, result_schema=result_schema,
+        label=label, parent_attempt_id=parent_attempt_id,
+        reason=reason if reason is not None else "Retry the failed explicit experiment with a caller-supplied correction.",
     )
 
 
@@ -5669,14 +5669,6 @@ def _research_registry() -> CapabilityRegistry:
     # same controller attempt boundary as every other accepted-plan step.
     registry.register("summary", run_summary_capability)
     return registry
-
-
-def _normalize_assets(brief: ResearchBrief, services: ResearchApplicationServices) -> tuple[ResearchAsset, ...]:
-    base = services.input_base_dir
-    if base is None and brief.source_path:
-        source = Path(brief.source_path)
-        base = source.parent if source.suffix else source
-    return normalize_assets(brief, input_base_dir=base or Path.cwd())
 
 
 def _raise_on_errors(diagnostics: tuple[Diagnostic, ...]) -> None:

@@ -259,14 +259,15 @@ def build_parser(
     continuation_parser.add_argument(
         "--parent-attempt-id",
         default=None,
-        help="Failed experiment attempt to branch from; defaults to the latest canonical experiment (or experiment-001 for legacy sessions).",
+        help="Failed experiment attempt to branch from; defaults to the latest failed condition in a common comparison, or the latest experiment otherwise.",
     )
     continuation_parser.add_argument(
         "--model",
         default=None,
         help="Compatibility option; this command does not change the saved model or request a model decision.",
     )
-    continuation_parser.add_argument("--cwd", default=".")
+    continuation_parser.add_argument("--cwd", default=None,
+        help="Working directory; defaults to the retained workspace for common tasks and the current directory for historical sessions.")
     continuation_parser.add_argument("--timeout-sec", type=int, default=300)
     continuation_parser.add_argument("--label", default="research-session-recovery")
     continuation_parser.add_argument("--primary-metric", default=None)

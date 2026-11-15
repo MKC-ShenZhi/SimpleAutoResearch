@@ -83,8 +83,8 @@ def build_report_audit(
     )
     status = _overall_status([citation.status, metric.status, claim.status])
     if any(
-        finding.severity == "critical"
-        or (finding.severity == "major" and finding.type in FACTUAL_REVIEW_FINDING_TYPES)
+        finding_requires_resolution(finding) and (finding.severity == "critical"
+        or (finding.severity == "major" and finding.type in FACTUAL_REVIEW_FINDING_TYPES))
         for finding in reviewer_findings
     ):
         status = "failed"

@@ -32,7 +32,7 @@ Look up syntax, parameters and recovery limits here. Prefix examples with `uv ru
 | Use exact structured inputs or continue saved research work | [`simple-ar research-session`](#simple-ar-research-session) |
 | Generate or refresh a report using a saved research session | [`simple-ar research-report`](#simple-ar-research-report) |
 | Compatibility spelling for a new summary-only session; inherits research-session parameters with the limits below. | [`simple-ar research-brief`](#simple-ar-research-brief) |
-| Run one corrected explicit experiment after a failed/timed-out simple experiment in the original research session. | [`simple-ar research-session-continue`](#simple-ar-research-session-continue) |
+| Retry one failed or timed-out explicitly declared measurement in the original research session. | [`simple-ar research-session-continue`](#simple-ar-research-session-continue) |
 | Create a successor from a read-only v1 session, importing only named small artifacts without changing the source. | [`simple-ar research-session-migrate`](#simple-ar-research-session-migrate) |
 | Prepare an isolated workspace for an explicit existing-project or greenfield contract. | [`simple-ar code-task init`](#simple-ar-code-task-init) |
 | Continue bounded planning, review, edits and benchmarks for a saved CodeTask. | [`simple-ar code-task execute`](#simple-ar-code-task-execute) |
@@ -165,6 +165,8 @@ Natural-language review requests are interpreted by the model. Set `--independen
 | `--switch-id NAME` | Stable idempotency key for --switch-model. | Unset |
 | `--switch-reason TEXT` | Human-readable reason for --switch-model. | Unset |
 | `--authorize-remaining DIMENSION=AMOUNT` | New remaining allowance as DIMENSION=AMOUNT; repeatable. Retains prior usage/unknown reservations. | Unset |
+| `--additional-attempts N` | Increase the saved task's attempt cap. Requires an authorization ID and reason. | 0 |
+| `--additional-no-progress N` | Increase the saved task's consecutive no-progress cap. Requires an authorization ID and reason. | 0 |
 | `--authorization-id NAME` | Stable idempotency key; identical ID/terms do not replenish spent capacity. | Unset |
 | `--authorization-reason TEXT` | Human-readable reason for remaining-allowance changes. | Unset |
 | `--approve-execution VALUE` | Exact printed token for the pending command; requires --resume-task. | Requires --resume-task and exact token |
@@ -528,7 +530,7 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 | `--outputs CHOICE ...` | Requested outputs; cannot combine with --with-report or --no-report. Choices: `summary`, `report`, `experiments`, `bug_fix`, `code_task`, `data_analysis`. | Unset |
 | `--material PATH` | Notes, drafts or an analysis package; repeatable. Ordinary materials are unverified, not bibliographic papers. | [] |
 | `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME. | Direct CLI: none; TOML normally env; resume keeps model |
-| `--independent-review-required` | Require independent review before complete delivery; partial delivery remains available. | New model-backed task; off |
+| `--independent-review-required` | Require independent review before complete delivery; partial delivery remains available. | Model-backed common task; off |
 | `--feasibility-review-model SELECTOR` | Independent model for source-backed feasibility review. | Unset |
 | `--output-root PATH` | Parent directory for a new task/run. | runs/research-session |
 | `--cache-dir PATH` | Optional shared full-text cache location. | Session-local cache |
@@ -571,8 +573,8 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 | `--authorization-id NAME` | Stable idempotency key; identical ID/terms do not replenish spent capacity. | Unset |
 | `--authorization-reason TEXT` | Human-readable reason for remaining-allowance changes. | Unset |
 | `--authorize-remaining DIMENSION=AMOUNT` | New remaining allowance as DIMENSION=AMOUNT; repeatable. Retains prior usage/unknown reservations. | Unset |
-| `--additional-attempts N` | Increase legacy total attempt cap without erasing prior attempts. | 0 |
-| `--additional-no-progress N` | Increase legacy consecutive no-progress cap. | 0 |
+| `--additional-attempts N` | Increase the saved task’s total attempt cap without erasing prior attempts. | 0 |
+| `--additional-no-progress N` | Increase the saved task’s consecutive no-progress cap. | 0 |
 | `--decision-id NAME` | Exact pending design/protocol decision ID; native replies require --resume-task. | Unset |
 | `--decision-response CHOICE` | Reply to the pending decision; accepting a design does not approve a process. Choices: `accept`, `reject`, `revise`. | Unset |
 | `--decision-guidance TEXT` | Facts or revised direction with --decision-response revise. | Unset |
@@ -737,8 +739,8 @@ simple-ar research-brief --topic TEXT [OPTIONS]
 | `--authorization-id NAME` | Stable idempotency key; identical ID/terms do not replenish spent capacity. | Unset |
 | `--authorization-reason TEXT` | Human-readable reason for remaining-allowance changes. | Unset |
 | `--authorize-remaining DIMENSION=AMOUNT` | New remaining allowance as DIMENSION=AMOUNT; repeatable. Retains prior usage/unknown reservations. | Unset |
-| `--additional-attempts N` | Increase legacy total attempt cap without erasing prior attempts. | 0 |
-| `--additional-no-progress N` | Increase legacy consecutive no-progress cap. | 0 |
+| `--additional-attempts N` | Increase the saved task’s total attempt cap without erasing prior attempts. | 0 |
+| `--additional-no-progress N` | Increase the saved task’s consecutive no-progress cap. | 0 |
 | `--decision-id NAME` | Exact pending design/protocol decision ID; native replies require --resume-task. | Unset |
 | `--decision-response CHOICE` | Reply to the pending decision; accepting a design does not approve a process. Choices: `accept`, `reject`, `revise`. | Unset |
 | `--decision-guidance TEXT` | Facts or revised direction with --decision-response revise. | Unset |
@@ -796,7 +798,7 @@ simple-ar research-brief --topic "Summarize local sources" --local-document pape
 
 ### `simple-ar research-session-continue`
 
-Run one corrected explicit experiment after a failed/timed-out simple experiment in the original research session.
+Retry one failed or timed-out explicitly declared measurement in the original research session.
 
 ```text
 simple-ar research-session-continue --session-root PATH [OPTIONS] --command ARGV...
@@ -805,9 +807,9 @@ simple-ar research-session-continue --session-root PATH [OPTIONS] --command ARGV
 | Parameter | Meaning | Default or conditions |
 | --- | --- | --- |
 | `--session-root PATH` | Saved research session, including a common structured task. | Required |
-| `--parent-attempt-id NAME` | Failed experiment to branch from; latest canonical experiment, or experiment-001 for old layouts. | Latest experiment; experiment-001 for old layouts |
+| `--parent-attempt-id NAME` | Failed experiment to branch from. | Latest failed condition in a common comparison; latest experiment otherwise |
 | `--model SELECTOR` | Compatibility option; this command does not change the saved model or request a model decision. | Unset |
-| `--cwd PATH` | Declared command working directory. | . |
+| `--cwd PATH` | Declared command working directory. | Retained workspace for common tasks; current directory for historical sessions |
 | `--timeout-sec N` | Per-process time limit in seconds. | 300 |
 | `--label NAME` | Declared experiment label. | research-session-recovery |
 | `--primary-metric NAME` | Primary comparison metric. | Unset |
@@ -815,7 +817,7 @@ simple-ar research-session-continue --session-root PATH [OPTIONS] --command ARGV
 | `--metric-direction NAME=DIRECTION` | NAME=DIRECTION; repeatable. Directions include higher, lower, resource and ignore. | [] |
 | `--command ARGV...` | Explicit argv; put last because all following tokens belong to the command. Research/start argv has no shell interpretation. | Required |
 
-Only a corrected simple explicit experiment is supported. Scientific negative results are not technical failures. Paired/prepared-data/CodeTask failures use their own continuation path. The original parent evidence, task and process ledger are retained; metric settings carry forward unless explicitly overridden. A passed common measurement is followed by deterministic analysis when attempt capacity permits; no model decision is started. Continue further work using the task's normal resume command. V1 sessions remain read-only.
+The latest failed simple measurement can be retried. New common tasks can also correct one declared condition in a comparison, retaining unchanged conditions and an applicable prepared environment or validated CodeTask workspace. A retained condition is not adopted when its recorded direct input or declared protected asset has changed. Reuse does not reinstall changed project code or dependencies. Scientific negative results are not technical failures. The original parent evidence, task and process ledger are retained; metric settings carry forward unless explicitly overridden. When the complete measurement set is available and capacity permits, deterministic analysis follows without a model decision. Continue further work using the task's normal resume command. V1 sessions remain read-only.
 
 Examples:
 

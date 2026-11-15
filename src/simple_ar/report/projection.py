@@ -541,6 +541,43 @@ def build_research_report_inputs(
     return context, memory
 
 
+def retain_reference_maps(context: ReportContext, maps: Sequence[tuple[Mapping[str, Any], bool]],
+                          *, artifact: str) -> ReportContext:
+    """Combine recorded reference identities without treating metadata as source evidence."""
+    from simple_ar.report.citations import references_from_citation_map
+
+    handles = list(context.source_handles)
+    papers = list(context.papers)
+    known_ids = {row['id'] for row in papers}
+    retained_keys: dict[str, str] = {}
+    for payload, retain_aliases in maps:
+        references, keys = references_from_citation_map(dict(payload))
+        for key, paper_id in (keys.items() if retain_aliases else ()):
+            if key in retained_keys and retained_keys[key] != paper_id:
+                raise ReportProjectionError('Reused citation maps have conflicting short keys; use stable paper identities before combining drafts.')
+            retained_keys[key] = paper_id
+        for paper in references:
+            if paper.id in known_ids:
+                continue
+            known_ids.add(paper.id)
+            papers.append(paper.to_row())
+            if not any(handle.paper_id == paper.id for handle in handles):
+                handles.append(SourceHandle(handle=f'reference:{paper.id}', kind='paper',
+                    paper_id=paper.id, title=paper.title, artifact=artifact,
+                    metadata={'evidence_role': 'reused_reference_metadata_not_primary_text',
+                              'document_chunk_count': 0, 'evidence_passages': []}))
+    for row in papers:
+        if row['id'] not in retained_keys.values():
+            index = 1
+            while f'P{index}' in retained_keys:
+                index += 1
+            retained_keys[f'P{index}'] = row['id']
+    by_id = {paper_id: key for key, paper_id in retained_keys.items()}
+    handles = [handle.model_copy(update={'citation_key': by_id.get(handle.paper_id, handle.citation_key)})
+               for handle in handles]
+    return context.model_copy(update={'papers': papers, 'source_handles': handles, 'citation_key_map': retained_keys})
+
+
 def build_material_report_inputs(
     *, topic: str, documents: DocumentBundle, documents_ref: ArtifactRef,
     assets: Sequence[Any], selected_evidence: bool = False, include_memory: bool = True,
@@ -676,12 +713,9 @@ def build_material_report_inputs(
     # Assign linked-material citation identities before joining a saved map;
     # otherwise the same snapshot gains a second metadata-only paper handle.
     _attach_linked_document_references(context, documents)
-    handles = list(context.source_handles)
     # Reused drafts need their recorded reference identities, not a BibTeX file
     # treated as prose. Keep this separate from original-source evidence.
-    from simple_ar.report.citations import references_from_citation_map
-    known_ids = {row["id"] for row in context.papers}
-    retained_keys = {}
+    reference_maps = []
     for record in documents.records:
         code = record.metadata.get("code_analysis")
         if code is not None:
@@ -693,41 +727,10 @@ def build_material_report_inputs(
             continue
         if not isinstance(payload, dict):
             continue
-        references, keys = references_from_citation_map(payload)
-        if code is not None:
-            # Producer-local aliases are not a frozen manuscript's citations.
-            # The active report assigns unique keys across analysis packages.
-            keys = {}
-        for key, paper_id in keys.items():
-            if key in retained_keys and retained_keys[key] != paper_id:
-                raise ReportProjectionError("Reused citation maps have conflicting short keys; use stable paper identities before combining drafts.")
-            retained_keys[key] = paper_id
-        for paper in references:
-            if paper.id in known_ids:
-                continue
-            known_ids.add(paper.id)
-            context.papers.append(paper.to_row())
-            if any(handle.paper_id == paper.id for handle in handles):
-                # Bibliographic metadata may describe a linked material that
-                # already has its own text/coverage. Do not promote that input
-                # into a second, metadata-only paper evidence handle.
-                continue
-            handles.append(SourceHandle(handle=f"reference:{paper.id}", kind="paper",
-                paper_id=paper.id, title=paper.title, artifact=documents_ref.path,
-                metadata={"evidence_role": "reused_reference_metadata_not_primary_text",
-                          "document_chunk_count": 0, "evidence_passages": []}))
-    # Do not renumber old aliases while their original map is visible to the
-    # writer. Assign only unused keys to newly supplied references.
-    for row in context.papers:
-        if row["id"] not in retained_keys.values():
-            index = 1
-            while f"P{index}" in retained_keys:
-                index += 1
-            retained_keys[f"P{index}"] = row["id"]
-    context.citation_key_map = retained_keys
-    by_id = {paper_id: key for key, paper_id in retained_keys.items()}
-    handles = [handle.model_copy(update={"citation_key": by_id.get(handle.paper_id, handle.citation_key)})
-               for handle in handles]
+        # Producer-local aliases do not belong to a frozen manuscript.
+        reference_maps.append((payload, code is None))
+    context = retain_reference_maps(context, reference_maps, artifact=documents_ref.path)
+    handles = list(context.source_handles)
     analyses = []
     for record in documents.records:
         table = record.metadata.get("table_analysis")

@@ -1732,18 +1732,18 @@ class GoalWorkTests(unittest.TestCase):
                 'basis': 'executed', 'execution_records': ['made-up-receipt'], 'method': 'Claimed a run.',
                 'reasoning': 'No actual computation was performed.', 'evidence': ['evidence-1'],
                 'outcome': 'unresolved'}]}
-        for method in ('goal.v1', 'execute.v2'):
+        for method in ('goal.v1', 'execute.v2', 'execute.v3'):
             with self.subTest(method=method):
                 saved['work_method'] = method
                 opinion = deepcopy(value)
-                if method == 'execute.v2':
+                if method.startswith('execute.'):
                     opinion.pop('evidence')
                     opinion['investigations'][0]['findings'] = opinion.pop('findings')
                 with self.assertRaisesRegex(ValueError, 'actual own successful'):
                     inspector._delivery_decision(saved, opinion)
                 opinion['investigations'][0].update(basis='not_checked', execution_records=[])
                 finding = {'severity':'required', 'message':'Must be wrong because not checked.', 'artifacts':['note']}
-                if method == 'execute.v2':
+                if method.startswith('execute.'):
                     opinion['investigations'][0]['findings'] = [finding]
                 else:
                     opinion['findings'] = [{**finding, 'investigation':0}]

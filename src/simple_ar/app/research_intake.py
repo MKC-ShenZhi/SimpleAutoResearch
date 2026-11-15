@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 import hashlib
 import json
 import stat
@@ -34,17 +34,35 @@ def _legacy_creation_options(services: Any) -> dict:
 
 
 _DEFAULT_RESEARCH_PROVIDERS = ('openalex', 'semantic_scholar', 'arxiv')
+_OUTPUT_ALIASES = {'experiment': 'experiments', 'code': 'code_task', 'code_patch': 'code_task',
+    'patch': 'code_task', 'bug_repair': 'bug_fix'}
 
 
-def _creation_model_limits(limits: Mapping, *, model_enabled: bool) -> dict:
-    return {name: limits[name] if limits.get(name) is not None else default if model_enabled else 0
+def _requested_outputs(brief: ResearchBrief) -> tuple[str, ...]:
+    outputs = (value.strip().lower() for value in brief.requested_outputs)
+    return tuple(dict.fromkeys(_OUTPUT_ALIASES.get(value, value) for value in outputs)) or ('research_summary',)
+
+
+def _creation_model_limits(limits: Mapping, *, model_enabled: bool, preserve_unlimited: bool = False) -> dict:
+    if not model_enabled:
+        return {'llm_requests': 0, 'total_tokens': 0}
+    return {name: limits[name] if name in limits and (limits[name] is not None or preserve_unlimited) else default
         for name, default in (('llm_requests', 30), ('total_tokens', 600000))}
+
+
+def declared_research_work(outputs: Iterable[str], sources: Iterable[Mapping],
+                           research_config: Mapping | None, *, explicit_research: bool) -> bool:
+    """Interpret source/design intent once for a caller-declared execution."""
+    requested = {_OUTPUT_ALIASES.get(value.strip().lower(), value.strip().lower()) for value in outputs}
+    return bool({'summary', 'research_summary'} & requested
+        or (research_config is not None and any(row['role'] in {'paper', 'material'} for row in sources))
+        or explicit_research or (research_config or {}).get('research_selected_idea_id'))
 
 
 def create_structured_research_task(brief: ResearchBrief, *, root: str | Path,
                                     config: Mapping, budget_limits: Mapping,
                                     model: str | None, max_results: int,
-                                    timeout_sec: int | None = None, research_work: bool = False,
+                                    timeout_sec: int | None = None, research_work: bool | None = None,
                                     queries: Iterable[str] | None = None,
                                     providers: Iterable[str] | None = None,
                                     interaction: str | None = None, **creation_options):
@@ -72,6 +90,7 @@ def create_structured_research_task(brief: ResearchBrief, *, root: str | Path,
         limits.update(_creation_model_limits(limits if model_enabled else {}, model_enabled=model_enabled))
         attempts = max(20, limits['llm_requests'] * 10 + 16)
     return create_research_task(brief, root=root, model=model, config=values, budget_limits=limits,
+        _research_work=research_work if values.get('execution') is not None else None,
         max_results=max_results, max_attempts=attempts, max_no_progress=6, **creation_options)
 
 
@@ -79,11 +98,12 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
                          model: str | None = None, allow_vision: bool = False,
                          snapshot_sources: bool = False,
                          max_snapshot_bytes: int = 16 * 1024 * 1024,
+                         _research_work: bool | None = None,
                          **creation_options):
     """Create without running; intake owns configuration and domain admission.
 
     Creation keywords are config, budget_limits, input_base_dir, max_results,
-    max_chunks, idea_limit, cache_dir, max_attempts and max_no_progress.
+    max_chunks, idea_limit, cache_dir, extraction_dir, max_attempts and max_no_progress.
     Services supply runtime bindings only. Historical ResearchApplicationServices
     settings remain supported, but cannot be mixed with direct creation keywords.
     Image inspection requires explicit allow_vision and the native vision route.
@@ -94,7 +114,201 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
         creation_options = _legacy_creation_options(services)
     return _create_research_task(brief, root=root, services=services, model=model,
         allow_vision=allow_vision, snapshot_sources=snapshot_sources,
-        max_snapshot_bytes=max_snapshot_bytes, **creation_options)
+        max_snapshot_bytes=max_snapshot_bytes, research_work=_research_work, **creation_options)
+
+
+def revise_research_task(app: Any, *, research_settings: Mapping[str, Any] | None = None,
+                         materials: Iterable[tuple[str | Path, str]] = (),
+                         report_settings: Mapping[str, Any] | None = None,
+                         report_requested: bool | None = None, report_method: str | None = None,
+                         independent_review_required: bool | None = None,
+                         resource_allowances: Mapping[str, int | float] | None = None,
+                         additional_attempts: int | None = None, additional_no_progress: int | None = None,
+                         authorization_id: str = '', authorization_reason: str = '') -> bool:
+    """Apply explicit research revisions to the original common task and ledger."""
+    from simple_ar.tools.sources import SourcePolicy
+    from simple_ar.tools.workspace import resolve_source_mount
+
+    saved = app.state['config']
+    mounts = dict(saved['sources'])
+    policy = dict(saved.get('research_policy') or {'allow_network': saved['allow_network']})
+    selected = list(policy.get('materials', ()))
+    has_source_work = bool(research_settings)
+    confirm_protocol = bool((research_settings or {}).get('interaction') in {'assisted', 'checkpoints'}
+        and saved.get('execution_contract') is not None and not policy.get('require_design'))
+    if confirm_protocol:
+        policy['require_design'] = True
+    for locator, role in materials:
+        path = str(resolve_source_mount(Path(locator)))
+        alias = next((name for name, value in mounts.items() if value == path), None)
+        if alias is None:
+            index = 0
+            while f'source{index}' in mounts:
+                index += 1
+            alias = f'source{index}'
+            mounts[alias] = path
+        if role in {'paper', 'material'}:
+            if not Path(path).is_file():
+                raise ValueError('Research material must be a file')
+            if alias not in selected:
+                selected.append(alias)
+                has_source_work = True
+    changes: dict[str, Any] = {}
+    if mounts != saved['sources']:
+        changes['sources'] = mounts
+    aliases = {'research_use_fulltext': 'require_fulltext',
+        'max_research_iterations': 'max_iterations'}
+    for name, value in (research_settings or {}).items():
+        if name == 'research_materials_only':
+            policy['allow_network'] = not value
+            changes['allow_network'] = not value
+        else:
+            target = aliases.get(name, name.removeprefix('research_'))
+            if target == 'cache_dir' and value is not None:
+                value = str(Path(value).expanduser().resolve())
+            if target not in SourcePolicy.model_fields:
+                raise ValueError('Unknown research revision: ' + name)
+            policy[target] = value
+    if has_source_work:
+        policy['materials'] = selected
+        normalized = SourcePolicy.model_validate(policy).model_dump(mode='json')
+        if normalized != saved.get('research_policy'):
+            changes['research_policy'] = normalized
+    if changes.get('allow_network') == saved.get('allow_network'):
+        changes.pop('allow_network')
+    if independent_review_required is not None:
+        if type(independent_review_required) is not bool:
+            raise ValueError('Independent review selection must be a boolean')
+        if independent_review_required != saved.get('independent_review_required', False):
+            changes['independent_review_required'] = independent_review_required
+    if report_requested is False:
+        if saved.get('report_requirement') is not None or app._report_projection()['kind'] == 'report':
+            changes['report_requirement'] = None
+    elif report_requested or report_settings is not None or report_method is not None:
+        if (report_requested is not True and saved.get('report_requirement') is None
+                and app._report_projection()['kind'] != 'report'):
+            raise ValueError('Report settings require an existing or explicitly requested report')
+        requirement = app.report_revision(dict(report_settings or {}), method=report_method)
+        if requirement is not None:
+            changes['report_requirement'] = requirement
+    allowances = dict(resource_allowances or {})
+    capacity = bool(allowances or additional_attempts or additional_no_progress)
+    if capacity and (not authorization_id.strip() or not authorization_reason.strip()):
+        raise ValueError('A resource revision requires an authorization id and reason')
+    if not changes:
+        if not capacity:
+            return False
+        # The ordinary continuation owns standalone grants too. Stop before
+        # action selection so changing capacity cannot start a model or tool.
+        app.run(resource_allowances=allowances, additional_attempts=additional_attempts,
+            additional_no_progress=additional_no_progress, authorization_id=authorization_id,
+            authorization_reason=authorization_reason, should_stop=lambda: True, progress=lambda _: None)
+        return True
+    app.supply(supply_id=authorization_id or f"research-revision-{len(app.state.get('supplies', [])) + 1}",
+        reason=authorization_reason or 'Revise the supplied research materials and settings.',
+        changes=changes, replace_existing=True, resource_allowances=allowances,
+        additional_attempts=additional_attempts, additional_no_progress=additional_no_progress)
+    if confirm_protocol:
+        app.request_execution_confirmation()
+    return True
+
+
+def start_research_task(app: Any, *, progress: Callable[[str], None] | None = None) -> dict[str, Any]:
+    """Start structured research through the saved common task and its budget.
+
+    With no model, collect the explicitly supplied materials or run the declared
+    table analysis; later authored or experimental work stays pending. The
+    normal task action journal owns execution, confirmation and recovery.
+    """
+    progress = progress or getattr(app.services, 'message_callback', None) or print
+    saved = app.state['config']
+    if saved['model']:
+        return app.run(progress=progress)
+    if saved.get('execution_contract') is not None and saved.get('research_policy') is None:
+        return start_declared_measurements(app, progress=progress)
+    brief = ResearchBrief.from_dict(app.session.store.read_json(app.session.manifest.state_refs['brief']))
+    policy = saved.get('research_policy') or {}
+    action = ({'tool_name': 'analyze_table', 'arguments': saved['table_analysis']}
+        if saved.get('table_analysis') is not None else
+        {'tool_name': 'research_collect' if saved['allow_network'] else 'research', 'arguments': {
+            'operation': 'summary', 'question': brief.objective or brief.request_text,
+            'materials': policy.get('materials', []), 'use_llm': False}})
+    status = app.run(actions=[action], progress=progress)
+    turn = app.state['turns'][-1]
+    result = app.session.store.read_json(turn['tools'][-1]['result']) if turn['tools'] else {}
+    if result.get('status') != 'ok' or not result.get('artifacts'):
+        return status
+    if saved.get('execution_contract'):
+        confirm = bool(policy.get('require_design'))
+        if confirm:
+            app.request_execution_confirmation()
+        return start_declared_measurements(app, request=brief.request_text, confirm=confirm, progress=progress)
+    deferred = bool('experiments' in _requested_outputs(brief) or saved.get('report_requirement')
+        or policy.get('require_design'))
+    completion = ({'tool_name': 'ask_user', 'arguments': {'question':
+        'Materials are retained, but the requested design, execution or authored report is not complete. '
+        'Continue this task with an authorized model and execution contract/approval as needed.'}}
+        if deferred else {'tool_name': 'deliver_result', 'arguments': {
+        'summary': brief.request_text, 'artifacts': result['artifacts'],
+        'unresolved': result.get('data', {}).get('unresolved', [])}})
+    return app.run(actions=[completion], progress=progress)
+
+
+def start_declared_measurements(app: Any, *, request: str | None = None, confirm: bool = False,
+                                progress: Callable[[str], None] | None = None) -> dict[str, Any]:
+    """Run the caller's initial literal conditions with one-use authorization.
+
+    A bound protocol confirmation remains separate from process approval. New
+    proposals, retries and resumed commands use the ordinary approval boundary.
+    """
+    from simple_ar.tools.scientific import measurement_conditions
+
+    progress = progress or getattr(app.services, 'message_callback', None) or print
+    if request is None:
+        brief = ResearchBrief.from_dict(app.session.store.read_json(app.session.manifest.state_refs['brief']))
+        request = brief.request_text
+    saved = app.state['config']
+    contract = saved['execution_contract']
+    conditions = [row for row in measurement_conditions(contract) if not row.get('reuse_ref')]
+    grouped = 'conditions' in contract
+    actions = [{'tool_name': 'measure_experiment', 'arguments':
+        {**row['execution'], 'condition_id': row['id']} if grouped else
+        row['execution'] if saved['model'] or saved.get('report_requirement') else
+        {**row['execution'], 'delivery': {'summary': request, 'artifacts': []}}}
+        for row in conditions]
+    turn_index = len(app.state['turns'])
+    request_count = len(app.state['requests'])
+    remaining = {f'caller-{turn_index}-{index}': row['arguments'] for index, row in enumerate(actions)}
+
+    def approve(call: dict, token: str) -> bool:
+        progress(f"Execution proposal: {call['function']['arguments']}\nApproval token: {token}")
+        arguments = json.loads(call['function']['arguments'])
+        if (len(app.state['turns']) != turn_index + 1
+                or app.state['turns'][-1].get('origin') != 'caller'
+                or app.state['turns'][-1].get('request_count') != request_count
+                or call['id'] not in remaining or call['function']['name'] != 'measure_experiment'
+                or arguments != remaining[call['id']]):
+            return False
+        if arguments.get('environment') is not None:
+            binding = app.scientific.approval_binding(arguments, identity=app.state['pending']['attempt'])
+            if preparation := binding.get('environment_preparation'):
+                steps = preparation['steps']
+                wall = len(steps) * preparation['profile']['timeout_sec'] + sum(
+                    row['execution']['timeout_sec'] for row in conditions)
+                progress('Environment preparation steps (literal argv): ' + json.dumps(steps, ensure_ascii=False))
+                progress(f"Preparation once + {len(conditions)} formal measurements: {len(steps) + len(conditions)} invocations; <= {wall}s declared wall reservation. "
+                         f"Shared process limits: {json.dumps(binding['limits'], sort_keys=True)}")
+            else:
+                progress('Reuse verified shared environment: ' + json.dumps(binding['shared_environment'], sort_keys=True))
+        del remaining[call['id']]
+        return True
+
+    status = app.run(actions=actions, approve=None if confirm else approve, progress=progress)
+    if grouped and not saved['model']:
+        completion = app.measurement_completion_actions()
+        if completion:
+            status = app.run(actions=completion, progress=progress)
+    return status
 
 
 def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: Any | None,
@@ -103,6 +317,7 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
                           budget_limits: Mapping | None = None, input_base_dir: str | Path | None = None,
                           max_results: int = 10, max_chunks: int | None = 300, idea_limit: int = 3,
                           cache_dir: str | Path | None = None, extraction_dir: str | Path | None = None,
+                          research_work: bool | None = None,
                           max_attempts: int | None = None,
                           max_no_progress: int = 3):
     from simple_ar.app.tool_application import ToolApplication
@@ -124,7 +339,7 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
     aliases = {'research_sources': 'providers', 'research_use_fulltext': 'require_fulltext',
         'research_selected_idea_id': 'selected_idea_id', 'feasibility_review_model': 'feasibility_connection'}
     policy_values, unhandled = {}, []
-    auxiliary = {'research_task_kind', 'research_materials_only', 'report', 'report_writing_method',
+    auxiliary = {'research_task_kind', 'research_materials_only', 'research_local_documents', 'report', 'report_writing_method',
         'independent_review_required',
         'data_analysis', 'max_output_tokens', 'execution', 'execution_confirmation'}
     for name, value in config.items():
@@ -133,13 +348,34 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
             policy_values[target] = value
         elif name not in auxiliary:
             unhandled.append(name)
-    if unhandled or extraction_dir is not None:
+    if unhandled:
         raise ValueError('These legacy creation controls need their explicit execution/revision owner: '
-            + ', '.join(sorted([*unhandled, *(['extraction_dir'] if extraction_dir is not None else [])])))
-    source = Path(brief.source_path) if brief.source_path else None
-    base = Path(input_base_dir) if input_base_dir is not None else (
-        (source.parent if source and source.suffix else source) or Path.cwd())
+            + ', '.join(sorted(unhandled)))
+    if extraction_dir is not None:
+        directory = str(Path(extraction_dir).expanduser().resolve())
+        if policy_values.get('extraction_dir') not in (None, directory):
+            raise ValueError('Conflicting explicit extraction directories')
+        policy_values['extraction_dir'] = directory
+    base = brief_input_base(brief, input_base_dir)
     assets = normalize_assets(brief, input_base_dir=base)
+    local_documents = config.get('research_local_documents', ())
+    if local_documents is None:
+        local_documents = ()
+    if not isinstance(local_documents, (list, tuple)) or any(
+            not isinstance(path, (str, Path)) or not str(path).strip() or _is_remote_locator(str(path))
+            for path in local_documents):
+        raise ValueError('research_local_documents must contain explicit local paths')
+    declared_paths = set()
+    if local_documents:
+        declared = ResearchBrief(request_text=brief.request_text, asset_requests=tuple(
+            {'locator': str(path), 'role': 'paper'} for path in local_documents))
+        declared_assets = normalize_assets(declared, input_base_dir=base)
+        declared_paths = {asset.locator for asset in declared_assets}
+        present = {asset.locator for asset in assets}
+        for asset in declared_assets:
+            if asset.locator not in present:
+                assets = (*assets, asset)
+                present.add(asset.locator)
     diagnostics = validate_brief(brief, assets)
     if any(item.severity == 'error' for item in diagnostics):
         raise ResearchInputError(item for item in diagnostics if item.severity == 'error')
@@ -149,7 +385,7 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
             continue  # Explicit URLs remain in the original request; acquisition needs network permission.
         alias = f'source{index}'
         mounts[alias] = Path(asset.locator)
-        if asset.role not in {'dataset', 'code'} and mounts[alias].is_file():
+        if (asset.role not in {'dataset', 'code'} or asset.locator in declared_paths) and mounts[alias].is_file():
             materials.append(alias)
     registry = getattr(services, 'search_registry', None)
     providers = (list(registry.names()) if registry is not None
@@ -158,7 +394,7 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
         or policy_values.get('allow_network') is False
         or bool(materials) and config.get('research_materials_only') is not False
             and policy_values.get('allow_network') is not True)
-    outputs = brief.requested_outputs or ('research_summary',)
+    outputs = _requested_outputs(brief)
     supported = {'summary', 'research_summary', 'report', 'paper', 'full_paper', 'assessment',
         'idea_assessment', 'idea_comparison', 'design', 'research_design', 'data_analysis', 'experiments',
         'bug_fix', 'code_task'}
@@ -170,9 +406,10 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
         raise ValueError('execution must be an object containing the declared domain contract')
     if {'bug_fix', 'code_task'} & set(outputs) and (execution is None or not execution.get('code_task')):
         raise ValueError('Code deliverables require an explicit execution.code_task contract')
-    research_work = (execution is None or bool({'summary', 'research_summary'} & set(outputs)
-        or materials or any(policy_values.get(name) for name in (
-            'require_summary', 'require_design', 'materials', 'source_workspace', 'queries', 'providers', 'allow_network'))))
+    if research_work is None:
+        research_work = (execution is None or bool({'summary', 'research_summary'} & set(outputs)
+            or materials or any(policy_values.get(name) for name in (
+                'require_summary', 'require_design', 'materials', 'source_workspace', 'queries', 'providers', 'allow_network'))))
     design_required = bool(policy_values.get('require_design', research_work and 'experiments' in outputs))
     confirm_execution = config.get('execution_confirmation', False)
     if type(confirm_execution) is not bool or confirm_execution and (execution is None or design_required):
@@ -185,15 +422,20 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
         mounts = projection['sources']
         materials = [name for name, path in mounts.items() if any(
             not _is_remote_locator(asset.locator) and Path(asset.locator) == path
-            and asset.role not in {'dataset', 'code'} and path.is_file() for asset in assets)]
+            and (asset.role not in {'dataset', 'code'} or asset.locator in declared_paths)
+            and path.is_file() for asset in assets)]
     if confirm_execution and (projection is None or projection['execution_contract'] is None):
         raise ValueError('execution_confirmation requires a fixed scientific measurement contract')
+    selected_materials = policy_values.get('materials', materials)
+    if local_documents and 'materials' in policy_values and isinstance(selected_materials, (list, tuple)):
+        selected_materials = list(dict.fromkeys([*selected_materials, *(alias for alias, path in mounts.items()
+            if str(path) in declared_paths)]))
     policy = SourcePolicy.model_validate({'max_results': max_results,
         'max_documents': max_results, 'max_chunks': max_chunks,
         'idea_limit': idea_limit,
         'cache_dir': str(Path(cache_dir).resolve()) if cache_dir else None,
         'providers': providers, **policy_values,
-        'materials': policy_values.get('materials', materials), 'allow_network': not local_only,
+        'materials': selected_materials, 'allow_network': not local_only,
         'require_design': bool(confirm_execution or design_required),
         'require_summary': bool(policy_values.get('require_summary') or {'summary', 'research_summary'} & set(outputs))})
     report = (freeze_report_requirement(dict(config.get('report') or {}),
@@ -234,7 +476,8 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
         'llm_requests', 'total_tokens', 'process_invocations', 'process_wall_seconds', 'source_operations'}}
     if unsupported_limits:
         raise ValueError('Unsupported creation resource controls: ' + ', '.join(sorted(unsupported_limits)))
-    model_limits = _creation_model_limits(limits, model_enabled=selected_model is not None)
+    model_limits = _creation_model_limits(limits, model_enabled=selected_model is not None,
+        preserve_unlimited=services is not None and hasattr(services, 'config'))
     source_count = max(1, len(policy.queries)) * len(policy.providers)
     # Preserve the old bounded process allowance independently of native attempts.
     execution_runs = (max_attempts if max_attempts is not None else 16) if 'experiments' in outputs else 0
@@ -255,8 +498,12 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
     attempt_limit = max_attempts
     if selected_model is None and attempt_limit is None:
         attempt_limit = 16
+    request_context = brief.to_dict()
+    task_kind = str(config.get('research_task_kind') or '').strip()
+    if task_kind and task_kind.lower() != 'auto':
+        request_context['research_task_kind'] = task_kind
     app = ToolApplication.create(root, (brief.objective or brief.request_text)
-        + '\nOriginal user request and declared constraints:\n' + json.dumps(brief.to_dict(), ensure_ascii=False),
+        + '\nOriginal user request and declared constraints:\n' + json.dumps(request_context, ensure_ascii=False),
         model=selected_model, sources=mounts, allow_vision=allow_vision,
         allow_execution='experiments' in outputs or projection is not None,
         allow_network=policy.allow_network if projection is None or research_work else False,
@@ -568,6 +815,16 @@ def parse_research_input(
         raise ResearchInputError(
             (Diagnostic("brief_invalid", str(exc), field="brief"),)
         ) from exc
+
+
+def brief_input_base(brief: ResearchBrief, input_base_dir: str | Path | None = None) -> Path:
+    """Resolve relative material and execution inputs for both research entries."""
+    if input_base_dir is not None:
+        return Path(input_base_dir)
+    if brief.source_path:
+        source = Path(brief.source_path)
+        return source.parent if source.suffix else source
+    return Path.cwd()
 
 
 def normalize_assets(
@@ -1002,6 +1259,8 @@ __all__ = [
     "ResearchInputError",
     "create_research_task",
     "create_structured_research_task",
+    "start_research_task",
+    "start_declared_measurements",
     "project_execution_creation",
     "UnsupportedExecutionCreation",
     "normalize_assets",

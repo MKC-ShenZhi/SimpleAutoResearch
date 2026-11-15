@@ -57,8 +57,8 @@ _CONTENT_REUSE_MAX_HASH_BYTES = 64 * 1024 * 1024
 _CONTENT_REUSE_MAX_REFERENCES = 256
 
 
-def read_bound_material_bytes(workspace: Any, locator: str, digest: str, *, max_bytes: int) -> bytes:
-    """Recheck an admitted complete subject, not a newly requested text window."""
+def read_material_bytes(workspace: Any, locator: str, *, max_bytes: int) -> bytes:
+    """Read an authorized complete subject as one stable bounded snapshot."""
     if type(max_bytes) is not int or not 0 <= max_bytes <= 256000:
         raise ValueError('Complete material read exceeds its inspection bound')
     path = workspace.resolve_material_root(locator)
@@ -73,6 +73,12 @@ def read_bound_material_bytes(workspace: Any, locator: str, digest: str, *, max_
             raise ValueError('Professional attachment changed during complete reading')
     if len(raw) > max_bytes:
         raise ValueError('Complete professional unit inspection exceeds 256000 total text bytes')
+    return raw
+
+
+def read_bound_material_bytes(workspace: Any, locator: str, digest: str, *, max_bytes: int) -> bytes:
+    """Recheck a previously admitted complete subject."""
+    raw = read_material_bytes(workspace, locator, max_bytes=max_bytes)
     if hashlib.sha256(raw).hexdigest() != digest:
         raise ValueError('Professional attachment changed during complete reading')
     return raw

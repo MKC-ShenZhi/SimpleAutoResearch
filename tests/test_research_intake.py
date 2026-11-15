@@ -14,6 +14,9 @@ from simple_ar.app.research_intake import (
     ResearchInputError,
     create_research_task,
     create_structured_research_task,
+    declared_research_work,
+    revise_research_task,
+    start_research_task,
     normalize_assets,
     parse_research_input,
     validate_brief,
@@ -64,11 +67,289 @@ def _reply(name, arguments):
 
 
 class ResearchIntakeTests(unittest.TestCase):
+    def test_common_research_starts_from_saved_brief_and_retains_extraction_location(self):
+        with TemporaryDirectory() as directory, patch.object(LLMClient, 'from_env',
+                side_effect=AssertionError('No model was authorized')):
+            base = Path(directory).resolve()
+            source = base / 'source.html'
+            source.write_text('<h1>Evidence</h1><p>A supplied observation.</p>', encoding='utf-8')
+            extra = base / 'extra.html'
+            extra.write_text('<p>A second supplied observation.</p>', encoding='utf-8')
+            extracted = base / 'extracted'
+            messages = []
+            brief = ResearchBrief(request_text='Summarize the supplied observation.',
+                requested_outputs=('summary',), asset_requests=({'locator': str(source), 'role': 'paper'},))
+            app = create_research_task(brief, root=base / 'research', services=ResearchApplicationServices(
+                extraction_dir=extracted, message_callback=messages.append,
+                config={'research_materials_only': True, 'research_materials': ['source0'],
+                    'research_task_kind': 'writing',
+                    'research_local_documents': [str(source), str(extra)]}))
+            result = start_research_task(app)
+            self.assertEqual(result['status'], 'completed')
+            self.assertTrue(messages)
+            self.assertEqual(source.read_text(encoding='utf-8'), '<h1>Evidence</h1><p>A supplied observation.</p>')
+            self.assertTrue(any('A supplied observation.' in path.read_text(encoding='utf-8')
+                for path in extracted.glob('*.txt')))
+            restored = ToolApplication.load(base / 'research')
+            self.assertEqual(restored.sources.policy.extraction_dir, str(extracted))
+            self.assertEqual(len(restored.sources.policy.materials), 2)
+            self.assertEqual(len(restored.session.store.read_json(
+                restored.session.manifest.state_refs['assets'])['assets']), 2)
+            self.assertEqual(len(restored.session.store.read_json(
+                restored.session.manifest.state_refs['brief'])['asset_requests']), 1)
+            self.assertIn('"research_task_kind": "writing"', restored.state['requests'][0])
+            self.assertEqual(restored.session.manifest.session_id, app.session.manifest.session_id)
+            self.assertFalse(restored.ledger.entries)
+            overlap = create_research_task(ResearchBrief(request_text='Use the selected document.',
+                asset_requests=({'locator': str(source), 'role': 'code'},)), root=base / 'overlap',
+                services=ResearchApplicationServices(config={'research_local_documents': [str(source)]}))
+            self.assertEqual(overlap.sources.policy.materials, ('source0',))
+
+    def test_common_declared_measurement_uses_original_task_and_process_ledger(self):
+        import sys
+        with TemporaryDirectory() as directory, patch.object(LLMClient, 'from_env',
+                side_effect=AssertionError('No model was authorized')):
+            base = Path(directory).resolve()
+            brief = ResearchBrief(request_text='Measure the declared command.', requested_outputs=('experiment',))
+            execution = {'command': [sys.executable, '-c', "print('score: 3')"],
+                'cwd': str(base), 'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
+            app = create_structured_research_task(brief, root=base / 'measurement', model=None,
+                config={'execution': execution}, budget_limits={'process_invocations': 1,
+                    'process_wall_seconds': 5}, max_results=5)
+            result = start_research_task(app, progress=lambda _: None)
+            self.assertEqual(result['status'], 'completed')
+            restored = ToolApplication.load(base / 'measurement')
+            saved_brief = restored.session.store.read_json(restored.session.manifest.state_refs['brief'])
+            self.assertEqual(saved_brief['requested_outputs'], ['experiment'])
+            measurements = [row for row in restored._operation_observations()
+                if row['tool_name'] == 'measure_experiment']
+            self.assertEqual(len(measurements), 1)
+            self.assertEqual(measurements[0]['data']['metrics']['score'], 3)
+            self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in restored.ledger.entries), 1)
+            self.assertEqual(restored.session.manifest.session_id, app.session.manifest.session_id)
+
+    def test_declared_material_intent_is_shared_by_startup_and_creation(self):
+        import sys
+
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            note = base / 'note.md'
+            note.write_text('Reference material for the declared run.', encoding='utf-8')
+            sources = ({'locator': str(note), 'role': 'paper'},)
+            outputs = ('experiments',)
+            brief = ResearchBrief(request_text='Run the supplied conditions.',
+                requested_outputs=outputs, asset_requests=sources)
+            execution = {'command': [sys.executable, '-c', "print('score: 3')"],
+                'cwd': str(base), 'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
+            for name, config, expected in (('mounted', None, False), ('source-work', {}, True)):
+                with self.subTest(intent=name):
+                    research_work = declared_research_work(outputs, sources, config, explicit_research=False)
+                    self.assertEqual(research_work, expected)
+                    app = create_structured_research_task(brief, root=base / name, model=None,
+                        config={'execution': execution, 'research_materials_only': True,
+                            'require_design': False}, budget_limits={'process_invocations': 1,
+                            'process_wall_seconds': 5}, max_results=5, research_work=research_work)
+                    saved = ToolApplication.load(base / name).state['config']
+                    self.assertEqual(saved['research_policy'] is not None, expected)
+                    self.assertIn(note, map(Path, saved['sources'].values()))
+                    self.assertFalse(saved['allow_network'])
+                    self.assertFalse(app.ledger.entries)
+
+    def test_research_then_declared_measurement_uses_same_task_and_caller_authority(self):
+        import sys
+
+        with TemporaryDirectory() as directory, patch.object(LLMClient, 'from_env',
+                side_effect=AssertionError('No model was authorized')):
+            base = Path(directory).resolve()
+            note = base / 'source.html'
+            note.write_text('<h1>Method</h1><p>The supplied condition is measured once.</p>', encoding='utf-8')
+            brief = ResearchBrief(request_text='Read the source and measure the supplied condition.',
+                requested_outputs=('experiments',), asset_requests=({'locator': str(note), 'role': 'paper'},))
+            execution = {'command': [sys.executable, '-c', "print('score: 3')"],
+                'cwd': str(base), 'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
+            app = create_structured_research_task(brief, root=base / 'research', model=None,
+                config={'execution': execution, 'require_design': False, 'research_materials_only': True},
+                budget_limits={'process_invocations': 1, 'process_wall_seconds': 5},
+                max_results=5, research_work=True)
+            outcome = start_research_task(app, progress=lambda _: None)
+            self.assertEqual(outcome['status'], 'completed')
+            restored = ToolApplication.load(base / 'research')
+            observations = restored._operation_observations()
+            self.assertEqual([row['tool_name'] for row in observations], ['research', 'measure_experiment'])
+            self.assertEqual(observations[-1]['data']['metrics']['score'], 3)
+            self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in restored.ledger.entries), 1)
+            self.assertEqual(restored.session.manifest.session_id, app.session.manifest.session_id)
+
+    def test_declared_measurement_does_not_finish_a_still_required_report(self):
+        import sys
+
+        with TemporaryDirectory() as directory, patch.object(LLMClient, 'from_env',
+                side_effect=AssertionError('No model was authorized')):
+            base = Path(directory).resolve()
+            note = base / 'source.html'
+            note.write_text('<h1>Method</h1><p>Inspect the measured result.</p>', encoding='utf-8')
+            brief = ResearchBrief(request_text='Measure and explain the result.',
+                requested_outputs=('experiments', 'report'),
+                asset_requests=({'locator': str(note), 'role': 'paper'},))
+            execution = {'command': [sys.executable, '-c', "print('score: 3')"],
+                'cwd': str(base), 'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
+            app = create_structured_research_task(brief, root=base / 'research', model=None,
+                config={'execution': execution, 'require_design': False, 'research_materials_only': True},
+                budget_limits={'process_invocations': 1, 'process_wall_seconds': 5},
+                max_results=5, research_work=True)
+            outcome = start_research_task(app, progress=lambda _: None)
+            self.assertNotEqual(outcome['status'], 'completed')
+            self.assertFalse(app.session.store.exists('delivery.json'))
+            measurements = [row for row in app._operation_observations()
+                if row['tool_name'] == 'measure_experiment']
+            self.assertEqual(measurements[-1]['data']['metrics']['score'], 3)
+            self.assertNotIn('delivery', measurements[-1]['arguments'])
+
+    def test_research_revision_preserves_the_session_evidence_and_budget(self):
+        with TemporaryDirectory() as directory, patch.object(LLMClient, 'from_env',
+                side_effect=AssertionError('No model was authorized')):
+            base = Path(directory).resolve()
+            first, second = base / 'first.html', base / 'second.html'
+            first.write_text('<h1>First</h1><p>Original evidence.</p>', encoding='utf-8')
+            second.write_text('<h1>Second</h1><p>Additional evidence.</p>', encoding='utf-8')
+            brief = ResearchBrief(request_text='Compare the supplied materials.',
+                asset_requests=({'locator': str(first), 'role': 'paper'},))
+            app = create_research_task(brief, root=base / 'task',
+                services=ResearchApplicationServices(config={'research_materials_only': True}))
+            app.run(actions=[{'tool_name': 'research', 'arguments': {'operation': 'summary',
+                'question': brief.request_text, 'materials': ['source0'], 'use_llm': False}}],
+                progress=lambda _: None, should_stop=lambda: app.state['pending'] is None
+                    and not any(turn['remaining'] for turn in app.state['turns']))
+            observed = app._operation_observations(domain='sources')[-1]
+            self.assertEqual(observed['status'], 'ok')
+            record = app.session.store.resolve(observed['record'])
+            original = record.read_bytes()
+            entries = app.ledger.to_dict()['entries']
+            previous_attempts = app.session.manifest.budget.attempts
+            previous_limit = app.session.manifest.budget.max_attempts
+            changed = revise_research_task(app, materials=[(second, 'paper')],
+                resource_allowances={'source_operations': 20},
+                additional_attempts=3, additional_no_progress=1,
+                authorization_id='research-revision', authorization_reason='Review the additional material.')
+            self.assertTrue(changed)
+            restored = ToolApplication.load(base / 'task')
+            self.assertEqual(restored.session.manifest.session_id, app.session.manifest.session_id)
+            self.assertEqual(restored.state['config']['research_policy']['materials'], ['source0', 'source1'])
+            self.assertEqual(restored.state['config']['sources']['source1'], str(second))
+            self.assertEqual(record.read_bytes(), original)
+            self.assertTrue(restored._operation_observations(domain='sources')[0]['contract_current'])
+            self.assertTrue(any('Required research summary' in issue
+                for issue in restored.sources.delivery_issues([])))
+            self.assertEqual(restored.ledger.to_dict()['entries'][:len(entries)], entries)
+            self.assertEqual(restored.session.manifest.budget.attempts, previous_attempts)
+            self.assertEqual(restored.session.manifest.budget.max_attempts, previous_limit + 3)
+            self.assertEqual(restored.ledger.remaining('source_operations'), 20)
+            self.assertTrue(revise_research_task(restored, research_settings={'max_results': 7}))
+            restored = ToolApplication.load(base / 'task')
+            self.assertEqual(restored.state['config']['research_policy']['max_results'], 7)
+            self.assertFalse(restored._operation_observations(domain='sources')[0]['contract_current'])
+
+    def test_plain_resume_does_not_rewrite_an_older_source_policy(self):
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            app = create_research_task(ResearchBrief(request_text='Inspect the supplied work.'),
+                root=base / 'task', services=ResearchApplicationServices(config={'research_materials_only': True}))
+            app.state['config']['research_policy'].pop('max_pdf_pages')
+            app._save()  # Simulate a retained task from before this optional default was saved.
+            restored = ToolApplication.load(base / 'task')
+            before = copy.deepcopy(restored.state)
+            ledger = restored.ledger.to_dict()
+            self.assertFalse(revise_research_task(restored))
+            self.assertEqual(restored.state, before)
+            self.assertEqual(restored.ledger.to_dict(), ledger)
+
+    def test_attempt_allowance_reuses_the_saved_task_without_replenishing_on_replay(self):
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            app = create_research_task(ResearchBrief(request_text='Use this saved task.'), root=base / 'task',
+                services=ResearchApplicationServices(config={'research_materials_only': True},
+                    budget_limits={'source_operations': 0}))
+            before = app.session.manifest.budget.to_dict()
+            for _ in range(2):
+                self.assertTrue(revise_research_task(app, additional_attempts=3, additional_no_progress=1,
+                    authorization_id='attempts-1', authorization_reason='Continue the original task.',
+                ))
+            restored = ToolApplication.load(base / 'task')
+            budget = restored.session.manifest.budget
+            self.assertEqual(budget.max_attempts, before['max_attempts'] + 3)
+            self.assertEqual(budget.max_no_progress, before['max_no_progress'] + 1)
+            self.assertEqual(budget.attempts, before['attempts'])
+            self.assertFalse(restored.ledger.entries)
+            self.assertIn('attempts-1', restored._professional_resource_authorizations())
+            for _ in range(2):
+                self.assertTrue(revise_research_task(restored, resource_allowances={'source_operations': 3},
+                    authorization_id='source-1', authorization_reason='Continue with the saved materials.'))
+            restored = ToolApplication.load(base / 'task')
+            self.assertEqual(restored.ledger.remaining('source_operations'), 3)
+
+    def test_adding_a_reference_retains_an_unchanged_table_analysis(self):
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            table, note = base / 'observations.csv', base / 'notes.md'
+            table.write_text('score\n1\n2\n3\n', encoding='utf-8')
+            note.write_text('Context for the same observations.', encoding='utf-8')
+            app = ToolApplication.create(base / 'task', 'Summarize the observations.', model=None,
+                sources={'source0': table}, table_analysis={'path': 'source0',
+                    'spec': {'value_columns': ['score'], 'observation_unit': 'one supplied row'}})
+            app.run(actions=[{'tool_name': 'analyze_table', 'arguments': app.state['config']['table_analysis']}],
+                progress=lambda _: None, should_stop=lambda: app.state['pending'] is None
+                    and not any(turn['remaining'] for turn in app.state['turns']))
+            before = app._operation_observations(domain='analysis')[-1]
+            self.assertEqual(before['status'], 'ok')
+            self.assertTrue(revise_research_task(app, materials=[(note, 'material')]))
+            restored = ToolApplication.load(base / 'task')
+            self.assertTrue(restored._operation_observations(domain='analysis')[-1]['contract_current'])
+            replacement = base / 'replacement.csv'
+            replacement.write_text('score\n9\n', encoding='utf-8')
+            restored.supply(supply_id='replace-data', reason='Use the replacement dataset.',
+                changes={'sources': {**restored.state['config']['sources'], 'source0': str(replacement)}},
+                replace_existing=True)
+            self.assertFalse(restored._operation_observations(domain='analysis')[-1]['contract_current'])
+
+    def test_research_revision_keeps_explicit_independent_review_on_the_common_task(self):
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            services = ResearchApplicationServices(llm_client=_JSONClient(),
+                config={'research_materials_only': True},
+                budget_limits={'llm_requests': 2, 'total_tokens': 100000})
+            app = create_research_task(ResearchBrief(request_text='Review the supplied research.'),
+                root=base / 'task', services=services)
+            ledger = app.ledger.to_dict()
+            self.assertTrue(revise_research_task(app, independent_review_required=True))
+            restored = ToolApplication.load(base / 'task', services=services)
+            self.assertTrue(restored.state['config']['independent_review_required'])
+            self.assertEqual(restored.ledger.to_dict(), ledger)
+            self.assertEqual(restored.session.manifest.session_id, app.session.manifest.session_id)
+
+    def test_new_structured_work_can_reuse_results_without_forcing_a_script(self):
+        import sys
+        from simple_ar.app.operation_tools import _executable_work_system
+
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            services = ResearchApplicationServices(llm_client=_JSONClient(), config={'execution': {
+                'command': [sys.executable, '-c', "print('score: 3')"],
+                'cwd': str(base), 'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}},
+                budget_limits={'llm_requests': 2, 'total_tokens': 100000})
+            app = create_research_task(ResearchBrief(request_text='Check the supplied measurement.',
+                requested_outputs=('experiments',)), root=base / 'task', services=services)
+            self.assertEqual(app.state['config']['work_method'], 'execute.v3')
+            self.assertIn('Use existing results and the available reading, analysis, editing and execution operations',
+                app.operations.system_text())
+            self.assertNotIn('Use a complete script or command', app.operations.system_text())
+            self.assertIn('Use a complete script or command', _executable_work_system())
+
     def test_collection_budget_allows_multiple_sources_and_preserves_explicit_limit(self):
         from simple_ar.research.contracts import DocumentRecord
         from simple_ar.research.documents.fulltext import build_fulltext_manifest
         from simple_ar.tools.sources import SourcePolicy
 
+        self.assertNotIn('extraction_dir', SourcePolicy().model_dump(mode='json'))
         # A saved task without a source policy reconstructs the gateway default.
         with TemporaryDirectory() as directory:
             root = Path(directory) / 'saved-task'
@@ -172,6 +453,54 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(client.calls, [])
             self.assertEqual(reviewer.calls, [])
             self.assertEqual(options, original)
+
+    def test_legacy_unlimited_model_budget_survives_common_creation_and_resume(self):
+        from types import SimpleNamespace
+        from simple_ar.integrations.llm import LLMSettings
+
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            brief = ResearchBrief(request_text='Assess the supplied finding.', requested_outputs=('assessment',))
+            client = LLMClient(LLMSettings(api_key='fixture', model='fixture', api_mode='chat'))
+            legacy = ResearchApplicationServices(llm_client=client, config={'research_materials_only': True})
+            app = create_research_task(brief, root=base / 'legacy-settings', services=legacy)
+            self.assertIsNone(app.ledger.limits['llm_requests'])
+            self.assertIsNone(app.ledger.limits['total_tokens'])
+            self.assertIsNone(app._request_capacity())
+            self.assertTrue(app._can_request(2))
+            resources = json.loads(app._messages()[1]['content'])['resources']
+            self.assertIsNone(resources['model_turns_remaining'])
+            self.assertIsNone(resources['decision_budget']['provider_slots_after_one_attempt'])
+            before = app.ledger.to_dict()
+            app.supply(supply_id='require-review', reason='Require an independent check',
+                changes={'independent_review_required': True})
+            self.assertEqual(app.ledger.to_dict(), before)
+            loaded = ToolApplication.load(base / 'legacy-settings', services=legacy)
+            self.assertIsNone(loaded._request_capacity())
+            self.assertEqual(loaded.ledger.to_dict(), before)
+            direct = create_research_task(brief, root=base / 'new-defaults',
+                services=SimpleNamespace(llm_client=client), config={'research_materials_only': True})
+            self.assertEqual(direct.ledger.limits['llm_requests'], 30)
+            self.assertEqual(direct.ledger.limits['total_tokens'], 600000)
+            self.assertEqual(client.budget_ledger, None)
+
+    def test_custom_model_client_can_join_the_existing_task_ledger(self):
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.integrations.llm import bind_task_budget, task_budget_identity
+
+        ledger = BudgetLedger({'llm_requests': 2, 'total_tokens': 100})
+        client = _JSONClient()
+        bound = bind_task_budget(client, ledger, session_id='original', attempt_id='writing')
+        self.assertIs(bound._budget_ledger, ledger)
+        self.assertEqual(task_budget_identity(bound, None), (ledger, 'original', 'writing'))
+        resumed = bind_task_budget(bound, ledger, session_id='original', attempt_id='review')
+        self.assertEqual(resumed._budget_attempt_id, 'review')
+        self.assertEqual(bound._budget_attempt_id, 'writing')
+        ledger_only = bind_task_budget(client, ledger)
+        identified = bind_task_budget(ledger_only, ledger, session_id='original', attempt_id='execution')
+        self.assertEqual(task_budget_identity(identified, None), (ledger, 'original', 'execution'))
+        self.assertEqual(task_budget_identity(ledger_only, None), (ledger, '', ''))
+        self.assertEqual(ledger.entries, ())
 
     def test_direct_creation_rejects_unowned_controls_before_mutation(self):
         brief = ResearchBrief(request_text='Retain explicit ownership.')
@@ -649,7 +978,7 @@ class ResearchIntakeTests(unittest.TestCase):
             original = copy.deepcopy(execution)
             services = ResearchApplicationServices(llm_client=client, feasibility_llm_client=reviewer,
                 search_registry=registry, input_base_dir=base,
-                config={'execution': execution, 'require_design': False},
+                config={'execution': execution, 'require_design': False, 'independent_review_required': True},
                 budget_limits={'llm_requests': 2, 'total_tokens': 100000,
                     'process_invocations': 0, 'process_wall_seconds': 0, 'source_operations': 0})
             with patch.object(LLMClient, 'from_env', side_effect=AssertionError('Use supplied services')):
@@ -672,6 +1001,27 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(app.operations.implementation.code_work_policy, 'shared.v2')
             self.assertTrue(app.operations.implementation.defer_code_review)
             self.assertTrue(app.operations.implementation.direct_code_edit)
+            self.assertEqual(saved['delivery_review_selection'], 'model.v3')
+            optional = create_research_task(ResearchBrief(request_text='Implement an adapter.',
+                requested_outputs=('experiments',)), root=base / 'optional-review',
+                services=replace(services, config={'execution': execution, 'require_design': False}))
+            self.assertIsNone(optional.state['config']['code_review_policy'])
+            self.assertFalse(optional.operations.implementation.defer_code_review)
+            optional.supply(supply_id='require-independent', reason='The caller requested independent review',
+                changes={'independent_review_required': True})
+            self.assertEqual(optional.state['config']['code_review_policy'], 'delivery.v1')
+            self.assertTrue(optional.operations.implementation.defer_code_review)
+            optional.supply(supply_id='make-review-optional', reason='The caller changed the review requirement',
+                changes={'independent_review_required': False}, replace_existing=True)
+            self.assertFalse(optional.state['config']['independent_review_required'])
+            self.assertIsNone(optional.state['config']['code_review_policy'])
+            self.assertFalse(optional.operations.implementation.defer_code_review)
+            alias = create_research_task(ResearchBrief(request_text='Implement an adapter.',
+                requested_outputs=('code',)), root=base / 'code-alias', services=services)
+            self.assertIsNotNone(alias.state['config']['code_task'])
+            self.assertIsNone(alias.state['config']['execution_contract'])
+            self.assertEqual(alias.session.store.read_json(alias.session.manifest.state_refs['brief'])['requested_outputs'],
+                ['code'])
             self.assertIn('model review belongs to the independent task delivery review',
                 app.gateway.registry.get('implement_code_task').description)
             self.assertIs(app.operations.implementation.ledger, app.ledger)

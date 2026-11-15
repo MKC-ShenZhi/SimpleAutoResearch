@@ -4,14 +4,15 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
 from simple_ar.report.projection import (
-    apply_report_bibliography, build_material_report_inputs, selected_material_window,
+    apply_report_bibliography, build_material_report_inputs, retain_reference_maps, selected_material_window,
 )
 from simple_ar.report.schema import (
-    ReportContext, ReportRuntimeConfig, ReportTemplateBundle, SourceHandle, finding_requires_resolution,
+    ReportContext, ReportRuntimeConfig, ReportTemplateBundle, ReviewerFinding, SourceHandle, finding_requires_resolution,
 )
 from simple_ar.research.contracts import TextChunk
 from simple_ar.research.documents.ingest import DocumentBundle
@@ -67,7 +68,8 @@ def _observed_documents(observations: list[dict]) -> tuple[DocumentBundle, dict]
 
 def write_observed_report(*, store: ArtifactStore, identity: str, requirement: dict,
                           title: str, goal: str, work_context: dict, observations: list[dict],
-                          attachments: list[str], prior_draft: str, client: Any, sources: Any = None) -> dict:
+                          attachments: list[str], prior_draft: str, client: Any, sources: Any = None,
+                          prior_references: dict | None = None, current_work: bool = False) -> dict:
     """Draft, review and assemble using the existing Writer and shared ledger client."""
     from simple_ar.report.capability import ReportAssemblyRequest, run_report_capability
     from simple_ar.report.assembler import ReportAssemblyMode
@@ -87,6 +89,25 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
             documents_ref=documents_ref, assets=[], selected_evidence=True, max_selected_characters=None)
     else:
         context, projected = ReportContext(topic=title, report_mode='supplied_materials'), None
+    prior_map = (prior_references or {}).get('citation_map')
+    prior_bib = (prior_references or {}).get('bibliography') or {}
+    merged_bibliography = 'text' in prior_bib
+    if merged_bibliography:
+        from simple_ar.literature.bibtex import bibtex_keys
+        from simple_ar.report.citations import body_citation_ids
+        saved = prior_map['data'] if prior_map else {'schema_version': 'citation_map.v1', 'entries': []}
+        cited = body_citation_ids(prior_draft, set(), include_unknown=True)
+        retained = [row for row in saved.get('entries', [])
+            if row.get('paper_id') in cited or row.get('model_key') in cited]
+        known = {row['paper_id'] for row in retained}
+        extra = [{'paper_id': key, 'title': '', 'url': '', 'bibliography': {},
+                  'model_key': key if re.fullmatch(r'[Pp]\d+', key) else ''}
+                 for key in sorted((bibtex_keys(prior_bib['text']) & cited) - known)]
+        saved = {**saved, 'entries': [*retained, *extra]}
+        context = retain_reference_maps(context, [(saved, True)],
+            artifact=prior_map['source'] if prior_map else prior_bib['source'])
+        if projected is not None:
+            projected.source_handles = list(context.source_handles)
     writer = ArtifactStore(store.root / 'writer')
     snapshot = writer.read_json('report_inputs.json') if writer.exists('report_inputs.json') else None
     previous = (snapshot.get('context', {}) if requirement['method'] == 'sections' else
@@ -108,6 +129,8 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
             title='Previous version', summary='Earlier prose to revise, not primary evidence.',
             metadata={'evidence_role': 'prior_draft_not_primary_evidence', 'draft_markdown': prior_draft}))
     config = ReportRuntimeConfig.model_validate(requirement['config'])
+    if current_work:
+        config = config.model_copy(update={'review_action_contract': 'action.v1'})
     template = ReportTemplateBundle.model_validate(requirement['template'])
     memory = initialize_report_memory(context=context, template=template)
     if projected is not None:
@@ -137,7 +160,26 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
     from simple_ar.report.schema import ReportMemory
     memory = ReportMemory.model_validate(written['memory'])
     gaps = [str(row.message or row.type) for row in memory.reviewer_findings if finding_requires_resolution(row)]
-    if completed['status'] != 'completed':
+    review = written.get('independent_review')
+    review_status = review.get('review_status') if current_work and isinstance(review, dict) else None
+    if review_status == 'incomplete':
+        gaps.append('The document inspection is incomplete; see the retained review.')
+    if current_work and isinstance(review, dict):
+        for section in review.get('section_reviews', []):
+            if section.get('context_requests'):
+                gaps.append('The document reviewer requested further evidence; see the retained review.')
+            if section.get('verdict') in {'revise_required', 'fail'}:
+                gaps.extend(str(item) for item in section.get('revision_instructions', []) if item)
+                actionable = any(finding_requires_resolution(ReviewerFinding.model_validate(row))
+                    for row in section.get('findings', []))
+                if not actionable and not section.get('revision_instructions'):
+                    gaps.append('The document reviewer requested revision without a specific correction; see the retained review.')
+        constraint = review.get('mechanical_constraints') or {}
+        if constraint.get('status') == 'needs_revision':
+            gaps.append(str(constraint.get('diagnostic') or 'The document does not meet its requested constraints.'))
+    # The Writer can mark an uncorrected review as failed. Its concrete
+    # findings above, rather than that aggregate status, determine the gaps.
+    if completed['status'] != 'completed' and review_status != 'needs_revision':
         gaps.extend(completed['diagnostics'] or ['Report writing or its review is incomplete.'])
     context, memory = apply_report_bibliography(context, memory, documents=documents,
         notes=memory.outline_planning.get('source_notes', []))
@@ -152,6 +194,16 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
             section_headings={row.section_id: row.heading for row in planned}))
     if assembled.status != 'completed':
         gaps.extend(assembled.diagnostics or ('Report assembly is incomplete.',))
+    if merged_bibliography:
+        from simple_ar.literature.bibtex import papers_to_bibtex
+        from simple_ar.report.citations import references_from_citation_map
+        existing = bibtex_keys(prior_bib['text'])
+        references, _ = references_from_citation_map(assembly.read_json('citation_map.json'))
+        added = [paper for paper in references if paper.id not in existing]
+        text = prior_bib['text'].rstrip()
+        if added:
+            text += '\n\n' + papers_to_bibtex(added).strip()
+        assembly.write_text('references.bib', text + '\n')
     removed_citations = assembly.read_json('citation_cleanup.json')['removed_citations']
     if removed_citations:
         gaps.append('Unresolved citation references were removed during assembly: '
@@ -161,6 +213,11 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
         if row.kind == 'figure' and row.status == 'available')
     authored = {'markdown': assembly.read_text('report_body.md'), 'gaps': gaps,
         'outputs': list(dict.fromkeys(outputs)), 'writer_result': completed['path']}
+    if merged_bibliography:
+        authored['merged_prior_bibliography'] = True
+    if review_status is not None:
+        authored['review'] = {'status': review_status,
+            'record': f"records/{identity}/document_work/writer/{completed['path']}"}
     if any(row.get('tool_name') in {'search_source_chunks', 'get_neighbor_chunks'}
            and row.get('status') == 'ok' for row in written.get('tool_results', [])):
         authored['source_reads_record'] = f"records/{identity}/document_work/writer/{completed['path']}"

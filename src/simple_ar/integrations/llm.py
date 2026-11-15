@@ -283,6 +283,45 @@ class LLMRequest:
     label: str = ""
 
 
+def task_budget_identity(client: "LLMClient | None", ledger: BudgetLedger | None, *,
+                         session_id: str = "", attempt_id: str = "") -> tuple[BudgetLedger | None, str, str]:
+    """Resolve the shared ledger and execution identity once for task consumers."""
+    current = getattr(client, "_budget_ledger", None)
+    if isinstance(current, BudgetLedger):
+        if ledger is not None and current is not ledger:
+            raise ValueError("The code task and model client use different budget ledgers")
+        ledger = current
+    session_id = session_id or getattr(client, '_budget_session_id', '') or ''
+    attempt_id = attempt_id or getattr(client, '_budget_attempt_id', '') or ''
+    return ledger, session_id, attempt_id
+
+
+def bind_task_budget(client: "LLMClient | None", ledger: BudgetLedger | None, *,
+                     session_id: str = "", attempt_id: str = "", model: str | None = None) -> "LLMClient | None":
+    """Use the caller's physical ledger for a model-backed task operation."""
+    ledger, session_id, attempt_id = task_budget_identity(client, ledger,
+        session_id=session_id, attempt_id=attempt_id)
+    if ledger is None:
+        return client
+    if client is None:
+        return LLMClient.from_env(model=model, purpose="code", budget_ledger=ledger,
+            budget_session_id=session_id, budget_attempt_id=attempt_id)
+    current = getattr(client, "_budget_ledger", None)
+    if current is not None and current is not ledger:
+        raise ValueError("The code task and model client use different budget ledgers")
+    prior_session = getattr(client, '_budget_session_id', '')
+    prior_attempt = getattr(client, '_budget_attempt_id', '')
+    if current is ledger and (not session_id or prior_session == session_id) and (
+            not attempt_id or prior_attempt == attempt_id):
+        return client
+    bind = getattr(client, 'with_budget', None)
+    if callable(bind):
+        bound = bind(ledger, session_id=session_id, attempt_id=attempt_id)
+        if getattr(bound, '_budget_ledger', None) is ledger:
+            return bound
+    raise ValueError("The model client must use the task's budget ledger and execution identity")
+
+
 class LLMClient:
     """Small OpenAI-compatible wrapper used by the pipeline stages.
 
@@ -1327,28 +1366,6 @@ class LLMClient:
                     raise LLMError(f"LLM batch request failed{label}: {exc}") from exc
                 submit_next()
         return [results[index] for index in range(len(requests))]
-
-    def _record_usage(
-        self,
-        response: object,
-        system: str,
-        user: str,
-        output: str,
-        *,
-        label: str,
-        provider_attempts: int = 1,
-    ) -> LLMUsage:
-        """Build and notify one usage record for compatibility callers."""
-        record = self._build_usage_record(
-            response,
-            system,
-            user,
-            output,
-            label=label,
-            provider_attempts=provider_attempts,
-        )
-        self._notify_usage(record)
-        return record
 
     def _build_usage_record(
         self,

@@ -35,6 +35,7 @@ from simple_ar.report.schema import (
     ReportDraftQuote,
     ReportToolCall,
     REVIEW_ACTION_RULES,
+    bind_finding_actions,
     finding_requires_resolution,
 )
 
@@ -640,6 +641,8 @@ def review_document(
                                   "arguments": {}, "caller": "document_reviewer"}],
         }]},
     }
+    if config.review_action_contract is not None:
+        view['review_action_contract'] = config.review_action_contract
     if author_owns_body:
         view["focus"].append(
             ("The author owns prose, tables and image placement; explicit provided_figure_captions belong to assembly. "
@@ -1039,6 +1042,7 @@ def _document_review_record(raw: Mapping[str, Any], *,
 ) -> ReportSectionReview:
     """Validate one observation after the complete batch has been bound."""
     review = ReportSectionReview.model_validate(resolve_review_evidence(raw, evidence_view))
+    review.findings = bind_finding_actions(review.findings, evidence_view.get('review_action_contract'))
     if (review.verdict in {"revise_required", "fail"} and not review.findings
             and not any(check.status == "unresolved" for check in review.finding_checks)):
         raise LLMResponseError("Whole-document revision needs a concrete finding.")

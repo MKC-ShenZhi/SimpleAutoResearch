@@ -78,6 +78,7 @@ class ReportRuntimeConfig(ReportModel):
     allow_llm_fallback: bool = False
     agent: str = "llm"
     reviewer: str = "llm"
+    review_action_contract: Literal["action.v1"] | None = Field(default=None, exclude_if=lambda value: value is None)
     max_review_iterations: int = 2
     # Optional until cross-document editing is validated on real long-form work.
     document_review: bool = False
@@ -285,6 +286,7 @@ class ReviewerFinding(ReportModel):
     evidence_handles: list[str] = Field(default_factory=list)
     suggested_action: str = ""
     required_action: Literal["advisory", "revise", "verify"] | None = None
+    action_contract: Literal["action.v1"] | None = Field(default=None, exclude_if=lambda value: value is None)
     draft_quotes: list[ReportDraftQuote] = Field(default_factory=list, exclude_if=lambda quotes: not quotes)
     evidence_quotes: list[ReportEvidenceQuote] = Field(default_factory=list, exclude_if=lambda quotes: not quotes)
     delivery_targets: list[str] = Field(default_factory=list, max_length=32,
@@ -299,14 +301,23 @@ FACTUAL_REVIEW_FINDING_TYPES = frozenset({
 })
 
 
-# Severity ranks impact; it is not an instruction to ignore a correction.
-# Keep historical finding behavior when no explicit action was recorded.
+# New reviews distinguish the requested action from severity. Old saved
+# opinions keep their original interpretation, including during recovery.
 def finding_requires_resolution(finding: ReviewerFinding) -> bool:
+    if finding.action_contract == "action.v1" and finding.required_action is not None:
+        return finding.required_action in {"revise", "verify"}
     return (
         finding.severity in {"major", "critical"}
         or (finding.severity == "minor" and finding.type in FACTUAL_REVIEW_FINDING_TYPES)
         or finding.required_action in {"revise", "verify"}
     )
+
+
+def bind_finding_actions(findings: list[ReviewerFinding], contract: str | None) -> list[ReviewerFinding]:
+    """Bind model findings to the caller's recorded interpretation contract."""
+    if contract not in {None, "action.v1"}:
+        raise ValueError("Unknown review action contract")
+    return [finding.model_copy(update={"action_contract": contract}) for finding in findings]
 
 
 REVIEW_ACTION_RULES = (

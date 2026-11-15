@@ -20,7 +20,7 @@ from simple_ar.code_task.generation.agent_step import (
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.tools.materials import (
     freeze_work_context, material_inventories, material_observation_seed,
-    read_bound_material_bytes, read_material_window, validate_material_observation,
+    read_bound_material_bytes, read_material_bytes, read_material_window, validate_material_observation,
     window_key, relative_image_target, document_local_targets,
 )
 from simple_ar.tools.sources import SourceToolGateway
@@ -77,6 +77,18 @@ _WORKING_CONTRACTS = frozenset({'document_work_operation.v4', 'document_work_ope
 _MATERIAL_ID_CONTRACTS = frozenset({'document_work_operation.v3', *_WORKING_CONTRACTS})
 
 
+def _decision_context(context: dict, *, compact_references: bool) -> dict:
+    """Present the draft while retaining reference data with the document owner."""
+    prior = context.get('prior_draft')
+    if not prior or not compact_references:
+        return context
+    visible = {key: value for key, value in prior.items() if key != 'citation_map'}
+    bibliography = prior.get('bibliography') or {}
+    if 'text' in bibliography:
+        visible['bibliography'] = {key: value for key, value in bibliography.items() if key != 'text'}
+    return {**context, 'prior_draft': visible}
+
+
 class _CandidateSelectionError(ValueError):
     """A rejected proposal with no output writes or unresolved side effects."""
 
@@ -115,18 +127,17 @@ class WorkDocumentRequest(BaseModel):
         description='Actual document goal or feedback; the owner investigates the authorized originals.')
     material_roots: list[str] = Field(default_factory=list, max_length=1000,
         description='Additional authorized material roots or current result files. Original task roots supplied by the application remain available.')
-    prior_draft: str = Field(default='', description='Authorized manuscript FILE LOCATOR, not Markdown content. '
-        'For a supplied draft not yet observed by the caller, omit both prior fields and let the producer '
-        'locate and read the draft in the original task roots.')
-    prior_sha256: str = Field(default='', description='Observed SHA-256 of the prior_draft file locator. '
-        'Use a prior producer result for feedback; do not read or transcribe originals merely to fill this field.')
+    prior_draft: str = Field(default='', description='Authorized manuscript file locator to revise, not Markdown content. '
+        'The document owner reads and binds its actual version; no preliminary read is needed.')
+    prior_sha256: str = Field(default='', description='Optional previously observed version of prior_draft. '
+        'Omit when the document owner should use the current accessible file.')
 
     @model_validator(mode='after')
     def valid_prior(self) -> 'WorkDocumentRequest':
         if not self.goal.strip():
             raise ValueError('Document goal must not be blank')
-        if bool(self.prior_draft) != bool(self.prior_sha256):
-            raise ValueError('A prior manuscript and its observed SHA-256 must be supplied together')
+        if self.prior_sha256 and not self.prior_draft:
+            raise ValueError('A prior version requires its manuscript')
         if self.prior_sha256 and not re.fullmatch(r'[0-9a-f]{64}', self.prior_sha256):
             raise ValueError('prior_sha256 must be a lowercase SHA-256')
         if any(not path.strip() for path in self.material_roots):
@@ -191,11 +202,19 @@ class _ReportDecision(BaseModel):
         return self
 
 
-def document_work_tool_specs() -> list[CommonToolSpec]:
+def document_work_tool_specs(*, bind_current: bool = False) -> list[CommonToolSpec]:
     """Register this package on new ordinary operation contracts only."""
+    schema = WorkDocumentRequest.model_json_schema()
+    if not bind_current:
+        schema['properties']['prior_draft']['description'] = (
+            'Authorized manuscript FILE LOCATOR, not Markdown content. For a supplied draft not yet observed '
+            'by the caller, omit both prior fields and let the producer locate and read the draft in the original task roots.')
+        schema['properties']['prior_sha256']['description'] = (
+            'Observed SHA-256 of the prior_draft file locator. Use a prior producer result for feedback; '
+            'do not read or transcribe originals merely to fill this field.')
     return [CommonToolSpec(name='work_document', domain='document_work',
         permission_level='write_patch', risk_level='medium',
-        input_schema=WorkDocumentRequest.model_json_schema(),
+        input_schema=schema,
         description=('Investigate authorized original materials and create or substantively revise an editable '
             'Markdown manuscript. Original task roots, requests, version-bound feedback and reusable reads '
             'are supplied by the application. Return a candidate, current version, provenance and gaps. '
@@ -234,7 +253,7 @@ class DocumentWorkToolGateway:
                  material_roots: Callable[[], list[str]] | None = None,
                  sources: Any | None = None, context_policy: str | None = None,
                  report_requirement: dict | None = None) -> None:
-        if context_policy not in (None, 'working.v1', 'working.v2', 'working.v3'):
+        if context_policy not in (None, 'working.v1', 'working.v2', 'working.v3', 'working.v4'):
             raise ValueError('Unknown document context policy')
         self.context_policy = context_policy
         self.report_requirement = report_requirement
@@ -405,6 +424,8 @@ class DocumentWorkToolGateway:
             if name != 'work_document':
                 raise ValueError('Unknown document operation')
             request = WorkDocumentRequest.model_validate(arguments)
+            if request.prior_draft and not request.prior_sha256 and self.context_policy != 'working.v4':
+                raise ValueError('A prior manuscript and its observed SHA-256 must be supplied together')
             store = self._store(identity)
             normalized = request.model_dump(mode='json')
             if store.exists('request.json'):
@@ -451,10 +472,11 @@ class DocumentWorkToolGateway:
             path = self.workspace.resolve_material_root(request.prior_draft)
             if not path.is_file() or path.stat().st_size > 256000:
                 raise ValueError('Prior manuscript must be an accessible UTF-8 file of at most 256000 bytes')
-            raw = read_bound_material_bytes(self.workspace, request.prior_draft,
-                request.prior_sha256, max_bytes=256000)
+            raw = (read_bound_material_bytes(self.workspace, request.prior_draft, request.prior_sha256, max_bytes=256000)
+                if request.prior_sha256 else read_material_bytes(self.workspace, request.prior_draft, max_bytes=256000))
             prior = {'path': request.prior_draft, 'absolute_path': str(path),
-                'sha256': request.prior_sha256, 'size_bytes': len(raw), 'text': raw.decode('utf-8')}
+                'sha256': request.prior_sha256 or hashlib.sha256(raw).hexdigest(),
+                'size_bytes': len(raw), 'text': raw.decode('utf-8')}
             prior_links = self._prior_assets(prior, identity)
         targets = [*roots, *([request.prior_draft] if prior else [])]
         context = freeze_work_context(self.work_context or (lambda _targets: {}), targets)
@@ -462,7 +484,8 @@ class DocumentWorkToolGateway:
         # References in the actual current manuscript are part of that work
         # product, even when its directory is outside the original input roots.
         prior_files = ([row['source'] for row in [*prior['images'], *prior_links] if row.get('source')]
-            + ([prior['bibliography']['source']] if prior['bibliography'] else []) if prior else [])
+            + ([prior['bibliography']['source']] if prior['bibliography'] else [])
+            + ([prior['citation_map']['source']] if prior.get('citation_map') else []) if prior else [])
         if prior_files:
             inventories.extend(material_inventories(self.workspace, list(dict.fromkeys(prior_files)), identity=identity))
         prior_path = prior['absolute_path'] if prior else None
@@ -517,8 +540,8 @@ class DocumentWorkToolGateway:
             excluded_paths=source_paths | ({prior_path} if prior_path else set()),
             **({'remaining_bytes': context_input_tokens * 4}
                if self.context_policy else {}))
-        contract = (_REPORT_CONTRACT if self.context_policy == 'working.v3' and self.report_requirement is not None else
-                    'document_work_operation.v5' if self.context_policy in {'working.v2', 'working.v3'} else
+        contract = (_REPORT_CONTRACT if self.context_policy in {'working.v3', 'working.v4'} and self.report_requirement is not None else
+                    'document_work_operation.v5' if self.context_policy in {'working.v2', 'working.v3', 'working.v4'} else
                     'document_work_operation.v4' if self.context_policy else 'document_work_operation.v3')
         binding = {'contract': contract,
             'request_sha256': _digest(request.model_dump(mode='json')),
@@ -554,8 +577,9 @@ class DocumentWorkToolGateway:
                 observed = read_material_window(self.workspace, {'path': str(path), 'max_bytes': 1,
                     'full_digest': True}, identity=identity)
                 bibliography = {'source': str(path), 'sha256': observed['data']['sha256']}
-                if observed['data']['size_bytes'] <= 64000:
-                    raw = read_bound_material_bytes(self.workspace, str(path), bibliography['sha256'], max_bytes=64000)
+                limit = 256000 if self.context_policy == 'working.v4' and self.report_requirement else 64000
+                if observed['data']['size_bytes'] <= limit:
+                    raw = read_bound_material_bytes(self.workspace, str(path), bibliography['sha256'], max_bytes=limit)
                     try:
                         bibliography['text'] = raw.decode('utf-8')
                     except UnicodeDecodeError:
@@ -563,6 +587,20 @@ class DocumentWorkToolGateway:
         except (ValueError, OSError):
             pass  # No accessible bibliography is not evidence of one elsewhere.
         prior['images'], prior['bibliography'] = images, bibliography
+        if bibliography and self.context_policy == 'working.v4' and self.report_requirement:
+            try:
+                path = self.workspace.resolve_material_root(str(parent / 'citation_map.json'))
+                if path.is_file():
+                    observed = read_material_window(self.workspace, {'path': str(path), 'max_bytes': 1,
+                        'full_digest': True}, identity=identity)
+                    if observed['data']['size_bytes'] <= 256000:
+                        raw = read_bound_material_bytes(self.workspace, str(path), observed['data']['sha256'], max_bytes=256000)
+                        payload = json.loads(raw)
+                        if isinstance(payload, dict) and payload.get('schema_version') == 'citation_map.v1':
+                            prior['citation_map'] = {'source': str(path), 'sha256': observed['data']['sha256'],
+                                'data': payload}
+            except (ValueError, OSError):
+                pass  # A manuscript may have no reusable framework citation map.
         links = document_local_targets(prior['text'])
         bound = {row['relative_target']: {key: row[key] for key in ('source', 'sha256')}
             for row in images if row.get('source') and row.get('relative_target')}
@@ -590,7 +628,7 @@ class DocumentWorkToolGateway:
 
     @staticmethod
     def _inherited_assets(binding: dict, markdown: str, identity: str,
-                          selected: list[dict] | None = None) -> list[dict]:
+                          selected: list[dict] | None = None, *, merged_bibliography: bool = False) -> list[dict]:
         from simple_ar.report.export import report_image_targets
 
         prior = binding['context']['prior_draft']
@@ -603,8 +641,9 @@ class DocumentWorkToolGateway:
         assets = [{'source': row['source'], 'source_sha256': row['sha256'],
             'path': f"workspace/document-work/{identity}/{row['relative_target']}"}
             for row in rows if row.get('source') and row.get('relative_target')
+            and not (merged_bibliography and row['relative_target'] in {'references.bib', 'citation_map.json'})
             and (row['relative_target'] if current else row['target']) in referenced]
-        if prior['bibliography']:
+        if prior['bibliography'] and not merged_bibliography:
             assets.append({'source': prior['bibliography']['source'],
                 'source_sha256': prior['bibliography']['sha256'],
                 'path': f'workspace/document-work/{identity}/references.bib'})
@@ -672,7 +711,8 @@ class DocumentWorkToolGateway:
         presented_ids = set()
         while True:
             step += 1
-            prompt = {**context, 'observations': observations, 'read_results': feedback,
+            prompt = {**_decision_context(context, compact_references=self.context_policy == 'working.v4'),
+                'observations': observations, 'read_results': feedback,
                 'response_schema': (_ReportDecision if binding['contract'] == _REPORT_CONTRACT else _Decision).model_json_schema(),
                 'coverage': ('Only actual observation bodies are evidence; file candidates and '
                     'unread ranges are not. Source passage lookup is not exhaustive.')}
@@ -798,8 +838,11 @@ class DocumentWorkToolGateway:
             requirement=binding['report_requirement'], title=decision.title, goal=context['goal'],
             work_context=work_context, observations=selected, attachments=decision.attachments,
             prior_draft=context['prior_draft']['text'] if context['prior_draft'] else '',
+            prior_references=context['prior_draft'] if self.context_policy == 'working.v4' else None,
+            current_work=self.context_policy == 'working.v4',
             client=client, sources=self.sources)
-        if context['prior_draft'] and context['prior_draft'].get('bibliography'):
+        if (context['prior_draft'] and context['prior_draft'].get('bibliography')
+                and not authored.get('merged_prior_bibliography')):
             authored['outputs'] = [name for name in authored['outputs'] if name not in {'references.bib', 'citation_map.json'}]
             if (store.root / 'assembly' / 'references.bib').read_text(encoding='utf-8').strip():
                 authored['gaps'].append('Retained the previous bibliography; reconcile it with any newly cited sources.')
@@ -837,10 +880,9 @@ class DocumentWorkToolGateway:
         return {**{key: value for key, value in row.items() if key != 'text'},
                 'result': json.loads(row['text'])}
 
-    @staticmethod
-    def _context_matches(binding: dict, prompt: dict, identity: str) -> bool:
+    def _context_matches(self, binding: dict, prompt: dict, identity: str) -> bool:
         """Keep old inputs exact; the new view may select only its frozen feedback."""
-        context = binding['context']
+        context = _decision_context(binding['context'], compact_references=self.context_policy == 'working.v4')
         if any(prompt.get(key) != value for key, value in context.items() if key != 'work_context'):
             return False
         if binding['contract'] not in {'document_work_operation.v5', _REPORT_CONTRACT}:
@@ -1037,7 +1079,10 @@ class DocumentWorkToolGateway:
             target = f"workspace/document-work/{identity}/{visible[source]['delivery_path']}"
             assets.append({'source': source, 'source_sha256': observation['data']['sha256'], 'path': target})
         generated = generated or []
-        inherited = self._inherited_assets(binding, decision.manuscript_markdown, identity, [*assets, *generated])
+        merged_bibliography = (bool(generated) and binding['contract'] == _REPORT_CONTRACT
+            and store.read_json(f'decisions/{step}/authored.json').get('merged_prior_bibliography', False))
+        inherited = self._inherited_assets(binding, decision.manuscript_markdown, identity,
+            [*assets, *generated], merged_bibliography=merged_bibliography)
         manuscript = f'workspace/document-work/{identity}/manuscript.md'
         targets = [manuscript, *(row['path'] for row in [*assets, *generated, *inherited])]
         if len(targets) != len(set(targets)):
@@ -1050,6 +1095,8 @@ class DocumentWorkToolGateway:
             'input_sha256': _digest(binding), 'decision': step, 'response_sha256': _digest(decision.model_dump(mode='json')),
             'manuscript': manuscript, 'markdown': decision.manuscript_markdown,
             'selected': selected, 'assets': assets, 'inherited_assets': inherited, 'gaps': decision.gaps}
+        if merged_bibliography:
+            candidate['merged_prior_bibliography'] = True
         if binding['contract'] == _REPORT_CONTRACT:
             candidate['generated_assets'] = generated
         self._check_inputs(binding, candidate, identity)
@@ -1061,6 +1108,10 @@ class DocumentWorkToolGateway:
             raw = read_bound_material_bytes(self.workspace, prior['path'], prior['sha256'], max_bytes=256000)
             if raw != prior['text'].encode('utf-8'):
                 raise ValueError('Prior manuscript changed')
+            for name in ('bibliography', 'citation_map'):
+                source = prior.get(name)
+                if source and candidate.get('merged_prior_bibliography'):
+                    read_bound_material_bytes(self.workspace, source['source'], source['sha256'], max_bytes=256000)
         for row in candidate['selected']:
             if row['kind'] == 'material_window':
                 validate_material_observation(self.workspace, row['observation'], identity=identity)
@@ -1187,6 +1238,8 @@ class DocumentWorkToolGateway:
             'gaps': gaps, 'receipt': f'records/{identity}/document_work/receipt.json'}
         if binding['contract'] == _REPORT_CONTRACT:
             authored = store.read_json(f"decisions/{candidate['decision']}/authored.json")
+            if authored.get('review'):
+                data['review'] = authored['review']
             if authored.get('source_reads_record'):
                 data['provenance']['writer_source_reads'] = authored['source_reads_record']
                 data['provenance']['scope'] = ('Selected original observations and recorded Writer source reads; '

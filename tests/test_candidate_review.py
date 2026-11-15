@@ -96,6 +96,13 @@ class CandidateReviewTests(unittest.TestCase):
         historical = self.owner.review_delivery(claim, 'historical', may_start=True, candidate=True)
         self.assertNotIn('purpose', historical['binding'])
 
+        self.owner.config['delivery_review_selection'] = 'model.v3'
+        current = self.owner.review_delivery(claim, 'current', may_start=True, candidate=True)
+        self.assertEqual(current['binding']['purpose'], 'candidate')
+        final = self.owner.review_delivery(claim, 'final', may_start=True,
+            candidate=True, review_scope='delivery')
+        self.assertNotIn('purpose', final['binding'])
+
     def test_candidate_versions_are_rechecked_and_new_investigation_does_not_replay_old_work(self):
         first = self.owner.review_delivery(self.claim,'first',may_start=True,candidate=True)
         self.observations.append({'tool_name':'review_result','status':'ok',
@@ -159,18 +166,81 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertEqual(self.owner.lifecycle_requirements(accepted_delivery=previous)
                          ['minimum_resources']['llm_requests'], 0)
 
-    def test_selected_final_review_is_retained_only_for_the_current_request(self):
-        self.owner.config.update(delivery_review_selection='model.v2',
+    def test_selected_final_review_applies_to_its_work_and_current_request(self):
+        self.owner.config.update(delivery_review_selection='model.v3',
             candidate_review_protocol='candidate.v1')
         direct = DeliveryRequest.model_validate({
             'summary': 'A small note', 'artifacts': ['draft.md'], 'independent_review': False})
+        binding = {'artifacts': {str(self.workspace.resolve('draft.md')): 'version'}, 'purpose': 'candidate'}
         self.observations.append({'tool_name': 'review_result', 'status': 'ok',
-            'arguments': {'review_scope': 'candidate'}, 'current_request': True})
+            'metadata': {'delivery_review': {'binding': binding}}, 'current_request': True})
         self.assertFalse(self.owner.requires_review(direct))
-        self.observations[-1]['arguments']['review_scope'] = 'delivery'
+        binding.pop('purpose')
         self.assertTrue(self.owner.requires_review(direct))
+        self.workspace.resolve('other.md').write_text('Different work', encoding='utf-8')
+        other = direct.model_copy(update={'artifacts': ['other.md']})
+        self.assertFalse(self.owner.requires_review(other))
         self.observations[-1]['current_request'] = False
         self.assertFalse(self.owner.requires_review(direct))
+
+    def test_saved_v2_review_selection_keeps_its_original_request_scope(self):
+        self.owner.config['delivery_review_selection'] = 'model.v2'
+        self.observations.append({'tool_name': 'review_result', 'status': 'ok',
+            'arguments': {'review_scope': 'delivery'}, 'current_request': True})
+        self.workspace.resolve('other.md').write_text('Different work', encoding='utf-8')
+        direct = DeliveryRequest.model_validate({
+            'summary': 'Another result', 'artifacts': ['other.md'], 'independent_review': False})
+        self.assertTrue(self.owner.requires_review(direct))
+        self.observations[0]['current_request'] = False
+        self.assertFalse(self.owner.requires_review(direct))
+
+    def test_delivery_review_must_have_started_before_it_is_retained(self):
+        self.owner.config.update(delivery_review_selection='model.v3',
+            candidate_review_protocol='candidate.v1')
+        self.owner.config['tool_completions'].update({
+            'deliver_result': {'kind': 'delivery'},
+            'write_file': {'kind': 'delivery', 'field': 'delivery'},
+        })
+        direct = DeliveryRequest.model_validate({
+            'summary': 'The result', 'artifacts': ['draft.md'], 'independent_review': False})
+        for name, arguments in (
+                ('deliver_result', {'summary': 'The result', 'artifacts': ['draft.md']}),
+                ('write_file', {'path': 'draft.md', 'delivery': {
+                    'summary': 'The result', 'artifacts': ['draft.md']}})):
+            with self.subTest(tool=name):
+                self.observations[:] = [{'tool_name': name, 'status': 'ok',
+                    'arguments': arguments, 'metadata': {'delivery_review': {
+                        'binding': {'artifacts': {str(self.workspace.resolve('draft.md')): 'version'}},
+                        'result': {'status': 'incomplete'}}},
+                    'current_request': True}]
+                self.assertTrue(self.owner.requires_review(direct))
+                self.observations[0]['metadata']['delivery_review']['error'] = 'The inspection could not start'
+                self.assertFalse(self.owner.requires_review(direct))
+                self.observations[0]['metadata'] = {'delivery_review_error': 'Review did not complete'}
+                self.assertFalse(self.owner.requires_review(direct))
+                self.observations[0]['current_request'] = False
+                self.assertFalse(self.owner.requires_review(direct))
+
+    def test_caller_required_review_cannot_be_waived_after_a_changed_claim(self):
+        self.owner.config.update(delivery_review_selection='model.v3', independent_review_required=True)
+        original = {'summary': 'Original claim', 'artifacts': ['draft.md']}
+        proof = self.owner.review_delivery(original, 'original', may_start=True,
+            candidate=True, review_scope='delivery')
+        self.observations.append({'tool_name': 'review_result', 'status': 'ok',
+            'metadata': {'delivery_review': proof}, 'current_request': True})
+        reuse = DeliveryRequest.model_validate({**original, 'independent_review': False})
+        capacity = Mock(side_effect=AssertionError('A retained review needs no new reservation'))
+        self.owner.bind_result(reuse, {'metadata': {}}, 'same', current_outputs=(), current_result={},
+            retain=lambda: None, review_capacity=capacity, may_start=True)
+        capacity.assert_not_called()
+        self.assertEqual(len(self.inspector.calls), 1)
+        revised = DeliveryRequest.model_validate({'summary': 'A changed claim', 'artifacts': ['draft.md'],
+            'independent_review': False})
+        payload = {'metadata': {}}
+        self.owner.bind_result(revised, payload, 'revised', current_outputs=(), current_result={},
+            retain=lambda: None, review_capacity=nullcontext, may_start=True)
+        self.assertEqual(len(self.inspector.calls), 2)
+        self.assertEqual(payload['metadata']['delivery_review']['identity'], 'revised')
 
     def test_feedback_keeps_prior_delivery_without_rechecking_it_as_a_new_candidate(self):
         self.owner.config['tool_completions']['deliver_result'] = {'kind': 'delivery'}
@@ -225,6 +295,55 @@ class CandidateReviewTests(unittest.TestCase):
 
 
 class IntegratedCandidateFlowTests(unittest.TestCase):
+    def test_optional_review_of_one_delivery_does_not_require_review_of_another(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
+
+        case = OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.app = ToolApplication.create(case.root, 'Complete the requested work.',
+            model='fixture', sources={}, services=case.services, max_turns=20,
+            max_tokens=900000, max_attempts=100, tool_contracts='full')
+        case._write('first.md', 'The first candidate.\n')
+        case._write('second.md', 'A different candidate.\n')
+        case.review = lambda view: {'conclusion': 'incomplete', 'findings': [], 'evidence': [],
+            'limitations': ['The independent investigation is unfinished.']}
+        case._submit(_action('review_result', summary='First', artifacts=['first.md'], review_scope='delivery'))
+        checked = len(case.inspection_requests)
+        case._submit(_action('deliver_result', summary='Second', artifacts=['second.md'], independent_review=False))
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertEqual(len(case.inspection_requests), checked)
+
+    def test_incomplete_delivery_review_cannot_be_waived_by_a_later_delivery(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
+
+        case = OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.app = ToolApplication.create(case.root, 'Check and deliver the explanation.',
+            model='fixture', sources={}, services=case.services, max_turns=20,
+            max_tokens=900000, max_attempts=100, tool_contracts='full')
+        case._write('note.md', 'The current explanation.\n')
+        claim = {'summary': 'The explanation', 'artifacts': ['note.md']}
+        case.review = lambda view: {'conclusion': 'incomplete', 'findings': [], 'evidence': [],
+            'limitations': ['The independent investigation is unfinished.']}
+        case._submit(_action('deliver_result', **claim))
+        case._not_delivered()
+        checked = len(case.inspection_requests)
+        self.assertEqual(checked, 1)
+        case._submit(_action('deliver_result', **claim, independent_review=False))
+        case._not_delivered()
+        self.assertEqual(len(case.inspection_requests), checked)
+        case.review = case._review_complete_targets
+        case._submit(_action('review_result', **claim, review_scope='delivery'))
+        case._ok('review_result', reviewed=True)
+        checked = len(case.inspection_requests)
+        case._submit(_action('deliver_result', **claim, independent_review=False))
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertEqual(len(case.inspection_requests), checked)
+
     def test_supplied_contract_does_not_cancel_a_selected_final_review(self):
         from simple_ar.app.tool_application import ToolApplication
         from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
@@ -264,7 +383,7 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         case.app = ToolApplication.create(case.root, 'Independently check this note before delivery.',
             model='fixture', sources={}, services=case.services, max_turns=20,
             max_tokens=900000, max_attempts=100, tool_contracts='full')
-        self.assertEqual(case.app.state['config']['delivery_review_selection'], 'model.v2')
+        self.assertEqual(case.app.state['config']['delivery_review_selection'], 'model.v3')
         case._write('note.md', 'The current explanation.\n')
         claim = {'summary': 'The explanation', 'artifacts': ['note.md']}
         case.review = lambda view: {'conclusion': 'incomplete', 'findings': [], 'evidence': [],
@@ -297,6 +416,9 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         case.review = lambda view: {'conclusion': 'incomplete', 'findings': [], 'evidence': [],
             'limitations': ['The independent investigation is unfinished.']}
         claim = {'summary': 'A bounded explanation', 'artifacts': ['note.md']}
+        case._submit(_action('deliver_result', **claim, independent_review=False))
+        self.assertEqual(len(case.inspection_requests), 1)
+        case._not_delivered()
         case._submit(_action('deliver_result', **claim, independent_review=False))
         self.assertEqual(len(case.inspection_requests), 1)
         case._not_delivered()

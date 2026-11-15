@@ -64,6 +64,21 @@ class ExternalAgentAccountingTests(unittest.TestCase):
             check_agent_budget(self.root, 'external_cli', enabled=True, binary=sys.executable,
                                mode='handoff', ledger=ledger)
 
+    def test_agent_factory_inherits_the_parent_clients_budget_and_identity(self):
+        from simple_ar.agent_backends import create_agent_backend
+        from simple_ar.integrations.llm import LLMClient, LLMSettings
+
+        ledger = BudgetLedger({'llm_requests': 2, 'total_tokens': 10000})
+        client = LLMClient(LLMSettings(api_key='fixture'), budget_ledger=ledger,
+            budget_session_id='session', budget_attempt_id='attempt')
+        backend = create_agent_backend('external_cli', enabled=True, binary=sys.executable, client=client)
+        self.assertIs(backend.ledger, ledger)
+        self.assertEqual((backend.session_id, backend.attempt_id), ('session', 'attempt'))
+        with self.assertRaises(BudgetError), patch('simple_ar.agent_backends.external_cli.run_process') as launch:
+            backend.run(self.request)
+        launch.assert_not_called()
+        self.assertEqual(ledger.entries, ())
+
     def test_standalone_cli_retains_unknown_usage_at_the_task_root(self):
         result = self.backend().run(self.request)
         self.assertEqual(result.metadata['usage_status'], 'unknown')

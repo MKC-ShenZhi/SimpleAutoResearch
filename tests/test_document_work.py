@@ -116,6 +116,188 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertIn('Researcher Example', bibliography)
         self.assertFalse(any('citation references were removed' in gap for gap in result.data['gaps']))
 
+    def test_report_revision_retains_prior_references_and_adds_new_sources(self):
+        from simple_ar.literature.models import Paper
+        from simple_ar.report.citations import citation_map_artifact
+        from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
+        from tests.report_review_fixtures import prompt_payload
+
+        root, source, ledger, workspace = self.workspace()
+        previous = workspace.workspace / 'previous'
+        previous.mkdir()
+        (previous / 'manuscript.md').write_text('# Previous\n\nEarlier finding [@old-paper].\n', encoding='utf-8')
+        old_bib = '@article{old-paper, title={Earlier work}, journal={Original venue}}\n' + '% preserved reference notes\n' * 3000
+        (previous / 'references.bib').write_text(old_bib, encoding='utf-8')
+        old_paper = Paper(id='old-paper', title='Earlier work', authors=[], abstract='', url='')
+        (previous / 'citation_map.json').write_text(json.dumps(citation_map_artifact(
+            {'old-paper': 1}, [old_paper], {'P1': 'old-paper'})), encoding='utf-8')
+        bundle = DocumentBundle([DocumentRecord(document_id='paper', title='New paper', source='local_files',
+            authors=['New Researcher'], extraction_status='parsed', metadata={'paper_id': 'paper'})], {}, {}, [], [
+                TextChunk('chunk-1', 'paper', 'The additional observation updates the earlier result.')])
+        (source / 'original.json').write_text(json.dumps(bundle.to_handoff_dict()), encoding='utf-8')
+        config = ReportRuntimeConfig(reviewer='disabled', max_review_iterations=0, allow_source_backtracking=False)
+        template = ReportTemplateBundle(name='brief', mode='supplied_materials', template_path='',
+            criteria_path='', template_markdown='## Findings\n', criteria_markdown='')
+        requirement = {'method': 'article', 'config': config.model_dump(mode='json'),
+            'template': template.model_dump(mode='json'), 'outline': []}
+
+        class Client(_Client):
+            def ask_json(self, system, prompt, *, label='', budget_call_id='', **options):
+                self._budget_ledger.reserve(budget_call_id, {'llm_requests': 1, 'total_tokens': 10},
+                    session_id='session', attempt_id=self._budget_attempt_id, purpose='document')
+                if label == 'document-work-1':
+                    prior = prompt_payload(prompt)['prior_draft']
+                    self_test.assertNotIn('citation_map', prior)
+                    self_test.assertNotIn('text', prior['bibliography'])
+                    response = {'action': 'investigate', 'source_queries': [
+                        {'document_record': 'source0/original.json', 'query': 'additional observation'}]}
+                elif label == 'document-work-2':
+                    response = {'action': 'write', 'title': 'Updated findings', 'selected_observation_ids': ['o1']}
+                elif label == 'composition-article':
+                    view = prompt_payload(prompt)
+                    self_test.assertIn('old-paper' if self._budget_attempt_id == 'revision' else 'P1',
+                        json.dumps(view))
+                    response = {'draft_markdown': '# Updated findings\n\nEarlier work [@P1]. New evidence [@P2].'}
+                else:
+                    raise AssertionError(label)
+                self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
+                return response
+
+        self_test = self
+        client = Client(ledger, 'revision', None)
+        gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
+            material_roots=lambda: ['source0'], sources=SourceToolGateway(root, workspace, ledger),
+            context_policy='working.v4', report_requirement=requirement)
+        result = gateway.call('work_document', {'goal': 'Update the findings',
+            'prior_draft': str(previous / 'manuscript.md')}, identity='revision')
+        self.assertTrue(result.ok, result.error)
+        output = workspace.resolve(result.data['manuscript']).parent
+        bibliography = (output / 'references.bib').read_text(encoding='utf-8')
+        self.assertIn(old_bib.strip(), bibliography)
+        self.assertIn('New paper', bibliography)
+        self.assertIn('[@old-paper]', result.data['markdown'])
+        self.assertIn('[@paper]', result.data['markdown'])
+        self.assertEqual((previous / 'references.bib').read_text(encoding='utf-8'), old_bib)
+        self.assertFalse(any('citation references were removed' in gap or 'reconcile' in gap
+            for gap in result.data['gaps']))
+        self.assertEqual({row['paper_id'] for row in json.loads((output / 'citation_map.json').read_text(
+            encoding='utf-8'))['entries']}, {'old-paper', 'paper'})
+        before = ledger.to_dict()
+        self.assertTrue(gateway.call('work_document', {'goal': 'Update the findings',
+            'prior_draft': str(previous / 'manuscript.md')}, identity='revision').ok)
+        self.assertEqual(ledger.to_dict(), before)
+
+        manual = workspace.workspace / 'manual'
+        manual.mkdir()
+        (manual / 'manuscript.md').write_text('# Previous\n\nEarlier finding [@P1].\n', encoding='utf-8')
+        manual_bib = '@article{P1, title={User supplied reference}, journal={Original venue}}\n'
+        (manual / 'references.bib').write_text(manual_bib, encoding='utf-8')
+        second_client = Client(ledger, 'manual-revision', None)
+        second = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: second_client,
+            material_roots=lambda: ['source0'], sources=SourceToolGateway(root, workspace, ledger),
+            context_policy='working.v4', report_requirement=requirement)
+        result = second.call('work_document', {'goal': 'Update the findings',
+            'prior_draft': str(manual / 'manuscript.md')}, identity='manual-revision')
+        self.assertTrue(result.ok, result.error)
+        output = workspace.resolve(result.data['manuscript']).parent
+        self.assertIn(manual_bib.strip(), (output / 'references.bib').read_text(encoding='utf-8'))
+        self.assertIn('New paper', (output / 'references.bib').read_text(encoding='utf-8'))
+        self.assertIn('[@P1]', result.data['markdown'])
+        self.assertIn('[@paper]', result.data['markdown'])
+
+    def test_article_exposes_review_and_only_reports_actionable_findings_as_gaps(self):
+        from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
+        from tests.report_review_fixtures import draft_quotes, prompt_payload
+
+        for verdict, action, severity, expected_gap in (('pass', None, 'minor', False),
+                ('warning', 'advisory', 'minor', False),
+                ('warning', 'advisory', 'major', False),
+                ('revise_required', 'advisory', 'minor', False), ('revise_required', 'revise', 'minor', True)):
+            with self.subTest(verdict=verdict, action=action, severity=severity):
+                root, source, ledger, workspace = self.workspace()
+                (source / 'result.txt').write_text('Observed value: 2.\n', encoding='utf-8')
+                config = ReportRuntimeConfig(reviewer='llm', document_review=True,
+                    review_scope='document', draft_scope='document', max_review_iterations=0,
+                    allow_source_backtracking=False)
+                template = ReportTemplateBundle(name='brief', mode='supplied_materials', template_path='',
+                    criteria_path='', template_markdown='## Result\n', criteria_markdown='')
+                requirement = {'method': 'article', 'config': config.model_dump(mode='json'),
+                    'template': template.model_dump(mode='json'), 'outline': []}
+
+                class Client(_Client):
+                    def ask_json(self, system, prompt, *, label='', budget_call_id='', **options):
+                        view = prompt_payload(prompt)
+                        self._budget_ledger.reserve(budget_call_id, {'llm_requests': 1, 'total_tokens': 10},
+                            session_id='session', attempt_id=self._budget_attempt_id, purpose='document')
+                        if label == 'document-work-1':
+                            response = {'action': 'investigate', 'read_windows': [{'path': 'source0/result.txt'}]}
+                        elif label == 'document-work-2':
+                            response = {'action': 'write', 'title': 'Result',
+                                'selected_observation_ids': [view['observations'][0]['id']]}
+                        elif label == 'composition-article':
+                            response = {'draft_markdown': 'The observed value is 2.'}
+                        elif label == 'article-independent-review':
+                            findings = ([{'finding_id': 'scope', 'type': 'style', 'severity': severity,
+                                'required_action': action, 'message': 'Clarify the scope.',
+                                'draft_quotes': draft_quotes(prompt, 'document')}] if action else [])
+                            response = {'section_reviews': [{'section_id': 'document', 'verdict': verdict,
+                                'findings': findings}]}
+                        else:
+                            raise AssertionError(label)
+                        self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
+                        return response
+
+                client = Client(ledger, 'reviewed-report', None)
+                gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
+                    material_roots=lambda: ['source0'], context_policy='working.v4', report_requirement=requirement)
+                result = gateway.call('work_document', {'goal': 'Explain the result'}, identity='reviewed-report')
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual('Clarify the scope.' in result.data['gaps'], expected_gap)
+                if verdict == 'revise_required' and action == 'advisory':
+                    self.assertTrue(any('without a specific correction' in gap for gap in result.data['gaps']))
+                self.assertEqual(result.data['review']['status'],
+                    'needs_revision' if verdict == 'revise_required' else 'reviewed')
+                self.assertIn('reviewed_writer', result.data['review']['record'])
+
+    def test_uncited_prior_bibliography_does_not_create_a_citation_requirement(self):
+        from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
+
+        root, _, ledger, workspace = self.workspace()
+        previous = workspace.workspace / 'previous'
+        previous.mkdir()
+        (previous / 'manuscript.md').write_text('# Before\n\nA plain explanation.\n', encoding='utf-8')
+        bibliography = '@article{unused, title={Available but not cited}}\n'
+        (previous / 'references.bib').write_text(bibliography, encoding='utf-8')
+        config = ReportRuntimeConfig(reviewer='disabled', max_review_iterations=0, allow_source_backtracking=False)
+        template = ReportTemplateBundle(name='brief', mode='supplied_materials', template_path='',
+            criteria_path='', template_markdown='## Explanation\n', criteria_markdown='')
+        requirement = {'method': 'article', 'config': config.model_dump(mode='json'),
+            'template': template.model_dump(mode='json'), 'outline': []}
+
+        class Client(_Client):
+            def ask_json(self, system, prompt, *, label='', budget_call_id='', **options):
+                self._budget_ledger.reserve(budget_call_id, {'llm_requests': 1, 'total_tokens': 10},
+                    session_id='session', attempt_id=self._budget_attempt_id, purpose='document')
+                if label == 'document-work-1':
+                    response = {'action': 'write', 'title': 'Explanation', 'selected_observation_ids': []}
+                elif label == 'composition-article':
+                    response = {'draft_markdown': '# Explanation\n\nA clearer explanation.'}
+                else:
+                    raise AssertionError(label)
+                self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
+                return response
+
+        client = Client(ledger, 'uncited', None)
+        gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
+            material_roots=lambda: [], context_policy='working.v4', report_requirement=requirement)
+        result = gateway.call('work_document', {'goal': 'Clarify the supplied prose',
+            'prior_draft': str(previous / 'manuscript.md')}, identity='uncited')
+        self.assertTrue(result.ok, result.error)
+        self.assertIn('A clearer explanation.', result.data['markdown'])
+        self.assertNotIn('[@', result.data['markdown'])
+        self.assertEqual((workspace.resolve(result.data['manuscript']).parent / 'references.bib')
+            .read_text(encoding='utf-8'), bibliography)
+
     def test_common_section_writer_can_read_an_unselected_passage_of_selected_source(self):
         from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
         from tests.report_review_fixtures import prompt_payload
@@ -549,7 +731,8 @@ class DocumentWorkTests(unittest.TestCase):
         workspace = WorkspaceToolGateway(root, {'source0': source, 'records': root / 'attempts'}, ledger)
         return root, source, ledger, workspace
 
-    def gateway(self, root, source, ledger, workspace, decide, *, context=None, observations=None, sources=None):
+    def gateway(self, root, source, ledger, workspace, decide, *, context=None, observations=None, sources=None,
+                context_policy=None):
         clients = []
         def factory(identity):
             client = _Client(ledger, identity, decide)
@@ -557,7 +740,7 @@ class DocumentWorkTests(unittest.TestCase):
             return client
         gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=factory,
             material_roots=lambda: ['source0'], work_context=lambda targets: context or {},
-            material_observations=observations, sources=sources)
+            material_observations=observations, sources=sources, context_policy=context_policy)
         return gateway, clients
 
     def test_revision_investigates_originals_and_reuses_parent_read_without_fixed_rounds(self):
@@ -589,9 +772,8 @@ class DocumentWorkTests(unittest.TestCase):
                 'gaps': ['The records do not establish an external comparison.']}
 
         gateway, clients = self.gateway(root, source, ledger, workspace, decide, context=original_context,
-            observations=lambda roots: [{'request': parent_request, 'data': parent.data}])
-        arguments = {'goal': 'Revise against the original conditions', 'prior_draft': 'workspace/draft.md',
-            'prior_sha256': old_sha}
+            observations=lambda roots: [{'request': parent_request, 'data': parent.data}], context_policy='working.v4')
+        arguments = {'goal': 'Revise against the original conditions', 'prior_draft': 'workspace/draft.md'}
         result = gateway.call('work_document', arguments, identity='revision')
         self.assertTrue(result.ok, result.error)
         self.assertEqual(len(clients[0].calls), 8)
@@ -980,6 +1162,9 @@ class DocumentWorkTests(unittest.TestCase):
         wrong = gateway.call('work_document', {'goal': 'Revise', 'prior_draft': 'workspace/draft.md',
             'prior_sha256': '0' * 64}, identity='stale')
         self.assertFalse(wrong.ok)
+        missing = gateway.call('work_document', {'goal': 'Revise', 'prior_draft': 'workspace/draft.md'},
+            identity='historical-contract')
+        self.assertFalse(missing.ok)
         self.assertEqual(clients, [])
         result = gateway.call('work_document', {'goal': 'Draft'}, identity='unobserved')
         self.assertFalse(result.ok)

@@ -5,16 +5,28 @@
 User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-11-16
+
+### Improved
+
+- The research retry API and CLI use the same saved task and ledger, including validated CodeTask sources; explicit resource-only continuations also retain the original ledger. Historical sessions retain their original continuation contract.
+
 ## 2026-11-15
 
 ### Improved
 
-- New scoped work on existing code uses the authorized task directly for editing, without a separate model-generated patch plan. It retains deterministic patch and validator checks; the task's independent delivery review owns the advisory model review and includes all changed code. New standalone and programmatically initialized CodeTask runs use the same editor and retain approval of actual edits; saved runs and explicit plan reviews keep their existing behavior. Eligible new-project work also uses task isolation and delegates advisory model review to the independent delivery review, retaining structural and execution checks.
-- Common research sessions can retry a failed explicit experiment in the same task and process ledger; report continuation, including earlier native contracts, reuses the saved Writer, model and budget.
+- New scoped work on existing code uses the authorized task directly for editing, without a separate model-generated patch plan. Deterministic patch and validator checks remain; when independent delivery review is required, it owns the advisory model review and covers changed code. New standalone and programmatically initialized CodeTask runs use the same editor and retain approval of actual edits; saved runs and explicit plan reviews keep their existing behavior. Eligible new-project work also uses task isolation and the same review choice.
+- Common research sessions can retry a failed explicit measurement in the same task and process ledger. New tasks can retain an applicable prepared environment and unchanged comparison measurements when correcting a condition; report continuation, including earlier native contracts, reuses the saved Writer, model and budget. Caller-directed measurements without research or a model can start through the same research entry.
+- Structured research continuation can add materials, revise source and report settings, and explicitly require independent review in the original task. Attempt and no-progress allowances use the same recorded continuation as other resources.
+- Adding a reference retains unchanged source observations and table analysis for reuse; a summary still has to address the updated research inputs.
+- New document revisions can name the existing draft directly and retain its references while adding new ones. Structured tasks may reuse existing results without being directed to run a new script.
 
 ### Fixed
 
-- An explicitly configured independent review cannot be waived by the producer; the common and structured research entries both accept the requirement. New tasks also retain a selected final review; applicable reviews remain reusable when the requirement and resources are supplied together, local candidate checks stay optional and unfinished work can be delivered as partial.
+- An explicitly configured independent review cannot be waived by the producer; the common and structured research entries both accept the requirement. Local candidate checks retain their requested scope, and an applicable final review can be reused; changed claims receive a new check when required. Unfinished work can be delivered as partial.
+- CodeTask generation, review and repair use the task's supplied model ledger and operation identity even when the caller provides an unbound or partially bound client; execution uses the same ledger when it is already bound to the client.
+- Common report writing keeps review advice distinct from required revision or verification across editing and audit; saved opinions keep their original contract. Drafting and recovery use the same reference-aware input view when a previous citation map is supplied.
+- The common research entry preserves unlimited model allowances supplied through the older service contract; new direct-entry defaults remain bounded.
 - Structured source collection aligns its default fetch attempts with the permitted document count, so a multi-source request is not cut short by a single-document default.
 - A selected independent review can use remaining capacity when a forecast for a later decision would prevent its actual work; the review's own follow-up capacity and results are retained.
 - Workspace-isolated execution retains system alternatives links so standard tools using those links remain available.

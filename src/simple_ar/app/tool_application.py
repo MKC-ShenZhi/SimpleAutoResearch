@@ -457,8 +457,10 @@ class ToolApplication:
         from simple_ar.app.professional_conversation import NATIVE_HISTORY_POLICY
         if config.get('native_history_policy') not in (None, NATIVE_HISTORY_POLICY):
             raise ValueError('Unsupported saved native history policy')
-        if config.get('document_context_policy') not in (None, 'working.v1', 'working.v2', 'working.v3'):
+        if config.get('document_context_policy') not in (None, 'working.v1', 'working.v2', 'working.v3', 'working.v4'):
             raise ValueError('Unsupported saved document context policy')
+        if config.get('scientific_condition_reuse') not in (None, 'unchanged.v1'):
+            raise ValueError('Unsupported saved scientific condition reuse policy')
         if config.get('process_artifact_paths') not in (None, 'cwd.v1'):
             raise ValueError('Unsupported saved process artifact paths')
         if config.get('work_lifecycle') not in (None, *INTEGRATED_WORK_LIFECYCLES):
@@ -570,6 +572,8 @@ class ToolApplication:
             user_request_count=lambda: len(self.state['requests']),
             review_request_start=self._review_request_start,
             native_route_validator=self._validate_professional_route,
+            scientific_revisions=(self._scientific_revision_attempts
+                if config.get('scientific_condition_reuse') == 'unchanged.v1' else None),
             search_registry=getattr(self.services,'search_registry',None))
         self.workspace, self.gateway = self.operations.workspace, self.operations.gateway
         self.sources, self.publication = self.operations.sources, self.operations.publication
@@ -577,30 +581,42 @@ class ToolApplication:
         self.writing = None
         self.implementation, self.scientific = self.operations.implementation, self.operations.scientific
 
-    def _operation_observations(self) -> list[dict]:
+    def _operation_observations(self, *, domain: str | None = None, verify: bool = True) -> list[dict]:
         from simple_ar.tools.professional_outcomes import accepted_native_result
-        active = {domain: {id(turn) for turn in self._evidence_turns(domain)}
-                  for domain in ('sources', 'analysis', 'scientific', 'implementation')}
+        active = {name: {id(turn) for turn in self._evidence_turns(name)}
+                  for name in ((domain,) if domain else ('sources', 'analysis', 'scientific', 'implementation'))}
         result = []
         for turn in self.state['turns']:
             calls = {call['id']: call for call in
                      self.session.store.read_json(turn['reply']).get('tool_calls', [])}
             for item in turn['tools']:
+                call = calls[item['id']]
+                spec = self.gateway.registry.get(call['function']['name'])
+                if domain is not None and (spec is None or spec.domain != domain):
+                    continue
                 observed = self.session.store.read_json(item['result'])
-                if observed.get('status') == 'ok':
+                if verify and observed.get('status') == 'ok':
                     # Prove the original producer before projecting its record.
                     # A separate review can reject delivery without changing
                     # production identity or silently settling its charges.
                     accepted_native_result(self.session.store.root,self.session.manifest.session_id,
                         observed,Path(item['result']).parent.name,
                         ledger=None if self.operations is not None and self.operations.professional else self.ledger)
-                call = calls[item['id']]
-                spec = self.gateway.registry.get(call['function']['name'])
-                result.append(self._operation_observation(observed, call, item['result'],
+                observation = self._operation_observation(observed, call, item['result'],
                     current_request=turn.get('request_count', 1) == len(self.state['requests']),
                     request_count=turn.get('request_count', 1),
                     contract_current=spec is None or spec.domain not in active
-                        or id(turn) in active[spec.domain], review_record=item.get('review_result')))
+                        or id(turn) in active[spec.domain], review_record=item.get('review_result'))
+                if (not observation['contract_current'] and spec is not None and spec.domain == 'scientific'
+                        and observation.get('tool_name') == 'measure_experiment'
+                        and self.state['config'].get('scientific_condition_reuse') == 'unchanged.v1'):
+                    supplies = [row for row in self.state.get('supplies', [])
+                        if row.get('request_count', 0) > turn.get('request_count', 1)]
+                    configs = [row['previous_config'] for row in supplies] + [self.state['config']]
+                    if supplies:
+                        observation['contract_current'] = self.scientific.unchanged_condition_observation(
+                            observation['arguments'].get('condition_id'), configs)
+                result.append(observation)
         return result
 
     @staticmethod
@@ -614,6 +630,39 @@ class ToolApplication:
         return {**payload, 'record':record, 'arguments':arguments,
                 'current_request':current_request, 'request_count':request_count, 'contract_current':contract_current,
                 **({'review_record':review_record} if review_record is not None else {})}
+
+    def _scientific_observations(self) -> list[dict]:
+        if self.state['config'].get('scientific_condition_reuse') == 'unchanged.v1':
+            # Scientific consumers validate their own measurement receipts;
+            # this projection does not repeat that work or grant adoption.
+            return self._operation_observations(domain='scientific', verify=False)
+        return [{**self.session.store.read_json(item['result']), 'record': item['result']}
+            for turn in self._evidence_turns('scientific') for item in turn['tools']]
+
+    def _scientific_revision_attempts(self) -> dict[str, bool]:
+        """Project attempts retained across revisions of the measurement itself."""
+        from simple_ar.tools.scientific import ScientificToolGateway
+
+        supplies = self.state.get('supplies', [])
+        start = revision = 0
+        for index, supply in enumerate(supplies):
+            before = supply['previous_config']
+            after = supplies[index + 1]['previous_config'] if index + 1 < len(supplies) else self.state['config']
+            count = supply.get('request_count', 0)
+            project = (before.get('code_task') or {}).get('project_path', '').replace('\\', '/').split('/')[0]
+            if (before.get('code_task') != after.get('code_task')
+                    or project and before.get('sources', {}).get(project) != after.get('sources', {}).get(project)
+                    or ScientificToolGateway.preparation_contract(before.get('execution_contract'))
+                        != ScientificToolGateway.preparation_contract(after.get('execution_contract'))):
+                start = count
+            if 'execution_contract' in supply['changes']:
+                revision = count
+        attempts = {Path(item['result']).parent.name: turn.get('request_count', 1) < revision
+            for turn in self.state['turns'] if turn.get('request_count', 1) >= start
+            for item in turn['tools'] if item['result'].startswith('attempts/')}
+        if self.state.get('pending') and self.state['pending'].get('attempt'):
+            attempts[self.state['pending']['attempt']] = False
+        return attempts
 
     def _configure_tools(self) -> None:
         controller = self.session
@@ -718,10 +767,8 @@ class ToolApplication:
             execution_observations=self._execution_observations, exact=config.get('code_task'),
             research_inputs=lambda: self.sources.implementation_evidence(),
             candidate_outputs=lambda record: scientific['scientific'].candidate_outputs(record) if scientific else {},
-            measurement_inputs=lambda origin, required: scientific['scientific'].implementation_inputs([
-                observed['data']['result_ref'] for turn in self._evidence_turns('scientific') for item in turn['tools']
-                if (observed := self.session.store.read_json(item['result'])).get('tool_name') == 'measure_experiment'
-                and observed.get('status') == 'ok'], origin, required=required),
+            measurement_inputs=lambda origin, required: scientific['scientific'].implementation_inputs(
+                scientific['scientific'].measurement_refs(self._scientific_observations()), origin, required=required),
             measurement=config.get('execution_contract') if config.get('code_task') is not None else None,
             measurement_supplier=(lambda: scientific['scientific'].execution_contract)
                 if config.get('code_task') is not None and config.get('scientific_tools', False) else None)
@@ -1333,7 +1380,7 @@ class ToolApplication:
                       additional_protection: bool = False, selected_turns: list | None = None,
                       economic_floor: int | None = None) -> tuple:
         """Checkpoint old closed work through the same model attempt and ledger."""
-        if self._request_capacity()<2 or not cutoff:
+        if not self._can_request(2) or not cutoff:
             return ()
         previous = self._working_memory()
         journal = self.state['config'].get('memory_protocol') == 'journal.v1'
@@ -1711,8 +1758,8 @@ class ToolApplication:
     @classmethod
     def _configuration(cls, root: Path, goal: str, *, model: str | None, sources: dict[str, Path],
                allow_execution: bool = False, sandbox_execution: bool = False,
-               allow_network: bool = False, allow_vision: bool = False, max_turns: int = 30,
-               max_tokens: int = 600000, max_images: int = 0,
+               allow_network: bool = False, allow_vision: bool = False, max_turns: int | None = 30,
+               max_tokens: int | None = 600000, max_images: int = 0,
                project_python: Path | None = None, code_task: dict[str, Any] | None = None,
                process_limits: dict[str, int | float] | None = None,
                report_requirement: dict[str, Any] | None = None, report_protocol: str | None = None,
@@ -1760,16 +1807,16 @@ class ToolApplication:
             from simple_ar.tools.workspace import validate_delivery_patterns
             delivery_files = validate_delivery_patterns(delivery_files)
         if (not goal.strip() or max_images < 0 or
-                (model is not None and (not model.strip() or max_turns < 1 or max_tokens < 1))):
+                (model is not None and (not model.strip() or max_turns == 0 or max_tokens == 0))):
             raise ValueError('Goal and positive model resource bounds are required')
         if source_operations is not None and (type(source_operations) is not int or source_operations < 0):
             raise ValueError('Source operation allowance must be a finite nonnegative count')
-        if type(max_turns) is not int or type(max_tokens) is not int or max_turns < 0 or max_tokens < 0:
-            raise ValueError('Finite nonnegative model resource allowances are required')
+        if any(value is not None and (type(value) is not int or value < 0) for value in (max_turns, max_tokens)):
+            raise ValueError('Model resource allowances must be nonnegative integers or unlimited')
         if model is None and (allow_vision or max_images
                 or code_task is not None or max_output_tokens is not None):
             raise ValueError('A caller-directed task cannot authorize a model-owned contract')
-        attempt_limit = max_attempts if max_attempts is not None else max_turns * 10
+        attempt_limit = max_attempts if max_attempts is not None else (max_turns * 10 if max_turns is not None else 300)
         if type(attempt_limit) is not int or attempt_limit < 1:
             raise ValueError('A finite positive task attempt allowance is required')
         if execution_contract is not None:
@@ -2012,8 +2059,10 @@ class ToolApplication:
             # One model turn can contain multiple bounded tool operations.
             # Search backends share process receipts, but must not consume a
             # one-process-per-model-turn allowance before validation starts.
-            "process_invocations": max_turns * 10, "process_wall_seconds": max_turns * 300,
-            "source_operations": source_operations if source_operations is not None else max_turns * 3,
+            "process_invocations": max_turns * 10 if max_turns is not None else None,
+            "process_wall_seconds": max_turns * 300 if max_turns is not None else None,
+            "source_operations": source_operations if source_operations is not None else
+                max_turns * 3 if max_turns is not None else None,
             "image_requests": max_images, **(process_limits or {})}
         return config, reused_inputs, limits, attempt_limit
 
@@ -2042,6 +2091,10 @@ class ToolApplication:
         if options.get('creation_declarations') is not None and context_protocol not in _CONVERSATION_CONTEXT_PROTOCOLS:
             raise ValueError('Declared inputs require a journal-backed conversation context')
         config, reused, limits, attempts = cls._configuration(root, goal, **options)
+        # Keep independent condition reuse with the scientific owner regardless
+        # of the task's model prompt or working-memory selection.
+        config['scientific_condition_reuse'] = 'unchanged.v1'
+        config['source_observation_reuse'] = 'additive.v1'
         if config.get('sandbox_execution'):
             # New specialized actions can adopt the same task execution scope.
             # Saved tasks without this contract retain their original approval.
@@ -2049,23 +2102,24 @@ class ToolApplication:
         if config.get('code_task') is not None:
             config['code_work_policy'] = 'shared.v2'
             config['code_implementation_policy'] = 'direct.v1'
-            # New exact-code tasks already require a whole-delivery review.
-            # Keep deterministic patch checks in CodeTask; its advisory model
-            # review belongs to that one independent owner instead.
+            # A required whole-delivery check owns the advisory model review;
+            # deterministic patch and validation checks remain in CodeTask.
             preparation = config['code_task'].get('preparation') or {}
             config['code_review_policy'] = 'delivery.v2' if preparation.get('kind') == 'greenfield' else 'delivery.v1'
         if config.get('code_task') is not None or config.get('report_requirement') is not None:
             # Structured analysis/measurement tasks need the same frozen
             # report requirements at the actual document-work consumer.
-            config['document_context_policy'] = 'working.v2'
-        if config.get('report_requirement') is not None:
-            config['document_context_policy'] = 'working.v3'
+            config['document_context_policy'] = 'working.v4'
         config['inspection_protocol'] = 'subjects.v3'
         config['inspection_execution_protocol'] = 'shared.v1'
         config['inspection_coverage_policy'] = 'offered.v2'
         if config['model'] is not None:
             config['delivery_review_protocol'] = 'task.v5'
             config['inspection_finding_policy'] = 'linked.v1'
+            if config.get('control_protocol') == 'operations.v1':
+                config['delivery_review_selection'] = 'model.v3'
+                if config.get('code_task') is not None and not config.get('independent_review_required'):
+                    config['code_review_policy'] = None
         from simple_ar.app.operation_tools import CURRENT_PROFESSIONAL_CONTRACT
         config['professional_operations'] = 'work.v5'
         if context_protocol is not None:
@@ -2077,19 +2131,17 @@ class ToolApplication:
             config['memory_protocol'] = 'journal.v1'
             config['context_checkpoint_policy'] = 'economic.v3'
             config['work_method'] = (CURRENT_WORK_METHOD if not any(config.get(key) for key in
-                ('code_task', 'execution_contract', 'table_analysis', 'source_generation_protocol')) else 'execute.v2')
+                ('code_task', 'execution_contract', 'table_analysis', 'source_generation_protocol')) else 'execute.v3')
             if config['work_method'] == GOAL_WORK_METHOD:
                 if config['model'] is not None:
                     config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
                     from simple_ar.app.professional_conversation import NATIVE_HISTORY_POLICY
                     config['native_history_policy'] = NATIVE_HISTORY_POLICY
-                    config['document_context_policy'] = ('working.v3' if config.get('report_requirement')
-                        else 'working.v2')
+                    config['document_context_policy'] = 'working.v4'
                     config['process_artifact_paths'] = 'cwd.v1'
                     config['work_lifecycle'] = 'integrated.v3'
                     config['inspection_execution_protocol'] = 'shared.v2'
                     config['candidate_review_protocol'] = 'candidate.v1'
-                    config['delivery_review_selection'] = 'model.v2'
                     config['working_set_policy'] = 'recent.v6'
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = ('native.v5'
@@ -2099,8 +2151,8 @@ class ToolApplication:
     @classmethod
     def create(cls, root: Path, goal: str, *, model: str | None, sources: dict[str, Path],
                allow_execution: bool = False, sandbox_execution: bool = False,
-               allow_network: bool = False, allow_vision: bool = False, max_turns: int = 30,
-               max_tokens: int = 600000, max_images: int = 0,
+               allow_network: bool = False, allow_vision: bool = False, max_turns: int | None = 30,
+               max_tokens: int | None = 600000, max_images: int = 0,
                project_python: Path | None = None, code_task: dict[str, Any] | None = None,
                process_limits: dict[str, int | float] | None = None,
                report_requirement: dict[str, Any] | None = None, report_protocol: str | None = None,
@@ -2175,27 +2227,44 @@ class ToolApplication:
         self.session.store.write_json("actions.json", self.state)
         self.session.save()
 
-    def retry_experiment(self, *, command: tuple[str, ...], cwd: str | Path,
+    def retry_experiment(self, *, command: tuple[str, ...], cwd: str | Path | None = None,
                          timeout_sec: int, result_schema: dict[str, object] | None = None,
                          label: str = 'experiment-retry', parent_attempt_id: str | None = None,
+                         reason: str | None = None,
                          progress: Callable[[str], None] = print) -> dict[str, Any]:
         """Run one caller-specified correction through the existing scientific owner."""
         from simple_ar.app.research_execution import merge_result_schema
-        from simple_ar.tools.scientific import measurement_contract
+        from simple_ar.tools.scientific import measurement_conditions, measurement_contract
 
         if self.operations is None or self.scientific is None:
             raise ValueError('This task has no common scientific execution owner')
-        source = self.scientific.retry_source(self._operation_observations(),
-            parent_attempt_id=parent_attempt_id)
+        source = self.scientific.retry_source(self._operation_observations(domain='scientific'),
+            parent_attempt_id=parent_attempt_id,
+            allow_reuse=self.state['config'].get('scientific_condition_reuse') == 'unchanged.v1')
         parent = source['parent_attempt_id']
-        revised = dict(source['contract'])
-        revised.update(command=list(command), cwd=str(Path(cwd).expanduser().absolute()), timeout_sec=timeout_sec)
+        revised = json.loads(json.dumps(source['contract']))
+        condition_id = source['condition_id']
+        execution = (next(row['execution'] for row in revised['conditions'] if row['id'] == condition_id)
+            if condition_id else revised)
+        run_cwd = str(Path(cwd if cwd is not None else source['source_cwd'] or execution['cwd']).expanduser().absolute())
+        if source['source']:
+            if run_cwd != str(Path(source['source_cwd']).absolute()):
+                raise ValueError('The corrected measurement must use its retained source workspace')
+            execution.update(command=list(command), timeout_sec=timeout_sec)
+        else:
+            execution.update(command=list(command), cwd=run_cwd, timeout_sec=timeout_sec)
         if label.strip():
-            revised['label'] = label.strip()
+            execution['label'] = label.strip()
         if result_schema:
-            revised['result_schema'] = merge_result_schema(revised.get('result_schema'), result_schema)
+            execution['result_schema'] = merge_result_schema(execution.get('result_schema'), result_schema)
         revised = measurement_contract(revised)
-        reason = f'Retry the failed scientific measurement {parent} using the caller-supplied command.'
+        arguments = ({**next(row['execution'] for row in revised['conditions'] if row['id'] == condition_id),
+            'condition_id': condition_id} if condition_id else revised)
+        if source['source']:
+            arguments = {**arguments, 'cwd': run_cwd, **source['source']}
+        reason = reason if reason is not None else f'Retry the failed scientific measurement {parent} using the caller-supplied command.'
+        if not reason.strip():
+            raise ValueError('An experiment retry needs a nonempty reason')
         supplies = self.state.get('supplies', [])
         supplied = (bool(supplies) and supplies[-1].get('reason') == reason
             and supplies[-1].get('changes') == {'execution_contract': revised}
@@ -2212,7 +2281,7 @@ class ToolApplication:
             call = remaining[0] if len(remaining) == 1 else None
             if (not supplied or turn.get('origin') != 'caller' or call is None
                     or call.get('function', {}).get('name') != 'measure_experiment'
-                    or json.loads(call['function']['arguments']) != revised
+                    or json.loads(call['function']['arguments']) != arguments
                     or turn.get('parents', {}).get(call['id']) != parent
                     or pending and (pending.get('kind') != 'tool' or pending.get('call') != call)):
                 raise ValueError('Reconcile the existing task action before submitting an experiment retry')
@@ -2222,32 +2291,38 @@ class ToolApplication:
 
         def approve(call: dict[str, Any], _token: str) -> bool:
             return (call['function']['name'] == 'measure_experiment'
-                and json.loads(call['function']['arguments']) == revised
+                and json.loads(call['function']['arguments']) == arguments
                 and self.state['turns'][-1].get('origin') == 'caller')
 
         def stop_after_caller_action() -> bool:
             return self.state['pending'] is None and not any(turn['remaining'] for turn in self.state['turns'])
 
         snapshot = self.run(actions=None if pending or queued else [
-            {'tool_name': 'measure_experiment', 'arguments': revised, 'parent_attempt_id': parent}], approve=approve,
+            {'tool_name': 'measure_experiment', 'arguments': arguments, 'parent_attempt_id': parent}], approve=approve,
             should_stop=stop_after_caller_action, progress=progress)
         turn = self.state['turns'][-1] if self.state['turns'] else {}
         observed = (self.session.store.read_json(turn['tools'][-1]['result'])
             if turn.get('origin') == 'caller' and turn.get('tools') else None)
         analysis = None
+        missing_conditions = []
         data = (observed or {}).get('data') or {}
-        if (observed and observed.get('status') == 'ok' and data.get('execution_status') == 'passed'
-                and not self.session.manifest.budget.exhausted()):
-            snapshot = self.run(actions=[{'tool_name': 'analyze_measurements',
-                'arguments': {'result_refs': [data['result_ref']]}}],
-                should_stop=stop_after_caller_action, progress=progress)
-            turn = self.state['turns'][-1]
-            analysis = (self.session.store.read_json(turn['tools'][-1]['result'])
-                if turn.get('origin') == 'caller' and turn.get('tools') else None)
-        return {'parent_attempt_id': parent, 'observation': observed, 'analysis': analysis, 'task': snapshot}
+        if observed and observed.get('status') == 'ok' and data.get('execution_status') == 'passed':
+            refs = self.scientific.measurement_refs(self._operation_observations(domain='scientific'))
+            selected = self.scientific._condition_results(refs)
+            missing_conditions = [row['id'] for row in measurement_conditions(revised) if row['id'] not in selected]
+            if not missing_conditions and not self.session.manifest.budget.exhausted():
+                snapshot = self.run(actions=[{'tool_name': 'analyze_measurements',
+                    'arguments': self.scientific.analysis_arguments(refs)}],
+                    should_stop=stop_after_caller_action, progress=progress)
+                turn = self.state['turns'][-1]
+                analysis = (self.session.store.read_json(turn['tools'][-1]['result'])
+                    if turn.get('origin') == 'caller' and turn.get('tools') else None)
+        return {'parent_attempt_id': parent, 'observation': observed, 'analysis': analysis,
+            'missing_conditions': missing_conditions, 'task': snapshot}
 
-    def request_report(self, settings: dict[str, Any], *, refresh: bool = False) -> bool:
-        """Add or revise a report in the saved task; do not run it here."""
+    def report_revision(self, settings: dict[str, Any], *, refresh: bool = False,
+                        method: str | None = None) -> dict[str, Any] | None:
+        """Resolve a requested report against the retained Writer contract."""
         from simple_ar.report.requirements import freeze_report_requirement
 
         config = self.state['config']
@@ -2257,8 +2332,10 @@ class ToolApplication:
         projection = self._report_projection()
         saved = frozen or (projection['requirement'] if projection['kind'] == 'report' else None)
         if saved is None:
-            requirement = freeze_report_requirement(settings, method='sections')
+            requirement = freeze_report_requirement(settings, method=method or 'sections')
         else:
+            if method is not None and method != saved['method']:
+                raise ValueError('The saved report keeps its writing method and checkpoint owner')
             merged = {**saved['config'], **settings}
             if merged == saved['config']:
                 requirement = saved
@@ -2274,16 +2351,20 @@ class ToolApplication:
                          and not delivery.get('unresolved')) or bool(
             report.get('manuscript') and report.get('status') in {'candidate', 'canonical'}
             and not delivery.get('unresolved'))
-        needs_request = (saved != requirement or refresh
-            or self.session.manifest.status in {'completed', 'partial'} and not delivered)
-        if not needs_request:
+        return (requirement if saved != requirement or refresh
+            or self.session.manifest.status in {'completed', 'partial'} and not delivered else None)
+
+    def request_report(self, settings: dict[str, Any], *, refresh: bool = False) -> bool:
+        """Add or revise a report in the saved task; do not run it here."""
+        requirement = self.report_revision(settings, refresh=refresh)
+        if requirement is None:
             return False
         if self.state['pending'] is not None:
             raise ValueError('Finish or reconcile the pending task operation before changing its report request')
         self.supply(supply_id=f"research-report-{len(self.state['requests']) + 1}",
             reason='Generate a report from the retained research and results. Reuse existing work; '
                    'do not rerun the experiments merely to prepare the report.',
-            changes={'report_requirement': requirement}, replace_existing=frozen is not None)
+            changes={'report_requirement': requirement}, replace_existing=self.state['config'].get('report_requirement') is not None)
         return True
 
     @classmethod
@@ -2367,7 +2448,8 @@ class ToolApplication:
 
     def supply(self, *, supply_id: str, reason: str, changes: dict[str, Any],
                resource_allowances: dict[str, int | float] | None = None,
-               replace_existing: bool = False) -> dict[str, Any]:
+               replace_existing: bool = False, additional_attempts: int | None = None,
+               additional_no_progress: int | None = None) -> dict[str, Any]:
         """Record caller contracts, optionally replacing them with explicit intent.
 
         Ordinary supply only fills missing contracts. Explicit replacement keeps
@@ -2380,6 +2462,9 @@ class ToolApplication:
                     or not isinstance(reason, str) or not reason.strip()
                     or not isinstance(changes, dict) or not changes or type(replace_existing) is not bool):
                 raise ValueError('Supply requires a stable id, reason, explicit contracts and a boolean replacement choice')
+            for value in (additional_attempts, additional_no_progress):
+                if value is not None and (type(value) is not int or value < 0):
+                    raise ValueError('Additional attempt allowances must be non-negative integers')
             supply_id, reason = supply_id.strip(), reason.strip()
             fields = {'model', 'sources', 'allow_execution', 'sandbox_execution', 'allow_network', 'code_task',
                 'execution_contract', 'research_policy', 'table_analysis', 'report_requirement', 'max_output_tokens',
@@ -2404,6 +2489,10 @@ class ToolApplication:
             supplied = json.loads(json.dumps(supplied, ensure_ascii=False, allow_nan=False))
             terms = {'supply_id': supply_id, 'reason': reason, 'changes': supplied,
                 'resource_allowances': dict(resource_allowances or {})}
+            if additional_attempts is not None:
+                terms['additional_attempts'] = additional_attempts
+            if additional_no_progress is not None:
+                terms['additional_no_progress'] = additional_no_progress
             if replace_existing:
                 terms['replace_existing'] = True
             interrupted = self.state.get('pending_supply')
@@ -2460,8 +2549,10 @@ class ToolApplication:
                 allow_execution=candidate['allow_execution'], sandbox_execution=candidate.get('sandbox_execution', False),
                 allow_network=candidate.get('allow_network', False),
                 allow_vision=candidate.get('allow_vision', False), max_images=candidate.get('max_images', 0),
-                max_turns=allowances['llm_requests'] if first_model else max(1, candidate['max_turns']),
-                max_tokens=allowances['total_tokens'] if first_model else max(1, self.ledger.limits['total_tokens']),
+                max_turns=allowances['llm_requests'] if first_model else (
+                    max(1, candidate['max_turns']) if candidate['max_turns'] is not None else None),
+                max_tokens=allowances['total_tokens'] if first_model else (
+                    max(1, self.ledger.limits['total_tokens']) if self.ledger.limits['total_tokens'] is not None else None),
                 project_python=Path(candidate['project_python']) if candidate.get('project_python') else None,
                 code_task=candidate.get('code_task'), execution_contract=candidate.get('execution_contract'),
                 research_policy=candidate.get('research_policy'), table_analysis=candidate.get('table_analysis'),
@@ -2522,7 +2613,7 @@ class ToolApplication:
                           'context_checkpoint_policy', 'work_method', 'work_selection_policy', 'native_supply_policy', 'context_authority',
                           'native_history_policy', 'document_context_policy', 'process_artifact_paths', 'work_lifecycle', 'code_work_policy',
                           'code_review_policy', 'code_implementation_policy',
-                          'sandbox_operations',
+                          'sandbox_operations', 'scientific_condition_reuse', 'source_observation_reuse',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
                     if field in old:
@@ -2534,7 +2625,8 @@ class ToolApplication:
                 # Supplying a report is an explicit new request: route its new
                 # document work to the same Writer used at task creation.
                 # Started operations retain their own saved document contract.
-                config['document_context_policy'] = 'working.v3'
+                config['document_context_policy'] = ('working.v4' if old.get('document_context_policy') == 'working.v4'
+                    else 'working.v3')
             if supplied.get('sandbox_execution') is True and old.get('control_protocol') == 'operations.v1':
                 # Explicitly granting isolation is a new execution contract;
                 # supply cancels unstarted work and never rewrites started work.
@@ -2554,6 +2646,12 @@ class ToolApplication:
                     config['code_review_policy'] = None
             elif 'code_task' in supplied and supplied['code_task'] is None:
                 config['code_work_policy'] = config['code_review_policy'] = config['code_implementation_policy'] = None
+            if (supplied.get('independent_review_required') is True and config.get('code_task') is not None
+                    and config.get('code_work_policy') == 'shared.v2'
+                    and config.get('delivery_review_protocol') == 'task.v5'
+                    and old.get('delivery_review_selection') in MODEL_REVIEW_SELECTIONS):
+                preparation = config['code_task'].get('preparation') or {}
+                config['code_review_policy'] = 'delivery.v2' if preparation.get('kind') == 'greenfield' else 'delivery.v1'
             if (supplied.get('independent_review_required') is False
                     and old.get('delivery_review_selection') in MODEL_REVIEW_SELECTIONS
                     and old.get('code_review_policy') in {'delivery.v1', 'delivery.v2'}):
@@ -2567,10 +2665,13 @@ class ToolApplication:
                 config['authority_revision'] = old.get('authority_revision', 0) + 1
             terms['previous_config'] = old
             terms['request_count'] = len(self.state['requests']) + 1
-            if allowances:
-                self.ledger.validate_remaining(allowances, authorization_id=supply_id, reason=reason)
+            capacity = bool(allowances or additional_attempts or additional_no_progress)
+            if capacity:
+                if allowances:
+                    self.ledger.validate_remaining(allowances, authorization_id=supply_id, reason=reason)
                 check = BudgetState.from_dict(self.session.manifest.budget.to_dict())
-                check.authorize_additional(supply_id, attempts=allowances.get('llm_requests', 0) * 10,
+                attempts = allowances.get('llm_requests', 0) * 10 if additional_attempts is None else additional_attempts
+                check.authorize_additional(supply_id, attempts=attempts, no_progress=additional_no_progress or 0,
                     resource_allowances=allowances, reason=reason)
             else:
                 check = self.session.manifest.budget
@@ -2583,7 +2684,8 @@ class ToolApplication:
             self._save()
             # Persist a grant before its config consumer; the same id recovers a
             # crash here without replenishing spent resources or authorizing a call.
-            self._authorize_resources(allowances, supply_id if allowances else '', reason if allowances else '',
+            self._authorize_resources(allowances, supply_id if capacity else '', reason if capacity else '',
+                additional_attempts=additional_attempts, additional_no_progress=additional_no_progress,
                 model_binding=config.get('model_connection'), persist=False)
             from simple_ar.core.artifacts import write_atomically
             for relative, content in reused:
@@ -2609,9 +2711,33 @@ class ToolApplication:
         fields = {'scientific': {'execution_contract', 'code_task'}, 'implementation': {'code_task'},
             'analysis': {'table_analysis'}, 'sources': {'sources', 'research_policy', 'execution_contract', 'code_task'}}
         table_alias = ((self.state['config'].get('table_analysis') or {}).get('path') or '').split('/')[0]
+        def retires(row: dict[str, Any]) -> bool:
+            changed = fields.get(domain, set()).intersection(row['changes'])
+            if (domain == 'sources' and changed and changed <= {'sources', 'research_policy'}
+                    and self.state['config'].get('source_observation_reuse') == 'additive.v1'):
+                previous = row['previous_config']
+                old_mounts = previous['sources']
+                supplied = row['changes'].get('sources', {})
+                mounts = supplied if row.get('replace_existing') and 'sources' in row['changes'] else {**old_mounts, **supplied}
+                old_policy = previous.get('research_policy') or {}
+                policy = row['changes'].get('research_policy', previous.get('research_policy')) or {}
+                if (all(mounts.get(name) == path for name, path in old_mounts.items())
+                        and {k: v for k, v in old_policy.items() if k != 'materials'}
+                            == {k: v for k, v in policy.items() if k != 'materials'}
+                        and set(old_policy.get('materials', ())) <= set(policy.get('materials', ()))):
+                    return False
+            if changed:
+                return True
+            if domain == 'analysis' and 'sources' in row['changes']:
+                supplied = row['changes']['sources']
+                if self.state['config'].get('source_observation_reuse') == 'additive.v1':
+                    original = row['previous_config']['sources'].get(table_alias)
+                    current = supplied.get(table_alias) if row.get('replace_existing') else supplied.get(table_alias, original)
+                    return original != current
+                return table_alias in supplied
+            return False
         start = max((row.get('request_count', 0) for row in self.state.get('supplies', [])
-            if fields.get(domain, set()).intersection(row['changes']) or domain == 'analysis'
-                and table_alias in row['changes'].get('sources', {})), default=0)
+            if retires(row)), default=0)
         return [turn for turn in self.state['turns'] if turn.get('request_count', 1) >= start]
 
     def _check_cancellation(self) -> None:
@@ -2751,8 +2877,11 @@ class ToolApplication:
             and turns[-1].get('request_count') == len(self.state['requests'])
             and self.session.store.read_json(turns[-1]['reply']).get('abandoned_failed_decision'))
 
-    def _request_capacity(self) -> int:
-        allowance = self.state['config']['max_turns'] + sum(
+    def _request_capacity(self) -> int | None:
+        initial = self.state['config']['max_turns']
+        if initial is None:
+            return self.ledger.remaining('llm_requests')
+        allowance = initial + sum(
             terms.get('resource_allowances', {}).get('llm_requests', 0)
             for terms in self.session.manifest.budget.continuation_authorizations.values())
         capacity = max(0, allowance - sum(turn.get('origin') not in {'caller', 'professional'}
@@ -2760,12 +2889,20 @@ class ToolApplication:
         remaining = self.ledger.remaining('llm_requests')
         return capacity if remaining is None else min(capacity, remaining)
 
+    def _can_request(self, count: int) -> bool:
+        remaining = self._request_capacity()
+        return remaining is None or remaining >= count
+
     def _professional_resource_authorizations(self) -> list[str]:
-        """Only resource grants committed by both existing budget consumers."""
+        """Expose grants committed by the budget owners they actually affect."""
         terms = self.session.manifest.budget.continuation_authorizations
-        return sorted(entry.reservation_id for entry in self.ledger.entries
+        committed = {entry.reservation_id for entry in self.ledger.entries
             if entry.actual_source == 'user_authorization' and entry.reservation_id in terms
-            and entry.reserved == terms[entry.reservation_id].get('resource_allowances'))
+            and entry.reserved == terms[entry.reservation_id].get('resource_allowances')}
+        committed.update(identity for identity, grant in terms.items()
+            if not grant.get('resource_allowances')
+            and (grant.get('additional_attempts') or grant.get('additional_no_progress')))
+        return sorted(committed)
 
     def _professional_stop_can_resume(self, retained: dict) -> bool:
         known = retained.get('resource_authorizations')
@@ -3369,8 +3506,8 @@ class ToolApplication:
                 "model_turns_remaining": remaining_requests,
                 "decision_budget": {
                     "includes_current_decision": True,
-                    "provider_slots_after_one_attempt": max(0, remaining_requests - 1),
-                    "nested_provider_slots_after_decision_and_followup": max(0, remaining_requests - 2),
+                    "provider_slots_after_one_attempt": max(0, remaining_requests - 1) if remaining_requests is not None else None,
+                    "nested_provider_slots_after_decision_and_followup": max(0, remaining_requests - 2) if remaining_requests is not None else None,
                     "followup_policy": config.get('completion_policy', 'none'),
                     "closing_required": closing,
                     "scope": "Shared physical attempts, not completed actions. Professional selection, writing, review and retries also spend them. Protection is a follow-up opportunity, not guaranteed task completion."},
@@ -3868,8 +4005,8 @@ class ToolApplication:
                 'model_turns_remaining': requests, 'context_input_target_tokens': target,
                 'next_output_token_reservation': output,
                 'decision_budget': {'includes_current_decision': True,
-                    'provider_slots_after_one_attempt': max(0, requests - 1),
-                    'nested_provider_slots_after_decision_and_followup': max(0, requests - 2),
+                    'provider_slots_after_one_attempt': max(0, requests - 1) if requests is not None else None,
+                    'nested_provider_slots_after_decision_and_followup': max(0, requests - 2) if requests is not None else None,
                     'followup_policy': config.get('completion_policy', 'none'), 'closing_required': closing},
                 'semantics': {
                     'llm_requests': 'Shared physical provider attempts: decisions, professional selection/writing/review, inspect_images and retries.',
@@ -4351,10 +4488,10 @@ class ToolApplication:
                     targets = tuple(sorted(feedback_targets))
                     key = ('feedback', *targets)
                     if decision_views is None:
-                        feedback = self._work_feedback(list(targets))
+                        feedback = self._work_feedback(list(targets), observations=decision_observations)
                     else:
                         if key not in decision_views:
-                            decision_views[key] = self._work_feedback(list(targets))
+                            decision_views[key] = self._work_feedback(list(targets), observations=decision_observations)
                         feedback = decision_views[key]
                     related.extend(feedback_observations(feedback))
                 additions = []
@@ -4602,7 +4739,7 @@ class ToolApplication:
         remaining = self.ledger.remaining('total_tokens')
         # A last affordable decision can deliver/question, but its retry must
         # not steal a future decision while ordinary work is still affordable.
-        protect = bool(floor and self._request_capacity() > 1
+        protect = bool(floor and self._can_request(2)
             and self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts > 2
             and (remaining is None or remaining >= 2 * floor['total_tokens']))
         closing = self.state['config'].get('completion_policy') == 'closing_decision.v2' and not protect
@@ -4874,7 +5011,7 @@ class ToolApplication:
                     or not journal and self.state['config'].get('context_protocol') != 'working.v1') else checkpoint,
                 closing_enabled=operation_exit or self.state['config'].get('completion_policy') == 'closing_decision.v2',
                 exit_first=operation_exit or integrated,
-                continue_allowed=self._request_capacity() > 1 and (
+                continue_allowed=self._can_request(2) and (
                     self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts > 2))
         floor = ({'llm_requests':1, 'total_tokens':conversation.tokens(value)}
             if value.closing else value.reserve if operation_exit else self._completion_floor(client, value.messages))
@@ -5298,8 +5435,7 @@ class ToolApplication:
             self.session.store.read_json(item['result'])
             for turn in self._evidence_turns('implementation') for item in turn['tools']],
             require_current_origin=require_current_origin)
-        observations = [{**self.session.store.read_json(item['result']), 'record': item['result']}
-            for turn in self._evidence_turns('scientific') for item in turn['tools']]
+        observations = self._scientific_observations()
         measurements = self.scientific.measurement_refs(observations) if self.scientific is not None else []
         analyses = self.scientific.analysis_records(observations) if self.scientific is not None else []
         if not code['implementation_refs'] and not measurements:
@@ -5325,12 +5461,16 @@ class ToolApplication:
             observations = []
             active = {domain: {id(turn) for turn in self._evidence_turns(domain)}
                 for domain in ('sources', 'analysis', 'scientific')}
+            scientific_records = ({row['record'] for row in self._scientific_observations()
+                if row.get('contract_current', True)}
+                if self.state['config'].get('scientific_condition_reuse') == 'unchanged.v1' else None)
             for turn in self.state['turns']:
                 for item in turn['tools']:
                     row = self.session.store.read_json(item['result'])
                     spec = self.gateway.registry.get(row.get('tool_name', ''))
                     if (row.get('status') == 'ok' and spec is not None and spec.domain in active
-                            and id(turn) in active[spec.domain]):
+                            and (item['result'] in scientific_records if spec.domain == 'scientific'
+                                 and scientific_records is not None else id(turn) in active[spec.domain])):
                         observations.append(row)
             return observations
         return bind_report_inputs(config=self.state['config'], report=report if report is not None else self._report_projection(),
@@ -5464,12 +5604,7 @@ class ToolApplication:
                 or self.session.manifest.status != 'paused' or self.state['pending'] is not None
                 or not self.state['turns'] or self.state['turns'][-1]['remaining']):
             return []
-        locators = []
-        for turn in self._evidence_turns('scientific'):
-            for item in turn['tools']:
-                observed = self.session.store.read_json(item['result'])
-                if observed.get('tool_name') == 'measure_experiment' and observed.get('status') == 'ok':
-                    locators.append(observed['data']['result_ref'])
+        locators = self.scientific.measurement_refs(self._operation_observations(domain='scientific'))
         selected = self.scientific._condition_results(locators)
         if len(selected) != len(config['execution_contract']['conditions']):
             return []
@@ -6059,10 +6194,15 @@ class ToolApplication:
             raise ValueError('Reconcile in-flight or unknown operations before authorizing resources')
     def _authorize_resources(self, allowances: dict[str, int | float],
                              authorization_id: str, reason: str, *,
+                             additional_attempts: int | None = None,
+                             additional_no_progress: int | None = None,
                              model_binding: dict[str, Any] | None = None, persist: bool = True) -> None:
-        if not allowances:
+        for value in (additional_attempts, additional_no_progress):
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError('Additional attempt allowances must be non-negative integers')
+        if not allowances and not additional_attempts and not additional_no_progress:
             if authorization_id or reason:
-                raise ValueError('Resource authorization requires an explicit remaining allowance')
+                raise ValueError('Resource authorization requires an explicit allowance')
             return
         requests = allowances.get('llm_requests', 0)
         if 'llm_requests' in allowances and (type(requests) is not int or requests <= 0):
@@ -6072,11 +6212,14 @@ class ToolApplication:
             self._client()  # Resource authorization cannot change model identity.
         elif not model_binding and set(allowances) & {'llm_requests', 'total_tokens', 'image_requests'}:
             raise ValueError('Caller-directed tasks cannot acquire model access through resource continuation')
-        self.ledger.validate_remaining(allowances, authorization_id=authorization_id, reason=reason)
+        if allowances:
+            self.ledger.validate_remaining(allowances, authorization_id=authorization_id, reason=reason)
         self.session.manifest.budget.authorize_additional(authorization_id,
-            attempts=requests * 10, resource_allowances=allowances, reason=reason)
+            attempts=requests * 10 if additional_attempts is None else additional_attempts,
+            no_progress=additional_no_progress or 0, resource_allowances=allowances, reason=reason)
         self.session.save()
-        self.ledger.authorize_remaining(allowances, authorization_id=authorization_id, reason=reason)
+        if allowances:
+            self.ledger.authorize_remaining(allowances, authorization_id=authorization_id, reason=reason)
         pending = self.state['pending']
         if pending and pending['kind'] == 'model':
             attempt = self._failed_model_attempt(pending)
@@ -6290,7 +6433,9 @@ class ToolApplication:
             raise ValueError('Unknown reservation does not cover the saved output cap; inspect before retry')
         budget = self.session.manifest.budget
         requests = self.ledger.remaining('llm_requests')
-        if budget.exhausted() or self._request_capacity() <= 0 or requests is None or requests < 1:
+        if (budget.exhausted() or not self._can_request(1)
+                or requests is None and self.ledger.limits.get('llm_requests') is not None
+                or requests is not None and requests < 1):
             raise ValueError('Remaining decision budget is exhausted; retry cannot increase it')
         # This is a read-only preflight using the same serialized inputs and
         # effective cap as chat_turn. LLMClient still owns actual reservations
@@ -6298,7 +6443,8 @@ class ToolApplication:
         tokens = self.ledger.remaining('total_tokens')
         required = self._decision_tokens(client, self._messages(client=client,
             native_history_start_turn=len(self.state['turns']) if model_selector else None))
-        if tokens is None or tokens < required:
+        if (tokens is None and self.ledger.limits.get('total_tokens') is not None
+                or tokens is not None and tokens < required):
             raise ValueError('Remaining token budget cannot cover the saved output cap and decision input')
         if self.session.manifest.status != 'running':
             self.session.continue_with_revision('Explicit --retry-model continuation of ' + attempt.attempt_id)
@@ -6376,6 +6522,7 @@ class ToolApplication:
             read_only_sources: tuple[Path, ...] = (), allow_execution: bool = False,
             allow_network: bool = False, allow_vision: bool = False,
             resource_allowances: dict[str, int | float] | None = None,
+            additional_attempts: int | None = None, additional_no_progress: int | None = None,
             authorization_id: str = "", authorization_reason: str = "",
             decision: dict[str, str] | None = None,
             approve: Callable[[dict[str, Any], str], bool | ExecutionRejection] | None = None,
@@ -6386,7 +6533,8 @@ class ToolApplication:
         if submission_id is not None:
             if (actions is not None or approved_execution or retry_model or retry_model_selector
                     or read_only_sources or allow_execution or allow_network or allow_vision
-                    or resource_allowances or authorization_id or authorization_reason or decision is not None):
+                    or resource_allowances or additional_attempts or additional_no_progress
+                    or authorization_id or authorization_reason or decision is not None):
                 raise ValueError('Run a feedback submission separately from actions, retries or authorization')
             if feedback:
                 self.submit_feedback(self.session.store.root, submission_id=submission_id, feedback=feedback)
@@ -6420,7 +6568,8 @@ class ToolApplication:
             if decision is not None:
                 if (feedback or actions is not None or retry_model or approved_execution
                         or read_only_sources or allow_execution or allow_network or allow_vision
-                        or resource_allowances or authorization_id or authorization_reason):
+                        or resource_allowances or additional_attempts or additional_no_progress
+                        or authorization_id or authorization_reason):
                     raise ValueError('Confirm a design separately from feedback, retries or new access/resources')
                 pending = self.state['pending']
                 active = pending.get('action') if pending and pending.get('inspection') else pending
@@ -6449,7 +6598,7 @@ class ToolApplication:
             if (actions is not None and self.state['pending']
                     and self.state['pending']['kind'] == 'model'
                     and (feedback or approved_execution or read_only_sources or allow_execution
-                        or allow_network or allow_vision or resource_allowances
+                        or allow_network or allow_vision or resource_allowances or additional_attempts or additional_no_progress
                         or authorization_id or authorization_reason)):
                 raise ValueError('Submit caller takeover separately from feedback or authorization changes')
             if retry_model_selector and not retry_model:
@@ -6463,11 +6612,12 @@ class ToolApplication:
                 self._commit_terminal(progress)
             if retry_model:
                 if (feedback or actions is not None or approved_execution or read_only_sources or allow_execution
-                        or allow_network or allow_vision or resource_allowances
+                        or allow_network or allow_vision or resource_allowances or additional_attempts or additional_no_progress
                         or authorization_id or authorization_reason):
                     raise ValueError('Use --retry-model separately from feedback, access, resource or tool authorization')
                 self._retry_model(retry_model_selector)
-            self._authorize_resources(resource_allowances or {}, authorization_id, authorization_reason)
+            self._authorize_resources(resource_allowances or {}, authorization_id, authorization_reason,
+                additional_attempts=additional_attempts, additional_no_progress=additional_no_progress)
             authorization = self._authorize(read_only_sources, execution=allow_execution,
                                             network=allow_network, vision=allow_vision)
             if authorization:
@@ -6476,7 +6626,7 @@ class ToolApplication:
                 self._apply_feedback(feedback)
             if actions is not None:
                 self._submit_actions(actions)
-            if resource_allowances and self.session.manifest.status in {'paused', 'blocked', 'failed'}:
+            if (resource_allowances or additional_attempts or additional_no_progress) and self.session.manifest.status in {'paused', 'blocked', 'failed'}:
                 self.session.continue_with_revision('Explicit resource continuation: ' + authorization_id)
             try:
                 self._consume_feedback()
@@ -6764,7 +6914,7 @@ class ToolApplication:
                             # not at the expense of already accepted work after
                             # model capacity is exhausted. Actual attempt/tool
                             # budgets and approval still gate that work below.
-                            and self._request_capacity() > 0
+                            and self._can_request(1)
                             and not {'llm_requests', 'total_tokens'}.intersection(
                                 self.ledger.unknown_dimensions(current_allowance_only=True))
                             and ((tokens := self.ledger.remaining('total_tokens')) is None
@@ -6796,7 +6946,7 @@ class ToolApplication:
                             or caller_takeover):
                         self.session.pause('Caller actions consumed; submit explicit next work or delivery. No model decision was requested.')
                         return
-                    if self._request_capacity() <= 0:
+                    if not self._can_request(1):
                         self.session.pause("Shared model request allowance exhausted, including professional calls; "
                                            "existing artifacts are retained, not marked complete")
                         return
@@ -6824,7 +6974,7 @@ class ToolApplication:
                     continue  # The saved response remains history, not a new request's work.
                 if not calls:
                     if (self.operations is not None and self._unacted_reply_count()==1
-                            and self._request_capacity()>0
+                            and self._can_request(1)
                             and not self.ledger.unknown_dimensions(current_allowance_only=True)
                             and not any(entry.status == 'reserved' for entry in self.ledger.entries)):
                         progress('Assistant text retained without a delivery; one action correction uses the same budget, no operation replay')

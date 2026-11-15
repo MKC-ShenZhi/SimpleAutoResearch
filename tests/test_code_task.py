@@ -540,6 +540,16 @@ class CodeTaskTests(unittest.TestCase):
                 run.assert_called_once()
                 self.assertIs(run.call_args.kwargs["budget_ledger"], budget)
             self.assertEqual(ledger.to_dict(), before)
+            # A client already bound to the task carries that ledger into the
+            # validator even when the caller does not repeat the ledger argument.
+            client = Mock()
+            client._budget_ledger = ledger
+            with patch('simple_ar.code_task.orchestration.verification.run_code_task_benchmark',
+                       return_value=SimpleNamespace(status='passed')) as run:
+                verify_implementation(root, command=(sys.executable, 'check.py'),
+                    approval_note='Authorized technical validation', llm_client=client,
+                    asset_guard=lambda: {'status': 'unchanged'})
+            self.assertIs(run.call_args.kwargs['budget_ledger'], ledger)
             with patch("simple_ar.code_task.orchestration.verification.apply_patch_edits") as apply:
                 with self.assertRaisesRegex(ValueError, "approval"):
                     apply_verified_repair(root, Mock(), approval_note="", llm_client=Mock())
@@ -625,8 +635,9 @@ class CodeTaskTests(unittest.TestCase):
             initialize_code_task(run_dir=run_dir, code_root=project, task_file=task,
                 benchmark_command='python -m unittest discover -s tests')
             ledger = BudgetLedger({'llm_requests': 4, 'total_tokens': 50000})
-            client = LLMClient(LLMSettings(api_key='fixture', api_mode='chat', max_output_tokens=2048),
-                budget_ledger=ledger, budget_session_id='research', budget_attempt_id='implement-1')
+            # An independently supplied task ledger must bind an unbound client,
+            # including when this consumer skips the legacy planning stages.
+            client = LLMClient(LLMSettings(api_key='fixture', api_mode='chat', max_output_tokens=2048))
             response = {'choices': [{'message': {'content': json.dumps(
                 keyword_code_responses()['code-task-propose-edits'])}}],
                 'usage': {'prompt_tokens': 30, 'completion_tokens': 20, 'total_tokens': 50}}
@@ -641,11 +652,45 @@ class CodeTaskTests(unittest.TestCase):
                 self.assertIn("('win', 'prize')", candidate.read_text(encoding='utf-8'))
                 self.assertEqual((project / 'spam_model.py').read_bytes(), original)
                 self.assertEqual(ledger.remaining('llm_requests'), 3)
+                self.assertIsNone(client.budget_ledger)
+                self.assertEqual(ledger.entries[0].session_id, 'research')
+                self.assertEqual(ledger.entries[0].attempt_id, 'implement-1')
                 resumed = implement_code_task(run_dir, approval_note='Existing task grants isolated edits',
                     direct_edit=True, review_use_llm=False, llm_client=client,
                     budget_ledger=ledger, session_id='research', attempt_id='implement-1')
                 self.assertEqual(resumed.stop_reason, 'stop_point')
                 self.assertEqual(call.call_count, 1)
+
+    def test_greenfield_clients_share_the_supplied_ledger(self) -> None:
+        from simple_ar.agent_backends import create_agent_backend
+        from simple_ar.code_task.generation.greenfield import _llm_client
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = BudgetLedger({'llm_requests': 2, 'total_tokens': 50000})
+            unbound = LLMClient(LLMSettings(api_key='fixture', api_mode='chat', max_output_tokens=2048))
+            client = _llm_client(Path(tmp), llm_client=unbound, model=None, use_llm=True,
+                allow_fallback=False, message_callback=None, budget_ledger=ledger,
+                session_id='research', attempt_id='implementation')
+            response = {'choices': [{'message': {'content': '{"result": "ok"}'}}],
+                'usage': {'prompt_tokens': 30, 'completion_tokens': 20, 'total_tokens': 50}}
+            with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response):
+                self.assertEqual(client.ask_json('Produce JSON', 'Return a result'), {'result': 'ok'})
+            self.assertEqual(ledger.remaining('llm_requests'), 1)
+            self.assertEqual(ledger.entries[0].attempt_id, 'implementation')
+            self.assertIsNone(unbound.budget_ledger)
+            continuation = _llm_client(Path(tmp), llm_client=client, model=None, use_llm=True,
+                allow_fallback=False, message_callback=None, budget_ledger=ledger,
+                session_id='research', attempt_id='repair')
+            self.assertEqual(continuation._budget_attempt_id, 'repair')
+            self.assertEqual(client._budget_attempt_id, 'implementation')
+            handoff = create_agent_backend('local_llm', client=unbound, budget_ledger=ledger,
+                session_id='research', attempt_id='handoff')
+            self.assertIs(handoff.client.budget_ledger, ledger)
+            self.assertEqual(handoff.client._budget_attempt_id, 'handoff')
+            with self.assertRaisesRegex(ValueError, 'different budget ledgers'):
+                _llm_client(Path(tmp), llm_client=client, model=None, use_llm=True,
+                    allow_fallback=False, message_callback=None,
+                    budget_ledger=BudgetLedger({'llm_requests': 1}))
 
     def test_atomic_text_write_retries_transient_destination_lock(self) -> None:
         TEST_ROOT.mkdir(exist_ok=True)

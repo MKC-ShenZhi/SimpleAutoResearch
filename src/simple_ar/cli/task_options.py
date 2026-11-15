@@ -49,6 +49,7 @@ def validate_interactive_options(args: argparse.Namespace) -> None:
     separate = ('chat', 'resume_setup', 'prepare_only', 'write_task_config',
                 'retry_model', 'switch_model', 'switch_id', 'switch_reason', 'supply_task',
                 'authorize_remaining', 'authorization_id', 'authorization_reason',
+                'additional_attempts', 'additional_no_progress',
                 'decision_id', 'decision_response', 'decision_guidance', 'allow', 'validate')
     conflicts = [name for name in separate if getattr(args, name, None)]
     if getattr(args, 'resume_task', None):

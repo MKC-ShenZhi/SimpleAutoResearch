@@ -4724,7 +4724,6 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertNotIn(self.app.workspace.locator(str(current_project/'main.tex')),delivery['artifacts'])
         observations = self.app._operation_observations()
         ledger = self.app.ledger.to_dict()
-        calls = self.send.call_count
 
         def check(rows,artifacts):
             return self.app.publication.check_requested_delivery(rows,artifacts,
@@ -8368,6 +8367,43 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.send.call_count, len(self.inspection_requests))
         self.assertEqual(len({tuple(sorted(view['proposed_delivery']['artifacts']))
             for view in self.inspection_views}), 1)
+
+        # An explicitly corrected scientific command reuses the validated code
+        # and unchanged baseline rather than repeating implementation or setup.
+        retained_ledger = self.app.ledger.to_dict()['entries']
+        model_calls = self.send.call_count
+        failure_contract = json.loads(json.dumps(self.app.state['config']['execution_contract']))
+        failure_contract['conditions'][1]['execution']['command'] = ['python', '-c', 'raise SystemExit(2)']
+        self.app.supply(supply_id='correct-measurement', reason='Use a corrected candidate command',
+            changes={'execution_contract': failure_contract}, replace_existing=True)
+        source = self.app.implementation.measurement_source(second_ref, identity='retained-source')
+        failure = {**failure_contract['conditions'][1]['execution'], 'cwd': source['cwd'],
+            'condition_id': 'candidate', 'implementation_ref': second_ref}
+        self._submit(_action('measure_experiment', **failure), approve=lambda *_: True)
+        failed = self._ok('measure_experiment')
+        self.assertEqual(failed['data']['execution_status'], 'failed')
+        parent = self.app.workspace.resolve(failed['data']['result_ref']).parent.name
+        resumed = self.app.retry_experiment(command=tuple(execution['command']),
+            timeout_sec=5, parent_attempt_id=parent, progress=lambda _: None)
+        self.assertEqual(resumed['observation']['data']['execution_status'], 'passed')
+        self.assertEqual(resumed['analysis']['status'], 'ok')
+        self.assertEqual(resumed['missing_conditions'], [])
+        self.assertEqual(self.send.call_count, model_calls)
+        self.assertEqual(self.app.ledger.to_dict()['entries'][:len(retained_ledger)], retained_ledger)
+        self.assertEqual(sum(row['purpose'] == 'local_process' for row in
+            self.app.ledger.to_dict()['entries'][len(retained_ledger):]), 2)
+        for path, raw in prior_records.items():
+            self.assertEqual(path.read_bytes(), raw)
+        alternate = self.directory / 'alternate-code-source'
+        shutil.copytree(self.inputs, alternate)
+        changed_contract = json.loads(json.dumps(self.app.state['config']['execution_contract']))
+        for condition in changed_contract['conditions']:
+            condition['execution']['cwd'] = str(alternate)
+        self.app.supply(supply_id='replace-code-source', reason='Use a different source project',
+            changes={'sources': {'project': str(alternate)}, 'execution_contract': changed_contract},
+            replace_existing=True)
+        with self.assertRaises(ValueError):
+            self.app.implementation.measurement_source(second_ref, identity='replaced-source')
 
         # A flat frozen measurement has the same revision requirement. Its
         # actual final measurement can deliver inline through the common gate.

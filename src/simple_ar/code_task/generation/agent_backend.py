@@ -97,11 +97,6 @@ def write_greenfield_project_from_agent_backend(
     """
 
     root = Path(run_dir)
-    client_ledger = client.budget_ledger if isinstance(client, LLMClient) else None
-    if budget_ledger is None:
-        budget_ledger = client_ledger
-    elif client_ledger is not None and client_ledger is not budget_ledger:
-        raise ValueError('Code task and model client must use the same budget ledger')
     normalized_provider = _normalize_provider(provider)
     resolved_agent_mode = normalize_agent_mode(agent_mode, provider=normalized_provider)
     if resolved_agent_mode == AgentExecutionMode.DELEGATED_WORKSPACE:

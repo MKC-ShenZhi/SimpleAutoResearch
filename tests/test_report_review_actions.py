@@ -42,6 +42,58 @@ class ReviewActionTests(unittest.TestCase):
         for changes in ({'severity': 'critical'}, {'type': 'citation_misuse'}, {'severity': 'major'}):
             self.assertTrue(finding_requires_resolution(self.finding('advisory', **changes)))
 
+    def test_current_action_contract_is_shared_by_review_replay_and_audit(self):
+        from simple_ar.report.editor import replay_document_reviews
+
+        body = 'The recorded observation is limited to one setting.'
+        section = ReportSectionDraft(section_id='findings', heading='Findings', draft_markdown=body)
+        memory = ReportMemory(section_plan=[ReportSectionPlan(section_id='findings', heading='Findings', goal='Explain the observation')])
+        response = {'section_reviews': [{'section_id': 'findings', 'verdict': 'warning', 'findings': [
+            {'finding_id': 'scope', 'type': 'style', 'severity': 'major',
+             'message': 'Additional detail could help.', 'required_action': 'advisory'}]}]}
+
+        class Client:
+            def ask_json(self, system, prompt, **kwargs):
+                self.view = prompt_payload(prompt)
+                return response
+
+        for contract, required in ((None, True), ('action.v1', False)):
+            with self.subTest(contract=contract):
+                client = Client()
+                config = ReportRuntimeConfig(review_action_contract=contract)
+                reviews = review_document(client=client,
+                    **document_review_inputs(memory, config, [section]))
+                self.assertEqual(_needs_revision(reviews[0]), required)
+                replay = replay_document_reviews(response, sections=[section], evidence_view=client.view)
+                self.assertEqual(replay, reviews)
+                finding = ReviewerFinding.model_validate_json(reviews[0].findings[0].model_dump_json())
+                self.assertEqual(finding_requires_resolution(finding), required)
+                audit = build_report_audit(report=body, report_body=body,
+                    context=ReportContext(topic='Review', report_mode='supplied_materials'),
+                    memory=ReportMemory(reviewer_findings=[finding]))
+                self.assertEqual(audit.status == 'warning', required)
+
+    def test_current_section_review_preserves_advisory_without_rewriting(self):
+        objects = self.objects(review_action_contract='action.v1')
+        calls = []
+
+        class Client:
+            def ask_json(self, system, prompt, *, label='', **kwargs):
+                calls.append(label)
+                if 'reviewer' in label:
+                    return {'verdict': 'warning', 'findings': [{
+                        'finding_id': 'polish', 'type': 'style', 'severity': 'major',
+                        'message': 'Optional additional detail.', 'required_action': 'advisory'}]}
+                if 'reviser' in label:
+                    raise AssertionError('Optional advice must not cause a rewrite')
+                return {'draft_markdown': 'Only the supplied setting was observed.'}
+
+        result = run_report_agent(client=Client(), **objects)
+        self.assertTrue(any('reviewer' in label for label in calls))
+        self.assertFalse(any('reviser' in label for label in calls))
+        self.assertTrue(any(row.action_contract == 'action.v1' and row.required_action == 'advisory'
+                            for row in result.reviewer_findings))
+
     def test_mixed_edit_and_verification_does_not_add_redundant_recheck(self):
         from simple_ar.report.schema import ReportToolCall
         call = ReportToolCall(tool_name='get_paper_brief', arguments={'handle': 'paper:p'})

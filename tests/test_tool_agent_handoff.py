@@ -583,7 +583,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         allow_execution=True, allow_network=False, max_turns=30, code_task=None, process_limits=None,
                         report_requirement=None, measurement_command=None, tool_contracts=None,
                         completion_policy=None, report_protocol=None, context_target=24000,
-                        operation_control=True, review_delivery=False):
+                        operation_control=True, review_delivery=False, independent_review_required=False):
         run_dir, inputs = self._tool_materials()
         fake = Mock()
         fake.ask_json = _LegacyArticleFixtureResponses()
@@ -672,7 +672,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     max_turns=max_turns, project_python=interpreter, code_task=code_task,
                     process_limits=process_limits, report_requirement=report_requirement,
                     tool_contracts=tool_contracts or 'on_demand', completion_policy=completion_policy,
-                    report_protocol=report_protocol, execution_contract=measurement)
+                    report_protocol=report_protocol, execution_contract=measurement,
+                    independent_review_required=independent_review_required)
         else:
             # Only _historical_native_fixture selects this saved wire format.
             # No modern task is created and then relabelled as old history.
@@ -721,7 +722,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         _, _, _, _, app, _ = self._native_fixture(
             report_requirement=requirement, measurement_command=['python', 'measure.py'])
         self.assertEqual(app.state['config']['professional_operations'], 'work.v5')
-        self.assertEqual(app.state['config']['document_context_policy'], 'working.v3')
+        self.assertEqual(app.state['config']['document_context_policy'], 'working.v4')
         self.assertIn('work_document', {row['function']['name'] for row in app.operation_schemas})
         self.assertEqual(app.operations.document.report_requirement, requirement)
         context = app.operations.document.work_context([])
@@ -3665,7 +3666,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'allowed_patterns': ['generated_project/**'],
             'validation_command': ['python', '-m', 'compileall', 'generated_project'],
             'preparation': {'kind': 'greenfield', 'workspace_mode': 'empty'}}
-        root, _, _, binding, app, _ = self._native_fixture(code_task=contract, mount_inputs=False)
+        root, _, _, binding, app, _ = self._native_fixture(code_task=contract, mount_inputs=False,
+            independent_review_required=True)
         self.assertEqual(app.state['config']['code_review_policy'], 'delivery.v2')
         self.assertTrue(app.operations.implementation.defer_greenfield_review)
         from tests.native_history_fixture import load_prepared_operation_history
@@ -13587,7 +13589,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                         context.store, result.model_dump(mode='json'), name=tool_name))
                 registry.register('native_tool', native)
                 controller = SessionController.create(root, session_id='unit', topic=contract['goal'],
-                    registry=registry, budget=BudgetState(max_attempts=8))
+                    registry=registry, budget=BudgetState(max_attempts=10))
                 denied = {'token': 'confirmed', 'binding': owner.approval_binding({}, identity='insufficient')}
                 ledger.limits['process_invocations'] = 0
                 saved = ledger.to_dict()
@@ -13785,6 +13787,55 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertIn('attempts/prepared/execution.json', evidence['evidence_sha256'])
                 self.assertIn('attempts/' + ('baseline' if mode == 'venv' else 'baseline-probe') + '/results.json', evidence['measurement_refs'])
                 self.assertIn('attempts/formal-feedback/results.json', evidence['measurement_refs'])
+                if mode == 'current':
+                    # A caller may correct a later measurement without discarding
+                    # the already validated project or its original preparation.
+                    revised = json.loads(json.dumps(conditions))
+                    revised['conditions'][1]['execution']['label'] = 'corrected-measurement'
+                    retained = ImplementationToolGateway(root, workspace, ledger, 'test-model', 'unit',
+                        exact=contract, measurement=revised,
+                        measurement_revisions=lambda: {'prepared': True, 'initial': True, 'feedback': True})
+                    before = ledger.to_dict()
+                    self.assertEqual(retained.prepared_source('records/prepared/execution.json',
+                        identity='revised-baseline')['cwd'], prepared['cwd'])
+                    self.assertEqual(retained.measurement_source('records/feedback/implementation.json',
+                        identity='revised-candidate')['cwd'], source['cwd'])
+                    retained.check_delivery(result['data'], [result['data']['project_path']])
+                    self.assertEqual(ledger.to_dict(), before)
+                    historical = ImplementationToolGateway(root, workspace, ledger, 'test-model', 'unit',
+                        exact=contract, measurement=revised)
+                    with self.assertRaises(ValueError):
+                        historical.measurement_source('records/feedback/implementation.json', identity='old-contract')
+                    old_owner, old_science = owner, science
+                    failing = json.loads(json.dumps(revised))
+                    failing['conditions'][1]['execution']['command'] = ['python', '-c', 'raise SystemExit(2)']
+                    retained._declared_measurement = retained._validate_measurement(failing)
+                    owner = retained
+                    science = ScientificToolGateway(root, workspace, ledger, 'unit', implementation=owner,
+                        execution_contract=failing)
+                    arguments = {**failing['conditions'][1]['execution'], 'cwd': source['cwd'],
+                        'condition_id': 'candidate', 'implementation_ref': 'records/feedback/implementation.json'}
+                    controller.execute_attempt('native_tool', attempt_id='failed-candidate', tool_name='measure_experiment',
+                        arguments=arguments, approval={'token': 'failure',
+                            'binding': science.approval_binding(arguments, identity='failed-candidate')})
+                    failed = read_json(root / 'attempts/failed-candidate/native_result.json')
+                    self.assertEqual(failed['data']['execution_status'], 'failed')
+                    retry = science.retry_source([{**failed, 'arguments': arguments}],
+                        parent_attempt_id='failed-candidate', allow_reuse=True)
+                    self.assertEqual(retry['source'], {'implementation_ref': 'records/feedback/implementation.json'})
+                    self.assertEqual(retry['source_cwd'], source['cwd'])
+                    corrected = json.loads(json.dumps(failing))
+                    corrected['conditions'][1]['execution']['command'] = formal['command']
+                    owner._declared_measurement = owner._validate_measurement(corrected)
+                    science._declared_execution_contract = owner.measurement
+                    arguments = {**corrected['conditions'][1]['execution'], 'cwd': retry['source_cwd'],
+                        'condition_id': 'candidate', **retry['source']}
+                    controller.execute_attempt('native_tool', attempt_id='corrected-candidate', tool_name='measure_experiment',
+                        arguments=arguments, approval={'token': 'correction',
+                            'binding': science.approval_binding(arguments, identity='corrected-candidate')})
+                    self.assertEqual(read_json(root / 'attempts/corrected-candidate/results.json')['metrics']['score'], 3)
+                    self.assertEqual(read_json(root / 'attempts/prepared/execution.json'), original_prepared)
+                    owner, science = old_owner, old_science
                 original_manifest = code_task_paths(workspace.workspace / 'code_tasks/prepared').manifest_path
                 original_bytes = original_manifest.read_bytes()
                 if mode != 'isolated':

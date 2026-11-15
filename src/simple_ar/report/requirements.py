@@ -1,6 +1,7 @@
 """Frozen report requirements shared by current and historical consumers."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -42,6 +43,21 @@ def validate_report_settings(settings: dict[str, Any], *, method: str) -> None:
     from simple_ar.report.schema import ReportRuntimeConfig
     from simple_ar.report.writing import validate_report_writing_config
     validate_report_writing_config(ReportRuntimeConfig.model_validate(settings), method=method)
+
+
+def report_config_overrides(supplied: Mapping[str, object], config: Mapping[str, object], *,
+                            session_resume: bool = True, changes_only: bool = True) -> dict[str, object]:
+    """Resolve explicit report settings against the saved Writer contract."""
+    supplied = dict(supplied)
+    if (session_resume and supplied.get('template') == 'experiment'
+            and not config.get('execution') and config.get('research_task_kind') != 'writing'):
+        supplied['template'] = 'survey'
+    saved = config.get('report', {})
+    saved = saved if isinstance(saved, Mapping) else {}
+    if config.get('report_writing_method', 'sections') == 'article':
+        validate_report_settings({**saved, **supplied}, method='article')
+    return ({key: value for key, value in supplied.items() if key not in saved or saved[key] != value}
+        if changes_only else supplied)
 
 
 def working_report_requirement(value: dict[str, Any], *, for_writing: bool = False) -> dict[str, Any]:
