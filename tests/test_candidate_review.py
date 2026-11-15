@@ -178,6 +178,12 @@ class CandidateReviewTests(unittest.TestCase):
         binding.pop('purpose')
         self.assertTrue(self.owner.requires_review(direct))
         self.workspace.resolve('other.md').write_text('Different work', encoding='utf-8')
+        self.observations[-1]['arguments'] = {'review_scope': 'delivery'}
+        expanded = direct.model_copy(update={'artifacts': ['draft.md', 'other.md']})
+        self.assertTrue(self.owner.requires_review(expanded))
+        binding['artifacts'][str(self.workspace.resolve('other.md'))] = 'other-version'
+        self.assertTrue(self.owner.requires_review(direct))
+        binding['artifacts'].pop(str(self.workspace.resolve('other.md')))
         other = direct.model_copy(update={'artifacts': ['other.md']})
         self.assertFalse(self.owner.requires_review(other))
         self.observations[-1]['current_request'] = False
@@ -262,6 +268,8 @@ class CandidateReviewTests(unittest.TestCase):
                     'current_request': True}]
                 self.assertTrue(self.owner.requires_review(direct))
                 self.workspace.resolve('other.md').write_text('Another result', encoding='utf-8')
+                expanded = direct.model_copy(update={'artifacts': ['draft.md', 'other.md']})
+                self.assertTrue(self.owner.requires_review(expanded))
                 self.assertFalse(self.owner.requires_review(direct.model_copy(update={'artifacts': ['other.md']})))
                 self.observations[0]['current_request'] = False
                 self.assertFalse(self.owner.requires_review(direct))

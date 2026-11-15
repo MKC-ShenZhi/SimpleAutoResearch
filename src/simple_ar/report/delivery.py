@@ -154,9 +154,13 @@ class Delivery:
                     selected = {str(self.workspace.resolve(path)) for path in resolved['artifacts']}
                 except (ValueError, OSError):
                     return False  # The normal delivery owner reports invalid or unfinished outputs.
-            # A text-only delivery has a legitimate empty inventory. Retain an
-            # explicit review choice for it, not an incidental default review.
-            if selected == set(artifacts) and (selected or explicitly_selected):
+            reviewed_work = set(artifacts)
+            # Expanding or narrowing the same work cannot waive its explicit
+            # final review. The review owner still determines whether the old
+            # opinion applies to the new claim; this retains only the choice.
+            if (selected == reviewed_work and (selected or explicitly_selected)
+                    or explicitly_selected and selected and reviewed_work
+                       and (reviewed_work <= selected or selected <= reviewed_work)):
                 return True
         return False
 
