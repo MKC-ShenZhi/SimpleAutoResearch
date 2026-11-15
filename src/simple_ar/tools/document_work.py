@@ -628,7 +628,7 @@ class DocumentWorkToolGateway:
 
     @staticmethod
     def _inherited_assets(binding: dict, markdown: str, identity: str,
-                          selected: list[dict] | None = None, *, merged_bibliography: bool = False) -> list[dict]:
+                          selected: list[dict] | None = None, *, generated: list[dict] | None = None) -> list[dict]:
         from simple_ar.report.export import report_image_targets
 
         prior = binding['context']['prior_draft']
@@ -638,12 +638,16 @@ class DocumentWorkToolGateway:
         referenced = (set(row['relative_target'] for row in document_local_targets(markdown)) if current
             else set(report_image_targets(markdown)))
         rows = binding['context']['prior_asset_links'] if current else prior['images']
+        generated_paths = {row['path'] for row in generated or []}
+        replaced_references = {f'workspace/document-work/{identity}/{name}'
+            for name in ('references.bib', 'citation_map.json')} & generated_paths
         assets = [{'source': row['source'], 'source_sha256': row['sha256'],
             'path': f"workspace/document-work/{identity}/{row['relative_target']}"}
             for row in rows if row.get('source') and row.get('relative_target')
-            and not (merged_bibliography and row['relative_target'] in {'references.bib', 'citation_map.json'})
+            and f"workspace/document-work/{identity}/{row['relative_target']}" not in replaced_references
             and (row['relative_target'] if current else row['target']) in referenced]
-        if prior['bibliography'] and not merged_bibliography:
+        if (prior['bibliography']
+                and f'workspace/document-work/{identity}/references.bib' not in replaced_references):
             assets.append({'source': prior['bibliography']['source'],
                 'source_sha256': prior['bibliography']['sha256'],
                 'path': f'workspace/document-work/{identity}/references.bib'})
@@ -1082,7 +1086,7 @@ class DocumentWorkToolGateway:
         merged_bibliography = (bool(generated) and binding['contract'] == _REPORT_CONTRACT
             and store.read_json(f'decisions/{step}/authored.json').get('merged_prior_bibliography', False))
         inherited = self._inherited_assets(binding, decision.manuscript_markdown, identity,
-            [*assets, *generated], merged_bibliography=merged_bibliography)
+            [*assets, *generated], generated=generated)
         manuscript = f'workspace/document-work/{identity}/manuscript.md'
         targets = [manuscript, *(row['path'] for row in [*assets, *generated, *inherited])]
         if len(targets) != len(set(targets)):
@@ -1110,7 +1114,10 @@ class DocumentWorkToolGateway:
                 raise ValueError('Prior manuscript changed')
             for name in ('bibliography', 'citation_map'):
                 source = prior.get(name)
-                if source and candidate.get('merged_prior_bibliography'):
+                used_mapping = (name == 'citation_map' and any(
+                    row['path'] == f'workspace/document-work/{identity}/citation_map.json'
+                    for row in candidate.get('generated_assets', [])))
+                if source and (candidate.get('merged_prior_bibliography') or used_mapping):
                     read_bound_material_bytes(self.workspace, source['source'], source['sha256'], max_bytes=256000)
         for row in candidate['selected']:
             if row['kind'] == 'material_window':
@@ -1176,7 +1183,7 @@ class DocumentWorkToolGateway:
                     for asset in candidate['assets'])
                 or candidate.get('generated_assets', []) != generated
                 or candidate['inherited_assets'] != self._inherited_assets(binding, candidate['markdown'], identity,
-                    [*candidate['assets'], *generated])):
+                    [*candidate['assets'], *generated], generated=generated)):
             raise ValueError('Document attachment selection or destination changed')
         targets = [candidate['manuscript'], *(row['path'] for row in [*candidate['assets'], *generated, *candidate['inherited_assets']])]
         if len(targets) != len(set(targets)):

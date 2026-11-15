@@ -158,7 +158,8 @@ class DocumentWorkTests(unittest.TestCase):
                     view = prompt_payload(prompt)
                     self_test.assertIn('P1' if self._budget_attempt_id == 'manual-revision' else 'old-paper',
                         json.dumps(view))
-                    response = {'draft_markdown': '# Updated findings\n\nEarlier work [@P1]. New evidence [@P2].'}
+                    link = '\n\n[Reference metadata](citation_map.json)' if self._budget_attempt_id.startswith('mapped-') else ''
+                    response = {'draft_markdown': '# Updated findings\n\nEarlier work [@P1]. New evidence [@P2].' + link}
                 else:
                     raise AssertionError(label)
                 self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
@@ -212,7 +213,8 @@ class DocumentWorkTests(unittest.TestCase):
             identity = 'mapped-with-bib' if include_bibliography else 'mapped-without-bib'
             prior = workspace.workspace / identity
             prior.mkdir()
-            (prior / 'manuscript.md').write_text('# Previous\n\nEarlier finding [@P1].\n', encoding='utf-8')
+            (prior / 'manuscript.md').write_text(
+                '# Previous\n\nEarlier finding [@P1].\n\n[Reference metadata](citation_map.json)\n', encoding='utf-8')
             (prior / 'citation_map.json').write_text(json.dumps(citation_map_artifact(
                 {'old-paper': 1}, [old_paper], {'P1': 'old-paper'})), encoding='utf-8')
             if include_bibliography:
@@ -228,6 +230,7 @@ class DocumentWorkTests(unittest.TestCase):
             entries = json.loads((output / 'citation_map.json').read_text(encoding='utf-8'))['entries']
             self.assertEqual({row['paper_id'] for row in entries}, {'old-paper', 'paper'})
             self.assertIn('[@old-paper]', result.data['markdown'])
+            self.assertIn('[Reference metadata](citation_map.json)', result.data['markdown'])
             self.assertIn('Earlier work', (output / 'references.bib').read_text(encoding='utf-8'))
             self.assertFalse(any('citation references were removed' in gap for gap in result.data['gaps']))
 
