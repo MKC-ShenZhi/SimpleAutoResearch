@@ -660,6 +660,7 @@ code = "daily"
             self.assertTrue(all((path / "code_task/workspace/module.py").is_file() for path in runs))
 
     def test_standalone_code_task_accounts_for_model_and_runs_in_one_ledger(self):
+        from simple_ar.code_task import execute_code_task, run_code_task_baseline
         from simple_ar.core.budget import BudgetError, BudgetLedger
         from simple_ar.core.locking import SessionBusyError, SessionFileLock
         from simple_ar.integrations.llm import LLMClient, LLMSettings
@@ -690,20 +691,24 @@ code = "daily"
             with patch.object(LLMClient, 'from_env', side_effect=client_from_env), \
                     patch('simple_ar.integrations.llm._call_provider', return_value=provider):
                 main(['code-task', 'work-plan', str(run)])
+            execute_code_task(run, to_step='baseline', use_llm=False, skip_validation=True, timeout_sec=10)
             main(['code-task', 'baseline', str(run), '--skip-validation'])
             main(['code-task', 'run', str(run), '--skip-validation'])
+            run_code_task_baseline(run, skip_validation=True, timeout_sec=10)
             ledger = BudgetLedger.load(ledger_path)
-            self.assertEqual(len(ledger.entries), 3)
+            self.assertEqual(len(ledger.entries), 5)
             self.assertEqual(sum(row.actual.get('llm_requests', 0) for row in ledger.entries), 1)
             self.assertEqual(sum(row.actual.get('total_tokens', 0) for row in ledger.entries), 8)
-            self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in ledger.entries), 2)
+            self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in ledger.entries), 4)
             self.assertTrue(all(row.status == 'settled' for row in ledger.entries))
             self.assertEqual({row.session_id for row in ledger.entries}, {str(run.resolve())})
             self.assertEqual({row.attempt_id for row in ledger.entries}, {'standalone'})
             with SessionFileLock(run / 'code_task/meta/budget.lock'):
                 with self.assertRaises(SessionBusyError):
                     main(['code-task', 'run', str(run), '--skip-validation'])
-            self.assertEqual(len(BudgetLedger.load(ledger_path).entries), 3)
+                with self.assertRaises(SessionBusyError):
+                    execute_code_task(run, to_step='baseline', use_llm=False)
+            self.assertEqual(len(BudgetLedger.load(ledger_path).entries), 5)
             held_ledger = run / 'budget_ledger.held.json'
             ledger_path.rename(held_ledger)
             try:
@@ -711,7 +716,7 @@ code = "daily"
                     main(['code-task', 'run', str(run), '--skip-validation'])
             finally:
                 held_ledger.rename(ledger_path)
-            self.assertEqual(len(BudgetLedger.load(ledger_path).entries), 3)
+            self.assertEqual(len(BudgetLedger.load(ledger_path).entries), 5)
 
     def test_historical_standalone_external_ledger_keeps_its_original_identity(self):
         from simple_ar.code_task import initialize_code_task

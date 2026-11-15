@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
 import os
 import shlex
 import shutil
@@ -10,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from simple_ar.core.artifacts import read_json, read_text
+from simple_ar.code_task.runtime.accounting import standalone_task_accounting as _code_task_accounting
 from simple_ar.cli.research_view import ResearchConsole, report_audit_line
 from simple_ar.cli.code_task_view import (
     confirm_next_step,
@@ -1835,32 +1835,6 @@ def _print_code_task_init(args: argparse.Namespace) -> None:
         metric_directions=options.metric_directions,
     )
     print_line(f"Resource ledger: {run_dir / 'budget_ledger.json'}")
-
-
-@contextmanager
-def _code_task_accounting(run_dir: Path, *, active: bool = True):
-    """Use a standalone task's existing ledger for one CLI action.
-
-    Historical tasks keep their original accounting contract. The shared
-    lock serializes paid/process actions, rather than giving each command
-    its own ledger or treating earlier unrecorded work as zero.
-    """
-    manifest_path = run_dir / 'manifest.json'
-    if not active or not manifest_path.is_file():
-        yield {}
-        return
-    policy = read_json(manifest_path).get('code_task', {}).get('cli_accounting')
-    if policy is None:
-        yield {}
-        return
-    if policy != 'standalone.v1':
-        raise ValueError('Unknown standalone CodeTask accounting contract')
-    path = run_dir / 'budget_ledger.json'
-    from simple_ar.core.budget import BudgetLedger
-    from simple_ar.core.locking import SessionFileLock
-    with SessionFileLock(run_dir / 'code_task' / 'meta' / 'budget.lock'):
-        yield {'budget_ledger': BudgetLedger.load(path), 'session_id': str(run_dir.resolve()),
-               'attempt_id': 'standalone'}
 
 
 def _code_task_client(accounting: dict, model: str | None, *, enabled: bool):

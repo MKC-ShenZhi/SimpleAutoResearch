@@ -14,6 +14,7 @@ from typing import Any, Callable
 from simple_ar.core.artifacts import read_json, write_json, write_text
 from simple_ar.core.process import ProcessResult, ProcessSpec, confine_process, run_process, with_process_outputs
 from simple_ar.core.budget import BudgetLedger
+from simple_ar.code_task.runtime.accounting import account_standalone_task
 from simple_ar.code_task.editing.attempts import (
     load_latest_code_task_batch,
     update_code_task_batch_state,
@@ -199,6 +200,7 @@ class CodeTaskRunResult:
     metrics: dict[str, float] = field(default_factory=dict)
 
 
+@account_standalone_task
 def run_code_task_benchmark(
     run_dir: Path,
     *,

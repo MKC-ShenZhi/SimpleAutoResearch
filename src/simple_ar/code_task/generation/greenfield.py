@@ -25,6 +25,7 @@ from simple_ar.code_task.runtime.state import (
 )
 from simple_ar.core.artifacts import read_json, read_text, write_json, write_text
 from simple_ar.core.budget import BudgetLedger
+from simple_ar.code_task.runtime.accounting import account_standalone_task
 from simple_ar.code_task.generation.architecture import (
     build_architecture_plan,
     file_plan_from_architecture,
@@ -188,6 +189,7 @@ def _json_hash(value: object) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+@account_standalone_task
 def generate_greenfield_code_task(
     run_dir: Path,
     *,
