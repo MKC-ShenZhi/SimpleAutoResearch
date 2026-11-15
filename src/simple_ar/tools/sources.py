@@ -645,7 +645,7 @@ class SourceToolGateway:
                 if any(self._digest(Path(path)) != digest for path, digest in saved['hashes'].items()):
                     raise ValueError('Research result artifact changed')
                 return ToolResult.model_validate(saved['result'])
-            if self.user_requests is not None:
+            if request.use_llm and self.user_requests is not None:
                 binding['user_requests'] = list(self.user_requests())
             if network and not paths and not request.document_record:
                 # Reject missing runtime services before writing an attempt or

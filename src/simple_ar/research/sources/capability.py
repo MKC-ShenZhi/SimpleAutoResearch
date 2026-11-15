@@ -610,7 +610,8 @@ def select_search_result(
         select_retrieval_candidates,
     )
 
-    scope_topic = (filters or {}).get("topic", policy.topic)
+    filter_topic = (filters or {}).get("topic")
+    scope_topic = filter_topic if isinstance(filter_topic, str) else policy.topic
     scope = temporal_scope(filters or {}, topic=scope_topic)
     query_numbers = {
         _query_key(query): index
