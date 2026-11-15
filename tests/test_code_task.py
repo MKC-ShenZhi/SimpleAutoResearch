@@ -1809,6 +1809,23 @@ primary_metric = "accuracy"
             self.assertEqual(validation["status"], "passed")
             metrics = read_json(run_dir / "code_task" / "run" / "patched" / "metrics.json")
             self.assertIn("accuracy", metrics)
+
+    def test_new_greenfield_preserves_an_explicit_external_agent_choice(self) -> None:
+        with _temporary_root() as root:
+            task = root / 'task.md'
+            write_text(task, 'Generate a runnable project with an external handoff.')
+            run = root / 'run'
+            _initialize_greenfield(run_dir=run, task_file=task, primary_metric='accuracy', direct_greenfield=True)
+            self.assertEqual(read_json(run / 'manifest.json')['code_task']['auto_edit_policy'], 'direct.v1')
+            preview = execute_code_task(run, use_llm=False, dry_run=True,
+                implementation_provider='fake', implementation_agent_mode='handoff')
+            self.assertEqual(preview.stop_reason, 'dry_run')
+            self.assertEqual(read_json(run / 'manifest.json')['code_task']['auto_edit_policy'], 'direct.v1')
+            result = execute_code_task(run, use_llm=False, to_step='run', timeout_sec=30,
+                implementation_provider='fake', implementation_agent_mode='handoff')
+            self.assertEqual(result.stop_reason, 'completed')
+            self.assertEqual(read_json(run / 'code_task/meta/code_backend.json')['provider'], 'fake')
+            self.assertNotIn('auto_edit_policy', read_json(run / 'manifest.json')['code_task'])
             manifest = read_json(run_dir / "manifest.json")
             self.assertEqual(manifest["implementation"]["status"], "generated")
             self.assertEqual(manifest["patch"]["mode"], "greenfield_generated")
@@ -5174,6 +5191,54 @@ protected_patterns = ["pyproject.toml"]
             self.assertTrue((run_dir / "code_task" / "meta" / "proposed_edits.json").is_file())
             manifest = read_json(run_dir / "manifest.json")
             self.assertEqual(manifest["plan"]["status"], "approved")
+
+    def test_new_standalone_project_supports_direct_and_explicitly_planned_work(self):
+        for planned in (False, True):
+            with self.subTest(planned=planned), _temporary_root() as root:
+                task = root / 'task.md'
+                write_text(task, 'Create a reusable double function and its test.')
+                with contextlib.redirect_stdout(io.StringIO()):
+                    main(['code-task', 'init', '--kind', 'greenfield', '--task-file', str(task),
+                        '--output-root', str(root / 'runs'), '--name', 'new', '--benchmark-command',
+                        'python -m unittest discover -s tests'])
+                run = next((root / 'runs').glob('*/manifest.json')).parent
+                manifest = read_json(run / 'manifest.json')
+                self.assertEqual(manifest['code_task']['auto_edit_policy'], 'direct.v1')
+                files = {'pkg/math.py': 'def double(value):\n    return value * 2\n',
+                    'tests/test_math.py': 'import unittest\nfrom pkg.math import double\n'
+                        'class TestDouble(unittest.TestCase):\n'
+                        '    def test_double(self):\n        self.assertEqual(double(3), 6)\n'}
+                labels = []
+                def reply(_system, _prompt, *, label='', **_kwargs):
+                    labels.append(label)
+                    if label == 'code-task-plan':
+                        return {'summary': 'Create the requested files.', 'goals': ['Double values'],
+                            'files_to_modify': [], 'new_files': [{'path': path, 'reason': 'Requested work'}
+                                for path in files], 'proposed_steps': ['Implement and validate.'],
+                            'validation': ['Run the provided tests.'], 'risks': [], 'rollback': [],
+                            'open_questions': [], 'requires_approval_before_patch': True}
+                    if label == 'code-task-propose-edits':
+                        return {'summary': 'Create the requested files.', 'edits': [
+                            {'path': path, 'old': '', 'new': contents, 'reason': 'Requested work'}
+                            for path, contents in files.items()], 'validation': [], 'risks': []}
+                    if label.startswith('code-task-review-'):
+                        return {'findings': []}
+                    raise AssertionError(f'Unexpected model call: {label}')
+                client = LLMClient(LLMSettings(api_key='fixture', api_mode='chat'))
+                with patch.object(LLMClient, 'ask_json', side_effect=reply):
+                    if planned:
+                        plan = execute_code_task(run, to_step='plan', llm_client=client)
+                        self.assertEqual(plan.stop_reason, 'approval_required')
+                        record_plan_decision(run, decision='approve', note='Approved planned work.', reviewer='test')
+                    result = execute_code_task(run, to_step='run', llm_client=client,
+                        approval_note='Approved isolated work.', apply_proposed_edits=True)
+                self.assertEqual(result.stop_reason, 'completed', result)
+                self.assertEqual('code-task-plan' in labels, planned)
+                workspace = code_task_paths(run).workspace_dir
+                self.assertFalse((workspace / 'generated_project').exists())
+                for path, contents in files.items():
+                    self.assertEqual((workspace / path).read_text(), contents)
+                self.assertEqual(read_json(run / 'code_task/run/patched/execution_report.json')['status'], 'passed')
 
     def test_new_standalone_reuses_shared_editor_and_preserves_explicit_review(self):
         with _temporary_root() as root:

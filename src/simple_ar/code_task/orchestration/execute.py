@@ -296,6 +296,25 @@ def execute_code_task(
     root = Path(run_dir)
     paths = code_task_paths(root)
     manifest = load_code_task_manifest(root)
+    if (_code_task_kind(manifest) == 'greenfield'
+            and manifest.get('code_task', {}).get('auto_edit_policy') == 'direct.v1'):
+        from simple_ar.code_task.generation.agent_backend import should_use_agent_backend
+        if planning_snapshot_from or should_use_agent_backend(implementation_provider):
+            # The caller explicitly selected the retained generated-project
+            # owner. Switch before editing; a started direct task keeps its work.
+            started = (_plan_status(manifest) != 'not_started'
+                or _patch_status(manifest) != 'not_started' or _proposal_exists(paths)
+                or budget_ledger is not None and any(
+                    entry.status != 'released' and entry.purpose.startswith(('code-task-plan', 'code-task-propose-edits'))
+                    for entry in budget_ledger.entries))
+            if started:
+                raise ValueError('The current task already began direct editing; preserve its work before choosing another implementation owner')
+            manifest['code_task'].pop('auto_edit_policy')
+            if not dry_run:
+                save_code_task_manifest(root, manifest)
+        elif baseline_policy == 'auto':
+            # A new project has no unchanged implementation to benchmark.
+            baseline_policy = 'skip'
     if direct_edit is None:
         direct_edit = direct_edit_available(manifest, paths.task_dir, to_step=to_step, use_llm=use_llm)
     ensure_task_memory(root)

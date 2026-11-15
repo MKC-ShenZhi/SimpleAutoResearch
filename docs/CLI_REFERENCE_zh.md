@@ -868,7 +868,7 @@ simple-ar code-task init [OPTIONS]
 | --- | --- | --- |
 | `--config PATH` | init 设置 TOML；CLI 参数覆盖配置值。 | 未设置 |
 | `--code-root PATH` | 源项目。`existing_project` 必填；`greenfield` 仅在需要 scaffold/source root 时填写。 | 未设置 |
-| `--kind CHOICE` | `existing_project` 表示已有项目 patch；`greenfield` 表示从零生成项目。 可选：`existing_project`, `greenfield`. | 未设置 |
+| `--kind CHOICE` | `existing_project` 表示修改已有项目；`greenfield` 表示新建项目。新项目使用共同编辑器；显式选择外部智能体或沿用旧新建项目计划时，使用对应生成流程。可选：`existing_project`, `greenfield`。 | 未设置 |
 | `--task-file PATH` | Markdown/text 任务描述。除非配置中已设置，否则必填。 | 未设置 |
 | `--output-root PATH` | code-task run 创建位置。 | 未设置 |
 | `--name NAME` | run 名称后缀。 | 未设置 |

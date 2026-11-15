@@ -304,7 +304,13 @@ def propose_patch_edits(
                 max_files=max_files,
                 max_chars_per_file=max_source_chars_per_file,
             )
-    proposal_allowed_files = allowed_edit_files if allowed_edit_files else selected
+    if allowed_edit_files:
+        proposal_allowed_files = allowed_edit_files
+    elif task_only:
+        proposal_allowed_files = selected
+    else:
+        from simple_ar.code_task.editing.work_plan import _creation_paths
+        proposal_allowed_files = list(dict.fromkeys([*selected, *_creation_paths(manifest, run_dir=root)]))
     _write_batch_context(
         root,
         batch,
@@ -843,7 +849,7 @@ def _edit_user_prompt(
            + ". Protected paths remain read-only. "
            "For a genuinely absent file use old=\"\" and new=the complete file text. "
            "Split implementation into focused helper modules when useful; the same edit budgets apply.\n\n"
-           if allow_new_files else "New files require an explicitly listed batch target; use old=\"\" only for an absent file.\n\n")
+           if allow_new_files else "New files require an explicitly approved target; use old=\"\" only for an absent file.\n\n")
         +
         "Context discipline:\n"
         "- A selected file can be only partially visible. If the required behavior is "

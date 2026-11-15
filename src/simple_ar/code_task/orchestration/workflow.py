@@ -90,6 +90,7 @@ def initialize_code_task(
     data_inputs: tuple[str, ...] = (),
     initial_files: tuple[str, ...] = (),
     direct_edit: bool = True,
+    direct_greenfield: bool = False,
     standalone: bool = True,
 ) -> CodeTaskInitResult:
     """Initialize a local code-task run without modifying the source project.
@@ -136,6 +137,8 @@ def initialize_code_task(
         direct_edit: New existing-project tasks may propose edits without a
             separate plan; applying them remains subject to caller approval.
             Use False when retaining an explicitly planned historical task.
+        direct_greenfield: Use that same editor for a new project. The default
+            retains the experimental generator for existing Python callers.
         standalone: Create and use this task's own ledger. Embedded work passes
             False and uses its enclosing task's ledger instead.
 
@@ -266,7 +269,7 @@ def initialize_code_task(
         edit_scope=edit_scope,
         environment_policy=environment_policy,
         kind=normalized_kind,
-        direct_edit=direct_edit,
+        direct_edit=direct_edit and (normalized_kind != 'greenfield' or direct_greenfield),
     )
     if standalone:
         from simple_ar.core.budget import BudgetLedger
@@ -338,7 +341,7 @@ def _manifest(
         "status": "initialized",
         "code_task": {
             "kind": kind,
-            **({"auto_edit_policy": "direct.v1"} if direct_edit and kind == "existing_project" else {}),
+            **({"auto_edit_policy": "direct.v1"} if direct_edit else {}),
         },
         "created_at": _utcnow_iso(),
         "run_dir": str(run_dir),

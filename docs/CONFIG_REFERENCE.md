@@ -563,7 +563,7 @@ Model tokens, processes, edit sizes, correction rounds and cost estimates are se
 
 ### Edit scope behavior
 
-Edits occur inside the CodeTask workspace. Nonempty allowlists narrow paths; protection wins. Standalone CodeTask and saved historical tasks retain the built-in test, benchmark, secret and credential protections. New scoped code work in a shared task can edit tests and benchmarks within its allowed paths; declared protected paths and the files used directly by its validator remain read-only. Workspace isolation is not an OS sandbox.
+Edits occur inside the CodeTask workspace. Nonempty allowlists narrow paths; protection wins. Standalone existing-project and saved historical tasks retain the built-in test, benchmark, secret and credential protections. A new empty project may create tests and benchmarks; copied scaffolds keep the standalone protections. New scoped code work in a shared task can edit tests and benchmarks within its allowed paths; declared protected paths and the files used directly by its validator remain read-only. Workspace isolation is not an OS sandbox.
 
 <a id="codetask-in-a-research-session"></a>
 

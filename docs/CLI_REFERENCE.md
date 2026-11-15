@@ -873,7 +873,7 @@ simple-ar code-task init [OPTIONS]
 | --- | --- | --- |
 | `--config PATH` | TOML config for init settings. CLI flags override config values. | Unset |
 | `--code-root PATH` | Source project. Required for `existing_project`; optional scaffold/source root for `greenfield`. | Unset |
-| `--kind CHOICE` | `existing_project` for patching an existing codebase, or `greenfield` for from-scratch generation. Choices: `existing_project`, `greenfield`. | Unset |
+| `--kind CHOICE` | `existing_project` for patching an existing codebase, or `greenfield` for a new project. New projects use the shared editor; an explicitly selected external agent or retained greenfield plan keeps its generation workflow. Choices: `existing_project`, `greenfield`. | Unset |
 | `--task-file PATH` | Markdown/text task description. Required unless set in config. | Unset |
 | `--output-root PATH` | Directory where the code-task run is created. | Unset |
 | `--name NAME` | Run name suffix. | Unset |
