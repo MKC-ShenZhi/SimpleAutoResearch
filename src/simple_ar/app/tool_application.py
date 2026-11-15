@@ -2406,7 +2406,8 @@ class ToolApplication:
             elif 'code_task' in supplied and supplied['code_task'] is None:
                 config['code_work_policy'] = config['code_review_policy'] = None
             if (supplied.get('independent_review_required') is False
-                    and old.get('delivery_review_selection') == 'model.v1'):
+                    and old.get('delivery_review_selection') == 'model.v1'
+                    and old.get('code_review_policy') == 'delivery.v1'):
                 config['code_review_policy'] = None
             if old.get('source_snapshots'):
                 config['source_snapshots'] = {name: value for name, value in old['source_snapshots'].items()
