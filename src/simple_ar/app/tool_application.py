@@ -568,7 +568,7 @@ class ToolApplication:
             artifact_changes=self._artifact_changes,
             work_context=self._work_context,
             material_observations=self._material_observations,
-            user_requests=self._inspection_requests,
+            user_requests=self._professional_user_requests,
             user_request_count=lambda: len(self.state['requests']),
             review_request_start=self._review_request_start,
             native_route_validator=self._validate_professional_route,
@@ -1466,7 +1466,7 @@ class ToolApplication:
         return declare_report(intent, config=self.state['config'], requests=self.state['requests'],
             previous=self._report_projection, writing=self.writing, report_inputs=self._report_inputs)
 
-    def _inspection_requests(self) -> list[str]:
+    def _professional_user_requests(self) -> list[str]:
         """Original requests without administrative permission-only notices."""
         requests = list(self.state['requests'])
         administrative = {'independent_review_required'}
@@ -1556,7 +1556,9 @@ class ToolApplication:
                         if self.operations is not None and self.operations.professional else None)
         feedback = (self._work_feedback(targets, observations=observations)
                     if observations is not None else self._work_feedback(targets))
-        context = {'user_requests': list(self.state['requests']), 'review_observations': feedback['review_observations'],
+        requests = (self._professional_user_requests()
+            if self.state['config'].get('delivery_review_selection') == 'model.v3' else list(self.state['requests']))
+        context = {'user_requests': requests, 'review_observations': feedback['review_observations'],
             'scope': 'Original requests and related accepted checks, not permission, scientific proof or verification of changed files. Historical checks without bound inputs are not inferred.'}
         if 'professional_findings' in feedback:
             context['professional_findings'] = feedback['professional_findings']

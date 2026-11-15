@@ -447,6 +447,8 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         case.app.supply(supply_id='execution-access', reason='Authorize later workspace execution',
             changes={'allow_execution': True})
         case._reload()
+        self.assertEqual(case.app._work_context(['note.md'])['user_requests'],
+                         ['Complete the requested explanation.'])
         case._submit(_action('deliver_result', **claim, independent_review=False))
         case._not_delivered()
         self.assertEqual(len(case.inspection_requests), checked)
@@ -594,7 +596,7 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         case._reload()
         self.assertEqual(case.app.ledger.to_dict()['entries'][:len(before['entries'])], before['entries'])
         self.assertEqual(case.app.ledger.remaining('llm_requests'), 1)
-        self.assertEqual(case.app._inspection_requests(), requests)
+        self.assertEqual(case.app._professional_user_requests(), requests)
         case._submit(_action('deliver_result', reviewed_candidate=proof['identity']))
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
         self.assertEqual(len(case.inspection_requests), checked)
