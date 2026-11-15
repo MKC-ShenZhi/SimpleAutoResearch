@@ -11,7 +11,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 - The research retry API and CLI use the same saved task and ledger, including validated CodeTask sources; explicit resource-only continuations also retain the original ledger. Historical sessions retain their original continuation contract.
 - New standalone CodeTask runs created by the CLI or Python use their task ledger for planning, edits, repair, review and execution; embedded work keeps the parent ledger.
-- CodeTask preparation reuses the running Python version. External interpreter and GPU probes use the task process ledger, leaving necessary execution capacity intact.
+- CodeTask reuses the running Python version and recorded initial syntax findings. Environment and dependency probes use the task process ledger, leaving necessary execution capacity intact.
 - Retained work hands original observations to the material owner for current admission without an extra handoff read; writing and independent review can use those observations without inheriting an opinion.
 - Common article revisions can return either local replacements or a complete revised draft, using the existing writing and review flow.
 

@@ -2792,6 +2792,7 @@ protected_patterns = ["pyproject.toml"]
                 propose_patch_edits(run_dir, use_llm=True)
             self.assertEqual(client.ask_json.call_count, 2)
             self.assertEqual(probe.call_count, 1)
+            self.assertIsNotNone(probe.call_args.kwargs['budget_ledger'])
             self.assertIn("compute_bins", client.ask_json.call_args.args[1])
             self.assertEqual(read_json(run_dir / "code_task/meta/dependency_api.json"), observed)
 

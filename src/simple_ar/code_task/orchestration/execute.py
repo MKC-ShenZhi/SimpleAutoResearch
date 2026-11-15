@@ -666,6 +666,8 @@ def execute_code_task(
             budget_profile=budget_profile,
             edit_budget_overrides=edit_budget_overrides,
             message_callback=message_callback,
+            process_protection=({'process_invocations': 1, 'process_wall_seconds': timeout_sec}
+                if to_step in {'run', 'analyze-failure', 'repair'} else None),
             **({'task_only': True} if direct_without_plan else {}),
             **({'process_scope': process_scope} if process_scope is not None else {}),
         )
@@ -810,7 +812,10 @@ def execute_code_task(
     if dry_run:
         return _dry_result(paths, steps, "validate", "run static validation")
     validation = _validate_candidate(root, steps, strict=strict_validation,
-        max_file_bytes=validation_max_file_bytes, process_scope=process_scope, message_callback=message_callback)
+        max_file_bytes=validation_max_file_bytes, process_scope=process_scope, message_callback=message_callback,
+        budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+        process_protection=({'process_invocations': 1, 'process_wall_seconds': timeout_sec}
+            if to_step in {'run', 'analyze-failure', 'repair'} else None))
     if validation.error_count or validation.warning_count:
         severity = "blocking" if validation.error_count else "warning"
         record_review_finding(
@@ -1168,7 +1173,10 @@ def _execute_greenfield_code_task(
     if dry_run:
         return _dry_result(paths, steps, "validate", "run static validation")
     validation = _validate_candidate(root, steps, strict=strict_validation,
-        max_file_bytes=validation_max_file_bytes, process_scope=process_scope, message_callback=message_callback)
+        max_file_bytes=validation_max_file_bytes, process_scope=process_scope, message_callback=message_callback,
+        budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+        process_protection=({'process_invocations': 1, 'process_wall_seconds': timeout_sec}
+            if to_step in {'run', 'analyze-failure', 'repair'} else None))
     if validation.status == "failed":
         return _result(
             paths,
@@ -1223,7 +1231,9 @@ def _execute_greenfield_code_task(
                 )
         _emit(message_callback, "Run repair patched generated project; rerunning static validation.")
         validation = _validate_candidate(root, steps, strict=strict_validation,
-            max_file_bytes=validation_max_file_bytes, process_scope=process_scope, message_callback=message_callback)
+            max_file_bytes=validation_max_file_bytes, process_scope=process_scope, message_callback=message_callback,
+            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+            process_protection={'process_invocations': 1, 'process_wall_seconds': timeout_sec})
         if validation.status == "failed":
             return _result(
                 paths,
@@ -1370,9 +1380,13 @@ def _run_validated_candidate(root: Path, steps: list[ExecuteStepRecord], *, time
 
 def _validate_candidate(root: Path, steps: list[ExecuteStepRecord], *, strict: bool,
                         max_file_bytes: int, process_scope: Any | None,
-                        message_callback: MessageCallback | None):
+                        message_callback: MessageCallback | None,
+                        budget_ledger: BudgetLedger | None, session_id: str, attempt_id: str,
+                        process_protection: dict[str, int | float] | None):
     _emit(message_callback, "Running static validation.")
     result = validate_code_task(root, strict=strict, max_file_bytes=max_file_bytes,
+        budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+        process_protection=process_protection,
         **({'process_scope': process_scope} if process_scope is not None else {}))
     _record(steps, "validate", "done", f"status {result.status}")
     _memory_event(root, "validation", f"Static validation finished with status {result.status}.",

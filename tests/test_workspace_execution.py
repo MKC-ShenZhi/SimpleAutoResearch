@@ -314,12 +314,16 @@ class WorkspaceExecutionTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('pandoc') and shutil.which('xelatex'), 'Pandoc and XeLaTeX required')
     def test_code_environment_probes_use_the_task_ledger_and_preserve_work_budget(self):
+        from simple_ar.code_task.analysis.dependency_api import inspect_dependency_api
         from simple_ar.code_task.execution.environment import probe_code_task_environment
+        from simple_ar.code_task.execution.runner import run_code_task_benchmark
+        from simple_ar.code_task.execution.validation import validate_code_task
         from simple_ar.code_task.orchestration.workflow import initialize_code_task
         from simple_ar.core.budget import BudgetLedger
 
         task = self.base / 'probe-task.txt'
         task.write_text('Inspect the project')
+        (self.source / 'main.py').write_text('import json\nVALUE = 1\n')
         python = self.base / 'external-python'
         python.symlink_to(Path(sys.executable))
         gpu = self.base / 'nvidia-smi'
@@ -343,6 +347,17 @@ class WorkspaceExecutionTests(unittest.TestCase):
             self.assertEqual(report.gpu['devices'][0]['memory_total_mib'], 8192)
             saved = json.loads(report.report_path.read_text())
             self.assertNotEqual(saved['execution_policy']['python_version'], 'unknown')
+            validation = validate_code_task(run.run_dir)
+            self.assertEqual(validation.status, 'passed')
+            ledger = BudgetLedger.load(run.run_dir / 'budget_ledger.json')
+            self.assertEqual([entry.purpose for entry in ledger.entries], ['code_probe'] * 3)
+            api = inspect_dependency_api([{'module': 'json', 'symbols': ['loads']}],
+                {'files': [{'path': 'main.py', 'python': {'imports': ['json']}}]}, ['main.py'],
+                python_executable=str(python), workspace_dir=run.workspace_dir,
+                budget_ledger=ledger, session_id='standalone', attempt_id='edit',
+                output_root=run.meta_dir / 'probe-processes')
+            self.assertEqual(api['status'], 'observed')
+            self.assertEqual(BudgetLedger.load(run.run_dir / 'budget_ledger.json').entries[-1].purpose, 'code_probe')
 
             nested = initialize_code_task(run_dir=self.base / 'nested-probe', code_root=self.source,
                 task_file=task, env_mode='external', python_executable=python, standalone=False)
@@ -353,6 +368,11 @@ class WorkspaceExecutionTests(unittest.TestCase):
             self.assertFalse(parent.entries)
             self.assertEqual(limited.gpu['probe'], 'budget_unavailable')
             self.assertEqual(json.loads(limited.report_path.read_text())['execution_policy']['python_version'], 'unknown')
+            # The validator must retain the only process for the actual check.
+            result = run_code_task_benchmark(nested.run_dir, command="python -c 'print(42)'", timeout_sec=6,
+                budget_ledger=parent, session_id='original', attempt_id='run')
+            self.assertEqual(result.status, 'passed')
+            self.assertEqual([entry.purpose for entry in parent.entries], ['local_process'])
 
     def test_publication_uses_the_same_scope_and_records_each_process(self):
         (self.app.workspace.workspace / 'draft.md').write_text('# Report\n\nA result.\n', encoding='utf-8')

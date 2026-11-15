@@ -79,9 +79,18 @@ class SourceEncodingTests(unittest.TestCase):
             initialize_code_task(run_dir=run, code_root=project, task_file=task, workspace_mode='git_worktree')
             from simple_ar.code_task.runtime.state import code_task_paths
             workspace = code_task_paths(run).workspace_dir
-            result = validate_code_task(run)
+            with patch('simple_ar.code_task.execution.validation._unchanged_git_baseline',
+                       side_effect=AssertionError('An initial record already owns this observation')):
+                result = validate_code_task(run)
             self.assertEqual(result.status, 'passed')
             issue = next(row for row in read_json(result.report_path)['issues'] if row['code'] == 'syntax_error')
+            self.assertEqual(issue['baseline_status'], 'byte_identical_initial_syntax_error')
+            # Older worktrees without the initial record can still use their frozen commit.
+            manifest = read_json(run / 'manifest.json')
+            manifest['workspace'].pop('initial_syntax_errors')
+            write_json(run / 'manifest.json', manifest)
+            historical = validate_code_task(run)
+            issue = next(row for row in read_json(historical.report_path)['issues'] if row['code'] == 'syntax_error')
             self.assertEqual(issue['baseline_status'], 'byte_identical_frozen_git_source')
             self.assertEqual(validate_code_task(run, strict=True).status, 'failed')
             # Moving the live source no longer changes the frozen comparison.

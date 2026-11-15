@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
 import importlib.util
 import os
 import platform
@@ -15,6 +14,7 @@ from typing import Any
 from simple_ar.core.artifacts import read_json, write_json
 from simple_ar.core.budget import BudgetExceededError, BudgetLedger
 from simple_ar.code_task.runtime.accounting import account_code_task
+from simple_ar.code_task.execution.scope import run_code_task_probe
 from simple_ar.code_task.runtime.state import (
     code_task_paths,
     load_code_task_manifest,
@@ -276,22 +276,13 @@ def _probe_code_task_environment(
     )
     def run_probe(argv: list[str]):
         """Use the task's execution boundary; a missed optional probe is not failure."""
-        if process_scope is not None:
-            try:
-                return process_scope.probe(argv, cwd=paths.workspace_dir, timeout_sec=3)
-            except BudgetExceededError:
-                return None
-        if budget_ledger is None:
-            return subprocess.run(argv, capture_output=True, text=True, timeout=3, check=False)
-        from simple_ar.experiment.execution.backend import LocalExecutionBackend, RunRequest
-        guard = (budget_ledger.protect_remaining(process_protection, additional=True)
-                 if process_protection else nullcontext())
         try:
-            with guard:
-                return LocalExecutionBackend(budget_ledger=budget_ledger, accounting_purpose='code_probe').run(
-                    RunRequest(argv, paths.workspace_dir, 3, label='code_probe',
-                        env=code_task_process_environment(paths.workspace_dir),
-                        output_dir=paths.meta_dir / 'probe-processes', session_id=session_id, attempt_id=attempt_id))
+            return run_code_task_probe(argv, cwd=paths.workspace_dir, timeout_sec=3,
+                process_scope=process_scope, ledger=budget_ledger,
+                session_id=session_id, attempt_id=attempt_id,
+                output_root=paths.meta_dir / 'probe-processes',
+                environment=code_task_process_environment(paths.workspace_dir) if budget_ledger is not None else None,
+                protect=process_protection)
         except BudgetExceededError:
             return None
 

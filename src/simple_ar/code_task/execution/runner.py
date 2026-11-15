@@ -271,6 +271,8 @@ def run_code_task_benchmark(
 
     if not skip_validation:
         validation = validate_code_task(run_dir,
+            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+            process_protection={'process_invocations': 1, 'process_wall_seconds': timeout_sec},
             **({'process_scope': process_scope} if process_scope is not None else {}))
         if validation.error_count:
             return _write_blocked_result(

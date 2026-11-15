@@ -8,7 +8,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from simple_ar.core.budget import BudgetExceededError
+from simple_ar.core.budget import BudgetExceededError, BudgetLedger
+from simple_ar.code_task.execution.scope import run_code_task_probe
 from simple_ar.experiment.execution.backend import ExecutionError
 
 
@@ -47,6 +48,10 @@ def inspect_dependency_api(
     workspace_dir: Path,
     timeout_sec: int = 12,
     process_scope: Any | None = None,
+    budget_ledger: BudgetLedger | None = None,
+    session_id: str = '', attempt_id: str = '',
+    output_root: Path | None = None,
+    process_protection: dict[str, int | float] | None = None,
 ) -> dict[str, Any]:
     """Resolve an explicit, limited API request against the configured interpreter.
 
@@ -85,9 +90,9 @@ def inspect_dependency_api(
         return {"status": "invalid_request", "interfaces": []}
     try:
         argv = [python_executable, "-I", "-c", _PROBE, json.dumps(accepted)]
-        completed = (process_scope.probe(argv, cwd=workspace_dir, timeout_sec=timeout_sec)
-            if process_scope is not None else subprocess.run(argv, cwd=workspace_dir,
-                capture_output=True, text=True, timeout=timeout_sec, check=False))
+        completed = run_code_task_probe(argv, cwd=workspace_dir, timeout_sec=timeout_sec,
+            process_scope=process_scope, ledger=budget_ledger, session_id=session_id,
+            attempt_id=attempt_id, output_root=output_root, protect=process_protection)
         interfaces = json.loads(completed.stdout) if completed.returncode == 0 else None
         if not isinstance(interfaces, list):
             raise ValueError("Dependency probe did not return a JSON list")

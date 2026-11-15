@@ -150,6 +150,7 @@ def propose_patch_edits(
     process_scope: Any | None = None,
     task_only: bool = False,
     budget_ledger: BudgetLedger | None = None, session_id: str = "", attempt_id: str = "",
+    process_protection: dict[str, int | float] | None = None,
 ) -> ProposedEditsResult:
     """Generate controlled old/new edits from the task and any approved plan.
 
@@ -391,6 +392,8 @@ def propose_patch_edits(
                             request["dependency_symbols"], index,
                             [item["path"] for item in supplied],
                             python_executable=interpreter, workspace_dir=workspace_dir,
+                            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+                            output_root=meta_dir / 'probe-processes', process_protection=process_protection,
                             **({'process_scope': process_scope} if process_scope is not None else {}),
                         ) if isinstance(interpreter, str) and interpreter else
                         {"status": "unavailable", "interfaces": [], "reason": "project_python_not_configured"}

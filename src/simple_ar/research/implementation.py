@@ -138,6 +138,9 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
             apply_verified_repair(request.run_dir, repair, approval_note=request.approval_note,
                 llm_client=client, message_callback=request.message_callback,
                 review_use_llm=review_with_llm,
+                process_protection=({'process_invocations': 1,
+                    'process_wall_seconds': request.validation_timeout_sec or 60}
+                    if request.validation_command else None),
                 **({'direct_edit': True} if direct_edit else {}),
                 **({'process_scope': request.process_scope} if request.process_scope is not None else {}))
             stop_reason, next_action = "stop_point", "Measure the repaired candidate separately."

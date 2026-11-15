@@ -13,8 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from simple_ar.core.artifacts import write_json
-from simple_ar.core.budget import BudgetExceededError
+from simple_ar.core.budget import BudgetExceededError, BudgetLedger
 from simple_ar.experiment.execution.backend import ExecutionError
+from simple_ar.code_task.execution.scope import run_code_task_probe
+from simple_ar.code_task.runtime.accounting import account_code_task
 from simple_ar.code_task.editing.attempts import (
     load_latest_code_task_batch,
     update_code_task_batch_state,
@@ -78,12 +80,16 @@ class CodeTaskValidationResult:
     issue_count: int
 
 
+@account_code_task
 def validate_code_task(
     run_dir: Path,
     *,
     strict: bool = False,
     max_file_bytes: int = 500_000,
     process_scope: Any | None = None,
+    budget_ledger: BudgetLedger | None = None,
+    session_id: str = '', attempt_id: str = '',
+    process_protection: dict[str, int | float] | None = None,
 ) -> CodeTaskValidationResult:
     """Validate Python files in a code-task workspace.
 
@@ -124,7 +130,9 @@ def validate_code_task(
                 except SyntaxError:
                     pass  # Reported by the ordinary syntax pass below.
         import_availability = _external_import_availability(str(external_python), names,
-            **({'process_scope': process_scope, 'cwd': paths.workspace_dir} if process_scope is not None else {}))
+            process_scope=process_scope, cwd=paths.workspace_dir, budget_ledger=budget_ledger,
+            session_id=session_id, attempt_id=attempt_id, output_root=paths.meta_dir / 'probe-processes',
+            process_protection=process_protection)
         if import_availability is None:
             issues.append(_issue(severity="warning", code="dependency_check_unavailable", path="",
                 message="Could not inspect the configured external interpreter; dependency availability is unknown."))
@@ -157,13 +165,12 @@ def validate_code_task(
             import_availability=import_availability,
         )
         if not strict and issues and issues[-1]["code"] == "syntax_error" and issues[-1]["path"] == rel_path:
-            baseline = _unchanged_git_baseline(path, rel_path, paths.workspace_dir, manifest, max_file_bytes)
-            if baseline:
+            if (manifest_section(manifest, "workspace").get("initial_syntax_errors", {}).get(rel_path)
+                    == hashlib.sha256(path.read_bytes()).hexdigest()):
+                issues[-1].update(severity="warning", baseline_status="byte_identical_initial_syntax_error")
+            elif baseline := _unchanged_git_baseline(path, rel_path, paths.workspace_dir, manifest, max_file_bytes):
                 issues[-1].update(severity="warning", baseline_status="byte_identical_frozen_git_source",
                                   baseline_commit=baseline)
-            elif (manifest_section(manifest, "workspace").get("initial_syntax_errors", {}).get(rel_path)
-                  == hashlib.sha256(path.read_bytes()).hexdigest()):
-                issues[-1].update(severity="warning", baseline_status="byte_identical_initial_syntax_error")
 
     error_count = sum(1 for item in issues if item["severity"] == "error")
     warning_count = sum(1 for item in issues if item["severity"] == "warning")
@@ -365,21 +372,22 @@ def _import_available(name: str, workspace_dir: Path, *, current_file: Path | No
 
 
 def _external_import_availability(executable: str, names: set[str], *,
-                                  process_scope: Any | None = None, cwd: Path | None = None) -> dict[str, bool] | None:
+                                  process_scope: Any | None = None, cwd: Path | None = None,
+                                  budget_ledger: BudgetLedger | None = None,
+                                  session_id: str = '', attempt_id: str = '',
+                                  output_root: Path | None = None,
+                                  process_protection: dict[str, int | float] | None = None) -> dict[str, bool] | None:
     """One bounded stdlib-only probe; never import project or training modules."""
     script = (
         "import importlib.util,json,sys; "
-        "names=json.load(sys.stdin); "
+        "names=json.loads(sys.argv[1]); "
         "print(json.dumps({n: importlib.util.find_spec(n) is not None for n in names}))"
     )
     try:
-        if process_scope is not None:
-            scoped_script = script.replace('json.load(sys.stdin)', 'json.loads(sys.argv[1])')
-            result = process_scope.probe([executable, '-I', '-c', scoped_script, json.dumps(sorted(names))],
-                cwd=cwd, timeout_sec=10)
-        else:
-            result = subprocess.run([executable, "-I", "-c", script],
-                input=json.dumps(sorted(names)), capture_output=True, text=True, timeout=10, check=False)
+        result = run_code_task_probe([executable, '-I', '-c', script, json.dumps(sorted(names))],
+            cwd=cwd or Path.cwd(), timeout_sec=10, process_scope=process_scope,
+            ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+            output_root=output_root, protect=process_protection)
         if result.returncode != 0:
             return None
         data = json.loads(result.stdout)

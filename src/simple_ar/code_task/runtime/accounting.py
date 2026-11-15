@@ -44,7 +44,13 @@ def account_code_task(action):
             kwargs = {**kwargs, 'budget_ledger': scope.ledger,
                       'session_id': scope.session_id, 'attempt_id': scope.attempt_id}
             return action(run_dir, *args, **kwargs)
-        if kwargs.get('budget_ledger') is not None or isinstance(client_ledger, BudgetLedger):
+        if isinstance(client_ledger, BudgetLedger):
+            from simple_ar.integrations.llm import task_budget_identity
+            ledger, session_id, attempt_id = task_budget_identity(client, kwargs.get('budget_ledger'),
+                session_id=kwargs.get('session_id', ''), attempt_id=kwargs.get('attempt_id', ''))
+            kwargs = {**kwargs, 'budget_ledger': ledger, 'session_id': session_id, 'attempt_id': attempt_id}
+            return action(run_dir, *args, **kwargs)
+        if kwargs.get('budget_ledger') is not None:
             return action(run_dir, *args, **kwargs)
         with standalone_task_accounting(Path(run_dir), active=not kwargs.get('dry_run', False)) as accounting:
             if accounting:

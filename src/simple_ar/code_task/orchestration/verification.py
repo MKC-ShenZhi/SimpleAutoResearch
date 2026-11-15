@@ -23,8 +23,11 @@ def validate_repair_patch(
     use_llm: bool = True, message_callback: MessageCallback | None = None,
     process_scope: Any | None = None,
     budget_ledger: BudgetLedger | None = None, session_id: str = "", attempt_id: str = "",
+    process_protection: dict[str, int | float] | None = None,
 ) -> None:
     """Review and statically validate an applied repair without measuring it."""
+    budget_ledger, session_id, attempt_id = task_budget_identity(llm_client, budget_ledger,
+        session_id=session_id, attempt_id=attempt_id)
     _emit(message_callback, "Reviewing embedded code-task repair before validation.")
     from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest
     report = code_task_paths(run_dir).meta_dir / 'review_report_post_repair.json'
@@ -46,6 +49,8 @@ def validate_repair_patch(
         if whole['status'] == 'failed':
             raise RuntimeError('Generated revision failed the retained whole-project/API contract')
     repaired_validation = validate_code_task(run_dir,
+        budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+        process_protection=process_protection,
         **({'process_scope': process_scope} if process_scope is not None else {}))
     if repaired_validation.status == "failed":
         raise RuntimeError(
@@ -67,6 +72,7 @@ def apply_verified_repair(
     review_use_llm: bool = True,
     direct_edit: bool = False,
     budget_ledger: BudgetLedger | None = None, session_id: str = "", attempt_id: str = "",
+    process_protection: dict[str, int | float] | None = None,
 ) -> None:
     """Apply an already authorized proposal; proposal-only entry points do not call this."""
     if not approval_note.strip():
@@ -82,6 +88,7 @@ def apply_verified_repair(
     validate_repair_patch(run_dir, llm_client=llm_client, message_callback=message_callback,
         use_llm=review_use_llm,
         budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+        process_protection=process_protection,
         **({'process_scope': process_scope} if process_scope is not None else {}))
 
 
@@ -152,6 +159,7 @@ def verify_implementation(
             validate_repair_patch(run_dir, llm_client=task_client(review_use_llm), message_callback=message_callback,
                 use_llm=review_use_llm,
                 budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+                process_protection={'process_invocations': 1, 'process_wall_seconds': timeout_sec},
                 **({'process_scope': process_scope} if process_scope is not None else {}))
         elif repair_state.get('status') == 'repair_proposed':
             proposal_path = Path(run_dir) / repair_state['latest_proposed_edits']
@@ -162,6 +170,7 @@ def verify_implementation(
                 llm_client=task_client(review_use_llm), message_callback=message_callback,
                 review_use_llm=review_use_llm,
                 budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+                process_protection={'process_invocations': 1, 'process_wall_seconds': timeout_sec},
                 **({'direct_edit': True} if direct_edit else {}),
                 **({'process_scope': process_scope} if process_scope is not None else {}))
             recovered = None
@@ -224,6 +233,7 @@ def verify_implementation(
                               llm_client=task_client(review_use_llm), message_callback=message_callback,
                               review_use_llm=review_use_llm,
                               budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+                              process_protection={'process_invocations': 1, 'process_wall_seconds': timeout_sec},
                               **({'direct_edit': True} if direct_edit else {}),
                               **({'process_scope': process_scope} if process_scope is not None else {}))
         if asset_guard()["status"] == "changed":
