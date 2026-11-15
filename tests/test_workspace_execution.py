@@ -313,6 +313,46 @@ class WorkspaceExecutionTests(unittest.TestCase):
         self.assertEqual(ledger.to_dict(), before)
 
     @unittest.skipUnless(shutil.which('pandoc') and shutil.which('xelatex'), 'Pandoc and XeLaTeX required')
+    def test_code_environment_probes_use_the_task_ledger_and_preserve_work_budget(self):
+        from simple_ar.code_task.execution.environment import probe_code_task_environment
+        from simple_ar.code_task.orchestration.workflow import initialize_code_task
+        from simple_ar.core.budget import BudgetLedger
+
+        task = self.base / 'probe-task.txt'
+        task.write_text('Inspect the project')
+        python = self.base / 'external-python'
+        python.symlink_to(Path(sys.executable))
+        gpu = self.base / 'nvidia-smi'
+        gpu.write_text("#!/bin/sh\nprintf 'Test GPU, 8192\\n'\n")
+        gpu.chmod(0o755)
+        which = shutil.which
+
+        def find_tool(name):
+            return str(gpu) if name == 'nvidia-smi' else which(name)
+
+        with patch('simple_ar.code_task.execution.environment.shutil.which', side_effect=find_tool):
+            with patch('simple_ar.code_task.execution.environment.subprocess.run',
+                       side_effect=AssertionError('Initialization must not launch the external interpreter')):
+                run = initialize_code_task(run_dir=self.base / 'standalone-probe', code_root=self.source,
+                    task_file=task, env_mode='external', python_executable=python)
+            report = probe_code_task_environment(run.run_dir)
+            ledger = BudgetLedger.load(run.run_dir / 'budget_ledger.json')
+            self.assertEqual([entry.purpose for entry in ledger.entries], ['code_probe', 'code_probe'])
+            self.assertTrue(all(entry.status == 'settled' for entry in ledger.entries))
+            self.assertEqual(report.gpu['devices'][0]['memory_total_mib'], 8192)
+            saved = json.loads(report.report_path.read_text())
+            self.assertNotEqual(saved['execution_policy']['python_version'], 'unknown')
+
+            nested = initialize_code_task(run_dir=self.base / 'nested-probe', code_root=self.source,
+                task_file=task, env_mode='external', python_executable=python, standalone=False)
+            parent = BudgetLedger({'process_invocations': 1, 'process_wall_seconds': 10})
+            limited = probe_code_task_environment(nested.run_dir, budget_ledger=parent,
+                session_id='original', attempt_id='probe',
+                process_protection={'process_invocations': 1, 'process_wall_seconds': 6})
+            self.assertFalse(parent.entries)
+            self.assertEqual(limited.gpu['probe'], 'budget_unavailable')
+            self.assertEqual(json.loads(limited.report_path.read_text())['execution_policy']['python_version'], 'unknown')
+
     def test_publication_uses_the_same_scope_and_records_each_process(self):
         (self.app.workspace.workspace / 'draft.md').write_text('# Report\n\nA result.\n', encoding='utf-8')
         self.app.run(actions=[action('export_report', markdown='draft.md', layout='article', compile_pdf=True)],

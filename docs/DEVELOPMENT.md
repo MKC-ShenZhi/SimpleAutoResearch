@@ -42,6 +42,8 @@ Ordinary shared actions use the task's execution records and resource accounting
 CodeTask initialization creates a ledger for standalone Python and CLI tasks;
 embedded work sets `standalone=False` and uses the enclosing task's ledger.
 Injected model clients must support the existing task-ledger binding.
+Environment inspection runs external interpreter and GPU probes through the
+task ledger; an unaffordable optional probe is reported as unmeasured.
 An explicitly enabled external agent CLI uses the shared process runner and
 task ledger. Its model usage remains unknown; it cannot run under a finite
 request or token limit until it supports enforceable accounting.

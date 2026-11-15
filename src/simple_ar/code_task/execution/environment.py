@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import importlib.util
 import os
 import platform
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from simple_ar.core.artifacts import read_json, write_json
+from simple_ar.core.budget import BudgetExceededError, BudgetLedger
+from simple_ar.code_task.runtime.accounting import account_code_task
 from simple_ar.code_task.runtime.state import (
     code_task_paths,
     load_code_task_manifest,
@@ -108,12 +111,17 @@ class CodeTaskEnvironmentResult:
     gpu: dict[str, Any] = field(default_factory=dict)
 
 
+@account_code_task
 def probe_code_task_environment(
     run_dir: Path,
     *,
     env_mode: str | None = None,
     python_executable: str | Path | None = None,
     process_scope: Any | None = None,
+    budget_ledger: BudgetLedger | None = None,
+    session_id: str = "",
+    attempt_id: str = "",
+    process_protection: Mapping[str, int | float] | None = None,
 ) -> CodeTaskEnvironmentResult:
     """Probe runtime and project environment for a code-task workspace.
 
@@ -141,6 +149,8 @@ def probe_code_task_environment(
         env_mode=env_mode,
         python_executable=python_executable,
         **({'process_scope': process_scope} if process_scope is not None else {}),
+        budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+        process_protection=process_protection,
     )
 
 
@@ -246,6 +256,10 @@ def _probe_code_task_environment(
     env_mode: str | None = None,
     python_executable: str | Path | None = None,
     process_scope: Any | None = None,
+    budget_ledger: BudgetLedger | None = None,
+    session_id: str = "",
+    attempt_id: str = "",
+    process_protection: Mapping[str, int | float] | None = None,
 ) -> CodeTaskEnvironmentResult:
     manifest = load_code_task_manifest(run_dir)
     paths = code_task_paths(run_dir)
@@ -260,13 +274,43 @@ def _probe_code_task_environment(
         python_executable=python_executable,
         **({'process_scope': process_scope} if process_scope is not None else {}),
     )
+    def run_probe(argv: list[str]):
+        """Use the task's execution boundary; a missed optional probe is not failure."""
+        if process_scope is not None:
+            try:
+                return process_scope.probe(argv, cwd=paths.workspace_dir, timeout_sec=3)
+            except BudgetExceededError:
+                return None
+        if budget_ledger is None:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=3, check=False)
+        from simple_ar.experiment.execution.backend import LocalExecutionBackend, RunRequest
+        guard = (budget_ledger.protect_remaining(process_protection, additional=True)
+                 if process_protection else nullcontext())
+        try:
+            with guard:
+                return LocalExecutionBackend(budget_ledger=budget_ledger, accounting_purpose='code_probe').run(
+                    RunRequest(argv, paths.workspace_dir, 3, label='code_probe',
+                        env=code_task_process_environment(paths.workspace_dir),
+                        output_dir=paths.meta_dir / 'probe-processes', session_id=session_id, attempt_id=attempt_id))
+        except BudgetExceededError:
+            return None
+
+    if policy.get('python_version') == 'unknown':
+        try:
+            version = run_probe([policy['python_executable'], '--version'])
+        except (OSError, subprocess.TimeoutExpired):
+            version = None
+        if version is not None and version.returncode == 0:
+            text = (version.stdout or version.stderr).strip()
+            if text:
+                policy['python_version'] = text.replace('Python ', '', 1)
     manifest = load_code_task_manifest(run_dir)
     codebase_index = _load_codebase_index(paths.meta_dir / "codebase_index.json")
     report = _build_environment_report(paths.workspace_dir, manifest, codebase_index, policy,
-        **({'scoped': True} if process_scope is not None else {}))
+        run_probe=run_probe, **({'scoped': True} if process_scope is not None else {}))
     report_path = paths.meta_dir / "environment_report.json"
     write_json(report_path, report)
-    resource_probe, resource_decision = _resource_artifacts(report)
+    resource_probe, resource_decision = _resource_artifacts(report, run_probe=run_probe)
     write_json(paths.meta_dir / "resource_probe.json", resource_probe)
     write_json(paths.meta_dir / "resource_decision.json", resource_decision)
     _update_manifest_after_probe(run_dir, manifest, report)
@@ -286,7 +330,7 @@ def _build_environment_report(
     manifest: dict[str, Any],
     codebase_index: dict[str, Any],
     policy: dict[str, Any],
-    *, scoped: bool = False,
+    *, scoped: bool = False, run_probe=None,
 ) -> dict[str, Any]:
     warnings: list[str] = []
     if not codebase_index:
@@ -296,7 +340,7 @@ def _build_environment_report(
         warnings.append("benchmark_command_missing")
 
     gpu = ({'available': False, 'count': 0, 'backend': None, 'devices': [],
-            'probe': 'task_scope_no_gpu'} if scoped else _gpu_summary(warnings))
+            'probe': 'task_scope_no_gpu'} if scoped else _gpu_summary(warnings, run_probe=run_probe))
     project = _project_summary(workspace_dir, codebase_index)
     if not project["dependency_files"]:
         warnings.append("dependency_file_not_found")
@@ -398,18 +442,9 @@ def _resolve_external_python(value: str) -> str:
 def _python_version_for_policy(mode: str, executable: str) -> str:
     if os.path.normcase(os.path.abspath(executable)) == os.path.normcase(os.path.abspath(sys.executable)):
         return platform.python_version()
-    try:
-        completed = subprocess.run(
-            [executable, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return "unknown"
-    text = (completed.stdout or completed.stderr).strip()
-    return text.replace("Python ", "", 1) if text else "unknown"
+    # Initialization selects an executable but does not run it. The optional
+    # environment probe can measure its version under the task execution owner.
+    return "unknown"
 
 
 def _platform_summary() -> dict[str, Any]:
@@ -467,7 +502,7 @@ def _execution_context_summary() -> dict[str, Any]:
     }
 
 
-def _gpu_summary(warnings: list[str]) -> dict[str, Any]:
+def _gpu_summary(warnings: list[str], *, run_probe=None) -> dict[str, Any]:
     nvidia_smi = shutil.which("nvidia-smi")
     if not nvidia_smi:
         return {
@@ -478,17 +513,9 @@ def _gpu_summary(warnings: list[str]) -> dict[str, Any]:
             "probe": "nvidia-smi_not_found",
         }
     try:
-        completed = subprocess.run(
-            [
-                nvidia_smi,
-                "--query-gpu=name,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
+        argv = [nvidia_smi, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]
+        completed = (run_probe(argv) if run_probe is not None else
+                     subprocess.run(argv, capture_output=True, text=True, timeout=3, check=False))
     except (OSError, subprocess.TimeoutExpired) as exc:
         warnings.append("gpu_probe_failed")
         return {
@@ -499,6 +526,10 @@ def _gpu_summary(warnings: list[str]) -> dict[str, Any]:
             "probe": "failed",
             "error": str(exc),
         }
+    if completed is None:
+        warnings.append('gpu_probe_not_run_budget')
+        return {'available': False, 'count': 0, 'backend': 'nvidia-smi', 'devices': [],
+            'probe': 'budget_unavailable'}
     if completed.returncode != 0:
         warnings.append("gpu_probe_failed")
         return {
@@ -622,10 +653,10 @@ def _update_manifest_after_probe(
     save_code_task_manifest(run_dir, manifest)
 
 
-def _resource_artifacts(report: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _resource_artifacts(report: dict[str, Any], *, run_probe=None) -> tuple[dict[str, Any], dict[str, Any]]:
     gpu = report.get("gpu", {}) if isinstance(report.get("gpu"), dict) else {}
     platform_info = report.get("platform", {}) if isinstance(report.get("platform"), dict) else {}
-    memory_total_mib = _system_memory_total_mib()
+    memory_total_mib = _system_memory_total_mib(run_probe=run_probe)
     probe = {
         "schema_version": "code_task_resource_probe.v1",
         "generated_at": report.get("generated_at"),
@@ -667,7 +698,8 @@ def _resource_artifacts(report: dict[str, Any]) -> tuple[dict[str, Any], dict[st
             "prefer_gpu": allow_gpu,
             "max_parallel_jobs": _recommended_parallel_jobs(profile),
             "timeout_multiplier": 2.0 if profile == "local_cpu" else 1.0,
-            "notes": _resource_notes(profile, max_gpu_memory=max_gpu_memory),
+            "notes": (["GPU availability was not measured because the optional probe had no remaining budget."]
+                if gpu.get('probe') == 'budget_unavailable' else _resource_notes(profile, max_gpu_memory=max_gpu_memory)),
         },
         "limits": {
             "observed_memory_total_mib": memory_total_mib,
@@ -701,16 +733,14 @@ def _resource_notes(profile: str, *, max_gpu_memory: int) -> list[str]:
     return ["No usable NVIDIA GPU was detected; prefer CPU-friendly smoke tests and small local datasets."]
 
 
-def _system_memory_total_mib() -> int | None:
+def _system_memory_total_mib(*, run_probe=None) -> int | None:
     try:
         if platform.system().lower() == "windows":
-            completed = subprocess.run(
-                ["wmic", "computersystem", "get", "TotalPhysicalMemory", "/value"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-            )
+            argv = ["wmic", "computersystem", "get", "TotalPhysicalMemory", "/value"]
+            completed = (run_probe(argv) if run_probe is not None else
+                         subprocess.run(argv, capture_output=True, text=True, timeout=3, check=False))
+            if completed is None:
+                return None
             for line in completed.stdout.splitlines():
                 if line.startswith("TotalPhysicalMemory="):
                     return int(int(line.split("=", 1)[1].strip()) / (1024 * 1024))
@@ -718,6 +748,6 @@ def _system_memory_total_mib() -> int | None:
             pages = os.sysconf("SC_PHYS_PAGES")
             page_size = os.sysconf("SC_PAGE_SIZE")
             return int((pages * page_size) / (1024 * 1024))
-    except Exception:
+    except (OSError, ValueError, AttributeError, subprocess.TimeoutExpired):
         return None
     return None

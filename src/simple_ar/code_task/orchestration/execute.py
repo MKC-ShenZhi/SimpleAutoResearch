@@ -313,6 +313,9 @@ def execute_code_task(
     else:
         _emit(message_callback, "Running environment and resource probe." if greenfield else "Running environment probe.")
         result = probe_code_task_environment(root, env_mode=env_mode, python_executable=python_executable,
+            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+            process_protection=({'process_invocations': 1, 'process_wall_seconds': timeout_sec}
+                if to_step != 'probe' and process_scope is None else None),
             **({'process_scope': process_scope} if process_scope is not None else {}))
         _record(steps, "probe", "done", f"wrote {result.report_path}")
         _memory_event(root, "probe", "Recorded environment and resource signals for greenfield generation."
