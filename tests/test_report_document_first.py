@@ -483,7 +483,7 @@ class DocumentFirstTests(unittest.TestCase):
             self.assertEqual(snapshot['owner'], 'direct_article.v1')
             retained_writer_bytes = {name: (owner / 'writer' / name).read_bytes()
                 for name in ('report_inputs.json', 'response.json', 'writer.json')}
-            self.assertEqual(json.loads(retained_writer_bytes['response.json']), draft)
+            self.assertEqual(json.loads(retained_writer_bytes['response.json'])['response'], draft)
             self.assertFalse((owner / 'writer/sections.json').exists())
             figure = next(row for row in snapshot['inputs']['article']['source_handles'] if row['handle'].startswith('figure:'))
             self.assertEqual(figure['metadata']['caption'], caption)
