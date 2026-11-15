@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import os
 import shlex
 import shutil
@@ -340,6 +341,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.code_task_command == "init":
             _print_code_task_init(args)
             return
+        accounted = {
+            'work-plan': _print_code_task_work_plan, 'plan': _print_code_task_plan,
+            'propose-edits': _print_code_task_propose_edits, 'repair': _print_code_task_repair,
+            'baseline': _print_code_task_baseline, 'run': _print_code_task_run,
+            'execute': _print_code_task_execute,
+        }
+        if handler := accounted.get(args.code_task_command):
+            with _code_task_accounting(Path(args.run_dir), active=not getattr(args, 'dry_run', False)) as accounting:
+                handler(args, accounting)
+            return
         if args.code_task_command == "probe":
             _print_code_task_probe(args)
             return
@@ -352,20 +363,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.code_task_command == "context":
             _print_code_task_context(args)
             return
-        if args.code_task_command == "work-plan":
-            _print_code_task_work_plan(args)
-            return
         if args.code_task_command == "batch":
             _print_code_task_batch(args)
             return
-        if args.code_task_command == "plan":
-            _print_code_task_plan(args)
-            return
         if args.code_task_command == "decide-plan":
             _print_code_task_decision(args)
-            return
-        if args.code_task_command == "propose-edits":
-            _print_code_task_propose_edits(args)
             return
         if args.code_task_command == "apply-edits":
             _print_code_task_apply_edits(args)
@@ -373,20 +375,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.code_task_command == "validate":
             _print_code_task_validate(args)
             return
-        if args.code_task_command == "baseline":
-            _print_code_task_baseline(args)
-            return
-        if args.code_task_command == "run":
-            _print_code_task_run(args)
-            return
         if args.code_task_command == "analyze-failure":
             _print_code_task_analyze_failure(args)
-            return
-        if args.code_task_command == "repair":
-            _print_code_task_repair(args)
-            return
-        if args.code_task_command == "execute":
-            _print_code_task_execute(args)
             return
         parser.error(f"Unknown code-task command: {args.code_task_command}")
 
@@ -1822,6 +1812,14 @@ def _print_code_task_init(args: argparse.Namespace) -> None:
             edit_scope_allowed_patterns=options.edit_scope_allowed_patterns,
             edit_scope_protected_patterns=options.edit_scope_protected_patterns,
         )
+        # A standalone task owns its accounting; embedded CodeTask work uses
+        # the enclosing session's ledger instead of creating another one.
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.code_task.runtime.state import load_code_task_manifest, save_code_task_manifest
+        manifest = load_code_task_manifest(run_dir)
+        manifest['code_task']['cli_accounting'] = 'standalone.v1'
+        save_code_task_manifest(run_dir, manifest)
+        BudgetLedger(storage_path=run_dir / 'budget_ledger.json').save()
     except (
         FileExistsError,
         FileNotFoundError,
@@ -1837,6 +1835,41 @@ def _print_code_task_init(args: argparse.Namespace) -> None:
         primary_metric=options.primary_metric,
         metric_directions=options.metric_directions,
     )
+    print_line(f"Resource ledger: {run_dir / 'budget_ledger.json'}")
+
+
+@contextmanager
+def _code_task_accounting(run_dir: Path, *, active: bool = True):
+    """Use a standalone task's existing ledger for one CLI action.
+
+    Historical tasks keep their original accounting contract. The shared
+    lock serializes paid/process actions, rather than giving each command
+    its own ledger or treating earlier unrecorded work as zero.
+    """
+    manifest_path = run_dir / 'manifest.json'
+    if not active or not manifest_path.is_file():
+        yield {}
+        return
+    policy = read_json(manifest_path).get('code_task', {}).get('cli_accounting')
+    if policy is None:
+        yield {}
+        return
+    if policy != 'standalone.v1':
+        raise ValueError('Unknown standalone CodeTask accounting contract')
+    path = run_dir / 'budget_ledger.json'
+    from simple_ar.core.budget import BudgetLedger
+    from simple_ar.core.locking import SessionFileLock
+    with SessionFileLock(run_dir / 'code_task' / 'meta' / 'budget.lock'):
+        yield {'budget_ledger': BudgetLedger.load(path), 'session_id': str(run_dir.resolve()),
+               'attempt_id': 'standalone'}
+
+
+def _code_task_client(accounting: dict, model: str | None, *, enabled: bool):
+    if not accounting or not enabled:
+        return None
+    from simple_ar.integrations.llm import bind_task_budget
+    return bind_task_budget(None, accounting['budget_ledger'],
+        session_id=accounting['session_id'], attempt_id=accounting['attempt_id'], model=model)
 
 
 def _code_task_init_error_message(
@@ -1997,9 +2030,10 @@ def _print_code_task_context(args: argparse.Namespace) -> None:
         print_line(read_text(result.prompt_context_path))
 
 
-def _print_code_task_work_plan(args: argparse.Namespace) -> None:
+def _print_code_task_work_plan(args: argparse.Namespace, accounting: dict) -> None:
     """Generate a batch-oriented work plan and print artifact paths."""
     try:
+        client = _code_task_client(accounting, args.model, enabled=not args.no_llm)
         result = generate_code_task_work_plan(
             Path(args.run_dir),
             model=args.model,
@@ -2010,6 +2044,7 @@ def _print_code_task_work_plan(args: argparse.Namespace) -> None:
             max_files=args.max_files,
             max_source_chars_per_file=args.max_source_chars_per_file,
             message_callback=lambda message: print_line(f"  - {message}"),
+            **({'llm_client': client} if client is not None else {}),
         )
     except LLMError as exc:
         raise SystemExit(str(exc)) from exc
@@ -2041,9 +2076,10 @@ def _print_code_task_batch(args: argparse.Namespace) -> None:
     print_line(f"Batch state: {result.batch_state_path}")
 
 
-def _print_code_task_plan(args: argparse.Namespace) -> None:
+def _print_code_task_plan(args: argparse.Namespace, accounting: dict) -> None:
     """Generate a code-task patch plan and print a compact summary."""
     try:
+        client = _code_task_client(accounting, args.model, enabled=not args.no_llm)
         result = generate_patch_plan(
             Path(args.run_dir),
             model=args.model,
@@ -2054,6 +2090,7 @@ def _print_code_task_plan(args: argparse.Namespace) -> None:
             max_files=args.max_files,
             max_source_chars_per_file=args.max_source_chars_per_file,
             message_callback=lambda message: print_line(f"  - {message}"),
+            **({'llm_client': client} if client is not None else {}),
         )
     except LLMError as exc:
         raise SystemExit(str(exc)) from exc
@@ -2079,8 +2116,9 @@ def _print_code_task_decision(args: argparse.Namespace) -> None:
     print_line("Decision log: code_task/meta/hitl_decisions.jsonl")
 
 
-def _print_code_task_propose_edits(args: argparse.Namespace) -> None:
+def _print_code_task_propose_edits(args: argparse.Namespace, accounting: dict) -> None:
     """Generate controlled edits and print a compact proposal summary."""
+    client = _code_task_client(accounting, args.model, enabled=not args.no_llm)
     result = propose_patch_edits(
         Path(args.run_dir),
         model=args.model,
@@ -2090,6 +2128,7 @@ def _print_code_task_propose_edits(args: argparse.Namespace) -> None:
         max_source_chars_per_file=args.max_source_chars_per_file,
         allow_large_edits=args.allow_large_edits,
         message_callback=lambda message: print_line(f"  - {message}"),
+        **({'llm_client': client} if client is not None else {}),
     )
     print_line(f"Code task run: {result.run_dir}")
     print_line(f"Proposed edits: {result.proposal_path}")
@@ -2135,7 +2174,7 @@ def _print_code_task_validate(args: argparse.Namespace) -> None:
     print_line(f"Warnings: {result.warning_count}")
 
 
-def _print_code_task_run(args: argparse.Namespace) -> None:
+def _print_code_task_run(args: argparse.Namespace, accounting: dict) -> None:
     """Run a code-task benchmark and print execution artifacts."""
     result = run_code_task_benchmark(
         Path(args.run_dir),
@@ -2144,6 +2183,7 @@ def _print_code_task_run(args: argparse.Namespace) -> None:
         skip_validation=args.skip_validation,
         env_mode=args.env_mode,
         python_executable=args.python_executable,
+        **accounting,
     )
     print_line(f"Code task run: {result.run_dir}")
     print_line(f"Run label: {result.label}")
@@ -2159,7 +2199,7 @@ def _print_code_task_run(args: argparse.Namespace) -> None:
             print_line(f"- {key}: {value}")
 
 
-def _print_code_task_baseline(args: argparse.Namespace) -> None:
+def _print_code_task_baseline(args: argparse.Namespace, accounting: dict) -> None:
     """Run the pre-patch benchmark and print execution artifacts."""
     result = run_code_task_baseline(
         Path(args.run_dir),
@@ -2168,6 +2208,7 @@ def _print_code_task_baseline(args: argparse.Namespace) -> None:
         skip_validation=args.skip_validation,
         env_mode=args.env_mode,
         python_executable=args.python_executable,
+        **accounting,
     )
     print_line(f"Code task run: {result.run_dir}")
     print_line(f"Baseline report: {result.report_path}")
@@ -2194,8 +2235,9 @@ def _print_code_task_analyze_failure(args: argparse.Namespace) -> None:
         print_line(f"- {path}")
 
 
-def _print_code_task_repair(args: argparse.Namespace) -> None:
+def _print_code_task_repair(args: argparse.Namespace, accounting: dict) -> None:
     """Generate a bounded repair proposal and print the review path."""
+    client = _code_task_client(accounting, args.model, enabled=not args.no_llm)
     result = propose_repair_edits(
         Path(args.run_dir),
         model=args.model,
@@ -2203,6 +2245,7 @@ def _print_code_task_repair(args: argparse.Namespace) -> None:
         max_files=args.max_files,
         max_source_chars_per_file=args.max_source_chars_per_file,
         message_callback=lambda message: print_line(f"  - {message}"),
+        **({'llm_client': client} if client is not None else {}),
     )
     print_line(f"Code task run: {result.run_dir}")
     print_line(f"Repair directory: {result.repair_dir}")
@@ -2214,7 +2257,7 @@ def _print_code_task_repair(args: argparse.Namespace) -> None:
         print_line(f"- {path}")
 
 
-def _print_code_task_execute(args: argparse.Namespace) -> None:
+def _print_code_task_execute(args: argparse.Namespace, accounting: dict) -> None:
     """Run the state-aware code-task orchestrator and render progress."""
     try:
         options = load_code_task_execute_options(config_path=args.config)
@@ -2268,10 +2311,11 @@ def _print_code_task_execute(args: argparse.Namespace) -> None:
     )
 
     def run_execute(target_step: str, *, dry_run_override: bool | None = None):
+        dry_run = args.dry_run if dry_run_override is None else dry_run_override
         return execute_code_task(
             run_dir,
             to_step=target_step,
-            dry_run=args.dry_run if dry_run_override is None else dry_run_override,
+            dry_run=dry_run,
             model=model,
             planner_model=options.planner_model,
             writer_model=options.writer_model,
@@ -2326,6 +2370,7 @@ def _print_code_task_execute(args: argparse.Namespace) -> None:
             implementation_agent_args=options.implementation_agent_args,
             implementation_agent_timeout_sec=options.implementation_agent_timeout_sec,
             message_callback=render_execute_message,
+            **accounting,
         )
 
     staged_mode = bool(args.interactive)

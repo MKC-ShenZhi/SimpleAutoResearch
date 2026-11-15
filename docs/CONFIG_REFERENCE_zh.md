@@ -510,7 +510,7 @@ init 读取项目／工作区；execute 读取执行／模型／预算。研究�
 
 <a id="execute-与-budget"></a>
 
-CodeTask 预算与研究预算分开，显式 execute CLI 优先。解释器选择不安装依赖，只解析开头裸 Python，保留其余 argv。
+新建的独立 CLI 任务将模型和基准运行用量记入任务账本，不自动设置调用次数或 token 上限。嵌入研究任务的 CodeTask 使用原研究任务账本。显式 execute CLI 优先。解释器选择不安装依赖，只解析开头裸 Python，保留其余 argv。
 
 | 字段 | 含义 | 类型与默认值 | 修改后何时生效 |
 | --- | --- | --- | --- |

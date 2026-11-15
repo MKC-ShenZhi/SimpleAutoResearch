@@ -10,6 +10,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Improved
 
 - The research retry API and CLI use the same saved task and ledger, including validated CodeTask sources; explicit resource-only continuations also retain the original ledger. Historical sessions retain their original continuation contract.
+- New standalone CodeTask CLI runs record model work and benchmark execution in the task's existing budget ledger; embedded work keeps the parent ledger.
 
 ### Fixed
 

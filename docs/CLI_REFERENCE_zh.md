@@ -856,6 +856,8 @@ simple-ar research-session-migrate --source-root OLD_SESSION --destination-root 
 
 为显式已有项目或从零创建合同准备隔离工作区。
 
+新建的独立 CLI 任务将计划、编辑、修复和 execute 的模型调用，以及 execute、baseline、run 的基准运行记入 `RUN_DIR/budget_ledger.json`。账本记录用量，不自动设置调用次数或 token 上限；旧任务保留原有记账方式。环境探测不在此范围内。
+
 ```text
 simple-ar code-task init [OPTIONS]
 ```

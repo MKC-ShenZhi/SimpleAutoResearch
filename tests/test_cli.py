@@ -659,6 +659,85 @@ code = "daily"
             self.assertEqual((first / "manifest.json").read_bytes(), original_manifest)
             self.assertTrue(all((path / "code_task/workspace/module.py").is_file() for path in runs))
 
+    def test_standalone_code_task_accounts_for_model_and_runs_in_one_ledger(self):
+        from simple_ar.core.budget import BudgetError, BudgetLedger
+        from simple_ar.core.locking import SessionBusyError, SessionFileLock
+        from simple_ar.integrations.llm import LLMClient, LLMSettings
+
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            project = root / 'project'
+            project.mkdir()
+            (project / 'module.py').write_text("print('score: 1')\n", encoding='utf-8')
+            task = root / 'task.md'
+            task.write_text('Improve the recorded computation.\n', encoding='utf-8')
+            outputs = root / 'runs'
+            main(['code-task', 'init', '--code-root', str(project), '--task-file', str(task),
+                  '--workspace-mode', 'copy', '--output-root', str(outputs),
+                  '--benchmark-command', f'{sys.executable} module.py'])
+            run = next(outputs.iterdir())
+            ledger_path = run / 'budget_ledger.json'
+            self.assertEqual(BudgetLedger.load(ledger_path).entries, ())
+
+            settings = LLMSettings(api_key='fixture', model='fixture', api_mode='chat', retry_attempts=1)
+            def client_from_env(**kwargs):
+                return LLMClient(settings, budget_ledger=kwargs['budget_ledger'],
+                    budget_session_id=kwargs['budget_session_id'], budget_attempt_id=kwargs['budget_attempt_id'])
+            response = {'summary': 'Improve the computation.', 'items': [
+                {'id': 'W1', 'objective': 'Update the computation.', 'target_files': ['module.py']}]}
+            provider = {'choices': [{'message': {'content': json.dumps(response)}}],
+                'usage': {'prompt_tokens': 5, 'completion_tokens': 3, 'total_tokens': 8}}
+            with patch.object(LLMClient, 'from_env', side_effect=client_from_env), \
+                    patch('simple_ar.integrations.llm._call_provider', return_value=provider):
+                main(['code-task', 'work-plan', str(run)])
+            main(['code-task', 'baseline', str(run), '--skip-validation'])
+            main(['code-task', 'run', str(run), '--skip-validation'])
+            ledger = BudgetLedger.load(ledger_path)
+            self.assertEqual(len(ledger.entries), 3)
+            self.assertEqual(sum(row.actual.get('llm_requests', 0) for row in ledger.entries), 1)
+            self.assertEqual(sum(row.actual.get('total_tokens', 0) for row in ledger.entries), 8)
+            self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in ledger.entries), 2)
+            self.assertTrue(all(row.status == 'settled' for row in ledger.entries))
+            self.assertEqual({row.session_id for row in ledger.entries}, {str(run.resolve())})
+            self.assertEqual({row.attempt_id for row in ledger.entries}, {'standalone'})
+            with SessionFileLock(run / 'code_task/meta/budget.lock'):
+                with self.assertRaises(SessionBusyError):
+                    main(['code-task', 'run', str(run), '--skip-validation'])
+            self.assertEqual(len(BudgetLedger.load(ledger_path).entries), 3)
+            held_ledger = run / 'budget_ledger.held.json'
+            ledger_path.rename(held_ledger)
+            try:
+                with self.assertRaises(BudgetError):
+                    main(['code-task', 'run', str(run), '--skip-validation'])
+            finally:
+                held_ledger.rename(ledger_path)
+            self.assertEqual(len(BudgetLedger.load(ledger_path).entries), 3)
+
+    def test_historical_standalone_external_ledger_keeps_its_original_identity(self):
+        from simple_ar.code_task import initialize_code_task
+        from simple_ar.core.budget import BudgetLedger
+
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            project = root / 'project'
+            project.mkdir()
+            (project / 'module.py').write_text('value = 1\n', encoding='utf-8')
+            task = root / 'task.md'
+            task.write_text('Inspect the module.\n', encoding='utf-8')
+            run = root / 'old-task'
+            initialize_code_task(run_dir=run, code_root=project, task_file=task, workspace_mode='copy')
+            ledger = BudgetLedger(storage_path=run / 'budget_ledger.json')
+            ledger.reserve('old-agent', {'llm_requests': 0, 'total_tokens': 0}, purpose='external_agent')
+            ledger.mark_unknown('old-agent', reason='Original external model usage was not reported')
+            before = (run / 'budget_ledger.json').read_bytes()
+            with patch('simple_ar.cli.main.execute_code_task') as execute, \
+                    patch('simple_ar.cli.main.render_execute_header'), \
+                    patch('simple_ar.cli.main.render_execute_result'):
+                main(['code-task', 'execute', str(run), '--no-llm', '--to-step', 'validate', '--no-review-inline'])
+            self.assertNotIn('budget_ledger', execute.call_args.kwargs)
+            self.assertNotIn('attempt_id', execute.call_args.kwargs)
+            self.assertEqual((run / 'budget_ledger.json').read_bytes(), before)
+
     def test_fixed_protocol_does_not_claim_candidate_lineage_is_missing(self):
         from simple_ar.cli.research_view import method_validation_line
         for kind in ("measurement", "reproduction"):

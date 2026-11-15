@@ -512,7 +512,7 @@ The handoff describes requested access; filesystem and network isolation depend 
 
 <a id="execute-and-budget"></a>
 
-CodeTask budget is separate from research budget. Explicit execute CLI values win. Interpreter selection installs nothing; only a leading bare Python alias is resolved, preserving other argv.
+New standalone CLI tasks retain model and benchmark usage in their own task ledger without imposing a default call or token cap. Embedded CodeTask work uses its parent research task's ledger. Explicit execute CLI values win. Interpreter selection installs nothing; only a leading bare Python alias is resolved, preserving other argv.
 
 | Field | Meaning | Type and default | Change effect |
 | --- | --- | --- | --- |

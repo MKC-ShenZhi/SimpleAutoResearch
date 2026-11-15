@@ -858,6 +858,11 @@ simple-ar research-session-migrate --source-root OLD_SESSION --destination-root 
 
 Prepare an isolated workspace for an explicit existing-project or greenfield contract.
 
+New standalone CLI tasks keep model calls from planning, editing, repair and execute,
+and benchmark runs from execute, baseline or run, in `RUN_DIR/budget_ledger.json`.
+This ledger records usage without adding a call or token limit. Older tasks retain
+their existing accounting; environment probes are not included.
+
 ```text
 simple-ar code-task init [OPTIONS]
 ```
