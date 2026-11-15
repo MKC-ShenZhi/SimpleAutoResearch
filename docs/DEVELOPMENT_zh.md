@@ -74,8 +74,9 @@ flowchart LR
 | 写作、引用与出版 | [report](../src/simple_ar/report/)、[出版工具](../src/simple_ar/tools/publication.py) |
 | 模型连接与共享记账 | [integrations](../src/simple_ar/integrations/)、[预算](../src/simple_ar/core/budget.py) |
 
-已保存会话和显式兼容 API 可能仍由 [ResearchApplication](../src/simple_ar/app/research_application.py)
-承接，沿保存的执行合同恢复。修改普通新任务时，从共同行动循环追踪调用链。
+新建 Python 研究任务使用[研究接入](../src/simple_ar/app/research_intake.py)中的
+`create_research_task` 和 `start_research_task`。已保存会话和显式兼容 API 仍可由
+[ResearchApplication](../src/simple_ar/app/research_application.py)承接，沿保存的执行合同恢复。
 
 ## 实施一项改动
 

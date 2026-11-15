@@ -403,6 +403,20 @@ def validate_material_observation(workspace: Any, reference: dict, *, identity: 
         **{key: reference[key] for key in ('record', 'receipt_sha256', 'input_index', 'source_reference') if key in reference}}
 
 
+def material_window_reference(window: dict) -> dict | None:
+    """Recover a source reference without duplicating its saved observation."""
+    reference = window.get('source_reference')
+    if (not isinstance(reference, dict) or 'record' in reference or 'data' in reference
+            or not isinstance(reference.get('request'), dict)
+            or not isinstance(reference.get('source_reference'), dict)):
+        return reference
+    data = {key: value for key, value in window.items() if key not in {
+        'review_text', 'review_next_offset_bytes', 'read_request', 'source_reference'}}
+    if reference['request'].get('start_line') is None:
+        data.pop('offset_bytes', None)
+    return {**reference, 'data': data}
+
+
 def current_text_window(workspace: Any, window: dict) -> dict:
     """Project validated reads or authored write context in the historical shape."""
     reference = window['reference']

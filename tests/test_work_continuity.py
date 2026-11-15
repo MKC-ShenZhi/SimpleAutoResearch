@@ -121,7 +121,24 @@ class SelectedWorkContinuityTests(unittest.TestCase):
         self.assertEqual(provider[0]['data']['text'], 'second\n')
         ToolApplication.load(fresh.session.store.root)
         copied = Path(fresh.state['config']['sources']['retained_delivery']) / 'workspace/selected.txt'
+        # A fresh independent check can consume the selected original window,
+        # while still checking the current bytes rather than inheriting an opinion.
+        from simple_ar.tools.materials import material_window_reference, validate_material_observation
+        digest = observation['sha256']
+        saved = {'delivery_context': {'schema_version': 'delivery_review.v3',
+                'scope_policy': 'applicable.v2', 'artifacts': {str(copied): digest}},
+            'targets': [{'subject': 'target-1', 'path': str(copied), 'sha256': digest,
+                'readable': True, 'complete': False, 'windows': []}], 'evidence': [],
+            'source_priming_policy': 'priority.v3', 'source_provenance': 'versions.v2'}
+        fresh.operations.inspection._reuse_observations(saved, [50000])
+        window, = saved['targets'][0]['windows']
+        self.assertEqual(window['text'], 'second\n')
+        reference = material_window_reference(window)
+        self.assertEqual(validate_material_observation(fresh.workspace, reference,
+            identity='fresh-review')['data']['text'], 'second\n')
         copied.write_text('later changed content')
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            validate_material_observation(fresh.workspace, reference, identity='stale-review')
         stale = material_observation_seed(workspace=fresh.workspace, inventories=None,
             provider=fresh._material_observations, roots=['retained_delivery'], context={})
         self.assertFalse(stale['observations'])

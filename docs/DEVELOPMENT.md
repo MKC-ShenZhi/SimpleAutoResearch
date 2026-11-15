@@ -142,9 +142,10 @@ the current request without adopting an earlier verdict.
 | Writing, citations and publication | [report](../src/simple_ar/report/), [publication tool](../src/simple_ar/tools/publication.py) |
 | Provider connections and shared accounting | [integrations](../src/simple_ar/integrations/), [budget](../src/simple_ar/core/budget.py) |
 
-Saved sessions and explicit compatibility APIs may still use
-[ResearchApplication](../src/simple_ar/app/research_application.py). They retain their
-recorded execution contracts. New-task changes should follow the shared action loop.
+New Python research tasks use `create_research_task` and `start_research_task` from
+[research intake](../src/simple_ar/app/research_intake.py). Saved sessions and
+explicit compatibility APIs may still use [ResearchApplication](../src/simple_ar/app/research_application.py)
+and retain their recorded execution contracts.
 
 ## Implement a change
 

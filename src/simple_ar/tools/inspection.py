@@ -1096,9 +1096,10 @@ class InspectionToolGateway:
         if (include_delivery and saved.get('source_priming_policy') in _PRIORITY_SOURCE_POLICIES
                 and not self._offered_coverage(saved)):
             source_rows.extend(row for row in [*saved['targets'], *saved['evidence']] if row not in source_rows)
+        from simple_ar.tools.materials import material_window_reference
         for row in source_rows:
             for window in row.get('windows', []):
-                reference = window.get('source_reference')
+                reference = material_window_reference(window)
                 exposed = ((row.get('path'), row.get('sha256'), window.get('offset_bytes'),
                     window.get('review_next_offset_bytes')) in supplied)
                 if reference and (row in (selected or []) or exposed) and (
@@ -1869,9 +1870,11 @@ class InspectionToolGateway:
 
         def supply(seed: dict | None) -> None:
             for observed in (seed or {}).get('observations', []):
-                if applicable and ('record' not in observed or 'content_reuse' in observed):
+                if applicable and ('content_reuse' in observed or
+                        'record' not in observed and not isinstance(observed.get('source_reference'), dict)):
                     # An inspected source needs its own original read receipt.
-                    # Equal bytes at another path do not transfer provenance.
+                    # A creation-frozen read has an explicit retained source;
+                    # equal bytes at another path do not transfer provenance.
                     continue
                 data, request = observed['data'], observed['request']
                 path = data.get('absolute_path') or data.get('path') or request['path']
