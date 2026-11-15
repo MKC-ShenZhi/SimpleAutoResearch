@@ -330,7 +330,7 @@ def _build_environment_report(
     manifest: dict[str, Any],
     codebase_index: dict[str, Any],
     policy: dict[str, Any],
-    *, scoped: bool = False, run_probe=None,
+    *, run_probe, scoped: bool = False,
 ) -> dict[str, Any]:
     warnings: list[str] = []
     if not codebase_index:
@@ -453,8 +453,21 @@ def _platform_summary() -> dict[str, Any]:
         "release": platform.release(),
         "version": platform.version(),
         "machine": platform.machine(),
-        "processor": platform.processor(),
+        "processor": _processor_name(),
     }
+
+
+def _processor_name() -> str:
+    """Use existing host facts without platform.processor's hidden subprocess."""
+    if sys.platform.startswith('linux'):
+        try:
+            for line in Path('/proc/cpuinfo').read_text(encoding='utf-8').splitlines():
+                name, separator, value = line.partition(':')
+                if separator and name.strip().lower() in {'model name', 'hardware', 'cpu model'}:
+                    return value.strip()
+        except OSError:
+            pass
+    return os.environ.get('PROCESSOR_IDENTIFIER', '')
 
 
 def _python_summary() -> dict[str, Any]:
@@ -502,7 +515,7 @@ def _execution_context_summary() -> dict[str, Any]:
     }
 
 
-def _gpu_summary(warnings: list[str], *, run_probe=None) -> dict[str, Any]:
+def _gpu_summary(warnings: list[str], *, run_probe) -> dict[str, Any]:
     nvidia_smi = shutil.which("nvidia-smi")
     if not nvidia_smi:
         return {
@@ -514,8 +527,7 @@ def _gpu_summary(warnings: list[str], *, run_probe=None) -> dict[str, Any]:
         }
     try:
         argv = [nvidia_smi, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]
-        completed = (run_probe(argv) if run_probe is not None else
-                     subprocess.run(argv, capture_output=True, text=True, timeout=3, check=False))
+        completed = run_probe(argv)
     except (OSError, subprocess.TimeoutExpired) as exc:
         warnings.append("gpu_probe_failed")
         return {
@@ -653,7 +665,7 @@ def _update_manifest_after_probe(
     save_code_task_manifest(run_dir, manifest)
 
 
-def _resource_artifacts(report: dict[str, Any], *, run_probe=None) -> tuple[dict[str, Any], dict[str, Any]]:
+def _resource_artifacts(report: dict[str, Any], *, run_probe) -> tuple[dict[str, Any], dict[str, Any]]:
     gpu = report.get("gpu", {}) if isinstance(report.get("gpu"), dict) else {}
     platform_info = report.get("platform", {}) if isinstance(report.get("platform"), dict) else {}
     memory_total_mib = _system_memory_total_mib(run_probe=run_probe)
@@ -733,12 +745,11 @@ def _resource_notes(profile: str, *, max_gpu_memory: int) -> list[str]:
     return ["No usable NVIDIA GPU was detected; prefer CPU-friendly smoke tests and small local datasets."]
 
 
-def _system_memory_total_mib(*, run_probe=None) -> int | None:
+def _system_memory_total_mib(*, run_probe) -> int | None:
     try:
         if platform.system().lower() == "windows":
             argv = ["wmic", "computersystem", "get", "TotalPhysicalMemory", "/value"]
-            completed = (run_probe(argv) if run_probe is not None else
-                         subprocess.run(argv, capture_output=True, text=True, timeout=3, check=False))
+            completed = run_probe(argv)
             if completed is None:
                 return None
             for line in completed.stdout.splitlines():

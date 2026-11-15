@@ -335,7 +335,8 @@ class WorkspaceExecutionTests(unittest.TestCase):
                        side_effect=AssertionError('Initialization must not launch the external interpreter')):
                 run = initialize_code_task(run_dir=self.base / 'standalone-probe', code_root=self.source,
                     task_file=task, env_mode='external', python_executable=python)
-            report = probe_code_task_environment(run.run_dir)
+            with patch('subprocess.check_output', side_effect=AssertionError('Unaccounted platform probe')):
+                report = probe_code_task_environment(run.run_dir)
             ledger = BudgetLedger.load(run.run_dir / 'budget_ledger.json')
             self.assertEqual([entry.purpose for entry in ledger.entries], ['code_probe', 'code_probe'])
             self.assertTrue(all(entry.status == 'settled' for entry in ledger.entries))
