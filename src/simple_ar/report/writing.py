@@ -85,6 +85,10 @@ ARTICLE_PARAGRAPH_EDIT_SYSTEM = ARTICLE_EDIT_SYSTEM.replace(
     'Alternatively an individual edit may use exactly {old_text, new_text} for an exact unique span. '
     'Never mix selector fields in one edit. Targets must be distinct and must not intersect. '
     'All edits refer to the original body, not earlier replacements. ')
+ARTICLE_FLEXIBLE_EDIT_SYSTEM = ARTICLE_PARAGRAPH_EDIT_SYSTEM.replace(
+    'Do not return draft_markdown. Optionally include source_notes ',
+    'Alternatively, when restructuring requires it, return {"draft_markdown": "complete revised article"} '
+    'instead of replacements; preserve unaffected work where appropriate. Optionally include source_notes ')
 
 
 def provided_caption_bindings(binding: dict[str, Any]) -> dict[str, str]:
@@ -101,9 +105,11 @@ def provided_caption_bindings(binding: dict[str, Any]) -> dict[str, str]:
     return captions
 
 
-def _article_system(inputs: dict, *, editing: bool, edit_contract: dict) -> str:
+def _article_system(inputs: dict, *, editing: bool, edit_contract: dict,
+                    flexible_revision: bool = False) -> str:
     system = ((ARTICLE_EDIT_SYSTEM if edit_contract['version'] == 'exact_replacements.v1'
-        else ARTICLE_PARAGRAPH_EDIT_SYSTEM) if editing else ARTICLE_SYSTEM)
+        else ARTICLE_FLEXIBLE_EDIT_SYSTEM if flexible_revision else ARTICLE_PARAGRAPH_EDIT_SYSTEM)
+        if editing else ARTICLE_SYSTEM)
     if inputs['article'].get('publication_caption_contract') == SUPPLIED_CAPTION_CONTRACT:
         system = system.replace(
             'Use supplied figures when relevant as standalone Markdown images, with the exact '
@@ -652,7 +658,8 @@ def retained_writing_client(*, store: ArtifactStore, identity: str, client: Any,
 def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
                         client: Any = None, recovering: bool = False,
                         resume_store: ArtifactStore | None = None, edit_prior: bool = True,
-                        edit_contract_version: str = 'paragraph_replacements.v2') -> dict[str, Any]:
+                        edit_contract_version: str = 'paragraph_replacements.v2',
+                        flexible_revision: bool = False) -> dict[str, Any]:
     """One logical article call using shared transport policy; recovery never calls."""
     def digest(value: Any) -> str:
         return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
@@ -703,7 +710,8 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
             expected_keys.add('response_record_contract')
         if isinstance(snapshot, dict) and 'prompt_contract' in snapshot:
             expected_keys.add('prompt_contract')
-            if snapshot['prompt_contract'] not in {'article_delivery_once.v1', 'article_authoring_evidence.v1'}:
+            if snapshot['prompt_contract'] not in {'article_delivery_once.v1', 'article_authoring_evidence.v1',
+                    'article_authoring_evidence.v2'}:
                 raise ValueError('Unknown article prompt contract')
         if (not isinstance(snapshot, dict)
                 or set(snapshot) != expected_keys
@@ -725,9 +733,11 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
         if client is None:
             raise ValueError('Report writing requires an LLM client; no offline paper is invented.')
         editing = bool(prior) and edit_prior
-        system = _article_system(inputs, editing=editing, edit_contract=edit_contract)
+        system = _article_system(inputs, editing=editing, edit_contract=edit_contract,
+            flexible_revision=flexible_revision)
         snapshot = {'owner': ARTICLE_OWNER, 'source_attempt': identity, 'system': system, 'inputs': inputs,
-            'prompt_contract': 'article_authoring_evidence.v1', 'response_record_contract': 'atomic_complete.v1'}
+            'prompt_contract': 'article_authoring_evidence.v2' if flexible_revision else 'article_authoring_evidence.v1',
+            'response_record_contract': 'atomic_complete.v1'}
         if edit_prior:
             # Freeze correction policy on the first request, even for a full-body initial draft.
             snapshot['edit_contract'] = edit_contract
@@ -770,7 +780,9 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
             label='composition-article', budget_call_id=f'{identity}:article', **output_limit))
     # Persist the original response before any contract or assembly validation.
     if not supplied:
-        if editing:
+        complete_revision = (editing and snapshot.get('prompt_contract') == 'article_authoring_evidence.v2'
+            and isinstance(response, dict) and 'draft_markdown' in response)
+        if editing and not complete_revision:
             markdown = _apply_article_replacements(response, edit_contract, prior)
         elif (not isinstance(response, dict) or 'draft_markdown' not in response
                 or set(response) - {'draft_markdown', 'source_notes'}
@@ -1096,6 +1108,7 @@ class ReportWritingRequest:
     output_outline: Sequence[dict[str, Any]] = ()
     publication_view: Callable[[dict], dict] | None = None
     source_reader: Callable[[str], list | None] | None = None
+    flexible_article_revision: bool = False
 
 
 def _fixed_section_memory(memory: ReportMemory, outline: Sequence[dict[str, Any]],
@@ -2508,6 +2521,7 @@ def _edit_article(*, store: ArtifactStore, retained: ArtifactStore, written: dic
             edit_prior='edit_contract' in source.read_json('report_inputs.json'),
             edit_contract_version=source.read_json('report_inputs.json').get('edit_contract', {}).get(
                 'version', 'paragraph_replacements.v2'),
+            flexible_revision=source.read_json('report_inputs.json').get('prompt_contract') == 'article_authoring_evidence.v2',
             resume_store=prior if not revision.exists('report_inputs.json') and prior.exists('report_inputs.json') else None)
 
     def draft(event: ReportIterationRecord, baseline: list[ReportSectionDraft]) -> list[ReportSectionDraft]:
@@ -2651,7 +2665,8 @@ def _run_article_writing(*, context: CapabilityContext, request: ReportWritingRe
         inputs['pending_constraints'] = True
     written = write_whole_article(store=context.store, inputs=inputs, identity=context.attempt.attempt_id,
         client=request.llm_client, recovering=context.store.exists('report_inputs.json'),
-        resume_store=ArtifactStore(context.require_input(request.resume_ref).parent) if request.resume_ref else None)
+        resume_store=ArtifactStore(context.require_input(request.resume_ref).parent) if request.resume_ref else None,
+        flexible_revision=request.flexible_article_revision)
     if article_inspection_enabled(config) and 'memory' not in written:
         written = {**written, 'memory': request.memory.model_dump(mode='json')}
     writer_path, status, diagnostics = 'writer.json', 'completed', ('Whole article drafted without independent writing review or source backtracking.',)

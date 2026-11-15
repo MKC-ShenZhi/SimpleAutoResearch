@@ -1833,8 +1833,9 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     self.assertEqual(calls, ['original:review', 'original:review-format-correction'])
 
     def test_article_corrections_use_complete_candidates_and_retained_producers(self):
-        for constrained, reject, rounds in ((False, False, 1), (True, False, 1), (False, True, 1), (False, True, 2)):
-            with self.subTest(constrained=constrained, reject=reject, rounds=rounds), tempfile.TemporaryDirectory() as tmp:
+        for constrained, reject, rounds, flexible in ((False, False, 1, False), (True, False, 1, False),
+                (False, True, 1, False), (False, True, 2, False), (False, False, 1, True)):
+            with self.subTest(constrained=constrained, reject=reject, rounds=rounds, flexible=flexible), tempfile.TemporaryDirectory() as tmp:
                 calls = []
                 initial = 'Initial explanation.' if not constrained else '## Wrong\n\nInitial explanation.'
                 revised = 'Corrected explanation.' if not constrained else '## Observations\n\nCorrected explanation.\n\n## Limits\n\nSupplied conditions.'
@@ -1846,6 +1847,10 @@ class StructuredArticleWritingTests(unittest.TestCase):
                             if len(calls) > 1:
                                 self_outer.assertEqual(view['prior_draft'], initial if len(calls) == 3 else revised)
                                 self_outer.assertIn('not source facts', view['revision_findings']['status'])
+                                if flexible:
+                                    self_outer.assertIn('draft_markdown', system)
+                                    self_outer.assertNotIn('Do not return draft_markdown', system)
+                                    return {'draft_markdown': revised}
                                 return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
                                     'replacements': [{'old_text': initial, 'new_text': revised}]
                                         if view['prior_draft'] == initial else []}
@@ -1863,6 +1868,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
                 request = replace(request, config=request.config.model_copy(update={'reviewer': 'llm',
                     'document_review': True, 'review_scope': 'document', 'draft_scope': 'document',
                     'max_review_iterations': rounds, 'outline_strategy': 'template' if constrained else 'auto'}),
+                    flexible_article_revision=flexible,
                     memory=request.memory.model_copy(update={'section_plan': [
                         ReportSectionPlan(section_id='observations', heading='Observations', goal='Explain the observations', final_order=1),
                         ReportSectionPlan(section_id='limits', heading='Limits', goal='Explain their limits', final_order=2)]}))
@@ -1879,8 +1885,11 @@ class StructuredArticleWritingTests(unittest.TestCase):
                 revision = store.read_json('review/revision-1/report_inputs.json')
                 self.assertEqual(revision['response_record_contract'], 'atomic_complete.v1')
                 self.assertNotEqual(revision['system'], store.read_json('report_inputs.json')['system'])
-                self.assertEqual(store.read_json('review/revision-1/response.json')['response']['replacements'],
-                    [{'old_text': initial, 'new_text': revised}])
+                response = store.read_json('review/revision-1/response.json')['response']
+                if flexible:
+                    self.assertEqual(response['draft_markdown'], revised)
+                else:
+                    self.assertEqual(response['replacements'], [{'old_text': initial, 'new_text': revised}])
                 ref = result.artifacts[0]
                 target = ArtifactStore(Path(tmp) / 'resumed')
                 recovered = run_report_writing_capability(context=CapabilityContext(target, AttemptManifest('resumed'),

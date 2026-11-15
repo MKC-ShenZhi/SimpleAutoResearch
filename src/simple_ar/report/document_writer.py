@@ -148,7 +148,7 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
             inputs=(documents_ref, *((resume,) if resume else ())), input_store=store), request=ReportWritingRequest(report_context=context,
                 memory=memory, config=config, template=template, llm_client=writer_client,
                 method=requirement['method'], prior_draft=prior_draft, output_outline=requirement['outline'],
-                resume_ref=resume, source_reader=read_source))
+                resume_ref=resume, source_reader=read_source, flexible_article_revision=current_work))
         writer_ref = next((row for row in reversed(result.artifacts) if row.kind == 'report_writer_result'), None)
         if writer_ref is None:
             raise ValueError('Report writing has no complete candidate; retain its checkpoint: ' + '; '.join(result.diagnostics))

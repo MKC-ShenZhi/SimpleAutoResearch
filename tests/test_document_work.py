@@ -316,7 +316,7 @@ class DocumentWorkTests(unittest.TestCase):
                 if label == 'document-work-1':
                     response = {'action': 'write', 'title': 'Explanation', 'selected_observation_ids': []}
                 elif label == 'composition-article':
-                    response = article_revision(json.loads(prompt), '# Explanation\n\nA clearer explanation.')
+                    response = {'draft_markdown': '# Explanation\n\nA clearer explanation.'}
                 else:
                     raise AssertionError(label)
                 self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
@@ -332,6 +332,12 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertNotIn('[@', result.data['markdown'])
         self.assertEqual((workspace.resolve(result.data['manuscript']).parent / 'references.bib')
             .read_text(encoding='utf-8'), bibliography)
+        before = ledger.to_dict()
+        replay = gateway.call('work_document', {'goal': 'Clarify the supplied prose',
+            'prior_draft': str(previous / 'manuscript.md')}, identity='uncited')
+        self.assertTrue(replay.ok, replay.error)
+        self.assertEqual(replay.data['markdown'], result.data['markdown'])
+        self.assertEqual(ledger.to_dict(), before)
 
     def test_common_section_writer_can_read_an_unselected_passage_of_selected_source(self):
         from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
