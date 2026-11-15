@@ -1149,8 +1149,7 @@ def _print_common_research_report(args: argparse.Namespace) -> None:
         app = ToolApplication.load(root)
         if args.model is not None and args.model != app.state['config'].get('model'):
             raise ValueError('The common session retains its saved model; research-report cannot switch it.')
-        projection = app._report_projection()
-        saved = projection['requirement'] if projection['kind'] == 'report' else None
+        saved = app.current_report_requirement()
         explicit = getattr(args, '_explicit_resume_destinations', set())
         status = app.session.manifest.status
         settings = report_settings(args, explicit_destinations=explicit if saved is not None else None)

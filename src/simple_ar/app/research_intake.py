@@ -182,11 +182,10 @@ def revise_research_task(app: Any, *, research_settings: Mapping[str, Any] | Non
         if independent_review_required != saved.get('independent_review_required', False):
             changes['independent_review_required'] = independent_review_required
     if report_requested is False:
-        if saved.get('report_requirement') is not None or app._report_projection()['kind'] == 'report':
+        if app.current_report_requirement() is not None:
             changes['report_requirement'] = None
     elif report_requested or report_settings is not None or report_method is not None:
-        if (report_requested is not True and saved.get('report_requirement') is None
-                and app._report_projection()['kind'] != 'report'):
+        if report_requested is not True and app.current_report_requirement() is None:
             raise ValueError('Report settings require an existing or explicitly requested report')
         requirement = app.report_revision(dict(report_settings or {}), method=report_method)
         if requirement is not None:

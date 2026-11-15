@@ -2320,6 +2320,14 @@ class ToolApplication:
         return {'parent_attempt_id': parent, 'observation': observed, 'analysis': analysis,
             'missing_conditions': missing_conditions, 'task': snapshot}
 
+    def current_report_requirement(self) -> dict[str, Any] | None:
+        """Return the saved or declared report contract for its actual consumers."""
+        saved = self.state['config'].get('report_requirement')
+        if saved is None:
+            projection = self._report_projection()
+            saved = projection['requirement'] if projection['kind'] == 'report' else None
+        return deepcopy(saved) if saved is not None else None
+
     def report_revision(self, settings: dict[str, Any], *, refresh: bool = False,
                         method: str | None = None) -> dict[str, Any] | None:
         """Resolve a requested report against the retained Writer contract."""
@@ -2328,9 +2336,7 @@ class ToolApplication:
         config = self.state['config']
         if config.get('model') is None:
             raise ValueError('Bind a model and its budget to the saved task before requesting a report')
-        frozen = config.get('report_requirement')
-        projection = self._report_projection()
-        saved = frozen or (projection['requirement'] if projection['kind'] == 'report' else None)
+        saved = self.current_report_requirement()
         if saved is None:
             requirement = freeze_report_requirement(settings, method=method or 'sections')
         else:
