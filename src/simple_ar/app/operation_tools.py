@@ -419,7 +419,8 @@ class OperationTools:
                 execution_observations=execution_observations if not exact else None,
                 work_context=work_context if not exact or config.get('code_work_policy') in {'shared.v1', 'shared.v2'} else None,
                 code_work_policy=config.get('code_work_policy') if exact else None,
-                defer_code_review=config.get('code_review_policy') == 'delivery.v1',
+                defer_code_review=config.get('code_review_policy') in {'delivery.v1', 'delivery.v2'},
+                defer_greenfield_review=config.get('code_review_policy') == 'delivery.v2',
                 direct_code_edit=config.get('code_implementation_policy') == 'direct.v1',
                 sandboxed_execution=(config.get('sandbox_execution', False)
                     and config.get('sandbox_operations') == 'workspace.v1'),
@@ -434,7 +435,8 @@ class OperationTools:
                     if exact else None)
             self.registry.register_package(implementation_tool_specs(exact=exact,preparation_only=not exact,
                 source_owner_contract=source_owner, sandboxed_execution=self.implementation.sandboxed_execution,
-                defer_code_review=self.implementation.defer_code_review),
+                defer_code_review=self.implementation.defer_code_review,
+                defer_greenfield_review=self.implementation.defer_greenfield_review),
                 self.implementation,request_visible=True)
             if source_owner == 'source_owner.v3':
                 # The common queue invokes this primitive for the admitted source

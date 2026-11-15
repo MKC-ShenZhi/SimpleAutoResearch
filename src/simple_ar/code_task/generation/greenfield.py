@@ -197,6 +197,7 @@ def generate_greenfield_code_task(
     writer_model: str | None = None,
     reviewer_model: str | None = None,
     use_llm: bool = True,
+    review_use_llm: bool | None = None,
     max_files: int = 8,
     max_generated_lines: int = 1600,
     max_source_chars_per_file: int = 4000,
@@ -312,11 +313,12 @@ def generate_greenfield_code_task(
         allow_fallback=allow_planning_fallback,
         message_callback=message_callback,
     )
+    model_review = use_llm if review_use_llm is None else use_llm and review_use_llm
     reviewer_client = _llm_client(
         paths.meta_dir,
         llm_client=llm_client,
         model=reviewer_model or model,
-        use_llm=use_llm,
+        use_llm=model_review,
         allow_fallback=allow_planning_fallback,
         message_callback=message_callback,
     )
@@ -516,6 +518,7 @@ def generate_greenfield_code_task(
         implementation_memory=memory,
         architecture_plan=architecture,
         client=reviewer_client,
+        use_llm=model_review,
         meta_dir=paths.meta_dir,
     )
     review_report_path = paths.meta_dir / "review_report.json"

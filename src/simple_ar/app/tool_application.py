@@ -502,8 +502,8 @@ class ToolApplication:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
         if config.get('delivery_review_selection') not in {None, *MODEL_REVIEW_SELECTIONS}:
             raise ValueError('Unsupported saved delivery review selection')
-        if (config.get('code_review_policy') not in {None, 'delivery.v1'}
-                or config.get('code_review_policy') == 'delivery.v1' and (
+        if (config.get('code_review_policy') not in {None, 'delivery.v1', 'delivery.v2'}
+                or config.get('code_review_policy') in {'delivery.v1', 'delivery.v2'} and (
                     config.get('code_work_policy') != 'shared.v2'
                     or config.get('delivery_review_protocol') != 'task.v5'
                     or config.get('delivery_review_selection') in MODEL_REVIEW_SELECTIONS
@@ -2052,7 +2052,8 @@ class ToolApplication:
             # New exact-code tasks already require a whole-delivery review.
             # Keep deterministic patch checks in CodeTask; its advisory model
             # review belongs to that one independent owner instead.
-            config['code_review_policy'] = 'delivery.v1'
+            preparation = config['code_task'].get('preparation') or {}
+            config['code_review_policy'] = 'delivery.v2' if preparation.get('kind') == 'greenfield' else 'delivery.v1'
         if config.get('code_task') is not None or config.get('report_requirement') is not None:
             # Structured analysis/measurement tasks need the same frozen
             # report requirements at the actual document-work consumer.
@@ -2547,14 +2548,15 @@ class ToolApplication:
                 if (config.get('delivery_review_protocol') == 'task.v5'
                         and (old.get('delivery_review_selection') not in MODEL_REVIEW_SELECTIONS
                              or config.get('independent_review_required'))):
-                    config['code_review_policy'] = 'delivery.v1'
+                    preparation = (config['code_task'].get('preparation') or {})
+                    config['code_review_policy'] = 'delivery.v2' if preparation.get('kind') == 'greenfield' else 'delivery.v1'
                 else:
                     config['code_review_policy'] = None
             elif 'code_task' in supplied and supplied['code_task'] is None:
                 config['code_work_policy'] = config['code_review_policy'] = config['code_implementation_policy'] = None
             if (supplied.get('independent_review_required') is False
                     and old.get('delivery_review_selection') in MODEL_REVIEW_SELECTIONS
-                    and old.get('code_review_policy') == 'delivery.v1'):
+                    and old.get('code_review_policy') in {'delivery.v1', 'delivery.v2'}):
                 config['code_review_policy'] = None
             if old.get('source_snapshots'):
                 config['source_snapshots'] = {name: value for name, value in old['source_snapshots'].items()

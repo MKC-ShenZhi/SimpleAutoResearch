@@ -239,7 +239,8 @@ def implementation_tool_specs(*, exact: bool = False,
                               preparation_only: bool = False,
                               source_owner_contract: str | None = None,
                               sandboxed_execution: bool = False,
-                              defer_code_review: bool = False) -> list[CommonToolSpec]:
+                              defer_code_review: bool = False,
+                              defer_greenfield_review: bool = False) -> list[CommonToolSpec]:
     _source_owner_options(source_owner_contract, preparation_only=preparation_only, exact=exact)
     if exact and preparation_only:
         raise ValueError('Preparation-only source generation cannot use the exact code-task contract')
@@ -252,7 +253,9 @@ def implementation_tool_specs(*, exact: bool = False,
             permission_level='execution', risk_level='high',
             input_schema=ExactCodeWork.model_json_schema(),
             description='Implement the frozen scoped code task using its approved isolated-workspace preparation, CodeTask investigation, edit/protected-file gates and declared validator. '
-                + ('Existing-project model review belongs to the independent task delivery review; new-project work retains its own project review. '
+                + (('Advisory model review belongs to the independent task delivery review. '
+                    if defer_greenfield_review else
+                    'Existing-project model review belongs to the independent task delivery review; new-project work retains its own project review. ')
                    if defer_code_review else 'CodeTask also performs its own independent review. ')
                 + 'Uses this task budget and attempt. Optional instruction/prior_result support feedback on the existing candidate; no arguments change scope, preparation or validator. '
                 + ('Work contained by the task workspace isolation uses its grant; other source or environment work requires explicit approval. '
@@ -581,6 +584,7 @@ class ImplementationToolGateway:
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
                  code_work_policy: str | None = None,
                  defer_code_review: bool = False,
+                 defer_greenfield_review: bool = False,
                  direct_code_edit: bool = False,
                  sandboxed_execution: bool = False,
                  declaration_review: bool = False,
@@ -633,6 +637,7 @@ class ImplementationToolGateway:
         self.work_context = work_context
         self.code_work_policy = code_work_policy
         self.defer_code_review = defer_code_review
+        self.defer_greenfield_review = defer_greenfield_review
         self.direct_code_edit = direct_code_edit
         self.sandboxed_execution = sandboxed_execution
         self.material_observations = material_observations
@@ -1286,6 +1291,7 @@ class ImplementationToolGateway:
                 protocol=manifest['code_task']['native_protocol'],
                 handoff_policy=self.code_work_policy,
                 defer_model_review=self.defer_code_review,
+                defer_greenfield_review=self.defer_greenfield_review,
                 direct_edit=self.direct_code_edit,
                 **({'process_scope': process_scope} if process_scope is not None else {}),
                 **(contract.edit_policy or {}),
@@ -1726,7 +1732,8 @@ class ImplementationToolGateway:
         candidate = code_task_paths(run).workspace_dir.resolve()
         if not any(self.workspace.resolve(path).is_relative_to(candidate) for path in artifacts):
             raise ValueError('Exact delivery must include the verified candidate, not only unrelated artifacts')
-        if self.defer_code_review and manifest.get('code_task', {}).get('kind') != 'greenfield':
+        if self.defer_code_review and (self.defer_greenfield_review
+                or manifest.get('code_task', {}).get('kind') != 'greenfield'):
             original = native_workspace_binding(manifest, candidate)['file_hashes']
             changed = [name for name, digest in payload['implementation_file_hashes'].items()
                        if original.get(name) != digest]

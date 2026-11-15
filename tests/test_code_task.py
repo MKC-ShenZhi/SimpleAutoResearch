@@ -6616,9 +6616,10 @@ class GenerationAuthorizationTests(unittest.TestCase):
 
         if sys.platform.startswith('linux') and shutil.which('bwrap'):
             with self.subTest(workspace='empty', execution='isolated'):
-                self._exact_greenfield_generation_feedback('empty', failed_baseline=False, isolated=True)
+                self._exact_greenfield_generation_feedback('empty', failed_baseline=False,
+                    isolated=True, deferred_review=True)
 
-    def _exact_greenfield_generation_feedback(self, mode, *, failed_baseline, isolated=False):
+    def _exact_greenfield_generation_feedback(self, mode, *, failed_baseline, isolated=False, deferred_review=False):
         from simple_ar.app.tool_application import ToolApplication
         from simple_ar.tools.implementation import ImplementationToolGateway
         from simple_ar.tools.scientific import ScientificToolGateway
@@ -6688,7 +6689,8 @@ class GenerationAuthorizationTests(unittest.TestCase):
             owner = ImplementationToolGateway(root, workspace, ledger, 'fixture', 'same-task',
                 exact=contract, client_factory=lambda _: fake, measurement=measurement,
                 **({'code_work_policy': 'shared.v2', 'work_context': lambda _: {'user_requests': [contract['goal']]},
-                    'sandboxed_execution': True} if isolated else {}))
+                    'sandboxed_execution': True, 'defer_code_review': deferred_review,
+                    'defer_greenfield_review': deferred_review} if isolated else {}))
             science = ScientificToolGateway(root, workspace, ledger, 'same-task', implementation=owner,
                 execution_contract=measurement, sandboxed_execution=isolated)
             measured = []
@@ -6792,6 +6794,12 @@ class GenerationAuthorizationTests(unittest.TestCase):
                     self.assertIn('generation_architecture_plan', result.data['artifact_refs'])
                     self.assertEqual(result.data['validation']['status'], 'passed')
                     self.assertEqual(result.data['validation']['metrics'], {})  # Compile/API validation is not a measured score.
+                    if deferred_review and number == 1:
+                        self.assertFalse(any(label.startswith('greenfield-code-review-') for label in labels))
+                        candidate = result.data['project_path']
+                        with self.assertRaisesRegex(ValueError, 'changed code for independent review'):
+                            owner.check_delivery(result.data, [candidate + '/generated_project/main.py'])
+                        owner.check_delivery(result.data, [candidate])
                     from simple_ar.code_task.generation.greenfield import result_schema_from_manifest, _benchmark_command
                     self.assertEqual(result_schema_from_manifest(manifest)['primary_metric'], 'score')
                     self.assertIn('generated_project/main.py', _benchmark_command(manifest))

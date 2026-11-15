@@ -3660,6 +3660,26 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(current.state['config']['report_protocol'], 'canonical_report.v1')
         self.assertEqual(current._report_projection()['kind'], 'none')
 
+    def test_new_greenfield_delegates_review_but_saved_review_contract_stays_unchanged(self):
+        contract = {'project_path': '', 'goal': 'Build a small research utility',
+            'allowed_patterns': ['generated_project/**'],
+            'validation_command': ['python', '-m', 'compileall', 'generated_project'],
+            'preparation': {'kind': 'greenfield', 'workspace_mode': 'empty'}}
+        root, _, _, binding, app, _ = self._native_fixture(code_task=contract, mount_inputs=False)
+        self.assertEqual(app.state['config']['code_review_policy'], 'delivery.v2')
+        self.assertTrue(app.operations.implementation.defer_greenfield_review)
+        from tests.native_history_fixture import load_prepared_operation_history
+        restored = load_prepared_operation_history(root / 'saved-greenfield', contract['goal'], config={
+            'model': 'fixture', 'model_connection': binding, 'sources': {}, 'allow_execution': True,
+            'code_task': app.state['config']['code_task'], 'code_work_policy': 'shared.v2',
+            'code_implementation_policy': 'direct.v1', 'code_review_policy': 'delivery.v1',
+            'delivery_review_protocol': 'task.v5'},
+            limits={'llm_requests': 4, 'total_tokens': 100000, 'process_invocations': 8,
+                'process_wall_seconds': 120})
+        self.assertEqual(restored.state['config']['code_review_policy'], 'delivery.v1')
+        self.assertTrue(restored.operations.implementation.defer_code_review)
+        self.assertFalse(restored.operations.implementation.defer_greenfield_review)
+
     def test_report_request_retains_compatible_history_and_supersedes_conversion(self):
         for kind in ('conversion', 'none', 'report'):
             with self.subTest(previous=kind):

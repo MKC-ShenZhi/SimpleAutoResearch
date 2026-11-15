@@ -288,12 +288,29 @@ def execute_code_task(
         direct_edit = direct_edit_available(manifest, paths.task_dir, to_step=to_step, use_llm=use_llm)
     ensure_task_memory(root)
     steps: list[ExecuteStepRecord] = []
-    if (_code_task_kind(manifest) == "greenfield"
-            and manifest.get('implementation', {}).get('mode') != 'controlled_patch'):
-        if process_scope is not None:
-            from simple_ar.code_task.generation.agent_backend import should_use_agent_backend
-            if should_use_agent_backend(implementation_provider):
-                raise ValueError('External agent execution requires its own explicit approval')
+    greenfield = (_code_task_kind(manifest) == "greenfield"
+        and manifest.get('implementation', {}).get('mode') != 'controlled_patch')
+    if greenfield and process_scope is not None:
+        from simple_ar.code_task.generation.agent_backend import should_use_agent_backend
+        if should_use_agent_backend(implementation_provider):
+            raise ValueError('External agent execution requires its own explicit approval')
+    if _environment_report_exists(paths):
+        _record(steps, "probe", "skipped", "environment_report.json already exists")
+    elif dry_run:
+        return _dry_result(paths, steps, "probe", "record environment and resource signals" if greenfield
+            else "record environment signals")
+    else:
+        _emit(message_callback, "Running environment and resource probe." if greenfield else "Running environment probe.")
+        result = probe_code_task_environment(root, env_mode=env_mode, python_executable=python_executable,
+            **({'process_scope': process_scope} if process_scope is not None else {}))
+        _record(steps, "probe", "done", f"wrote {result.report_path}")
+        _memory_event(root, "probe", "Recorded environment and resource signals for greenfield generation."
+            if greenfield else "Recorded environment and dependency signals.", status="done",
+            artifacts=[_relative_to_run(root, result.report_path),
+                *(["code_task/meta/resource_probe.json", "code_task/meta/resource_decision.json"] if greenfield else [])])
+    if to_step == "probe":
+        return _result(paths, steps, "stop_point", "Stopped after probe as requested.")
+    if greenfield:
         return _execute_greenfield_code_task(
             root,
             paths,
@@ -309,6 +326,7 @@ def execute_code_task(
             reviewer_model=reviewer_model,
             repair_model=repair_model,
             use_llm=use_llm,
+            review_use_llm=review_use_llm,
             timeout_sec=timeout_sec,
             skip_validation=skip_validation,
             env_mode=env_mode,
@@ -363,32 +381,7 @@ def execute_code_task(
                 status = 'failed'
         return status
 
-    manifest = load_code_task_manifest(root)
     # Stages are sequential: each stop point owns admission to the next stage.
-    # Only failure analysis/repair need a separate requested-boundary check.
-    if _environment_report_exists(paths):
-        _record(steps, "probe", "skipped", "environment_report.json already exists")
-    elif dry_run:
-        return _dry_result(paths, steps, "probe", "record environment signals")
-    else:
-        _emit(message_callback, "Running environment probe.")
-        result = probe_code_task_environment(
-            root,
-            env_mode=env_mode,
-            python_executable=python_executable,
-            **({'process_scope': process_scope} if process_scope is not None else {}),
-        )
-        _record(steps, "probe", "done", f"wrote {result.report_path}")
-        _memory_event(
-            root,
-            "probe",
-            "Recorded environment and dependency signals.",
-            status="done",
-            artifacts=[_relative_to_run(root, result.report_path)],
-        )
-    if to_step == "probe":
-        return _result(paths, steps, "stop_point", "Stopped after probe as requested.")
-
     manifest = load_code_task_manifest(root)
     baseline = _run_record(manifest, "baseline")
     if baseline:
@@ -797,22 +790,8 @@ def execute_code_task(
         return _result(paths, steps, "patch_not_applied", "Apply reviewed edits before validation.")
     if dry_run:
         return _dry_result(paths, steps, "validate", "run static validation")
-    _emit(message_callback, "Running static validation.")
-    validation = validate_code_task(
-        root,
-        strict=strict_validation,
-        max_file_bytes=validation_max_file_bytes,
-        **({'process_scope': process_scope} if process_scope is not None else {}),
-    )
-    _record(steps, "validate", "done", f"status {validation.status}")
-    _memory_event(
-        root,
-        "validation",
-        f"Static validation finished with status {validation.status}.",
-        status=validation.status,
-        artifacts=["code_task/meta/validation_report.json"],
-        metadata={"error_count": validation.error_count, "warning_count": validation.warning_count},
-    )
+    validation = _validate_candidate(root, steps, strict=strict_validation,
+        max_file_bytes=validation_max_file_bytes, process_scope=process_scope, message_callback=message_callback)
     if validation.error_count or validation.warning_count:
         severity = "blocking" if validation.error_count else "warning"
         record_review_finding(
@@ -1026,6 +1005,7 @@ def _execute_greenfield_code_task(
     reviewer_model: str | None,
     repair_model: str | None,
     use_llm: bool,
+    review_use_llm: bool | None,
     timeout_sec: int,
     skip_validation: bool,
     env_mode: str | None,
@@ -1080,33 +1060,6 @@ def _execute_greenfield_code_task(
             message_callback=message_callback, summary=summary,
         )
 
-    if _environment_report_exists(paths):
-        _record(steps, "probe", "skipped", "environment_report.json already exists")
-    elif dry_run:
-        return _dry_result(paths, steps, "probe", "record environment and resource signals")
-    else:
-        _emit(message_callback, "Running environment and resource probe.")
-        result = probe_code_task_environment(
-            root,
-            env_mode=env_mode,
-            python_executable=python_executable,
-            **({'process_scope': process_scope} if process_scope is not None else {}),
-        )
-        _record(steps, "probe", "done", f"wrote {result.report_path}")
-        _memory_event(
-            root,
-            "probe",
-            "Recorded environment and resource signals for greenfield generation.",
-            status="done",
-            artifacts=[
-                _relative_to_run(root, result.report_path),
-                "code_task/meta/resource_probe.json",
-                "code_task/meta/resource_decision.json",
-            ],
-        )
-    if to_step == "probe":
-        return _result(paths, steps, "stop_point", "Stopped after probe as requested.")
-
     _record(steps, "baseline", "skipped", "greenfield mode has no unchanged baseline")
     if to_step == "baseline":
         return _result(paths, steps, "stop_point", "Stopped after baseline as requested.")
@@ -1128,6 +1081,7 @@ def _execute_greenfield_code_task(
             writer_model=writer_model or model,
             reviewer_model=reviewer_model or model,
             use_llm=use_llm,
+            review_use_llm=review_use_llm,
             max_files=max_files,
             max_generated_lines=max_generated_lines,
             max_source_chars_per_file=max_source_chars_per_file,
@@ -1212,22 +1166,8 @@ def _execute_greenfield_code_task(
 
     if dry_run:
         return _dry_result(paths, steps, "validate", "run static validation")
-    _emit(message_callback, "Running static validation.")
-    validation = validate_code_task(
-        root,
-        strict=strict_validation,
-        max_file_bytes=validation_max_file_bytes,
-        **({'process_scope': process_scope} if process_scope is not None else {}),
-    )
-    _record(steps, "validate", "done", f"status {validation.status}")
-    _memory_event(
-        root,
-        "validation",
-        f"Static validation finished with status {validation.status}.",
-        status=validation.status,
-        artifacts=["code_task/meta/validation_report.json"],
-        metadata={"error_count": validation.error_count, "warning_count": validation.warning_count},
-    )
+    validation = _validate_candidate(root, steps, strict=strict_validation,
+        max_file_bytes=validation_max_file_bytes, process_scope=process_scope, message_callback=message_callback)
     if validation.status == "failed":
         return _result(
             paths,
@@ -1427,6 +1367,19 @@ def _handle_failure(
         "repair_review_required",
         "Review the repair proposal, then apply it explicitly with code-task apply-edits --edits-file.",
     )
+
+
+def _validate_candidate(root: Path, steps: list[ExecuteStepRecord], *, strict: bool,
+                        max_file_bytes: int, process_scope: Any | None,
+                        message_callback: MessageCallback | None):
+    _emit(message_callback, "Running static validation.")
+    result = validate_code_task(root, strict=strict, max_file_bytes=max_file_bytes,
+        **({'process_scope': process_scope} if process_scope is not None else {}))
+    _record(steps, "validate", "done", f"status {result.status}")
+    _memory_event(root, "validation", f"Static validation finished with status {result.status}.",
+        status=result.status, artifacts=["code_task/meta/validation_report.json"],
+        metadata={"error_count": result.error_count, "warning_count": result.warning_count})
+    return result
 
 
 def _record(steps: list[ExecuteStepRecord], step: str, status: str, detail: str) -> None:

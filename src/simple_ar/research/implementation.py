@@ -44,6 +44,7 @@ class ImplementationRequest:
     allow_large_edits: bool = False
     message_callback: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
     defer_model_review: bool = False
+    defer_greenfield_review: bool = False
     direct_edit: bool = False
 
 
@@ -53,11 +54,10 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
     if not request.approval_note.strip():
         raise ValueError("Implementation requires explicit isolated-workspace approval.")
     manifest = load_code_task_manifest(request.run_dir)
-    # Greenfield generation has its own whole-project review contract. Existing
-    # project patches can hand advisory content review to task delivery while
-    # retaining CodeTask's deterministic scope and interface checks.
+    # New contracts may hand advisory content review to task delivery while
+    # retaining deterministic scope, structure and interface checks.
     review_with_llm = not (request.defer_model_review
-        and manifest.get('code_task', {}).get('kind') != 'greenfield')
+        and (request.defer_greenfield_review or manifest.get('code_task', {}).get('kind') != 'greenfield'))
     direct_edit = request.direct_edit and manifest.get('code_task', {}).get('kind') != 'greenfield'
     paths = code_task_paths(request.run_dir)
     if paths.workspace_dir.resolve() != request.cwd.resolve():

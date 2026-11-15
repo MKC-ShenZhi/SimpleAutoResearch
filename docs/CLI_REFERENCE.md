@@ -665,7 +665,7 @@ simple-ar research-report --session-root PATH [--model SELECTOR] [OPTIONS]
 | `--data-tables CHOICE` | Link complete copied analysis records, or also repeat full tables in the report. Choices: `linked`, `full`. | linked for sections; retained on resume |
 | `--max-section-tokens N` | Output cap per writing unit; zero/unset omits this extra cap. | Unset |
 
-Historical sessions require a ready-for-report handoff; v1 is read-only. Shared operation sessions continue through the same task and request reuse of existing research and results; earlier shared-task contracts keep their saved entry. An already delivered report is reused unless --refresh or changed settings request new work. Omitted options and an unchanged template retain their saved values. Writing and any checks use the original authorization and budget; authorize resources separately if exhausted. Disabling the Writer reviewer does not replace an independent task review.
+Historical sessions require a ready-for-report handoff; v1 is read-only. Shared tasks, including earlier native contracts, continue through the same task and request reuse of existing research and results. An already delivered report is reused unless --refresh or changed settings request new work. Omitted options and an unchanged template retain their saved values. Writing and any checks use the original authorization and budget; authorize resources separately if exhausted. Disabling the Writer reviewer does not replace an independent task review.
 
 Examples:
 
