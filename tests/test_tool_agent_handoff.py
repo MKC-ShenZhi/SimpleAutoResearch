@@ -8304,6 +8304,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 {'operation': 'synthesize', 'question': 'Investigate the method',
                  'document_record': 'source0/document.json'})
         self.assertEqual(produced.status, 'ok', produced.error)
+        # The saved original bundle, not a fresh read of the earlier input,
+        # is what assessment actually consumes.
+        (inputs / 'document.json').unlink()
         assessment = make_context('assessment')
         result = owner.execute_tool('research', assessment, {'operation': 'assess',
             'question': 'Evaluate the method', 'synthesis_record': 'records/synthesis/synthesis_result.json',
@@ -8335,6 +8338,24 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(design_context.store.read_json('idea_assessment.json')['recommended_idea_id'], 'method')
         self.assertEqual(design_context.store.read_json('design_review/idea_assessment.json')['recommended_idea_id'], 'method')
         self.assertEqual(client.ask_json.call_count, 3)
+
+    def test_research_read_combines_selected_bundle_and_additional_material(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        from simple_ar.tools.sources import SourcePolicy, SourceToolGateway
+
+        root, inputs, workspace = self._workspace_fixture()
+        workspace.mounts['records'] = root / 'attempts'
+        write_json(inputs / 'document.json', self._original_document().to_handoff_dict())
+        (inputs / 'additional.md').write_text('# Additional material\nA separate observation.\n', encoding='utf-8')
+        owner = SourceToolGateway(root, workspace, workspace.ledger, policy=SourcePolicy(allow_network=False))
+        context = CapabilityContext(ArtifactStore(root / 'attempts' / 'combined-read'),
+            AttemptManifest('combined-read', capability='native_tool'))
+        result = owner.execute_tool('research', context, {'operation': 'read', 'question': 'Review both materials',
+            'document_record': 'source0/document.json', 'materials': ['source0/additional.md']})
+        self.assertEqual(result.status, 'ok', result.error)
+        documents = context.store.read_json('document_bundle.json')['documents']
+        self.assertEqual(len(documents), 2)
+        self.assertIn('original', {row['document_id'] for row in documents})
 
     def test_professional_summary_uses_parent_attempt_and_retains_bound_partial_evidence(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext

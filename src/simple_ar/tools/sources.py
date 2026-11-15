@@ -644,9 +644,22 @@ class SourceToolGateway:
             network = name == 'research_collect'
             if network and (not self.policy.allow_network or request.operation not in {'ingest', 'summary'}):
                 raise ValueError('Network collection is not authorized for this operation')
-            paths = self._material_paths(request.materials or list(self.policy.materials))
             saved_binding = (context.store.read_json('source_request.json')
                 if context.store.exists('source_request.json') else None)
+            if request.materials:
+                materials = request.materials
+            elif saved_binding is not None:
+                # Reconstruct the exact saved input selection for old and new receipts.
+                materials = [value for value in self.policy.materials
+                    if str(self.workspace.resolve(value)) in saved_binding['inputs']]
+            elif request.operation in {'ingest', 'read', 'summary', 'synthesize'} and not request.document_record:
+                materials = list(self.policy.materials)
+            else:
+                materials = []
+            paths = self._material_paths(materials)
+            if request.document_record and request.operation in {'ingest', 'read', 'summary', 'synthesize'}:
+                selected_document = self.workspace.resolve(request.document_record)
+                paths = [path for path in paths if path != selected_document]
             evidence = (saved_binding.get('assessment_evidence', {}) if saved_binding is not None
                 else self._assessment_evidence(request))
             locators = [value for value in (request.plan_record, request.document_record, request.read_record,
@@ -757,9 +770,9 @@ class SourceToolGateway:
         elif op in {'ingest', 'read', 'summary', 'synthesize'}:
             if request.document_record:
                 bundle = DocumentBundle.from_handoff_dict(self._handoff(request.document_record, 'document_bundle.v1'))
-            elif op != 'synthesize':
+            if (bundle is None and op != 'synthesize') or paths:
                 papers = []
-                if network and not paths:
+                if network and not paths and bundle is None:
                     if not policy.providers:
                         raise ValueError('Collection needs configured providers or materials')
                     queries = policy.queries or (tuple(plan.source_plan.queries) if plan else (request.question,))
@@ -799,7 +812,7 @@ class SourceToolGateway:
                 if papers and network:
                     self.ledger.reserve(reservation, {'source_operations': 1}, attempt_id=identity, purpose='research ingest')
                 try:
-                    bundle = self._bundle(papers, [], context.store.root, network=network, local_documents=local)
+                    incoming = self._bundle(papers, [], context.store.root, network=network, local_documents=local)
                 except BaseException:
                     if papers and network:
                         self.ledger.mark_unknown(reservation, reason='Acquisition interrupted; no blind replay')
@@ -807,9 +820,15 @@ class SourceToolGateway:
                 if papers and network:
                     self.ledger.settle(reservation, {'source_operations': 1}, actual_source='adapter')
                 for saved in retained:
-                    bundle.records.extend(saved.records)
-                    bundle.sections.extend(saved.sections)
-                    bundle.chunks.extend(saved.chunks)
+                    incoming.records.extend(saved.records)
+                    incoming.sections.extend(saved.sections)
+                    incoming.chunks.extend(saved.chunks)
+                if bundle is None:
+                    bundle = incoming
+                else:
+                    bundle.records.extend(incoming.records)
+                    bundle.sections.extend(incoming.sections)
+                    bundle.chunks.extend(incoming.chunks)
             if bundle is not None:
                 if len(bundle.records) > policy.max_documents:
                     raise ValueError('Selected bundle exceeds document policy; narrow the material selection')
