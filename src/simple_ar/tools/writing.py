@@ -2956,19 +2956,18 @@ class WritingToolGateway:
                     if source.suffix.lower() != '.json' or source.stat().st_size > 8_000_000:
                         continue
                     if candidates:
-                        with source.open('rb') as handle:
-                            before = hashlib.file_digest(handle, 'sha256').hexdigest()
-                    view = SourceToolGateway.inventory_source(source)
-                    if view is None:
-                        continue
+                        snapshot = SourceToolGateway.inventory_source_snapshot(source)
+                        if snapshot is None:
+                            continue
+                        view, digest = snapshot
+                    else:
+                        view = SourceToolGateway.inventory_source(source)
+                        if view is None:
+                            continue
                     view['document_record'] = self.workspace.locator(str(source))
                     source_views.append(view)
                     if candidates:
-                        with source.open('rb') as handle:
-                            after = hashlib.file_digest(handle, 'sha256').hexdigest()
-                        if before != after:
-                            raise ValueError('Original source changed while reading its selection preview; use a new identity')
-                        preview_bindings.append({'path': str(source), 'sha256': after, 'view': view})
+                        preview_bindings.append({'path': str(source), 'sha256': digest, 'view': view})
         selection_request = request.model_dump()
         for key in ('required_headings', 'max_cited_sources'):
             if not selection_request.get(key):

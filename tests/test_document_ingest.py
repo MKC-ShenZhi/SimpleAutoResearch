@@ -61,10 +61,13 @@ class DocumentIngestTests(unittest.TestCase):
                         record.metadata['fulltext_extraction'].pop('coverage')
                     write_json(path, bundle.to_handoff_dict())
                     inventory = owner.inventory_source(path)
+                    preview, preview_version = owner.inventory_source_snapshot(path)
+                    self.assertEqual(preview, inventory)
                     for query in ('', 'conditions'):
                         result = owner.call('find_source_passages', {
                             'document_record': str(path), 'query': query}, identity='inspect')
                         self.assertEqual(result.status, 'ok', result.error)
+                        self.assertEqual(result.data['document_sha256'], preview_version)
                         identity = result.data['documents'][0]
                         self.assertEqual(identity, inventory['documents'][0])
                         self.assertEqual(identity['status'], 'parsed')

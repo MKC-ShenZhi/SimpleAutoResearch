@@ -225,28 +225,42 @@ def _source_identity(record: DocumentRecord, bundle: DocumentBundle) -> dict[str
 
 class SourceToolGateway:
     @staticmethod
-    def inventory_source(path: Path) -> dict[str, Any] | None:
-        """Describe a bound original bundle for professional material selection.
-
-        The caller owns path authorization and inventory digests. This is a
-        read-only view of declared provenance, not source verification or a
-        second index. Ordinary JSON and oversized files remain ordinary inputs.
-        """
+    def _load_source_bundle(path: Path) -> tuple[DocumentBundle, bytes] | None:
+        """Read the original once so its view and version describe the same bytes."""
         if path.suffix.lower() != '.json' or path.stat().st_size > 8_000_000:
             return None
         try:
-            payload = json.loads(path.read_bytes())
+            raw = path.read_bytes()
+            payload = json.loads(raw)
         except (ValueError, UnicodeError):
             return None
         if not isinstance(payload, dict) or payload.get('schema_version') != 'document_bundle.v1':
             return None
-        bundle = DocumentBundle.from_handoff_dict(payload)
+        return DocumentBundle.from_handoff_dict(payload), raw
+
+    @staticmethod
+    def _source_inventory(path: Path, bundle: DocumentBundle) -> dict[str, Any]:
         return {'document_record': str(path),
             'documents': [_source_identity(row, bundle) for row in bundle.records[:20]],
             'documents_truncated': len(bundle.records) > 20,
             'retained_chunks': len(bundle.chunks),
             'retained_preview': source_chunk_views(bundle.chunks[:1], max_chars=1200),
             'scope': 'Declared source identity and bounded retained preview, not verified claims or exhaustive reading.'}
+
+    @classmethod
+    def inventory_source(cls, path: Path) -> dict[str, Any] | None:
+        """Preview an authorized original bundle without certifying its claims."""
+        loaded = cls._load_source_bundle(path)
+        return cls._source_inventory(path, loaded[0]) if loaded is not None else None
+
+    @classmethod
+    def inventory_source_snapshot(cls, path: Path) -> tuple[dict[str, Any], str] | None:
+        """Return the preview and version of the bytes actually read."""
+        loaded = cls._load_source_bundle(path)
+        if loaded is None:
+            return None
+        bundle, raw = loaded
+        return cls._source_inventory(path, bundle), hashlib.sha256(raw).hexdigest()
 
     @staticmethod
     def history_identity(name: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -771,8 +785,9 @@ class SourceToolGateway:
         def material_bundle(materials: list[Path], papers: list, *, network: bool) -> DocumentBundle:
             local, retained = [], []
             for path in materials:
-                if self.inventory_source(path) is not None:
-                    retained.append(DocumentBundle.from_handoff_dict(json.loads(path.read_bytes())))
+                loaded = self._load_source_bundle(path)
+                if loaded is not None:
+                    retained.append(loaded[0])
                 else:
                     local.append(str(path))
             incoming = self._bundle(papers, [], context.store.root, network=network, local_documents=local)

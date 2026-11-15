@@ -502,13 +502,11 @@ class DocumentWorkToolGateway:
                     else self.workspace.resolve_source_record(path))
             except ValueError:
                 continue
-            before = self.workspace.artifact_hashes([str(original)])[str(original)]
-            view = SourceToolGateway.inventory_source(original)
-            if view is None:
+            snapshot = SourceToolGateway.inventory_source_snapshot(original)
+            if snapshot is None:
                 continue
-            if self.workspace.artifact_hashes([str(original)])[str(original)] != before:
-                raise ValueError('Original source changed during inventory')
-            source_views.append({'path': str(original), 'sha256': before, 'view': view})
+            view, digest = snapshot
+            source_views.append({'path': str(original), 'sha256': digest, 'view': view})
         stable_paths = {row['source']: row['relative_target'] for row in prior_links
             if row.get('source') and row['relative_target']}
         occupied = set(stable_paths.values())
