@@ -16,7 +16,8 @@ FIELDS = {
     'extensions': list, 'from_session': str, 'reuse': list, 'reuse_version': int,
     'data_file': str, 'data_path': list,
     'project_python': str, 'allow_execution': bool, 'sandbox_execution': bool, 'allow_network': bool,
-    'allow_vision': bool, 'max_images': int, 'max_turns': int, 'max_tokens': int,
+    'allow_vision': bool, 'independent_review_required': bool,
+    'max_images': int, 'max_turns': int, 'max_tokens': int,
     'max_processes': int, 'max_process_seconds': (int, float),
 }
 PATHS = {'output_root', 'project_python', 'project', 'data_file', 'from_session'}
@@ -81,7 +82,7 @@ def validate_resume_options(args: argparse.Namespace) -> None:
     creation = set(getattr(args, '_explicit_start_destinations', ())) & {
         'max_turns', 'max_tokens', 'max_images', 'max_processes',
         'max_process_seconds', 'project_python', 'output_root', 'sandbox_execution',
-        'extensions', 'from_session', 'reuse', 'reuse_version',
+        'extensions', 'from_session', 'reuse', 'reuse_version', 'independent_review_required',
     }
     creation.update(name for name in ('max_processes', 'max_process_seconds')
                     if getattr(args, name, None) is not None)
@@ -169,6 +170,7 @@ def write_task_config(args: argparse.Namespace) -> bool:
         'sandbox_execution': 'With allow_execution, run ordinary work and rendering in the task workspace using Linux bubblewrap. Processes cannot access original sources or the network.',
         'allow_network': 'Allows public source acquisition; does not authorize installations.',
         'allow_vision': 'Allows sending rendered images to the configured vision connection.',
+        'independent_review_required': 'Require an independent review of a complete delivery; partial results remain available.',
         'max_images': 'Paid image generation/edit submissions, separate from inspecting images.',
         'max_turns': 'Shared model request allowance, including specialist calls; feedback retains the same ledger.',
         'max_tokens': 'Shared model token allowance; unknown reservations remain recorded.',

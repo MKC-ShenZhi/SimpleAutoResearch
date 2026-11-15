@@ -183,6 +183,7 @@ max_tokens = 1000000 # 示例：将本次新任务的 token 总额度设为一�
 | `sandbox_execution` | 允许工作区进程、报告构建及符合范围的代码／测量操作自动执行 | 布尔 false | 需开启 `allow_execution`、Linux 和 bubblewrap；进程不能联网或直接访问原始材料。环境准备、外部输入等超出隔离范围的工作仍须批准 |
 | `allow_network` | 公共来源获取 | 布尔 false | 新任务；不授权安装 |
 | `allow_vision` | 将挂载图像发送给视觉路由 | 布尔 false | 新任务；与生成分开 |
+| `independent_review_required` | 正式交付前需要独立复核 | 布尔 false | 新任务；可复用适用的复核，未完成工作可部分交付 |
 | `max_turns`、`max_tokens` | 共享模型请求／token 额度 | 整数 30、600000 | 新账本上限 |
 | `max_processes` | 累计进程次数，含后端进程 | 非负整数；max_turns × 10 | 新账本；零禁用 |
 | `max_process_seconds` | 累计进程墙钟时间 | 非负有限数；max_turns × 300 秒 | 新账本；不是单命令时限 |

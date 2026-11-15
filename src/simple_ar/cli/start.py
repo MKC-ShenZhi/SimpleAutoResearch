@@ -132,6 +132,7 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     native.add_argument("--sandbox-execution", action="store_true", help="With --allow-execution, authorize ordinary commands and report rendering inside the Linux task workspace; requires bubblewrap. Source materials must be copied into the workspace and process networking is disabled.")
     native.add_argument("--allow-network", action="store_true", help="Native task: authorize public source search/acquisition, including bounded PDFs; no installation or command authorization.")
     native.add_argument("--allow-vision", action="store_true", help="Native task: authorize sending mounted rendered images to the named TOML vision route, sharing the task model budget.")
+    native.add_argument("--independent-review-required", action="store_true", help="Require an independent review before complete delivery; unfinished work can still be delivered as partial.")
     native.add_argument("--max-images", type=int, default=0, help="Native task: authorize this many image generation/edit submissions through the named image route (default: disabled); retained on resume.")
     native.add_argument("--approve-execution", default="", help="Native resume: exact approval token printed for its pending process.")
     native.add_argument("--remember-execution", action="store_true",
@@ -452,6 +453,7 @@ def native_creation_options(args: argparse.Namespace) -> dict:
         sources={f'source{index}': path for index, path in enumerate(args.source)},
         allow_execution=args.allow_execution, sandbox_execution=getattr(args, 'sandbox_execution', False),
         allow_network=args.allow_network, allow_vision=args.allow_vision,
+        independent_review_required=getattr(args, 'independent_review_required', False),
         max_turns=args.max_turns, max_tokens=args.max_tokens, max_images=args.max_images,
         project_python=args.project_python, code_task=getattr(args, '_code_task', None),
         process_limits=native_process_limits(args),

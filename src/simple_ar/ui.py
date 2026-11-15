@@ -136,7 +136,8 @@ class Workspace:
         options.update(model=None, sources={})
         _, _, limits, _ = ToolApplication.preview_creation(self.tasks, 'Configuration preview', **options)
         return {key: options[key] for key in ('max_turns', 'max_tokens', 'max_images',
-                    'allow_execution', 'sandbox_execution', 'allow_network', 'allow_vision')} | {
+                    'allow_execution', 'sandbox_execution', 'allow_network', 'allow_vision',
+                    'independent_review_required')} | {
             key: limits[key] for key in ('process_invocations', 'process_wall_seconds')}
 
     def connection(self, selector: str) -> tuple[dict, str]:
@@ -197,6 +198,7 @@ class Workspace:
             args.allow_execution = data.get('execution') is True
             args.sandbox_execution = data.get('sandbox_execution') is True
             args.allow_network = data.get('network') is True
+            args.independent_review_required = data.get('independent_review_required') is True
             for field, destination in (('max_turns', 'max_turns'), ('max_tokens', 'max_tokens'),
                     ('process_invocations', 'max_processes'), ('process_wall_seconds', 'max_process_seconds')):
                 value = data[field]
@@ -290,6 +292,7 @@ class Workspace:
             binding_id=hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest(),
             recipients=recipients, sources=config['sources'], project_python=config['project_python'],
             access={k: config.get(k, False) for k in ('allow_execution', 'sandbox_execution', 'allow_network', 'allow_vision')},
+            independent_review_required=config.get('independent_review_required', False),
             limits=limits, attempts=attempts, extensions=config.get('extensions', []))
 
     def listing(self) -> list[dict]:

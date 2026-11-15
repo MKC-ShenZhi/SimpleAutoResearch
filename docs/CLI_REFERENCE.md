@@ -113,6 +113,7 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--sandbox-execution` | Run workspace commands, report rendering and eligible code/measurement operations without per-command approval. Processes have no external network, host GPU or direct access to original source mounts; copy needed inputs first. Setup, external inputs and other work outside this scope still require approval. | Requires `--allow-execution`, Linux and bubblewrap |
 | `--allow-network` | Authorize public-source search/acquisition; not package installation or arbitrary commands. | Off |
 | `--allow-vision` | Send mounted rendered PNG/JPEG/WebP to the vision route; shares the model budget. | Off |
+| `--independent-review-required` | Require an independent review for complete delivery; useful unfinished work can still be delivered as partial. | Off |
 | `--max-images N` | Image generation/edit submissions through the image route; separate from visual inspection. | 0 |
 | `--max-turns N` | Cumulative native model-request allowance, including feedback. | 30 |
 | `--max-tokens N` | Cumulative native model-token allowance, including feedback. Input is estimated before a request; actual settled usage may exceed the allowance. | 600000 |
@@ -236,6 +237,8 @@ total_tokens = 600000
 ```
 
 Supply requires supply_id, reason and [changes]; source aliases resolve from the supply file. By default it fills missing contracts. Explicit replace_existing = true revises saved contracts; replacing sources requires the complete alias map. Evidence and charges remain. To authorize workspace execution for an existing task, set `sandbox_execution = true` in [changes] and also grant `allow_execution` if absent. An unstarted pending operation is cancelled and may be proposed again; host execution still requires approval. Keep supply separate from feedback, retry, CLI grants and command approval.
+
+To retain a caller-required independent review in an existing common task, set `independent_review_required = true` in `[changes]`. This keeps the original task and ledger; a complete delivery must use an applicable independent review.
 
 ```bash
 simple-ar start --resume-task SESSION --supply-task supply.toml --prepare-only

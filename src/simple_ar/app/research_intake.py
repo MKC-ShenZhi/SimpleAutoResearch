@@ -125,6 +125,7 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
         'research_selected_idea_id': 'selected_idea_id', 'feasibility_review_model': 'feasibility_connection'}
     policy_values, unhandled = {}, []
     auxiliary = {'research_task_kind', 'research_materials_only', 'report', 'report_writing_method',
+        'independent_review_required',
         'data_analysis', 'max_output_tokens', 'execution', 'execution_confirmation'}
     for name, value in config.items():
         target = aliases.get(name, name.removeprefix('research_'))
@@ -261,6 +262,7 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
         allow_network=policy.allow_network if projection is None or research_work else False,
         max_turns=model_limits['llm_requests'], max_tokens=model_limits['total_tokens'],
         max_attempts=attempt_limit, report_requirement=report, control_protocol='operations.v1',
+        independent_review_required=config.get('independent_review_required', False),
         max_output_tokens=config.get('max_output_tokens'), table_analysis=table,
         research_policy=policy.model_dump(mode='json') if projection is None or research_work or confirm_execution else None,
         code_task=projection['code_task'] if projection else None,

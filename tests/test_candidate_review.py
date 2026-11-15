@@ -211,6 +211,60 @@ class CandidateReviewTests(unittest.TestCase):
 
 
 class IntegratedCandidateFlowTests(unittest.TestCase):
+    def test_caller_required_review_cannot_be_waived_and_reuses_the_reviewed_candidate(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
+
+        case = OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.app = ToolApplication.create(case.root, 'Independently review the note before delivery.',
+            model='fixture', sources={}, services=case.services, max_turns=20,
+            max_tokens=900000, max_attempts=100, tool_contracts='full',
+            independent_review_required=True)
+        case._write('note.md', 'A bounded explanation.\n')
+        case.review = lambda view: {'conclusion': 'incomplete', 'findings': [], 'evidence': [],
+            'limitations': ['The independent investigation is unfinished.']}
+        claim = {'summary': 'A bounded explanation', 'artifacts': ['note.md']}
+        case._submit(_action('deliver_result', **claim, independent_review=False))
+        self.assertEqual(len(case.inspection_requests), 1)
+        case._not_delivered()
+
+        # A passed full-scope review of the same claim is adopted, rather than
+        # starting another check when the producer repeats the false choice.
+        case.review = case._review_complete_targets
+        case._submit(_action('review_result', **claim, review_scope='delivery'))
+        case._ok('review_result', reviewed=True)
+        checked = len(case.inspection_requests)
+        case._reload()
+        case._submit(_action('deliver_result', **claim, independent_review=False))
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertEqual(len(case.inspection_requests), checked)
+
+    def test_review_requirement_can_be_supplied_to_the_original_session_without_resetting_ledger(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
+
+        case = OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.app = ToolApplication.create(case.root, 'Continue the existing work and independently check it.',
+            model='fixture', sources={}, services=case.services, max_turns=20,
+            max_tokens=900000, max_attempts=100, tool_contracts='full')
+        case._write('note.md', 'Existing work remains available.\n')
+        ledger = deepcopy(case.app.ledger.to_dict())
+        case.app.supply(supply_id='required-review', reason='Preserve the requested independent review',
+            changes={'independent_review_required': True})
+        case._reload()
+        self.assertEqual(case.app.ledger.to_dict(), ledger)
+        self.assertEqual(case.app.operations.delivery.lifecycle_requirements()['minimum_resources']['llm_requests'], 1)
+        self.assertTrue(case.app.operations.delivery.requires_review(DeliveryRequest.model_validate({
+            'summary': 'Existing work', 'artifacts': ['note.md'], 'independent_review': False})))
+        case._submit(_action('deliver_result', summary='Existing work', artifacts=['note.md'],
+            independent_review=False, unresolved=['Independent review remains unfinished.']))
+        self.assertEqual(case.app.session.manifest.status, 'partial', case.app.result_snapshot())
+        self.assertEqual(case.inspection_requests, [])
+
     def test_caller_can_spend_the_last_call_on_an_explicit_review(self):
         from simple_ar.app.tool_application import ToolApplication
         from tests.test_professional_work_loop import OperationsWorkLoopTests, _action

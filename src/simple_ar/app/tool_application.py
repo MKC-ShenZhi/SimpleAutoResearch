@@ -498,6 +498,11 @@ class ToolApplication:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
         if config.get('delivery_review_selection') not in {None, 'model.v1'}:
             raise ValueError('Unsupported saved delivery review selection')
+        if ('independent_review_required' in config
+                and (type(config['independent_review_required']) is not bool
+                     or config['independent_review_required'] and config.get('delivery_review_protocol')
+                         not in {'task.v3', 'task.v4', 'task.v5'})):
+            raise ValueError('The required review needs the shared whole-delivery review contract')
         if (config.get('candidate_review_protocol') not in {None, 'candidate.v1'}
                 or config.get('candidate_review_protocol') is not None and (
                     config.get('work_method') != GOAL_WORK_METHOD
@@ -1673,6 +1678,7 @@ class ToolApplication:
                tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
                completion_policy: str | None = None, control_protocol: str | None = None,
                delivery_files: list[str] | None = None,
+               independent_review_required: bool = False,
                model_catalogs: dict[str, str | None] | None = None,
                extensions: list[Path] | None = None,
                creation_declarations: dict[str, Any] | None = None,
@@ -1680,6 +1686,10 @@ class ToolApplication:
         """Validate caller contracts before creation or supply; never execute or persist."""
         if control_protocol not in {None, 'operations.v1'}:
             raise ValueError('Unsupported operation control protocol')
+        if type(independent_review_required) is not bool:
+            raise ValueError('independent_review_required must be a boolean')
+        if independent_review_required and (model is None or control_protocol != 'operations.v1'):
+            raise ValueError('A required independent review needs a model and the common operation delivery owner')
         if type(sandbox_execution) is not bool or sandbox_execution and not allow_execution:
             raise ValueError('Workspace execution requires explicit process authorization')
         if sandbox_execution:
@@ -1915,6 +1925,8 @@ class ToolApplication:
             config['report_protocol'] = report_protocol
         if delivery_files is not None:
             config['delivery_files'] = delivery_files
+        if independent_review_required:
+            config['independent_review_required'] = True
         if snapshots:
             config['source_snapshots'] = {}
             for name, original, content in snapshots:
@@ -2046,6 +2058,7 @@ class ToolApplication:
                extensions: list[Path] | None = None,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
                delivery_files: list[str] | None = None,
+               independent_review_required: bool = False,
                tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
                completion_policy: str | None = None, professional_inputs: bool = False,
                investigate_results: bool = True,
@@ -2067,7 +2080,7 @@ class ToolApplication:
             max_attempts=max_attempts, source_operations=source_operations, execution_contract=execution_contract,
             services=services, snapshot_sources=snapshot_sources, max_snapshot_bytes=max_snapshot_bytes,
             tool_contracts=tool_contracts, completion_policy=completion_policy, control_protocol=control_protocol,
-            delivery_files=delivery_files,
+            delivery_files=delivery_files, independent_review_required=independent_review_required,
             extensions=extensions, creation_declarations=creation_declarations,
             professional_inputs=professional_inputs, investigate_results=investigate_results,
             context_protocol=context_protocol)
@@ -2203,7 +2216,8 @@ class ToolApplication:
             supply_id, reason = supply_id.strip(), reason.strip()
             fields = {'model', 'sources', 'allow_execution', 'sandbox_execution', 'allow_network', 'code_task',
                 'execution_contract', 'research_policy', 'table_analysis', 'report_requirement', 'max_output_tokens',
-                'tool_contracts', 'completion_policy', 'delivery_files', 'document_source_contract'}
+                'tool_contracts', 'completion_policy', 'delivery_files', 'document_source_contract',
+                'independent_review_required'}
             if set(changes) - fields:
                 raise ValueError('Unsupported supply fields: ' + ', '.join(sorted(set(changes) - fields)))
             supplied = dict(changes)
@@ -2241,6 +2255,9 @@ class ToolApplication:
                     row.attempt_id == pending['attempt'] for row in self.session.list_attempts())):
                 raise ValueError('Reconcile the started operation before supplying contracts')
             old = json.loads(json.dumps(self.state['config']))
+            if (supplied.get('independent_review_required') is True
+                    and old.get('delivery_review_protocol') not in {'task.v3', 'task.v4', 'task.v5'}):
+                raise ValueError('This saved task has no shared whole-delivery review contract')
             if _runtime_bindings(self.services) != old.get('runtime_dependencies', {}):
                 raise ValueError('Restore unchanged runtime dependencies before supplying new contracts')
             for name, value in supplied.items():
@@ -2287,6 +2304,8 @@ class ToolApplication:
                 tool_contracts=candidate.get('tool_contracts', 'full'),
                 completion_policy=candidate.get('completion_policy', 'protected_decision.v1'),
                 delivery_files=candidate.get('delivery_files'), model_catalogs=hints,
+                independent_review_required=candidate.get('independent_review_required', False),
+                control_protocol=old.get('control_protocol'),
                 creation_declarations=old.get('creation_declarations') if old.get('input_contract') == _DECLARED_INPUTS else None)
             if 'sandbox_execution' in supplied and not supplied['sandbox_execution']:
                 config['sandbox_execution'] = False
@@ -2304,6 +2323,10 @@ class ToolApplication:
                 config['producer_completion'] = old['producer_completion']
             if 'result_investigation' in old:
                 config['result_investigation'] = old['result_investigation']
+            if 'independent_review_required' in supplied:
+                # Explicit replacement with false must also override the old
+                # value when the final configuration is merged with history.
+                config['independent_review_required'] = supplied['independent_review_required']
             for name in fields - {'model', 'sources', 'allow_execution', 'sandbox_execution', 'allow_network'}:
                 if not replace_existing and old.get(name) is not None and old[name] != config.get(name):
                     raise ValueError(f'{name} is already frozen; use its existing feedback/revision contract')

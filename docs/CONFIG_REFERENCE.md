@@ -183,6 +183,7 @@ Place `notes.md` beside the file. All fields below belong to `[task]`; paths use
 | `sandbox_execution` | Authorize workspace processes, report rendering and eligible code/measurement operations | Boolean false | Requires `allow_execution`, Linux and bubblewrap; no process network or direct source mounts. Environment setup, external inputs and other work outside the isolated scope still require approval |
 | `allow_network` | Public-source acquisition | Boolean false | New task; not installation authorization |
 | `allow_vision` | Send mounted images to vision route | Boolean false | New task; separate from generation |
+| `independent_review_required` | Require independent review of a complete delivery | Boolean false | New task; applicable reviews can be reused and unfinished work can be delivered as partial |
 | `max_turns`, `max_tokens` | Shared model request/token allowances | Integers `30`, `600000` | New ledger limits |
 | `max_processes` | Cumulative process invocations, including backend processes | Nonnegative integer; max_turns × 10 | New ledger limit; zero disables |
 | `max_process_seconds` | Cumulative process wall time | Nonnegative finite number; max_turns × 300 seconds | New ledger limit; not command timeout |

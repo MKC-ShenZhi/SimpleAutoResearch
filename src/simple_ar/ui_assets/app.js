@@ -14,7 +14,7 @@ let confirmation = null, confirmationSending = false, actionSending = false, cre
 let previewTarget = null;
 let reuseOrigin = null;
 let viewKey = '', view = {selected: '', tasks: {}, create: {}};
-const createFields = ['taskConfig', 'goal', 'materials', 'profile', 'turns', 'tokens', 'processes', 'seconds', 'network', 'execution', 'sandboxExecution'];
+const createFields = ['taskConfig', 'goal', 'materials', 'profile', 'turns', 'tokens', 'processes', 'seconds', 'network', 'execution', 'sandboxExecution', 'requiredReview'];
 function persistView() {
   if (!viewKey) return;
   try { sessionStorage.setItem(viewKey, JSON.stringify(view)); }
@@ -460,7 +460,8 @@ $('createForm').onsubmit = async event => {
     max_turns: Number($('turns').value), max_tokens: Number($('tokens').value),
     process_invocations: Number($('processes').value), process_wall_seconds: Number($('seconds').value),
     network: $('network').checked, execution: $('execution').checked,
-    sandbox_execution: $('sandboxExecution').checked, ...(reuseOrigin || {})};
+    sandbox_execution: $('sandboxExecution').checked,
+    independent_review_required: $('requiredReview').checked, ...(reuseOrigin || {})};
   const epoch = viewEpoch;
   creationPreviewSending = true; confirmationControls();
   try {
@@ -473,6 +474,7 @@ $('createForm').onsubmit = async event => {
       '实际额度': {limits: preview.limits, attempts: preview.attempts,
         token_note: '输入预留为估算，实际结算可能超过预留或 token 额度。'},
       '生效权限': preview.access,
+      '正式交付前需要独立复核': preview.independent_review_required,
       '受信任扩展（含代码、资源身份与工具声明）': preview.extensions,
       '信任与审批边界': '扩展 Python 具有宿主机 OS 权限，确认即信任扩展代码。若开启工作区自动执行，普通命令和报告构建在隔离范围内接续；其他执行仍需批准。公共来源网络许可不授权进程联网或安装。视觉许可和图像生成分别受对应配置与额度约束。',
       '操作范围': '只创建并保存原生任务；创建后选择“继续执行”才开始工作。配置、连接或扩展变化会拒绝创建，请重新预览。'
@@ -542,6 +544,7 @@ async function poll() {
       $(id).value = metadata.creation_defaults[field];
     }
     $('network').checked = metadata.creation_defaults.allow_network;
+    $('requiredReview').checked = metadata.creation_defaults.independent_review_required;
     $('execution').checked = metadata.creation_defaults.allow_execution;
     $('sandboxExecution').checked = metadata.creation_defaults.sandbox_execution;
     effectiveAccess(); $('createSubmit').disabled = false;
