@@ -1388,8 +1388,17 @@ class ToolApplication:
             previous=self._report_projection, writing=self.writing, report_inputs=self._report_inputs)
 
     def _inspection_requests(self) -> list[str]:
-        """Original journal requests, separate from a coordinator's review goal."""
-        return list(self.state['requests'])
+        """Original requests, without a review-only administrative supply notice."""
+        requests = list(self.state['requests'])
+        for supply in reversed(self.state.get('supplies', [])):
+            if set(supply.get('changes', {})) != {'independent_review_required'} or supply.get('resource_allowances'):
+                continue
+            index = supply.get('request_count', 0) - 1
+            prefix = ('Caller explicitly replaced task contracts: ' if supply.get('replace_existing')
+                      else 'Caller supplied missing task contracts: ')
+            if 0 <= index < len(requests) and requests[index] == prefix + supply['reason']:
+                requests.pop(index)
+        return requests
 
     def _material_observations(self, targets: list[str]) -> list[dict[str, Any]]:
         """Locate successful parent reads, without transferring bodies or authority.

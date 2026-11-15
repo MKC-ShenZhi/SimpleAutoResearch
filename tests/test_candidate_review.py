@@ -265,6 +265,30 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         self.assertEqual(case.app.session.manifest.status, 'partial', case.app.result_snapshot())
         self.assertEqual(case.inspection_requests, [])
 
+    def test_review_only_supply_reuses_prior_complete_review_without_a_new_investigation(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
+
+        case = OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.app = ToolApplication.create(case.root, 'Independently check and deliver this note.',
+            model='fixture', sources={}, services=case.services, max_turns=20,
+            max_tokens=900000, max_attempts=100, tool_contracts='full')
+        case._write('note.md', 'The current editable explanation.\n')
+        claim = {'summary': 'The checked explanation', 'artifacts': ['note.md']}
+        case._submit(_action('review_result', **claim, review_scope='delivery'))
+        proof = case._ok('review_result', reviewed=True)['metadata']['delivery_review']
+        checked = len(case.inspection_requests)
+        before = deepcopy(case.app.ledger.to_dict())
+        case.app.supply(supply_id='required-review', reason='Retain the requested independent review',
+            changes={'independent_review_required': True})
+        case._reload()
+        self.assertEqual(case.app.ledger.to_dict(), before)
+        case._submit(_action('deliver_result', reviewed_candidate=proof['identity']))
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertEqual(len(case.inspection_requests), checked)
+
     def test_caller_can_spend_the_last_call_on_an_explicit_review(self):
         from simple_ar.app.tool_application import ToolApplication
         from tests.test_professional_work_loop import OperationsWorkLoopTests, _action

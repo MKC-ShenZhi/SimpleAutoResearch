@@ -565,6 +565,10 @@ class OperationTools:
                     and self.config.get('working_set_policy') in {'recent.v4', 'recent.v5', 'recent.v6'}
                     and self.config.get('candidate_handoff_policy') is None):
                 if self.config.get('delivery_review_selection') == 'model.v1':
+                    if self.config.get('independent_review_required'):
+                        return (_ORDINARY_WORK + ' The caller requires an independent review before '
+                            'complete delivery. Reuse an applicable review or submit a candidate for one; '
+                            'unfinished requirements belong in a partial delivery.')
                     return (_ORDINARY_WORK + ' For a completed delivery, set independent_review=false only when '
                         'the request and result do not need independent review. Keep independent review when '
                         'the user requests it or the result needs a separate assessment. Omit the field to '

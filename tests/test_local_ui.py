@@ -1155,6 +1155,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     self.assertEqual(defaults['max_tokens'], args.max_tokens)
                     self.assertEqual(defaults['allow_execution'], args.allow_execution)
                     self.assertEqual(defaults['sandbox_execution'], args.sandbox_execution)
+                    self.assertFalse(defaults['independent_review_required'])
                     _, _, owner_limits, _ = ToolApplication.preview_creation(workspace.tasks,
                         'Configuration preview', model=None, sources={},
                         max_turns=args.max_turns, max_tokens=args.max_tokens)
@@ -1163,6 +1164,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                         self.assertGreater(defaults[field], 0)
                     self.assertEqual(set(defaults), {'max_turns', 'max_tokens', 'max_images',
                         'allow_execution', 'sandbox_execution', 'allow_network', 'allow_vision',
+                        'independent_review_required',
                         'process_invocations', 'process_wall_seconds'})
                     # Parser changes flow into metadata without a second UI default.
                     args.max_turns += 1
@@ -1232,7 +1234,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     config_path = project / 'task.toml'
                     config_text = ('[task]\nrequest="Reuse these notes"\nmodel="route:default"\n'
                         'kind="writing"\nmaterial=["notes.txt"]\nproject="."\nextensions=["extension"]\n'
-                        'allow_network=true\nallow_execution=false\nallow_vision=true\nmax_images=1\nmax_turns=4\nmax_tokens=2000\n'
+                        'allow_network=true\nallow_execution=false\nallow_vision=true\nindependent_review_required=true\nmax_images=1\nmax_turns=4\nmax_tokens=2000\n'
                         'max_processes=2\nmax_process_seconds=12.5\n')
                     config_path.write_text(config_text, encoding='utf-8')
                     config_input = dict(op='preview_create', task_config=str(config_path))
@@ -1240,6 +1242,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     self.assertEqual(status, 200, config_preview)
                     self.assertEqual(config_preview['model'], 'profile:a')
                     self.assertTrue(config_preview['access']['allow_vision'])
+                    self.assertTrue(config_preview['independent_review_required'])
                     self.assertEqual(config_preview['limits']['image_requests'], 1)
                     self.assertEqual(config_preview['recipients']['vision']['base_url'], 'https://vision.invalid/v1')
                     self.assertEqual(config_preview['recipients']['image']['base_url'], 'https://image.invalid/v1')
