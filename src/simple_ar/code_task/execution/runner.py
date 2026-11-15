@@ -246,13 +246,6 @@ def run_code_task_benchmark(
     """
     if timeout_sec < 1:
         raise CodeTaskRunError("timeout_sec must be at least 1")
-    if process_scope is not None:
-        if (budget_ledger is not None and budget_ledger is not process_scope.ledger
-                or session_id and session_id != process_scope.session_id
-                or attempt_id and attempt_id != process_scope.attempt_id):
-            raise ValueError('Scoped code execution must use its task ledger and identity')
-        budget_ledger, session_id, attempt_id = (
-            process_scope.ledger, process_scope.session_id, process_scope.attempt_id)
     label = _normalize_run_label(run_label)
 
     manifest = load_code_task_manifest(run_dir)

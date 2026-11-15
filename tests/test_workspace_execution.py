@@ -293,10 +293,21 @@ class WorkspaceExecutionTests(unittest.TestCase):
         self.assertEqual(ledger.to_dict(), before)
 
         greenfield = initialize_code_task(run_dir=self.base / 'greenfield-run', code_root=None,
-            task_file=task, kind='greenfield', workspace_mode='empty', benchmark_command='python main.py')
+            task_file=task, kind='greenfield', workspace_mode='empty', benchmark_command='python main.py',
+            env_mode='external', python_executable=sys.executable)
+        green_workspace = greenfield.workspace_dir.resolve()
+        green_scope = CodeTaskProcessScope(ProcessSandbox(green_workspace, green_workspace, Path(sys.executable)),
+            ledger, 'unit', 'greenfield', self.base / 'greenfield-probes',
+            {'PATH': '/usr/bin:/bin', 'HOME': str(green_workspace)}, 5)
+        result = execute_code_task(greenfield.run_dir, to_step='baseline', use_llm=False, process_scope=green_scope)
+        self.assertEqual(result.stop_reason, 'stop_point')
         before = ledger.to_dict()
-        with self.assertRaisesRegex(ValueError, 'Scoped greenfield orchestration is not supported'):
-            execute_code_task(greenfield.run_dir, to_step='baseline', use_llm=False, process_scope=scope)
+        with self.assertRaisesRegex(ValueError, 'External agent execution requires its own explicit approval'):
+            execute_code_task(greenfield.run_dir, to_step='baseline', use_llm=False, process_scope=green_scope,
+                implementation_provider='codex')
+        with self.assertRaisesRegex(ValueError, 'Scoped code execution must use its task ledger'):
+            execute_code_task(greenfield.run_dir, to_step='baseline', use_llm=False,
+                process_scope=green_scope, budget_ledger=BudgetLedger())
         self.assertEqual(ledger.to_dict(), before)
 
     @unittest.skipUnless(shutil.which('pandoc') and shutil.which('xelatex'), 'Pandoc and XeLaTeX required')

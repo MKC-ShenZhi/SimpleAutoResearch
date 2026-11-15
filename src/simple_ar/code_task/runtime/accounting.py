@@ -32,8 +32,18 @@ def account_standalone_task(action):
     @wraps(action)
     def run(run_dir, *args, **kwargs):
         client = kwargs.get('llm_client')
-        if (kwargs.get('budget_ledger') is not None or getattr(client, '_budget_ledger', None) is not None
-                or kwargs.get('process_scope') is not None):
+        client_ledger = getattr(client, '_budget_ledger', None)
+        scope = kwargs.get('process_scope')
+        if scope is not None:
+            if (kwargs.get('budget_ledger') is not None and kwargs['budget_ledger'] is not scope.ledger
+                    or isinstance(client_ledger, BudgetLedger) and client_ledger is not scope.ledger
+                    or kwargs.get('session_id') and kwargs['session_id'] != scope.session_id
+                    or kwargs.get('attempt_id') and kwargs['attempt_id'] != scope.attempt_id):
+                raise ValueError('Scoped code execution must use its task ledger and identity')
+            kwargs = {**kwargs, 'budget_ledger': scope.ledger,
+                      'session_id': scope.session_id, 'attempt_id': scope.attempt_id}
+            return action(run_dir, *args, **kwargs)
+        if kwargs.get('budget_ledger') is not None or client_ledger is not None:
             return action(run_dir, *args, **kwargs)
         with standalone_task_accounting(Path(run_dir), active=not kwargs.get('dry_run', False)) as accounting:
             if accounting:
