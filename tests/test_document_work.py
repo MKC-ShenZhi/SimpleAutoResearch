@@ -469,8 +469,9 @@ class DocumentWorkTests(unittest.TestCase):
             gateway.call('work_document', {'goal': 'Explain the observation'}, identity='report')
         saved_usage = ledger.to_dict()
         saved_calls = len(calls)
-        self.assertTrue(gateway.can_reconcile('work_document', 'report'))
-        result = gateway.call('work_document', {'goal': 'Explain the observation'}, identity='report')
+        with patch('simple_ar.tools.document_work._system_for', return_value='Updated instruction for new work'):
+            self.assertTrue(gateway.can_reconcile('work_document', 'report'))
+            result = gateway.call('work_document', {'goal': 'Explain the observation'}, identity='report')
         self.assertTrue(result.ok, result.error)
         inputs = json.loads((root / 'attempts/report/document_work/writer/report_inputs.json').read_text(encoding='utf-8'))
         self.assertNotIn('requested_report', json.loads(inputs['context']['goal_markdown'])['work_context'])
@@ -535,9 +536,10 @@ class DocumentWorkTests(unittest.TestCase):
             return result
         with patch.object(ArtifactStore, 'write_json', interrupt_checkpoint), self.assertRaises(KeyboardInterrupt):
             gateway.call('work_document', {'goal': 'Write the requested brief'}, identity='sections')
-        self.assertTrue(gateway.can_reconcile('work_document', 'sections'))
-        initial_labels = [row[0] for row in calls]
-        result = gateway.call('work_document', {'goal': 'Write the requested brief'}, identity='sections')
+        with patch('simple_ar.tools.document_work._system_for', return_value='Updated instruction for new work'):
+            self.assertTrue(gateway.can_reconcile('work_document', 'sections'))
+            initial_labels = [row[0] for row in calls]
+            result = gateway.call('work_document', {'goal': 'Write the requested brief'}, identity='sections')
         self.assertTrue(result.ok, result.error)
         self.assertEqual([row[0] for row in calls[:len(initial_labels)]], initial_labels)
         self.assertIn('## Observations', result.data['markdown'])
@@ -1032,9 +1034,10 @@ class DocumentWorkTests(unittest.TestCase):
         with patch.object(workspace, 'call', side_effect=interrupt_after_write):
             with self.assertRaises(KeyboardInterrupt):
                 gateway.call('work_document', args, identity='partial')
-        self.assertTrue(gateway.can_reconcile('work_document', 'partial'))
-        entries = [entry.to_dict() for entry in ledger.entries]
-        result = gateway.call('work_document', args, identity='partial')
+        with patch('simple_ar.tools.document_work._system_for', return_value='Updated instruction for new work'):
+            self.assertTrue(gateway.can_reconcile('work_document', 'partial'))
+            entries = [entry.to_dict() for entry in ledger.entries]
+            result = gateway.call('work_document', args, identity='partial')
         self.assertTrue(result.ok, result.error)
         self.assertEqual(workspace.resolve(result.artifacts[1]).read_bytes(), asset.read_bytes())
         self.assertEqual([entry.to_dict() for entry in ledger.entries], entries)
@@ -1147,9 +1150,10 @@ class DocumentWorkTests(unittest.TestCase):
         with patch.object(gateway, '_candidate', side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 gateway.call('work_document', args, identity='response-saved')
-        self.assertTrue(gateway.can_reconcile('work_document', 'response-saved'))
-        entries = [entry.to_dict() for entry in ledger.entries]
-        result = gateway.call('work_document', args, identity='response-saved')
+        with patch('simple_ar.tools.document_work._system_for', return_value='Updated instruction for new work'):
+            self.assertTrue(gateway.can_reconcile('work_document', 'response-saved'))
+            entries = [entry.to_dict() for entry in ledger.entries]
+            result = gateway.call('work_document', args, identity='response-saved')
         self.assertTrue(result.ok, result.error)
         self.assertEqual(result.data['markdown'], '# Retained response\n')
         self.assertEqual([entry.to_dict() for entry in ledger.entries], entries)

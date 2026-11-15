@@ -271,6 +271,43 @@ class CandidateReviewTests(unittest.TestCase):
                 'error': 'Review did not finish'}}, 'current_request': True}]
         self.assertFalse(self.owner.requires_review(direct))
 
+    def test_explicit_final_review_survives_a_preflight_failure_without_review_receipt(self):
+        self.owner.config.update(delivery_review_selection='model.v3',
+            candidate_review_protocol='candidate.v1')
+        self.owner.config['tool_completions'].update({
+            'deliver_result': {'kind': 'delivery'},
+            'write_file': {'kind': 'delivery', 'field': 'delivery'},
+        })
+        ready = {**self.claim, 'unresolved': [],
+            'report': {**self.claim['report'], 'status': 'canonical'}}
+        direct = DeliveryRequest.model_validate({
+            'summary': 'The result', 'artifacts': ['draft.md'], 'independent_review': False})
+        for tool, arguments, candidate in (
+                ('review_result', {**ready, 'review_scope': 'delivery'}, True),
+                ('deliver_result', {**ready, 'independent_review': True}, False),
+                ('write_file', {'delivery': {**ready, 'independent_review': True}}, False)):
+            with self.subTest(tool=tool):
+                self.observations.clear()
+                claim = arguments['delivery'] if tool == 'write_file' else {
+                    key: value for key, value in arguments.items() if key != 'review_scope'}
+                payload = {'status': 'ok', 'metadata': {}}
+                self.owner.bind_result(DeliveryRequest.model_validate(claim), payload, 'preflight',
+                    current_outputs=(), current_result={}, retain=lambda: None,
+                    review_capacity=nullcontext, may_start=True, candidate=candidate,
+                    review_scope='delivery' if candidate else None)
+                self.assertIn('delivery_review_error', payload['metadata'])
+                self.assertNotIn('delivery_review', payload['metadata'])
+                self.observations.append({'tool_name': tool, 'arguments': arguments,
+                    'metadata': payload['metadata'], 'current_request': True})
+                self.assertTrue(self.owner.requires_review(direct))
+                self.observations[0]['current_request'] = False
+                self.assertFalse(self.owner.requires_review(direct))
+
+        # A local candidate check does not become an obligation for final delivery.
+        self.observations[0].update(tool_name='review_result', current_request=True,
+            arguments={'review_scope': 'candidate', 'independent_review': True})
+        self.assertFalse(self.owner.requires_review(direct))
+
     def test_feedback_keeps_prior_delivery_without_rechecking_it_as_a_new_candidate(self):
         self.owner.config['tool_completions']['deliver_result'] = {'kind': 'delivery'}
         delivered = {'summary': 'Earlier explanation', 'artifacts': ['draft.md']}

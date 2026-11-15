@@ -305,7 +305,6 @@ class DocumentWorkToolGateway:
             if (decision.action != 'write' or not record['accounting_known']
                     or record['request_sha256'] != _digest(snapshot)
                     or record['response_sha256'] != _digest(record['response'])
-                    or snapshot['system'] != _system_for(binding)
                     or snapshot['budget_call_id'] != f'{identity}:document:{step}'
                     or any(row not in observations for row in snapshot['input']['observations'])
                     or not self._context_matches(binding, snapshot['input'], identity)):
@@ -336,7 +335,6 @@ class DocumentWorkToolGateway:
             if (decision.action != 'finish' or not record['accounting_known']
                     or record['response_sha256'] != _digest(record['response'])
                     or record['request_sha256'] != _digest(snapshot)
-                    or snapshot['system'] != _system_for(binding)
                     or snapshot['budget_call_id'] != f'{identity}:document:{step}'
                     or (snapshot['input']['observations'] != observations
                         if binding['contract'] not in _WORKING_CONTRACTS else
@@ -1147,7 +1145,6 @@ class DocumentWorkToolGateway:
                 or candidate['response_sha256'] != _digest(decision.model_dump(mode='json'))
                 or record['request_sha256'] != _digest(snapshot)
                 or record['response_sha256'] != _digest(record['response']) or not record['accounting_known']
-                or snapshot['system'] != _system_for(binding)
                 or snapshot['budget_call_id'] != f"{identity}:document:{candidate['decision']}"
                 or not self._context_matches(binding, snapshot['input'], identity)
                 or decision.action != 'finish' or decision.manuscript_markdown != candidate['markdown']

@@ -9575,7 +9575,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             logical.assert_called_once()
             self.assertEqual(app.ledger.to_dict(), retained_ledger)
         self.assertEqual(app.session.store.read_json(
-            f'tools/writing/{identity}/writer/response.json'), response)
+            f'tools/writing/{identity}/writer/response.json')['response'], response)
 
     def test_composition_reconciles_native_assembly_publication_and_envelope_interruptions(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore
@@ -9768,7 +9768,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'outline': [{'heading': '1. Decision ###', 'required': True}, {'heading': '2. LIMITS', 'required': True}],
             'max_cited_sources': 1})
         owner = app.session.store.root / 'tools/writing/writing-constrained'
-        self.assertEqual(read_json(owner / 'writer/response.json'), response)
+        self.assertEqual(read_json(owner / 'writer/response.json')['response'], response)
         self.assertEqual(read_json(owner / 'writer/writer.json')['constraints_checked'],
             {'headings': ['Decision', 'Limits'], 'distinct_cited_sources': 1})
         binding = read_json(owner / 'request.json')['request']
@@ -10274,7 +10274,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 with patch.object(app.writing, 'client_factory', side_effect=AssertionError('No rejected replay')):
                     self._compose_document(app, request, 'invalid-article', status='error')
                 fake.ask_json.assert_called_once()
-                self.assertEqual(read_json(owner / 'writer/response.json'), response)
+                self.assertEqual(read_json(owner / 'writer/response.json')['response'], response)
                 self.assertFalse((owner / 'writer/writer.json').exists())
 
     def test_composition_recovery_rejects_partial_changed_and_failed_writer_records(self) -> None:

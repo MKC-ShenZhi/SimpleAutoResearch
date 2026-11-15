@@ -121,26 +121,41 @@ class Delivery:
                 continue
             if request is None:
                 return False
-            review = (row.get('metadata') or {}).get('delivery_review') or {}
-            if review.get('error'):
+            metadata = row.get('metadata') or {}
+            review = metadata.get('delivery_review') or {}
+            failed = review.get('error') if review else metadata.get('delivery_review_error')
+            if failed:
                 completion = tool_completion(row.get('tool_name', ''), self.config.get('tool_completions'))
                 arguments = row.get('arguments') or {}
                 claim = arguments.get(completion.field) if completion and completion.field else arguments
                 explicitly_selected = (completion is not None and (
                     completion.kind == 'review' and arguments.get('review_scope') == 'delivery'
-                    or isinstance(claim, dict) and claim.get('independent_review') is True))
+                    or completion.kind == 'delivery' and isinstance(claim, dict)
+                       and claim.get('independent_review') is True))
                 if not explicitly_selected:
                     continue  # A failed default check does not create a new requirement.
             binding = review.get('binding') or {}
-            if binding.get('purpose') or not isinstance(binding.get('artifacts'), dict):
+            if binding.get('purpose'):
                 continue
+            artifacts = binding.get('artifacts')
+            if not isinstance(artifacts, dict):
+                # A failure before the review owner starts has no review binding.
+                # The ordinary delivery receipt already records the resolved
+                # inventory; it retains the choice, not a successful opinion.
+                artifacts = metadata.get('delivery_hashes') if failed else None
+                if not isinstance(artifacts, dict):
+                    continue
+                try:
+                    artifacts = {str(self.workspace.resolve(path)) for path in artifacts}
+                except (ValueError, OSError):
+                    continue
             if selected is None:
                 try:
                     resolved = self.workspace.resolve_delivery(request)
                     selected = {str(self.workspace.resolve(path)) for path in resolved['artifacts']}
                 except (ValueError, OSError):
                     return False  # The normal delivery owner reports invalid or unfinished outputs.
-            if selected and selected == set(binding['artifacts']):
+            if selected and selected == set(artifacts):
                 return True
         return False
 

@@ -694,32 +694,29 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
         # Historical requests retain their original prompt, not today's method.
         if isinstance(snapshot, dict) and 'edit_contract' in snapshot:
             edit_contract = _article_edit_contract(prior, snapshot['edit_contract'])
-        editing = isinstance(snapshot, dict) and snapshot.get('system') in (
-            ARTICLE_EDIT_SYSTEM, ARTICLE_PARAGRAPH_EDIT_SYSTEM,
-            _article_system(inputs, editing=True, edit_contract=edit_contract))
+        atomic_response = isinstance(snapshot, dict) and snapshot.get('response_record_contract') == 'atomic_complete.v1'
+        editing = bool(prior) and isinstance(snapshot, dict) and 'edit_contract' in snapshot and atomic_response
         expected_keys = {'owner', 'source_attempt', 'system', 'inputs', 'snapshot_id'}
         if isinstance(snapshot, dict) and 'edit_contract' in snapshot:
             expected_keys.add('edit_contract')
+        if isinstance(snapshot, dict) and 'response_record_contract' in snapshot:
+            expected_keys.add('response_record_contract')
         if isinstance(snapshot, dict) and 'prompt_contract' in snapshot:
             expected_keys.add('prompt_contract')
             if snapshot['prompt_contract'] not in {'article_delivery_once.v1', 'article_authoring_evidence.v1'}:
                 raise ValueError('Unknown article prompt contract')
-        if editing:
-            expected_keys.update({'edit_contract', 'response_record_contract'})
         if (not isinstance(snapshot, dict)
                 or set(snapshot) != expected_keys
                 or snapshot['owner'] != ARTICLE_OWNER or snapshot['source_attempt'] != identity
                 or snapshot['inputs'] != inputs
                 or not isinstance(snapshot['system'], str)
-                or (not editing and (
+                or ('response_record_contract' in snapshot and not atomic_response)
+                or (not atomic_response and (
                     snapshot['system'] != _article_system(inputs, editing=False, edit_contract=edit_contract)
                     if inputs['article'].get('publication_caption_contract') == SUPPLIED_CAPTION_CONTRACT else
                     hashlib.sha256(snapshot['system'].encode('utf-8')).hexdigest() not in _ARTICLE_SYSTEM_SHA256))
                 or ('edit_contract' in snapshot and snapshot['edit_contract'] != edit_contract)
                 or (not editing and 'edit_contract' in snapshot and bool(prior))
-                or (editing and (not prior or snapshot['edit_contract'] != edit_contract
-                    or snapshot['system'] != _article_system(inputs, editing=True, edit_contract=edit_contract)
-                    or snapshot['response_record_contract'] != 'atomic_complete.v1'))
                 or snapshot['snapshot_id'] != digest({key: value for key, value in snapshot.items()
                                                      if key != 'snapshot_id'})):
             raise ValueError('Article input snapshot changed or is unavailable; no blind replay')
@@ -730,12 +727,10 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
         editing = bool(prior) and edit_prior
         system = _article_system(inputs, editing=editing, edit_contract=edit_contract)
         snapshot = {'owner': ARTICLE_OWNER, 'source_attempt': identity, 'system': system, 'inputs': inputs,
-            'prompt_contract': 'article_authoring_evidence.v1'}
+            'prompt_contract': 'article_authoring_evidence.v1', 'response_record_contract': 'atomic_complete.v1'}
         if edit_prior:
             # Freeze correction policy on the first request, even for a full-body initial draft.
             snapshot['edit_contract'] = edit_contract
-        if editing:
-            snapshot['response_record_contract'] = 'atomic_complete.v1'
         snapshot['snapshot_id'] = digest(snapshot)
         # Authoring uses selected original evidence. Full attachment text stays
         # in the frozen inputs for independent inspection, not a second author

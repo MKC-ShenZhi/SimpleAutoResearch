@@ -1365,7 +1365,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
             self.assertEqual(article['results']['status'], 'partial')
             self.assertEqual(store.read_json('report_inputs.json')['edit_contract'], {
                 'version': 'paragraph_replacements.v2', 'max_replacements': 40, 'max_text_chars': 96_000})
-            self.assertIn('draft_markdown', store.read_json('response.json'))
+            self.assertIn('draft_markdown', store.read_json('response.json')['response'])
             self.assertTrue(article['source_handles'][0]['metadata']['evidence_passages_truncated'])
             # The existing structured snapshot is still exact input data, not
             # the sparse composition contract or a new projection version.
@@ -1406,7 +1406,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     run_report_writing_capability(context=CapabilityContext(target, AttemptManifest('resume'),
                         inputs=(ref,), input_store=store), request=replace(rejected, resume_ref=ref))
                 self.assertFalse(target.root.exists())
-                self.assertEqual(store.read_json('response.json'), response)
+                self.assertEqual(store.read_json('response.json')['response'], response)
                 self.assertFalse(store.exists('writer.json'))
                 with self.assertRaisesRegex(ValueError, 'no automatic correction'):
                     run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('invalid')),
@@ -2229,6 +2229,26 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     self.assertEqual(_edit_article(**arguments, request=replace(request, llm_client=None)), edited)
                     self.assertEqual(calls, ['article-independent-review', 'composition-article', 'article-independent-review'])
 
+    def test_article_recovery_uses_recorded_prompt_after_instructions_change(self):
+        import hashlib
+        from simple_ar.report.writing import write_whole_article
+
+        for prior in ('', 'Original prose.'):
+            with self.subTest(prior=bool(prior)), tempfile.TemporaryDirectory() as tmp:
+                inputs = {'article': {'title': 'A retained article', 'prior_draft': prior}}
+                response = ({'prior_draft_sha256': hashlib.sha256(prior.encode()).hexdigest(),
+                    'replacements': [{'old_text': 'Original', 'new_text': 'Revised'}]}
+                    if prior else {'draft_markdown': 'New article.'})
+                client = ArticleClient(response)
+                store = ArtifactStore(Path(tmp))
+                written = write_whole_article(store=store, inputs=inputs, identity='article', client=client)
+                original = {name: store.resolve(name).read_bytes() for name in ('report_inputs.json', 'response.json')}
+                with patch('simple_ar.report.writing._article_system', return_value='Updated instruction for new work'):
+                    recovered = write_whole_article(store=store, inputs=inputs, identity='article', recovering=True)
+                self.assertEqual(recovered, written)
+                self.assertEqual(len(client.calls), 1)
+                self.assertEqual({name: store.resolve(name).read_bytes() for name in original}, original)
+
     def test_supplied_candidate_inspection_patch_adoption_and_zero_call_recovery(self):
         import hashlib
 
@@ -2695,7 +2715,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, 'fixed section structure'):
                             run_report_writing_capability(context=context,
                                 request=replace(request, llm_client=None) if offline else request)
-                    self.assertEqual(store.read_json('response.json'), request.llm_client.response)
+                    self.assertEqual(store.read_json('response.json')['response'], request.llm_client.response)
                     self.assertFalse(store.exists('writer.json'))
                 self.assertEqual(len(request.llm_client.calls), 1)
                 self.assertEqual(request.llm_client.calls[0][1]['constraints']['outline'], [
@@ -2757,7 +2777,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
                                 request=replace(request, llm_client=None) if offline else request)
                     self.assertFalse(store.exists('writer.json'))
                     self.assertFalse(store.exists('review/request.json'))
-                self.assertEqual(store.read_json('response.json'), {'draft_markdown': markdown})
+                self.assertEqual(store.read_json('response.json')['response'], {'draft_markdown': markdown})
                 self.assertEqual(len(request.llm_client.calls), 1)
 
     def test_auto_article_keeps_section_plan_as_soft_guidance(self):
