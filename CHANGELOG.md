@@ -17,12 +17,13 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
-- Common research work carries the original request and feedback into planning, reading, synthesis and design, and honors older callers' deterministic planning and planning limits. Source selection retains an explicit publication range; combining retained bundles and new materials preserves their acquisition and extraction records without charging old retrievals to the current allowance. Idea assessment can reuse that reading without replacing the initial assessment with the subsequent design review.
+- Common research work carries the original request and feedback into planning, reading, synthesis and design, and honors older callers' deterministic planning and planning limits. Source selection retains an explicit publication range; new and historical research use the same source-version selection when combining retained bundles with new material, preserve the selected acquisition and extraction records, and do not charge old retrievals to the current allowance. Idea assessment can reuse that reading without replacing the initial assessment with the subsequent design review.
 - Research feasibility review uses the caller's saved reviewer connection and the same task ledger.
 - Structured data analysis can request independent review of its results and supporting materials without also requesting a report.
 - A connection or resource failure before review starts is reported without inventing an interrupted inspection.
 - Document revisions retain prior citation mappings without requiring a bibliography, resolve aliases to their recorded identities, and use the same file inheritance rules for production and acceptance.
 - Document and article responses bound to their recorded inputs can recover after later instruction changes without another authoring call.
+- If section writing stops before completion, already saved sections are available as an explicitly incomplete draft; unknown model calls are not replayed. Text artifacts preserve the supplied newline bytes on Windows as well as other platforms.
 - Structured research can request other supported outcomes alongside a declared measurement; deterministic work no longer marks those outcomes complete merely because collection or measurement finished.
 - Ad hoc environment checks in ordinary tasks can reach the appropriate execution approval without a fixed experiment contract.
 - An explicitly selected final independent review remains required for the same work, including text-only delivery and an expanded or narrowed artifact inventory, when preparation, resources or execution prevent it from completing. New shared tasks do not treat permission-only updates as changed research claims.

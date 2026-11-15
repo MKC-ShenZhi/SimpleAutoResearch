@@ -46,6 +46,17 @@ class CapabilityBoundaryTests(unittest.TestCase):
             self.assertNotIn("sha256", ref.to_dict())
             self.assertNotIn("hash", ref.to_dict())
 
+    def test_text_writers_preserve_existing_newlines(self) -> None:
+        from simple_ar.core.artifacts import write_atomically
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp))
+            text = 'First\r\nSecond\n中文\r\n'
+            ref = store.write_text('report.txt', text, kind='report')
+            self.assertEqual(store.resolve(ref).read_bytes(), text.encode('utf-8'))
+            write_atomically(store.resolve('atomic.txt'), text)
+            self.assertEqual(store.resolve('atomic.txt').read_bytes(), text.encode('utf-8'))
+
     def test_store_rejects_paths_outside_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ArtifactStore(Path(tmp))

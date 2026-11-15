@@ -8403,6 +8403,23 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         identity = next(row for row in lookup.data['documents'] if row['id'] == 'original')
         self.assertEqual(identity['content_scope'], 'source_webpage_not_verified_paper_fulltext')
 
+        # Supplying the same original through two supported research inputs is
+        # one source, not two documents or two copies of its passages.
+        write_json(inputs / 'document-copy.json', original.to_handoff_dict())
+        repeated_context = CapabilityContext(ArtifactStore(root / 'attempts' / 'repeated-read'),
+            AttemptManifest('repeated-read', capability='native_tool'))
+        repeated = owner.execute_tool('research', repeated_context, {'operation': 'read',
+            'question': 'Review the material', 'document_record': 'source0/document.json',
+            'materials': ['source0/document-copy.json']})
+        self.assertEqual(repeated.status, 'ok', repeated.error)
+        merged = repeated_context.store.read_json('document_bundle.json')
+        self.assertEqual([row['document_id'] for row in merged['documents']], ['original'])
+        self.assertEqual(len(merged['chunks']), len(original.chunks))
+        again = owner.call('find_source_passages',
+            {'document_record': repeated.data['document_record'], 'query': 'cancellation'}, identity='repeated-lookup')
+        self.assertTrue(again.ok, again.error)
+        self.assertEqual(again.data['documents'][0]['content_scope'], 'source_webpage_not_verified_paper_fulltext')
+
     def test_professional_summary_uses_parent_attempt_and_retains_bound_partial_evidence(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
         from simple_ar.tools.sources import SourcePolicy, SourceToolGateway

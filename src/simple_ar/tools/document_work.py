@@ -454,8 +454,32 @@ class DocumentWorkToolGateway:
                 store.write_json('failure.json', {'type': type(exc).__name__, 'error': str(exc)})
             windows = (self._material_observations(store.read_json('observations.json'))
                 if store is not None and store.exists('observations.json') else [])
+            data = {'receipt_directory': f'records/{identity}/document_work'} if store else {}
+            artifacts = []
+            if store is not None and store.exists('writer/sections.json'):
+                # Completed sections remain useful even if a later section or
+                # inspection cannot run. Expose the Writer's saved prefix as an
+                # explicitly incomplete draft, not as an accepted candidate.
+                try:
+                    from simple_ar.report.assembler import assemble_report_sections
+                    from simple_ar.report.schema import ReportSectionDraft
+                    completed = store.read_json('writer/sections.json')['completed']
+                    sections = [ReportSectionDraft.model_validate(row) for row in completed['sections']
+                        if row.get('draft_markdown', '').strip()]
+                    if sections:
+                        title = store.read_json('writer/report_inputs.json')['context']['topic']
+                        body = assemble_report_sections(title=title, sections=sections)
+                        path = f'workspace/document-work/{identity}/partial.md'
+                        self._materialize('write_file', path, hashlib.sha256(body.encode('utf-8')).hexdigest(),
+                            identity, {'content': body})
+                        artifacts.append(path)
+                        data['partial_manuscript'] = path
+                        data['partial_scope'] = ('Saved completed sections only; this unfinished draft does not '
+                            'establish full document completion or independent review. Attachments are not included.')
+                except (OSError, KeyError, TypeError, ValueError) as partial_error:
+                    data['partial_error'] = str(partial_error)
             return ToolResult(tool_name=name, status='blocked' if isinstance(exc, ValueError) else 'error',
-                error=str(exc), data={'receipt_directory': f'records/{identity}/document_work'} if store else {},
+                error=str(exc), data=data, artifacts=artifacts,
                 metadata={'material_observations': windows} if windows else {})
 
     def _admit(self, store: ArtifactStore, request: WorkDocumentRequest, identity: str,

@@ -560,6 +560,53 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertEqual(len(writers), 2)
         self.assertTrue(all(options['max_output_tokens'] == 96 for _, options in writers))
 
+    def test_incomplete_report_exposes_saved_sections_without_replaying_calls(self):
+        from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
+        from tests.report_review_fixtures import prompt_payload
+
+        root, source, ledger, workspace = self.workspace()
+        ledger.limits['llm_requests'] = 2
+        config = ReportRuntimeConfig(outline_strategy='template', reviewer='disabled',
+            max_review_iterations=0, allow_source_backtracking=False)
+        template = ReportTemplateBundle(name='sections', mode='supplied_materials', template_path='',
+            criteria_path='', template_markdown='## Observations\n\n## Limits\n', criteria_markdown='')
+        requirement = {'method': 'sections', 'config': config.model_dump(mode='json'),
+            'template': template.model_dump(mode='json'), 'outline': [
+                {'heading': 'Observations', 'required': True}, {'heading': 'Limits', 'required': True}]}
+        labels = []
+
+        class Client(_Client):
+            def ask_json(self, system, prompt, *, label='', budget_call_id='', **options):
+                self._budget_ledger.reserve(budget_call_id, {'llm_requests': 1, 'total_tokens': 10},
+                    session_id='session', attempt_id=self._budget_attempt_id, purpose='document')
+                labels.append(label)
+                if label == 'document-work-1':
+                    response = {'action': 'write', 'title': 'Brief'}
+                else:
+                    view = prompt_payload(prompt)
+                    response = {'section_id': view['section']['section_id'], 'heading': view['section']['heading'],
+                        'draft_markdown': 'The first observation is retained.'}
+                self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
+                return response
+
+        client = Client(ledger, 'partial-report', None)
+        gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
+            material_roots=lambda: ['source0'], context_policy='working.v3', report_requirement=requirement)
+        arguments = {'goal': 'Write the requested brief'}
+        result = gateway.call('work_document', arguments, identity='partial-report')
+        self.assertFalse(result.ok)
+        path = result.data['partial_manuscript']
+        self.assertEqual(result.artifacts, [path])
+        self.assertIn('first observation is retained', workspace.resolve(path).read_text(encoding='utf-8'))
+        self.assertIn('unfinished', result.data['partial_scope'])
+        self.assertEqual(len(labels), 2)
+        self.assertEqual(len(ledger.entries), 2)
+        self.assertFalse(gateway.can_reconcile('work_document', 'partial-report'))
+        replay = gateway.call('work_document', arguments, identity='partial-report')
+        self.assertFalse(replay.ok)
+        self.assertEqual(len(labels), 2)
+        self.assertEqual(len(ledger.entries), 2)
+
     def test_common_article_feedback_keeps_unaffected_prior_work(self):
         from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
         from tests.report_review_fixtures import prompt_payload
@@ -788,6 +835,7 @@ class DocumentWorkTests(unittest.TestCase):
 
     def test_revision_investigates_originals_and_reuses_parent_read_without_fixed_rounds(self):
         root, source, ledger, workspace = self.workspace()
+        ledger.limits['total_tokens'] = 10000
         for number in range(8):
             (source / f'part-{number}.txt').write_text(f'Original condition {number}.\n', encoding='utf-8')
         original = source / 'part-0.txt'

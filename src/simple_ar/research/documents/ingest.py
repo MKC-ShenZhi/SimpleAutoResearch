@@ -101,7 +101,11 @@ def retain_document_report(current: dict[str, Any], retained: dict[str, Any],
     result = dict(current)
     if not retained or not document_ids:
         return result
-    reports = list(result.get('retained_reports', []))
+    reports = []
+    for row in result.get('retained_reports', []):
+        remaining = set(row['document_ids']) - document_ids
+        if remaining:
+            reports.append({**row, 'document_ids': sorted(remaining)})
     primary = {key: value for key, value in retained.items() if key != 'retained_reports'}
     sources = [{'document_ids': sorted(document_ids), 'report': primary}]
     for row in retained.get('retained_reports', []):
@@ -118,8 +122,10 @@ def retain_document_report(current: dict[str, Any], retained: dict[str, Any],
 
 def document_report_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
     """Expose current and selected retained source observations together."""
-    rows = list(report.get('documents', []))
-    for retained in report.get('retained_reports', []):
+    reports = report.get('retained_reports', [])
+    selected = {identity for retained in reports for identity in retained['document_ids']}
+    rows = [row for row in report.get('documents', []) if row.get('document_id') not in selected]
+    for retained in reports:
         selected = set(retained['document_ids'])
         rows.extend(row for row in retained['report'].get('documents', [])
                     if row.get('document_id') in selected and row not in rows)
@@ -128,15 +134,37 @@ def document_report_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
 
 def merge_document_bundles(current: DocumentBundle | None, retained: DocumentBundle,
                            *, prepend: bool = False) -> DocumentBundle:
-    """Reuse source content and provenance without charging old retrievals again."""
+    """Choose one version per source and retain its provenance and new costs."""
     if current is None:
         current = DocumentBundle([], {'document_count': 0}, {'document_count': 0}, [], [])
-    ids = {record.document_id for record in retained.records}
+    existing = {record.document_id: record for record in current.records}
+    current_text = {chunk.document_id for chunk in current.chunks}
+    retained_text = {chunk.document_id for chunk in retained.chunks}
+    selected = set()
+    for record in retained.records:
+        previous = existing.get(record.document_id)
+        if previous is not None:
+            if (previous.source != record.source or previous.is_original_source != record.is_original_source
+                    or any(getattr(previous, key) and getattr(record, key)
+                           and getattr(previous, key) != getattr(record, key) for key in ('source_id', 'doi'))):
+                raise ValueError('Retained document identities conflict with another supplied source.')
+            if (record.document_id in current_text and
+                    (previous.extraction_status == 'parsed' or record.document_id not in retained_text)):
+                continue
+        selected.add(record.document_id)
+    current = replace(current,
+        records=[row for row in current.records if row.document_id not in selected],
+        sections=[row for row in current.sections if row.document_id not in selected],
+        chunks=[row for row in current.chunks if row.document_id not in selected])
+    retained = replace(retained,
+        records=[row for row in retained.records if row.document_id in selected],
+        sections=[row for row in retained.sections if row.document_id in selected],
+        chunks=[row for row in retained.chunks if row.document_id in selected])
     first, second = (retained, current) if prepend else (current, retained)
     return DocumentBundle(records=[*first.records, *second.records],
         sections=[*first.sections, *second.sections], chunks=[*first.chunks, *second.chunks],
-        fulltext_manifest=retain_document_report(current.fulltext_manifest, retained.fulltext_manifest, ids),
-        fulltext_extraction=retain_document_report(current.fulltext_extraction, retained.fulltext_extraction, ids))
+        fulltext_manifest=retain_document_report(current.fulltext_manifest, retained.fulltext_manifest, selected),
+        fulltext_extraction=retain_document_report(current.fulltext_extraction, retained.fulltext_extraction, selected))
 
 
 def analysis_material_paths(paths: Iterable[Path]) -> tuple[Path, ...]:
@@ -452,35 +480,12 @@ def run_document_ingest_capability(
     if packages:
         bundle.chunks[:] = build_text_chunks(bundle.records, sections=bundle.sections, max_chunks=request.max_chunks)
     for path, saved in retained.items():
-        existing = {record.document_id: record for record in bundle.records}
-        # A follow-up naturally retrieves previously read sources. Choose one
-        # complete text version; never mix old chunks with new sections.
-        keep_saved = set()
-        for record in saved.records:
-            current = existing.get(record.document_id)
-            if current is not None:
-                if (current.source != record.source or current.is_original_source != record.is_original_source
-                        or any(getattr(current, key) and getattr(record, key)
-                               and getattr(current, key) != getattr(record, key) for key in ("source_id", "doi"))):
-                    raise ValueError("Retained document identities conflict with another supplied source.")
-                current_text = any(row.document_id == record.document_id for row in bundle.chunks)
-                saved_text = any(row.document_id == record.document_id for row in saved.chunks)
-                if current_text and (current.extraction_status == "parsed" or not saved_text):
-                    continue
-            keep_saved.add(record.document_id)
-        bundle.records[:] = [row for row in bundle.records if row.document_id not in keep_saved]
-        bundle.sections[:] = [row for row in bundle.sections if row.document_id not in keep_saved]
-        bundle.chunks[:] = [row for row in bundle.chunks if row.document_id not in keep_saved]
-        bundle.records.extend(replace(record, metadata={**record.metadata,
+        saved = replace(saved, records=[replace(record, metadata={**record.metadata,
             "retained_bundle": str(path),
             "retained_source_role": "paper" if record.metadata.get("paper_id") else "material",
             "evidence_role": record.metadata.get("evidence_role") or "retained_source_text_not_reverified"})
-            for record in saved.records if record.document_id in keep_saved)
-        bundle.sections.extend(row for row in saved.sections if row.document_id in keep_saved)
-        bundle.chunks.extend(row for row in saved.chunks if row.document_id in keep_saved)
-        bundle = replace(bundle,
-            fulltext_manifest=retain_document_report(bundle.fulltext_manifest, saved.fulltext_manifest, keep_saved),
-            fulltext_extraction=retain_document_report(bundle.fulltext_extraction, saved.fulltext_extraction, keep_saved))
+            for record in saved.records])
+        bundle = merge_document_bundles(bundle, saved)
     output = context.store.write_json(
         "document_bundle.json",
         bundle.to_handoff_dict(),

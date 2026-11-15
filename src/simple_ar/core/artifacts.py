@@ -50,7 +50,7 @@ def replace_exact_spans(text: str, replacements: Iterable[tuple[str, str]]) -> s
 
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    path.write_text(text, encoding="utf-8", newline="")
 
 
 def read_text(path: Path) -> str:
@@ -72,6 +72,7 @@ def write_atomically(path: Path, content: str | bytes, *, overwrite: bool = True
         with tempfile.NamedTemporaryFile(
             mode="wb" if isinstance(content, bytes) else "w",
             encoding=None if isinstance(content, bytes) else "utf-8",
+            newline=None if isinstance(content, bytes) else "",
             dir=path.parent,
             prefix=f".{path.name}.",
             suffix=".tmp",
@@ -120,7 +121,7 @@ def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
 
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
+    with path.open("a", encoding="utf-8", newline="") as handle:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 

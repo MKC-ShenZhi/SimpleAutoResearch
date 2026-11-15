@@ -23,6 +23,39 @@ from simple_ar._legacy.documents import load_search_document_bundle
 
 
 class DocumentIngestTests(unittest.TestCase):
+    def test_reused_source_selects_one_complete_version_for_both_research_entries(self) -> None:
+        from simple_ar.research.documents.ingest import DocumentBundle, document_report_rows, merge_document_bundles
+
+        def bundle(text: str, *, parsed: bool, provenance: str) -> DocumentBundle:
+            record = DocumentRecord(document_id='paper', title='A source', source='fixture', source_id='paper',
+                extraction_status='parsed' if parsed else 'metadata_only')
+            report = {'document_count': 1, 'documents': [{'document_id': 'paper', 'provenance': provenance}]}
+            return DocumentBundle(records=[record], fulltext_manifest=report, fulltext_extraction={}, sections=[],
+                chunks=[TextChunk(chunk_id='paper-chunk', document_id='paper', text=text)] if text else [])
+
+        metadata = bundle('', parsed=False, provenance='metadata')
+        original = bundle('Original evidence.', parsed=True, provenance='original')
+        combined = merge_document_bundles(metadata, original)
+        self.assertEqual([row.document_id for row in combined.records], ['paper'])
+        self.assertEqual([row.text for row in combined.chunks], ['Original evidence.'])
+        self.assertEqual(combined.fulltext_manifest['document_count'], 1)
+        self.assertEqual(document_report_rows(combined.fulltext_manifest)[0]['provenance'], 'original')
+
+        # A newer parsed source replaces the old text as a whole; a repeated
+        # bundle must not duplicate it or use an older acquisition description.
+        fresh = bundle('Updated evidence.', parsed=True, provenance='updated')
+        updated = merge_document_bundles(fresh, combined, prepend=True)
+        repeated = merge_document_bundles(updated, updated)
+        self.assertEqual([row.document_id for row in repeated.records], ['paper'])
+        self.assertEqual([row.text for row in repeated.chunks], ['Updated evidence.'])
+        self.assertEqual(document_report_rows(repeated.fulltext_manifest)[0]['provenance'], 'updated')
+        inherited = merge_document_bundles(merge_document_bundles(None, metadata), original)
+        self.assertEqual(document_report_rows(inherited.fulltext_manifest)[0]['provenance'], 'original')
+
+        other = replace(original, records=[replace(original.records[0], source_id='different')])
+        with self.assertRaisesRegex(ValueError, 'identities conflict'):
+            merge_document_bundles(fresh, other)
+
     def test_source_identity_preserves_webpage_scope_without_rejecting_html(self) -> None:
         from simple_ar.tools.sources import SourceToolGateway
 
