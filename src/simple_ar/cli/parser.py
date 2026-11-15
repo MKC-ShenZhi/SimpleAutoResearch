@@ -72,7 +72,7 @@ def build_parser(
     )
     session_parser.add_argument("--config", type=Path, help="Research TOML; explicit CLI options override file values.")
     session_parser.add_argument("--report-writing-method", choices=("article", "sections"), default=None,
-        help="Legacy Writer method; common tasks retain the setting but do not run its sectional Writer.")
+        help="Use article or section writing for a requested report; saved sessions retain their method.")
     session_parser.add_argument("--session-root", type=Path, help="Continue this session; unchanged evidence and measurements are reused, while explicitly revised inputs invalidate only dependent results.")
     session_parser.add_argument(
         "--recover-interrupted", action="store_true",
@@ -216,13 +216,13 @@ def build_parser(
         "--report-reviewer",
         choices=("llm", "disabled"),
         default="llm",
-        help="Legacy Writer reviewer; common task-level inspection is configured separately.",
+        help="Choose the report Writer reviewer; task-level independent review is separate.",
     )
     session_parser.add_argument(
         "--max-review-iterations",
         type=int,
         default=1,
-        help="Legacy Writer revision bound; the common document worker does not run that revision loop.",
+        help="Maximum report Writer review and revision rounds; task-level independent review is separate.",
     )
     _add_report_document_args(session_parser, prefix="report-")
     session_parser.add_argument(

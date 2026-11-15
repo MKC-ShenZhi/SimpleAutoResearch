@@ -1747,9 +1747,11 @@ class StartTests(unittest.TestCase):
             material = root / "notes.md"
             material.write_text("# Notes\nSupplied observations, not a locally executed experiment.\n", encoding="utf-8")
             config = self.prepare("--kind", "writing", "--goal", "Explain notes", "--material", str(material),
-                                  "--template", "material_report", "--output-root", str(root / "runs"), "--prepare-only")
+                                  "--template", "material_report", "--independent-review-required",
+                                  "--output-root", str(root / "runs"), "--prepare-only")
             defaults = research_defaults(["research-session", "--config", str(config)])
             self.assertEqual(defaults["report_template"], "material_report")
+            self.assertTrue(defaults['independent_review_required'])
             self.assertEqual(defaults["report_draft_scope"], "document")
             self.assertEqual(defaults["report_review_scope"], "document")
             for genre in ("analysis_report", "source_review"):
@@ -2008,7 +2010,8 @@ class StartTests(unittest.TestCase):
             root = Path(directory)
             created = self.prepare("--kind", "code", "--goal", "Build a reusable CSV validator",
                 "--allow", "generated_project/**", "--validate", "python generated_project/main.py",
-                "--with-report", "--output-root", str(root / "new-code"), "--prepare-only")
+                "--with-report", "--independent-review-required",
+                "--output-root", str(root / "new-code"), "--prepare-only")
             defaults = research_defaults(["research-session", "--config", str(created)])
             options = load_code_task_init_options(config_path=defaults["code_task_config"])
             self.assertEqual(defaults["outputs"], ["code_task", "report"])
@@ -2017,6 +2020,7 @@ class StartTests(unittest.TestCase):
             self.assertEqual(options.workspace_mode, "empty")
             self.assertEqual(defaults['report_outline_strategy'], 'adaptive')
             self.assertTrue(defaults['report_document_review'])
+            self.assertTrue(defaults['independent_review_required'])
 
     def test_fulltext_is_explicit_and_maps_to_existing_retrieval_permissions(self):
         with tempfile.TemporaryDirectory() as directory:

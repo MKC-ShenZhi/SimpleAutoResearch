@@ -142,9 +142,11 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     native.add_argument("--decision-guidance", default=None, help="Facts or direction for a revise response; not execution authorization.")
     native.add_argument("--max-turns", type=int, default=30, help="Native task: model request allowance, retained across feedback/resume.")
     native.add_argument("--max-tokens", type=int, default=600000, help="Native task: shared model token allowance, retained across feedback/resume.")
-    parser.set_defaults(_native_start_destinations={action.dest for action in native._group_actions} | {'extensions'},
+    parser.set_defaults(_native_start_destinations=({action.dest for action in native._group_actions}
+            - {'independent_review_required'}) | {'extensions'},
         extensions=[],
-        _shared_start_destinations={'goal', 'model', 'output_root', 'prepare_only', 'yes', 'project_python'},
+        _shared_start_destinations={'goal', 'model', 'output_root', 'prepare_only', 'yes', 'project_python',
+            'independent_review_required'},
         _data_declaration_destinations={'value_column', 'group_column', 'observation_unit', 'value_unit',
             'data_attribution', 'paired_baseline', 'x_column', 'x_unit', 'data_association',
             'data_mode', 'data_missing', 'data_plot', 'series_layout', 'figure_width'})
@@ -1263,6 +1265,8 @@ def prepare_start(args: argparse.Namespace, *, for_execution: bool = False) -> P
         raise ValueError("start --with-report requires data_analysis or bug_fix; survey, reproduction and writing already request reports.")
     if args.with_report and not args.model:
         raise ValueError("--with-report requires a model connection; analysis alone needs no model.")
+    if getattr(args, 'independent_review_required', False) and kind == 'data_analysis' and not args.with_report:
+        raise ValueError('A required independent review needs a model; request a report or use a model-backed task.')
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
@@ -1331,6 +1335,8 @@ def prepare_start(args: argparse.Namespace, *, for_execution: bool = False) -> P
     options = {"topic": goal, "task_kind": "auto" if kind == "code" else kind,
                "outputs": outputs[kind], "output_root": str((root / "sessions").resolve()),
                "model": model, "interaction": args.interaction, **reproduction_options}
+    if getattr(args, 'independent_review_required', False):
+        options['independent_review_required'] = True
     if kind in {"survey", "reproduction", "writing"} or (kind == "data_analysis" and args.with_report) or (kind in {"bug_fix", "code"} and (sources or documents)):
         options.update(research_materials_only=sources == "materials", research_use_fulltext=args.fulltext,
                        research_allow_pdf_download=args.fulltext, research_keep_raw_pdf=args.fulltext,
