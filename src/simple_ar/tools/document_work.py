@@ -587,7 +587,7 @@ class DocumentWorkToolGateway:
         except (ValueError, OSError):
             pass  # No accessible bibliography is not evidence of one elsewhere.
         prior['images'], prior['bibliography'] = images, bibliography
-        if bibliography and self.context_policy == 'working.v4' and self.report_requirement:
+        if self.context_policy == 'working.v4' and self.report_requirement:
             try:
                 path = self.workspace.resolve_material_root(str(parent / 'citation_map.json'))
                 if path.is_file():

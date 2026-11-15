@@ -92,17 +92,17 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
     prior_map = (prior_references or {}).get('citation_map')
     prior_bib = (prior_references or {}).get('bibliography') or {}
     merged_bibliography = 'text' in prior_bib
-    if merged_bibliography:
+    if prior_map or merged_bibliography:
         from simple_ar.literature.bibtex import bibtex_keys
         from simple_ar.report.citations import body_citation_ids
         saved = prior_map['data'] if prior_map else {'schema_version': 'citation_map.v1', 'entries': []}
         cited = body_citation_ids(prior_draft, set(), include_unknown=True)
         retained = [row for row in saved.get('entries', [])
             if row.get('paper_id') in cited or row.get('model_key') in cited]
-        known = {row['paper_id'] for row in retained}
+        known = {key for row in retained for key in (row.get('paper_id'), row.get('model_key')) if key}
         extra = [{'paper_id': key, 'title': '', 'url': '', 'bibliography': {},
                   'model_key': key if re.fullmatch(r'[Pp]\d+', key) else ''}
-                 for key in sorted((bibtex_keys(prior_bib['text']) & cited) - known)]
+                 for key in sorted((bibtex_keys(prior_bib.get('text', '')) & cited) - known)]
         saved = {**saved, 'entries': [*retained, *extra]}
         context = retain_reference_maps(context, [(saved, True)],
             artifact=prior_map['source'] if prior_map else prior_bib['source'])
