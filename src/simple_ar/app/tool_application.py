@@ -32,7 +32,7 @@ from simple_ar.tools.openai_schema import compact_json_schema, export_openai_too
 from simple_ar.tools.permissions import ToolPermissionPolicy
 from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.extensions import LocalExtension, freeze_extensions
-from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, ToolCompletion, tool_completion, NATIVE_WORK_METHODS, CURRENT_WORK_METHOD, GOAL_WORK_METHOD, DIRECT_NATIVE_SELECTION_POLICIES
+from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, ToolCompletion, tool_completion, NATIVE_WORK_METHODS, CURRENT_WORK_METHOD, GOAL_WORK_METHOD, DIRECT_NATIVE_SELECTION_POLICIES, MODEL_REVIEW_SELECTIONS
 from simple_ar.tools.professional_outcomes import (
     accepted_review_journal, check_professional_stop, related_feedback, stop_decision)
 from simple_ar.tools.workspace import (WorkspaceToolGateway, workspace_tool_specs,
@@ -496,13 +496,13 @@ class ToolApplication:
             raise ValueError('Journal continuity requires the saved shared native work context')
         if config.get('delivery_review_protocol') not in {None, 'task.v1', 'task.v2', 'task.v3', 'task.v4', 'task.v5'}:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
-        if config.get('delivery_review_selection') not in {None, 'model.v1'}:
+        if config.get('delivery_review_selection') not in {None, *MODEL_REVIEW_SELECTIONS}:
             raise ValueError('Unsupported saved delivery review selection')
         if (config.get('code_review_policy') not in {None, 'delivery.v1'}
                 or config.get('code_review_policy') == 'delivery.v1' and (
                     config.get('code_work_policy') != 'shared.v2'
                     or config.get('delivery_review_protocol') != 'task.v5'
-                    or config.get('delivery_review_selection') == 'model.v1'
+                    or config.get('delivery_review_selection') in MODEL_REVIEW_SELECTIONS
                        and not config.get('independent_review_required'))):
             raise ValueError('Shared code review requires the whole-delivery review owner')
         if ('independent_review_required' in config
@@ -2053,7 +2053,7 @@ class ToolApplication:
                     config['work_lifecycle'] = 'integrated.v3'
                     config['inspection_execution_protocol'] = 'shared.v2'
                     config['candidate_review_protocol'] = 'candidate.v1'
-                    config['delivery_review_selection'] = 'model.v1'
+                    config['delivery_review_selection'] = 'model.v2'
                     config['working_set_policy'] = 'recent.v6'
                 config['inspection_material_policy'] = 'operations.v3'
                 config['work_selection_policy'] = ('native.v5'
@@ -2398,7 +2398,7 @@ class ToolApplication:
                 # change to an already running historical code operation.
                 config['code_work_policy'] = 'shared.v2'
                 if (config.get('delivery_review_protocol') == 'task.v5'
-                        and (old.get('delivery_review_selection') != 'model.v1'
+                        and (old.get('delivery_review_selection') not in MODEL_REVIEW_SELECTIONS
                              or config.get('independent_review_required'))):
                     config['code_review_policy'] = 'delivery.v1'
                 else:
@@ -2406,7 +2406,7 @@ class ToolApplication:
             elif 'code_task' in supplied and supplied['code_task'] is None:
                 config['code_work_policy'] = config['code_review_policy'] = None
             if (supplied.get('independent_review_required') is False
-                    and old.get('delivery_review_selection') == 'model.v1'
+                    and old.get('delivery_review_selection') in MODEL_REVIEW_SELECTIONS
                     and old.get('code_review_policy') == 'delivery.v1'):
                 config['code_review_policy'] = None
             if old.get('source_snapshots'):

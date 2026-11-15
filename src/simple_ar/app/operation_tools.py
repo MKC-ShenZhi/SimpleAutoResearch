@@ -12,7 +12,7 @@ from simple_ar.core.assessments import current_assessments
 from simple_ar.tools.gateway import CommonToolGateway
 from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.permissions import ToolPermissionPolicy
-from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS, GOAL_WORK_METHOD, DIRECT_NATIVE_SELECTION_POLICIES
+from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS, GOAL_WORK_METHOD, DIRECT_NATIVE_SELECTION_POLICIES, MODEL_REVIEW_SELECTIONS
 from simple_ar.tools.workspace import WorkspaceToolGateway, workspace_tool_specs
 from simple_ar.tools.sources import SourceToolGateway, source_tool_specs
 from simple_ar.tools.publication import PublicationToolGateway, publication_tool_specs
@@ -565,15 +565,19 @@ class OperationTools:
                     and self.config.get('candidate_review_protocol') == 'candidate.v1'
                     and self.config.get('working_set_policy') in {'recent.v4', 'recent.v5', 'recent.v6'}
                     and self.config.get('candidate_handoff_policy') is None):
-                if self.config.get('delivery_review_selection') == 'model.v1':
+                if self.config.get('delivery_review_selection') in MODEL_REVIEW_SELECTIONS:
                     if self.config.get('independent_review_required'):
                         return (_ORDINARY_WORK + ' The caller requires an independent review before '
                             'complete delivery. Reuse an applicable review or submit a candidate for one; '
                             'unfinished requirements belong in a partial delivery.')
-                    return (_ORDINARY_WORK + ' For a completed delivery, set independent_review=false only when '
+                    choice = (_ORDINARY_WORK + ' For a completed delivery, set independent_review=false only when '
                         'the request and result do not need independent review. Keep independent review when '
                         'the user requests it or the result needs a separate assessment. Omit the field to '
                         'use the default review; this choice cannot waive an unresolved finding.')
+                    if self.config.get('delivery_review_selection') == 'model.v2':
+                        choice += (' A selected delivery-scope review remains part of this request; '
+                            'candidate-scope investigations do not require a final review.')
+                    return choice
                 return _ORDINARY_WORK
             instructions = _goal_work_system(candidate=self.config.get('candidate_review_protocol') == 'candidate.v1',
                 recent=self.config.get('working_set_policy') in {'recent.v3', 'recent.v4', 'recent.v5', 'recent.v6'})

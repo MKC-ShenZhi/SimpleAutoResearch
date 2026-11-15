@@ -133,8 +133,12 @@ class DeliveryVersions:
                 'files': {}, 'binding': 'unavailable', 'status': 'unavailable', 'reason': reason})
         return rows
 
-    def latest_prior(self, request_count: int) -> dict | None:
+    def latest_prior(self, request_count: int | None = None) -> dict | None:
         """Find the most recent retained complete work before this request."""
+        if request_count is None:
+            request_count = len(self.reader.state.get('requests', []))
+        if request_count < 2:
+            return None
         for record, turn in reversed(list(self._closed())):
             if turn.get('request_count', 1) >= request_count:
                 continue
