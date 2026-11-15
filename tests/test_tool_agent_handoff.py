@@ -3683,6 +3683,11 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(restored.state['turns'], turns)
                 self.assertEqual(restored.ledger.to_dict(), ledger)
                 self.assertEqual(source.read_text(encoding='utf-8'), 'Existing research.')
+                if kind == 'report':
+                    restored.supply(supply_id='remove-report', reason='No report is required now',
+                        changes={'report_requirement': None}, replace_existing=True)
+                    self.assertEqual(restored._report_projection()['kind'], 'pending')
+                    self.assertIsNone(restored._report_projection()['requirement'])
                 fake.ask_json.assert_not_called()
                 fake.chat_turn.assert_not_called()
 

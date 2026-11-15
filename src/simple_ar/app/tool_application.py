@@ -752,14 +752,18 @@ class ToolApplication:
         publication_contract = config.get('publication_preparation')
         if publication_contract not in {None, 'bound_candidate.v1'}:
             raise ValueError('Unsupported publication preparation contract')
+
+        def report_source(path):
+            report = self._report_projection()
+            return self.writing.publication_source(path,
+                self._report_inputs(report=report) if report['requirement'] else None,
+                intent=report['intent'], adopted=report['conversion_source'])
+
         self.publication = PublicationToolGateway(controller.store.root, self.workspace, self.ledger,
             asset_protocol=config.get('publication_assets'),
             candidate_source=self.writing.preparation_source,
             owned_execution=publication_contract == 'bound_candidate.v1',
-            report_source=(lambda path: self.writing.publication_source(path,
-                self._report_inputs() if self._report_projection()['requirement'] else None,
-                intent=self._report_projection()['intent'], adopted=self._report_projection()['conversion_source']))
-                if config.get('report_protocol') == _REPORT_PROTOCOL else None)
+            report_source=report_source if config.get('report_protocol') == _REPORT_PROTOCOL else None)
         if publication_contract == 'bound_candidate.v1':
             self.writing.publication_inspection = 'prepared_document.v1'
             self.writing.prepared_publication = lambda ref: self.publication.inspection_source(
@@ -1394,15 +1398,17 @@ class ToolApplication:
         from simple_ar.report.legacy_contract import project_report
         # A new report supersedes an earlier conversion or no-report choice;
         # a compatible earlier report still carries its requested formats.
-        start = max((row.get('request_count', 0) for row in self.state.get('supplies', [])
-            if 'report_requirement' in row.get('changes', {})), default=0)
+        revision = next((row for row in reversed(self.state.get('supplies', []))
+            if 'report_requirement' in row.get('changes', {})), None)
+        start = revision.get('request_count', 0) if revision else 0
         def observations():
             for turn in reversed(self.state['turns']):
                 for item in reversed(turn['tools']):
                     row = self.session.store.read_json(item['result'])
                     intent = (row.get('data') or {}).get('report_intent')
                     if (turn.get('request_count', 1) < start and row.get('tool_name') == 'update_work_plan'
-                            and row.get('status') == 'ok' and intent and intent['kind'] != 'report'):
+                            and row.get('status') == 'ok' and intent
+                            and (intent['kind'] != 'report' or revision['changes']['report_requirement'] is None)):
                         return
                     yield row
         return project_report(self.state['config'], observations())
@@ -5311,7 +5317,7 @@ class ToolApplication:
             'implementation_refs': code['implementation_refs'],
             'evidence_sha256': {**scientific.get('evidence_sha256', {}), **code['evidence_sha256']}}
 
-    def _report_inputs(self) -> dict[str, Any] | None:
+    def _report_inputs(self, *, report: dict | None = None) -> dict[str, Any] | None:
         from simple_ar.report.legacy_contract import bind_report_inputs
         def material_observations():
             observations = []
@@ -5325,7 +5331,7 @@ class ToolApplication:
                             and id(turn) in active[spec.domain]):
                         observations.append(row)
             return observations
-        return bind_report_inputs(config=self.state['config'], report=self._report_projection(),
+        return bind_report_inputs(config=self.state['config'], report=report if report is not None else self._report_projection(),
             workspace=self.workspace, requests=self.state['requests'],
             material_observations=material_observations, execution_evidence=self._execution_evidence,
             implementation=self.implementation)
