@@ -697,10 +697,11 @@ code = "daily"
             main(['code-task', 'run', str(run), '--skip-validation'])
             run_code_task_baseline(run, skip_validation=True, timeout_sec=10)
             ledger = BudgetLedger.load(ledger_path)
-            self.assertEqual(len(ledger.entries), 5)
+            work = [row for row in ledger.entries if row.purpose != 'code_probe']
+            self.assertEqual(len(work), 5)
             self.assertEqual(sum(row.actual.get('llm_requests', 0) for row in ledger.entries), 1)
             self.assertEqual(sum(row.actual.get('total_tokens', 0) for row in ledger.entries), 8)
-            self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in ledger.entries), 4)
+            self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in work), 4)
             self.assertTrue(all(row.status == 'settled' for row in ledger.entries))
             self.assertEqual({row.session_id for row in ledger.entries}, {str(run.resolve())})
             self.assertEqual({row.attempt_id for row in ledger.entries}, {'standalone'})
@@ -709,7 +710,7 @@ code = "daily"
                     main(['code-task', 'run', str(run), '--skip-validation'])
                 with self.assertRaises(SessionBusyError):
                     execute_code_task(run, to_step='baseline', use_llm=False)
-            self.assertEqual(len(BudgetLedger.load(ledger_path).entries), 5)
+            self.assertEqual(len(BudgetLedger.load(ledger_path).entries), len(ledger.entries))
             held_ledger = run / 'budget_ledger.held.json'
             ledger_path.rename(held_ledger)
             try:
@@ -717,7 +718,7 @@ code = "daily"
                     main(['code-task', 'run', str(run), '--skip-validation'])
             finally:
                 held_ledger.rename(ledger_path)
-            self.assertEqual(len(BudgetLedger.load(ledger_path).entries), 5)
+            self.assertEqual(len(BudgetLedger.load(ledger_path).entries), len(ledger.entries))
 
             api_run = root / 'api-task'
             initialize_code_task(run_dir=api_run, code_root=project, task_file=task,
@@ -739,7 +740,8 @@ code = "daily"
             run_code_task_baseline(api_run, skip_validation=True, timeout_sec=10)
             api_ledger = BudgetLedger.load(api_run / 'budget_ledger.json')
             self.assertEqual(sum(row.actual.get('llm_requests', 0) for row in api_ledger.entries), 3)
-            self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in api_ledger.entries), 2)
+            self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in api_ledger.entries
+                if row.purpose != 'code_probe'), 2)
             self.assertIsNone(client.budget_ledger)
 
     def test_historical_standalone_external_ledger_keeps_its_original_identity(self):
