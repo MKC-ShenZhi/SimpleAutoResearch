@@ -903,7 +903,7 @@ simple-ar code-task execute RUN_DIR [OPTIONS]
 | `--model SELECTOR` | Model override for LLM-backed steps. | Unset |
 | `--no-llm` | Use deterministic fallbacks where possible. | Off |
 | `--timeout N` | Benchmark timeout. | 60 |
-| `--yes` | Auto-approve inline review gates in normal execute mode; with `--interactive`, auto-continue primitive prompts. New existing-project tasks directly use the authorized editor without a separate model plan; explicit plan steps and saved tasks retain their original path. | Off |
+| `--yes` | Auto-approve inline review gates in normal execute mode; with `--interactive`, auto-continue primitive prompts. New existing-project tasks propose edits without a separate plan; without `--yes`, applying them still requires approval. Explicit plan steps and saved tasks retain their original path. | Off |
 | `--interactive` | Debug mode: confirm each primitive step instead of running continuously to the next review gate. | Off |
 | `--no-review-inline` | Disable inline review prompts and stop at review gates instead. | Off |
 | `--skip-validation` | Run benchmark even when static validation has not passed. | Off |

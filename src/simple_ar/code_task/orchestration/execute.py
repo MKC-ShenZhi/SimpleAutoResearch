@@ -277,8 +277,8 @@ def execute_code_task(
         raise ValueError("cost_cap_usd must be non-negative when provided")
     if llm_retry_attempts < 1:
         raise ValueError("llm_retry_attempts must be at least 1")
-    if direct_edit and not approval_note.strip():
-        raise ValueError("Direct code work requires the existing task approval")
+    if direct_edit and apply_proposed_edits and not approval_note.strip():
+        raise ValueError("Applying direct code work requires the existing task approval")
     baseline_policy = normalize_baseline_policy(baseline_policy)
 
     root = Path(run_dir)
@@ -546,9 +546,8 @@ def execute_code_task(
     direct_without_plan = (direct_edit and plan_status == 'not_started'
                            and not (paths.task_dir / 'patch_plan.md').exists())
     if direct_without_plan:
-        # The shared caller has already supplied the goal, scope and approval.
-        # Source selection belongs to the editor; no second model plan or
-        # synthetic plan approval is needed for this work unit.
+        # The caller supplied the goal and scope. The editor selects sources;
+        # an unapproved proposal still stops before applying changes.
         _record(steps, "plan", "skipped", "shared task supplies the authorized work")
         plan_status = "approved"
     elif plan_status in {"approved", "rejected", "revision_requested", "pending_approval"}:

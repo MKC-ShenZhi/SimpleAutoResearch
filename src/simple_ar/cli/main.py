@@ -1863,8 +1863,8 @@ def _print_code_task_init(args: argparse.Namespace) -> None:
             edit_scope_protected_patterns=options.edit_scope_protected_patterns,
         )
         if result.kind == 'existing_project':
-            # New standalone runs can reuse the same authorized editor when
-            # the caller chooses automatic approval. Saved runs keep their plan.
+            # New standalone runs use the shared editor. Saved runs keep their
+            # existing plan and approval contract.
             from simple_ar.code_task.runtime.state import load_code_task_manifest, save_code_task_manifest
             saved = load_code_task_manifest(result.run_dir)
             saved['code_task']['auto_edit_policy'] = 'direct.v1'
@@ -2301,11 +2301,13 @@ def _print_code_task_execute(args: argparse.Namespace) -> None:
 
     run_dir = Path(args.run_dir)
     direct_edit = False
-    if (args.yes and not args.no_review_inline and not args.interactive and not args.dry_run
+    if (not args.interactive and not args.dry_run
             and use_llm and EXECUTE_STEPS.index(to_step) > EXECUTE_STEPS.index('plan')):
         from simple_ar.code_task.runtime.state import load_code_task_manifest
         saved = load_code_task_manifest(run_dir)
-        direct_edit = saved.get('code_task', {}).get('auto_edit_policy') == 'direct.v1'
+        direct_edit = (saved.get('code_task', {}).get('auto_edit_policy') == 'direct.v1'
+            and (saved.get('plan', {}).get('status') or 'not_started') == 'not_started'
+            and not (run_dir / 'code_task' / 'patch_plan.md').exists())
     render_execute_header(
         run_dir,
         to_step=to_step,
@@ -2339,15 +2341,17 @@ def _print_code_task_execute(args: argparse.Namespace) -> None:
                 args.apply_proposed_edits
                 or options.apply_proposed_edits
                 or inline_apply_proposed_edits
-                or direct_edit
+                or (direct_edit and args.yes and not args.no_review_inline)
             ),
             allow_large_edits=(
                 args.allow_large_edits
                 or options.allow_large_edits
                 or inline_allow_large_edits
-                or direct_edit
+                or (direct_edit and args.yes and not args.no_review_inline)
             ),
-            **({'direct_edit': True, 'approval_note': 'Caller explicitly selected --yes for this isolated code task.'}
+            **({'direct_edit': True, 'approval_note': ('Caller approved the isolated code changes.'
+                    if (args.yes and not args.no_review_inline) or args.apply_proposed_edits or options.apply_proposed_edits
+                    or inline_apply_proposed_edits else '')}
                if direct_edit else {}),
             allow_planning_fallback=allow_planning_fallback,
             planning_mode=planning_mode,

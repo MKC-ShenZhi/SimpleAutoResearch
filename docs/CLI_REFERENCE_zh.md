@@ -901,7 +901,7 @@ simple-ar code-task execute RUN_DIR [OPTIONS]
 | `--model SELECTOR` | LLM 步骤模型覆盖。 | 未设置 |
 | `--no-llm` | 尽可能使用 deterministic fallback。 | 关闭 |
 | `--timeout N` | benchmark timeout。 | 60 |
-| `--yes` | 普通 execute 模式下自动批准 inline 审核门；与 `--interactive` 一起使用时自动继续逐步提示。新建现有项目任务直接使用已授权编辑，不再另调模型制订补丁计划；显式计划步骤和已保存任务保留原路径。 | 关闭 |
+| `--yes` | 普通 execute 模式下自动批准 inline 审核门；与 `--interactive` 一起使用时自动继续逐步提示。新建现有项目任务直接生成改动建议，不再另制补丁计划；不使用 `--yes` 时，应用改动仍需批准。显式计划步骤和已保存任务保留原路径。 | 关闭 |
 | `--interactive` | 调试模式：逐个 primitive step 确认，而不是连续运行到下一个审核门。 | 关闭 |
 | `--no-review-inline` | 禁用 inline 审核提示，在审核门直接停止。 | 关闭 |
 | `--skip-validation` | 静态验证未通过时仍运行 benchmark。 | 关闭 |

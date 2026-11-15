@@ -5127,7 +5127,7 @@ protected_patterns = ["pyproject.toml"]
             manifest = read_json(run_dir / "manifest.json")
             self.assertEqual(manifest["plan"]["status"], "approved")
 
-    def test_new_standalone_auto_approval_reuses_shared_editor_while_old_runs_keep_the_plan(self):
+    def test_new_standalone_reuses_shared_editor_and_preserves_explicit_review(self):
         with _temporary_root() as root:
             project, task = root / 'project', root / 'task.md'
             _write_toy_project(project)
@@ -5157,6 +5157,51 @@ protected_patterns = ["pyproject.toml"]
                 self.assertEqual((target / 'code_task/patch_plan.md').exists(), expected_plan)
                 self.assertEqual('code-task-plan' in calls, expected_plan)
                 self.assertIn("('win', 'prize')", (code_task_paths(target).workspace_dir / 'spam_model.py').read_text())
+
+            # Manual callers review the actual proposal rather than a separate
+            # plan, and may resume it without regenerating the candidate.
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(['code-task', 'init', '--code-root', str(project), '--task-file', str(task),
+                    '--output-root', str(root / 'manual-runs'), '--name', 'manual',
+                    '--benchmark-command', TOY_BENCHMARK_COMMAND])
+            manual = next((root / 'manual-runs').glob('*/manifest.json')).parent
+            calls = []
+            fake = _FakeCodeTaskClient()
+            def reply(system, user, *, label=''):
+                calls.append(label)
+                return fake.ask_json(system, user, label=label)
+            client = LLMClient(LLMSettings(api_key='fixture', api_mode='chat'))
+            common = ['code-task', 'execute', str(manual), '--model', 'fixture',
+                '--no-review-inline', '--baseline-policy', 'skip', '--to-step', 'apply-edits']
+            with patch.object(LLMClient, 'from_env', return_value=client), \
+                    patch.object(LLMClient, 'ask_json', side_effect=reply), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                main(common)
+                self.assertEqual((code_task_paths(manual).workspace_dir / 'spam_model.py').read_bytes(), original)
+                self.assertTrue((manual / 'code_task/meta/proposed_edits.json').is_file())
+                self.assertFalse((manual / 'code_task/patch_plan.md').exists())
+                before = len(calls)
+                main([*common, '--apply-proposed-edits'])
+            self.assertEqual(len(calls), before)
+            self.assertNotIn('code-task-plan', calls)
+            self.assertIn("('win', 'prize')", (code_task_paths(manual).workspace_dir / 'spam_model.py').read_text())
+
+            # A caller that explicitly requested a plan retains that approval
+            # checkpoint; the later default must not silently approve it.
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(['code-task', 'init', '--code-root', str(project), '--task-file', str(task),
+                    '--output-root', str(root / 'planned-runs'), '--name', 'planned',
+                    '--benchmark-command', TOY_BENCHMARK_COMMAND])
+            planned = next((root / 'planned-runs').glob('*/manifest.json')).parent
+            with patch.object(LLMClient, 'from_env', return_value=client), \
+                    patch.object(LLMClient, 'ask_json', side_effect=reply), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                main(['code-task', 'execute', str(planned), '--model', 'fixture',
+                    '--baseline-policy', 'skip', '--to-step', 'plan'])
+                main(['code-task', 'execute', str(planned), '--model', 'fixture',
+                    '--baseline-policy', 'skip', '--to-step', 'apply-edits', '--no-review-inline'])
+            self.assertEqual(read_json(planned / 'manifest.json')['plan']['status'], 'pending_approval')
+            self.assertFalse((planned / 'code_task/meta/proposed_edits.json').exists())
             self.assertEqual((project / 'spam_model.py').read_bytes(), original)
 
     def test_execute_applies_reviewed_proposal_after_approval(self) -> None:
