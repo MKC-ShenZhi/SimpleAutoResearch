@@ -96,7 +96,7 @@ def setup_option_contract(kind: str | None = None) -> dict:
         "scripted": {"type": "boolean", "kinds": ["data_analysis"], "description": "Generate analysis/plot code when presets do not cover the goal."},
         "independent_review_required": {"type": "boolean",
             "kinds": ["survey", "writing", "reproduction", "bug_fix", "data_analysis"],
-            "description": "Require independent review of the complete result when the user asks for it; leave unset otherwise. Preset data analysis requires with_report."},
+            "description": "Require independent review of the complete result when the user asks for it; leave unset otherwise. Requires a model."},
     })
     return {key: value for key, value in options.items() if kind is None or kind in value["kinds"]}
 
@@ -127,13 +127,11 @@ def normalize_setup_options(value: object, args: argparse.Namespace, locked: set
         if kind not in spec["kinds"]:
             raise ValueError(f"Data semantics or option {key} requires {', '.join(spec['kinds'])}")
     if "sources" in options:
-        if kind == "data_analysis" and not options.get("with_report", args.with_report):
+        if (kind == "data_analysis" and not options.get("with_report", args.with_report)
+                and not options.get("independent_review_required", getattr(args, "independent_review_required", False))):
             raise ValueError("Source scope requires a literature/material task")
         if kind != "survey" and options["sources"] != "materials":
             raise ValueError("Native writing/reproduction preparation here uses supplied material only")
-    if (kind == "data_analysis" and options.get("independent_review_required", getattr(args, "independent_review_required", False))
-            and not options.get("with_report", args.with_report)):
-        raise ValueError("Required independent review needs a model-backed report or an ordinary native task")
     return options
 
 
@@ -255,8 +253,8 @@ def validate_session_arguments(args: argparse.Namespace) -> SessionArguments:
     if task_kind == "data_analysis":
         if command or execution_details or args.code_task_config or args.queries or args.providers or (outputs is not None and set(outputs) not in ({"data_analysis"}, {"data_analysis", "report"})):
             raise SystemExit("Data analysis accepts a supplied table, descriptive settings and an optional report, without research, CodeTask or experiment execution.")
-        if (args.local_document or materials) and not data_report:
-            raise SystemExit("Data documentation and references require outputs=[data_analysis, report].")
+        if (args.local_document or materials) and not (data_report or getattr(args, 'independent_review_required', False)):
+            raise SystemExit("Data documentation and references require a report or independent review.")
         if not getattr(args, "session_root", None):
             try:
                 data_analysis = data_settings(args)

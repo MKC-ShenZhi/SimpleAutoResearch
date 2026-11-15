@@ -479,7 +479,8 @@ def migrate_structured_creation(args: argparse.Namespace, *, request: str, outpu
     """Project domain contracts into one task; modules own their local work."""
     from simple_ar.app.research_intake import create_structured_research_task
     from simple_ar.research.workflow_contracts import ResearchBrief
-    model = args.model if data_analysis is None or 'report' in outputs else None
+    model = (args.model if data_analysis is None or 'report' in outputs
+        or research_config.get('independent_review_required') else None)
     config = dict(research_materials_only=data_analysis is not None or args.task_kind == 'writing')
     config.update(research_config)
     config.update(research_task_kind=args.task_kind, report=report_config,
@@ -1049,11 +1050,12 @@ def prepare_start(args: argparse.Namespace, *, for_execution: bool = False) -> P
         raise ValueError("--asset-max-mb applies to confirmed --chat downloads, not ordinary task preparation.")
     _select_start_preference(args, interactive=interactive)
     kind = args.kind
+    data_model = args.with_report or getattr(args, 'independent_review_required', False)
     if kind == "figure" or args.scripted:
         raise ValueError("Figure/scripted preferences require native entry; technical setup cannot preserve their controls as a structured protocol.")
     if kind == "code" and args.project is None:
         print_line("Structured code creation compatibility: retaining the explicit edit scope/validator and CodeTask protocol. Use a natural-language start goal for native creation.")
-    if kind != "data_analysis" or args.with_report or args.chat:
+    if kind != "data_analysis" or data_model or args.chat:
         select_start_model(args, interactive=interactive)
     project_python = getattr(args, "project_python", None)
     if project_python is not None:
@@ -1110,8 +1112,8 @@ def prepare_start(args: argparse.Namespace, *, for_execution: bool = False) -> P
         from simple_ar.research.documents.ingest import retained_document_materials
         if any(path.suffix.lower() != ".json" for path in materials) or len(retained_document_materials(materials, original_sources_only=True)) != len(materials):
             raise ValueError("Survey materials must be saved original-source document bundles; use --document for ordinary source files.")
-    elif materials and kind not in {"writing", "reproduction"} and not (kind == "data_analysis" and args.with_report):
-        raise ValueError("--material requires writing, reproduction preparation or data_analysis --with-report.")
+    elif materials and kind not in {"writing", "reproduction"} and not (kind == "data_analysis" and data_model):
+        raise ValueError("--material requires writing, reproduction, or data analysis with a report or independent review.")
     if kind == "writing" and interactive and not (documents or materials):
         materials.append(Path(_answer("Draft, notes or results / 草稿、笔记或结果说明路径", None,
                                       interactive=interactive)).expanduser().resolve())
@@ -1157,8 +1159,8 @@ def prepare_start(args: argparse.Namespace, *, for_execution: bool = False) -> P
     if kind == "data_analysis":
         if any((args.fulltext, args.project, args.validate, allowed, args.max_cited_sources)) or sources not in {None, "materials"}:
             raise ValueError("Data analysis does not authorize online search, remote retrieval or project editing.")
-        if (documents or materials or sources) and not args.with_report:
-            raise ValueError("Data documentation and references require --with-report; analysis alone reads only its table.")
+        if (documents or materials or sources) and not data_model:
+            raise ValueError("Data documentation and references require a report or independent review.")
         if any(path.suffix.lower() not in {".md", ".markdown", ".txt", ".pdf"} for path in [*documents, *materials]):
             raise ValueError("Data report documentation must be local text/PDF; supply the table through --data-file.")
         if len(set([*documents, *materials])) != len(documents) + len(materials):
@@ -1228,15 +1230,15 @@ def prepare_start(args: argparse.Namespace, *, for_execution: bool = False) -> P
         raise ValueError("start --with-report requires data_analysis or bug_fix; survey, reproduction and writing already request reports.")
     if args.with_report and not args.model:
         raise ValueError("--with-report requires a model connection; analysis alone needs no model.")
-    if getattr(args, 'independent_review_required', False) and kind == 'data_analysis' and not args.with_report:
-        raise ValueError('A required independent review needs a model; request a report or use a model-backed task.')
+    if getattr(args, 'independent_review_required', False) and not args.model:
+        raise ValueError('A required independent review needs a model connection.')
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
     from simple_ar.core.console import make_console
     summary = Table.grid(padding=(0, 2))
     for label, value in (("Task", kind), ("Goal", goal),
-                         ("Model", "not used (descriptive analysis)" if kind == "data_analysis" and not args.with_report else args.model),
+                         ("Model", "not used (descriptive analysis)" if kind == "data_analysis" and not data_model else args.model),
                          ("Interaction", args.interaction)):
         summary.add_row(Text(label, style="cyan"), Text(value))
     make_console().print(Panel(summary, title="Task preview / 任务确认", border_style="cyan"))
@@ -1296,13 +1298,13 @@ def prepare_start(args: argparse.Namespace, *, for_execution: bool = False) -> P
     outputs = {"survey": ["report"], "bug_fix": ["bug_fix"], "code": ["code_task"], "reproduction": ["experiments", "report"], "writing": ["report"], "data_analysis": ["data_analysis"]}
     if args.with_report:
         outputs[kind].append("report")
-    model = "" if kind == "data_analysis" and not args.with_report else args.model
+    model = "" if kind == "data_analysis" and not data_model else args.model
     options = {"topic": goal, "task_kind": "auto" if kind == "code" else kind,
                "outputs": outputs[kind], "output_root": str((root / "sessions").resolve()),
                "model": model, "interaction": args.interaction, **reproduction_options}
     if getattr(args, 'independent_review_required', False):
         options['independent_review_required'] = True
-    if kind in {"survey", "reproduction", "writing"} or (kind == "data_analysis" and args.with_report) or (kind in {"bug_fix", "code"} and (sources or documents)):
+    if kind in {"survey", "reproduction", "writing"} or (kind == "data_analysis" and data_model) or (kind in {"bug_fix", "code"} and (sources or documents)):
         options.update(research_materials_only=sources == "materials", research_use_fulltext=args.fulltext,
                        research_allow_pdf_download=args.fulltext, research_keep_raw_pdf=args.fulltext,
                        local_document=[str(path) for path in documents])

@@ -132,6 +132,10 @@ class SelectedWorkContinuityTests(unittest.TestCase):
             'source_priming_policy': 'priority.v3', 'source_provenance': 'versions.v2',
             'execution_protocol': 'shared.v2', 'identity': 'fresh-review'}
         inspector = fresh.operations.inspection
+        historical = deepcopy(saved)
+        historical.pop('source_provenance')
+        inspector._reuse_observations(historical, [50000])
+        self.assertFalse(historical['targets'][0]['windows'])
         inspector._reuse_observations(saved, [50000])
         window, = saved['targets'][0]['windows']
         self.assertEqual(window['text'], 'second\n')

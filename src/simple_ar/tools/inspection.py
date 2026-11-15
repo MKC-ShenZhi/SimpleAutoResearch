@@ -1871,7 +1871,8 @@ class InspectionToolGateway:
         def supply(seed: dict | None) -> None:
             for observed in (seed or {}).get('observations', []):
                 if applicable and ('content_reuse' in observed or
-                        'record' not in observed and not isinstance(observed.get('source_reference'), dict)):
+                        'record' not in observed and not (self._observed_sources(saved)
+                            and isinstance(observed.get('source_reference'), dict))):
                     # An inspected source needs its own original read receipt.
                     # A creation-frozen read has an explicit retained source;
                     # equal bytes at another path do not transfer provenance.

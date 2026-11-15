@@ -522,7 +522,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
         raise SystemExit("Use either --with-report or --no-report for research-session, not both.")
     analysis_only = task_kind == "data_analysis" and not (args.with_report or
         ("report" in (outputs if outputs is not None else saved_outputs) and not args.no_report))
-    model_enabled = bool(args.model) and not analysis_only
+    model_enabled = bool(args.model) and (not analysis_only or getattr(args, 'independent_review_required', False))
     review_model = (getattr(args, "feasibility_review_model", None) or "").strip()
     if review_model and not model_enabled:
         raise SystemExit("--feasibility-review-model requires --model for research design.")

@@ -41,6 +41,24 @@ class AnalysisWritingTests(unittest.TestCase):
             self.assertEqual(defaults['local_document'], [str(paper.resolve())])
             self.assertTrue(defaults['research_materials_only'])
             self.assertFalse(defaults['research_allow_pdf_download'])
+            with patch('sys.stdin.isatty', return_value=False), contextlib.redirect_stdout(io.StringIO()):
+                review_config = prepare_start(parser.parse_args([
+                    *common, '--independent-review-required', '--model', 'review-model']))
+            reviewed = research_defaults(['research-session', '--config', str(review_config)])
+            self.assertEqual(reviewed['outputs'], ['data_analysis'])
+            self.assertEqual(reviewed['model'], 'review-model')
+            self.assertTrue(reviewed['independent_review_required'])
+            self.assertEqual(reviewed['material'], [str(notes.resolve())])
+            self.assertEqual(reviewed['local_document'], [str(paper.resolve())])
+            from simple_ar.cli.main import main
+            with patch('simple_ar.app.research_intake.create_structured_research_task') as create, \
+                    patch('simple_ar.cli.start._run_created_research'), contextlib.redirect_stdout(io.StringIO()):
+                main(['research-session', '--config', str(review_config)])
+            self.assertEqual(create.call_args.kwargs['model'], 'review-model')
+            self.assertTrue(create.call_args.kwargs['config']['independent_review_required'])
+            self.assertEqual(create.call_args.args[0].requested_outputs, ('data_analysis',))
+            self.assertEqual({row['role'] for row in create.call_args.args[0].asset_requests},
+                {'dataset', 'material', 'paper'})
             advanced = parser.parse_args(['research-session', '--topic', 'Describe supplied values', '--task-kind', 'data_analysis',
                 '--data-file', str(source), '--value-column', 'score', '--observation-unit', 'row',
                 '--material', str(notes), '--with-report'])
