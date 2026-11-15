@@ -660,7 +660,8 @@ code = "daily"
             self.assertTrue(all((path / "code_task/workspace/module.py").is_file() for path in runs))
 
     def test_standalone_code_task_accounts_for_model_and_runs_in_one_ledger(self):
-        from simple_ar.code_task import execute_code_task, run_code_task_baseline
+        from simple_ar.code_task import (execute_code_task, generate_code_task_work_plan,
+            initialize_code_task, propose_patch_edits, run_code_task_baseline)
         from simple_ar.core.budget import BudgetError, BudgetLedger
         from simple_ar.core.locking import SessionBusyError, SessionFileLock
         from simple_ar.integrations.llm import LLMClient, LLMSettings
@@ -718,6 +719,29 @@ code = "daily"
                 held_ledger.rename(ledger_path)
             self.assertEqual(len(BudgetLedger.load(ledger_path).entries), 5)
 
+            api_run = root / 'api-task'
+            initialize_code_task(run_dir=api_run, code_root=project, task_file=task,
+                benchmark_command=f'{sys.executable} module.py')
+            client = LLMClient(settings)
+            with patch('simple_ar.integrations.llm._call_provider', return_value=provider):
+                execute_code_task(api_run, to_step='work-plan', baseline_policy='skip', llm_client=client)
+                generate_code_task_work_plan(api_run, llm_client=client, force=True)
+            edit = {'summary': 'Improve the output.', 'edits': [{'path': 'module.py',
+                'old': "print('score: 1')", 'new': "print('score: 2')"}]}
+            edit_provider = {**provider, 'choices': [{'message': {'content': json.dumps(edit)}}]}
+            with patch('simple_ar.integrations.llm._call_provider', return_value=edit_provider):
+                proposal = propose_patch_edits(api_run, llm_client=client, task_only=True)
+            self.assertEqual(proposal.edit_count, 1)
+            run_code_task_baseline(api_run, skip_validation=True, timeout_sec=10)
+            saved = read_json(api_run / 'manifest.json')
+            saved['code_task']['cli_accounting'] = saved['code_task'].pop('accounting')
+            write_json(api_run / 'manifest.json', saved)
+            run_code_task_baseline(api_run, skip_validation=True, timeout_sec=10)
+            api_ledger = BudgetLedger.load(api_run / 'budget_ledger.json')
+            self.assertEqual(sum(row.actual.get('llm_requests', 0) for row in api_ledger.entries), 3)
+            self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in api_ledger.entries), 2)
+            self.assertIsNone(client.budget_ledger)
+
     def test_historical_standalone_external_ledger_keeps_its_original_identity(self):
         from simple_ar.code_task import initialize_code_task
         from simple_ar.core.budget import BudgetLedger
@@ -730,7 +754,8 @@ code = "daily"
             task = root / 'task.md'
             task.write_text('Inspect the module.\n', encoding='utf-8')
             run = root / 'old-task'
-            initialize_code_task(run_dir=run, code_root=project, task_file=task, workspace_mode='copy')
+            initialize_code_task(run_dir=run, code_root=project, task_file=task, workspace_mode='copy',
+                standalone=False)
             ledger = BudgetLedger(storage_path=run / 'budget_ledger.json')
             ledger.reserve('old-agent', {'llm_requests': 0, 'total_tokens': 0}, purpose='external_agent')
             ledger.mark_unknown('old-agent', reason='Original external model usage was not reported')

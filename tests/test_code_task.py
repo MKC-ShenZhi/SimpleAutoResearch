@@ -582,7 +582,8 @@ class CodeTaskTests(unittest.TestCase):
             _write_toy_project(project)
             task.write_text("Improve spam prediction for prize messages.", encoding="utf-8")
             initialize_code_task(run_dir=run_dir, code_root=project, task_file=task,
-                                 benchmark_command="python -m unittest discover -s tests", direct_edit=False)
+                                 benchmark_command="python -m unittest discover -s tests", direct_edit=False,
+                                 standalone=False)
             ledger = BudgetLedger({"llm_requests": 12, "total_tokens": 50000,
                                    "process_invocations": 1, "process_wall_seconds": 5})
             observed = []
@@ -633,7 +634,8 @@ class CodeTaskTests(unittest.TestCase):
             original = (project / 'spam_model.py').read_bytes()
             task.write_text('Update spam_model.py predict to classify prize messages as spam.', encoding='utf-8')
             initialize_code_task(run_dir=run_dir, code_root=project, task_file=task,
-                benchmark_command='python -m unittest discover -s tests')
+                benchmark_command='python -m unittest discover -s tests', standalone=False)
+            self.assertFalse((run_dir / 'budget_ledger.json').exists())
             ledger = BudgetLedger({'llm_requests': 4, 'total_tokens': 50000})
             # An independently supplied task ledger must bind an unbound client,
             # including when this consumer skips the legacy planning stages.

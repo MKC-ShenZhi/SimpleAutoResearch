@@ -15,7 +15,8 @@ def standalone_task_accounting(run_dir: Path, *, active: bool = True):
     if not active or not manifest_path.is_file():
         yield {}
         return
-    policy = read_json(manifest_path).get('code_task', {}).get('cli_accounting')
+    task = read_json(manifest_path).get('code_task', {})
+    policy = task.get('accounting', task.get('cli_accounting'))
     if policy is None:
         yield {}
         return
@@ -25,6 +26,16 @@ def standalone_task_accounting(run_dir: Path, *, active: bool = True):
     with SessionFileLock(root / 'code_task' / 'meta' / 'budget.lock'):
         yield {'budget_ledger': BudgetLedger.load(root / 'budget_ledger.json'),
                'session_id': str(root.resolve()), 'attempt_id': 'standalone'}
+
+
+@contextmanager
+def task_model_accounting(run_dir: Path | None, client):
+    """Supply the saved ledger to the existing model-client factory."""
+    if run_dir is None or isinstance(getattr(client, '_budget_ledger', None), BudgetLedger):
+        yield {}
+        return
+    with standalone_task_accounting(run_dir) as accounting:
+        yield accounting
 
 
 def account_code_task(action):

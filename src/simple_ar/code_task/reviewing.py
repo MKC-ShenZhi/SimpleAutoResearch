@@ -10,6 +10,7 @@ from simple_ar.integrations.llm import LLMClient, LLMError, LLMResponseError
 from simple_ar.reviewing.schema import ReviewFinding, normalize_review_findings, review_report
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.artifacts import write_atomically, write_json
+from simple_ar.core.budget import BudgetLedger
 from simple_ar.code_task.runtime.state import review_workspace_boundary
 from simple_ar.code_task.review_pipeline import (
     build_review_index, build_review_clusters, compact_review_index, snippets_for_cluster,
@@ -214,6 +215,8 @@ def run_llm_review(
     message_callback: MessageCallback | None = None,
     max_findings: int = 16,
     allow_blocking: bool = False,
+    budget_ledger: BudgetLedger | None = None,
+    session_id: str = "", attempt_id: str = "",
 ) -> list[ReviewFinding]:
     """Run the shared LLM reviewer and normalize its findings."""
 
@@ -226,6 +229,7 @@ def run_llm_review(
         llm_client = client if client is not None and not record_injected_usage else LLMClient.for_task(
             client=client,
             model=model,
+            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
             usage_callback=lambda usage: record_usage(
                 meta_dir,
                 usage,

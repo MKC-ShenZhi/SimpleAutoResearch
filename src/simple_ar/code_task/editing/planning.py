@@ -16,6 +16,7 @@ from simple_ar.code_task.editing.scope import (
 from simple_ar.code_task.runtime.state import (
     code_task_paths, read_required_json as _read_required_json, utcnow_iso as _utcnow_iso,
 )
+from simple_ar.code_task.runtime.accounting import task_model_accounting
 from simple_ar.code_task.analysis.context import (
     LoadedCodeTaskContextPack,
     ensure_code_task_context_pack,
@@ -120,7 +121,7 @@ def generate_patch_plan(
     )
     inputs["benchmark_command"] = _benchmark_command(manifest)
     plan_data, mode = _generate_plan_data(
-        meta_dir, inputs=inputs, selected_files=selected,
+        meta_dir, run_dir=root, inputs=inputs, selected_files=selected,
         ask=_ask_llm_for_plan, offline=_offline_plan,
         plan_name="patch", usage_stage="code_task.plan",
         model=model, use_llm=use_llm, llm_client=llm_client,
@@ -239,39 +240,41 @@ def _generate_plan_data(
     llm_retry_attempts: int,
     allow_llm_fallback: bool,
     message_callback: MessageCallback | None,
+    run_dir: Path | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Adapt planning to the existing completed-response correction owner."""
     if use_llm:
-        client = LLMClient.for_task(
-            client=llm_client, model=model,
-            usage_callback=lambda usage: record_usage(
-                meta_dir, usage, stage=usage_stage, message_callback=message_callback),
-        )
+        with task_model_accounting(run_dir, llm_client) as accounting:
+            client = LLMClient.for_task(
+                client=llm_client, model=model, **accounting,
+                usage_callback=lambda usage: record_usage(
+                    meta_dir, usage, stage=usage_stage, message_callback=message_callback),
+            )
 
-        # Keep fallback conservative across every correction in this plan unit.
-        accounting_before = response_accounting_snapshot(client)
+            # Keep fallback conservative across every correction in this plan unit.
+            accounting_before = response_accounting_snapshot(client)
 
-        def operation(attempt: int, last_error: LLMError | None) -> dict[str, Any]:
-            suffix = f" (attempt {attempt}/{llm_retry_attempts})" if llm_retry_attempts > 1 else ""
-            _emit(message_callback, f"Calling LLM for code-task {plan_name} planning{suffix}.")
-            return ask(client, **inputs, retry_feedback=retry_suffix(last_error, attempt))
+            def operation(attempt: int, last_error: LLMError | None) -> dict[str, Any]:
+                suffix = f" (attempt {attempt}/{llm_retry_attempts})" if llm_retry_attempts > 1 else ""
+                _emit(message_callback, f"Calling LLM for code-task {plan_name} planning{suffix}.")
+                return ask(client, **inputs, retry_feedback=retry_suffix(last_error, attempt))
 
-        def on_failure(exc: LLMError, attempt: int, correct: bool) -> None:
-            if isinstance(exc, LLMResponseError):
-                write_json(meta_dir / "planning_steps" / f"{plan_name}-plan-response-{attempt:03d}.json",
-                    {"error": str(exc), "raw_response": exc.raw_response})
-                if response_accounting_known(client, accounting_before):
-                    _emit(message_callback, f"LLM {plan_name} planning attempt {attempt} failed: {exc}")
+            def on_failure(exc: LLMError, attempt: int, correct: bool) -> None:
+                if isinstance(exc, LLMResponseError):
+                    write_json(meta_dir / "planning_steps" / f"{plan_name}-plan-response-{attempt:03d}.json",
+                        {"error": str(exc), "raw_response": exc.raw_response})
+                    if response_accounting_known(client, accounting_before):
+                        _emit(message_callback, f"LLM {plan_name} planning attempt {attempt} failed: {exc}")
 
-        try:
-            return run_completed_response_corrections(
-                client=client, operation=operation, retry_attempts=llm_retry_attempts,
-                on_failure=on_failure,
-            ), "llm"
-        except LLMResponseError as exc:
-            if not allow_llm_fallback or not response_accounting_known(client, accounting_before):
-                raise
-            _emit(message_callback, f"Using offline fallback after LLM {plan_name} planning failed. {exc}")
+            try:
+                return run_completed_response_corrections(
+                    client=client, operation=operation, retry_attempts=llm_retry_attempts,
+                    on_failure=on_failure,
+                ), "llm"
+            except LLMResponseError as exc:
+                if not allow_llm_fallback or not response_accounting_known(client, accounting_before):
+                    raise
+                _emit(message_callback, f"Using offline fallback after LLM {plan_name} planning failed. {exc}")
 
     return offline(
         task_text=inputs["task_text"], index=inputs["index"],

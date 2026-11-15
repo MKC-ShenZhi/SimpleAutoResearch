@@ -264,7 +264,7 @@ class WorkspaceExecutionTests(unittest.TestCase):
         task.write_text('Check the existing project')
         run = initialize_code_task(run_dir=self.base / 'baseline-run', code_root=source,
             task_file=task, benchmark_command='python check.py',
-            env_mode='external', python_executable=sys.executable)
+            env_mode='external', python_executable=sys.executable, standalone=False)
         workspace = run.workspace_dir.resolve()
         ledger = BudgetLedger({'process_invocations': 4, 'process_wall_seconds': 60})
         sandbox = ProcessSandbox(workspace, workspace, Path(sys.executable))
@@ -294,7 +294,7 @@ class WorkspaceExecutionTests(unittest.TestCase):
 
         greenfield = initialize_code_task(run_dir=self.base / 'greenfield-run', code_root=None,
             task_file=task, kind='greenfield', workspace_mode='empty', benchmark_command='python main.py',
-            env_mode='external', python_executable=sys.executable)
+            env_mode='external', python_executable=sys.executable, standalone=False)
         green_workspace = greenfield.workspace_dir.resolve()
         green_scope = CodeTaskProcessScope(ProcessSandbox(green_workspace, green_workspace, Path(sys.executable)),
             ledger, 'unit', 'greenfield', self.base / 'greenfield-probes',

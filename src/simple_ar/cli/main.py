@@ -1811,14 +1811,6 @@ def _print_code_task_init(args: argparse.Namespace) -> None:
             edit_scope_allowed_patterns=options.edit_scope_allowed_patterns,
             edit_scope_protected_patterns=options.edit_scope_protected_patterns,
         )
-        # A standalone task owns its accounting; embedded CodeTask work uses
-        # the enclosing session's ledger instead of creating another one.
-        from simple_ar.core.budget import BudgetLedger
-        from simple_ar.code_task.runtime.state import load_code_task_manifest, save_code_task_manifest
-        manifest = load_code_task_manifest(run_dir)
-        manifest['code_task']['cli_accounting'] = 'standalone.v1'
-        save_code_task_manifest(run_dir, manifest)
-        BudgetLedger(storage_path=run_dir / 'budget_ledger.json').save()
     except (
         FileExistsError,
         FileNotFoundError,

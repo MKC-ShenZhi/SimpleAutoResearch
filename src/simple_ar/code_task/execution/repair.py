@@ -28,6 +28,7 @@ from simple_ar.code_task.runtime.state import (
     utcnow_iso,
 )
 from simple_ar.code_task.execution.summary import write_code_task_summary
+from simple_ar.code_task.runtime.accounting import task_model_accounting
 from simple_ar.code_task.memory import task_memory_context
 from simple_ar.integrations.llm import LLMClient
 from simple_ar.integrations.usage import record_usage
@@ -195,34 +196,36 @@ def propose_repair_edits(
 
     mode = "offline"
     if use_llm:
-        _emit(message_callback, "Calling LLM for bounded repair proposal.")
-        client = LLMClient.for_task(
-            client=llm_client,
-            model=model,
-            usage_callback=lambda usage: record_usage(
-                paths.meta_dir,
-                usage,
-                stage="code_task.repair",
-                message_callback=message_callback,
-            ),
-        )
-        proposal = client.ask_json(
-            CODE_TASK_REPAIR_SYSTEM,
-            _repair_prompt(
-                task_text=task_text,
-                patch_plan=patch_plan,
-                patch_diff=patch_diff,
-                memory_context=memory_context,
-                failure_analysis=failure_analysis,
-                execution_report=execution_report,
-                validation_report=validation_report,
-                snippets=snippets,
-                read_only_context=read_only_context,
-                new_files=new_files,
-            ),
-            label="code-task-repair",
-        )
-        mode = "llm"
+        with task_model_accounting(run_dir, llm_client) as accounting:
+            _emit(message_callback, "Calling LLM for bounded repair proposal.")
+            client = LLMClient.for_task(
+                client=llm_client,
+                model=model,
+                **accounting,
+                usage_callback=lambda usage: record_usage(
+                    paths.meta_dir,
+                    usage,
+                    stage="code_task.repair",
+                    message_callback=message_callback,
+                ),
+            )
+            proposal = client.ask_json(
+                CODE_TASK_REPAIR_SYSTEM,
+                _repair_prompt(
+                    task_text=task_text,
+                    patch_plan=patch_plan,
+                    patch_diff=patch_diff,
+                    memory_context=memory_context,
+                    failure_analysis=failure_analysis,
+                    execution_report=execution_report,
+                    validation_report=validation_report,
+                    snippets=snippets,
+                    read_only_context=read_only_context,
+                    new_files=new_files,
+                ),
+                label="code-task-repair",
+            )
+            mode = "llm"
     else:
         proposal = _offline_repair(selected)
 

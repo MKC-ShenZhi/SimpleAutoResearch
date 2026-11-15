@@ -90,6 +90,7 @@ def initialize_code_task(
     data_inputs: tuple[str, ...] = (),
     initial_files: tuple[str, ...] = (),
     direct_edit: bool = True,
+    standalone: bool = True,
 ) -> CodeTaskInitResult:
     """Initialize a local code-task run without modifying the source project.
 
@@ -135,6 +136,8 @@ def initialize_code_task(
         direct_edit: New existing-project tasks may propose edits without a
             separate plan; applying them remains subject to caller approval.
             Use False when retaining an explicitly planned historical task.
+        standalone: Create and use this task's own ledger. Embedded work passes
+            False and uses its enclosing task's ledger instead.
 
     Returns:
         Paths and metadata for the initialized code-task run.
@@ -248,26 +251,28 @@ def initialize_code_task(
         python_executable=resolved_python,
     )
     manifest_path = root / "manifest.json"
-    write_json(
-        manifest_path,
-        _manifest(
-            run_dir=root,
-            code_root=source_root,
-            task_file=task_source,
-            benchmark_command=benchmark_command,
-            primary_metric=primary_metric_value,
-            metric_directions=normalized_metric_directions,
-            max_file_bytes=max_file_bytes,
-            copy_report=copy_report,
-            workspace=workspace,
-            codebase_index=codebase_index,
-            repo_map=repo_map,
-            edit_scope=edit_scope,
-            environment_policy=environment_policy,
-            kind=normalized_kind,
-            direct_edit=direct_edit,
-        ),
+    manifest = _manifest(
+        run_dir=root,
+        code_root=source_root,
+        task_file=task_source,
+        benchmark_command=benchmark_command,
+        primary_metric=primary_metric_value,
+        metric_directions=normalized_metric_directions,
+        max_file_bytes=max_file_bytes,
+        copy_report=copy_report,
+        workspace=workspace,
+        codebase_index=codebase_index,
+        repo_map=repo_map,
+        edit_scope=edit_scope,
+        environment_policy=environment_policy,
+        kind=normalized_kind,
+        direct_edit=direct_edit,
     )
+    if standalone:
+        from simple_ar.core.budget import BudgetLedger
+        manifest['code_task']['accounting'] = 'standalone.v1'
+        BudgetLedger(storage_path=root / 'budget_ledger.json').save()
+    write_json(manifest_path, manifest)
     if normalized_kind != "greenfield":
         result_schema = _init_result_schema(primary_metric_value, normalized_metric_directions)
         save_task_contract(

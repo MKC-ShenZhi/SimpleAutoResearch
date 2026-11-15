@@ -909,9 +909,13 @@ class LLMClient:
     def for_task(
         cls, *, client: "LLMClient | None" = None,
         model: str | None = None, usage_callback: UsageCallback | None = None,
-        purpose: str = "code",
+        purpose: str = "code", budget_ledger: BudgetLedger | None = None,
+        session_id: str = "", attempt_id: str = "",
     ) -> "LLMClient":
         """Use an injected session client while preserving task usage reporting."""
+        if budget_ledger is not None:
+            client = bind_task_budget(client, budget_ledger, model=model,
+                session_id=session_id, attempt_id=attempt_id)
         if client is None:
             return cls.from_env(model=model, usage_callback=usage_callback, purpose=purpose)
 

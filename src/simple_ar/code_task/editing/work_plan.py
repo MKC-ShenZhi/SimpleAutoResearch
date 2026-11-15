@@ -140,7 +140,7 @@ def generate_code_task_work_plan(
     if new_files:
         inputs["run_context"]["new_files"] = new_files
     plan_data, mode = _generate_plan_data(
-        paths.meta_dir, inputs=inputs, selected_files=selected,
+        paths.meta_dir, run_dir=root, inputs=inputs, selected_files=selected,
         ask=_ask_llm_for_work_plan, offline=_offline_work_plan,
         plan_name="work", usage_stage="code_task.work_plan",
         model=model, use_llm=use_llm, llm_client=llm_client,
