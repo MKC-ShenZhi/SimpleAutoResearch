@@ -8,6 +8,13 @@ from typing import Any
 from simple_ar.core.artifacts import read_json, write_json
 
 
+def uses_legacy_greenfield(manifest: dict[str, Any]) -> bool:
+    """Keep the saved experimental generator's contract with its consumers."""
+    task = manifest.get('code_task', {})
+    return (isinstance(task, dict) and str(task.get('kind') or '').lower() == 'greenfield'
+            and task.get('auto_edit_policy') != 'direct.v1')
+
+
 @dataclass(frozen=True)
 class CodeTaskPaths:
     """Common paths for a code-task run.

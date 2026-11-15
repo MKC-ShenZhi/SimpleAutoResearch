@@ -467,8 +467,8 @@ class ToolApplication:
             raise ValueError('Unsupported saved work lifecycle policy')
         if config.get('code_work_policy') not in (None, 'shared.v1', 'shared.v2'):
             raise ValueError('Unsupported saved code work policy')
-        if (config.get('code_implementation_policy') not in (None, 'direct.v1')
-                or config.get('code_implementation_policy') == 'direct.v1'
+        if (config.get('code_implementation_policy') not in (None, 'direct.v1', 'direct.v2')
+                or config.get('code_implementation_policy') in {'direct.v1', 'direct.v2'}
                    and (config.get('code_task') is None or config.get('code_work_policy') != 'shared.v2')):
             raise ValueError('Direct code implementation requires the shared code-work contract')
         if config.get('sandbox_operations') not in (None, 'workspace.v1'):
@@ -2106,10 +2106,10 @@ class ToolApplication:
             config['sandbox_operations'] = 'workspace.v1'
         if config.get('code_task') is not None:
             config['code_work_policy'] = 'shared.v2'
-            config['code_implementation_policy'] = 'direct.v1'
+            preparation = config['code_task'].get('preparation') or {}
+            config['code_implementation_policy'] = 'direct.v2' if preparation.get('kind') == 'greenfield' else 'direct.v1'
             # A required whole-delivery check owns the advisory model review;
             # deterministic patch and validation checks remain in CodeTask.
-            preparation = config['code_task'].get('preparation') or {}
             config['code_review_policy'] = 'delivery.v2' if preparation.get('kind') == 'greenfield' else 'delivery.v1'
         if config.get('code_task') is not None or config.get('report_requirement') is not None:
             # Structured analysis/measurement tasks need the same frozen
@@ -2647,7 +2647,8 @@ class ToolApplication:
                 # An explicitly supplied new code contract is new work, not a
                 # change to an already running historical code operation.
                 config['code_work_policy'] = 'shared.v2'
-                config['code_implementation_policy'] = 'direct.v1'
+                preparation = config['code_task'].get('preparation') or {}
+                config['code_implementation_policy'] = 'direct.v2' if preparation.get('kind') == 'greenfield' else 'direct.v1'
                 if (config.get('delivery_review_protocol') == 'task.v5'
                         and (old.get('delivery_review_selection') not in MODEL_REVIEW_SELECTIONS
                              or config.get('independent_review_required'))):

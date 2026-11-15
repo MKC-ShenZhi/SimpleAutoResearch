@@ -3669,7 +3669,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         root, _, _, binding, app, _ = self._native_fixture(code_task=contract, mount_inputs=False,
             independent_review_required=True)
         self.assertEqual(app.state['config']['code_review_policy'], 'delivery.v2')
+        self.assertEqual(app.state['config']['code_implementation_policy'], 'direct.v2')
         self.assertTrue(app.operations.implementation.defer_greenfield_review)
+        self.assertTrue(app.operations.implementation.direct_greenfield)
         from tests.native_history_fixture import load_prepared_operation_history
         restored = load_prepared_operation_history(root / 'saved-greenfield', contract['goal'], config={
             'model': 'fixture', 'model_connection': binding, 'sources': {}, 'allow_execution': True,
@@ -3681,6 +3683,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(restored.state['config']['code_review_policy'], 'delivery.v1')
         self.assertTrue(restored.operations.implementation.defer_code_review)
         self.assertFalse(restored.operations.implementation.defer_greenfield_review)
+        self.assertFalse(restored.operations.implementation.direct_greenfield)
 
     def test_report_request_retains_compatible_history_and_supersedes_conversion(self):
         for kind in ('conversion', 'none', 'report'):

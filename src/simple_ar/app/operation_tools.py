@@ -457,7 +457,8 @@ class OperationTools:
                 code_work_policy=config.get('code_work_policy') if exact else None,
                 defer_code_review=config.get('code_review_policy') in {'delivery.v1', 'delivery.v2'},
                 defer_greenfield_review=config.get('code_review_policy') == 'delivery.v2',
-                direct_code_edit=config.get('code_implementation_policy') == 'direct.v1',
+                direct_code_edit=config.get('code_implementation_policy') in {'direct.v1', 'direct.v2'},
+                direct_greenfield=config.get('code_implementation_policy') == 'direct.v2',
                 sandboxed_execution=(config.get('sandbox_execution', False)
                     and config.get('sandbox_operations') == 'workspace.v1'),
                 material_observations=material_observations if not exact else None,

@@ -13,7 +13,7 @@ from simple_ar.code_task.orchestration.execute import implement_code_task
 from simple_ar.code_task.orchestration.verification import apply_verified_repair, verify_implementation
 from simple_ar.code_task.execution.repair import RepairEvidence, propose_repair_edits
 from simple_ar.code_task.analysis.context import load_latest_code_task_context_pack
-from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest, save_code_task_manifest, workspace_file
+from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest, save_code_task_manifest, uses_legacy_greenfield, workspace_file
 from simple_ar.code_task.editing.scope import protected_patterns_from_manifest
 from simple_ar.experiment.execution.measurement import snapshot_protocol_assets, reconcile_protocol_assets
 from simple_ar.integrations.llm import bind_task_budget
@@ -59,7 +59,7 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
     # retaining deterministic scope, structure and interface checks.
     review_with_llm = not (request.defer_model_review
         and (request.defer_greenfield_review or manifest.get('code_task', {}).get('kind') != 'greenfield'))
-    direct_edit = request.direct_edit and manifest.get('code_task', {}).get('kind') != 'greenfield'
+    direct_edit = request.direct_edit and not uses_legacy_greenfield(manifest)
     paths = code_task_paths(request.run_dir)
     if paths.workspace_dir.resolve() != request.cwd.resolve():
         raise ValueError("Candidate cwd must be the initialized CodeTask workspace.")

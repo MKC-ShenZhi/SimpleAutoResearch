@@ -40,6 +40,7 @@ from simple_ar.code_task.runtime.state import (
     native_workspace_binding,
     native_preparation_processes,
     save_code_task_manifest,
+    uses_legacy_greenfield,
     utcnow_iso,
 )
 from simple_ar.code_task.execution.summary import write_code_task_summary
@@ -359,7 +360,7 @@ def run_code_task_benchmark(
     stderr_truncated |= process.record["streams"]["stderr"]["tail_bytes_discarded"] > 0
     if not timed_out:
         artifact_scan: dict[str, Any] | None = None
-        if (_is_greenfield_manifest(manifest)
+        if (uses_legacy_greenfield(manifest)
                 and not (binding and binding['binding'].get('measurement_contract') is not None)):
             artifact_scan = scan_required_artifacts(run_dir, manifest)
             artifact_scan_path = _write_runtime_artifact_scan(run_dir, label, artifact_scan)
@@ -1054,11 +1055,6 @@ def _benchmark_command(manifest: dict[str, Any]) -> str:
     return ""
 
 
-def _is_greenfield_manifest(manifest: dict[str, Any]) -> bool:
-    code_task = manifest.get("code_task")
-    return isinstance(code_task, dict) and str(code_task.get("kind") or "") == "greenfield"
-
-
 def _write_runtime_artifact_scan(run_dir: Path, label: str, scan: dict[str, Any]) -> Path:
     paths = code_task_paths(run_dir)
     run_dir_for_label = _run_label_dir(paths.run_artifact_dir, label)
@@ -1085,7 +1081,7 @@ def _greenfield_result_quality_guard(
     if missing:
         return {'status': 'failed', 'reason': 'required_new_files',
             'message': 'Required new files were not created as nonempty regular files: ' + ', '.join(missing)}
-    if not _is_greenfield_manifest(manifest):
+    if not uses_legacy_greenfield(manifest):
         return None
     if manifest.get('code_task', {}).get('native_binding', {}).get('binding', {}).get('measurement_contract') is not None:
         # This physical invocation is the independently approved validator.

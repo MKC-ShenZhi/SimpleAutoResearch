@@ -586,6 +586,7 @@ class ImplementationToolGateway:
                  defer_code_review: bool = False,
                  defer_greenfield_review: bool = False,
                  direct_code_edit: bool = False,
+                 direct_greenfield: bool = False,
                  sandboxed_execution: bool = False,
                  declaration_review: bool = False,
                  professional_requests: bool = False,
@@ -639,7 +640,8 @@ class ImplementationToolGateway:
         self.code_work_policy = code_work_policy
         self.defer_code_review = defer_code_review
         self.defer_greenfield_review = defer_greenfield_review
-        self.direct_code_edit = direct_code_edit
+        self.direct_code_edit = direct_code_edit or direct_greenfield
+        self.direct_greenfield = direct_greenfield
         self.sandboxed_execution = sandboxed_execution
         self.material_observations = material_observations
         self.exact = ExactCodeTask.model_validate(exact) if exact is not None else None
@@ -1358,13 +1360,18 @@ class ImplementationToolGateway:
             if preparation is None else preparation.model_dump(exclude={'data_inputs'}))
         data_inputs = [] if preparation is None else preparation.data_inputs
         generation_source = None
+        shared_greenfield = bool(preparation and preparation.kind == 'greenfield' and self.direct_greenfield)
         if work.prior_result or work.prepared_result:
             # Feedback starts from the accepted candidate, not a fresh
             # filtered import or committed baseline. Keep its actual env.
             settings.update(kind=preparation.kind if preparation is not None else 'existing_project', workspace_mode='copy',
                 workspace_include=[], workspace_exclude=[], workspace_reuse_source_venv=False,
                 env_mode='external', python_executable=binding['python_executable'])
-            if work.prior_result and preparation is not None and preparation.kind == 'greenfield':
+            if preparation is not None and preparation.kind == 'greenfield':
+                predecessor = self.workspace.resolve(work.prior_result or work.prepared_result)
+                previous = load_code_task_manifest(self.workspace.workspace / 'code_tasks' / predecessor.parent.name)
+                shared_greenfield = previous['code_task'].get('auto_edit_policy') == 'direct.v1'
+            if work.prior_result and preparation is not None and preparation.kind == 'greenfield' and not shared_greenfield:
                 prior = ArtifactStore(self.workspace.resolve(work.prior_result).parent)
                 payload = prior.read_json('implementation.json')
                 original = load_code_task_manifest(Path(payload['code_task_run_dir']))['benchmark']
@@ -1390,6 +1397,10 @@ class ImplementationToolGateway:
             data_paths=tuple(origin / name for name in data_inputs), generation_source=generation_source,
             respect_allowed_paths=self.code_work_policy == 'shared.v2'))
         manifest = load_code_task_manifest(run)
+        if shared_greenfield:
+            # Persist the selected owner with the candidate, including revisions
+            # copied from a prepared source. Saved legacy candidates keep theirs.
+            manifest['code_task']['auto_edit_policy'] = 'direct.v1'
         manifest['code_task']['native_binding'] = approval
         initialized = native_workspace_binding(manifest, code_task_paths(run).workspace_dir)
         if preparation is not None and manifest['workspace']['selected_mode'] == 'git_worktree':

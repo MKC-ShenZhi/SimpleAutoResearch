@@ -196,6 +196,10 @@ def propose_patch_edits(
     batch = load_latest_code_task_batch(root)
     batch_constraints = _batch_constraints(batch)
     allowed_edit_files = batch_constraints["target_files"]
+    # An empty allowlist means all non-protected workspace paths are in scope.
+    # A direct task can therefore create files even without explicit patterns;
+    # a planned batch still narrows creation to its selected targets.
+    allow_new_files = not allowed_edit_files and (task_only or bool(allowed_patterns))
     memory_context = task_memory_context(root)
     budget = edit_budget_for_profile(
         budget_profile or batch_constraints["budget_profile"],
@@ -343,7 +347,7 @@ def propose_patch_edits(
                 allowed_edit_files=proposal_allowed_files,
                 batch_work_item=batch_constraints.get("work_item", {}),
                 memory_context=memory_context,
-                allow_new_files=bool(allowed_patterns) and not allowed_edit_files,
+                allow_new_files=allow_new_files,
                 diagnostics_dir=meta_dir,
             )
             # Evidence acquisition is bounded independently of edit approval.
@@ -457,7 +461,7 @@ def propose_patch_edits(
                         budget=budget, allowed_edit_files=proposal_allowed_files,
                         batch_work_item=batch_constraints.get("work_item", {}),
                         memory_context=memory_context, dependency_api=dependency_api,
-                        allow_new_files=bool(allowed_patterns) and not allowed_edit_files,
+                        allow_new_files=allow_new_files,
                     ) + "\nUnapplied draft edits (not changes in the workspace):\n"
                     + json.dumps(proposal.get("edits", []), ensure_ascii=False)
                     + "\nReturn one complete replacement proposal, retaining or correcting useful draft edits "
@@ -487,7 +491,7 @@ def propose_patch_edits(
         budget=budget,
         allow_large_edits=allow_large_edits,
         allowed_edit_files=proposal_allowed_files,
-        allow_new_files=bool(allowed_patterns) and not allowed_edit_files,
+        allow_new_files=allow_new_files,
     )
     normalized["selected_files"] = selected
     normalized["read_only_context"] = read_only_context
@@ -817,8 +821,8 @@ def _edit_user_prompt(
         "- Do not return markdown or a unified diff.\n"
         "- Do not include diff markers such as `+`, `-`, `@@`, `---`, or "
         "`+++` inside `old` or `new`; they must contain only file text.\n"
-        "- Use only workspace-relative paths from the provided file inventory.\n"
-        "- Only propose edits for inventory `editable_files` within the allowed batch.\n"
+        "- Use workspace-relative paths; existing files must be in inventory `editable_files` "
+        "and within the allowed batch.\n"
         "- Inventory `read_only_files` are evidence only; do not modify "
         "protected tests, benchmarks, or validation targets.\n"
         "- Reference source snippets are read-only dependency context. Use them "
@@ -833,8 +837,10 @@ def _edit_user_prompt(
         "combine them into one larger old/new replacement.\n"
         + ("- Keep the patch minimal and aligned with the approved patch plan.\n\n"
            if patch_plan else "- Keep the patch focused on the task.\n\n")
-        + ("New files are also permitted within these allowed scope patterns: "
-           + json.dumps(allowed_patterns) + ". Protected paths remain read-only. "
+        + ("New files are also permitted "
+           + ("within these allowed scope patterns: " + json.dumps(allowed_patterns)
+              if allowed_patterns else "within the workspace")
+           + ". Protected paths remain read-only. "
            "For a genuinely absent file use old=\"\" and new=the complete file text. "
            "Split implementation into focused helper modules when useful; the same edit budgets apply.\n\n"
            if allow_new_files else "New files require an explicitly listed batch target; use old=\"\" only for an absent file.\n\n")

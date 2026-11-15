@@ -11,6 +11,7 @@ from simple_ar.code_task.runtime.state import (
     load_code_task_manifest,
     manifest_section,
     save_code_task_manifest,
+    uses_legacy_greenfield,
     utcnow_iso,
 )
 
@@ -300,13 +301,15 @@ def _next_step(
     plan = manifest.get("plan", {})
     patch = manifest.get("patch", {})
     code_task = manifest.get("code_task", {})
-    is_greenfield = isinstance(code_task, dict) and str(code_task.get("kind", "")).lower() == "greenfield"
+    is_new_project = isinstance(code_task, dict) and str(code_task.get("kind", "")).lower() == "greenfield"
+    direct_edit = isinstance(code_task, dict) and code_task.get('auto_edit_policy') == 'direct.v1'
+    is_greenfield = uses_legacy_greenfield(manifest)
     plan_status = plan.get("status", "not_started") if isinstance(plan, dict) else "not_started"
     patch_status = patch.get("status", "not_started") if isinstance(patch, dict) else "not_started"
     validation_status = validation.get("status") if validation else ""
     if not environment:
         return "Run `simple-ar code-task probe <run-dir>` to record environment signals."
-    if not baseline_execution and not is_greenfield and not _baseline_not_required(manifest):
+    if not baseline_execution and not is_new_project and not _baseline_not_required(manifest):
         return "Run `simple-ar code-task baseline <run-dir>` before asking for edits."
     if is_greenfield and patched_execution:
         patched_status = str(patched_execution.get("status", "unknown"))
@@ -321,7 +324,9 @@ def _next_step(
         return "Review `code_task/meta/validation_report.json`; rerun execute with repair budget if needed."
     if is_greenfield and not patched_execution:
         return "Run `simple-ar code-task execute <run-dir> --to-step run` to benchmark the generated project."
-    if plan_status in {"not_started", "unknown"}:
+    if plan_status in {"not_started", "unknown"} and direct_edit and patch_status in {"not_started", "unknown"}:
+        return "Run `simple-ar code-task execute <run-dir>` to propose the authorized work."
+    if plan_status in {"not_started", "unknown"} and not direct_edit:
         return "Run `simple-ar code-task plan <run-dir>` to create a reviewable patch plan."
     if plan_status == "pending_approval":
         return "Review `code_task/patch_plan.md`, then run `simple-ar code-task decide-plan <run-dir> --decision approve|revise|reject`."

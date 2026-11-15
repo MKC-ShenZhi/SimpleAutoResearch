@@ -62,6 +62,7 @@ from simple_ar.code_task.runtime.state import (
     load_code_task_manifest,
     manifest_section,
     save_code_task_manifest,
+    uses_legacy_greenfield,
     utcnow_iso,
 )
 from simple_ar.code_task.execution.summary import write_code_task_summary
@@ -299,7 +300,7 @@ def execute_code_task(
         direct_edit = direct_edit_available(manifest, paths.task_dir, to_step=to_step, use_llm=use_llm)
     ensure_task_memory(root)
     steps: list[ExecuteStepRecord] = []
-    greenfield = (_code_task_kind(manifest) == "greenfield"
+    greenfield = (uses_legacy_greenfield(manifest)
         and manifest.get('implementation', {}).get('mode') != 'controlled_patch')
     if greenfield and process_scope is not None:
         from simple_ar.code_task.generation.agent_backend import should_use_agent_backend

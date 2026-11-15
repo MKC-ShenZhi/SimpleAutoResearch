@@ -6400,6 +6400,24 @@ class WorkspaceSourceBindingTests(unittest.TestCase):
 class GenerationAuthorizationTests(unittest.TestCase):
     """Exercise publication authority through real staging; only the model is fake."""
 
+    def test_direct_editor_can_create_a_file_in_the_default_workspace_scope(self):
+        with _temporary_root() as root:
+            source, task, run = root / 'source', root / 'task.md', root / 'run'
+            write_text(source / 'existing.py', 'VALUE = 1\n')
+            write_text(task, 'Add a small reusable helper.')
+            initialize_code_task(run_dir=run, code_root=source, task_file=task)
+            proposal = {'summary': 'Add the requested helper.', 'edits': [{
+                'path': 'helper.py', 'old': '', 'new': 'def value():\n    return 1\n',
+                'reason': 'The task requests a new helper.'}], 'validation': [], 'risks': []}
+            client = LLMClient(LLMSettings(api_key='fixture', api_mode='chat'))
+            with patch.object(LLMClient, 'ask_json', return_value=proposal):
+                result = propose_patch_edits(run, llm_client=client, task_only=True)
+            self.assertEqual(result.edit_count, 1)
+            apply_patch_edits(run, allow_unapproved_plan=True)
+            self.assertEqual((code_task_paths(run).workspace_dir / 'helper.py').read_text(),
+                'def value():\n    return 1\n')
+            self.assertFalse((source / 'helper.py').exists())
+
     def test_implementation_preserves_bound_originals_without_manufactured_edits(self):
         from simple_ar.code_task.generation.writer import write_implementation_unit
         from simple_ar.tools.materials import freeze_work_context
@@ -6657,6 +6675,111 @@ class GenerationAuthorizationTests(unittest.TestCase):
                                      for call in client.ask_json.call_args_list))
                 self.assertFalse((run / 'code_task/workspace/generated_project').exists())
 
+    def test_shared_greenfield_creation_and_feedback_keep_scope_and_real_validation(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.core.capabilities import ArtifactStore, CapabilityRegistry, CapabilityResult
+        from simple_ar.core.session import SessionController, BudgetState
+        from simple_ar.tools.implementation import ImplementationToolGateway
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+
+        for mode in ('empty', 'copy'):
+            with self.subTest(workspace=mode), _temporary_root() as root:
+                ledger = BudgetLedger({'llm_requests': 12, 'total_tokens': 10000,
+                    'process_invocations': 8, 'process_wall_seconds': 120})
+                (root / 'attempts').mkdir()
+                source = root / 'source'
+                if mode == 'copy':
+                    write_text(source / 'notes.txt', 'Preserve the existing scaffold.\n')
+                contract = {'project_path': 'source' if mode == 'copy' else '',
+                    'goal': 'Create a reusable Python function that doubles a value.',
+                    'allowed_patterns': ['pkg/**'], 'new_files': ['pkg/features.py'],
+                    'validation_command': ['python', '-c', 'from pkg.features import double; assert double(3) == 6'],
+                    'timeout_sec': 10, 'preparation': {'kind': 'greenfield', 'workspace_mode': mode,
+                        'max_file_bytes': 0, 'max_repairs': 0}}
+                workspace = WorkspaceToolGateway(root, {'records': root / 'attempts',
+                    **({'source': source} if mode == 'copy' else {})}, ledger)
+                client = Mock()
+                client.effective_output_limit.return_value = None
+                client._budget_ledger = ledger
+                client._budget_session_id = 'task'
+                client._budget_attempt_id = ''
+                def bind(bound_ledger, *, session_id, attempt_id):
+                    self.assertIs(bound_ledger, ledger)
+                    client._budget_attempt_id = attempt_id
+                    return client
+                client.with_budget.side_effect = bind
+                calls = []
+                def reply(_system, prompt, *, label='', **_kwargs):
+                    calls.append((label, prompt))
+                    call = f'mock-{len(calls)}'
+                    ledger.reserve(call, {'llm_requests': 1, 'total_tokens': 100},
+                        session_id='task', attempt_id=identity, purpose=label)
+                    ledger.settle(call, {'llm_requests': 1, 'total_tokens': 100})
+                    if label == 'code-task-propose-edits':
+                        old = '' if identity == 'first' else 'return value * 2'
+                        new = 'def double(value):\n    return value * 2\n' if not old else 'return value + value'
+                        return {'summary': 'Implement requested function.', 'edits': [
+                            {'path': 'pkg/features.py', 'old': old, 'new': new, 'reason': 'Requested behavior.'}],
+                            'validation': [], 'risks': []}
+                    if 'review' in label:
+                        return {'status': 'passed', 'summary': 'Mock review.', 'findings': []}
+                    raise AssertionError(f'Unexpected model call: {label}')
+                client.ask_json.side_effect = reply
+                owner = ImplementationToolGateway(root, workspace, ledger, 'fixture', 'task', exact=contract,
+                    client_factory=lambda _: client, code_work_policy='shared.v2',
+                    work_context=lambda _: {'user_requests': [contract['goal']]},
+                    direct_code_edit=True, direct_greenfield=True)
+                registry = CapabilityRegistry()
+                def native(*, context, tool_name, arguments, approval):
+                    result = owner.execute_tool(tool_name, context, arguments, approval=approval)
+                    context.store.write_json('native_result.json', result.model_dump(mode='json'))
+                    return CapabilityResult(status='completed', artifacts=ToolApplication._native_artifacts(
+                        context.store, result.model_dump(mode='json'), name=tool_name))
+                registry.register('native_tool', native)
+                controller = SessionController.create(root, session_id='task', topic=contract['goal'],
+                    registry=registry, budget=BudgetState(max_attempts=4))
+                original = _project_bytes(source)
+                previous = ''
+                prepared = ''
+                if mode == 'copy':
+                    identity = 'prepared'
+                    approval = {'token': identity, 'binding': owner.approval_binding(
+                        {}, identity=identity, for_preparation=True)}
+                    controller.execute_attempt('native_tool', attempt_id=identity, tool_name='prepare_code_task',
+                        arguments={}, approval=approval)
+                    result = ArtifactStore(root / 'attempts' / identity).read_json('native_result.json')
+                    self.assertEqual(result['status'], 'ok', result)
+                    self.assertFalse(calls)
+                    prepared = 'records/prepared/execution.json'
+                for identity in ('first', 'feedback'):
+                    work = ({'prepared_result': prepared} if prepared else {}) if not previous else {
+                        'prior_result': previous, 'instruction': 'Use equivalent addition while preserving the public function.'}
+                    approval = {'token': identity, 'binding': owner.approval_binding(work, identity=identity)}
+                    with patch('simple_ar.integrations.llm.LLMClient.for_task', return_value=client):
+                        controller.execute_attempt('native_tool', attempt_id=identity, tool_name='implement_code_task',
+                            arguments=work, approval=approval)
+                    store = ArtifactStore(root / 'attempts' / identity)
+                    observed = store.read_json('native_result.json')
+                    self.assertEqual(observed['status'], 'ok', observed)
+                    self.assertEqual(observed['data']['validation']['status'], 'passed')
+                    run = workspace.workspace / 'code_tasks' / identity
+                    manifest = read_json(run / 'manifest.json')
+                    self.assertEqual(manifest['code_task']['auto_edit_policy'], 'direct.v1')
+                    self.assertNotIn('generation_architecture_plan', observed['data']['artifact_refs'])
+                    candidate = code_task_paths(run).workspace_dir
+                    self.assertFalse((candidate / 'main.py').exists())
+                    self.assertFalse((candidate / 'generated_project').exists())
+                    self.assertNotIn('workspace/generated_project', (run / 'code_task/summary.md').read_text())
+                    self.assertEqual((candidate / 'pkg/features.py').read_text(),
+                        'def double(value):\n    return value * 2\n' if identity == 'first'
+                        else 'def double(value):\n    return value + value\n')
+                    if mode == 'copy':
+                        self.assertEqual((candidate / 'notes.txt').read_text(), 'Preserve the existing scaffold.\n')
+                    previous = f'records/{identity}/implementation.json'
+                self.assertEqual(_project_bytes(source), original)
+                self.assertFalse(any(label.startswith('greenfield-') for label, _ in calls))
+                self.assertIn('New files are also permitted', calls[0][1])
+
     def test_exact_greenfield_generation_feedback_and_api_guard_use_real_owners(self):
         for mode, failed_baseline in (('empty', False), ('copy', False), ('sparse_copy', False), ('copy', True)):
             with self.subTest(workspace=mode, failed_baseline=failed_baseline):
@@ -6679,8 +6802,10 @@ class GenerationAuthorizationTests(unittest.TestCase):
         from simple_ar.research.preparation import run_preparation_capability
         with _temporary_root() as root, patch('simple_ar.research.preparation.run_preparation_capability',
                 wraps=run_preparation_capability) as prepare:
+            # Include environment/static probes as well as the physical
+            # validators and measurements counted explicitly below.
             ledger = BudgetLedger({'llm_requests': 30, 'total_tokens': 50000,
-                                   'process_invocations': 32 if isolated else 8,
+                                   'process_invocations': 32 if isolated else 12,
                                    'process_wall_seconds': 480 if isolated else 120})
             (root / 'attempts').mkdir()
             source = root / 'source'
