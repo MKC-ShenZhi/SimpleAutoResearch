@@ -8285,17 +8285,22 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             motivation_refs=['original-span'], metrics=['accuracy'])
         synthesis = SynthesisResult(status='ready', gap_summary='A bounded question',
             ideas=(candidate,), novelty_checks=())
-        client = Mock()
+        client, reviewer = Mock(), Mock()
         def bound(identity):
             client._budget_ledger, client._budget_attempt_id = workspace.ledger, identity
             return client
+        def bound_reviewer(identity):
+            reviewer._budget_ledger, reviewer._budget_attempt_id = workspace.ledger, identity
+            return reviewer
         client.ask_json.return_value = {'assessments': [{
             'idea_id': 'method', 'relevance': 'Relevant', 'differentiation': 'Unknown',
             'feasibility': 'Bounded', 'cost': 'One run', 'falsifiability': 'No effect',
             'recommendation': 'Investigate', 'supporting_evidence_refs': ['original-span'],
             'counter_evidence_refs': [], 'unknowns': []}],
             'recommended_idea_id': 'method', 'recommendation_reason': 'Supported by the supplied source'}
+        reviewer.ask_json.return_value = client.ask_json.return_value
         owner = SourceToolGateway(root, workspace, workspace.ledger, client_factory=bound,
+            feasibility_client_factory=bound_reviewer,
             policy=SourcePolicy(materials=('source0/document.json',), allow_network=False))
         def make_context(identity):
             return CapabilityContext(ArtifactStore(root / 'attempts' / identity),
@@ -8341,7 +8346,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(design_result.status, 'ok', design_result.error)
         self.assertEqual(design_context.store.read_json('idea_assessment.json')['recommended_idea_id'], 'method')
         self.assertEqual(design_context.store.read_json('design_review/idea_assessment.json')['recommended_idea_id'], 'method')
-        self.assertEqual(client.ask_json.call_count, 3)
+        self.assertEqual(client.ask_json.call_count, 2)
+        self.assertEqual(reviewer.ask_json.call_count, 1)
+        self.assertIn('Cancellation propagates', reviewer.ask_json.call_args.args[1])
 
     def test_research_read_combines_selected_bundle_and_additional_material(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
