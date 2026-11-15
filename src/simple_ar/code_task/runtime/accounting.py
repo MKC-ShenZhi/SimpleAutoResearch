@@ -27,8 +27,8 @@ def standalone_task_accounting(run_dir: Path, *, active: bool = True):
                'session_id': str(root.resolve()), 'attempt_id': 'standalone'}
 
 
-def account_standalone_task(action):
-    """Give direct API callers the same ledger used by the CLI action."""
+def account_code_task(action):
+    """Use the enclosing scope or the saved standalone ledger for a task action."""
     @wraps(action)
     def run(run_dir, *args, **kwargs):
         client = kwargs.get('llm_client')
@@ -43,11 +43,13 @@ def account_standalone_task(action):
             kwargs = {**kwargs, 'budget_ledger': scope.ledger,
                       'session_id': scope.session_id, 'attempt_id': scope.attempt_id}
             return action(run_dir, *args, **kwargs)
-        if kwargs.get('budget_ledger') is not None or client_ledger is not None:
+        if kwargs.get('budget_ledger') is not None or isinstance(client_ledger, BudgetLedger):
             return action(run_dir, *args, **kwargs)
         with standalone_task_accounting(Path(run_dir), active=not kwargs.get('dry_run', False)) as accounting:
             if accounting:
-                kwargs = {**accounting, **{key: value for key, value in kwargs.items()
-                    if key not in accounting or value}}
+                kwargs = dict(kwargs)
+                for key, value in accounting.items():
+                    if not kwargs.get(key):
+                        kwargs[key] = value
             return action(run_dir, *args, **kwargs)
     return run

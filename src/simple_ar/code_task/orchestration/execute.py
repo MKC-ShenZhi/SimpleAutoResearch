@@ -69,7 +69,7 @@ from simple_ar.code_task.execution.validation import validate_code_task
 from simple_ar.code_task.editing.work_plan import generate_code_task_work_plan
 from simple_ar.integrations.llm import LLMClient, LLMError, bind_task_budget, task_budget_identity
 from simple_ar.code_task.runtime.config import EXECUTE_STEPS, normalize_review_gate
-from simple_ar.code_task.runtime.accounting import account_standalone_task
+from simple_ar.code_task.runtime.accounting import account_code_task
 
 
 MessageCallback = Callable[[str], None]
@@ -133,7 +133,7 @@ class CodeTaskExecuteResult:
     summary_path: Path
 
 
-@account_standalone_task
+@account_code_task
 def execute_code_task(
     run_dir: Path,
     *,

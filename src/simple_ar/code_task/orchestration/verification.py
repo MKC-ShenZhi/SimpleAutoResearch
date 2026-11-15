@@ -9,7 +9,7 @@ from typing import Any, Callable, Mapping
 
 from simple_ar.core.artifacts import read_json
 from simple_ar.core.budget import BudgetLedger
-from simple_ar.code_task.runtime.accounting import account_standalone_task
+from simple_ar.code_task.runtime.accounting import account_code_task
 from simple_ar.code_task.editing.patching import apply_patch_edits
 from simple_ar.code_task.execution.repair import RepairEvidence, RepairProposalResult, propose_repair_edits
 from simple_ar.code_task.execution.runner import CodeTaskRunResult, recover_implementation_process, run_code_task_benchmark
@@ -81,7 +81,7 @@ def apply_verified_repair(
         **({'process_scope': process_scope} if process_scope is not None else {}))
 
 
-@account_standalone_task
+@account_code_task
 def verify_implementation(
     run_dir: Path, *, command: tuple[str, ...], approval_note: str,
     llm_client: LLMClient, max_repairs: int = 0, timeout_sec: int = 60,
