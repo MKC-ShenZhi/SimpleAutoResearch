@@ -8218,6 +8218,55 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual({name: resumed.session.store.resolve(name).read_bytes()
                                   for name in retained}, retained)
 
+    def test_research_handoff_keeps_user_requests_and_replays_frozen_context(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+
+        goal = 'Compare interval methods published from 2010 through 2014.'
+        _, _, fake, _, app, _ = self._native_fixture(goal=goal)
+        feedback = 'Also discuss failure cases.'
+        app.state['requests'].append(feedback)
+        self.assertEqual(app.sources.user_requests(), [goal, feedback])
+        fake.ask_json.return_value = {
+            'queries': ['interval methods'],
+            'questions': [{'question': 'Which methods?', 'facet': 'method'}],
+            'temporal_scope': {'start_year': 2010, 'end_year': 2014,
+                               'basis_quote': 'published from 2010 through 2014'}}
+        store = ArtifactStore(app.session.store.root / 'attempts' / 'research-task-context')
+        context = CapabilityContext(store, AttemptManifest('research-task-context', capability='native_tool'))
+        arguments = {'operation': 'plan', 'question': 'Compare interval methods', 'use_llm': True}
+        result = app.sources.execute_tool('research', context, arguments)
+        self.assertEqual(result.status, 'ok', result.error)
+        self.assertIn(feedback, fake.ask_json.call_args.args[1])
+        self.assertEqual(store.read_json('source_request.json')['user_requests'], [goal, feedback])
+        self.assertEqual(store.read_json('research_plan.json')['source_plan']['filters']['temporal_scope']['start_year'], 2010)
+        from simple_ar.literature.models import Paper
+        from simple_ar.research.planning.capability import ResearchPlanResult
+        from simple_ar.research.sources.base import SearchResponse
+        from simple_ar.research.sources.capability import SearchResult
+        from simple_ar.tools.sources import _Search
+        papers = [Paper(id=str(year), title='Interval methods', authors=[], abstract='Interval methods',
+                        url=f'https://example.org/{year}', published=f'{year}-01-01') for year in (2012, 2018)]
+        found = SearchResult(status='completed', papers=tuple(papers), responses=(
+            SearchResponse(source='arxiv', query='interval methods', papers=papers),))
+        plan = ResearchPlanResult.from_handoff_dict(store.read_json('research_plan.json'))
+        directory = app.session.store.root / 'evidence' / 'planned-search'
+        directory.mkdir(parents=True)
+        with patch('simple_ar.tools.sources.search_sources', return_value=found) as search:
+            app.sources._search(_Search(query='interval methods', providers=['arxiv']),
+                directory, plan=plan, question='Compare interval methods')
+        self.assertEqual(search.call_args.args[0].filters['temporal_scope']['end_year'], 2014)
+        selected = read_json(directory / 'search.json')['selected_paper_ids']
+        self.assertNotIn('2018', selected)
+        app.state['requests'].append('A later request.')
+        self.assertEqual(app.sources.execute_tool('research', context, arguments), result)
+        self.assertEqual(fake.ask_json.call_count, 1)
+        # A receipt saved by the earlier contract still replays unchanged.
+        saved = store.read_json('source_request.json')
+        del saved['user_requests']
+        store.write_json('source_request.json', saved)
+        self.assertEqual(app.sources.execute_tool('research', context, arguments), result)
+        self.assertEqual(fake.ask_json.call_count, 1)
+
     def test_professional_summary_uses_parent_attempt_and_retains_bound_partial_evidence(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
         from simple_ar.tools.sources import SourcePolicy, SourceToolGateway

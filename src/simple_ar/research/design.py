@@ -50,6 +50,7 @@ class ResearchDesignRequest:
     implementation_feedback: Mapping[str, Any] = field(default_factory=dict)
     source_workspace: Path | None = None
     source_index: Mapping[str, Any] = field(default_factory=dict)
+    user_requests: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.use_llm and self.llm_client is None:
@@ -423,6 +424,7 @@ def _refine_implementation_design(request: ResearchDesignRequest, *, trace: list
             RESEARCH_DESIGN_SYSTEM,
             prompt + json.dumps({"design": request.previous_design, "feedback": request.implementation_feedback,
                 "task": request.execution_context,
+                **({"user_requests": request.user_requests} if request.user_requests else {}),
                 "fixed_idea_id": request.idea_id if request.idea_id_is_fixed else "",
                 "research_materials": synthesis.to_handoff_dict() if synthesis is not None else {},
                 "source_excerpts": excerpts,
@@ -789,6 +791,7 @@ def _review_initial_feasibility(
         "Compare the candidate's intervention with the proposed code behavior, not merely "
         "their common research goal or metric.\n\n"
         + json.dumps({
+            **({"user_requests": request.user_requests} if request.user_requests else {}),
             "selected_idea": reviewed_idea.to_row() if reviewed_idea else None,
             "contract": previous.contract.to_row() if previous.contract else None,
             "implementation_spec": response.get("implementation_spec"),
@@ -992,6 +995,7 @@ def _select_idea_with_llm(
                 ensure_ascii=False,
             ),
             execution_context=request.execution_context,
+            user_requests=request.user_requests,
             execution_boundary_json=json.dumps(
                 dict(request.execution_boundary), ensure_ascii=False, default=str,
             ),

@@ -321,7 +321,7 @@ class OperationTools:
         self.sources = SourceToolGateway(root, self.workspace, ledger, policy=config.get('research_policy'),
             authority_revision=config.get('authority_revision', 0), execution_contract=config.get('execution_contract'),
             client_factory=(lambda identity:client_factory(identity, 'task')) if config['model'] is not None else None,
-            registry=search_registry)
+            registry=search_registry, user_requests=user_requests)
         self.registry.register_package(source_tool_specs(), self.sources)
         self.publication = PublicationToolGateway(root, self.workspace, ledger,
             work_lifecycle=config.get('work_lifecycle'),

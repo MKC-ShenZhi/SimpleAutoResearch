@@ -17,6 +17,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- Common research work carries the original request and feedback into planning, reading, synthesis and design; a verified publication range remains effective through source selection even if the delegated question omits it.
 - Structured data analysis can request independent review of its results and supporting materials without also requesting a report.
 - A connection or resource failure before review starts is reported without inventing an interrupted inspection.
 - Document revisions retain prior citation mappings without requiring a bibliography, resolve aliases to their recorded identities, and use the same file inheritance rules for production and acceptance.

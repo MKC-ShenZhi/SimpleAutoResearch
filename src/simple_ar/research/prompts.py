@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from simple_ar.research.contracts import CLAIM_SCOPE_RULES
 from simple_ar.research.evidence.bibliography import CITATION_FIELD_VALUE_RULE
 
@@ -68,6 +70,7 @@ def research_planner_user_prompt(
     max_queries: int,
     max_rounds: int,
     mode: str,
+    user_requests: tuple[str, ...] = (),
 ) -> str:
     """Build the prompt for LLM-backed research-question and query planning.
 
@@ -96,8 +99,9 @@ def research_planner_user_prompt(
         "- `required_facets`: evidence facets to cover.\n"
         "- `negative_terms`: terms or scopes that should be avoided.\n"
         "- `temporal_scope`: optional object with inclusive integer `start_year`, "
-        "`end_year`, and `basis_quote` copied verbatim from Topic, containing both "
-        "year endpoints. Return null/omit when Topic does not explicitly bound "
+        "`end_year`, and `basis_quote` copied verbatim from Topic"
+        + (" or an original user request" if user_requests else "")
+        + ", containing both year endpoints. Return null/omit when the request does not explicitly bound "
         "publication years. Never derive it from current date, paper metadata, "
         "or the generated Problem artifact; do not invent a recency window. "
         "This bounds core survey evidence, not separately identified foundational context.\n"
@@ -125,6 +129,9 @@ def research_planner_user_prompt(
         "- Prefer queries that can help later screening and coverage checks.\n"
         "- Keep every string concise.\n\n"
         f"Topic:\n{topic}\n\n"
+        + ("Original user request and subsequent feedback:\n"
+           + json.dumps(user_requests, ensure_ascii=False) + "\n\n" if user_requests else "")
+        +
         f"Problem artifact:\n{problem_markdown}\n\n"
         f"Seed queries JSON:\n{seed_queries_json}\n\n"
         f"Required facets JSON:\n{required_facets_json}\n\n"
@@ -416,6 +423,7 @@ def research_design_user_prompt(
     execution_boundary_json: str = "{}",
     entry_facts_json: str = "{}",
     requested_idea_id: str = "",
+    user_requests: tuple[str, ...] = (),
 ) -> str:
     """Build the bounded model prompt for selecting an idea and protocol."""
 
@@ -489,6 +497,8 @@ def research_design_user_prompt(
         f"Execution boundary JSON:\n{execution_boundary_json}\n\n"
         f"Inspected project entry facts JSON:\n{entry_facts_json}\n"
         f"{boundary}"
+        + ("\nOriginal user request and subsequent feedback (not source evidence):\n"
+           + json.dumps(user_requests, ensure_ascii=False) + "\n" if user_requests else "")
     )
 
 

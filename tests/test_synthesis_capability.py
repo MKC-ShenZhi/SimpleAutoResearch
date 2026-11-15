@@ -343,9 +343,11 @@ class SynthesisCapabilityTests(unittest.TestCase):
         client = FakeClient()
         result = synthesize_evidence(SynthesisRequest(
             evidence_pack=pack, use_llm=True, llm_client=client,
+            user_requests=("Compare the assumptions.", "Also describe limitations."),
         ))
         self.assertEqual(result.ideas[0].motivation_refs, ["paper-1#chunk-12"])
         self.assertIn("paper-1#chunk-12", client.user)
+        self.assertIn("Also describe limitations.", client.user)
 
     def test_llm_can_replace_rule_ideas_with_grounded_candidates(self) -> None:
         class FakeClient:

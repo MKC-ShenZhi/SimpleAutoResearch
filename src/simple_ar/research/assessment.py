@@ -44,6 +44,7 @@ class IdeaAssessmentRequest:
     evidence_chunks: tuple[TextChunk, ...] = ()
     evidence_cards: tuple[ClaimCard | MethodCard, ...] = ()
     llm_client: Any | None = field(default=None, repr=False, compare=False)
+    user_requests: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.limit < 1:
@@ -278,6 +279,7 @@ def _compare_with_model(
         )
         payload = json.dumps({
             "objective": request.objective, "constraints": request.constraints,
+            **({"user_requests": request.user_requests} if request.user_requests else {}),
             "candidates": [candidate.to_row() for candidate in candidates],
             "readiness": [item.to_dict() for item in result.assessments],
             "evidence": context,

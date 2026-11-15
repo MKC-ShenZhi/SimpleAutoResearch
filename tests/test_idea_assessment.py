@@ -88,9 +88,11 @@ class IdeaAssessmentTests(unittest.TestCase):
             candidates=(candidate,), available_evidence_refs=("claim-a", "chunk-a"),
             evidence_chunks=(TextChunk(chunk_id="chunk-a", document_id="p", text="Source"),),
             evidence_cards=(ClaimCard(claim_id="claim-a", paper_id="p", claim="Scoped finding",
-                                      evidence_refs=["chunk-a"]),), llm_client=client)
+                                      evidence_refs=["chunk-a"]),), llm_client=client,
+            user_requests=("Compare methods under a small compute budget.", "Include the failure cases."))
         result = assess_ideas(request)
         self.assertEqual(result.recommended_idea_id, "a")
+        self.assertEqual(client.payload["user_requests"], list(request.user_requests))
         self.assertNotIn("max_output_tokens", client.call_kwargs)
         self.assertIn("Scoped finding", client.payload["evidence"][-1]["text"])
         self.assertEqual(result.model_context[-1]["source_chunk_ids"], ["chunk-a"])

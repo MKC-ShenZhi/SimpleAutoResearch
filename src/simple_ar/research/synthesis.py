@@ -53,6 +53,7 @@ class SynthesisRequest:
     use_llm: bool = False
     llm_client: Any | None = field(default=None, repr=False, compare=False)
     purpose: Literal["research", "evidence_review"] = "research"
+    user_requests: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.idea_limit < 1:
@@ -335,6 +336,9 @@ def _add_llm_synthesis(
             "deterministic_idea_count": len(result.ideas),
         }, ensure_ascii=False), source_count=(int(counts["documents"])
             if isinstance(counts, Mapping) and counts.get("documents") is not None else None))
+    if request.user_requests:
+        prompt += ("\n\nOriginal user request and subsequent feedback (not source evidence):\n"
+                   + json.dumps(request.user_requests, ensure_ascii=False))
     prompt += (
         "\n\nAlso return comparisons: a list of substantive, task-relevant comparisons, not one summary per paper. "
         "Each object has dimension (the actual question or property compared), relation "

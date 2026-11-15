@@ -41,6 +41,13 @@ class PlanningCapabilityTests(unittest.TestCase):
         result = build_requested_research_plan(request)
         self.assertIn("basis_quote", client.prompt)
         self.assertEqual(result.source_plan.filters["temporal_scope"], scope)
+        # A coordinator's shorter topic must not erase the caller's time range.
+        original = (topic, "Compare the methods without changing the requested scope.")
+        delegated = build_requested_research_plan(ResearchPlanRequest(
+            topic="Survey interval methods", user_requests=original,
+            use_llm=True, llm_client=client, config={"research_sources": ["fixture"]}))
+        self.assertEqual(delegated.source_plan.filters["temporal_scope"], scope)
+        self.assertIn(original[1], client.prompt)
         restored = ResearchPlanResult.from_handoff_dict(result.to_handoff_dict())
         self.assertEqual(search_request_from_plan(restored).filters["temporal_scope"], scope)
         for value in ({**scope, "basis_quote": "from 2010 to 2014"},

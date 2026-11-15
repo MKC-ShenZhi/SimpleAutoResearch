@@ -52,6 +52,7 @@ class ResearchPlanRequest:
     llm_client: Any | None = field(default=None, repr=False, compare=False)
     task_plan_request: TaskPlanRequest | None = field(default=None, repr=False, compare=False)
     task_plan_only: bool = False
+    user_requests: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.topic.strip():
@@ -319,6 +320,7 @@ def build_requested_research_plan(request: ResearchPlanRequest) -> ResearchPlanR
         max_queries=max_queries,
         max_rounds=max_rounds,
         mode=mode,
+        user_requests=request.user_requests,
     )
     data = client.ask_json(
         RESEARCH_PLANNER_SYSTEM,
@@ -333,7 +335,8 @@ def build_requested_research_plan(request: ResearchPlanRequest) -> ResearchPlanR
         default_query=request.default_query or request.topic,
         data=data,
     )
-    scope = temporal_scope({"temporal_scope": data.get("temporal_scope")}, topic=request.topic)
+    scope = temporal_scope({"temporal_scope": data.get("temporal_scope")},
+                           topic="\n".join((request.topic, *request.user_requests)))
     source_config = dict(config)
     source_config["research_queries"] = list(query_plan.queries)
     source_plan = build_source_plan(
@@ -344,7 +347,13 @@ def build_requested_research_plan(request: ResearchPlanRequest) -> ResearchPlanR
         default_max_results=request.default_max_results,
     )
     if scope is not None:
-        source_plan = replace(source_plan, filters={**source_plan.filters, "temporal_scope": scope})
+        # The user's original request can carry a boundary omitted by the
+        # delegated topic; preserve the verified quote for downstream selection.
+        scope_topic = request.topic
+        if scope["basis_quote"] not in scope_topic:
+            scope_topic += "\n" + scope["basis_quote"]
+        source_plan = replace(source_plan, filters={**source_plan.filters,
+            "topic": scope_topic, "temporal_scope": scope})
     return ResearchPlanResult(
         questions=tuple(questions),
         query_plan=query_plan,

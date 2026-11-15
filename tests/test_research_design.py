@@ -56,6 +56,7 @@ class ResearchDesignTests(unittest.TestCase):
                 execution_boundary={"code_task": {"code_root": str(workspace)}},
                 source_workspace=workspace, source_index=index,
                 use_llm=True, llm_client=client,
+                user_requests=("Keep the existing evaluator.", "Explain failure cases."),
             ))
             self.assertEqual(result.status, "ready")
             self.assertIn("changed forward output", result.implementation_spec)
@@ -67,6 +68,9 @@ class ResearchDesignTests(unittest.TestCase):
             self.assertIn("def forward", client.ask_json.call_args.args[1])
             refinement_prompt = client.ask_json.call_args_list[1].args[1]
             self.assertIn('"fixed_idea_id": ""', refinement_prompt)
+            for call in client.ask_json.call_args_list:
+                self.assertIn("Keep the existing evaluator.", call.args[1])
+                self.assertIn("Explain failure cases.", call.args[1])
 
     def test_initial_design_does_not_accept_missing_or_different_mechanism_review(self):
         from unittest.mock import Mock

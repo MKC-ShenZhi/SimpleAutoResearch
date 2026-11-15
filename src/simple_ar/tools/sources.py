@@ -354,7 +354,8 @@ class SourceToolGateway:
                  client_factory: Callable[[str], Any] | None = None,
                  feasibility_client_factory: Callable[[str], Any] | None = None,
                  execution_contract: dict[str, Any] | None = None,
-                 authority_revision: int = 0) -> None:
+                 authority_revision: int = 0,
+                 user_requests: Callable[[], list[str]] | None = None) -> None:
         if type(authority_revision) is not int or authority_revision < 0:
             raise ValueError('Source authority revision must be a nonnegative integer')
         self.authority_revision = authority_revision
@@ -365,6 +366,7 @@ class SourceToolGateway:
         self.policy = (SourcePolicy(max_results=20) if policy is None
             else SourcePolicy.model_validate(policy)).model_copy(deep=True)
         self.client_factory, self.feasibility_client_factory = client_factory, feasibility_client_factory
+        self.user_requests = user_requests
         # Runtime reference to the scientific owner's fixed authority, not source policy.
         self._declared_execution_contract = execution_contract
         self._caller_contract_snapshot = (self._protocol_bytes(execution_contract)
@@ -494,13 +496,14 @@ class SourceToolGateway:
                 client: Any = None, plan: ResearchPlanResult | None = None, question: str = '') -> dict[str, Any]:
         for query in queries or (request.query,):
             self._validate_search(request.model_copy(update={'query': query}))
+        filters = plan.source_plan.filters if plan else {}
         result = search_sources(SearchRequest(queries=queries or (request.query,),
             providers=tuple(dict.fromkeys(request.providers)), max_results_per_query=request.max_results,
             cache_dir=self._cache_dir(), cache_enabled=self.policy.cache_enabled,
-            llm_client=client, problem_markdown=question,
+            llm_client=client, problem_markdown=question, filters=filters,
             research_plan_json=json.dumps(plan.to_handoff_dict()) if plan else '{}'), registry=self.registry)
         result = (select_search_result(result, policy=SearchSelectionPolicy(topic=question, questions=plan.questions,
-            query_plan=plan.query_plan, max_documents=self.policy.max_documents)) if plan else
+            query_plan=plan.query_plan, max_documents=self.policy.max_documents), filters=filters) if plan else
             replace(result, selected_papers=tuple({paper.id: paper for paper in result.papers}.values())[:self.policy.max_documents]))
         write_json(directory / "search.json", result.to_handoff_dict())
         return {"status": result.status, "search_record": (directory / 'search.json').relative_to(self.root).as_posix(),
@@ -631,7 +634,10 @@ class SourceToolGateway:
                 'inputs': {**{str(path): self._digest(path) for path in inputs}, **{
                     str(self.workspace.resolve(path)): digest for path, digest in (inventory or {}).get('file_hashes', {}).items()}}}
             if context.store.exists('source_request.json'):
-                if context.store.read_json('source_request.json') != binding:
+                saved_binding = context.store.read_json('source_request.json')
+                if 'user_requests' in saved_binding:
+                    binding['user_requests'] = saved_binding['user_requests']
+                if saved_binding != binding:
                     raise ValueError('Research request, policy or material bytes changed')
                 if not context.store.exists('source_result.json'):
                     raise ValueError('Research was already attempted; inspect partial evidence and ledger, no blind replay')
@@ -639,6 +645,8 @@ class SourceToolGateway:
                 if any(self._digest(Path(path)) != digest for path, digest in saved['hashes'].items()):
                     raise ValueError('Research result artifact changed')
                 return ToolResult.model_validate(saved['result'])
+            if self.user_requests is not None:
+                binding['user_requests'] = list(self.user_requests())
             if network and not paths and not request.document_record:
                 # Reject missing runtime services before writing an attempt or
                 # reserving budget; saved evidence remains available for replay.
@@ -646,7 +654,8 @@ class SourceToolGateway:
             context.store.write_json('source_request.json', binding, kind='source_request')
             if inventory:
                 context.store.write_json('source_inventory.json', inventory, kind='source_inventory')
-            result = self._research(context, request, paths, network=network)
+            result = self._research(context, request, paths, network=network,
+                user_requests=tuple(binding.get('user_requests', ())))
             if any(self._digest(Path(path)) != digest for path, digest in binding['inputs'].items()):
                 raise ValueError('Research inputs changed during the operation; inspect retained work')
             result.artifacts = [f'records/{identity}/{path}' for path in result.data['artifact_refs']]
@@ -672,9 +681,11 @@ class SourceToolGateway:
                 data={'failure_kind': 'resource_exhausted'} if isinstance(exc, BudgetExceededError) else {})
 
     def _research(self, context: CapabilityContext, request: _Research, paths: list[Path],
-                  *, network: bool) -> ToolResult:
+                  *, network: bool, user_requests: tuple[str, ...] = ()) -> ToolResult:
         artifacts, outcomes = [], []
         identity, policy = context.attempt.attempt_id, self.policy
+        task_context = ('Original user request and subsequent feedback:\n' +
+            json.dumps(user_requests, ensure_ascii=False)) if user_requests and request.use_llm else ''
 
         def run(capability: Callable, value: Any) -> None:
             result = capability(context=context, request=value)
@@ -702,9 +713,11 @@ class SourceToolGateway:
             run(run_research_plan_capability, ResearchPlanRequest(topic=request.question,
                 config={'research_queries': list(policy.queries), 'research_sources': list(policy.providers),
                         'research_auto_query_expansion': False}, default_max_results=policy.max_results,
-                use_llm=request.use_llm, llm_client=client()))
+                use_llm=request.use_llm, llm_client=client(), user_requests=user_requests))
             planned = context.store.read_json('research_plan.json')
-            planned['source_plan'] = replace(policy.source_plan(), queries=list(policy.queries) or planned['source_plan']['queries']).to_row()
+            planned['source_plan'] = replace(policy.source_plan(),
+                queries=list(policy.queries) or planned['source_plan']['queries'],
+                filters=planned['source_plan']['filters']).to_row()
             context.store.write_json('research_plan.json', planned)
         elif op in {'ingest', 'read', 'summary', 'synthesize'}:
             if request.document_record:
@@ -778,7 +791,8 @@ class SourceToolGateway:
                     # The shortlist bounds deterministic and model reading alike.
                     ids = tuple(row.document_id for row in bundle.records[:policy.read_max_shortlist])
                     run(run_read_capability, ReadRequest(bundle=bundle, document_ids=ids,
-                        topic=request.question, config={'research_read_max_shortlist': policy.read_max_shortlist},
+                        topic=request.question, problem_markdown=task_context,
+                        config={'research_read_max_shortlist': policy.read_max_shortlist},
                         research_plan_json=json.dumps(plan.to_handoff_dict()) if plan else '{}',
                         use_llm=request.use_llm, llm_client=client()))
                     read = ReadResult.from_handoff_dict(context.store.read_json('read_result.json'), bundle=bundle)
@@ -787,7 +801,8 @@ class SourceToolGateway:
                 run(run_synthesis_capability, SynthesisRequest(evidence_pack=pack,
                     idea_limit=policy.idea_limit, novelty_backend=policy.novelty_backend,
                     purpose='evidence_review' if op == 'summary' else 'research',
-                    include_experiment_contract=op != 'summary', use_llm=request.use_llm, llm_client=client()))
+                    include_experiment_contract=op != 'summary', use_llm=request.use_llm, llm_client=client(),
+                    user_requests=user_requests))
                 if op == 'summary':
                     from simple_ar.research.sources.capability import provided_materials_result
                     synthesis = SynthesisResult.from_handoff_dict(context.store.read_json('synthesis_result.json'))
@@ -811,7 +826,7 @@ class SourceToolGateway:
                 run(run_idea_assessment_capability, IdeaAssessmentRequest(candidates=synthesis.ideas,
                     novelty_checks=synthesis.novelty_checks, limit=policy.idea_limit,
                     available_evidence_refs=tuple(dict.fromkeys(ref for idea in synthesis.ideas for ref in idea.motivation_refs)),
-                    objective=request.question, llm_client=client()))
+                    objective=request.question, llm_client=client(), user_requests=user_requests))
                 assessment = context.store.read_json('idea_assessment.json')
                 selected = assessment.get('recommended_idea_id')
                 if op == 'design' and selected is None:
@@ -849,7 +864,8 @@ class SourceToolGateway:
                     execution_schema=policy.execution_schema, execution_boundary=policy.execution_boundary,
                     entry_facts=facts, source_workspace=source, source_index=index,
                     previous_design=previous, implementation_feedback={'guidance': request.guidance} if previous else {},
-                    use_llm=request.use_llm, llm_client=client(), feasibility_llm_client=reviewer))
+                    use_llm=request.use_llm, llm_client=client(), feasibility_llm_client=reviewer,
+                    user_requests=user_requests))
                 design = context.store.read_json('research_design.json')
                 if request.use_llm and source is None:
                     # The existing assessment owner independently reviews the frozen proposal.
@@ -857,7 +873,8 @@ class SourceToolGateway:
                         candidates=tuple(idea for idea in synthesis.ideas if idea.idea_id == design['selected_idea']['idea_id']),
                         novelty_checks=synthesis.novelty_checks,
                         available_evidence_refs=tuple(design['evidence_refs']),
-                        limit=1, objective=request.question, constraints={'design': design}, llm_client=reviewer))
+                        limit=1, objective=request.question, constraints={'design': design}, llm_client=reviewer,
+                        user_requests=user_requests))
                     if context.store.read_json('idea_assessment.json').get('recommended_idea_id') is None:
                         design.update(status='needs_review', diagnostics=[*design['diagnostics'],
                             'Independent reviewer abstained; no accepted protocol.'])
