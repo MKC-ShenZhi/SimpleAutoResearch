@@ -20,7 +20,7 @@ from typing import Any, Callable, Sequence
 from uuid import uuid4
 from simple_ar.integrations.model_profiles import model_connections_compatible
 
-from simple_ar.app.research_intake import brief_input_base, normalize_assets, validate_brief, write_intake_artifacts
+from simple_ar.app.research_intake import brief_input_base, normalize_assets, retry_research_experiment, validate_brief, write_intake_artifacts
 from simple_ar.app.research_execution import (
     code_task_validation,
     analysis_contract_context,
@@ -5636,19 +5636,9 @@ def retry_experiment(
     services: ResearchApplicationServices | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> ResearchApplicationView | dict[str, Any]:
-    manifest = Path(root) / 'session_manifest.json'
-    if manifest.is_file() and json.loads(manifest.read_text(encoding='utf-8')).get('transition_recipe') == 'native-tools-v1':
-        from simple_ar.app.tool_application import ToolApplication
-        return ToolApplication.load(Path(root), services=services).retry_experiment(
-            command=tuple(command), cwd=cwd, timeout_sec=timeout_sec,
-            result_schema=dict(result_schema) if result_schema is not None else None,
-            label=label, parent_attempt_id=parent_attempt_id, reason=reason,
-            progress=progress or (services.message_callback if services is not None else None) or print)
-    return load_session(root, services=services).retry_experiment(
-        command=command, cwd=cwd if cwd is not None else Path.cwd(), timeout_sec=timeout_sec, result_schema=result_schema,
-        label=label, parent_attempt_id=parent_attempt_id,
-        reason=reason if reason is not None else "Retry the failed explicit experiment with a caller-supplied correction.",
-    )
+    return retry_research_experiment(root, command=command, cwd=cwd, timeout_sec=timeout_sec,
+        result_schema=result_schema, label=label, parent_attempt_id=parent_attempt_id,
+        reason=reason, services=services, progress=progress)
 
 
 def export_session(root: str | Path, *, services: ResearchApplicationServices | None = None) -> ArtifactRef:

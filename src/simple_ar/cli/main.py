@@ -982,13 +982,13 @@ def _print_research_session_continue(args: argparse.Namespace) -> None:
     """Retry an experiment through the canonical application lifecycle."""
 
     session_root = Path(args.session_root)
-    from simple_ar.app.research_application import ResearchApplicationError, retry_experiment
+    from simple_ar.app.research_intake import retry_research_experiment
     try:
-        result = retry_experiment(session_root,
+        result = retry_research_experiment(session_root,
             command=tuple(args.command_argv or ()), cwd=Path(args.cwd) if args.cwd else None, timeout_sec=args.timeout_sec,
             result_schema=_experiment_result_schema(args), label=args.label,
             parent_attempt_id=args.parent_attempt_id, progress=print_line)
-    except (ResearchApplicationError, OSError, RuntimeError, TypeError, ValueError) as exc:
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
     if isinstance(result, dict):
         observed = result['observation'] or {}

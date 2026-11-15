@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 import hashlib
 import json
 import stat
@@ -213,6 +213,28 @@ def revise_research_task(app: Any, *, research_settings: Mapping[str, Any] | Non
     if confirm_protocol:
         app.request_execution_confirmation()
     return True
+
+
+def retry_research_experiment(root: str | Path, *, command: Sequence[str], cwd: str | Path | None = None,
+                              timeout_sec: int, result_schema: Mapping[str, object] | None = None,
+                              label: str = 'experiment-retry', parent_attempt_id: str | None = None,
+                              reason: str | None = None, services: Any | None = None,
+                              progress: Callable[[str], None] | None = None) -> Any:
+    """Continue a failed measurement through its saved task owner."""
+    root = Path(root)
+    manifest = root / 'session_manifest.json'
+    if manifest.is_file() and json.loads(manifest.read_text(encoding='utf-8')).get('transition_recipe') == 'native-tools-v1':
+        from simple_ar.app.tool_application import ToolApplication
+        return ToolApplication.load(root, services=services).retry_experiment(
+            command=tuple(command), cwd=cwd, timeout_sec=timeout_sec,
+            result_schema=dict(result_schema) if result_schema is not None else None,
+            label=label, parent_attempt_id=parent_attempt_id, reason=reason,
+            progress=progress or getattr(services, 'message_callback', None) or print)
+    from simple_ar.app.research_application import load_session
+    return load_session(root, services=services).retry_experiment(
+        command=command, cwd=cwd if cwd is not None else Path.cwd(), timeout_sec=timeout_sec,
+        result_schema=result_schema, label=label, parent_attempt_id=parent_attempt_id,
+        reason=reason if reason is not None else 'Retry the failed explicit experiment with a caller-supplied correction.')
 
 
 def start_research_task(app: Any, *, progress: Callable[[str], None] | None = None) -> dict[str, Any]:
@@ -1261,6 +1283,7 @@ __all__ = [
     "ResearchInputError",
     "create_research_task",
     "create_structured_research_task",
+    "retry_research_experiment",
     "start_research_task",
     "start_declared_measurements",
     "project_execution_creation",
