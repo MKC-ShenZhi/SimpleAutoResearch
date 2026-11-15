@@ -646,6 +646,8 @@ class SourceToolGateway:
                 raise ValueError('Network collection is not authorized for this operation')
             saved_binding = (context.store.read_json('source_request.json')
                 if context.store.exists('source_request.json') else None)
+            evidence = (saved_binding.get('assessment_evidence', {}) if saved_binding is not None
+                else self._assessment_evidence(request))
             if request.materials:
                 materials = request.materials
             elif saved_binding is not None:
@@ -654,14 +656,17 @@ class SourceToolGateway:
                     if str(self.workspace.resolve(value)) in saved_binding['inputs']]
             elif request.operation in {'ingest', 'read', 'summary', 'synthesize'} and not request.document_record:
                 materials = list(self.policy.materials)
+            elif request.operation in {'assess', 'design'} and request.use_llm and not evidence.get('document_record'):
+                materials = list(self.policy.materials)
             else:
                 materials = []
             paths = self._material_paths(materials)
-            if request.document_record and request.operation in {'ingest', 'read', 'summary', 'synthesize'}:
-                selected_document = self.workspace.resolve(request.document_record)
-                paths = [path for path in paths if path != selected_document]
-            evidence = (saved_binding.get('assessment_evidence', {}) if saved_binding is not None
-                else self._assessment_evidence(request))
+            # Handoff records are inputs to their own owners, not extra original material.
+            handoffs = [value for value in (request.plan_record, request.document_record, request.read_record,
+                request.synthesis_record, request.previous_design,
+                evidence.get('document_record'), evidence.get('read_record')) if value]
+            handoff_paths = {self.workspace.resolve(value) for value in handoffs}
+            paths = [path for path in paths if path not in handoff_paths]
             locators = [value for value in (request.plan_record, request.document_record, request.read_record,
                 request.synthesis_record, request.previous_design) if value]
             locators.extend(evidence.values())
@@ -755,6 +760,28 @@ class SourceToolGateway:
                 raise ValueError('Research client is not bound to the parent ledger/attempt')
             return value
 
+        def material_bundle(materials: list[Path], papers: list, *, network: bool) -> DocumentBundle:
+            local, retained = [], []
+            for path in materials:
+                if self.inventory_source(path) is not None:
+                    retained.append(DocumentBundle.from_handoff_dict(json.loads(path.read_bytes())))
+                else:
+                    local.append(str(path))
+            incoming = self._bundle(papers, [], context.store.root, network=network, local_documents=local)
+            for saved in retained:
+                incoming.records.extend(saved.records)
+                incoming.sections.extend(saved.sections)
+                incoming.chunks.extend(saved.chunks)
+            return incoming
+
+        def add_materials(existing: DocumentBundle | None, incoming: DocumentBundle) -> DocumentBundle:
+            if existing is None:
+                return incoming
+            existing.records.extend(incoming.records)
+            existing.sections.extend(incoming.sections)
+            existing.chunks.extend(incoming.chunks)
+            return existing
+
         op, bundle, read = request.operation, None, None
         plan = ResearchPlanResult.from_handoff_dict(self._handoff(request.plan_record, 'research_plan.v1')) if request.plan_record else None
         if op == 'plan':
@@ -802,33 +829,18 @@ class SourceToolGateway:
                         self.ledger.mark_unknown(reservation, reason='Collection interrupted; inspect saved responses')
                         raise
                 papers = list({paper.id: paper for paper in papers}.values())[:policy.max_documents]
-                local, retained = [], []
-                for path in paths:
-                    if self.inventory_source(path) is not None:
-                        retained.append(DocumentBundle.from_handoff_dict(json.loads(path.read_bytes())))
-                    else:
-                        local.append(str(path))
                 reservation = f'source:{identity}:ingest'
                 if papers and network:
                     self.ledger.reserve(reservation, {'source_operations': 1}, attempt_id=identity, purpose='research ingest')
                 try:
-                    incoming = self._bundle(papers, [], context.store.root, network=network, local_documents=local)
+                    incoming = material_bundle(paths, papers, network=network)
                 except BaseException:
                     if papers and network:
                         self.ledger.mark_unknown(reservation, reason='Acquisition interrupted; no blind replay')
                     raise
                 if papers and network:
                     self.ledger.settle(reservation, {'source_operations': 1}, actual_source='adapter')
-                for saved in retained:
-                    incoming.records.extend(saved.records)
-                    incoming.sections.extend(saved.sections)
-                    incoming.chunks.extend(saved.chunks)
-                if bundle is None:
-                    bundle = incoming
-                else:
-                    bundle.records.extend(incoming.records)
-                    bundle.sections.extend(incoming.sections)
-                    bundle.chunks.extend(incoming.chunks)
+                bundle = add_materials(bundle, incoming)
             if bundle is not None:
                 if len(bundle.records) > policy.max_documents:
                     raise ValueError('Selected bundle exceeds document policy; narrow the material selection')
@@ -874,8 +886,14 @@ class SourceToolGateway:
             evidence = assessment_evidence or {}
             if evidence.get('document_record'):
                 bundle = DocumentBundle.from_handoff_dict(self._handoff(evidence['document_record'], 'document_bundle.v1'))
-                if evidence.get('read_record'):
-                    read = ReadResult.from_handoff_dict(self._handoff(evidence['read_record'], 'read_result.v1'), bundle=bundle)
+            if paths and request.use_llm:
+                bundle = add_materials(bundle, material_bundle(paths, [], network=False))
+                if len(bundle.records) > policy.max_documents:
+                    raise ValueError('Selected bundle exceeds document policy; narrow the material selection')
+                bundle.chunks[:] = bounded_document_coverage(bundle.chunks, policy.max_chunks)
+                artifacts.append(context.store.write_json('document_bundle.json', bundle.to_handoff_dict(), kind='document_bundle'))
+            if bundle and evidence.get('read_record'):
+                read = ReadResult.from_handoff_dict(self._handoff(evidence['read_record'], 'read_result.v1'), bundle=bundle)
             chunks = tuple(bundle.chunks) if bundle else ()
             cards = (*read.claim_cards, *read.method_cards) if read else ()
             if read:

@@ -8350,6 +8350,21 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(reviewer.ask_json.call_count, 1)
         self.assertIn('Cancellation propagates', reviewer.ask_json.call_args.args[1])
 
+        # An externally supplied synthesis may have no saved reading receipt;
+        # use the task's original materials and retain the resulting bundle.
+        source = workspace.mounts['source0']
+        write_json(source / 'external-synthesis.json', synthesis.to_handoff_dict())
+        write_json(source / 'provided-document.json', self._original_document().to_handoff_dict())
+        fallback = SourceToolGateway(root, workspace, workspace.ledger, client_factory=bound,
+            policy=SourcePolicy(materials=('source0/provided-document.json',), allow_network=False))
+        fallback_context = make_context('assessment-from-material')
+        recovered = fallback.execute_tool('research', fallback_context, {'operation': 'assess',
+            'question': 'Evaluate the method', 'synthesis_record': 'source0/external-synthesis.json',
+            'use_llm': True})
+        self.assertEqual(recovered.status, 'ok', recovered.error)
+        self.assertEqual(fallback_context.store.read_json('idea_assessment.json')['recommended_idea_id'], 'method')
+        self.assertIn('records/assessment-from-material/document_bundle.json', recovered.artifacts)
+
     def test_research_read_combines_selected_bundle_and_additional_material(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
         from simple_ar.tools.sources import SourcePolicy, SourceToolGateway
