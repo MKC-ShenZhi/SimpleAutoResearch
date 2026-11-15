@@ -46,7 +46,7 @@ from simple_ar.core import (
     CapabilityRegistry,
     SessionController,
 )
-from simple_ar.research.brief import evidence_pack_from_read
+from simple_ar.research.brief import assessment_evidence_from_read, evidence_pack_from_read
 from simple_ar.research.assessment import IdeaAssessmentRequest
 from simple_ar.research.design import ResearchDesignRequest
 from simple_ar.research.documents.ingest import DocumentBundle, DocumentIngestRequest
@@ -82,7 +82,7 @@ from simple_ar.research.sources import (
     default_search_provider_registry,
 )
 from simple_ar.research.sources.capability import provided_materials_result
-from simple_ar.research.synthesis import SynthesisRequest, SynthesisResult, allowed_evidence_refs
+from simple_ar.research.synthesis import SynthesisRequest, SynthesisResult
 from simple_ar.research.summary import SummaryRequest, run_summary_capability
 from simple_ar.research.workflow_contracts import Diagnostic, ResearchAsset, ResearchBrief
 from simple_ar.result_analysis.schema import AnalysisRecommendation
@@ -1718,17 +1718,13 @@ class ResearchApplication:
             IdeaAssessmentRequest(
                 candidates=synthesis.ideas,
                 novelty_checks=synthesis.novelty_checks,
-                available_evidence_refs=tuple(sorted(allowed_evidence_refs(
-                    evidence_pack_from_read(self.controller.manifest.topic, read),
-                ))),
+                **assessment_evidence_from_read(read),
                 limit=self.services.idea_limit,
                 objective=self.brief.objective or self.brief.request_text,
                 constraints={"hard_constraints": list(self.brief.hard_constraints),
                              "research_request": self._problem_markdown(),
                              "execution_boundary": _idea_assessment_execution_boundary(
                                  self._execution_config().get("execution"))},
-                evidence_chunks=tuple(read.bundle.chunks),
-                evidence_cards=(*read.claim_cards, *read.method_cards),
                 llm_client=self.services.llm_client,
             ), self._input_refs("synthesis", "read", "brief", "runtime_config"), allow_partial=True,
         )

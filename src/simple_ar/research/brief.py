@@ -19,6 +19,7 @@ from simple_ar.research.evidence.reader import (
 from simple_ar.research.synthesis import (
     SynthesisRequest,
     SynthesisResult,
+    allowed_evidence_refs,
     synthesize_evidence,
 )
 from simple_ar.research.documents.ingest import DocumentBundle
@@ -248,6 +249,20 @@ def evidence_pack_from_read(
         "evidence_snippets": _evidence_snippets(result),
         "limitations": list(result.diagnostics),
         "execution_context": _execution_context_payload(execution_context),
+    }
+
+
+def assessment_evidence_from_read(result: ReadResult) -> dict[str, Any]:
+    """Project the same reading evidence to every idea-assessment consumer."""
+    references = {"evidence_refs": [chunk.chunk_id for chunk in result.bundle.chunks]}
+    for key, rows in (("papers", result.bundle.records), ("paper_cards", result.paper_cards),
+                      ("claim_cards", result.claim_cards), ("method_cards", result.method_cards),
+                      ("dataset_cards", result.dataset_cards), ("code_links", result.code_links)):
+        references[key] = [row.to_row() for row in rows]
+    return {
+        "available_evidence_refs": tuple(sorted(allowed_evidence_refs(references))),
+        "evidence_chunks": tuple(result.bundle.chunks),
+        "evidence_cards": (*result.claim_cards, *result.method_cards),
     }
 
 

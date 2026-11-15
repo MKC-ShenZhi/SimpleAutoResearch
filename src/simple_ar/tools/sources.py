@@ -17,8 +17,8 @@ from simple_ar.core.capabilities import ArtifactStore, CapabilityContext
 from simple_ar.integrations.llm import LLMError
 from simple_ar.research.planning.capability import ResearchPlanRequest, ResearchPlanResult, run_research_plan_capability
 from simple_ar.research.evidence.reader import ReadRequest, ReadResult, run_read_capability
-from simple_ar.research.brief import evidence_pack_from_read
-from simple_ar.research.synthesis import SynthesisRequest, SynthesisResult, allowed_evidence_refs, run_synthesis_capability
+from simple_ar.research.brief import assessment_evidence_from_read, evidence_pack_from_read
+from simple_ar.research.synthesis import SynthesisRequest, SynthesisResult, run_synthesis_capability
 from simple_ar.research.assessment import IdeaAssessmentRequest, run_idea_assessment_capability
 from simple_ar.research.design import ResearchDesignRequest, run_research_design_capability
 from simple_ar.research.summary import render_summary
@@ -895,12 +895,14 @@ class SourceToolGateway:
             if bundle and evidence.get('read_record'):
                 read = ReadResult.from_handoff_dict(self._handoff(evidence['read_record'], 'read_result.v1'), bundle=bundle)
             chunks = tuple(bundle.chunks) if bundle else ()
-            cards = (*read.claim_cards, *read.method_cards) if read else ()
             if read:
-                refs = tuple(sorted(allowed_evidence_refs(evidence_pack_from_read(request.question, read))))
+                assessment_inputs = assessment_evidence_from_read(read)
             else:
                 refs = tuple(record.document_id for record in bundle.records) + tuple(
                     chunk.chunk_id for chunk in chunks) if bundle else ()
+                assessment_inputs = {'available_evidence_refs': (refs if request.use_llm else tuple(
+                    dict.fromkeys(ref for idea in synthesis.ideas for ref in idea.motivation_refs))),
+                    'evidence_chunks': chunks, 'evidence_cards': ()}
             if len(synthesis.ideas) > policy.idea_limit:
                 raise ValueError('Synthesis exceeds configured idea limit')
             selected = policy.selected_idea_id or request.idea_id
@@ -909,9 +911,7 @@ class SourceToolGateway:
             if op == 'assess' or (request.use_llm and selected is None):
                 run(run_idea_assessment_capability, IdeaAssessmentRequest(candidates=synthesis.ideas,
                     novelty_checks=synthesis.novelty_checks, limit=policy.idea_limit,
-                    available_evidence_refs=(refs if request.use_llm else
-                        tuple(dict.fromkeys(ref for idea in synthesis.ideas for ref in idea.motivation_refs))),
-                    evidence_chunks=chunks, evidence_cards=cards,
+                    **assessment_inputs,
                     objective=request.question, llm_client=client(), user_requests=user_requests))
                 assessment = context.store.read_json('idea_assessment.json')
                 selected = assessment.get('recommended_idea_id')
@@ -958,8 +958,7 @@ class SourceToolGateway:
                     run(run_idea_assessment_capability, IdeaAssessmentRequest(
                         candidates=tuple(idea for idea in synthesis.ideas if idea.idea_id == design['selected_idea']['idea_id']),
                         novelty_checks=synthesis.novelty_checks,
-                        available_evidence_refs=refs,
-                        evidence_chunks=chunks, evidence_cards=cards,
+                        **assessment_inputs,
                         limit=1, objective=request.question, constraints={'design': design}, llm_client=reviewer,
                         user_requests=user_requests), output_dir='design_review')
                     if context.store.read_json('design_review/idea_assessment.json').get('recommended_idea_id') is None:
