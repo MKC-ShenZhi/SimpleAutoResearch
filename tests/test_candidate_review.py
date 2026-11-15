@@ -308,6 +308,16 @@ class CandidateReviewTests(unittest.TestCase):
             arguments={'review_scope': 'candidate', 'independent_review': True})
         self.assertFalse(self.owner.requires_review(direct))
 
+        # A requested review of a text-only result is still a review choice.
+        self.observations[:] = [{'tool_name': 'deliver_result', 'current_request': True,
+            'arguments': {'summary': 'Answer', 'artifacts': [], 'independent_review': True},
+            'metadata': {'delivery_review_error': 'Review did not start', 'delivery_hashes': {}}}]
+        text_only = DeliveryRequest.model_validate({'summary': 'Revised answer', 'artifacts': [],
+            'independent_review': False})
+        self.assertTrue(self.owner.requires_review(text_only))
+        self.observations[0]['arguments'].pop('independent_review')
+        self.assertFalse(self.owner.requires_review(text_only))
+
     def test_feedback_keeps_prior_delivery_without_rechecking_it_as_a_new_candidate(self):
         self.owner.config['tool_completions']['deliver_result'] = {'kind': 'delivery'}
         delivered = {'summary': 'Earlier explanation', 'artifacts': ['draft.md']}

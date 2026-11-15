@@ -21,7 +21,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - Document and article responses bound to their recorded inputs can recover after later instruction changes without another authoring call.
 - Structured research can request other supported outcomes alongside a declared measurement; deterministic work no longer marks those outcomes complete merely because collection or measurement finished.
 - Ad hoc environment checks in ordinary tasks can reach the appropriate execution approval without a fixed experiment contract.
-- An explicitly selected final independent review remains required for the same work when preparation, resources or execution prevent it from completing.
+- An explicitly selected final independent review remains required for the same work, including text-only delivery, when preparation, resources or execution prevent it from completing.
 - Structured chat setup can carry a confirmed request for independent review into the existing delivery condition.
 
 ## 2026-11-15

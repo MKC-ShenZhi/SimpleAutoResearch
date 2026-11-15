@@ -124,16 +124,15 @@ class Delivery:
             metadata = row.get('metadata') or {}
             review = metadata.get('delivery_review') or {}
             failed = review.get('error') if review else metadata.get('delivery_review_error')
-            if failed:
-                completion = tool_completion(row.get('tool_name', ''), self.config.get('tool_completions'))
-                arguments = row.get('arguments') or {}
-                claim = arguments.get(completion.field) if completion and completion.field else arguments
-                explicitly_selected = (completion is not None and (
-                    completion.kind == 'review' and arguments.get('review_scope') == 'delivery'
-                    or completion.kind == 'delivery' and isinstance(claim, dict)
-                       and claim.get('independent_review') is True))
-                if not explicitly_selected:
-                    continue  # A failed default check does not create a new requirement.
+            completion = tool_completion(row.get('tool_name', ''), self.config.get('tool_completions'))
+            arguments = row.get('arguments') or {}
+            claim = arguments.get(completion.field) if completion and completion.field else arguments
+            explicitly_selected = (completion is not None and (
+                completion.kind == 'review' and arguments.get('review_scope') == 'delivery'
+                or completion.kind == 'delivery' and isinstance(claim, dict)
+                   and claim.get('independent_review') is True))
+            if failed and not explicitly_selected:
+                continue  # A failed default check does not create a new requirement.
             binding = review.get('binding') or {}
             if binding.get('purpose'):
                 continue
@@ -155,7 +154,9 @@ class Delivery:
                     selected = {str(self.workspace.resolve(path)) for path in resolved['artifacts']}
                 except (ValueError, OSError):
                     return False  # The normal delivery owner reports invalid or unfinished outputs.
-            if selected and selected == set(artifacts):
+            # A text-only delivery has a legitimate empty inventory. Retain an
+            # explicit review choice for it, not an incidental default review.
+            if selected == set(artifacts) and (selected or explicitly_selected):
                 return True
         return False
 
