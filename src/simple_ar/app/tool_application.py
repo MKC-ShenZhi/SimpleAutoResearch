@@ -1467,10 +1467,15 @@ class ToolApplication:
             previous=self._report_projection, writing=self.writing, report_inputs=self._report_inputs)
 
     def _inspection_requests(self) -> list[str]:
-        """Original requests, without a review-only administrative supply notice."""
+        """Original requests without administrative permission-only notices."""
         requests = list(self.state['requests'])
+        administrative = {'independent_review_required'}
+        if self.state['config'].get('delivery_review_selection') == 'model.v3':
+            administrative |= {'allow_execution', 'sandbox_execution', 'allow_network',
+                               'allow_vision', 'max_output_tokens'}
         for supply in reversed(self.state.get('supplies', [])):
-            if set(supply.get('changes', {})) != {'independent_review_required'}:
+            changes = set(supply.get('changes', {}))
+            if not changes or not changes <= administrative:
                 continue
             index = supply.get('request_count', 0) - 1
             prefix = ('Caller explicitly replaced task contracts: ' if supply.get('replace_existing')
