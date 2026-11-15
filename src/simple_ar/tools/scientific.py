@@ -908,7 +908,7 @@ class ScientificToolGateway:
         """Verify accepted physical measurements for the selected code lineage."""
         refs, hashes, measurement_sources = [], {}, []
         if 'conditions' in (self.execution_contract or {}):
-            locators = list(self._condition_results(locators, implementation_refs=implementation_refs).values())
+            locators = list(self.condition_results(locators, implementation_refs=implementation_refs).values())
         for locator in dict.fromkeys(locators):
             saved = self._measurement_request(locator)
             hint = saved.get('execution_approval', saved.get('implementation_approval', {})).get('binding', {}).get('source')
@@ -936,7 +936,7 @@ class ScientificToolGateway:
                 fields = {'result_refs', 'baseline_ref', 'pairs'}
                 expected = MeasurementAnalysisRequest.model_validate(self.analysis_arguments(
                     selected, implementation_refs=implementation_refs)).model_dump(include=fields)
-                match = self._matching_analysis(analysis_records, expected)
+                match = self.matching_analysis(analysis_records, expected)
                 if match is not None:
                     path, receipt = match
                     store = self._store(path.parent.name)
@@ -954,7 +954,7 @@ class ScientificToolGateway:
                     evidence['analysis_records'] = [record]
         return evidence
 
-    def _matching_analysis(self, records: list[str], expected: dict) -> tuple[Path, dict] | None:
+    def matching_analysis(self, records: list[str], expected: dict) -> tuple[Path, dict] | None:
         """One receipt/selection owner for delivery and writing consumers."""
         expected = self._analysis_selection(MeasurementAnalysisRequest.model_validate(expected))
         for record in reversed(records):
@@ -1034,7 +1034,7 @@ class ScientificToolGateway:
             raise ValueError('Measurement must belong to this task')
         return ArtifactStore(path.parent).read_json('scientific_request.json')
 
-    def _condition_results(self, locators: list[str], *, implementation_refs: list[str] | None = None) -> dict[str, str]:
+    def condition_results(self, locators: list[str], *, implementation_refs: list[str] | None = None) -> dict[str, str]:
         """Select actual observations and frozen imports through the same source reader."""
         selected, sources, pending = {}, {}, []
         current = self._current_attempts() if self._current_attempts is not None else None
@@ -1113,7 +1113,7 @@ class ScientificToolGateway:
             raise ValueError('Prepared measurement and implementation do not share the approved preparation ancestor')
 
     def analysis_arguments(self, locators: list[str], *, implementation_refs: list[str] | None = None) -> dict[str, Any]:
-        selected = self._condition_results(locators, implementation_refs=implementation_refs)
+        selected = self.condition_results(locators, implementation_refs=implementation_refs)
         rows = measurement_conditions(self.execution_contract)
         if any(row['seed'] is not None for row in rows):
             seeds = dict.fromkeys(row['seed'] for row in rows)
@@ -1133,7 +1133,7 @@ class ScientificToolGateway:
             parsed = MeasurementRequest.model_validate(proposed_measurement)
             if parsed.model_dump(exclude={'delivery', 'implementation_ref', 'preparation_ref', 'workspace_outputs', 'condition_id'}) == self.execution_contract:
                 return []  # Literal single-run inline delivery; commit verifies the actual receipt.
-        selected = self._condition_results(locators, implementation_refs=implementation_refs)
+        selected = self.condition_results(locators, implementation_refs=implementation_refs)
         exact_single = implementation_refs is not None and 'conditions' not in self.execution_contract
         if exact_single and not selected:
             return ['The current implementation has no formal measurement for its frozen scientific contract']
@@ -1148,14 +1148,14 @@ class ScientificToolGateway:
                 ArtifactStore(self.root).read_json(ref), receipt['result']['data']))
         if 'conditions' not in self.execution_contract or issues:
             if exact_single and analysis_records:
-                self._matching_analysis(analysis_records, {'result_refs': [selected['candidate']]})
+                self.matching_analysis(analysis_records, {'result_refs': [selected['candidate']]})
             return issues
         expected = MeasurementAnalysisRequest.model_validate(self.analysis_arguments(list(selected.values())))
         fields = {'result_refs', 'baseline_ref', 'pairs'}
         if proposed_analysis is not None and self._analysis_selection(MeasurementAnalysisRequest.model_validate(
                 proposed_analysis)) == self._analysis_selection(expected):
             return []  # Preflight only; the saved domain result is checked again before commit.
-        match = self._matching_analysis(analysis_records, expected.model_dump(include=fields))
+        match = self.matching_analysis(analysis_records, expected.model_dump(include=fields))
         if match is not None:
             path, receipt = match
             return self._analysis_issues(receipt['result']['data'], self._store(path.parent.name))

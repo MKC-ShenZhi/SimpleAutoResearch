@@ -1356,7 +1356,7 @@ code = "daily"
                         {'baseline', 'candidate'})
                     baseline.write_text("print('score: 0.6')\n", encoding='utf-8')
                     refs = restored.scientific.measurement_refs(current)
-                    selected = restored.scientific._condition_results(refs)
+                    selected = restored.scientific.condition_results(refs)
                     self.assertEqual(set(selected), {'candidate'})
                     self.assertIsNone(restored.scientific.analysis_arguments(refs)['baseline_ref'])
                     retained = next(row for row in current if row['arguments']['condition_id'] == 'baseline')

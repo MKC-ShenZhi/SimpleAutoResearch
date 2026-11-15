@@ -173,6 +173,10 @@ class ResearchIntakeTests(unittest.TestCase):
                     measurements = [row for row in observations if row['tool_name'] == 'measure_experiment']
                     self.assertEqual(len(measurements), 2 if paired else 1)
                     self.assertTrue(all(row['data']['execution_status'] == 'passed' for row in measurements))
+                    if paired:
+                        self.assertEqual(len([row for row in observations
+                            if row['tool_name'] == 'analyze_measurements']), 1)
+                        self.assertEqual(app.measurement_completion_actions(), [])
                     self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in app.ledger.entries),
                         2 if paired else 1)
 

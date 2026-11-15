@@ -2308,7 +2308,7 @@ class ToolApplication:
         data = (observed or {}).get('data') or {}
         if observed and observed.get('status') == 'ok' and data.get('execution_status') == 'passed':
             refs = self.scientific.measurement_refs(self._operation_observations(domain='scientific'))
-            selected = self.scientific._condition_results(refs)
+            selected = self.scientific.condition_results(refs)
             missing_conditions = [row['id'] for row in measurement_conditions(revised) if row['id'] not in selected]
             if not missing_conditions and not self.session.manifest.budget.exhausted():
                 snapshot = self.run(actions=[{'tool_name': 'analyze_measurements',
@@ -5606,8 +5606,9 @@ class ToolApplication:
                 or self.session.manifest.status != 'paused' or self.state['pending'] is not None
                 or not self.state['turns'] or self.state['turns'][-1]['remaining']):
             return []
-        locators = self.scientific.measurement_refs(self._operation_observations(domain='scientific'))
-        selected = self.scientific._condition_results(locators)
+        observations = self._operation_observations(domain='scientific')
+        locators = self.scientific.measurement_refs(observations)
+        selected = self.scientific.condition_results(locators)
         if len(selected) != len(config['execution_contract']['conditions']):
             return []
         # The deterministic comparison can finish itself, but cannot claim
@@ -5622,6 +5623,8 @@ class ToolApplication:
         arguments = self.scientific.analysis_arguments(locators)
         if measurement_only:
             arguments['delivery'] = {'summary': self.state['requests'][-1], 'artifacts': []}
+        elif self.scientific.matching_analysis(self.scientific.analysis_records(observations), arguments) is not None:
+            return []  # The comparison is retained; other requested work remains.
         return [{'tool_name': 'analyze_measurements', 'arguments': arguments}]
 
     def _terminal_error(self, call: dict[str, Any]) -> str:

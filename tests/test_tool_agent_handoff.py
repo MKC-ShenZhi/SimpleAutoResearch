@@ -4106,7 +4106,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     for item in turn['tools']]
                 self.assertTrue(all(item['status'] == 'ok' for item in measured), measured)
                 locators = [item['data']['result_ref'] for item in measured]
-                selected = app.scientific._condition_results(locators)
+                selected = app.scientific.condition_results(locators)
                 self.assertEqual(len(selected), count * 2)
                 self.assertEqual({selected[row['id']] for row in imported}, {row['reuse_ref'] for row in imported})
                 completion = app.measurement_completion_actions()
@@ -4182,7 +4182,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     try:
                         asset.write_bytes(content + b'\nchanged')
                         with self.assertRaises(ValueError):
-                            app.scientific._condition_results(locators)
+                            app.scientific.condition_results(locators)
                     finally:
                         asset.write_bytes(content)
                 snapshot = app.workspace.resolve(imported[0]['reuse_ref'])
@@ -12612,8 +12612,8 @@ class ScientificToolTests(unittest.TestCase):
                 locators = [baseline, old, current, wrong]
                 revisions = ['attempts/old/implementation.json', 'attempts/current/implementation.json']
                 with self.assertRaisesRegex(ValueError, 'current implementation revision'):
-                    science._condition_results(locators)
-                selected = science._condition_results(locators, implementation_refs=revisions)
+                    science.condition_results(locators)
+                selected = science.condition_results(locators, implementation_refs=revisions)
                 self.assertEqual(selected, {'baseline': baseline, 'candidate': current})
                 self.assertNotIn(unittest.mock.call(old), proof.call_args_list)
                 evidence = science.report_evidence(locators, revisions)
