@@ -396,7 +396,7 @@ def _resolve_external_python(value: str) -> str:
 
 
 def _python_version_for_policy(mode: str, executable: str) -> str:
-    if mode == "current" and executable == sys.executable:
+    if os.path.normcase(os.path.abspath(executable)) == os.path.normcase(os.path.abspath(sys.executable)):
         return platform.python_version()
     try:
         completed = subprocess.run(

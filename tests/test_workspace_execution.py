@@ -262,9 +262,11 @@ class WorkspaceExecutionTests(unittest.TestCase):
             'print("score: 1")\n')
         task = self.base / 'baseline-task.txt'
         task.write_text('Check the existing project')
-        run = initialize_code_task(run_dir=self.base / 'baseline-run', code_root=source,
-            task_file=task, benchmark_command='python check.py',
-            env_mode='external', python_executable=sys.executable, standalone=False)
+        with patch('simple_ar.code_task.execution.environment.subprocess.run',
+                   side_effect=AssertionError('Current Python version is already known')):
+            run = initialize_code_task(run_dir=self.base / 'baseline-run', code_root=source,
+                task_file=task, benchmark_command='python check.py',
+                env_mode='external', python_executable=sys.executable, standalone=False)
         workspace = run.workspace_dir.resolve()
         ledger = BudgetLedger({'process_invocations': 4, 'process_wall_seconds': 60})
         sandbox = ProcessSandbox(workspace, workspace, Path(sys.executable))
