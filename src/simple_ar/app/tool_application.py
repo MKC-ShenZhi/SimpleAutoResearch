@@ -4339,7 +4339,8 @@ class ToolApplication:
             ensure_ascii=False) if declared else self.state['requests'][number])} for number in range(count, len(self.state['requests']))]
         prefix = [{'role': 'system', 'content': self._system_text(closing=closing)},
                   {'role': 'user', 'content': ''}]
-        schema_cost = estimate_tokens(json.dumps(self.schemas if schemas is None else schemas, ensure_ascii=False))
+        selected_schemas = self.schemas if schemas is None else schemas
+        schema_cost = estimate_tokens(json.dumps(selected_schemas, ensure_ascii=False))
         if working_mode:
             from simple_ar.core.working_context import (
                 current_material_paths, fit_working_context, processed_journal_turns)
@@ -4509,7 +4510,6 @@ class ToolApplication:
             journal_rows = [{'turn':number, 'record':'records/'+path.removeprefix('attempts/')}
                 for number, turn in enumerate(turns) if not turn.get('remaining')
                 for path in ([item['result'] for item in turn['tools']] or [turn['reply']])] if journal else []
-            selected_schemas = self.schemas if schemas is None else schemas
             messages, selection = fit_working_context(
                 measure_input=lambda value: estimate_native_input_tokens(client, value, selected_schemas),
                 user_requests=self.state['requests'],
@@ -4543,7 +4543,9 @@ class ToolApplication:
                        if config.get('work_method') in NATIVE_WORK_METHODS else {})} if journal else {}))
             if working_selection is not None:
                 working_selection.update(selection)
-            cost = estimate_native_input_tokens(client, messages, self.schemas if schemas is None else schemas)
+            # The selector has already measured this exact final request with
+            # selected_schemas; reuse that result for the allowance boundary.
+            cost = selection['estimated_input_tokens']
             if remaining is not None and cost+output>remaining:
                 raise ValueError('Current working view exceeds the remaining token allowance; no request sent')
             if getattr(client._settings, 'thinking_mode', '') == 'enabled' and any(
