@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from simple_ar.research.contracts import DocumentRecord, SourcePlan, TextChunk
 from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
-from simple_ar.research.documents.ingest import DocumentBundle, build_document_bundle, build_local_document_bundle
+from simple_ar.research.documents.ingest import DocumentBundle, build_document_bundle, build_local_document_bundle, merge_document_bundles
 from simple_ar.research.evidence.reader import (
     ReadRequest,
     ReadResult,
@@ -25,6 +25,23 @@ from simple_ar.research.evidence.reader import (
 
 
 class ReadBoundaryTests(unittest.TestCase):
+    def test_independent_source_histories_survive_combination_and_further_reading(self):
+        def bundle(name, size):
+            report = {'schema_version': 'research_fulltext_manifest.v1',
+                'budget': {'max_pdf_mb': size},
+                'documents': [{'document_id': name, 'hints': [{'status': 'cached'}]}]}
+            return DocumentBundle(records=[DocumentRecord(document_id=name, title=name, source='local_files')],
+                fulltext_manifest=report, fulltext_extraction={}, sections=[],
+                chunks=[TextChunk(chunk_id=f'{name}-chunk', document_id=name, text=f'Observation from {name}.')])
+
+        first, second, third = bundle('first', 8), bundle('second', 20), bundle('third', 5)
+        combined = merge_document_bundles(first, second)
+        merged = merge_read_results(read_documents(ReadRequest(combined)), read_documents(ReadRequest(third)))
+        history = merged.bundle.fulltext_manifest
+        self.assertEqual([item['budget']['max_pdf_mb'] for item in history['batches']], [8, 20, 5])
+        self.assertEqual({row['document_id'] for row in history['documents']}, {'first', 'second', 'third'})
+        self.assertNotIn('budget', history)  # No synthetic shared allowance.
+
     def test_question_gaps_survive_empty_or_context_shortlist_without_extra_model_call(self):
         plan = json.dumps({"research_questions": {"questions": [
             {"question_id": "Q1", "facet": "method", "required": True,

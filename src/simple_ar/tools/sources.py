@@ -24,7 +24,7 @@ from simple_ar.research.design import ResearchDesignRequest, run_research_design
 from simple_ar.research.summary import render_summary
 from simple_ar.research.workflow_contracts import ResearchBrief
 from simple_ar.research.contracts import DocumentRecord, SourcePlan
-from simple_ar.research.documents.ingest import DocumentBundle, build_document_bundle
+from simple_ar.research.documents.ingest import DocumentBundle, build_document_bundle, merge_document_bundles
 from simple_ar.research.documents.fulltext import fulltext_fetch_attempt_cap
 from simple_ar.research.store.retrieval import rank_source_chunks, source_chunk_views
 from simple_ar.research.store.chunking import bounded_document_coverage
@@ -797,20 +797,14 @@ class SourceToolGateway:
                     retained.append(loaded[0])
                 else:
                     local.append(str(path))
-            incoming = self._bundle(papers, [], context.store.root, network=network, local_documents=local)
+            incoming = (self._bundle(papers, [], context.store.root, network=network, local_documents=local)
+                if papers or local or not retained else retained.pop(0))
             for saved in retained:
-                incoming.records.extend(saved.records)
-                incoming.sections.extend(saved.sections)
-                incoming.chunks.extend(saved.chunks)
+                incoming = merge_document_bundles(incoming, saved)
             return incoming
 
         def add_materials(existing: DocumentBundle | None, incoming: DocumentBundle) -> DocumentBundle:
-            if existing is None:
-                return incoming
-            existing.records.extend(incoming.records)
-            existing.sections.extend(incoming.sections)
-            existing.chunks.extend(incoming.chunks)
-            return existing
+            return merge_document_bundles(existing, incoming)
 
         op, bundle, read = request.operation, None, None
         plan = ResearchPlanResult.from_handoff_dict(self._handoff(request.plan_record, 'research_plan.v1')) if request.plan_record else None

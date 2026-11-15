@@ -95,6 +95,37 @@ class DocumentBundle:
         )
 
 
+def merge_document_reports(previous: dict[str, Any], fresh: dict[str, Any]) -> dict[str, Any]:
+    """Keep independent acquisition/extraction reports and their document rows."""
+    if not previous or not fresh or previous == fresh:
+        return dict(previous or fresh)
+    batches = []
+    for report in (previous, fresh):
+        for batch in report.get('batches', [report]):
+            if batch not in batches:
+                batches.append(batch)
+    documents = []
+    for batch in batches:
+        for row in batch.get('documents', []):
+            if row not in documents:
+                documents.append(row)
+    # Budgets and fetch counts belong to their original attempts, not to this
+    # newly assembled view. Keep them in the unmodified individual reports.
+    return {'schema_version': previous.get('schema_version') or fresh.get('schema_version'),
+        'document_count': len({row.get('document_id') for row in documents}),
+        'documents': documents, 'batches': batches}
+
+
+def merge_document_bundles(previous: DocumentBundle | None, fresh: DocumentBundle) -> DocumentBundle:
+    """Combine retained source content with its actual acquisition provenance."""
+    if previous is None:
+        return fresh
+    return DocumentBundle(records=[*previous.records, *fresh.records],
+        sections=[*previous.sections, *fresh.sections], chunks=[*previous.chunks, *fresh.chunks],
+        fulltext_manifest=merge_document_reports(previous.fulltext_manifest, fresh.fulltext_manifest),
+        fulltext_extraction=merge_document_reports(previous.fulltext_extraction, fresh.fulltext_extraction))
+
+
 def analysis_material_paths(paths: Iterable[Path]) -> tuple[Path, ...]:
     """Recognize declared analysis packages, not every JSON writing material.
 
