@@ -233,7 +233,7 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         # A passed full-scope review of the same claim is adopted, rather than
         # starting another check when the producer repeats the false choice.
         case.review = case._review_complete_targets
-        case._submit(_action('review_result', **claim, review_scope='delivery'))
+        case._submit(_action('review_result', **claim, review_scope='delivery', independent_review=True))
         case._ok('review_result', reviewed=True)
         checked = len(case.inspection_requests)
         case._reload()
@@ -264,6 +264,14 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
             independent_review=False, unresolved=['Independent review remains unfinished.']))
         self.assertEqual(case.app.session.manifest.status, 'partial', case.app.result_snapshot())
         self.assertEqual(case.inspection_requests, [])
+        # Only a later explicit caller revision, not the producer, can remove it.
+        before_revision = deepcopy(case.app.ledger.to_dict())
+        case.app.supply(supply_id='review-no-longer-required', reason='Caller revised the review requirement',
+            changes={'independent_review_required': False}, replace_existing=True)
+        case._reload()
+        self.assertEqual(case.app.ledger.to_dict(), before_revision)
+        self.assertFalse(case.app.operations.delivery.requires_review(DeliveryRequest.model_validate({
+            'summary': 'Existing work', 'artifacts': ['note.md'], 'independent_review': False})))
 
     def test_review_only_supply_reuses_prior_complete_review_without_a_new_investigation(self):
         from simple_ar.app.tool_application import ToolApplication

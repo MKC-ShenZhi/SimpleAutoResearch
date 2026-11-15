@@ -5176,6 +5176,27 @@ protected_patterns = ["pyproject.toml"]
             reviewer.assert_not_called()
             self.assertEqual(post_run.read_bytes(), before)
 
+    def test_shared_delivery_review_replaces_only_the_advisory_code_model_review(self) -> None:
+        with _temporary_root() as root:
+            _, _, run_dir = _initialize_toy_task(root, '# Task\n\nRepair within the approved scope.\n',
+                benchmark_command=TOY_BENCHMARK_COMMAND)
+            execute_code_task(run_dir, use_llm=False, baseline_policy='skip')
+            record_plan_decision(run_dir, decision='approve')
+            _write_valid_edit_proposal(run_dir)
+            apply_patch_edits(run_dir)
+            # Deterministic scope/interface failures remain blocking, even
+            # when the common delivery owner handles the model review.
+            with patch('simple_ar.code_task.orchestration.execute.review_code_task_changes',
+                       return_value=SimpleNamespace(status='failed', blocking_count=1, warning_count=0)) as review:
+                result = execute_code_task(run_dir, use_llm=True, review_use_llm=False, to_step='review')
+            self.assertEqual(result.stop_reason, 'review_failed')
+            self.assertFalse(review.call_args.kwargs['use_llm'])
+            # The standalone/historical entry retains its original reviewer.
+            with patch('simple_ar.code_task.orchestration.execute.review_code_task_changes',
+                       return_value=SimpleNamespace(status='failed', blocking_count=1, warning_count=0)) as review:
+                execute_code_task(run_dir, use_llm=True, to_step='review')
+            self.assertTrue(review.call_args.kwargs['use_llm'])
+
     def test_execute_failure_boundaries_keep_analysis_and_repair_separate(self) -> None:
         for failed_step in ("validate", "run"):
             with self.subTest(failed_step=failed_step), _temporary_root() as root:

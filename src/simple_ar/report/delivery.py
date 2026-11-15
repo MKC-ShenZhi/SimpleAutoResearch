@@ -108,10 +108,10 @@ class Delivery:
                 raise ValueError('This task has no reusable independent review')
             return self.review_owner.reviewed_claim(choice.reviewed_candidate, observations, self.user_requests)
         request = delivery if isinstance(delivery, DeliveryRequest) else DeliveryRequest.model_validate(delivery)
-        # The producer's optional-review choice cannot negate a caller contract.
-        # Normalize before binding so an otherwise identical checked candidate
-        # can be adopted without a second review merely because of that choice.
-        if self.config.get('independent_review_required') and request.independent_review is False:
+        # A caller contract owns this decision. The producer's choice is not
+        # part of the substantive claim and must not invalidate an identical
+        # checked candidate merely because its spelling changed.
+        if self.config.get('independent_review_required') and request.independent_review is not None:
             request = request.model_copy(update={'independent_review': None})
         return request
 

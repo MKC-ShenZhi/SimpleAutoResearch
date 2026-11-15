@@ -667,7 +667,9 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(exact['project_path'], 'source0')
             self.assertEqual(exact['validation_command'], ['python', 'check.py'])
             self.assertEqual(saved['code_work_policy'], 'shared.v2')
+            self.assertEqual(saved['code_review_policy'], 'delivery.v1')
             self.assertEqual(app.operations.implementation.code_work_policy, 'shared.v2')
+            self.assertTrue(app.operations.implementation.defer_code_review)
             self.assertIs(app.operations.implementation.ledger, app.ledger)
             self.assertIn('implement_code_task', app.operations.system_text())
             self.assertNotIn('write_file and run_process', app.operations.system_text())
@@ -677,6 +679,7 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertIs(app.operations.document.ledger, app.ledger)
             restored = ToolApplication.load(base / 'task', services=services)
             self.assertEqual(restored.operations.implementation.code_work_policy, 'shared.v2')
+            self.assertTrue(restored.operations.implementation.defer_code_review)
             self.assertIs(restored.operations.implementation.ledger, restored.ledger)
             self.assertEqual(restored.operations.implementation.work_context([str(project)])['user_requests'],
                 app.state['requests'])
@@ -704,6 +707,7 @@ class ResearchIntakeTests(unittest.TestCase):
                 changes={'allow_execution': True, 'code_task': exact})
             self.assertEqual(continuing.state['config']['code_work_policy'], 'shared.v2')
             self.assertEqual(continuing.operations.implementation.code_work_policy, 'shared.v2')
+            self.assertFalse(continuing.operations.implementation.defer_code_review)
             self.assertIs(continuing.operations.implementation.ledger, continuing.ledger)
             self.assertEqual(continuing.ledger.to_dict(), before_ledger)
             self.assertEqual(continuing.operations.implementation.work_context([str(project)])['user_requests'],

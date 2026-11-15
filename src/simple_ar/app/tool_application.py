@@ -498,6 +498,12 @@ class ToolApplication:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
         if config.get('delivery_review_selection') not in {None, 'model.v1'}:
             raise ValueError('Unsupported saved delivery review selection')
+        if (config.get('code_review_policy') not in {None, 'delivery.v1'}
+                or config.get('code_review_policy') == 'delivery.v1' and (
+                    config.get('code_work_policy') != 'shared.v2'
+                    or config.get('delivery_review_protocol') != 'task.v5'
+                    or config.get('delivery_review_selection') == 'model.v1')):
+            raise ValueError('Shared code review requires the whole-delivery review owner')
         if ('independent_review_required' in config
                 and (type(config['independent_review_required']) is not bool
                      or config['independent_review_required'] and config.get('delivery_review_protocol')
@@ -2007,6 +2013,10 @@ class ToolApplication:
             config['sandbox_operations'] = 'workspace.v1'
         if config.get('code_task') is not None:
             config['code_work_policy'] = 'shared.v2'
+            # New exact-code tasks already require a whole-delivery review.
+            # Keep deterministic patch checks in CodeTask; its advisory model
+            # review belongs to that one independent owner instead.
+            config['code_review_policy'] = 'delivery.v1'
         if config.get('code_task') is not None or config.get('report_requirement') is not None:
             # Structured analysis/measurement tasks need the same frozen
             # report requirements at the actual document-work consumer.
@@ -2363,6 +2373,7 @@ class ToolApplication:
                           'delivery_review_protocol', 'publication_assets', 'professional_operations', 'memory_protocol',
                           'context_checkpoint_policy', 'work_method', 'work_selection_policy', 'native_supply_policy', 'context_authority',
                           'native_history_policy', 'document_context_policy', 'process_artifact_paths', 'work_lifecycle', 'code_work_policy',
+                          'code_review_policy',
                           'sandbox_operations',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:

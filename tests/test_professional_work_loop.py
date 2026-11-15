@@ -8315,6 +8315,11 @@ class OperationsWorkLoopTests(unittest.TestCase):
         with patch('simple_ar.research.implementation.run_implementation_capability',side_effect=generate):
             self._submit(_action('implement_code_task',**work),approve=lambda *_:True)
             first = self._ok('implement_code_task')
+            candidate_path = first['data']['project_path']
+            self.assertTrue(self.app.implementation.defer_code_review)
+            with self.assertRaisesRegex(ValueError, 'changed code for independent review'):
+                self.app.implementation.check_delivery(first['data'], [candidate_path + '/check.py'])
+            self.app.implementation.check_delivery(first['data'], [candidate_path + '/main.py'])
             first_ref = self.app.workspace.locator(str(self.root/first['artifacts'][0]))
             source = self.app.implementation.measurement_source(first_ref,identity='read-candidate')
             self._submit(_action('measure_experiment',**{**execution,'cwd':source['cwd']},

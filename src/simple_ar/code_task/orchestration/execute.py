@@ -145,6 +145,7 @@ def execute_code_task(
     editor_model: str | None = None,
     repair_model: str | None = None,
     use_llm: bool = True,
+    review_use_llm: bool | None = None,
     timeout_sec: int = 60,
     skip_validation: bool = False,
     env_mode: str | None = None,
@@ -338,7 +339,8 @@ def execute_code_task(
             _emit(message_callback, f"Running {phase} code review.")
             review = review_code_task_changes(
                 root, phase=phase, llm_client=llm_client,
-                model=reviewer_model or model, use_llm=use_llm,
+                model=reviewer_model or model,
+                use_llm=use_llm if review_use_llm is None else use_llm and review_use_llm,
                 max_source_chars_per_file=max_source_chars_per_file,
                 message_callback=message_callback,
             )

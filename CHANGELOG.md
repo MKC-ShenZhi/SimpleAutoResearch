@@ -7,6 +7,10 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ## 2026-11-15
 
+### Improved
+
+- New scoped work on existing code keeps deterministic patch and validator checks, while the task's independent delivery review owns the advisory model review. All changed code is included in the reviewed delivery.
+
 ### Fixed
 
 - An explicitly configured independent delivery review can no longer be waived by the producer; completed applicable reviews and partial delivery remain available.

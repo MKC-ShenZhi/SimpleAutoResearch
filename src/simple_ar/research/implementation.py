@@ -43,6 +43,7 @@ class ImplementationRequest:
     edit_budget_overrides: dict[str, int] | None = None
     allow_large_edits: bool = False
     message_callback: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
+    defer_model_review: bool = False
 
 
 def run_implementation_capability(*, context: CapabilityContext, request: ImplementationRequest) -> CapabilityResult:
@@ -51,6 +52,11 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
     if not request.approval_note.strip():
         raise ValueError("Implementation requires explicit isolated-workspace approval.")
     manifest = load_code_task_manifest(request.run_dir)
+    # Greenfield generation has its own whole-project review contract. Existing
+    # project patches can hand advisory content review to task delivery while
+    # retaining CodeTask's deterministic scope and interface checks.
+    review_with_llm = not (request.defer_model_review
+        and manifest.get('code_task', {}).get('kind') != 'greenfield')
     paths = code_task_paths(request.run_dir)
     if paths.workspace_dir.resolve() != request.cwd.resolve():
         raise ValueError("Candidate cwd must be the initialized CodeTask workspace.")
@@ -94,6 +100,7 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
         options = dict(
             approval_note=request.approval_note,
             llm_client=request.llm_client, use_llm=True, allow_planning_fallback=False,
+            review_use_llm=review_with_llm,
             budget_profile=request.budget_profile,
             edit_budget_overrides=request.edit_budget_overrides,
             allow_large_edits=request.allow_large_edits,
@@ -124,6 +131,7 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
         else:
             apply_verified_repair(request.run_dir, repair, approval_note=request.approval_note,
                 llm_client=request.llm_client, message_callback=request.message_callback,
+                review_use_llm=review_with_llm,
                 **({'process_scope': request.process_scope} if request.process_scope is not None else {}))
             stop_reason, next_action = "stop_point", "Measure the repaired candidate separately."
     integrity = reconcile_protocol_assets(before)
@@ -141,6 +149,7 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
             asset_guard=lambda: reconcile_protocol_assets(before),
             budget_ledger=request.budget_ledger, session_id=request.session_id,
             attempt_id=request.attempt_id, message_callback=request.message_callback,
+            review_use_llm=review_with_llm,
             **({'process_scope': request.process_scope} if request.process_scope is not None else {}),
         )
         validation = verified.validation

@@ -61,6 +61,7 @@ def apply_verified_repair(
     run_dir: Path, repair: RepairProposalResult, *, approval_note: str,
     llm_client: LLMClient, message_callback: MessageCallback | None = None,
     process_scope: Any | None = None,
+    review_use_llm: bool = True,
 ) -> None:
     """Apply an already authorized proposal; proposal-only entry points do not call this."""
     if not approval_note.strip():
@@ -69,6 +70,7 @@ def apply_verified_repair(
         raise ValueError("Applying a repair requires a nonempty model proposal.")
     apply_patch_edits(run_dir, edits_file=repair.proposal_path)
     validate_repair_patch(run_dir, llm_client=llm_client, message_callback=message_callback,
+        use_llm=review_use_llm,
         **({'process_scope': process_scope} if process_scope is not None else {}))
 
 
@@ -80,6 +82,7 @@ def verify_implementation(
     budget_ledger: BudgetLedger | None = None, session_id: str = "", attempt_id: str = "",
     message_callback: MessageCallback | None = None,
     process_scope: Any | None = None,
+    review_use_llm: bool = True,
 ) -> ImplementationVerificationResult:
     """Run an authorized technical check and bounded repairs, never scientific measurement.
 
@@ -127,6 +130,7 @@ def verify_implementation(
                 raise ValueError('Saved validator targets a different candidate without a committed authorized repair')
             recovered = None  # Validate the already applied repair, not the old candidate again.
             validate_repair_patch(run_dir, llm_client=llm_client, message_callback=message_callback,
+                use_llm=review_use_llm,
                 **({'process_scope': process_scope} if process_scope is not None else {}))
         elif repair_state.get('status') == 'repair_proposed':
             proposal_path = Path(run_dir) / repair_state['latest_proposed_edits']
@@ -135,6 +139,7 @@ def verify_implementation(
                 'llm', len(proposal['edits']), tuple(repair_state.get('selected_files', [])))
             apply_verified_repair(run_dir, repair, approval_note=approval_note,
                 llm_client=llm_client, message_callback=message_callback,
+                review_use_llm=review_use_llm,
                 **({'process_scope': process_scope} if process_scope is not None else {}))
             recovered = None
     repairs: list[dict[str, Any]] = []
@@ -193,6 +198,7 @@ def verify_implementation(
             break
         apply_verified_repair(run_dir, repair, approval_note=approval_note,
                               llm_client=llm_client, message_callback=message_callback,
+                              review_use_llm=review_use_llm,
                               **({'process_scope': process_scope} if process_scope is not None else {}))
         if asset_guard()["status"] == "changed":
             repairs[-1]["outcome"] = "protected_asset_changed"

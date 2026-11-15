@@ -576,6 +576,7 @@ class ImplementationToolGateway:
                  work_context: Callable[[list[str]], dict] | None = None,
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
                  code_work_policy: str | None = None,
+                 defer_code_review: bool = False,
                  sandboxed_execution: bool = False,
                  declaration_review: bool = False,
                  professional_requests: bool = False,
@@ -626,6 +627,7 @@ class ImplementationToolGateway:
         self.research_inputs = research_inputs
         self.work_context = work_context
         self.code_work_policy = code_work_policy
+        self.defer_code_review = defer_code_review
         self.sandboxed_execution = sandboxed_execution
         self.material_observations = material_observations
         self.exact = ExactCodeTask.model_validate(exact) if exact is not None else None
@@ -1278,6 +1280,7 @@ class ImplementationToolGateway:
                 max_repairs=contract.preparation.max_repairs if contract.preparation is not None else 1,
                 protocol=manifest['code_task']['native_protocol'],
                 handoff_policy=self.code_work_policy,
+                defer_model_review=self.defer_code_review,
                 **({'process_scope': process_scope} if process_scope is not None else {}),
                 **(contract.edit_policy or {}),
                 budget_ledger=self.ledger, session_id=self.session_id, attempt_id=identity))
@@ -1698,11 +1701,12 @@ class ImplementationToolGateway:
     def check_delivery(self, result: dict[str, Any], artifacts: list[str], *,
                        require_current_origin: bool = True) -> None:
         """Accept only the existing verified candidate, never a substitute output."""
-        from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest
+        from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest, native_workspace_binding
         run = Path(result['code_task_run_dir']).resolve()
         if run.parent != (self.workspace.workspace / 'code_tasks').resolve():
             raise ValueError('Exact delivery does not belong to this task')
-        binding = load_code_task_manifest(run)['code_task']['native_binding']
+        manifest = load_code_task_manifest(run)
+        binding = manifest['code_task']['native_binding']
         store = ArtifactStore(self.root / 'attempts' / run.name)
         payload = store.read_json('implementation.json')
         if {key: value for key, value in result.items() if key != 'project_path'} != payload:
@@ -1716,6 +1720,16 @@ class ImplementationToolGateway:
         candidate = code_task_paths(run).workspace_dir.resolve()
         if not any(self.workspace.resolve(path).is_relative_to(candidate) for path in artifacts):
             raise ValueError('Exact delivery must include the verified candidate, not only unrelated artifacts')
+        if self.defer_code_review and manifest.get('code_task', {}).get('kind') != 'greenfield':
+            original = native_workspace_binding(manifest, candidate)['file_hashes']
+            changed = [name for name, digest in payload['implementation_file_hashes'].items()
+                       if original.get(name) != digest]
+            selected = [self.workspace.resolve(path) for path in artifacts]
+            missing = [name for name in changed if not any(
+                candidate.joinpath(name) == path or path.is_dir() and candidate.joinpath(name).is_relative_to(path)
+                for path in selected)]
+            if missing:
+                raise ValueError('Deliver the changed code for independent review: ' + ', '.join(sorted(missing)))
 
     def _check_retained_result(self, store: ArtifactStore, payload: dict[str, Any], run: Path,
                                approval: dict[str, Any]) -> None:

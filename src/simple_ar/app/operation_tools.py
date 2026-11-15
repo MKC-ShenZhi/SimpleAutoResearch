@@ -418,6 +418,7 @@ class OperationTools:
                 execution_observations=execution_observations if not exact else None,
                 work_context=work_context if not exact or config.get('code_work_policy') in {'shared.v1', 'shared.v2'} else None,
                 code_work_policy=config.get('code_work_policy') if exact else None,
+                defer_code_review=config.get('code_review_policy') == 'delivery.v1',
                 sandboxed_execution=(config.get('sandbox_execution', False)
                     and config.get('sandbox_operations') == 'workspace.v1'),
                 material_observations=material_observations if not exact else None,
