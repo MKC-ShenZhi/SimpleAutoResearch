@@ -8410,7 +8410,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.root = self.directory/'flat-code-measurement'
         self.app = ToolApplication.create(self.root,contract['goal'],model='fixture',services=self.services,
             sources={'project':self.inputs},code_task=contract,execution_contract=execution,
-            allow_execution=True,tool_contracts='full',max_attempts=50,
+            allow_execution=True,tool_contracts='full',max_attempts=50,independent_review_required=True,
             process_limits={'process_invocations':16,'process_wall_seconds':90})
         value = 2
         with patch('simple_ar.research.implementation.run_implementation_capability',side_effect=generate):
