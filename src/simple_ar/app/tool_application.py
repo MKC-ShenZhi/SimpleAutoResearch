@@ -2157,6 +2157,77 @@ class ToolApplication:
         self.session.store.write_json("actions.json", self.state)
         self.session.save()
 
+    def retry_experiment(self, *, command: tuple[str, ...], cwd: str | Path,
+                         timeout_sec: int, result_schema: dict[str, object] | None = None,
+                         label: str = 'experiment-retry', parent_attempt_id: str | None = None,
+                         progress: Callable[[str], None] = print) -> dict[str, Any]:
+        """Run one caller-specified correction through the existing scientific owner."""
+        from simple_ar.app.research_execution import merge_result_schema
+        from simple_ar.tools.scientific import measurement_contract
+
+        if self.operations is None or self.scientific is None:
+            raise ValueError('This task has no common scientific execution owner')
+        source = self.scientific.retry_source(self._operation_observations(),
+            parent_attempt_id=parent_attempt_id)
+        parent = source['parent_attempt_id']
+        revised = dict(source['contract'])
+        revised.update(command=list(command), cwd=str(Path(cwd).expanduser().absolute()), timeout_sec=timeout_sec)
+        if label.strip():
+            revised['label'] = label.strip()
+        if result_schema:
+            revised['result_schema'] = merge_result_schema(revised.get('result_schema'), result_schema)
+        revised = measurement_contract(revised)
+        reason = f'Retry the failed scientific measurement {parent} using the caller-supplied command.'
+        supplies = self.state.get('supplies', [])
+        supplied = (bool(supplies) and supplies[-1].get('reason') == reason
+            and supplies[-1].get('changes') == {'execution_contract': revised}
+            and supplies[-1].get('request_count') == len(self.state['requests']))
+        if not source['contract_current'] and not supplied:
+            raise ValueError('The latest measurement is not part of the current execution contract')
+
+        pending = self.state.get('pending')
+        queued = any(turn['remaining'] for turn in self.state['turns'])
+        if pending or queued:
+            turns = self.state['turns']
+            turn = turns[-1] if turns else {}
+            remaining = turn.get('remaining', [])
+            call = remaining[0] if len(remaining) == 1 else None
+            if (not supplied or turn.get('origin') != 'caller' or call is None
+                    or call.get('function', {}).get('name') != 'measure_experiment'
+                    or json.loads(call['function']['arguments']) != revised
+                    or turn.get('parents', {}).get(call['id']) != parent
+                    or pending and (pending.get('kind') != 'tool' or pending.get('call') != call)):
+                raise ValueError('Reconcile the existing task action before submitting an experiment retry')
+        elif not supplied:
+            self.supply(supply_id=f'retry-{parent}-{len(supplies) + 1}', reason=reason,
+                changes={'execution_contract': revised}, replace_existing=True)
+
+        def approve(call: dict[str, Any], _token: str) -> bool:
+            return (call['function']['name'] == 'measure_experiment'
+                and json.loads(call['function']['arguments']) == revised
+                and self.state['turns'][-1].get('origin') == 'caller')
+
+        def stop_after_caller_action() -> bool:
+            return self.state['pending'] is None and not any(turn['remaining'] for turn in self.state['turns'])
+
+        snapshot = self.run(actions=None if pending or queued else [
+            {'tool_name': 'measure_experiment', 'arguments': revised, 'parent_attempt_id': parent}], approve=approve,
+            should_stop=stop_after_caller_action, progress=progress)
+        turn = self.state['turns'][-1] if self.state['turns'] else {}
+        observed = (self.session.store.read_json(turn['tools'][-1]['result'])
+            if turn.get('origin') == 'caller' and turn.get('tools') else None)
+        analysis = None
+        data = (observed or {}).get('data') or {}
+        if (observed and observed.get('status') == 'ok' and data.get('execution_status') == 'passed'
+                and not self.session.manifest.budget.exhausted()):
+            snapshot = self.run(actions=[{'tool_name': 'analyze_measurements',
+                'arguments': {'result_refs': [data['result_ref']]}}],
+                should_stop=stop_after_caller_action, progress=progress)
+            turn = self.state['turns'][-1]
+            analysis = (self.session.store.read_json(turn['tools'][-1]['result'])
+                if turn.get('origin') == 'caller' and turn.get('tools') else None)
+        return {'parent_attempt_id': parent, 'observation': observed, 'analysis': analysis, 'task': snapshot}
+
     @classmethod
     def _feedback_journal(cls, root: Path):
         from simple_ar.core.feedback import FeedbackSubmissions
@@ -2575,21 +2646,30 @@ class ToolApplication:
         if self.session.manifest.status in {'completed', 'partial'}:
             raise ValueError('New actions after delivery require explicit feedback')
         calls = []
+        parents = {}
         turn_number = len(self.state['turns'])
         for index, row in enumerate(actions):
-            if (not isinstance(row, dict) or set(row) != {'tool_name', 'arguments'}
+            if (not isinstance(row, dict) or not {'tool_name', 'arguments'} <= set(row)
+                    or set(row) - {'tool_name', 'arguments', 'parent_attempt_id'}
                     or not isinstance(row['tool_name'], str) or not isinstance(row['arguments'], dict)):
-                raise ValueError('Each caller action requires exactly tool_name and object arguments')
+                raise ValueError('Each caller action requires tool_name, object arguments and an optional parent attempt')
+            parent = row.get('parent_attempt_id')
+            if parent is not None and (not isinstance(parent, str) or not parent.strip()):
+                raise ValueError('A caller action parent must be a nonempty attempt ID')
             spec = self.gateway.registry.get(row['tool_name'])
             if spec is None or not self.gateway.policy.is_allowed(spec)[0]:
                 raise ValueError('Caller action is unavailable under this task permission policy')
             calls.append({'id': f'caller-{turn_number}-{index}', 'type': 'function',
                 'function': {'name': row['tool_name'],
                     'arguments': json.dumps(row['arguments'], ensure_ascii=False, allow_nan=False)}})
+            if parent is not None:
+                parents[calls[-1]['id']] = parent
         relative = f'tools/submissions/caller-{turn_number}.json'
         payload = {'role': 'assistant',
             'content': 'These actions were explicitly submitted by the caller, not generated by a model.',
             'tool_calls': calls}
+        if parents:
+            payload['content'] += ' Parent attempts: ' + json.dumps(parents, ensure_ascii=False)
         if abandoned is not None:
             payload['content'] += (' The caller explicitly abandoned failed native decision '
                 + abandoned.attempt_id + '; its failure and charges are retained. No model reply was accepted.')
@@ -2602,7 +2682,8 @@ class ToolApplication:
             self.session.store.write_json(relative, payload, kind='caller_actions')
         self.state['pending'] = None
         self.state['turns'].append({'origin': 'caller', 'reply': relative, 'tools': [],
-            'remaining': calls, 'request_count': len(self.state['requests'])})
+            'remaining': calls, 'request_count': len(self.state['requests']),
+            **({'parents': parents} if parents else {})})
         self._save()
 
     def _caller_takeover(self) -> bool:
@@ -5691,7 +5772,9 @@ class ToolApplication:
                                  'perform': perform}
                 else:
                     arguments = {"call": pending["call"]} if capability == "native_tool" else {}
-                result = self.session.execute_attempt(capability, attempt_id=identity, **arguments)
+                result = self.session.execute_attempt(capability, attempt_id=identity,
+                    **({'parent_attempt_id': pending['parent_attempt_id']} if pending.get('parent_attempt_id') else {}),
+                    **arguments)
             except (LLMCallStopped, KeyboardInterrupt) as exc:
                 # This stack has unwound after an observed caller stop; unlike
                 # a lost process, it is known not to dispatch further work.
@@ -6645,8 +6728,10 @@ class ToolApplication:
                             continue
                         self.session.pause('Insufficient attempt space for ordinary work and a follow-up decision; unstarted work retained, not delivered')
                         return
+                    parent = turns[-1].get('parents', {}).get(call['id'])
                     pending = {"kind": "tool", "call": call,
-                        "attempt": self.session.allocate_attempt_id("native-tool")}
+                        "attempt": self.session.allocate_attempt_id("native-tool"),
+                        **({'parent_attempt_id': parent} if parent is not None else {})}
                 else:
                     if decision := self.sources.pending_decision():
                         self.session.pause('Protocol requires an explicit bound user decision')

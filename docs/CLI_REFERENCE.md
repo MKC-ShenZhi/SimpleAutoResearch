@@ -32,7 +32,7 @@ Look up syntax, parameters and recovery limits here. Prefix examples with `uv ru
 | Use exact structured inputs or continue saved research work | [`simple-ar research-session`](#simple-ar-research-session) |
 | Generate or refresh a report using a saved research session | [`simple-ar research-report`](#simple-ar-research-report) |
 | Compatibility spelling for a new summary-only session; inherits research-session parameters with the limits below. | [`simple-ar research-brief`](#simple-ar-research-brief) |
-| Run one corrected explicit experiment after a failed/timed-out simple experiment in a saved canonical session. | [`simple-ar research-session-continue`](#simple-ar-research-session-continue) |
+| Run one corrected explicit experiment after a failed/timed-out simple experiment in the original research session. | [`simple-ar research-session-continue`](#simple-ar-research-session-continue) |
 | Create a successor from a read-only v1 session, importing only named small artifacts without changing the source. | [`simple-ar research-session-migrate`](#simple-ar-research-session-migrate) |
 | Prepare an isolated workspace for an explicit existing-project or greenfield contract. | [`simple-ar code-task init`](#simple-ar-code-task-init) |
 | Continue bounded planning, review, edits and benchmarks for a saved CodeTask. | [`simple-ar code-task execute`](#simple-ar-code-task-execute) |
@@ -646,14 +646,14 @@ simple-ar research-session --topic "Summarize local sources" --local-document pa
 Generate or refresh a report using retained research work in a shared or historical session.
 
 ```text
-simple-ar research-report --session-root PATH --model SELECTOR [OPTIONS]
+simple-ar research-report --session-root PATH [--model SELECTOR] [OPTIONS]
 ```
 
 | Parameter | Meaning | Default or conditions |
 | --- | --- | --- |
 | `--session-root PATH` | Saved research session with work available for the report. | Required |
 | `--refresh` | Request new report work from saved evidence and keep old reports. | Off |
-| `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME; a shared session retains its saved selector. | Required |
+| `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME. Shared tasks reuse their saved selector and reject changes. | Required for historical sessions; optional for shared tasks |
 | `--template NAME_OR_PATH` | Report template name or Markdown path. | experiment |
 | `--reviewer CHOICE` | Report reviewer; disabled retains audit. Choices: `llm`, `disabled`. | llm |
 | `--max-review-iterations N` | Report revision/correction bound; failed proposals count too. | 1 |
@@ -796,7 +796,7 @@ simple-ar research-brief --topic "Summarize local sources" --local-document pape
 
 ### `simple-ar research-session-continue`
 
-Run one corrected explicit experiment after a failed/timed-out simple experiment in a saved canonical session.
+Run one corrected explicit experiment after a failed/timed-out simple experiment in the original research session.
 
 ```text
 simple-ar research-session-continue --session-root PATH [OPTIONS] --command ARGV...
@@ -804,9 +804,9 @@ simple-ar research-session-continue --session-root PATH [OPTIONS] --command ARGV
 
 | Parameter | Meaning | Default or conditions |
 | --- | --- | --- |
-| `--session-root PATH` | Saved research session; follow its printed resume command. Common tasks resume with start --resume-task. | Required |
+| `--session-root PATH` | Saved research session, including a common structured task. | Required |
 | `--parent-attempt-id NAME` | Failed experiment to branch from; latest canonical experiment, or experiment-001 for old layouts. | Latest experiment; experiment-001 for old layouts |
-| `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME. | Unset |
+| `--model SELECTOR` | Compatibility option; this command does not change the saved model or request a model decision. | Unset |
 | `--cwd PATH` | Declared command working directory. | . |
 | `--timeout-sec N` | Per-process time limit in seconds. | 300 |
 | `--label NAME` | Declared experiment label. | research-session-recovery |
@@ -815,7 +815,7 @@ simple-ar research-session-continue --session-root PATH [OPTIONS] --command ARGV
 | `--metric-direction NAME=DIRECTION` | NAME=DIRECTION; repeatable. Directions include higher, lower, resource and ignore. | [] |
 | `--command ARGV...` | Explicit argv; put last because all following tokens belong to the command. Research/start argv has no shell interpretation. | Required |
 
-Only a corrected simple explicit experiment is supported. Scientific negative results are not technical failures. Paired/prepared-data/CodeTask failures use their own continuation path. Retains parent evidence/schema unless explicitly overridden. V1 cannot execute; native tasks use start --resume-task.
+Only a corrected simple explicit experiment is supported. Scientific negative results are not technical failures. Paired/prepared-data/CodeTask failures use their own continuation path. The original parent evidence, task and process ledger are retained; metric settings carry forward unless explicitly overridden. A passed common measurement is followed by deterministic analysis when attempt capacity permits; no model decision is started. Continue further work using the task's normal resume command. V1 sessions remain read-only.
 
 Examples:
 
@@ -903,7 +903,7 @@ simple-ar code-task execute RUN_DIR [OPTIONS]
 | `--model SELECTOR` | Model override for LLM-backed steps. | Unset |
 | `--no-llm` | Use deterministic fallbacks where possible. | Off |
 | `--timeout N` | Benchmark timeout. | 60 |
-| `--yes` | Auto-approve inline review gates in normal execute mode; with `--interactive`, auto-continue primitive prompts. Use only after you are comfortable approving the reviewed plan/proposal. | Off |
+| `--yes` | Auto-approve inline review gates in normal execute mode; with `--interactive`, auto-continue primitive prompts. New existing-project tasks directly use the authorized editor without a separate model plan; explicit plan steps and saved tasks retain their original path. | Off |
 | `--interactive` | Debug mode: confirm each primitive step instead of running continuously to the next review gate. | Off |
 | `--no-review-inline` | Disable inline review prompts and stop at review gates instead. | Off |
 | `--skip-validation` | Run benchmark even when static validation has not passed. | Off |

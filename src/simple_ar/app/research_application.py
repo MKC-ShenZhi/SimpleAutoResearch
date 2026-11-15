@@ -28,6 +28,7 @@ from simple_ar.app.research_execution import (
     execution_protocol,
     execution_request,
     implementation_request,
+    merge_result_schema,
     merge_execution_protocol,
     normalize_execution_config,
     repair_limit,
@@ -1187,7 +1188,7 @@ class ResearchApplication:
         if label.strip():
             revised_execution["label"] = label.strip()
         if result_schema:
-            revised_execution["result_schema"] = _merge_execution_result_schema(
+            revised_execution["result_schema"] = merge_result_schema(
                 revised_execution.get("result_schema"), result_schema
             )
         services_config = dict(self.services.config)
@@ -5617,19 +5618,6 @@ def _attempt_id_from_ref(ref: ArtifactRef) -> str:
         raise ResearchApplicationError(
             f"Cannot determine the parent attempt from artifact path: {ref.path}"
         ) from exc
-
-
-def _merge_execution_result_schema(
-    original: object, override: Mapping[str, object]
-) -> dict[str, object]:
-    merged = dict(original) if isinstance(original, Mapping) else {}
-    for key, value in override.items():
-        if key == "required_metrics" and not value:
-            continue
-        if key == "metric_directions" and not value:
-            continue
-        merged[str(key)] = value
-    return merged
 
 
 def create_session(brief: ResearchBrief, *, root: str | Path, services: ResearchApplicationServices | None = None) -> ResearchApplication:

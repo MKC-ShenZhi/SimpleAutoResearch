@@ -1205,6 +1205,35 @@ class ScientificToolGateway:
             if row.get('contract_current', True)
             and row.get('tool_name') == 'measure_experiment' and row.get('status') == 'ok']
 
+    def retry_source(self, observations: list[dict[str, Any]], *, parent_attempt_id: str | None = None) -> dict[str, Any]:
+        """Select a completed failed execution and its caller-declared contract."""
+        contract = self._declared_execution_contract
+        if (not isinstance(contract, dict) or 'conditions' in contract
+                or self.implementation is not None and self.implementation.exact is not None
+                or contract.get('environment') is not None):
+            raise ValueError('Experiment retry requires a simple caller-declared measurement; '
+                'paired, prepared and CodeTask work use their existing operation boundaries')
+        measurements = [row for row in observations if row.get('tool_name') == 'measure_experiment']
+        if not measurements or measurements[-1].get('status') != 'ok':
+            raise ValueError('No completed scientific measurement is available to retry; '
+                'reconcile any interrupted operation first')
+        previous = measurements[-1]
+        locator = previous.get('data', {}).get('result_ref')
+        if not isinstance(locator, str):
+            raise ValueError('The last measurement has no retained result')
+        ref, receipt = self._measurement_input(locator)
+        if receipt.get('origin') == 'reused':
+            raise ValueError('A reused baseline is not a failed local measurement')
+        parent = Path(ref.path).parent.name
+        if parent_attempt_id is not None and parent_attempt_id != parent:
+            raise ValueError('The retry parent must identify the latest measurement attempt')
+        actual = ArtifactStore(self.root).read_json(ref)
+        if actual.get('execution_status') not in {'failed', 'timed_out'}:
+            raise ValueError('Only a failed or timed-out execution can be retried; '
+                'scientific results and missing metrics remain evidence')
+        return {'contract': contract, 'parent_attempt_id': parent,
+                'contract_current': previous.get('contract_current', True)}
+
     @staticmethod
     def analysis_records(observations: list[dict[str, Any]]) -> list[str]:
         return [row['record'] for row in observations

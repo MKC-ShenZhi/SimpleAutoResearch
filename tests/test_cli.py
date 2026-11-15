@@ -1121,6 +1121,70 @@ code = "daily"
             self.assertIn("Status: completed", stdout.getvalue())
             self.assertIn("experiment-0002", stdout.getvalue())
 
+    def test_common_research_retry_uses_the_same_task_and_process_ledger(self) -> None:
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.tools.scientific import measurement_contract
+
+        for interrupted in ('none', 'supply', 'approval'):
+            with self.subTest(interrupted=interrupted), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp).resolve()
+                root = base / 'session'
+                initial = {'command': [sys.executable, '-c', 'raise SystemExit(4)'],
+                    'cwd': str(base), 'timeout_sec': 5, 'label': 'first',
+                    'result_schema': {'primary_metric': 'score', 'required_metrics': ['score']}}
+                app = ToolApplication.create(root, 'Measure the supplied example', model=None,
+                    sources={}, allow_execution=True, execution_contract=initial, max_attempts=30,
+                    process_limits={'process_invocations': 4, 'process_wall_seconds': 30})
+                app.run(actions=[{'tool_name': 'measure_experiment', 'arguments': initial}],
+                    approve=lambda *_: True, progress=lambda _: None,
+                    should_stop=lambda: app.state['pending'] is None
+                        and not any(turn['remaining'] for turn in app.state['turns']))
+                failed = app._operation_observations()[-1]
+                self.assertEqual(failed['data']['execution_status'], 'failed')
+                original = app.workspace.resolve(failed['data']['result_ref'])
+                original_bytes = original.read_bytes()
+                parent = original.parent.name
+                before = app.ledger.to_dict()['entries']
+                corrected = [sys.executable, '-c', "print('score: 1')"]
+                if interrupted != 'none':
+                    revised = measurement_contract({**app.state['config']['execution_contract'],
+                        'command': corrected, 'cwd': str(base), 'timeout_sec': 5,
+                        'label': 'research-session-recovery'})
+                    app.supply(supply_id='interrupted-retry',
+                        reason=f'Retry the failed scientific measurement {parent} using the caller-supplied command.',
+                        changes={'execution_contract': revised}, replace_existing=True)
+                    if interrupted == 'approval':
+                        app.run(actions=[{'tool_name': 'measure_experiment', 'arguments': revised,
+                            'parent_attempt_id': parent}], approve=lambda *_: False, progress=lambda _: None)
+                        self.assertIsNotNone(app.state['pending'])
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    main(['research-session-continue', '--session-root', str(root), '--cwd', str(base),
+                        '--timeout-sec', '5', '--parent-attempt-id', parent, '--command', *corrected])
+                resumed = ToolApplication.load(root)
+                results = [row for row in resumed._operation_observations()
+                           if row['tool_name'] == 'measure_experiment']
+                self.assertEqual(len(results), 2)
+                self.assertEqual(results[-1]['data']['execution_status'], 'passed')
+                self.assertEqual(results[-1]['data']['metrics']['score'], 1)
+                analyses = [row for row in resumed._operation_observations()
+                            if row['tool_name'] == 'analyze_measurements']
+                self.assertEqual(len(analyses), 1)
+                self.assertEqual(analyses[0]['status'], 'ok')
+                retry_id = resumed.workspace.resolve(results[-1]['data']['result_ref']).parent.name
+                retry = next(row for row in resumed.session.list_attempts() if row.attempt_id == retry_id)
+                self.assertEqual(retry.parent_attempt, parent)
+                self.assertEqual(original.read_bytes(), original_bytes)
+                entries = resumed.ledger.to_dict()['entries']
+                self.assertEqual(entries[:len(before)], before)
+                self.assertEqual(sum(row['purpose'] == 'local_process' for row in entries), 2)
+                self.assertEqual(len(resumed.state['supplies']), 1)
+                self.assertIn('Execution status: passed', output.getvalue())
+                with self.assertRaisesRegex(SystemExit, 'Only a failed or timed-out execution'):
+                    main(['research-session-continue', '--session-root', str(root), '--cwd', str(base),
+                        '--timeout-sec', '5', '--command', *corrected])
+                self.assertEqual(ToolApplication.load(root).ledger.to_dict()['entries'], entries)
+
     def test_legacy_session_continue_does_not_execute_or_rewrite_history(self) -> None:
         from tests.legacy_session_fixture import historical_session
 
@@ -1564,7 +1628,7 @@ code = "daily"
             prior.write_text('Retained analysis result.\n', encoding='utf-8')
             original_ledger = app.ledger.to_dict()
             self.assertEqual(app.state['config']['document_context_policy'], 'working.v2')
-            main(['research-report', '--session-root', str(root), '--model', 'fixture',
+            main(['research-report', '--session-root', str(root),
                   '--reviewer', 'disabled', '--max-section-tokens', '123'])
             restored = ToolApplication.load(root)
             requirement = restored.state['config']['report_requirement']

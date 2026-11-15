@@ -9,7 +9,8 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
-- New scoped work on existing code uses the authorized task directly for editing, without a separate model-generated patch plan. It retains deterministic patch and validator checks; the task's independent delivery review owns the advisory model review and includes all changed code. Saved and standalone CodeTask contracts keep their existing planning and approval behavior.
+- New scoped work on existing code uses the authorized task directly for editing, without a separate model-generated patch plan. It retains deterministic patch and validator checks; the task's independent delivery review owns the advisory model review and includes all changed code. New standalone CodeTask runs use the same editor when automatic approval is requested; saved runs and explicit plan reviews keep their existing behavior.
+- Common research sessions can retry a failed explicit experiment in the same task and process ledger; report continuation reuses the saved model without requiring its selector again.
 
 ### Fixed
 

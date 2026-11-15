@@ -57,6 +57,7 @@ from simple_ar.app.cleanup import (
     render_clean_plan,
 )
 from simple_ar.code_task.runtime.config import EXECUTE_STEPS
+from simple_ar.app.research_execution import merge_result_schema
 from simple_ar.core.console import print_line
 from simple_ar.integrations.llm import LLMClient, LLMError
 from simple_ar.retrieval.index import build_artifact_index
@@ -581,7 +582,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
                 else Path(code_task_spec.config_path).parent.resolve()),
             "timeout_sec": timeout_sec,
             "label": args.label,
-            "result_schema": _merge_result_schemas(
+            "result_schema": merge_result_schema(
                 code_task_metric_schema(code_task_spec.primary_metric, code_task_spec.metric_directions), _experiment_result_schema(args)
             ),
             "code_task": task,
@@ -982,25 +983,35 @@ def _merge_resume_brief(
     )
 
 
-def _merge_result_schemas(
-    configured: dict[str, object], cli_schema: dict[str, object]
-) -> dict[str, object]:
-    """Let explicit CLI metric flags override configured Code-Task defaults."""
-
-    merged = dict(configured)
-    if cli_schema.get("primary_metric"):
-        merged["primary_metric"] = cli_schema["primary_metric"]
-    if cli_schema.get("required_metrics"):
-        merged["required_metrics"] = cli_schema["required_metrics"]
-    if cli_schema.get("metric_directions"):
-        merged["metric_directions"] = cli_schema["metric_directions"]
-    return merged
-
-
 def _print_research_session_continue(args: argparse.Namespace) -> None:
     """Retry an experiment through the canonical application lifecycle."""
 
     session_root = Path(args.session_root)
+    manifest = session_root / 'session_manifest.json'
+    if manifest.is_file() and read_json(manifest).get('transition_recipe') == 'native-tools-v1':
+        from simple_ar.app.tool_application import ToolApplication
+        try:
+            result = ToolApplication.load(session_root).retry_experiment(
+                command=tuple(args.command_argv or ()), cwd=Path(args.cwd), timeout_sec=args.timeout_sec,
+                result_schema=_experiment_result_schema(args), label=args.label,
+                parent_attempt_id=args.parent_attempt_id, progress=print_line)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        observed = result['observation'] or {}
+        data = observed.get('data') or {}
+        print_line(f'Research session: {session_root}')
+        print_line(f"Status: {result['task']['status']}")
+        print_line('Mode: deterministic')
+        print_line(f"Recovery parent: {result['parent_attempt_id']}")
+        if data.get('result_ref'):
+            print_line(f"Execution: {data['result_ref']}")
+        print_line(f"Execution status: {data.get('execution_status', observed.get('status', 'pending'))}")
+        analysis = result.get('analysis') or {}
+        if analysis.get('data', {}).get('analysis_ref'):
+            print_line(f"Analysis: {analysis['data']['analysis_ref']}")
+        if observed.get('status') != 'ok' or data.get('execution_status') != 'passed':
+            raise SystemExit(observed.get('error') or 'Experiment retry did not pass; inspect the retained task evidence.')
+        return
     from simple_ar.app.research_application import (
         ResearchApplicationError,
         load_session,
@@ -1164,7 +1175,7 @@ def _print_common_research_report(args: argparse.Namespace) -> None:
     root = Path(args.session_root)
     try:
         app = ToolApplication.load(root)
-        if args.model != app.state['config'].get('model'):
+        if args.model is not None and args.model != app.state['config'].get('model'):
             raise ValueError('The common session retains its saved model; research-report cannot switch it.')
         if app.state['config'].get('control_protocol') != 'operations.v1':
             raise ValueError('This saved task uses an earlier work contract; continue it through its saved task entry.')
@@ -1851,6 +1862,13 @@ def _print_code_task_init(args: argparse.Namespace) -> None:
             edit_scope_allowed_patterns=options.edit_scope_allowed_patterns,
             edit_scope_protected_patterns=options.edit_scope_protected_patterns,
         )
+        if result.kind == 'existing_project':
+            # New standalone runs can reuse the same authorized editor when
+            # the caller chooses automatic approval. Saved runs keep their plan.
+            from simple_ar.code_task.runtime.state import load_code_task_manifest, save_code_task_manifest
+            saved = load_code_task_manifest(result.run_dir)
+            saved['code_task']['auto_edit_policy'] = 'direct.v1'
+            save_code_task_manifest(result.run_dir, saved)
     except (
         FileExistsError,
         FileNotFoundError,
@@ -2282,6 +2300,12 @@ def _print_code_task_execute(args: argparse.Namespace) -> None:
     inline_allow_large_edits = False
 
     run_dir = Path(args.run_dir)
+    direct_edit = False
+    if (args.yes and not args.no_review_inline and not args.interactive and not args.dry_run
+            and use_llm and EXECUTE_STEPS.index(to_step) > EXECUTE_STEPS.index('plan')):
+        from simple_ar.code_task.runtime.state import load_code_task_manifest
+        saved = load_code_task_manifest(run_dir)
+        direct_edit = saved.get('code_task', {}).get('auto_edit_policy') == 'direct.v1'
     render_execute_header(
         run_dir,
         to_step=to_step,
@@ -2315,12 +2339,16 @@ def _print_code_task_execute(args: argparse.Namespace) -> None:
                 args.apply_proposed_edits
                 or options.apply_proposed_edits
                 or inline_apply_proposed_edits
+                or direct_edit
             ),
             allow_large_edits=(
                 args.allow_large_edits
                 or options.allow_large_edits
                 or inline_allow_large_edits
+                or direct_edit
             ),
+            **({'direct_edit': True, 'approval_note': 'Caller explicitly selected --yes for this isolated code task.'}
+               if direct_edit else {}),
             allow_planning_fallback=allow_planning_fallback,
             planning_mode=planning_mode,
             planning_review_rounds=planning_review_rounds,

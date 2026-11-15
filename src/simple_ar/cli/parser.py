@@ -264,7 +264,7 @@ def build_parser(
     continuation_parser.add_argument(
         "--model",
         default=None,
-        help="Optional model override for the recovery result-analysis step.",
+        help="Compatibility option; this command does not change the saved model or request a model decision.",
     )
     continuation_parser.add_argument("--cwd", default=".")
     continuation_parser.add_argument("--timeout-sec", type=int, default=300)
@@ -341,8 +341,8 @@ def build_parser(
     )
     report_parser.add_argument(
         "--model",
-        required=True,
-        help="Model used by the existing report Writer/Reviewer agent.",
+        default=None,
+        help="Saved shared tasks reuse their model; historical report sessions require their original selector.",
     )
     report_parser.add_argument(
         "--template",

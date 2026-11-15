@@ -5127,6 +5127,38 @@ protected_patterns = ["pyproject.toml"]
             manifest = read_json(run_dir / "manifest.json")
             self.assertEqual(manifest["plan"]["status"], "approved")
 
+    def test_new_standalone_auto_approval_reuses_shared_editor_while_old_runs_keep_the_plan(self):
+        with _temporary_root() as root:
+            project, task = root / 'project', root / 'task.md'
+            _write_toy_project(project)
+            task.write_text('Update spam_model.py to classify prize messages as spam.', encoding='utf-8')
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(['code-task', 'init', '--code-root', str(project), '--task-file', str(task),
+                    '--output-root', str(root / 'runs'), '--name', 'new',
+                    '--benchmark-command', TOY_BENCHMARK_COMMAND])
+            run_dir = next((root / 'runs').glob('*/manifest.json')).parent
+            old = root / 'old'
+            initialize_code_task(run_dir=old, code_root=project, task_file=task,
+                benchmark_command=TOY_BENCHMARK_COMMAND)
+            self.assertEqual(read_json(run_dir / 'manifest.json')['code_task']['auto_edit_policy'], 'direct.v1')
+            original = (project / 'spam_model.py').read_bytes()
+            for target, expected_plan in ((run_dir, False), (old, True)):
+                calls = []
+                fake = _FakeCodeTaskClient()
+                def reply(system, user, *, label=''):
+                    calls.append(label)
+                    return fake.ask_json(system, user, label=label)
+                client = LLMClient(LLMSettings(api_key='fixture', api_mode='chat'))
+                with patch.object(LLMClient, 'from_env', return_value=client), \
+                        patch.object(LLMClient, 'ask_json', side_effect=reply), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    main(['code-task', 'execute', str(target), '--model', 'fixture', '--yes',
+                        '--baseline-policy', 'skip', '--to-step', 'validate'])
+                self.assertEqual((target / 'code_task/patch_plan.md').exists(), expected_plan)
+                self.assertEqual('code-task-plan' in calls, expected_plan)
+                self.assertIn("('win', 'prize')", (code_task_paths(target).workspace_dir / 'spam_model.py').read_text())
+            self.assertEqual((project / 'spam_model.py').read_bytes(), original)
+
     def test_execute_applies_reviewed_proposal_after_approval(self) -> None:
         with _temporary_root() as root:
             code_root, task_file, run_dir = _initialize_toy_task(

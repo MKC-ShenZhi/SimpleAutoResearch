@@ -19,6 +19,16 @@ class UnsupportedExecutionCreation(ValueError):
     """An explicit declaration still requires a different execution owner."""
 
 
+def merge_result_schema(original: object, override: Mapping[str, object]) -> dict[str, object]:
+    """Apply supplied metric controls without erasing unspecified ones."""
+    merged = dict(original) if isinstance(original, Mapping) else {}
+    for key, value in override.items():
+        if key in {'required_metrics', 'metric_directions'} and not value:
+            continue
+        merged[str(key)] = value
+    return merged
+
+
 def compile_scoped_measurement(execution: dict, task: dict, declaration: dict) -> tuple[dict, dict]:
     """Bind this schema's unchanged-source baseline and implemented candidate.
 

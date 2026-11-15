@@ -32,7 +32,7 @@
 | 使用精确结构化输入或继续已有研究 | [`simple-ar research-session`](#simple-ar-research-session) |
 | 使用已有研究会话生成或刷新报告 | [`simple-ar research-report`](#simple-ar-research-report) |
 | 新建仅摘要会话的兼容名称；继承 research-session 参数，受下述限制约束 | [`simple-ar research-brief`](#simple-ar-research-brief) |
-| 在已有 canonical 会话的简单实验失败／超时后运行一次修正的显式实验 | [`simple-ar research-session-continue`](#simple-ar-research-session-continue) |
+| 在原研究会话的简单实验失败／超时后运行一次修正的显式实验 | [`simple-ar research-session-continue`](#simple-ar-research-session-continue) |
 | 从只读 v1 会话创建后继，仅导入具名小成果，不修改源会话 | [`simple-ar research-session-migrate`](#simple-ar-research-session-migrate) |
 | 为显式已有项目或从零创建合同准备隔离工作区 | [`simple-ar code-task init`](#simple-ar-code-task-init) |
 | 继续已有 CodeTask 的有界规划、审阅、编辑及基准 | [`simple-ar code-task execute`](#simple-ar-code-task-execute) |
@@ -644,14 +644,14 @@ simple-ar research-session --topic "总结本地资料" --local-document paper.m
 使用共同或历史会话中已有的研究工作生成或刷新报告。
 
 ```text
-simple-ar research-report --session-root PATH --model SELECTOR [OPTIONS]
+simple-ar research-report --session-root PATH [--model SELECTOR] [OPTIONS]
 ```
 
 | 参数 | 说明 | 默认值或使用条件 |
 | --- | --- | --- |
 | `--session-root PATH` | 有可供撰写的已有研究工作的会话。 | 必填 |
 | `--refresh` | 请求根据已有证据生成新报告，并保留旧报告。 | 关闭 |
-| `--model SELECTOR` | 模型选择器：env、profile:NAME 或 route:NAME；共同会话保留已保存的选择器。 | 必填 |
+| `--model SELECTOR` | 模型选择器：env、profile:NAME 或 route:NAME。共同任务沿用已保存的选择器，不接受更换。 | 历史会话必填；共同任务可省略 |
 | `--template NAME_OR_PATH` | 报告模板名称或 Markdown 路径。 | experiment |
 | `--reviewer CHOICE` | 报告审阅器；disabled 保留审计。 可选：`llm`, `disabled`. | llm |
 | `--max-review-iterations N` | 报告修订／纠正上限；失败提案也计数。 | 1 |
@@ -794,7 +794,7 @@ simple-ar research-brief --topic "总结本地资料" --local-document paper.md
 
 ### `simple-ar research-session-continue`
 
-在已有 canonical 会话的简单实验失败／超时后运行一次修正的显式实验。
+在原研究会话的简单实验失败／超时后运行一次修正的显式实验。
 
 ```text
 simple-ar research-session-continue --session-root PATH [OPTIONS] --command ARGV...
@@ -802,9 +802,9 @@ simple-ar research-session-continue --session-root PATH [OPTIONS] --command ARGV
 
 | 参数 | 说明 | 默认值或使用条件 |
 | --- | --- | --- |
-| `--session-root PATH` | 已有研究会话；遵循显示的恢复命令。共用原生任务用 start --resume-task 恢复。 | 必填 |
+| `--session-root PATH` | 已有研究会话，包括共同创建的结构化任务。 | 必填 |
 | `--parent-attempt-id NAME` | 分支起点的失败实验；默认最新 canonical 实验，旧布局为 experiment-001。 | 最新实验；旧布局为 experiment-001 |
-| `--model SELECTOR` | 模型选择器：env、profile:NAME 或 route:NAME。 | 未设置 |
+| `--model SELECTOR` | 兼容参数；此命令不更换保存的模型，也不请求模型决策。 | 未设置 |
 | `--cwd PATH` | 声明命令的工作目录。 | . |
 | `--timeout-sec N` | 单进程超时限制（秒）。 | 300 |
 | `--label NAME` | 声明实验的标签。 | research-session-recovery |
@@ -813,7 +813,7 @@ simple-ar research-session-continue --session-root PATH [OPTIONS] --command ARGV
 | `--metric-direction NAME=DIRECTION` | NAME=DIRECTION，可重复；方向包括 higher、lower、resource、ignore。 | [] |
 | `--command ARGV...` | 显式 argv；放最后，后续 token 均属于命令。research／start 的 argv 不作 shell 解释。 | 必填 |
 
-仅支持修正简单显式实验。科学阴性结果不是技术失败。配对／预处理数据／CodeTask 失败使用各自续接路径。未显式覆盖时保留父证据／schema。v1 不可执行；原生任务用 start --resume-task。
+仅支持修正简单显式实验。科学阴性结果不是技术失败。配对／预处理数据／CodeTask 失败使用各自续接路径。保留原任务、父实验依据和进程账本，未显式覆盖的指标设置沿用原值。共同任务测量通过后，若还有执行机会则进行确定性分析，不启动模型决策；后续工作使用原任务的正常恢复命令。v1 会话保持只读。
 
 示例：
 
@@ -901,7 +901,7 @@ simple-ar code-task execute RUN_DIR [OPTIONS]
 | `--model SELECTOR` | LLM 步骤模型覆盖。 | 未设置 |
 | `--no-llm` | 尽可能使用 deterministic fallback。 | 关闭 |
 | `--timeout N` | benchmark timeout。 | 60 |
-| `--yes` | 普通 execute 模式下自动批准 inline 审核门；与 `--interactive` 一起使用时，自动继续 primitive prompts。只有明确接受审核风险、想自动化跑通时才使用。 | 关闭 |
+| `--yes` | 普通 execute 模式下自动批准 inline 审核门；与 `--interactive` 一起使用时自动继续逐步提示。新建现有项目任务直接使用已授权编辑，不再另调模型制订补丁计划；显式计划步骤和已保存任务保留原路径。 | 关闭 |
 | `--interactive` | 调试模式：逐个 primitive step 确认，而不是连续运行到下一个审核门。 | 关闭 |
 | `--no-review-inline` | 禁用 inline 审核提示，在审核门直接停止。 | 关闭 |
 | `--skip-validation` | 静态验证未通过时仍运行 benchmark。 | 关闭 |
