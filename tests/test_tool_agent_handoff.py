@@ -8267,6 +8267,75 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(app.sources.execute_tool('research', context, arguments), result)
         self.assertEqual(fake.ask_json.call_count, 1)
 
+    def test_research_assessment_reuses_original_reading_from_synthesis(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext, CapabilityResult
+        from simple_ar.research.contracts import IdeaCandidate
+        from simple_ar.research.synthesis import SynthesisResult
+        from simple_ar.tools.sources import SourcePolicy, SourceToolGateway
+
+        root, inputs, workspace = self._workspace_fixture()
+        workspace.mounts['records'] = root / 'attempts'
+        write_json(inputs / 'document.json', self._original_document().to_handoff_dict())
+        candidate = IdeaCandidate(idea_id='method', title='Test the method', hypothesis='Effect',
+            proposed_change='Try the method', expected_outcome='A measurable difference',
+            motivation_refs=['original-span'], metrics=['accuracy'])
+        synthesis = SynthesisResult(status='ready', gap_summary='A bounded question',
+            ideas=(candidate,), novelty_checks=())
+        client = Mock()
+        def bound(identity):
+            client._budget_ledger, client._budget_attempt_id = workspace.ledger, identity
+            return client
+        client.ask_json.return_value = {'assessments': [{
+            'idea_id': 'method', 'relevance': 'Relevant', 'differentiation': 'Unknown',
+            'feasibility': 'Bounded', 'cost': 'One run', 'falsifiability': 'No effect',
+            'recommendation': 'Investigate', 'supporting_evidence_refs': ['original-span'],
+            'counter_evidence_refs': [], 'unknowns': []}],
+            'recommended_idea_id': 'method', 'recommendation_reason': 'Supported by the supplied source'}
+        owner = SourceToolGateway(root, workspace, workspace.ledger, client_factory=bound,
+            policy=SourcePolicy(materials=('source0/document.json',), allow_network=False))
+        def make_context(identity):
+            return CapabilityContext(ArtifactStore(root / 'attempts' / identity),
+                AttemptManifest(identity, capability='native_tool'))
+        def save_synthesis(*, context, request):
+            ref = context.store.write_json('synthesis_result.json', synthesis.to_handoff_dict())
+            return CapabilityResult(status='completed', artifacts=(ref,))
+        with patch('simple_ar.tools.sources.run_synthesis_capability', side_effect=save_synthesis):
+            produced = owner.execute_tool('research', make_context('synthesis'),
+                {'operation': 'synthesize', 'question': 'Investigate the method',
+                 'document_record': 'source0/document.json'})
+        self.assertEqual(produced.status, 'ok', produced.error)
+        assessment = make_context('assessment')
+        result = owner.execute_tool('research', assessment, {'operation': 'assess',
+            'question': 'Evaluate the method', 'synthesis_record': 'records/synthesis/synthesis_result.json',
+            'use_llm': True})
+        self.assertEqual(result.status, 'ok', result.error)
+        saved = assessment.store.read_json('idea_assessment.json')
+        self.assertEqual(saved['recommended_idea_id'], 'method')
+        self.assertEqual(saved['generation_mode'], 'llm')
+        self.assertIn('Cancellation propagates', client.ask_json.call_args.args[1])
+        inputs = assessment.store.read_json('source_request.json')['assessment_evidence']
+        self.assertEqual(inputs['document_record'], 'records/synthesis/document_bundle.json')
+        self.assertEqual(inputs['read_record'], 'records/synthesis/read_result.json')
+        self.assertEqual(owner.execute_tool('research', assessment, {'operation': 'assess',
+            'question': 'Evaluate the method', 'synthesis_record': 'records/synthesis/synthesis_result.json',
+            'use_llm': True}), result)
+        self.assertEqual(client.ask_json.call_count, 1)
+        from simple_ar.research.design import ResearchDesignResult
+        def save_design(*, context, request):
+            design = ResearchDesignResult(status='ready', contract=None, selected_idea=candidate,
+                evidence_refs=('original-span',))
+            ref = context.store.write_json('research_design.json', design.to_handoff_dict())
+            return CapabilityResult(status='completed', artifacts=(ref,))
+        design_context = make_context('design')
+        with patch('simple_ar.tools.sources.run_research_design_capability', side_effect=save_design):
+            design_result = owner.execute_tool('research', design_context, {'operation': 'design',
+                'question': 'Design the study', 'synthesis_record': 'records/synthesis/synthesis_result.json',
+                'use_llm': True})
+        self.assertEqual(design_result.status, 'ok', design_result.error)
+        self.assertEqual(design_context.store.read_json('idea_assessment.json')['recommended_idea_id'], 'method')
+        self.assertEqual(design_context.store.read_json('design_review/idea_assessment.json')['recommended_idea_id'], 'method')
+        self.assertEqual(client.ask_json.call_count, 3)
+
     def test_professional_summary_uses_parent_attempt_and_retains_bound_partial_evidence(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
         from simple_ar.tools.sources import SourcePolicy, SourceToolGateway

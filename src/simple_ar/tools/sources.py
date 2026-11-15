@@ -13,12 +13,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from simple_ar.core.artifacts import write_json
 from simple_ar.app.research_execution import merge_execution_protocol
 from simple_ar.core.budget import BudgetError, BudgetExceededError, BudgetLedger
-from simple_ar.core.capabilities import CapabilityContext
+from simple_ar.core.capabilities import ArtifactStore, CapabilityContext
 from simple_ar.integrations.llm import LLMError
 from simple_ar.research.planning.capability import ResearchPlanRequest, ResearchPlanResult, run_research_plan_capability
 from simple_ar.research.evidence.reader import ReadRequest, ReadResult, run_read_capability
 from simple_ar.research.brief import evidence_pack_from_read
-from simple_ar.research.synthesis import SynthesisRequest, SynthesisResult, run_synthesis_capability
+from simple_ar.research.synthesis import SynthesisRequest, SynthesisResult, allowed_evidence_refs, run_synthesis_capability
 from simple_ar.research.assessment import IdeaAssessmentRequest, run_idea_assessment_capability
 from simple_ar.research.design import ResearchDesignRequest, run_research_design_capability
 from simple_ar.research.summary import render_summary
@@ -132,9 +132,9 @@ class _Research(BaseModel):
     operation: Literal['plan', 'ingest', 'read', 'summary', 'synthesize', 'assess', 'design']
     question: str = Field(min_length=1, max_length=16000)
     materials: list[str] = Field(default_factory=list, max_length=1000)
-    document_record: str = ''
+    document_record: str = Field(default='', description='Retained document bundle for reading or assessing research evidence.')
     plan_record: str = ''
-    read_record: str = ''
+    read_record: str = Field(default='', description='Retained reading result when reusing existing source interpretations.')
     synthesis_record: str = ''
     previous_design: str = ''
     guidance: str = Field(default='', max_length=16000)
@@ -607,6 +607,29 @@ class SourceToolGateway:
             raise ValueError(f'Expected {schema} handoff')
         return data
 
+    def _assessment_evidence(self, request: _Research) -> dict[str, str]:
+        """Locate the reading and original bundle already used for synthesis."""
+        if not request.use_llm or request.operation not in {'assess', 'design'}:
+            return {}
+        synthesis = self.resolve_source_handoff(request.synthesis_record)
+
+        def prior(path: Path, artifact: str, input_name: str) -> str:
+            if not path.is_relative_to((self.root / 'attempts').resolve()):
+                return ''
+            candidate = path.parent / artifact
+            if candidate.is_file():
+                return self.workspace.locator(str(candidate))
+            saved = path.parent / 'source_request.json'
+            if saved.is_file():
+                return str(json.loads(saved.read_text(encoding='utf-8')).get('request', {}).get(input_name) or '')
+            return ''
+
+        read = request.read_record or prior(synthesis, 'read_result.json', 'read_record')
+        document = request.document_record or prior(synthesis, 'document_bundle.json', 'document_record')
+        if read and not document:
+            document = prior(self.resolve_source_handoff(read), 'document_bundle.json', 'document_record')
+        return {key: value for key, value in (('document_record', document), ('read_record', read)) if value}
+
     def execute_tool(self, name: str, context: CapabilityContext, arguments: dict[str, Any],
                      *, approval: dict[str, Any] | None = None) -> ToolResult:
         """One caller-selected operation on the actual common attempt, never a session."""
@@ -622,8 +645,13 @@ class SourceToolGateway:
             if network and (not self.policy.allow_network or request.operation not in {'ingest', 'summary'}):
                 raise ValueError('Network collection is not authorized for this operation')
             paths = self._material_paths(request.materials or list(self.policy.materials))
+            saved_binding = (context.store.read_json('source_request.json')
+                if context.store.exists('source_request.json') else None)
+            evidence = (saved_binding.get('assessment_evidence', {}) if saved_binding is not None
+                else self._assessment_evidence(request))
             locators = [value for value in (request.plan_record, request.document_record, request.read_record,
                 request.synthesis_record, request.previous_design) if value]
+            locators.extend(evidence.values())
             inputs = [*paths, *(self.workspace.resolve(value) for value in locators)]
             source_locator = self.policy.source_workspace or request.source_workspace
             inventory = (self.workspace.bind_inventory(self.workspace.resolve(source_locator), identity=identity)
@@ -633,8 +661,9 @@ class SourceToolGateway:
                 'policy': self.policy.model_dump(mode='json'),
                 'inputs': {**{str(path): self._digest(path) for path in inputs}, **{
                     str(self.workspace.resolve(path)): digest for path, digest in (inventory or {}).get('file_hashes', {}).items()}}}
-            if context.store.exists('source_request.json'):
-                saved_binding = context.store.read_json('source_request.json')
+            if evidence:
+                binding['assessment_evidence'] = evidence
+            if saved_binding is not None:
                 if 'user_requests' in saved_binding:
                     binding['user_requests'] = saved_binding['user_requests']
                 if saved_binding != binding:
@@ -655,7 +684,7 @@ class SourceToolGateway:
             if inventory:
                 context.store.write_json('source_inventory.json', inventory, kind='source_inventory')
             result = self._research(context, request, paths, network=network,
-                user_requests=tuple(binding.get('user_requests', ())))
+                user_requests=tuple(binding.get('user_requests', ())), assessment_evidence=evidence)
             if any(self._digest(Path(path)) != digest for path, digest in binding['inputs'].items()):
                 raise ValueError('Research inputs changed during the operation; inspect retained work')
             result.artifacts = [f'records/{identity}/{path}' for path in result.data['artifact_refs']]
@@ -681,14 +710,20 @@ class SourceToolGateway:
                 data={'failure_kind': 'resource_exhausted'} if isinstance(exc, BudgetExceededError) else {})
 
     def _research(self, context: CapabilityContext, request: _Research, paths: list[Path],
-                  *, network: bool, user_requests: tuple[str, ...] = ()) -> ToolResult:
+                  *, network: bool, user_requests: tuple[str, ...] = (),
+                  assessment_evidence: dict[str, str] | None = None) -> ToolResult:
         artifacts, outcomes = [], []
         identity, policy = context.attempt.attempt_id, self.policy
         task_context = ('Original user request and subsequent feedback:\n' +
             json.dumps(user_requests, ensure_ascii=False)) if user_requests and request.use_llm else ''
 
-        def run(capability: Callable, value: Any) -> None:
-            result = capability(context=context, request=value)
+        def run(capability: Callable, value: Any, *, output_dir: str = '') -> None:
+            owner_context = (replace(context, store=ArtifactStore(context.store.root / output_dir))
+                if output_dir else context)
+            result = capability(context=owner_context, request=value)
+            if output_dir:
+                result = replace(result, artifacts=tuple(
+                    replace(ref, path=f'{output_dir}/{ref.path}') for ref in result.artifacts))
             artifacts.extend(result.artifacts)
             outcomes.append(result.to_dict())
             if result.status == 'failed' or (result.status == 'blocked'
@@ -817,6 +852,18 @@ class SourceToolGateway:
                         'diagnostics': [*read.diagnostics, *synthesis.diagnostics, *search.diagnostics]}, kind='research_summary'))
         else:
             synthesis = SynthesisResult.from_handoff_dict(self._handoff(request.synthesis_record, 'synthesis_result.v1'))
+            evidence = assessment_evidence or {}
+            if evidence.get('document_record'):
+                bundle = DocumentBundle.from_handoff_dict(self._handoff(evidence['document_record'], 'document_bundle.v1'))
+                if evidence.get('read_record'):
+                    read = ReadResult.from_handoff_dict(self._handoff(evidence['read_record'], 'read_result.v1'), bundle=bundle)
+            chunks = tuple(bundle.chunks) if bundle else ()
+            cards = (*read.claim_cards, *read.method_cards) if read else ()
+            if read:
+                refs = tuple(sorted(allowed_evidence_refs(evidence_pack_from_read(request.question, read))))
+            else:
+                refs = tuple(record.document_id for record in bundle.records) + tuple(
+                    chunk.chunk_id for chunk in chunks) if bundle else ()
             if len(synthesis.ideas) > policy.idea_limit:
                 raise ValueError('Synthesis exceeds configured idea limit')
             selected = policy.selected_idea_id or request.idea_id
@@ -825,7 +872,9 @@ class SourceToolGateway:
             if op == 'assess' or (request.use_llm and selected is None):
                 run(run_idea_assessment_capability, IdeaAssessmentRequest(candidates=synthesis.ideas,
                     novelty_checks=synthesis.novelty_checks, limit=policy.idea_limit,
-                    available_evidence_refs=tuple(dict.fromkeys(ref for idea in synthesis.ideas for ref in idea.motivation_refs)),
+                    available_evidence_refs=(refs if request.use_llm else
+                        tuple(dict.fromkeys(ref for idea in synthesis.ideas for ref in idea.motivation_refs))),
+                    evidence_chunks=chunks, evidence_cards=cards,
                     objective=request.question, llm_client=client(), user_requests=user_requests))
                 assessment = context.store.read_json('idea_assessment.json')
                 selected = assessment.get('recommended_idea_id')
@@ -872,10 +921,11 @@ class SourceToolGateway:
                     run(run_idea_assessment_capability, IdeaAssessmentRequest(
                         candidates=tuple(idea for idea in synthesis.ideas if idea.idea_id == design['selected_idea']['idea_id']),
                         novelty_checks=synthesis.novelty_checks,
-                        available_evidence_refs=tuple(design['evidence_refs']),
+                        available_evidence_refs=refs,
+                        evidence_chunks=chunks, evidence_cards=cards,
                         limit=1, objective=request.question, constraints={'design': design}, llm_client=reviewer,
-                        user_requests=user_requests))
-                    if context.store.read_json('idea_assessment.json').get('recommended_idea_id') is None:
+                        user_requests=user_requests), output_dir='design_review')
+                    if context.store.read_json('design_review/idea_assessment.json').get('recommended_idea_id') is None:
                         design.update(status='needs_review', diagnostics=[*design['diagnostics'],
                             'Independent reviewer abstained; no accepted protocol.'])
                         context.store.write_json('research_design.json', design)
