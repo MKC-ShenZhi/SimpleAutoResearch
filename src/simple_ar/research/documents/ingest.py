@@ -107,8 +107,10 @@ def retain_document_report(current: dict[str, Any], retained: dict[str, Any],
         if remaining:
             reports.append({**row, 'document_ids': sorted(remaining)})
     primary = {key: value for key, value in retained.items() if key != 'retained_reports'}
-    sources = [{'document_ids': sorted(document_ids), 'report': primary}]
-    for row in retained.get('retained_reports', []):
+    inherited = retained.get('retained_reports', [])
+    primary_ids = document_ids - {identity for row in inherited for identity in row['document_ids']}
+    sources = [{'document_ids': sorted(primary_ids), 'report': primary}] if primary_ids else []
+    for row in inherited:
         selected = document_ids.intersection(row['document_ids'])
         if selected:
             sources.append({'document_ids': sorted(selected), 'report': row['report']})

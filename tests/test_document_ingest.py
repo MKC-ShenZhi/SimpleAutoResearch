@@ -40,6 +40,9 @@ class DocumentIngestTests(unittest.TestCase):
         self.assertEqual([row.text for row in combined.chunks], ['Original evidence.'])
         self.assertEqual(combined.fulltext_manifest['document_count'], 1)
         self.assertEqual(document_report_rows(combined.fulltext_manifest)[0]['provenance'], 'original')
+        inherited_again = merge_document_bundles(None, combined)
+        self.assertEqual([row['provenance'] for row in document_report_rows(inherited_again.fulltext_manifest)],
+            ['original'])
 
         # A newer parsed source replaces the old text as a whole; a repeated
         # bundle must not duplicate it or use an older acquisition description.
