@@ -57,6 +57,22 @@ class AnalysisReportProposalTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'data_analysis'):
             validate_proposal(proposal('bug_fix', options={'with_report': True}), args, set())
 
+    def test_review_requirement_uses_the_supported_task_contract(self):
+        args = build_parser().parse_args(['start', '--independent-review-required'])
+        for kind in ('survey', 'writing', 'reproduction', 'bug_fix'):
+            with self.subTest(kind=kind):
+                value = validate_proposal(proposal(kind, options={'independent_review_required': True}), args,
+                                          {'independent_review_required'})
+                self.assertTrue(value['options']['independent_review_required'])
+                with self.assertRaisesRegex(ValueError, 'override explicit'):
+                    validate_proposal(proposal(kind, options={'independent_review_required': False}), args,
+                                      {'independent_review_required'})
+        with self.assertRaisesRegex(ValueError, 'model-backed report'):
+            validate_proposal(proposal(options={'independent_review_required': True}), args, set())
+        value = validate_proposal(proposal(options={'independent_review_required': True, 'with_report': True}),
+                                  args, set())
+        self.assertTrue(value['options']['independent_review_required'])
+
 
 class IntakeDialogueTests(unittest.TestCase):
     def setUp(self):
@@ -64,6 +80,25 @@ class IntakeDialogueTests(unittest.TestCase):
         catalog = patch('simple_ar.integrations.model_profiles.load_model_catalog', return_value=None)
         catalog.start()
         self.addCleanup(catalog.stop)
+
+    def test_confirmed_review_request_reaches_the_task_configuration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            args = self.args(root, '--kind', 'survey', '--model', 'fixture', locked={'kind', 'model'})
+            args.goal = 'Compare the supplied research question and independently review the final result.'
+            client = Client(proposal('survey', summary='Compare evidence and independently review the result',
+                                     options={'sources': 'search', 'independent_review_required': True}))
+            resolved = self.converse(args, client, ['y'])
+            contract = client.requests[0]['response_contract']['options']['independent_review_required']
+            self.assertEqual(contract['type'], 'boolean')
+            self.assertTrue(resolved.independent_review_required)
+            resumed = self.args(root, '--resume-setup', str(resolved._start_root))
+            restored = self.converse(resumed, Client(), [])
+            self.assertTrue(restored.independent_review_required)
+            restored.prepare_only = True
+            with patch('sys.stdin.isatty', return_value=False), patch('simple_ar.cli.start.print_line'):
+                config = prepare_start(restored)
+            self.assertTrue(research_defaults(['research-session', '--config', str(config)])['independent_review_required'])
 
     def test_supplied_paper_url_becomes_attributed_excerpt_and_prepared_material_with_restore(self):
         with tempfile.TemporaryDirectory() as folder:

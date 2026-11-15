@@ -122,6 +122,8 @@ Scoped code work uses a copied project and a task interpreter matching the frame
 
 Natural-language review requests are interpreted by the model. Set `--independent-review-required` when independent review must be an enforced condition of complete delivery.
 
+In structured `--chat` setup, an independent-review request can be included in the proposed settings; once confirmed it uses the same complete-delivery condition. Preset data analysis needs a model-written report for this option.
+
 #### Explicit structured compatibility
 
 | Parameter | Meaning | Default or conditions |

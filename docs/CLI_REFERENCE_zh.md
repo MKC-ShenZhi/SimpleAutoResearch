@@ -122,6 +122,8 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 
 自然语言中的复核要求由模型理解；需要将独立复核作为完整交付的确定条件时，请设置 `--independent-review-required`。
 
+结构化 `--chat` 设置可以将独立复核请求列入建议设置，确认后沿用同一完整交付条件。预设数据分析需同时启用模型撰写的报告。
+
 #### 显式结构化兼容
 
 | 参数 | 说明 | 默认值或使用条件 |

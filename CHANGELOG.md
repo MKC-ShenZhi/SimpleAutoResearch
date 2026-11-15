@@ -18,6 +18,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - Document and article responses bound to their recorded inputs can recover after later instruction changes without another authoring call.
 - Deterministic structured research no longer marks other requested work complete merely because material collection or measurement finished.
 - An explicitly selected final independent review remains required for the same work when preparation, resources or execution prevent it from completing.
+- Structured chat setup can carry a confirmed request for independent review into the existing delivery condition.
 
 ## 2026-11-15
 

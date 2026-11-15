@@ -1240,6 +1240,8 @@ def prepare_start(args: argparse.Namespace, *, for_execution: bool = False) -> P
                          ("Interaction", args.interaction)):
         summary.add_row(Text(label, style="cyan"), Text(value))
     make_console().print(Panel(summary, title="Task preview / 任务确认", border_style="cyan"))
+    if getattr(args, 'independent_review_required', False):
+        print_line("A complete delivery requires independent review; unfinished work can still be delivered as partial.")
     if project:
         print_line(f"Project: {project}\nEdit scope: {', '.join(allowed)}\nValidation: {validation}")
         print_line("The validation command is authorized in an isolated auto-selected worktree/copy using "

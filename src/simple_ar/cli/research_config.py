@@ -94,6 +94,9 @@ def setup_option_contract(kind: str | None = None) -> dict:
         "install_project": {"type": "boolean", "kinds": ["reproduction"], "description": "Inspected root packaging declaration; requires venv and confirmation."},
         "with_report": {"type": "boolean", "kinds": ["data_analysis"], "description": "Add a model-written report to preset analysis."},
         "scripted": {"type": "boolean", "kinds": ["data_analysis"], "description": "Generate analysis/plot code when presets do not cover the goal."},
+        "independent_review_required": {"type": "boolean",
+            "kinds": ["survey", "writing", "reproduction", "bug_fix", "data_analysis"],
+            "description": "Require independent review of the complete result when the user asks for it; leave unset otherwise. Preset data analysis requires with_report."},
     })
     return {key: value for key, value in options.items() if kind is None or kind in value["kinds"]}
 
@@ -128,6 +131,9 @@ def normalize_setup_options(value: object, args: argparse.Namespace, locked: set
             raise ValueError("Source scope requires a literature/material task")
         if kind != "survey" and options["sources"] != "materials":
             raise ValueError("Native writing/reproduction preparation here uses supplied material only")
+    if (kind == "data_analysis" and options.get("independent_review_required", getattr(args, "independent_review_required", False))
+            and not options.get("with_report", args.with_report)):
+        raise ValueError("Required independent review needs a model-backed report or an ordinary native task")
     return options
 
 
