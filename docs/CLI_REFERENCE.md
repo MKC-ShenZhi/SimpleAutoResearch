@@ -120,6 +120,8 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 
 Scoped code work uses a copied project and a task interpreter matching the framework's running Python, without environment setup or external validator inputs. Scoped measurements use workspace inputs and no additional environment preparation; other specialized operations still require explicit approval.
 
+Natural-language review requests are interpreted by the model. Set `--independent-review-required` when independent review must be an enforced condition of complete delivery.
+
 #### Explicit structured compatibility
 
 | Parameter | Meaning | Default or conditions |
