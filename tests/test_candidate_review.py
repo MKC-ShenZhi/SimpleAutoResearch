@@ -242,6 +242,35 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertEqual(len(self.inspector.calls), 2)
         self.assertEqual(payload['metadata']['delivery_review']['identity'], 'revised')
 
+    def test_explicit_final_review_survives_an_inspection_failure(self):
+        self.owner.config.update(delivery_review_selection='model.v3',
+            candidate_review_protocol='candidate.v1')
+        self.owner.config['tool_completions'].update({
+            'deliver_result': {'kind': 'delivery'},
+            'write_file': {'kind': 'delivery', 'field': 'delivery'},
+        })
+        direct = DeliveryRequest.model_validate({
+            'summary': 'The result', 'artifacts': ['draft.md'], 'independent_review': False})
+        binding = {'artifacts': {str(self.workspace.resolve('draft.md')): 'version'}}
+        for tool, arguments in (
+                ('review_result', {'review_scope': 'delivery'}),
+                ('deliver_result', {'independent_review': True}),
+                ('write_file', {'delivery': {'independent_review': True}})):
+            with self.subTest(tool=tool):
+                self.observations[:] = [{'tool_name': tool, 'arguments': arguments,
+                    'metadata': {'delivery_review': {'binding': binding, 'error': 'Review did not finish'}},
+                    'current_request': True}]
+                self.assertTrue(self.owner.requires_review(direct))
+                self.workspace.resolve('other.md').write_text('Another result', encoding='utf-8')
+                self.assertFalse(self.owner.requires_review(direct.model_copy(update={'artifacts': ['other.md']})))
+                self.observations[0]['current_request'] = False
+                self.assertFalse(self.owner.requires_review(direct))
+
+        self.observations[:] = [{'tool_name': 'review_result', 'arguments': {'review_scope': 'candidate'},
+            'metadata': {'delivery_review': {'binding': {**binding, 'purpose': 'candidate'},
+                'error': 'Review did not finish'}}, 'current_request': True}]
+        self.assertFalse(self.owner.requires_review(direct))
+
     def test_feedback_keeps_prior_delivery_without_rechecking_it_as_a_new_candidate(self):
         self.owner.config['tool_completions']['deliver_result'] = {'kind': 'delivery'}
         delivered = {'summary': 'Earlier explanation', 'artifacts': ['draft.md']}

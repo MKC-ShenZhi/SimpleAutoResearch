@@ -123,7 +123,14 @@ class Delivery:
                 return False
             review = (row.get('metadata') or {}).get('delivery_review') or {}
             if review.get('error'):
-                continue  # A failed review is an observation, not a new task-wide requirement.
+                completion = tool_completion(row.get('tool_name', ''), self.config.get('tool_completions'))
+                arguments = row.get('arguments') or {}
+                claim = arguments.get(completion.field) if completion and completion.field else arguments
+                explicitly_selected = (completion is not None and (
+                    completion.kind == 'review' and arguments.get('review_scope') == 'delivery'
+                    or isinstance(claim, dict) and claim.get('independent_review') is True))
+                if not explicitly_selected:
+                    continue  # A failed default check does not create a new requirement.
             binding = review.get('binding') or {}
             if binding.get('purpose') or not isinstance(binding.get('artifacts'), dict):
                 continue

@@ -15,6 +15,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 - Document revisions retain prior citation mappings without requiring a bibliography, resolve aliases to their recorded identities, and use the same file inheritance rules for production and acceptance.
 - Deterministic structured research no longer marks other requested work complete merely because material collection or measurement finished.
+- An explicitly selected final independent review remains required for the same work when it cannot finish because of resources or execution errors.
 
 ## 2026-11-15
 

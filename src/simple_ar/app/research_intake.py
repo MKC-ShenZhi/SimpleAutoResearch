@@ -38,7 +38,7 @@ _OUTPUT_ALIASES = {'experiment': 'experiments', 'code': 'code_task', 'code_patch
     'patch': 'code_task', 'bug_repair': 'bug_fix'}
 
 
-def _requested_outputs(brief: ResearchBrief) -> tuple[str, ...]:
+def requested_research_outputs(brief: ResearchBrief) -> tuple[str, ...]:
     outputs = (value.strip().lower() for value in brief.requested_outputs)
     return tuple(dict.fromkeys(_OUTPUT_ALIASES.get(value, value) for value in outputs)) or ('research_summary',)
 
@@ -244,7 +244,7 @@ def start_research_task(app: Any, *, progress: Callable[[str], None] | None = No
             app.request_execution_confirmation()
         return start_declared_measurements(app, request=brief.request_text, confirm=confirm, progress=progress)
     produced = {'data_analysis'} if saved.get('table_analysis') is not None else {'summary', 'research_summary'}
-    missing = [name for name in _requested_outputs(brief) if name not in produced]
+    missing = [name for name in requested_research_outputs(brief) if name not in produced]
     deferred = bool(missing or saved.get('report_requirement') or policy.get('require_design'))
     completion = ({'tool_name': 'ask_user', 'arguments': {'question':
         'Completed materials and results are retained, but requested work remains unfinished: '
@@ -276,7 +276,7 @@ def start_declared_measurements(app: Any, *, request: str | None = None, confirm
     actions = [{'tool_name': 'measure_experiment', 'arguments':
         {**row['execution'], 'condition_id': row['id']} if grouped else
         row['execution'] if (saved['model'] or saved.get('report_requirement')
-            or set(_requested_outputs(brief)) != {'experiments'}) else
+            or set(requested_research_outputs(brief)) != {'experiments'}) else
         {**row['execution'], 'delivery': {'summary': request, 'artifacts': []}}}
         for row in conditions]
     turn_index = len(app.state['turns'])
@@ -397,7 +397,7 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
         or policy_values.get('allow_network') is False
         or bool(materials) and config.get('research_materials_only') is not False
             and policy_values.get('allow_network') is not True)
-    outputs = _requested_outputs(brief)
+    outputs = requested_research_outputs(brief)
     supported = {'summary', 'research_summary', 'report', 'paper', 'full_paper', 'assessment',
         'idea_assessment', 'idea_comparison', 'design', 'research_design', 'data_analysis', 'experiments',
         'bug_fix', 'code_task'}

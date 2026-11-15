@@ -5615,10 +5615,10 @@ class ToolApplication:
         brief_ref = self.session.manifest.state_refs.get('brief')
         measurement_only = True
         if brief_ref is not None:
-            from simple_ar.app.research_intake import _requested_outputs
+            from simple_ar.app.research_intake import requested_research_outputs
             from simple_ar.research.workflow_contracts import ResearchBrief
             brief = ResearchBrief.from_dict(self.session.store.read_json(brief_ref))
-            measurement_only = set(_requested_outputs(brief)) == {'experiments'}
+            measurement_only = set(requested_research_outputs(brief)) == {'experiments'}
         arguments = self.scientific.analysis_arguments(locators)
         if measurement_only:
             arguments['delivery'] = {'summary': self.state['requests'][-1], 'artifacts': []}
