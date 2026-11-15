@@ -378,6 +378,35 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(restored.ledger.to_dict(), ledger)
             self.assertEqual(restored.session.manifest.session_id, app.session.manifest.session_id)
 
+    def test_structured_analysis_can_require_review_without_a_report(self):
+        from types import SimpleNamespace
+        from simple_ar.tools.workspace import DeliveryRequest
+
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            table = base / 'observations.csv'
+            table.write_text('score\n1\n2\n3\n', encoding='utf-8')
+            services = SimpleNamespace(llm_client=_JSONClient())
+            brief = ResearchBrief(request_text='Review the analysis of the supplied values.',
+                requested_outputs=('data_analysis',),
+                asset_requests=({'locator': str(table), 'role': 'dataset'},))
+            app = create_structured_research_task(brief, root=base / 'task', model=None,
+                services=services, max_results=1,
+                config={'data_analysis': {'file': str(table), 'value_columns': ['score'],
+                    'observation_unit': 'one supplied row'}, 'independent_review_required': True},
+                budget_limits={'llm_requests': 2, 'total_tokens': 100000})
+            self.assertIsNone(app.state['config'].get('report_requirement'))
+            self.assertTrue(app.state['config']['independent_review_required'])
+            app.run(actions=[{'tool_name': 'analyze_table', 'arguments': app.state['config']['table_analysis']}],
+                progress=lambda _: None, should_stop=lambda: app.state['pending'] is None
+                    and not any(turn['remaining'] for turn in app.state['turns']))
+            result = app._operation_observations(domain='analysis')[-1]
+            self.assertEqual(result['status'], 'ok')
+            claim = DeliveryRequest.model_validate({'summary': 'Analysis of supplied values',
+                'artifacts': result['artifacts'], 'independent_review': False})
+            self.assertTrue(app.operations.delivery.requires_review(claim))
+            self.assertFalse(app.ledger.entries)
+
     def test_new_structured_work_can_reuse_results_without_forcing_a_script(self):
         import sys
         from simple_ar.app.operation_tools import _executable_work_system
