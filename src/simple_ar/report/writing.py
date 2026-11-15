@@ -85,12 +85,6 @@ ARTICLE_PARAGRAPH_EDIT_SYSTEM = ARTICLE_EDIT_SYSTEM.replace(
     'Alternatively an individual edit may use exactly {old_text, new_text} for an exact unique span. '
     'Never mix selector fields in one edit. Targets must be distinct and must not intersect. '
     'All edits refer to the original body, not earlier replacements. ')
-ARTICLE_FLEXIBLE_EDIT_SYSTEM = ARTICLE_PARAGRAPH_EDIT_SYSTEM.replace(
-    'Do not return draft_markdown. Optionally include source_notes ',
-    'Alternatively, when restructuring requires it, return {"draft_markdown": "complete revised article"} '
-    'instead of replacements; preserve unaffected work where appropriate. Optionally include source_notes ')
-
-
 def provided_caption_bindings(binding: dict[str, Any]) -> dict[str, str]:
     """The composition's explicit caption owner, not another writing decision."""
     contract = binding.get('figure_caption_contract')
@@ -107,9 +101,16 @@ def provided_caption_bindings(binding: dict[str, Any]) -> dict[str, str]:
 
 def _article_system(inputs: dict, *, editing: bool, edit_contract: dict,
                     flexible_revision: bool = False) -> str:
-    system = ((ARTICLE_EDIT_SYSTEM if edit_contract['version'] == 'exact_replacements.v1'
-        else ARTICLE_FLEXIBLE_EDIT_SYSTEM if flexible_revision else ARTICLE_PARAGRAPH_EDIT_SYSTEM)
-        if editing else ARTICLE_SYSTEM)
+    system = (ARTICLE_EDIT_SYSTEM if edit_contract['version'] == 'exact_replacements.v1'
+        else ARTICLE_PARAGRAPH_EDIT_SYSTEM) if editing else ARTICLE_SYSTEM
+    if editing and flexible_revision:
+        system = system.replace(
+            'Preserve unaffected text exactly. Return one complete JSON response with ',
+            'Preserve unaffected work where relevant. Return one complete JSON response with either '
+        ).replace(
+            'Do not return draft_markdown. Optionally include source_notes ',
+            'Alternatively, return {"draft_markdown": "complete revised article"} instead of replacements '
+            'when a complete revision is more appropriate. Optionally include source_notes ')
     if inputs['article'].get('publication_caption_contract') == SUPPLIED_CAPTION_CONTRACT:
         system = system.replace(
             'Use supplied figures when relevant as standalone Markdown images, with the exact '

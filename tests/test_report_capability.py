@@ -1850,6 +1850,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
                                 if flexible:
                                     self_outer.assertIn('draft_markdown', system)
                                     self_outer.assertNotIn('Do not return draft_markdown', system)
+                                    self_outer.assertNotIn('Preserve unaffected text exactly', system)
                                     return {'draft_markdown': revised}
                                 return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
                                     'replacements': [{'old_text': initial, 'new_text': revised}]
@@ -2486,12 +2487,19 @@ class StructuredArticleWritingTests(unittest.TestCase):
                 request = self.request()
                 def interrupted(system, prompt, **kwargs):
                     if response_state == 'saved':
-                        store.write_json('response.json', request.llm_client.response)
+                        return request.llm_client.response
                     error = RuntimeError('interrupted after request')
                     if response_state == 'raw':
                         error.raw_response = 'Original non-JSON bytes'
                     raise error
-                with patch.object(request.llm_client, 'ask_json', side_effect=interrupted):
+                original_write = ArtifactStore.write_json
+                def interrupt_after_save(owner, path, value, **options):
+                    result = original_write(owner, path, value, **options)
+                    if response_state == 'saved' and owner.root == store.root and str(path) == 'response.json':
+                        raise RuntimeError('interrupted after request')
+                    return result
+                with patch.object(request.llm_client, 'ask_json', side_effect=interrupted), \
+                        patch.object(ArtifactStore, 'write_json', interrupt_after_save):
                     with self.assertRaisesRegex(RuntimeError, 'interrupted'):
                         run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('original')),
                             request=request)
@@ -2508,7 +2516,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     self.assertEqual(recovered.status, 'completed')
                 elif response_state == 'raw':
                     self.assertEqual(store.read_json('response.json'), {'raw_response': 'Original non-JSON bytes'})
-                    with self.assertRaisesRegex(ValueError, 'no automatic correction'):
+                    with self.assertRaisesRegex(ValueError, 'no blind replay'):
                         run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('original')), request=offline)
                 else:
                     with self.assertRaisesRegex(ValueError, 'no blind replay'):
