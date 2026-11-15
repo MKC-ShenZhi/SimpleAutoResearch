@@ -9,7 +9,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
-- New scoped work on existing code keeps deterministic patch and validator checks, while the task's independent delivery review owns the advisory model review. All changed code is included in the reviewed delivery.
+- New scoped work on existing code uses the authorized task directly for editing, without a separate model-generated patch plan. It retains deterministic patch and validator checks; the task's independent delivery review owns the advisory model review and includes all changed code. Saved and standalone CodeTask contracts keep their existing planning and approval behavior.
 
 ### Fixed
 

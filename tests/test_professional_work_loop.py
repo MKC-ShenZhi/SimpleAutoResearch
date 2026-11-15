@@ -8293,6 +8293,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             # Substitute code generation only. Preparation, frozen approval,
             # actual CPU validator and all native/domain receipts remain real.
             self.assertTrue(request.defer_model_review)
+            self.assertTrue(request.direct_edit)
             brief = context.store.read_json('inputs/brief.json')['request_text']
             if 'conditions' in self.app.implementation.measurement:
                 self.assertIn('Recorded prior measurement evidence',brief)

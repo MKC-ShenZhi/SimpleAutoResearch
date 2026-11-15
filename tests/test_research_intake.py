@@ -667,9 +667,11 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(exact['project_path'], 'source0')
             self.assertEqual(exact['validation_command'], ['python', 'check.py'])
             self.assertEqual(saved['code_work_policy'], 'shared.v2')
+            self.assertEqual(saved['code_implementation_policy'], 'direct.v1')
             self.assertEqual(saved['code_review_policy'], 'delivery.v1')
             self.assertEqual(app.operations.implementation.code_work_policy, 'shared.v2')
             self.assertTrue(app.operations.implementation.defer_code_review)
+            self.assertTrue(app.operations.implementation.direct_code_edit)
             self.assertIn('model review belongs to the independent task delivery review',
                 app.gateway.registry.get('implement_code_task').description)
             self.assertIs(app.operations.implementation.ledger, app.ledger)
@@ -682,9 +684,23 @@ class ResearchIntakeTests(unittest.TestCase):
             restored = ToolApplication.load(base / 'task', services=services)
             self.assertEqual(restored.operations.implementation.code_work_policy, 'shared.v2')
             self.assertTrue(restored.operations.implementation.defer_code_review)
+            self.assertTrue(restored.operations.implementation.direct_code_edit)
             self.assertIs(restored.operations.implementation.ledger, restored.ledger)
             self.assertEqual(restored.operations.implementation.work_context([str(project)])['user_requests'],
                 app.state['requests'])
+            # Saved code sessions predate this policy. An unrelated explicit
+            # review requirement must not change their in-flight editor path.
+            historical = create_research_task(ResearchBrief(request_text='Implement an adapter.',
+                requested_outputs=('experiments',)), root=base / 'historical-task', services=services)
+            historical.state['config'].pop('code_implementation_policy')
+            historical._save()
+            historical = ToolApplication.load(base / 'historical-task', services=services)
+            self.assertFalse(historical.operations.implementation.direct_code_edit)
+            historical.supply(supply_id='require-review', reason='Require independent review',
+                changes={'independent_review_required': True})
+            historical = ToolApplication.load(base / 'historical-task', services=services)
+            self.assertNotIn('code_implementation_policy', historical.state['config'])
+            self.assertFalse(historical.operations.implementation.direct_code_edit)
             self.assertEqual(saved['execution_contract']['conditions'][0]['source'], 'implementation')
             self.assertEqual(saved['execution_contract']['conditions'][0]['execution']['command'][1], 'measure.py')
             self.assertIs(app.services, services)
@@ -708,6 +724,7 @@ class ResearchIntakeTests(unittest.TestCase):
             continuing.supply(supply_id='code-work', reason='The caller provided the code scope and validator',
                 changes={'allow_execution': True, 'code_task': exact})
             self.assertEqual(continuing.state['config']['code_work_policy'], 'shared.v2')
+            self.assertTrue(continuing.operations.implementation.direct_code_edit)
             self.assertEqual(continuing.operations.implementation.code_work_policy, 'shared.v2')
             self.assertFalse(continuing.operations.implementation.defer_code_review)
             self.assertIn('CodeTask also performs its own independent review',

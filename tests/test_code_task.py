@@ -414,9 +414,10 @@ class CodeTaskTests(unittest.TestCase):
                 result = run_implementation_capability(context=context, request=ImplementationRequest(
                     run_dir, workspace, "Authorize isolated bug fix", client,
                     validation_command=(sys.executable, "-m", "unittest", "discover", "-s", "tests"),
-                    validation_timeout_sec=30, max_repairs=1,
+                    validation_timeout_sec=30, max_repairs=1, direct_edit=True,
                 ))
             self.assertEqual(result.status, "completed", result.diagnostics)
+            self.assertFalse((run_dir / 'code_task/patch_plan.md').exists())
             payload = read_json(root / "attempt" / "implementation.json")
             self.assertEqual(payload["validation"]["status"], "passed")
             self.assertEqual([row["outcome"] for row in payload["validation_repairs"]], ["passed"])
@@ -611,6 +612,40 @@ class CodeTaskTests(unittest.TestCase):
             self.assertEqual(sum(row["label"] == "code-task-plan" for row in usage), 1)
             self.assertTrue(any(row["stage"] == "code_task.review" for row in usage))
             self.assertEqual(read_json(run_dir / "code_task/run/patched/execution_report.json")["status"], "passed")
+
+    def test_shared_code_work_edits_without_a_second_model_plan(self) -> None:
+        from simple_ar.code_task.orchestration.execute import implement_code_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project, task, run_dir = root / 'project', root / 'task.md', root / 'run'
+            _write_toy_project(project)
+            original = (project / 'spam_model.py').read_bytes()
+            task.write_text('Update spam_model.py predict to classify prize messages as spam.', encoding='utf-8')
+            initialize_code_task(run_dir=run_dir, code_root=project, task_file=task,
+                benchmark_command='python -m unittest discover -s tests')
+            ledger = BudgetLedger({'llm_requests': 4, 'total_tokens': 50000})
+            client = LLMClient(LLMSettings(api_key='fixture', api_mode='chat', max_output_tokens=2048),
+                budget_ledger=ledger, budget_session_id='research', budget_attempt_id='implement-1')
+            response = {'choices': [{'message': {'content': json.dumps(
+                keyword_code_responses()['code-task-propose-edits'])}}],
+                'usage': {'prompt_tokens': 30, 'completion_tokens': 20, 'total_tokens': 50}}
+            with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as call:
+                result = implement_code_task(run_dir, approval_note='Existing task grants isolated edits',
+                    direct_edit=True, review_use_llm=False, llm_client=client,
+                    budget_ledger=ledger, session_id='research', attempt_id='implement-1')
+                self.assertEqual(result.stop_reason, 'stop_point')
+                self.assertEqual(call.call_count, 1)
+                self.assertFalse((run_dir / 'code_task/patch_plan.md').exists())
+                candidate = code_task_paths(run_dir).workspace_dir / 'spam_model.py'
+                self.assertIn('prize', candidate.read_text(encoding='utf-8'))
+                self.assertEqual((project / 'spam_model.py').read_bytes(), original)
+                self.assertEqual(ledger.remaining('llm_requests'), 3)
+                resumed = implement_code_task(run_dir, approval_note='Existing task grants isolated edits',
+                    direct_edit=True, review_use_llm=False, llm_client=client,
+                    budget_ledger=ledger, session_id='research', attempt_id='implement-1')
+                self.assertEqual(resumed.stop_reason, 'stop_point')
+                self.assertEqual(call.call_count, 1)
 
     def test_atomic_text_write_retries_transient_destination_lock(self) -> None:
         TEST_ROOT.mkdir(exist_ok=True)

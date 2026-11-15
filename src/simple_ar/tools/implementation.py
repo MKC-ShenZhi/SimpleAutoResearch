@@ -581,6 +581,7 @@ class ImplementationToolGateway:
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
                  code_work_policy: str | None = None,
                  defer_code_review: bool = False,
+                 direct_code_edit: bool = False,
                  sandboxed_execution: bool = False,
                  declaration_review: bool = False,
                  professional_requests: bool = False,
@@ -632,6 +633,7 @@ class ImplementationToolGateway:
         self.work_context = work_context
         self.code_work_policy = code_work_policy
         self.defer_code_review = defer_code_review
+        self.direct_code_edit = direct_code_edit
         self.sandboxed_execution = sandboxed_execution
         self.material_observations = material_observations
         self.exact = ExactCodeTask.model_validate(exact) if exact is not None else None
@@ -1285,6 +1287,7 @@ class ImplementationToolGateway:
                 protocol=manifest['code_task']['native_protocol'],
                 handoff_policy=self.code_work_policy,
                 defer_model_review=self.defer_code_review,
+                direct_edit=self.direct_code_edit,
                 **({'process_scope': process_scope} if process_scope is not None else {}),
                 **(contract.edit_policy or {}),
                 budget_ledger=self.ledger, session_id=self.session_id, attempt_id=identity))

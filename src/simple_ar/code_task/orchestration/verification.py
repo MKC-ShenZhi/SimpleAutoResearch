@@ -62,13 +62,19 @@ def apply_verified_repair(
     llm_client: LLMClient, message_callback: MessageCallback | None = None,
     process_scope: Any | None = None,
     review_use_llm: bool = True,
+    direct_edit: bool = False,
 ) -> None:
     """Apply an already authorized proposal; proposal-only entry points do not call this."""
     if not approval_note.strip():
         raise ValueError("Applying a repair requires explicit isolated-workspace approval.")
     if repair.mode != "llm" or not repair.edit_count:
         raise ValueError("Applying a repair requires a nonempty model proposal.")
-    apply_patch_edits(run_dir, edits_file=repair.proposal_path)
+    from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest
+    plan = load_code_task_manifest(run_dir).get('plan', {})
+    direct_without_plan = (direct_edit and isinstance(plan, dict) and plan.get('status') in (None, '', 'not_started')
+        and not (code_task_paths(run_dir).task_dir / 'patch_plan.md').exists())
+    apply_patch_edits(run_dir, edits_file=repair.proposal_path,
+        **({'allow_unapproved_plan': True} if direct_without_plan else {}))
     validate_repair_patch(run_dir, llm_client=llm_client, message_callback=message_callback,
         use_llm=review_use_llm,
         **({'process_scope': process_scope} if process_scope is not None else {}))
@@ -83,6 +89,7 @@ def verify_implementation(
     message_callback: MessageCallback | None = None,
     process_scope: Any | None = None,
     review_use_llm: bool = True,
+    direct_edit: bool = False,
 ) -> ImplementationVerificationResult:
     """Run an authorized technical check and bounded repairs, never scientific measurement.
 
@@ -140,6 +147,7 @@ def verify_implementation(
             apply_verified_repair(run_dir, repair, approval_note=approval_note,
                 llm_client=llm_client, message_callback=message_callback,
                 review_use_llm=review_use_llm,
+                **({'direct_edit': True} if direct_edit else {}),
                 **({'process_scope': process_scope} if process_scope is not None else {}))
             recovered = None
     repairs: list[dict[str, Any]] = []
@@ -199,6 +207,7 @@ def verify_implementation(
         apply_verified_repair(run_dir, repair, approval_note=approval_note,
                               llm_client=llm_client, message_callback=message_callback,
                               review_use_llm=review_use_llm,
+                              **({'direct_edit': True} if direct_edit else {}),
                               **({'process_scope': process_scope} if process_scope is not None else {}))
         if asset_guard()["status"] == "changed":
             repairs[-1]["outcome"] = "protected_asset_changed"

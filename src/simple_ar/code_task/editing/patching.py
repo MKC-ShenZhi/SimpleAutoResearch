@@ -145,8 +145,9 @@ def propose_patch_edits(
     message_callback: MessageCallback | None = None,
     llm_client: LLMClient | None = None,
     process_scope: Any | None = None,
+    task_only: bool = False,
 ) -> ProposedEditsResult:
-    """Generate controlled old/new text edits from an approved patch plan.
+    """Generate controlled old/new edits from the task and any approved plan.
 
     Args:
         run_dir: Code-task run directory.
@@ -183,7 +184,7 @@ def propose_patch_edits(
     manifest_path = root / "manifest.json"
     manifest = _load_code_task_manifest(manifest_path)
     task_text = _read_required_text(task_dir / "task.md")
-    patch_plan = _read_required_text(task_dir / "patch_plan.md")
+    patch_plan = "" if task_only else _read_required_text(task_dir / "patch_plan.md")
     index = _read_required_json(meta_dir / "codebase_index.json")
     allowed_patterns = allowed_patterns_from_manifest(manifest)
     protected_patterns = protected_patterns_from_manifest(manifest)
@@ -535,8 +536,8 @@ def apply_patch_edits(
         run_dir: Code-task run directory.
         edits_file: Optional JSON file containing edits. Defaults to
             ``code_task/meta/proposed_edits.json``.
-        allow_unapproved_plan: Bypass the human approval gate. This should be
-            used only for tests or explicit local experiments.
+        allow_unapproved_plan: Use an existing caller authorization in place
+            of the standalone patch-plan approval gate.
 
     Returns:
         Paths to patch metadata and the changed workspace files.
@@ -728,7 +729,8 @@ def _ask_llm_for_edits(
             + 'When source is missing, return context_request={"files":["exact indexed path"],'
             + '"query":"specific interface question","symbols":[],"reason":"what is missing"}. '
             + "Produce exact old/new replacements when the needed source is visible. "
-            + "Only declare the approved patch plan impossible for a concrete design or "
+            + ("Only declare the approved patch plan impossible for a concrete design or "
+               if patch_plan else "Only declare the requested change impossible for a concrete design or ")
             + "scope blocker, not because a bounded snippet omitted later code.",
             label="code-task-propose-edits-retry",
         )
@@ -821,7 +823,8 @@ def _edit_user_prompt(
         "- Do not propose deleting whole files or directories.\n"
         "- Prefer one edit per file. If a file needs multiple nearby changes, "
         "combine them into one larger old/new replacement.\n"
-        "- Keep the patch minimal and aligned with the approved patch plan.\n\n"
+        + ("- Keep the patch minimal and aligned with the approved patch plan.\n\n"
+           if patch_plan else "- Keep the patch focused on the task.\n\n")
         + ("New files are also permitted within these allowed scope patterns: "
            + json.dumps(allowed_patterns) + ". Protected paths remain read-only. "
            "For a genuinely absent file use old=\"\" and new=the complete file text. "
@@ -852,8 +855,8 @@ def _edit_user_prompt(
         "Available budget profiles for later planning:\n"
         f"{json.dumps(budget_profiles_json(), indent=2, ensure_ascii=False)}\n\n"
         f"Task:\n{task_text}\n\n"
-        f"Approved patch plan:\n{patch_plan_context(patch_plan, task_text)}\n\n"
-        f"Task memory:\n{memory_context}\n\n"
+        + (f"Approved patch plan:\n{patch_plan_context(patch_plan, task_text)}\n\n" if patch_plan else "")
+        + f"Task memory:\n{memory_context}\n\n"
         f"Workspace file inventory JSON:\n{json.dumps(compact_files, separators=(',', ':'), ensure_ascii=False)}\n\n"
         "Read-only context files omitted from editable snippets:\n"
         f"{json.dumps(read_only_context, indent=2, ensure_ascii=False)}\n\n"

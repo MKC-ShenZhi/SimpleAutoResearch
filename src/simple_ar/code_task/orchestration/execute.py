@@ -146,6 +146,7 @@ def execute_code_task(
     repair_model: str | None = None,
     use_llm: bool = True,
     review_use_llm: bool | None = None,
+    direct_edit: bool = False,
     timeout_sec: int = 60,
     skip_validation: bool = False,
     env_mode: str | None = None,
@@ -276,6 +277,8 @@ def execute_code_task(
         raise ValueError("cost_cap_usd must be non-negative when provided")
     if llm_retry_attempts < 1:
         raise ValueError("llm_retry_attempts must be at least 1")
+    if direct_edit and not approval_note.strip():
+        raise ValueError("Direct code work requires the existing task approval")
     baseline_policy = normalize_baseline_policy(baseline_policy)
 
     root = Path(run_dir)
@@ -540,7 +543,15 @@ def execute_code_task(
 
     manifest = load_code_task_manifest(root)
     plan_status = _plan_status(manifest)
-    if plan_status in {"approved", "rejected", "revision_requested", "pending_approval"}:
+    direct_without_plan = (direct_edit and plan_status == 'not_started'
+                           and not (paths.task_dir / 'patch_plan.md').exists())
+    if direct_without_plan:
+        # The shared caller has already supplied the goal, scope and approval.
+        # Source selection belongs to the editor; no second model plan or
+        # synthetic plan approval is needed for this work unit.
+        _record(steps, "plan", "skipped", "shared task supplies the authorized work")
+        plan_status = "approved"
+    elif plan_status in {"approved", "rejected", "revision_requested", "pending_approval"}:
         _record(steps, "plan", "skipped", f"plan status is {plan_status}")
     elif dry_run:
         return _dry_result(paths, steps, "plan", "generate patch_plan.md")
@@ -609,7 +620,7 @@ def execute_code_task(
         _record(steps, "propose-edits", "skipped", "patch already applied")
     elif proposal_exists and _proposal_edit_count(paths) > 0 and not patch_recovery:
         _record(steps, "propose-edits", "skipped", "proposed_edits.json already exists")
-    elif _plan_status(manifest) != "approved":
+    elif not direct_without_plan and _plan_status(manifest) != "approved":
         return _result(paths, steps, "approval_required", "Approve the patch plan before proposing edits.")
     elif dry_run:
         return _dry_result(paths, steps, "propose-edits", "generate controlled edit proposal")
@@ -639,6 +650,7 @@ def execute_code_task(
             budget_profile=budget_profile,
             edit_budget_overrides=edit_budget_overrides,
             message_callback=message_callback,
+            **({'task_only': True} if direct_without_plan else {}),
             **({'process_scope': process_scope} if process_scope is not None else {}),
         )
         if patch_recovery:
@@ -720,7 +732,8 @@ def execute_code_task(
     else:
         _emit(message_callback, "Applying reviewed edit proposal.")
         try:
-            result = apply_patch_edits(root, allow_large_edits=allow_large_edits)
+            result = apply_patch_edits(root, allow_large_edits=allow_large_edits,
+                **({'allow_unapproved_plan': True} if direct_without_plan else {}))
         except (PatchValidationError, EditBudgetApprovalRequired) as exc:
             if isinstance(exc, EditBudgetApprovalRequired):
                 key, category, stop_reason = "apply-edits-large-edit-approval-required", "edit_budget", "large_edit_approval_required"

@@ -465,6 +465,10 @@ class ToolApplication:
             raise ValueError('Unsupported saved work lifecycle policy')
         if config.get('code_work_policy') not in (None, 'shared.v1', 'shared.v2'):
             raise ValueError('Unsupported saved code work policy')
+        if (config.get('code_implementation_policy') not in (None, 'direct.v1')
+                or config.get('code_implementation_policy') == 'direct.v1'
+                   and (config.get('code_task') is None or config.get('code_work_policy') != 'shared.v2')):
+            raise ValueError('Direct code implementation requires the shared code-work contract')
         if config.get('sandbox_operations') not in (None, 'workspace.v1'):
             raise ValueError('Unsupported saved specialized execution scope')
         if config.get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES and (
@@ -2027,6 +2031,7 @@ class ToolApplication:
             config['sandbox_operations'] = 'workspace.v1'
         if config.get('code_task') is not None:
             config['code_work_policy'] = 'shared.v2'
+            config['code_implementation_policy'] = 'direct.v1'
             # New exact-code tasks already require a whole-delivery review.
             # Keep deterministic patch checks in CodeTask; its advisory model
             # review belongs to that one independent owner instead.
@@ -2387,7 +2392,7 @@ class ToolApplication:
                           'delivery_review_protocol', 'publication_assets', 'professional_operations', 'memory_protocol',
                           'context_checkpoint_policy', 'work_method', 'work_selection_policy', 'native_supply_policy', 'context_authority',
                           'native_history_policy', 'document_context_policy', 'process_artifact_paths', 'work_lifecycle', 'code_work_policy',
-                          'code_review_policy',
+                          'code_review_policy', 'code_implementation_policy',
                           'sandbox_operations',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
@@ -2410,6 +2415,7 @@ class ToolApplication:
                 # An explicitly supplied new code contract is new work, not a
                 # change to an already running historical code operation.
                 config['code_work_policy'] = 'shared.v2'
+                config['code_implementation_policy'] = 'direct.v1'
                 if (config.get('delivery_review_protocol') == 'task.v5'
                         and (old.get('delivery_review_selection') not in MODEL_REVIEW_SELECTIONS
                              or config.get('independent_review_required'))):
@@ -2417,7 +2423,7 @@ class ToolApplication:
                 else:
                     config['code_review_policy'] = None
             elif 'code_task' in supplied and supplied['code_task'] is None:
-                config['code_work_policy'] = config['code_review_policy'] = None
+                config['code_work_policy'] = config['code_review_policy'] = config['code_implementation_policy'] = None
             if (supplied.get('independent_review_required') is False
                     and old.get('delivery_review_selection') in MODEL_REVIEW_SELECTIONS
                     and old.get('code_review_policy') == 'delivery.v1'):

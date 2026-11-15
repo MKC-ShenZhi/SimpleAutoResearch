@@ -44,6 +44,7 @@ class ImplementationRequest:
     allow_large_edits: bool = False
     message_callback: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
     defer_model_review: bool = False
+    direct_edit: bool = False
 
 
 def run_implementation_capability(*, context: CapabilityContext, request: ImplementationRequest) -> CapabilityResult:
@@ -57,6 +58,7 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
     # retaining CodeTask's deterministic scope and interface checks.
     review_with_llm = not (request.defer_model_review
         and manifest.get('code_task', {}).get('kind') != 'greenfield')
+    direct_edit = request.direct_edit and manifest.get('code_task', {}).get('kind') != 'greenfield'
     paths = code_task_paths(request.run_dir)
     if paths.workspace_dir.resolve() != request.cwd.resolve():
         raise ValueError("Candidate cwd must be the initialized CodeTask workspace.")
@@ -101,6 +103,7 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
             approval_note=request.approval_note,
             llm_client=request.llm_client, use_llm=True, allow_planning_fallback=False,
             review_use_llm=review_with_llm,
+            **({'direct_edit': True} if direct_edit else {}),
             budget_profile=request.budget_profile,
             edit_budget_overrides=request.edit_budget_overrides,
             allow_large_edits=request.allow_large_edits,
@@ -132,6 +135,7 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
             apply_verified_repair(request.run_dir, repair, approval_note=request.approval_note,
                 llm_client=request.llm_client, message_callback=request.message_callback,
                 review_use_llm=review_with_llm,
+                **({'direct_edit': True} if direct_edit else {}),
                 **({'process_scope': request.process_scope} if request.process_scope is not None else {}))
             stop_reason, next_action = "stop_point", "Measure the repaired candidate separately."
     integrity = reconcile_protocol_assets(before)
@@ -150,6 +154,7 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
             budget_ledger=request.budget_ledger, session_id=request.session_id,
             attempt_id=request.attempt_id, message_callback=request.message_callback,
             review_use_llm=review_with_llm,
+            **({'direct_edit': True} if direct_edit else {}),
             **({'process_scope': request.process_scope} if request.process_scope is not None else {}),
         )
         validation = verified.validation

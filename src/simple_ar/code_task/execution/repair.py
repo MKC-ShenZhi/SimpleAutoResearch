@@ -283,7 +283,7 @@ def _repair_prompt(
         "declared missing creation targets below. Create an absent target with old=\"\" and nonempty new text.\n"
         "- Prefer repairing implicated or recently changed files.\n"
         "- Treat validation errors as first-class evidence even when the benchmark was not launched.\n"
-        "- Do not change read-only files such as tests, benchmarks, or validation targets.\n"
+        "- Do not change paths marked read-only or protected. Tests may be edited only when the task scope permits them.\n"
         "- Keep the repair minimal and runnable.\n"
         "- Distinguish measured symptoms from suspected causes; do not preserve a disproven plan.\n"
         "- Partial source is not a full implementation; do not invent unseen code.\n"
@@ -425,8 +425,8 @@ def _normalize_repair_proposal(
         "read_only_context": read_only_context,
         "constraints": [
             "Only selected context files or declared absent creation targets may be edited by this repair proposal.",
-            "Protected read-only files such as tests and benchmarks cannot be edited.",
-            "Apply this proposal explicitly with code-task apply-edits after review.",
+            "Paths marked read-only or protected cannot be edited.",
+            "An authorized caller must apply this proposal.",
         ],
         "summary": _string(proposal.get("summary")) or "No summary provided.",
         "edits": edits,
