@@ -340,12 +340,9 @@ class SourceToolGateway:
             if location not in digests:
                 digests[location] = None
                 try:
-                    path = self.resolve_source_handoff(location)
-                    if path == Path(location) and path.is_file() and path.stat().st_size <= 64 * 1024 * 1024:
-                        with path.open('rb') as handle:
-                            digest = hashlib.file_digest(handle, 'sha256').hexdigest()
-                        if self.resolve_source_handoff(location) == path:
-                            digests[location] = digest
+                    path, raw = self._read_source_handoff(location, max_bytes=64 * 1024 * 1024)
+                    if path == Path(location):
+                        digests[location] = hashlib.sha256(raw).hexdigest()
                 except (ValueError, KeyError, OSError, RuntimeError):
                     pass
             if digests[location] != window['sha256']:
@@ -361,13 +358,10 @@ class SourceToolGateway:
 
     def bound_document_chunks(self, document_record: str, document_id: str, expected_sha256: str):
         """Read retained chunks for one previously selected, authorized source."""
-        path = self.resolve_source_handoff(document_record)
-        raw = path.read_bytes()
+        _, raw = self._read_source_handoff(document_record)
         if hashlib.sha256(raw).hexdigest() != expected_sha256:
             raise ValueError('Selected original source changed')
         bundle = DocumentBundle.from_handoff_dict(json.loads(raw))
-        if self.resolve_source_handoff(document_record) != path or path.read_bytes() != raw:
-            raise ValueError('Source record changed during passage selection')
         return [row for row in bundle.chunks[:self.policy.max_chunks] if row.document_id == document_id]
 
     def __init__(self, root: Path, workspace: Any, ledger: BudgetLedger, *,
@@ -413,8 +407,7 @@ class SourceToolGateway:
                 raise ValueError('Unknown source operation')
             if name == "find_source_passages":
                 request = _Passages.model_validate(arguments)
-                path = self.resolve_source_handoff(request.document_record)
-                raw = path.read_bytes()
+                path, raw = self._read_source_handoff(request.document_record)
                 bundle = DocumentBundle.from_handoff_dict(json.loads(raw))
                 identity = {
                     "document_record": request.document_record,
@@ -437,9 +430,6 @@ class SourceToolGateway:
                         "matches": source_chunk_views(selected, query=request.query, max_chars=request.max_chars),
                         "selected_chunks": len(selected),
                         "scope": "Lexical lookup in retained text; not full reading or proof of absence"}
-                current = self.resolve_source_handoff(request.document_record)
-                if current != path or current.read_bytes() != raw:
-                    raise ValueError('Source record changed during passage selection')
                 return ToolResult(tool_name=name, data=data)
             request = (_Search if name == "search_sources" else _Acquire).model_validate(arguments)
             directory = self.root / "evidence" / identity
@@ -606,19 +596,36 @@ class SourceToolGateway:
                 raise ValueError('Material must be a bounded authorized file')
         return paths
 
-    def resolve_source_handoff(self, locator: str) -> Path:
-        """Resolve a supplied source or an output bound by this source owner."""
+    def _source_handoff_binding(self, locator: str) -> tuple[Path, str | None]:
+        """Admit a source and return the saved version, when it has one."""
         try:
-            return self.workspace.resolve_source_record(locator)
+            return self.workspace.resolve_source_record(locator), None
         except ValueError as original_error:
             path = self.workspace.resolve(locator)
             receipt_path = path.parent / 'source_result.json'
             if not path.is_relative_to((self.root / 'attempts').resolve()) or not receipt_path.is_file():
                 raise original_error
             receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
-            if receipt['hashes'].get(str(path)) != self._digest(path):
+            expected = receipt['hashes'].get(str(path))
+            if not isinstance(expected, str):
                 raise ValueError('Research handoff changed since its bound result')
-            return path
+            return path, expected
+
+    def _read_source_handoff(self, locator: str, *, max_bytes: int | None = None) -> tuple[Path, bytes]:
+        path, expected = self._source_handoff_binding(locator)
+        if max_bytes is not None and path.stat().st_size > max_bytes:
+            raise ValueError('Source record exceeds the retained reading limit')
+        raw = path.read_bytes()
+        if expected is not None and hashlib.sha256(raw).hexdigest() != expected:
+            raise ValueError('Research handoff changed since its bound result')
+        return path, raw
+
+    def resolve_source_handoff(self, locator: str) -> Path:
+        """Resolve a supplied source or an output bound by this source owner."""
+        path, expected = self._source_handoff_binding(locator)
+        if expected is not None and self._digest(path) != expected:
+            raise ValueError('Research handoff changed since its bound result')
+        return path
 
     def _handoff(self, locator: str, schema: str) -> dict[str, Any]:
         path = self.resolve_source_handoff(locator)

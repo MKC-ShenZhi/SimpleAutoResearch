@@ -981,6 +981,31 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertIn('changed', stale.error.lower())
         self.assertEqual(len(clients[0].calls), 2)
 
+    def test_changed_source_keeps_the_observed_snapshot_but_cannot_be_reused(self):
+        root, source, ledger, workspace = self.workspace()
+        bundle = DocumentBundle(
+            records=[DocumentRecord(document_id='paper', title='Original', source='local_files')],
+            fulltext_manifest={}, fulltext_extraction={}, sections=[],
+            chunks=[TextChunk('chunk-1', 'paper', 'The original observation.')])
+        document = source / 'original.json'
+        document.write_text(json.dumps(bundle.to_handoff_dict()), encoding='utf-8')
+        original = document.read_bytes()
+        owner = SourceToolGateway(root, workspace, ledger)
+
+        def change_after_read(chunks, query, **kwargs):
+            document.write_text(json.dumps({**bundle.to_handoff_dict(), 'changed': True}), encoding='utf-8')
+            return chunks[:1]
+
+        with patch('simple_ar.tools.sources.rank_source_chunks', side_effect=change_after_read):
+            result = owner.call('find_source_passages',
+                {'document_record': 'source0/original.json', 'query': 'observation'}, identity='lookup')
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.data['document_sha256'], sha(original))
+        self.assertIn('original observation', result.data['matches'][0]['text'])
+        retained = owner.retained_passages([{'data': result.data, 'turn': 1,
+            'record': 'records/lookup/native_result.json'}], before_turn=2)
+        self.assertEqual(retained, [])
+
     def test_research_source_handoff_remains_readable_through_document_work(self):
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
 
