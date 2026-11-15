@@ -238,7 +238,8 @@ class ExactCodeWork(BaseModel):
 def implementation_tool_specs(*, exact: bool = False,
                               preparation_only: bool = False,
                               source_owner_contract: str | None = None,
-                              sandboxed_execution: bool = False) -> list[CommonToolSpec]:
+                              sandboxed_execution: bool = False,
+                              defer_code_review: bool = False) -> list[CommonToolSpec]:
     _source_owner_options(source_owner_contract, preparation_only=preparation_only, exact=exact)
     if exact and preparation_only:
         raise ValueError('Preparation-only source generation cannot use the exact code-task contract')
@@ -250,7 +251,10 @@ def implementation_tool_specs(*, exact: bool = False,
             CommonToolSpec(name='implement_code_task', domain='implementation',
             permission_level='execution', risk_level='high',
             input_schema=ExactCodeWork.model_json_schema(),
-            description='Implement the frozen scoped code task using its approved isolated-workspace preparation, CodeTask investigation, edit/protected-file gates, independent review and declared validator. Uses this task budget and attempt. Optional instruction/prior_result support feedback on the existing candidate; no arguments change scope, preparation or validator. '
+            description='Implement the frozen scoped code task using its approved isolated-workspace preparation, CodeTask investigation, edit/protected-file gates and declared validator. '
+                + ('Existing-project model review belongs to the independent task delivery review; new-project work retains its own project review. '
+                   if defer_code_review else 'CodeTask also performs its own independent review. ')
+                + 'Uses this task budget and attempt. Optional instruction/prior_result support feedback on the existing candidate; no arguments change scope, preparation or validator. '
                 + ('Work contained by the task workspace isolation uses its grant; other source or environment work requires explicit approval. '
                    if sandboxed_execution else 'Requires explicit approval of the displayed work and current source/environment identity. ')
                 + 'Only the saved technical-repair ceiling is authorized (one for legacy contracts); no scientific measurement. Installation is allowed only by an explicitly frozen environment preparation contract; it shares this attempt and process budget. Inspect the retained result before delivery. Interrupted work without a complete domain result is never replayed automatically.')]

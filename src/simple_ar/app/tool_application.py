@@ -765,7 +765,8 @@ class ToolApplication:
         registry.register_package(publication_tool_specs(sandbox_execution=config.get('sandbox_execution', False)),
             self.publication, request_visible=True)
         registry.register_package(writing_tool_specs(), self.writing, request_visible=True)
-        registry.register_package(implementation_tool_specs(exact=config.get('code_task') is not None),
+        registry.register_package(implementation_tool_specs(exact=config.get('code_task') is not None,
+            defer_code_review=self.implementation.defer_code_review),
             self.implementation, request_visible=False if self.implementation.exact else {'prepare_implementation'})
         registry.register_package(analysis_tool_specs(),
             AnalysisToolGateway(controller.store.root, self.workspace, contract=config.get('table_analysis')),

@@ -670,6 +670,8 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(saved['code_review_policy'], 'delivery.v1')
             self.assertEqual(app.operations.implementation.code_work_policy, 'shared.v2')
             self.assertTrue(app.operations.implementation.defer_code_review)
+            self.assertIn('model review belongs to the independent task delivery review',
+                app.gateway.registry.get('implement_code_task').description)
             self.assertIs(app.operations.implementation.ledger, app.ledger)
             self.assertIn('implement_code_task', app.operations.system_text())
             self.assertNotIn('write_file and run_process', app.operations.system_text())
@@ -708,6 +710,8 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(continuing.state['config']['code_work_policy'], 'shared.v2')
             self.assertEqual(continuing.operations.implementation.code_work_policy, 'shared.v2')
             self.assertFalse(continuing.operations.implementation.defer_code_review)
+            self.assertIn('CodeTask also performs its own independent review',
+                continuing.gateway.registry.get('implement_code_task').description)
             self.assertIs(continuing.operations.implementation.ledger, continuing.ledger)
             self.assertEqual(continuing.ledger.to_dict(), before_ledger)
             self.assertEqual(continuing.operations.implementation.work_context([str(project)])['user_requests'],

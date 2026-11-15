@@ -431,7 +431,8 @@ class OperationTools:
                 candidate_outputs=(lambda record:self.scientific.candidate_outputs(record) if self.scientific else {})
                     if exact else None)
             self.registry.register_package(implementation_tool_specs(exact=exact,preparation_only=not exact,
-                source_owner_contract=source_owner, sandboxed_execution=self.implementation.sandboxed_execution),
+                source_owner_contract=source_owner, sandboxed_execution=self.implementation.sandboxed_execution,
+                defer_code_review=self.implementation.defer_code_review),
                 self.implementation,request_visible=True)
             if source_owner == 'source_owner.v3':
                 # The common queue invokes this primitive for the admitted source
