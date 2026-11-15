@@ -1498,20 +1498,17 @@ class ToolApplication:
             return []
         references = journal_material_references(self.workspace, self.session.store, self.state['turns'], targets,
             include_cross_path=self.state['config'].get('professional_work') in _ADOPTING_OWNER_MODES)
-        # Imported observations already belong to the selected immutable input
-        # snapshot. Re-read only their exact retained ranges through the byte
-        # owner, so professional consumers share normal current admission.
+        # The selected snapshot already contains the original observation.
+        # Consumers admit it through the byte owner; do not read it here too.
         for row in self._retained_working_inputs(targets)['observations']:
             if row['next_offset_bytes'] <= row['offset_bytes']:
                 continue
             request = {'path': row['path'], 'offset_bytes': row['offset_bytes'],
                 'max_bytes': row['next_offset_bytes'] - row['offset_bytes'], 'full_digest': True}
-            actual = self.workspace.call('read_file', request, identity='retained-work-input')
-            if (actual.status == 'ok' and actual.data.get('sha256') == row['sha256']
-                    and actual.data.get('text') == row['text']
-                    and actual.data.get('next_offset_bytes') == row['next_offset_bytes']):
-                references.append({'request': request, 'data': actual.data,
-                    'source_reference': row['source']})
+            data = {'text': row['text'], 'sha256': row['sha256'], 'size_bytes': row['size_bytes'],
+                'next_offset_bytes': row['next_offset_bytes'],
+                'has_more': row['next_offset_bytes'] < row['size_bytes'], 'absolute_path': row['absolute_path']}
+            references.append({'request': request, 'data': data, 'source_reference': row['source']})
         findings = self.gateway.professional_inputs(targets, include_observations=True)
         references = [row for finding in findings for row in finding.get('observations', [])] + references
         return ([{**row, 'copy_lineage_required': True} for row in references]

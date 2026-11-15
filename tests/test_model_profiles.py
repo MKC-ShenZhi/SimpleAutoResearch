@@ -446,6 +446,13 @@ class ModelProfileTests(unittest.TestCase):
                 self.assertEqual((writing._budget_session_id, writing._budget_attempt_id), ("writing-task", "compose"))
                 self.assertEqual(LLMClient.for_task(client=writing, purpose="writing").model, writing.model)
                 self.assertEqual("writing_route" in parent.connection_binding(), configured)
+                from simple_ar.core.budget import BudgetLedger
+                direct_ledger = BudgetLedger({"llm_requests": 2})
+                direct = LLMClient.for_task(purpose="writing", budget_ledger=direct_ledger,
+                    session_id="writing-task", attempt_id="compose")
+                self.assertEqual(direct.model, "coder-model" if configured else "writer-model")
+                self.assertIs(direct.budget_ledger, direct_ledger)
+                self.assertEqual((direct._budget_session_id, direct._budget_attempt_id), ("writing-task", "compose"))
         # Without a route, preserve an explicit nondefault parent too.
         self.path.write_text(CATALOG, encoding="utf-8")
         selected = LLMClient.from_env("profile:coder")

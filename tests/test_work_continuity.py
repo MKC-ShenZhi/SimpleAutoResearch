@@ -110,9 +110,21 @@ class SelectedWorkContinuityTests(unittest.TestCase):
         self.assertFalse(fresh.ledger.entries)
         self.assertFalse((fresh.session.store.root / 'delivery.json').exists())
         self.assertEqual({name: (self.app.session.store.root / name).read_bytes() for name in old}, old)
-        provider = fresh._material_observations(['retained_delivery'])
+        from simple_ar.tools.materials import material_observation_seed
+        with patch.object(fresh.workspace, 'call', wraps=fresh.workspace.call) as read:
+            provider = fresh._material_observations(['retained_delivery'])
+            read.assert_not_called()
+            seed = material_observation_seed(workspace=fresh.workspace, inventories=None,
+                provider=fresh._material_observations, roots=['retained_delivery'], context={})
+            self.assertEqual(len(seed['observations']), 1)
+            self.assertEqual(read.call_count, 1)
         self.assertEqual(provider[0]['data']['text'], 'second\n')
         ToolApplication.load(fresh.session.store.root)
+        copied = Path(fresh.state['config']['sources']['retained_delivery']) / 'workspace/selected.txt'
+        copied.write_text('later changed content')
+        stale = material_observation_seed(workspace=fresh.workspace, inventories=None,
+            provider=fresh._material_observations, roots=['retained_delivery'], context={})
+        self.assertFalse(stale['observations'])
 
     def test_current_registered_result_selection_uses_its_exact_retained_version(self):
         selection = select_reuse(self.app.session.store.root, ['artifacts'])
