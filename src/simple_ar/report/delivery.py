@@ -94,20 +94,24 @@ class Delivery:
                  review_owner: Any, config: dict,
                  observations: Callable[[], list[dict]],
                  user_requests: Callable[[], list[str]] | None,
-                 user_request_count: Callable[[], int] | None = None) -> None:
+                 user_request_count: Callable[[], int] | None = None,
+                 review_request_start: Callable[[], int] | None = None) -> None:
         self.workspace, self.gateway = workspace, gateway
         self.publication, self.review_owner = publication, review_owner
         self.config, self.observations, self.user_requests = config, observations, user_requests
         self.user_request_count = user_request_count
+        self.review_request_start = review_request_start
         self.legacy_report_status = config.get('delivery_review_protocol') not in {'task.v4', 'task.v5'}
 
     def _committed_review(self, observations: list[dict]) -> bool:
         """A selected final review remains work in this user request."""
         if self.config.get('delivery_review_selection') != 'model.v2':
             return False
+        first = self.review_request_start() if self.review_request_start is not None else None
         for row in reversed(observations):
             completion = tool_completion(row.get('tool_name', ''), self.config.get('tool_completions'))
-            if (row.get('current_request', True) and completion is not None and completion.kind == 'review'
+            current = row.get('current_request', True) if first is None else row.get('request_count', 1) >= first
+            if (current and completion is not None and completion.kind == 'review'
                     and (row.get('arguments') or {}).get('review_scope') == 'delivery'):
                 return True
         return False

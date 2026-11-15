@@ -225,6 +225,35 @@ class CandidateReviewTests(unittest.TestCase):
 
 
 class IntegratedCandidateFlowTests(unittest.TestCase):
+    def test_supplied_contract_does_not_cancel_a_selected_final_review(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
+
+        case = OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.app = ToolApplication.create(case.root, 'Complete the requested explanation.',
+            model='fixture', sources={}, services=case.services, max_turns=20,
+            max_tokens=900000, max_attempts=100, tool_contracts='full')
+        case._write('note.md', 'The current explanation.\n')
+        claim = {'summary': 'The explanation', 'artifacts': ['note.md']}
+        case.review = lambda view: {'conclusion': 'incomplete', 'findings': [], 'evidence': [],
+            'limitations': ['The independent investigation is unfinished.']}
+        case._submit(_action('review_result', **claim, review_scope='delivery'))
+        checked = len(case.inspection_requests)
+        case.app.supply(supply_id='execution-access', reason='Authorize later workspace execution',
+            changes={'allow_execution': True})
+        case._reload()
+        case._submit(_action('deliver_result', **claim, independent_review=False))
+        case._not_delivered()
+        self.assertEqual(len(case.inspection_requests), checked)
+
+        case.app.supply(supply_id='review-optional', reason='Make independent review optional',
+            changes={'independent_review_required': False}, replace_existing=True)
+        case._reload()
+        self.assertFalse(case.app.operations.delivery.requires_review(DeliveryRequest.model_validate({
+            **claim, 'independent_review': False})))
+
     def test_selected_final_review_cannot_be_silently_skipped_or_retried(self):
         from simple_ar.app.tool_application import ToolApplication
         from tests.test_professional_work_loop import OperationsWorkLoopTests, _action

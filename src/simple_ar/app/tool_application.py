@@ -564,6 +564,7 @@ class ToolApplication:
             material_observations=self._material_observations,
             user_requests=self._inspection_requests,
             user_request_count=lambda: len(self.state['requests']),
+            review_request_start=self._review_request_start,
             native_route_validator=self._validate_professional_route,
             search_registry=getattr(self.services,'search_registry',None))
         self.workspace, self.gateway = self.operations.workspace, self.operations.gateway
@@ -1408,6 +1409,16 @@ class ToolApplication:
             if 0 <= index < len(requests) and requests[index] == prefix + supply['reason']:
                 requests.pop(index)
         return requests
+
+    def _review_request_start(self) -> int:
+        """Supplied contracts do not silently cancel a selected final review."""
+        current = len(self.state['requests'])
+        for supply in reversed(self.state.get('supplies', [])):
+            if (supply.get('request_count') != current
+                    or supply.get('changes', {}).get('independent_review_required') is False):
+                break
+            current -= 1
+        return current
 
     def _material_observations(self, targets: list[str]) -> list[dict[str, Any]]:
         """Locate successful parent reads, without transferring bodies or authority.
