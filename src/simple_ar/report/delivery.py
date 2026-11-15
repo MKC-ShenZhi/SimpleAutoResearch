@@ -221,6 +221,8 @@ class Delivery:
         if (not self.config.get('independent_review_required')
                 and self.config.get('delivery_review_selection') in MODEL_REVIEW_SELECTIONS
                 and request.independent_review is False):
+            if self.config.get('delivery_review_selection') == 'model.v1':
+                return False
             if observations is None:
                 observations = self.observations()
             if not self._committed_review(observations):

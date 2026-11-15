@@ -145,8 +145,9 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertEqual(self.owner.lifecycle_requirements()['minimum_resources']['llm_requests'], 0)
         self.observations.append({'tool_name': 'edit_file', 'status': 'ok', 'current_request': True})
         self.assertEqual(self.owner.lifecycle_requirements()['minimum_resources']['llm_requests'], 1)
-        self.assertFalse(self.owner.requires_review(DeliveryRequest.model_validate({
-            'summary': 'A small note', 'artifacts': ['draft.md'], 'independent_review': False})))
+        with patch.object(self.owner, 'observations', side_effect=AssertionError('Saved v1 needs no history scan')):
+            self.assertFalse(self.owner.requires_review(DeliveryRequest.model_validate({
+                'summary': 'A small note', 'artifacts': ['draft.md'], 'independent_review': False})))
 
         self.owner.config['tool_completions']['deliver_result'] = {'kind': 'delivery'}
         previous = {'summary': 'Earlier explanation', 'artifacts': ['draft.md']}
