@@ -257,6 +257,14 @@ def authored_snapshot(workspace: Any, result: dict, record: str, session_id: str
         'version_scope': 'Complete authored edit result, not a read or independent evidence; reuse only for the matching current file version.'}
 
 
+def _inspection_window_data(window: dict, request: dict) -> dict:
+    data = {key: value for key, value in window.items() if key not in {
+        'review_text', 'review_next_offset_bytes', 'read_request', 'source_reference'}}
+    if request.get('start_line') is None:
+        data.pop('offset_bytes', None)  # Inspection owns this derived locator.
+    return data
+
+
 def journal_read_windows(receipt: dict, request: dict) -> list[dict]:
     """Decode successful byte-owner reads; no current access or fact certification."""
     material = (receipt.get('metadata') or {}).get('material_observations')
@@ -295,10 +303,7 @@ def journal_read_windows(receipt: dict, request: dict) -> list[dict]:
                         if len(subject['windows']) != 1:
                             continue
                         read_request = {**subject['request'], 'full_digest': True}
-                    data = {key: value for key, value in window.items() if key not in {
-                        'review_text', 'review_next_offset_bytes', 'read_request', 'source_reference'}}
-                    if read_request.get('start_line') is None:
-                        data.pop('offset_bytes', None)  # Inspection owns this derived locator.
+                    data = _inspection_window_data(window, read_request)
                     if not lossless_text_window(data):
                         continue
                     windows.append({'request': read_request, 'data': data,
@@ -410,11 +415,7 @@ def material_window_reference(window: dict) -> dict | None:
             or not isinstance(reference.get('request'), dict)
             or not isinstance(reference.get('source_reference'), dict)):
         return reference
-    data = {key: value for key, value in window.items() if key not in {
-        'review_text', 'review_next_offset_bytes', 'read_request', 'source_reference'}}
-    if reference['request'].get('start_line') is None:
-        data.pop('offset_bytes', None)
-    return {**reference, 'data': data}
+    return {**reference, 'data': _inspection_window_data(window, reference['request'])}
 
 
 def current_text_window(workspace: Any, window: dict) -> dict:
