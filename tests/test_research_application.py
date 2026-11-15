@@ -1524,10 +1524,10 @@ class ResearchApplicationTests(unittest.TestCase):
             app.services = replace(app.services, llm_client=client)
             responses_by_label = keyword_code_responses()
             payloads = [responses_by_label[label] for label in
-                        ("code-task-work-plan", "code-task-plan", "code-task-propose-edits")]
+                        ("code-task-plan", "code-task-propose-edits")]
             if repair_failure:
                 broken = "(text.lower() if __import__('sys').argv[-1] == '0' else text.lowerr())" if late_failure else "text.lowerr()"
-                payloads[2]["edits"][0]["new"] = payloads[2]["edits"][0]["new"].replace("text.lower()", broken)
+                payloads[1]["edits"][0]["new"] = payloads[1]["edits"][0]["new"].replace("text.lower()", broken)
             payloads += [{"findings": []}] * 8
             responses = [{"choices": [{"message": {"content": json.dumps(payload)}}],
                           "usage": {"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50}}
@@ -1748,6 +1748,12 @@ class ResearchApplicationTests(unittest.TestCase):
                 self.analysis_count = 0
                 self.gap_returned = False
                 self.refinement_calls = 0
+
+            def with_budget(self, ledger, *, session_id="", attempt_id=""):
+                self._budget_ledger = ledger
+                self._budget_session_id = session_id
+                self._budget_attempt_id = attempt_id
+                return self
 
             def ask(self, _system, _user, *, label=""):
                 if label not in {"result-analysis", "experiment-analysis"}:

@@ -104,7 +104,7 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
             approval_note=request.approval_note,
             llm_client=request.llm_client, use_llm=True, allow_planning_fallback=False,
             review_use_llm=review_with_llm,
-            **({'direct_edit': True} if direct_edit else {}),
+            direct_edit=direct_edit,
             budget_profile=request.budget_profile,
             edit_budget_overrides=request.edit_budget_overrides,
             allow_large_edits=request.allow_large_edits,

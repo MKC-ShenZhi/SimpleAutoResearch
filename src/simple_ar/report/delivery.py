@@ -527,12 +527,7 @@ class Delivery:
         producer_declined = request.independent_review is False
         observations = (self.observations() if self.config.get('delivery_review_selection') in {'model.v2', 'model.v3'}
             and request.independent_review is False else None)
-        # An optional review can reuse a pass without starting a new review
-        # against the producer's choice. An explicit caller requirement owns
-        # that choice and may inspect a changed claim using authorized capacity.
-        if (observations is not None and not self.config.get('independent_review_required')
-                and self._committed_review(request, observations)):
-            may_start = False
+        selected_review = observations is not None and self._committed_review(request, observations)
         request = self.resolve_request(request, observations or [])
         delivery = self.workspace.resolve_delivery(request, current_outputs=current_outputs)
         hashes = self.workspace.artifact_hashes(delivery['artifacts'])
@@ -559,8 +554,11 @@ class Delivery:
                 current_result=current_result, current_outputs=current_outputs, candidate=candidate,
                 review_scope=review_scope, observations=observations,
                 review_capacity=review_capacity if candidate or self.requires_review(request, observations=observations) else None,
-                repeat_identical=not (self.config.get('independent_review_required')
-                    and producer_declined and not candidate))
+                # Reuse a passing opinion, but never replay an unfinished
+                # identical check merely because delivery was submitted again.
+                # A changed claim still needs an applicable review.
+                repeat_identical=not (producer_declined and not candidate
+                    and (self.config.get('independent_review_required') or selected_review)))
             if review is not None:
                 if metadata.get('delivery_review', review) != review:
                     raise ValueError('Retained delivery review differs from its actual receipt')
