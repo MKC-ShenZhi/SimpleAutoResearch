@@ -6690,6 +6690,13 @@ class GenerationAuthorizationTests(unittest.TestCase):
             fake = Mock()
             fake.effective_output_limit.return_value = None
             fake._budget_ledger = ledger
+            fake._budget_session_id = 'same-task'
+            fake._budget_attempt_id = ''
+            def bind_budget(bound_ledger, *, session_id, attempt_id):
+                self.assertIs(bound_ledger, ledger)
+                fake._budget_session_id, fake._budget_attempt_id = session_id, attempt_id
+                return fake
+            fake.with_budget.side_effect = bind_budget
             broken = False
             labels = []
             contents = {'main.py': 'from model import predict\nprint("score:", int(predict("win") == "spam"))\n',

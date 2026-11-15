@@ -1127,7 +1127,8 @@ class IntakeDialogueTests(unittest.TestCase):
             self.assertEqual(client.requests[1]['assets']['project_python'], str(Path(sys.executable).absolute()))
             contract = client.requests[1]['response_contract']
             self.assertEqual(contract['kind'], ['reproduction'])
-            self.assertEqual(set(contract['options']), {'sources', 'environment', 'requirements', 'install_project'})
+            self.assertEqual(set(contract['options']), {'sources', 'environment', 'requirements', 'install_project',
+                'independent_review_required'})
             self.assertNotIn('native_paired_analysis', contract)
             self.assertEqual(values['cwd'], str(root.resolve()))
             self.assertEqual(values['metric'], ['mean'])

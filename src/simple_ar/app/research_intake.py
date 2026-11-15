@@ -36,6 +36,9 @@ def _legacy_creation_options(services: Any) -> dict:
 _DEFAULT_RESEARCH_PROVIDERS = ('openalex', 'semantic_scholar', 'arxiv')
 _OUTPUT_ALIASES = {'experiment': 'experiments', 'code': 'code_task', 'code_patch': 'code_task',
     'patch': 'code_task', 'bug_repair': 'bug_fix'}
+_SUPPORTED_RESEARCH_OUTPUTS = frozenset({'summary', 'research_summary', 'report', 'paper', 'full_paper',
+    'assessment', 'idea_assessment', 'idea_comparison', 'design', 'research_design',
+    'data_analysis', 'experiments', 'bug_fix', 'code_task'})
 
 
 def requested_research_outputs(brief: ResearchBrief) -> tuple[str, ...]:
@@ -397,12 +400,9 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
         or bool(materials) and config.get('research_materials_only') is not False
             and policy_values.get('allow_network') is not True)
     outputs = requested_research_outputs(brief)
-    supported = {'summary', 'research_summary', 'report', 'paper', 'full_paper', 'assessment',
-        'idea_assessment', 'idea_comparison', 'design', 'research_design', 'data_analysis', 'experiments',
-        'bug_fix', 'code_task'}
-    if set(outputs) - supported:
+    if set(outputs) - _SUPPORTED_RESEARCH_OUTPUTS:
         raise ValueError('Use explicit native execution contracts for these outputs: '
-            + ', '.join(sorted(set(outputs) - supported)))
+            + ', '.join(sorted(set(outputs) - _SUPPORTED_RESEARCH_OUTPUTS)))
     execution = config.get('execution')
     if execution is not None and not isinstance(execution, Mapping):
         raise ValueError('execution must be an object containing the declared domain contract')
@@ -693,7 +693,7 @@ def project_execution_creation(execution: Mapping[str, Any], *, request: str, ou
     if task is not None and (not isinstance(task, dict) or 'run_dir' in task):
         raise UnsupportedExecutionCreation('Initialized CodeTask adoption requires its saved owner')
     scientific = 'experiments' in outputs
-    if set(outputs) - {'experiments', 'report', 'summary', 'research_summary', 'bug_fix', 'code_task'}:
+    if set(outputs) - _SUPPORTED_RESEARCH_OUTPUTS:
         raise UnsupportedExecutionCreation('Unsupported execution outputs')
     if not scientific and task is None:
         raise UnsupportedExecutionCreation('Execution needs a measurement or explicit code deliverable')

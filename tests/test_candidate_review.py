@@ -730,7 +730,7 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         case._reload()
         case._write('final.md', 'Three supplied observations: 1, 2, and 3. No population inference.\n')
         final = {'summary':'Explanation with evidence limits', 'artifacts':['final.md']}
-        case._submit(_action('review_result', **final))
+        case._submit(_action('review_result', **final, review_scope='delivery'))
         ready = case._ok('review_result', reviewed=True)['metadata']['delivery_review']
         self.assertNotIn('purpose', ready['binding'])
         inspected = len(case.inspection_requests)

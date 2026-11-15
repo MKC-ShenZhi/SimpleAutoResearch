@@ -1328,8 +1328,8 @@ code = "daily"
             initial = app.state['config']['execution_contract']
             changed_baseline = {'conditions': [{**rows[0], 'execution': {
                 **rows[0]['execution'], 'label': 'changed'}}, rows[1]]}
-            self.assertTrue(ScientificToolGateway.unchanged_declared_condition('baseline', [initial, initial]))
-            self.assertFalse(ScientificToolGateway.unchanged_declared_condition('baseline', [initial, changed_baseline]))
+            self.assertTrue(ScientificToolGateway.unchanged_measurement_condition('baseline', [initial, initial]))
+            self.assertFalse(ScientificToolGateway.unchanged_measurement_condition('baseline', [initial, changed_baseline]))
             app.run(actions=[{'tool_name': 'measure_experiment',
                 'arguments': {**row['execution'], 'condition_id': row['id']}} for row in reversed(rows)],
                 approve=lambda *_: True, progress=lambda _: None,

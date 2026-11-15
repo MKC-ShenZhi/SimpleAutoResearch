@@ -8271,7 +8271,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             {'id':'candidate','role':'candidate','seed':None,'source':'implementation','execution':execution}]}
         self.app = ToolApplication.create(self.root,contract['goal'],model='fixture',services=self.services,
             sources={'project':self.inputs},code_task=contract,execution_contract=conditions,
-            allow_execution=True,tool_contracts='full',max_attempts=80,
+            allow_execution=True,tool_contracts='full',max_attempts=80,independent_review_required=True,
             process_limits={'process_invocations':32,'process_wall_seconds':180})
         self._submit(_action('prepare_code_task'),approve=lambda *_:True)
         prepared = self._ok('prepare_code_task')

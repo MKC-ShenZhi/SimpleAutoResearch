@@ -20,6 +20,11 @@ def sha(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
+def article_revision(view, markdown):
+    return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
+        'replacements': [{'old_text': view['prior_draft'], 'new_text': markdown}]}
+
+
 class _Client:
     def __init__(self, ledger, identity, decide):
         self._budget_ledger = ledger
@@ -159,7 +164,8 @@ class DocumentWorkTests(unittest.TestCase):
                     self_test.assertIn('P1' if self._budget_attempt_id == 'manual-revision' else 'old-paper',
                         json.dumps(view))
                     link = '\n\n[Reference metadata](citation_map.json)' if self._budget_attempt_id.startswith('mapped-') else ''
-                    response = {'draft_markdown': '# Updated findings\n\nEarlier work [@P1]. New evidence [@P2].' + link}
+                    response = article_revision(view,
+                        '# Updated findings\n\nEarlier work [@P1]. New evidence [@P2].' + link)
                 else:
                     raise AssertionError(label)
                 self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
@@ -310,7 +316,7 @@ class DocumentWorkTests(unittest.TestCase):
                 if label == 'document-work-1':
                     response = {'action': 'write', 'title': 'Explanation', 'selected_observation_ids': []}
                 elif label == 'composition-article':
-                    response = {'draft_markdown': '# Explanation\n\nA clearer explanation.'}
+                    response = article_revision(json.loads(prompt), '# Explanation\n\nA clearer explanation.')
                 else:
                     raise AssertionError(label)
                 self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
@@ -796,7 +802,11 @@ class DocumentWorkTests(unittest.TestCase):
             if count <= 7:
                 return {'action': 'investigate', 'read_windows': [{'path': f'source0/part-{count}.txt'}]}
             self.assertEqual(view['prior_draft']['sha256'], old_sha)
-            self.assertEqual(view['work_context'], original_context)
+            supplied = view['work_context']
+            self.assertEqual(supplied['user_requests'], original_context['user_requests'])
+            self.assertEqual(supplied['working_notes'], original_context['working_notes'])
+            self.assertEqual(supplied['related_feedback'][0]['result'],
+                original_context['professional_findings'][0]['result'])
             self.assertEqual(len(view['observations']), 8)
             return {'action': 'finish', 'selected_observation_ids': [f'o{i}' for i in range(1, 9)],
                 'manuscript_markdown': '# Revised\nThe original conditions are now stated.\n',
