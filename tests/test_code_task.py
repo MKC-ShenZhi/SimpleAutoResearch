@@ -1810,22 +1810,6 @@ primary_metric = "accuracy"
             metrics = read_json(run_dir / "code_task" / "run" / "patched" / "metrics.json")
             self.assertIn("accuracy", metrics)
 
-    def test_new_greenfield_preserves_an_explicit_external_agent_choice(self) -> None:
-        with _temporary_root() as root:
-            task = root / 'task.md'
-            write_text(task, 'Generate a runnable project with an external handoff.')
-            run = root / 'run'
-            _initialize_greenfield(run_dir=run, task_file=task, primary_metric='accuracy', direct_greenfield=True)
-            self.assertEqual(read_json(run / 'manifest.json')['code_task']['auto_edit_policy'], 'direct.v1')
-            preview = execute_code_task(run, use_llm=False, dry_run=True,
-                implementation_provider='fake', implementation_agent_mode='handoff')
-            self.assertEqual(preview.stop_reason, 'dry_run')
-            self.assertEqual(read_json(run / 'manifest.json')['code_task']['auto_edit_policy'], 'direct.v1')
-            result = execute_code_task(run, use_llm=False, to_step='run', timeout_sec=30,
-                implementation_provider='fake', implementation_agent_mode='handoff')
-            self.assertEqual(result.stop_reason, 'completed')
-            self.assertEqual(read_json(run / 'code_task/meta/code_backend.json')['provider'], 'fake')
-            self.assertNotIn('auto_edit_policy', read_json(run / 'manifest.json')['code_task'])
             manifest = read_json(run_dir / "manifest.json")
             self.assertEqual(manifest["implementation"]["status"], "generated")
             self.assertEqual(manifest["patch"]["mode"], "greenfield_generated")
@@ -1884,6 +1868,23 @@ primary_metric = "accuracy"
             self.assertEqual([step.detail for step in repaired.steps if step.step == "run"],
                              ["status failed", "status passed"])
             self.assertEqual(read_json(run_dir / "code_task/run/patched/metrics.json"), metrics)
+
+    def test_new_greenfield_preserves_an_explicit_external_agent_choice(self) -> None:
+        with _temporary_root() as root:
+            task = root / 'task.md'
+            write_text(task, 'Generate a runnable project with an external handoff.')
+            run = root / 'run'
+            _initialize_greenfield(run_dir=run, task_file=task, primary_metric='accuracy', direct_greenfield=True)
+            self.assertEqual(read_json(run / 'manifest.json')['code_task']['auto_edit_policy'], 'direct.v1')
+            preview = execute_code_task(run, use_llm=False, dry_run=True,
+                implementation_provider='fake', implementation_agent_mode='handoff')
+            self.assertEqual(preview.stop_reason, 'dry_run')
+            self.assertEqual(read_json(run / 'manifest.json')['code_task']['auto_edit_policy'], 'direct.v1')
+            result = execute_code_task(run, use_llm=False, to_step='run', timeout_sec=30,
+                implementation_provider='fake', implementation_agent_mode='handoff')
+            self.assertEqual(result.stop_reason, 'completed')
+            self.assertEqual(read_json(run / 'code_task/meta/code_backend.json')['provider'], 'fake')
+            self.assertNotIn('auto_edit_policy', read_json(run / 'manifest.json')['code_task'])
 
     def test_greenfield_review_failure_without_model_does_not_erase_package_code(self) -> None:
         with _temporary_root() as root:
