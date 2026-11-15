@@ -11,6 +11,11 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 - The research retry API and CLI use the same saved task and ledger, including validated CodeTask sources; explicit resource-only continuations also retain the original ledger. Historical sessions retain their original continuation contract.
 
+### Fixed
+
+- Document revisions retain prior citation mappings without requiring a bibliography, resolve aliases to their recorded identities, and use the same file inheritance rules for production and acceptance.
+- Deterministic structured research no longer marks other requested work complete merely because material collection or measurement finished.
+
 ## 2026-11-15
 
 ### Improved

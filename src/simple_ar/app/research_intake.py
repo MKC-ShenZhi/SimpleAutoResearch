@@ -243,11 +243,13 @@ def start_research_task(app: Any, *, progress: Callable[[str], None] | None = No
         if confirm:
             app.request_execution_confirmation()
         return start_declared_measurements(app, request=brief.request_text, confirm=confirm, progress=progress)
-    deferred = bool('experiments' in _requested_outputs(brief) or saved.get('report_requirement')
-        or policy.get('require_design'))
+    produced = {'data_analysis'} if saved.get('table_analysis') is not None else {'summary', 'research_summary'}
+    missing = [name for name in _requested_outputs(brief) if name not in produced]
+    deferred = bool(missing or saved.get('report_requirement') or policy.get('require_design'))
     completion = ({'tool_name': 'ask_user', 'arguments': {'question':
-        'Materials are retained, but the requested design, execution or authored report is not complete. '
-        'Continue this task with an authorized model and execution contract/approval as needed.'}}
+        'Completed materials and results are retained, but requested work remains unfinished: '
+        + ', '.join(missing or ['research design']) + '. Continue the same task with the required '
+        'inputs, authorized model or execution approval as appropriate.'}}
         if deferred else {'tool_name': 'deliver_result', 'arguments': {
         'summary': brief.request_text, 'artifacts': result['artifacts'],
         'unresolved': result.get('data', {}).get('unresolved', [])}})
@@ -264,8 +266,8 @@ def start_declared_measurements(app: Any, *, request: str | None = None, confirm
     from simple_ar.tools.scientific import measurement_conditions
 
     progress = progress or getattr(app.services, 'message_callback', None) or print
+    brief = ResearchBrief.from_dict(app.session.store.read_json(app.session.manifest.state_refs['brief']))
     if request is None:
-        brief = ResearchBrief.from_dict(app.session.store.read_json(app.session.manifest.state_refs['brief']))
         request = brief.request_text
     saved = app.state['config']
     contract = saved['execution_contract']
@@ -273,7 +275,8 @@ def start_declared_measurements(app: Any, *, request: str | None = None, confirm
     grouped = 'conditions' in contract
     actions = [{'tool_name': 'measure_experiment', 'arguments':
         {**row['execution'], 'condition_id': row['id']} if grouped else
-        row['execution'] if saved['model'] or saved.get('report_requirement') else
+        row['execution'] if (saved['model'] or saved.get('report_requirement')
+            or set(_requested_outputs(brief)) != {'experiments'}) else
         {**row['execution'], 'delivery': {'summary': request, 'artifacts': []}}}
         for row in conditions]
     turn_index = len(app.state['turns'])

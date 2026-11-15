@@ -5610,9 +5610,19 @@ class ToolApplication:
         selected = self.scientific._condition_results(locators)
         if len(selected) != len(config['execution_contract']['conditions']):
             return []
-        return [{'tool_name': 'analyze_measurements', 'arguments': {
-            **self.scientific.analysis_arguments(locators),
-            'delivery': {'summary': self.state['requests'][-1], 'artifacts': []}}}]
+        # The deterministic comparison can finish itself, but cannot claim
+        # unrelated structured outputs merely because its measurements exist.
+        brief_ref = self.session.manifest.state_refs.get('brief')
+        measurement_only = True
+        if brief_ref is not None:
+            from simple_ar.app.research_intake import _requested_outputs
+            from simple_ar.research.workflow_contracts import ResearchBrief
+            brief = ResearchBrief.from_dict(self.session.store.read_json(brief_ref))
+            measurement_only = set(_requested_outputs(brief)) == {'experiments'}
+        arguments = self.scientific.analysis_arguments(locators)
+        if measurement_only:
+            arguments['delivery'] = {'summary': self.state['requests'][-1], 'artifacts': []}
+        return [{'tool_name': 'analyze_measurements', 'arguments': arguments}]
 
     def _terminal_error(self, call: dict[str, Any]) -> str:
         if not self._terminal_intent(call):

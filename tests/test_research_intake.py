@@ -128,6 +128,54 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in restored.ledger.entries), 1)
             self.assertEqual(restored.session.manifest.session_id, app.session.manifest.session_id)
 
+    def test_deterministic_collection_keeps_other_requested_outputs_unfinished(self):
+        with TemporaryDirectory() as directory, patch.object(LLMClient, 'from_env',
+                side_effect=AssertionError('No model was authorized')):
+            base = Path(directory).resolve()
+            source = base / 'source.html'
+            source.write_text('<p>A supplied observation.</p>', encoding='utf-8')
+            for index, outputs in enumerate((('assessment',), ('summary', 'assessment'), ('data_analysis',))):
+                with self.subTest(outputs=outputs):
+                    brief = ResearchBrief(request_text='Work from the supplied material.',
+                        requested_outputs=outputs, asset_requests=({'locator': str(source), 'role': 'paper'},))
+                    app = create_research_task(brief, root=base / str(index),
+                        services=ResearchApplicationServices(config={'research_materials_only': True}))
+                    status = start_research_task(app, progress=lambda _: None)
+                    self.assertNotEqual(status['status'], 'completed')
+                    self.assertFalse(app.session.store.exists('delivery.json'))
+                    observations = app._operation_observations()
+                    self.assertEqual(observations[0]['tool_name'], 'research')
+                    self.assertEqual(observations[-1]['tool_name'], 'ask_user')
+                    self.assertTrue(all(not row.actual.get('llm_requests') for row in app.ledger.entries))
+
+    def test_declared_measurement_does_not_claim_other_requested_outputs(self):
+        import sys
+
+        with TemporaryDirectory() as directory, patch.object(LLMClient, 'from_env',
+                side_effect=AssertionError('No model was authorized')):
+            base = Path(directory).resolve()
+            for paired in (False, True):
+                with self.subTest(paired=paired):
+                    execution = {'command': [sys.executable, '-c', "print('score: 3')"],
+                        'cwd': str(base), 'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
+                    if paired:
+                        execution['baseline_policy'] = 'run'
+                    brief = ResearchBrief(request_text='Measure the condition and assess its implications.',
+                        requested_outputs=('experiments', 'assessment'))
+                    app = create_structured_research_task(brief, root=base / str(paired), model=None,
+                        config={'execution': execution, 'require_design': False},
+                        budget_limits={'process_invocations': 2 if paired else 1,
+                            'process_wall_seconds': 10 if paired else 5}, max_results=5, research_work=False)
+                    status = start_research_task(app, progress=lambda _: None)
+                    self.assertNotEqual(status['status'], 'completed')
+                    self.assertFalse(app.session.store.exists('delivery.json'))
+                    observations = app._operation_observations(domain='scientific')
+                    measurements = [row for row in observations if row['tool_name'] == 'measure_experiment']
+                    self.assertEqual(len(measurements), 2 if paired else 1)
+                    self.assertTrue(all(row['data']['execution_status'] == 'passed' for row in measurements))
+                    self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in app.ledger.entries),
+                        2 if paired else 1)
+
     def test_declared_material_intent_is_shared_by_startup_and_creation(self):
         import sys
 
