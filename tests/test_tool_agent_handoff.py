@@ -3660,6 +3660,32 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(current.state['config']['report_protocol'], 'canonical_report.v1')
         self.assertEqual(current._report_projection()['kind'], 'none')
 
+    def test_report_request_retains_compatible_history_and_supersedes_conversion(self):
+        for kind in ('conversion', 'none', 'report'):
+            with self.subTest(previous=kind):
+                _, _, fake, _, app, _ = self._historical_native_fixture(
+                    goal='Prepare the requested research output.', report_protocol='canonical_report.v1')
+                source = app.workspace.workspace / 'original.md'
+                source.write_text('Existing research.', encoding='utf-8')
+                fields = ({'source': 'workspace/original.md', 'formats': ['pdf']} if kind == 'conversion'
+                    else {'formats': ['pdf']} if kind == 'report' else {})
+                self._report_intent(app, 'earlier-' + kind, kind=kind, **fields)
+                before = app._report_projection()
+                turns, ledger = list(app.state['turns']), app.ledger.to_dict()
+                self.assertTrue(app.request_report({}, refresh=True))
+                restored = ToolApplication.load(app.session.store.root)
+                current = restored._report_projection()
+                self.assertEqual(current['kind'], 'report')
+                self.assertEqual(current['formats'], ['markdown', 'pdf'] if kind == 'report' else ['markdown'])
+                if kind == 'report':
+                    self.assertEqual(current['requirement'], before['requirement'])
+                self.assertIsNone(restored.operations)
+                self.assertEqual(restored.state['turns'], turns)
+                self.assertEqual(restored.ledger.to_dict(), ledger)
+                self.assertEqual(source.read_text(encoding='utf-8'), 'Existing research.')
+                fake.ask_json.assert_not_called()
+                fake.chat_turn.assert_not_called()
+
     def test_supply_upgrades_material_report_contract_without_accepting_old_composition(self):
         from simple_ar.tools.writing import freeze_report_requirement
 

@@ -807,9 +807,8 @@ class ImplementationToolGateway:
                 binding['research_inputs'] = research
         preparation_modes = set(binding.get('process_environments', {'copy': {}}))
         if (self.sandboxed_execution and self.workspace.sandbox_execution and self.code_work_policy == 'shared.v2'
-                and (preparation is None or preparation.kind == 'existing_project'
-                    and not preparation.workspace_reuse_source_venv)
-                and preparation_modes <= {'copy', 'sparse_copy'}
+                and (preparation is None or not preparation.workspace_reuse_source_venv)
+                and preparation_modes <= {'copy', 'sparse_copy', 'empty'}
                 and not binding.get('external_inputs') and not binding.get('environment_preparations')
                 and Path(binding['python_executable']).absolute() == self.workspace.python.absolute()
                 and Path(binding['python_executable']).resolve() == Path(sys.executable).resolve()):

@@ -537,6 +537,9 @@ def run_preparation_capability(*, context: CapabilityContext, request: Preparati
         edit_scope_protected_patterns=tuple(protected),
         data_inputs=data_inputs,
         initial_files=initial_files,
+        # A retained research controller decides its own saved plan contract;
+        # common code work explicitly chooses its editor at execution time.
+        direct_edit=False,
     )
     if source_snapshot is not None:
         from simple_ar.code_task.runtime.state import implementation_file_hashes

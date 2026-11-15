@@ -1392,9 +1392,20 @@ class ToolApplication:
 
     def _report_projection(self) -> dict[str, Any]:
         from simple_ar.report.legacy_contract import project_report
-        observations = (self.session.store.read_json(item['result'])
-            for turn in reversed(self.state['turns']) for item in reversed(turn['tools']))
-        return project_report(self.state['config'], observations)
+        # A new report supersedes an earlier conversion or no-report choice;
+        # a compatible earlier report still carries its requested formats.
+        start = max((row.get('request_count', 0) for row in self.state.get('supplies', [])
+            if 'report_requirement' in row.get('changes', {})), default=0)
+        def observations():
+            for turn in reversed(self.state['turns']):
+                for item in reversed(turn['tools']):
+                    row = self.session.store.read_json(item['result'])
+                    intent = (row.get('data') or {}).get('report_intent')
+                    if (turn.get('request_count', 1) < start and row.get('tool_name') == 'update_work_plan'
+                            and row.get('status') == 'ok' and intent and intent['kind'] != 'report'):
+                        return
+                    yield row
+        return project_report(self.state['config'], observations())
 
     def _declare_report(self, intent: _ReportIntent) -> dict[str, Any]:
         from simple_ar.report.legacy_contract import declare_report
@@ -2227,6 +2238,46 @@ class ToolApplication:
             analysis = (self.session.store.read_json(turn['tools'][-1]['result'])
                 if turn.get('origin') == 'caller' and turn.get('tools') else None)
         return {'parent_attempt_id': parent, 'observation': observed, 'analysis': analysis, 'task': snapshot}
+
+    def request_report(self, settings: dict[str, Any], *, refresh: bool = False) -> bool:
+        """Add or revise a report in the saved task; do not run it here."""
+        from simple_ar.report.requirements import freeze_report_requirement
+
+        config = self.state['config']
+        if config.get('model') is None:
+            raise ValueError('Bind a model and its budget to the saved task before requesting a report')
+        frozen = config.get('report_requirement')
+        projection = self._report_projection()
+        saved = frozen or (projection['requirement'] if projection['kind'] == 'report' else None)
+        if saved is None:
+            requirement = freeze_report_requirement(settings, method='sections')
+        else:
+            merged = {**saved['config'], **settings}
+            if merged == saved['config']:
+                requirement = saved
+            else:
+                template = saved['template'] if merged.get('template') == saved['config'].get('template') else None
+                requirement = freeze_report_requirement(merged, method=saved['method'], template=template)
+        delivery = (self.session.store.read_json('delivery.json')
+                    if self.session.store.exists('delivery.json') else {})
+        report = delivery.get('report') or {}
+        # Earlier native tasks enforced their saved report requirement before
+        # completion, including deliveries without an explicit report field.
+        delivered = bool(self.operations is None and saved and self.session.manifest.status == 'completed' and delivery
+                         and not delivery.get('unresolved')) or bool(
+            report.get('manuscript') and report.get('status') in {'candidate', 'canonical'}
+            and not delivery.get('unresolved'))
+        needs_request = (saved != requirement or refresh
+            or self.session.manifest.status in {'completed', 'partial'} and not delivered)
+        if not needs_request:
+            return False
+        if self.state['pending'] is not None:
+            raise ValueError('Finish or reconcile the pending task operation before changing its report request')
+        self.supply(supply_id=f"research-report-{len(self.state['requests']) + 1}",
+            reason='Generate a report from the retained research and results. Reuse existing work; '
+                   'do not rerun the experiments merely to prepare the report.',
+            changes={'report_requirement': requirement}, replace_existing=frozen is not None)
+        return True
 
     @classmethod
     def _feedback_journal(cls, root: Path):

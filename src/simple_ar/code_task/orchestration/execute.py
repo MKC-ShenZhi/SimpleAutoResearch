@@ -146,7 +146,7 @@ def execute_code_task(
     repair_model: str | None = None,
     use_llm: bool = True,
     review_use_llm: bool | None = None,
-    direct_edit: bool = False,
+    direct_edit: bool | None = None,
     timeout_sec: int = 60,
     skip_validation: bool = False,
     env_mode: str | None = None,
@@ -209,6 +209,8 @@ def execute_code_task(
         editor_model: Optional model override for controlled edit proposals.
         repair_model: Optional model override for repair proposals.
         use_llm: Whether planning/edit/repair steps may call the LLM.
+        direct_edit: Select direct editing explicitly, or use the saved new-task
+            policy when omitted. Existing proposals still require authorization.
         timeout_sec: Benchmark timeout for baseline and patched runs.
         skip_validation: Allow benchmark execution even when validation fails.
         env_mode: Optional environment mode override for probe and runs.
@@ -223,8 +225,8 @@ def execute_code_task(
             comparison evidence, and ``provided`` records user-supplied metrics.
         baseline_metrics_file: JSON or metric-line file used when
             ``baseline_policy`` is ``provided``.
-        apply_proposed_edits: Allow execute to apply an existing or generated
-            proposal after the patch plan has been approved.
+        apply_proposed_edits: Authorize application of an existing or generated
+            proposal after any required plan approval.
         allow_large_edits: Allow proposals that exceed the normal edit budget
             but fit the large profile.
         allow_planning_fallback: Allow deterministic offline work/patch plans
@@ -277,24 +279,27 @@ def execute_code_task(
         raise ValueError("cost_cap_usd must be non-negative when provided")
     if llm_retry_attempts < 1:
         raise ValueError("llm_retry_attempts must be at least 1")
-    if direct_edit and apply_proposed_edits and not approval_note.strip():
-        raise ValueError("Applying direct code work requires the existing task approval")
     baseline_policy = normalize_baseline_policy(baseline_policy)
 
     root = Path(run_dir)
     paths = code_task_paths(root)
     manifest = load_code_task_manifest(root)
+    if direct_edit is None:
+        direct_edit = direct_edit_available(manifest, paths.task_dir, to_step=to_step, use_llm=use_llm)
     ensure_task_memory(root)
     steps: list[ExecuteStepRecord] = []
     if (_code_task_kind(manifest) == "greenfield"
             and manifest.get('implementation', {}).get('mode') != 'controlled_patch'):
         if process_scope is not None:
-            raise ValueError('Scoped greenfield orchestration is not supported; use explicit execution approval')
+            from simple_ar.code_task.generation.agent_backend import should_use_agent_backend
+            if should_use_agent_backend(implementation_provider):
+                raise ValueError('External agent execution requires its own explicit approval')
         return _execute_greenfield_code_task(
             root,
             paths,
             steps,
             budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+            process_scope=process_scope,
             to_step=to_step,
             dry_run=dry_run,
             llm_client=llm_client,
@@ -1052,6 +1057,7 @@ def _execute_greenfield_code_task(
     budget_ledger: BudgetLedger | None,
     session_id: str,
     attempt_id: str,
+    process_scope: Any | None,
 ) -> CodeTaskExecuteResult:
     """Execute the unified greenfield code-task path.
 
@@ -1084,6 +1090,7 @@ def _execute_greenfield_code_task(
             root,
             env_mode=env_mode,
             python_executable=python_executable,
+            **({'process_scope': process_scope} if process_scope is not None else {}),
         )
         _record(steps, "probe", "done", f"wrote {result.report_path}")
         _memory_event(
@@ -1210,6 +1217,7 @@ def _execute_greenfield_code_task(
         root,
         strict=strict_validation,
         max_file_bytes=validation_max_file_bytes,
+        **({'process_scope': process_scope} if process_scope is not None else {}),
     )
     _record(steps, "validate", "done", f"status {validation.status}")
     _memory_event(
@@ -1246,6 +1254,7 @@ def _execute_greenfield_code_task(
             stream_output=stream_benchmark_output,
             output_callback=_benchmark_output_callback(message_callback),
             budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+            **({'process_scope': process_scope} if process_scope is not None else {}),
         )
         _record(steps, "run", "done", f"status {result.status}")
         _memory_event(
@@ -1298,6 +1307,7 @@ def _execute_greenfield_code_task(
             root,
             strict=strict_validation,
             max_file_bytes=validation_max_file_bytes,
+            **({'process_scope': process_scope} if process_scope is not None else {}),
         )
         _record(steps, "validate", "done", f"post-repair status {validation.status}")
         if validation.status == "failed":
@@ -2227,6 +2237,13 @@ def _record_baseline_policy(run_dir: Path, *, policy: str, status: str) -> None:
     if policy in {"skip", "none"} and status == "skipped":
         manifest["status"] = "baseline_skipped"
     save_code_task_manifest(run_dir, manifest)
+
+
+def direct_edit_available(manifest: dict[str, Any], task_dir: Path, *, to_step: str, use_llm: bool) -> bool:
+    """Select the saved new-task editor without overriding an explicit plan."""
+    return bool(use_llm and EXECUTE_STEPS.index(to_step) > EXECUTE_STEPS.index('plan')
+        and manifest.get('code_task', {}).get('auto_edit_policy') == 'direct.v1'
+        and _plan_status(manifest) == 'not_started' and not (task_dir / 'patch_plan.md').exists())
 
 
 def _plan_status(manifest: dict[str, object]) -> str:

@@ -1652,6 +1652,37 @@ code = "daily"
                 main(['research-report', '--session-root', str(root), '--model', 'other'])
             client.chat_turn.assert_not_called()
 
+    def test_research_report_continues_older_common_session_with_its_writer(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from tests.native_history_fixture import load_native_history
+
+        client = MagicMock()
+        client._settings = SimpleNamespace(api_mode='chat')
+        client.connection_binding.return_value = {'profile': 'fixture',
+            'settings': {'model': 'fixture', 'api_mode': 'chat'}}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch('simple_ar.app.tool_application.LLMClient.from_env', return_value=client), \
+                patch.object(ToolApplication, 'run', return_value={'status': 'completed'}) as run, \
+                patch('simple_ar.cli.main._render_native_result'), \
+                contextlib.redirect_stdout(io.StringIO()):
+            root = Path(tmp) / 'history'
+            app = load_native_history(root, 'Analyze the supplied observations', config={
+                'model': 'fixture', 'model_connection': client.connection_binding(), 'sources': {}})
+            prior = app.workspace.workspace / 'analysis.txt'
+            prior.write_text('Retained research result.\n', encoding='utf-8')
+            ledger = app.ledger.to_dict()
+            main(['research-report', '--session-root', str(root),
+                  '--reviewer', 'disabled', '--max-section-tokens', '123'])
+            restored = ToolApplication.load(root)
+            self.assertNotIn('control_protocol', restored.state['config'])
+            self.assertIsNone(restored.operations)
+            self.assertEqual(restored.state['config']['report_requirement']['method'], 'sections')
+            self.assertEqual(restored.state['config']['report_requirement']['config']['max_section_tokens'], 123)
+            self.assertEqual(restored.ledger.to_dict(), ledger)
+            self.assertEqual(prior.read_text(encoding='utf-8'), 'Retained research result.\n')
+            run.assert_called_once()
+            client.chat_turn.assert_not_called()
+
     def test_structured_report_preflight_precedes_model_and_creation(self):
         with patch("simple_ar.cli.main._optional_research_llm_client") as client, \
                 patch("simple_ar.cli.start.migrate_structured_creation") as migrate:

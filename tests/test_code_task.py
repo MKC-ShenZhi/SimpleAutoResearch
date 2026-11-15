@@ -572,7 +572,7 @@ class CodeTaskTests(unittest.TestCase):
             _write_toy_project(project)
             task.write_text("Improve spam prediction for prize messages.", encoding="utf-8")
             initialize_code_task(run_dir=run_dir, code_root=project, task_file=task,
-                                 benchmark_command="python -m unittest discover -s tests")
+                                 benchmark_command="python -m unittest discover -s tests", direct_edit=False)
             ledger = BudgetLedger({"llm_requests": 12, "total_tokens": 50000,
                                    "process_invocations": 1, "process_wall_seconds": 5})
             observed = []
@@ -5139,7 +5139,7 @@ protected_patterns = ["pyproject.toml"]
             run_dir = next((root / 'runs').glob('*/manifest.json')).parent
             old = root / 'old'
             initialize_code_task(run_dir=old, code_root=project, task_file=task,
-                benchmark_command=TOY_BENCHMARK_COMMAND)
+                benchmark_command=TOY_BENCHMARK_COMMAND, direct_edit=False)
             self.assertEqual(read_json(run_dir / 'manifest.json')['code_task']['auto_edit_policy'], 'direct.v1')
             original = (project / 'spam_model.py').read_bytes()
             for target, expected_plan in ((run_dir, False), (old, True)):
@@ -5202,6 +5202,24 @@ protected_patterns = ["pyproject.toml"]
                     '--baseline-policy', 'skip', '--to-step', 'apply-edits', '--no-review-inline'])
             self.assertEqual(read_json(planned / 'manifest.json')['plan']['status'], 'pending_approval')
             self.assertFalse((planned / 'code_task/meta/proposed_edits.json').exists())
+
+            # The public Python initializer and executor use the same saved
+            # new-task policy; a caller may inspect a proposal before applying.
+            api = root / 'api'
+            initialize_code_task(run_dir=api, code_root=project, task_file=task,
+                benchmark_command=TOY_BENCHMARK_COMMAND)
+            with patch.object(LLMClient, 'from_env', return_value=client), \
+                    patch.object(LLMClient, 'ask_json', side_effect=reply):
+                first = execute_code_task(api, model='fixture', baseline_policy='skip', to_step='apply-edits')
+                self.assertEqual(first.stop_reason, 'proposal_review_required')
+                self.assertFalse((api / 'code_task/patch_plan.md').exists())
+                self.assertEqual((code_task_paths(api).workspace_dir / 'spam_model.py').read_bytes(), original)
+                before = len(calls)
+                applied = execute_code_task(api, model='fixture', baseline_policy='skip',
+                    to_step='apply-edits', apply_proposed_edits=True)
+            self.assertEqual(applied.stop_reason, 'stop_point')
+            self.assertEqual(len(calls), before)
+            self.assertIn("('win', 'prize')", (code_task_paths(api).workspace_dir / 'spam_model.py').read_text())
             self.assertEqual((project / 'spam_model.py').read_bytes(), original)
 
     def test_execute_applies_reviewed_proposal_after_approval(self) -> None:
@@ -6596,7 +6614,11 @@ class GenerationAuthorizationTests(unittest.TestCase):
             with self.subTest(workspace=mode, failed_baseline=failed_baseline):
                 self._exact_greenfield_generation_feedback(mode, failed_baseline=failed_baseline)
 
-    def _exact_greenfield_generation_feedback(self, mode, *, failed_baseline):
+        if sys.platform.startswith('linux') and shutil.which('bwrap'):
+            with self.subTest(workspace='empty', execution='isolated'):
+                self._exact_greenfield_generation_feedback('empty', failed_baseline=False, isolated=True)
+
+    def _exact_greenfield_generation_feedback(self, mode, *, failed_baseline, isolated=False):
         from simple_ar.app.tool_application import ToolApplication
         from simple_ar.tools.implementation import ImplementationToolGateway
         from simple_ar.tools.scientific import ScientificToolGateway
@@ -6609,7 +6631,8 @@ class GenerationAuthorizationTests(unittest.TestCase):
         with _temporary_root() as root, patch('simple_ar.research.preparation.run_preparation_capability',
                 wraps=run_preparation_capability) as prepare:
             ledger = BudgetLedger({'llm_requests': 30, 'total_tokens': 50000,
-                                   'process_invocations': 8, 'process_wall_seconds': 120})
+                                   'process_invocations': 32 if isolated else 8,
+                                   'process_wall_seconds': 480 if isolated else 120})
             (root / 'attempts').mkdir()
             source = root / 'source'
             if mode != 'empty':
@@ -6617,7 +6640,7 @@ class GenerationAuthorizationTests(unittest.TestCase):
                 write_text(source / 'notes.txt', 'Read-only scaffold material.\n')
             original_source = _project_bytes(source)
             workspace = WorkspaceToolGateway(root, {'records': root / 'attempts',
-                **({'source': source} if mode != 'empty' else {})}, ledger)
+                **({'source': source} if mode != 'empty' else {})}, ledger, sandbox_execution=isolated)
             fake = Mock()
             fake.effective_output_limit.return_value = None
             fake._budget_ledger = ledger
@@ -6663,9 +6686,11 @@ class GenerationAuthorizationTests(unittest.TestCase):
                     'execution': {**formal, 'command': ['python', 'baseline.py']}},
                 {'id': 'candidate', 'role': 'candidate', 'seed': None, 'source': 'implementation', 'execution': formal}]}
             owner = ImplementationToolGateway(root, workspace, ledger, 'fixture', 'same-task',
-                exact=contract, client_factory=lambda _: fake, measurement=measurement)
+                exact=contract, client_factory=lambda _: fake, measurement=measurement,
+                **({'code_work_policy': 'shared.v2', 'work_context': lambda _: {'user_requests': [contract['goal']]},
+                    'sandboxed_execution': True} if isolated else {}))
             science = ScientificToolGateway(root, workspace, ledger, 'same-task', implementation=owner,
-                execution_contract=measurement)
+                execution_contract=measurement, sandboxed_execution=isolated)
             measured = []
             owner.measurement_inputs = lambda origin, required: science.implementation_inputs(measured, origin, required=required)
             registry = CapabilityRegistry()
@@ -6683,6 +6708,8 @@ class GenerationAuthorizationTests(unittest.TestCase):
             def invoke(tool_name, arguments, identity):
                 gateway = owner if tool_name in owner.context_tools else science
                 token = {'token': identity, 'binding': gateway.approval_binding(arguments, identity=identity)}
+                if isolated and tool_name == 'implement_code_task':
+                    self.assertEqual(token['binding'].get('execution_scope'), 'workspace.v1')
                 controller.execute_attempt('native_tool', attempt_id=identity, tool_name=tool_name,
                     arguments=arguments, approval=token)
                 store = ArtifactStore(root / 'attempts' / identity)

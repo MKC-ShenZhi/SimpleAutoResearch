@@ -89,7 +89,7 @@ def initialize_code_task(
     respect_allowed_paths: bool = False,
     data_inputs: tuple[str, ...] = (),
     initial_files: tuple[str, ...] = (),
-    direct_edit: bool = False,
+    direct_edit: bool = True,
 ) -> CodeTaskInitResult:
     """Initialize a local code-task run without modifying the source project.
 
@@ -134,6 +134,7 @@ def initialize_code_task(
             Fail-closed placeholders are created only in the isolated workspace.
         direct_edit: New existing-project tasks may propose edits without a
             separate plan; applying them remains subject to caller approval.
+            Use False when retaining an explicitly planned historical task.
 
     Returns:
         Paths and metadata for the initialized code-task run.

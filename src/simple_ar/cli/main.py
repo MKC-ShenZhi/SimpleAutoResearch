@@ -1170,41 +1170,18 @@ def _print_common_research_report(args: argparse.Namespace) -> None:
     """Continue the saved shared task using its existing Writer and budget."""
     from simple_ar.app.tool_application import ToolApplication
     from simple_ar.cli.research_config import report_settings
-    from simple_ar.report.requirements import freeze_report_requirement
 
     root = Path(args.session_root)
     try:
         app = ToolApplication.load(root)
         if args.model is not None and args.model != app.state['config'].get('model'):
             raise ValueError('The common session retains its saved model; research-report cannot switch it.')
-        if app.state['config'].get('control_protocol') != 'operations.v1':
-            raise ValueError('This saved task uses an earlier work contract; continue it through its saved task entry.')
-        saved = app.state['config'].get('report_requirement')
+        projection = app._report_projection()
+        saved = projection['requirement'] if projection['kind'] == 'report' else None
         explicit = getattr(args, '_explicit_resume_destinations', set())
-        if saved is None:
-            requirement = freeze_report_requirement(report_settings(args), method='sections')
-        else:
-            settings = {**saved['config'], **report_settings(args, explicit_destinations=explicit)}
-            if settings == saved['config']:
-                requirement = saved
-            else:
-                template = saved['template'] if settings.get('template') == saved['config'].get('template') else None
-                requirement = freeze_report_requirement(settings, method=saved['method'], template=template)
-        delivery = (app.session.store.read_json('delivery.json')
-                    if app.session.store.exists('delivery.json') else {})
-        report = delivery.get('report') or {}
-        delivered = bool(report.get('manuscript') and report.get('status') in {'candidate', 'canonical'}
-                         and not delivery.get('unresolved'))
         status = app.session.manifest.status
-        request_report = (saved != requirement or args.refresh
-            or status in {'completed', 'partial'} and not delivered)
-        if request_report:
-            if app.state['pending'] is not None:
-                raise ValueError('Finish or reconcile the pending task operation before changing its report request.')
-            reason = ('Generate a report from the retained research and results. Reuse existing work; '
-                'do not rerun the experiments merely to prepare the report.')
-            app.supply(supply_id=f"research-report-{len(app.state['requests']) + 1}", reason=reason,
-                changes={'report_requirement': requirement}, replace_existing=saved is not None)
+        settings = report_settings(args, explicit_destinations=explicit if saved is not None else None)
+        request_report = app.request_report(settings, refresh=args.refresh)
         result = app.run(progress=print_line) if request_report or status not in {'completed', 'partial'} else app.result_snapshot()
         _render_native_result(app, result)
         _ensure_research_cli_success(result['status'], operation='Research report', root=root)
@@ -1861,7 +1838,6 @@ def _print_code_task_init(args: argparse.Namespace) -> None:
             edit_scope_mode=options.edit_scope_mode,
             edit_scope_allowed_patterns=options.edit_scope_allowed_patterns,
             edit_scope_protected_patterns=options.edit_scope_protected_patterns,
-            direct_edit=True,
         )
     except (
         FileExistsError,
@@ -2295,13 +2271,11 @@ def _print_code_task_execute(args: argparse.Namespace) -> None:
 
     run_dir = Path(args.run_dir)
     direct_edit = False
-    if (not args.interactive and not args.dry_run
-            and use_llm and EXECUTE_STEPS.index(to_step) > EXECUTE_STEPS.index('plan')):
+    if not args.interactive:
+        from simple_ar.code_task.orchestration.execute import direct_edit_available
         from simple_ar.code_task.runtime.state import load_code_task_manifest
         saved = load_code_task_manifest(run_dir)
-        direct_edit = (saved.get('code_task', {}).get('auto_edit_policy') == 'direct.v1'
-            and (saved.get('plan', {}).get('status') or 'not_started') == 'not_started'
-            and not (run_dir / 'code_task' / 'patch_plan.md').exists())
+        direct_edit = direct_edit_available(saved, run_dir / 'code_task', to_step=to_step, use_llm=use_llm)
     render_execute_header(
         run_dir,
         to_step=to_step,
@@ -2343,10 +2317,10 @@ def _print_code_task_execute(args: argparse.Namespace) -> None:
                 or inline_allow_large_edits
                 or (direct_edit and args.yes and not args.no_review_inline)
             ),
-            **({'direct_edit': True, 'approval_note': ('Caller approved the isolated code changes.'
-                    if (args.yes and not args.no_review_inline) or args.apply_proposed_edits or options.apply_proposed_edits
-                    or inline_apply_proposed_edits else '')}
-               if direct_edit else {}),
+            direct_edit=direct_edit,
+            approval_note=('Caller approved the isolated code changes.' if direct_edit and (
+                (args.yes and not args.no_review_inline) or args.apply_proposed_edits
+                or options.apply_proposed_edits or inline_apply_proposed_edits) else ''),
             allow_planning_fallback=allow_planning_fallback,
             planning_mode=planning_mode,
             planning_review_rounds=planning_review_rounds,
