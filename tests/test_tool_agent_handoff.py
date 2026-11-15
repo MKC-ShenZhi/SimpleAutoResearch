@@ -7002,6 +7002,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(restored._client('restore', purpose=purpose).model, purpose)
                 self.assertTrue(restored._client('restore', purpose=purpose)._settings.stream)
         self.assertEqual(restored._feasibility_client('restore').model, 'review')
+        reviewer = restored.sources.feasibility_client_factory('restore')
+        self.assertEqual(reviewer.model, 'review')
+        self.assertIs(reviewer._budget_ledger, restored.ledger)
+        self.assertEqual(reviewer._budget_attempt_id, 'restore')
         self._assert_native_snapshot(restored, before)
         # First explicit role grants can use the already selected task file,
         # even after losing both the selecting environment and original cwd.

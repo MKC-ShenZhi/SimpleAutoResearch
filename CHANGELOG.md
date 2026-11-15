@@ -18,6 +18,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Fixed
 
 - Common research work carries the original request and feedback into planning, reading, synthesis and design. Source selection retains an explicit publication range; reading can combine a retained bundle with additional materials, and idea assessment can reuse that reading without replacing the initial assessment with the subsequent design review.
+- Research feasibility review uses the caller's saved reviewer connection and the same task ledger.
 - Structured data analysis can request independent review of its results and supporting materials without also requesting a report.
 - A connection or resource failure before review starts is reported without inventing an interrupted inspection.
 - Document revisions retain prior citation mappings without requiring a bibliography, resolve aliases to their recorded identities, and use the same file inheritance rules for production and acceptance.

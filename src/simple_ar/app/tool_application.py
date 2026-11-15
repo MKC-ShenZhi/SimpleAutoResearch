@@ -574,6 +574,7 @@ class ToolApplication:
             native_route_validator=self._validate_professional_route,
             scientific_revisions=(self._scientific_revision_attempts
                 if config.get('scientific_condition_reuse') == 'unchanged.v1' else None),
+            feasibility_client_factory=self._feasibility_client,
             search_registry=getattr(self.services,'search_registry',None))
         self.workspace, self.gateway = self.operations.workspace, self.operations.gateway
         self.sources, self.publication = self.operations.sources, self.operations.publication

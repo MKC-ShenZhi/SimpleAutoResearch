@@ -292,7 +292,7 @@ class OperationTools:
                  execution_observations=None, execution_history=None, artifact_changes=None,
                  work_context=None, material_observations=None,
                  user_requests=None, user_request_count=None, review_request_start=None,
-                 native_route_validator=None, scientific_revisions=None):
+                 native_route_validator=None, scientific_revisions=None, feasibility_client_factory=None):
         from simple_ar.tools.inspection import (
             InspectionToolGateway, SHARED_INSPECTION_OPERATIONS, inspection_tool_specs)
         self.root, self.config = root, config
@@ -321,6 +321,7 @@ class OperationTools:
         self.sources = SourceToolGateway(root, self.workspace, ledger, policy=config.get('research_policy'),
             authority_revision=config.get('authority_revision', 0), execution_contract=config.get('execution_contract'),
             client_factory=(lambda identity:client_factory(identity, 'task')) if config['model'] is not None else None,
+            feasibility_client_factory=feasibility_client_factory,
             registry=search_registry, user_requests=user_requests)
         self.registry.register_package(source_tool_specs(), self.sources)
         self.publication = PublicationToolGateway(root, self.workspace, ledger,
