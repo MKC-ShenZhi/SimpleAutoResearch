@@ -440,6 +440,31 @@ code = "daily"
                 contextlib.redirect_stdout(io.StringIO()):
             yield migrate
 
+    def test_structured_entry_carries_required_review_to_common_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / 'research.toml'
+            config.write_text('[task]\ngoal="Assess supplied work"\n'
+                'independent_review_required=true\n[model]\nname="fixture"\n', encoding='utf-8')
+            for options in (
+                    ['--topic', 'Assess supplied work', '--model', 'fixture', '--independent-review-required'],
+                    ['--config', str(config)]):
+                with self.subTest(options=options), self._structured_creation() as migrate:
+                    main(['research-session', *options])
+                self.assertTrue(migrate.call_args.kwargs['research_config']['independent_review_required'])
+            with self._structured_creation() as migrate:
+                main(['research-session', '--topic', 'Assess supplied work', '--model', 'fixture'])
+            self.assertNotIn('independent_review_required', migrate.call_args.kwargs['research_config'])
+            with patch('simple_ar.cli.start.create_declared_research', return_value=True) as create, \
+                    patch('simple_ar.cli.main._optional_research_llm_client',
+                          side_effect=lambda model, *a, **k: object() if model else None):
+                main(['research-session', '--topic', 'Check the implementation', '--model', 'fixture',
+                    '--independent-review-required', '--outputs', 'experiments', '--cwd', str(root),
+                    '--command', sys.executable, '-c', 'pass'])
+            self.assertTrue(create.call_args.kwargs['research_config']['independent_review_required'])
+            with self.assertRaisesRegex(SystemExit, 'existing common task'):
+                main(['research-session', '--session-root', str(root / 'saved'), '--independent-review-required'])
+
     def test_structured_new_routes_outputs_roles_and_table_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

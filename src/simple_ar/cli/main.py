@@ -441,6 +441,10 @@ def _print_research_session(args: argparse.Namespace) -> None:
 
     saved_outputs = ()
     if getattr(args, "session_root", None) is not None:
+        if 'independent_review_required' in getattr(args, '_explicit_resume_destinations', ()):
+            raise SystemExit('This option creates a new task. For an existing common task, use '
+                'start --resume-task with --supply-task to revise the review requirement; '
+                'historical research sessions retain their saved review contract.')
         manifest = Path(args.session_root) / 'session_manifest.json'
         if manifest.is_file() and read_json(manifest).get('transition_recipe') == 'native-tools-v1':
             from simple_ar.cli.start import resume_structured_task
@@ -638,6 +642,8 @@ def _print_research_session(args: argparse.Namespace) -> None:
         "research_max_iterations": args.max_research_iterations,
         "report": report_config,
     }
+    if getattr(args, 'independent_review_required', False):
+        config['independent_review_required'] = True
     if writing_method is not None:
         config["report_writing_method"] = writing_method
     if review_model and resume_root is None:

@@ -527,6 +527,7 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 | `--outputs CHOICE ...` | 请求的成果；不能与 --with-report 或 --no-report 同用。 可选：`summary`, `report`, `experiments`, `bug_fix`, `code_task`, `data_analysis`. | 未设置 |
 | `--material PATH` | 笔记、草稿或分析包，可重复。普通材料未经核验，不等同文献论文。 | [] |
 | `--model SELECTOR` | 模型选择器：env、profile:NAME 或 route:NAME。 | 直接 CLI：无；TOML 通常 env；恢复保留模型 |
+| `--independent-review-required` | 正式交付前需要独立复核，允许如实部分交付。 | 新建模型任务；默认关闭 |
 | `--feasibility-review-model SELECTOR` | 用于有来源依据的可行性审阅的独立模型。 | 未设置 |
 | `--output-root PATH` | 新任务／运行目录的父目录。 | runs/research-session |
 | `--cache-dir PATH` | 可选共享全文缓存位置。 | 会话本地缓存 |

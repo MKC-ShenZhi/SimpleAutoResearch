@@ -7,6 +7,7 @@ import tomllib
 
 FIELDS = {
     "task": {"goal": ("topic", str), "kind": ("task_kind", str), "outputs": ("outputs", list), "output_root": ("output_root", str),
+              "independent_review_required": ("independent_review_required", bool),
               "selected_idea_id": ("selected_idea_id", str)},
     "model": {"name": ("model", str), "feasibility_review_model": ("feasibility_review_model", str),
               "max_output_tokens": ("max_output_tokens", int)},

@@ -232,6 +232,7 @@ This assumes a configured model and adjacent `paper.md`. Unknown sections/fields
 | `task.goal` | Goal/deliverables | Required string | New task |
 | `task.kind` | Structured contract | `auto`; also survey, bug_fix, measurement, reproduction, writing, data_analysis | New task |
 | `task.outputs` | Requested outputs | Optional list: summary, report, experiments, bug_fix, code_task, data_analysis | New task; do not combine with CLI report toggles |
+| `task.independent_review_required` | Require independent review before complete delivery | Boolean false | New model-backed task; use task supply for an existing common task |
 | `task.output_root` | Output parent | Path string `runs/research-session` | New location |
 | `task.selected_idea_id` | Existing grounded candidate ID | Optional string | New selection |
 | `model.name` | Connection selector | String `env` for TOML; empty for deterministic work | New task |

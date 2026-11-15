@@ -232,6 +232,7 @@ papers = ["paper.md"]
 | `task.goal` | 目标／交付 | 必填字符串 | 新任务 |
 | `task.kind` | 结构化合同 | auto；另支持 survey、bug_fix、measurement、reproduction、writing、data_analysis | 新任务 |
 | `task.outputs` | 请求成果 | 可选列表：summary、report、experiments、bug_fix、code_task、data_analysis | 新任务；不与 CLI 报告开关合用 |
+| `task.independent_review_required` | 正式交付前需要独立复核 | 布尔 false | 新建模型任务；已有共同任务通过补齐修改 |
 | `task.output_root` | 输出父目录 | 路径 runs/research-session | 新位置 |
 | `task.selected_idea_id` | 已有且有依据的候选 ID | 可选字符串 | 新选择 |
 | `model.name` | 连接选择器 | TOML 默认 env；空字符串用于确定性工作 | 新任务 |

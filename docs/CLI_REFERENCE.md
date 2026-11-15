@@ -528,6 +528,7 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 | `--outputs CHOICE ...` | Requested outputs; cannot combine with --with-report or --no-report. Choices: `summary`, `report`, `experiments`, `bug_fix`, `code_task`, `data_analysis`. | Unset |
 | `--material PATH` | Notes, drafts or an analysis package; repeatable. Ordinary materials are unverified, not bibliographic papers. | [] |
 | `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME. | Direct CLI: none; TOML normally env; resume keeps model |
+| `--independent-review-required` | Require independent review before complete delivery; partial delivery remains available. | New model-backed task; off |
 | `--feasibility-review-model SELECTOR` | Independent model for source-backed feasibility review. | Unset |
 | `--output-root PATH` | Parent directory for a new task/run. | runs/research-session |
 | `--cache-dir PATH` | Optional shared full-text cache location. | Session-local cache |

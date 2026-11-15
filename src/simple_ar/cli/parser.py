@@ -109,6 +109,8 @@ def build_parser(
     session_parser.add_argument("--total-tokens", type=int, default=None, help="Optional session API token budget; omitted means unlimited.")
     session_parser.add_argument("--llm-requests", type=int, default=None, help="Optional session API request budget; omitted means unlimited.")
     session_parser.add_argument("--max-output-tokens", type=int, default=None)
+    session_parser.add_argument("--independent-review-required", action="store_true",
+        help="Require independent review for a new common task's complete delivery; partial delivery remains available.")
     session_parser.add_argument(
         "--max-section-tokens",
         type=int,
