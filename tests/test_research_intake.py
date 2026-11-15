@@ -67,6 +67,44 @@ def _reply(name, arguments):
 
 
 class ResearchIntakeTests(unittest.TestCase):
+    def test_legacy_planning_controls_are_honored_by_common_research(self):
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            client = _JSONClient()
+            controls = {'research_materials_only': True, 'research_plan_mode': ' Deterministic ',
+                        'research_max_queries': 2, 'research_planning_max_output_tokens': 1600}
+            services = ResearchApplicationServices(llm_client=client, config=controls,
+                budget_limits={'llm_requests': 2, 'total_tokens': 100000})
+            app = create_research_task(ResearchBrief(request_text='Compare reliable methods.'),
+                root=base / 'research', services=services)
+            store = ArtifactStore(app.session.store.root / 'attempts' / 'planning')
+            context = CapabilityContext(store, AttemptManifest('planning', capability='native_tool'))
+            result = app.sources.execute_tool('research', context,
+                {'operation': 'plan', 'question': 'Compare methods', 'use_llm': True})
+            self.assertEqual(result.status, 'ok', result.error)
+            self.assertLessEqual(len(store.read_json('research_plan.json')['query_plan']['queries']), 2)
+            self.assertEqual(client.calls, [])
+            self.assertEqual(app.ledger.entries, ())
+            self.assertEqual(app.sources.policy.plan_mode, 'deterministic')
+
+            # Model planning uses the same caller controls when explicitly enabled.
+            controls['research_plan_mode'] = 'llm'
+            services = replace(services, config=controls)
+            app = create_research_task(ResearchBrief(request_text='Compare reliable methods.'),
+                root=base / 'model-research', services=services)
+            store = ArtifactStore(app.session.store.root / 'attempts' / 'planning')
+            context = CapabilityContext(store, AttemptManifest('planning', capability='native_tool'))
+            with patch.object(client, 'ask_json', return_value={
+                    'queries': ['method one', 'method two', 'method three'],
+                    'questions': [{'question': 'Which methods?', 'facet': 'method'}]}) as ask:
+                result = app.sources.execute_tool('research', context,
+                    {'operation': 'plan', 'question': 'Compare methods', 'use_llm': True})
+            self.assertEqual(result.status, 'ok', result.error)
+            self.assertEqual(ask.call_args.kwargs['max_output_tokens'], 1600)
+            self.assertLessEqual(len(store.read_json('research_plan.json')['query_plan']['queries']), 2)
+
     def test_common_research_starts_from_saved_brief_and_retains_extraction_location(self):
         with TemporaryDirectory() as directory, patch.object(LLMClient, 'from_env',
                 side_effect=AssertionError('No model was authorized')):

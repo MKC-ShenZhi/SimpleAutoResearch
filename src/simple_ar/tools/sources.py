@@ -48,6 +48,9 @@ class SourcePolicy(BaseModel):
     queries: tuple[str, ...] = ()
     providers: tuple[str, ...] = ('arxiv', 'openalex', 'semantic_scholar', 'web')
     materials: tuple[str, ...] = ()
+    plan_mode: Literal['deterministic', 'llm'] | None = Field(default=None, exclude_if=lambda value: value is None)
+    max_queries: int | None = Field(default=None, ge=1, exclude_if=lambda value: value is None)
+    planning_max_output_tokens: int | None = Field(default=None, ge=1, exclude_if=lambda value: value is None)
     max_results: int = Field(default=5, ge=1, le=1000)
     max_documents: int = Field(default=20, ge=1, le=1000)
     max_chunks: int | None = Field(default=80, ge=1, le=10000)
@@ -99,6 +102,11 @@ class SourcePolicy(BaseModel):
     @classmethod
     def sequences(cls, value: Any) -> Any:
         return tuple(value) if isinstance(value, list) else value
+
+    @field_validator('plan_mode', mode='before')
+    @classmethod
+    def planning_mode(cls, value: Any) -> Any:
+        return value.strip().lower() if isinstance(value, str) else value
 
     @model_validator(mode='after')
     def validate_contract(self) -> SourcePolicy:
@@ -785,10 +793,18 @@ class SourceToolGateway:
         op, bundle, read = request.operation, None, None
         plan = ResearchPlanResult.from_handoff_dict(self._handoff(request.plan_record, 'research_plan.v1')) if request.plan_record else None
         if op == 'plan':
+            plan_uses_llm = request.use_llm and policy.plan_mode != 'deterministic'
+            plan_config = {'research_queries': list(policy.queries), 'research_sources': list(policy.providers),
+                           'research_auto_query_expansion': False}
+            if policy.max_queries is not None:
+                plan_config['research_max_queries'] = policy.max_queries
+            if policy.planning_max_output_tokens is not None:
+                plan_config['research_planning_max_output_tokens'] = policy.planning_max_output_tokens
             run(run_research_plan_capability, ResearchPlanRequest(topic=request.question,
-                config={'research_queries': list(policy.queries), 'research_sources': list(policy.providers),
-                        'research_auto_query_expansion': False}, default_max_results=policy.max_results,
-                use_llm=request.use_llm, llm_client=client(), user_requests=user_requests))
+                config=plan_config, default_max_results=policy.max_results,
+                problem_markdown=task_context if not plan_uses_llm else '',
+                use_llm=plan_uses_llm, llm_client=client() if plan_uses_llm else None,
+                user_requests=user_requests))
             planned = context.store.read_json('research_plan.json')
             planned['source_plan'] = replace(policy.source_plan(),
                 queries=list(policy.queries) or planned['source_plan']['queries'],
