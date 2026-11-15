@@ -485,6 +485,27 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
         self.assertEqual(len(case.inspection_requests), checked)
 
+    def test_expanded_delivery_keeps_selected_review_without_reusing_unchecked_work(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
+
+        case = OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.app = ToolApplication.create(case.root, 'Review and deliver the findings.', model='fixture',
+            sources={}, services=case.services, max_turns=20, max_tokens=900000, max_attempts=100)
+        case.review = case._review_complete_targets
+        case._write('note.md', 'Original finding.\n')
+        claim = {'summary': 'The findings', 'artifacts': ['note.md']}
+        case._submit(_action('review_result', **claim, review_scope='delivery'))
+        case._ok('review_result', reviewed=True)
+        checked = len(case.inspection_requests)
+        case._write('supplement.md', 'Additional finding.\n')
+        case._submit(_action('deliver_result', summary='The findings',
+            artifacts=['note.md', 'supplement.md'], independent_review=False))
+        self.assertGreater(len(case.inspection_requests), checked)
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+
     def test_caller_required_review_cannot_be_waived_and_reuses_the_reviewed_candidate(self):
         from simple_ar.app.tool_application import ToolApplication
         from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
