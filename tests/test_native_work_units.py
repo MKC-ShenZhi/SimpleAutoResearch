@@ -529,6 +529,38 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertTrue(c.app.workspace.resolve(prior['record']).is_file())
         self.assertEqual(c.app._work_context(['note.md'])['retained_prior_delivery'], prior)
 
+    def test_feedback_retains_partial_delivery_and_its_unfinished_work(self):
+        c = self.case
+        c._write('baseline.txt', 'Previously completed measurements.\n')
+        c.decisions.append(fixture._action('review_result', summary='Completed baseline',
+            artifacts=['baseline.txt'], review_scope='delivery'))
+        self.drain()
+        review = c._last('review_result')['metadata']['delivery_review']['identity']
+        c.decisions.append(fixture._action('deliver_result', reviewed_candidate=review))
+        self.drain()
+        self.assertEqual(c.app.session.manifest.status, 'completed')
+        baseline = c.app.session.store.read_json('delivery.json')['artifacts']
+
+        c._submit(fixture._action('write_file', path='note.md',
+            content='The observations support a preliminary explanation.\n'),
+            feedback='Add a comparison to the completed baseline.')
+        unfinished = ['The requested comparison still needs to be completed.']
+        c.decisions.append(fixture._action('deliver_result', summary='Preliminary note',
+            artifacts=['note.md'], unresolved=unfinished))
+        self.drain()
+        self.assertEqual(c.app.session.manifest.status, 'partial')
+
+        c._submit(fixture._action('read_file', path='note.md'),
+            feedback='Continue the comparison using the existing note.')
+        prior = c.app.operations.delivery.retained_prior_delivery()
+        self.assertEqual(prior['artifacts'], c.app.session.store.read_json('delivery.json')['artifacts'])
+        self.assertEqual(prior['unresolved'], unfinished)
+        self.assertEqual(prior['earlier_deliveries'][0]['artifacts'], baseline)
+        self.assertNotEqual(prior['record'], prior['earlier_deliveries'][0]['record'])
+        self.assertEqual(c.app._work_context(['note.md'])['retained_prior_delivery'], prior)
+        document_context = c.app.operations.document.work_context([str(c.inputs)])
+        self.assertIn('baseline.txt', json.dumps(document_context['professional_findings']))
+
     def test_new_model_review_defaults_to_candidate_scope_without_claiming_delivery(self):
         c = self.case
         c._write('note.md', 'A useful intermediate explanation.\n')

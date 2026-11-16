@@ -495,14 +495,18 @@ class OperationTools:
                 or config.get('document_context_policy') in {'working.v3', 'working.v4'}
                    and config.get('report_requirement') is not None)):
             from simple_ar.tools.document_work import DocumentWorkToolGateway, document_work_tool_specs
-            if config.get('document_context_policy') in {'working.v2', 'working.v3', 'working.v4'} and config.get('report_requirement') is not None:
-                from simple_ar.report.requirements import working_report_requirement
+            if config.get('document_context_policy') == 'working.v4' and work_context is not None:
                 def document_context(targets):
-                    context = work_context(targets) if work_context is not None else {}
-                    return {**context, 'requested_report': working_report_requirement(
-                        config['report_requirement'], for_writing=True)}
+                    return work_context(targets, include_retained_delivery=True)
             else:
                 document_context = work_context
+            if config.get('document_context_policy') in {'working.v2', 'working.v3', 'working.v4'} and config.get('report_requirement') is not None:
+                from simple_ar.report.requirements import working_report_requirement
+                base_document_context = document_context
+                def document_context(targets):
+                    context = base_document_context(targets) if base_document_context is not None else {}
+                    return {**context, 'requested_report': working_report_requirement(
+                        config['report_requirement'], for_writing=True)}
             self.document = DocumentWorkToolGateway(root, self.workspace, ledger, session_id,
                 client_factory=lambda identity: client_factory(identity, 'writing'),
                 work_context=document_context, material_observations=material_observations,

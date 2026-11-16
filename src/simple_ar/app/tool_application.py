@@ -1569,8 +1569,14 @@ class ToolApplication:
             context['professional_findings'] = findings
         return context
 
-    def _work_context(self, targets: list[str]) -> dict[str, Any]:
+    def _work_context(self, targets: list[str], *, include_retained_delivery: bool = False) -> dict[str, Any]:
         """Freeze the original requests, related feedback and working understanding for an owner."""
+        prior = (self.operations.delivery.retained_prior_delivery()
+                 if self.operations is not None and self.operations.professional else None)
+        if include_retained_delivery and prior:
+            from simple_ar.tools.materials import retained_delivery_targets
+            retained, _ = retained_delivery_targets(self.workspace, prior)
+            targets = list(dict.fromkeys([*targets, *retained]))
         observations = (self._operation_observations()
                         if self.operations is not None and self.operations.professional else None)
         feedback = (self._work_feedback(targets, observations=observations)
@@ -1585,7 +1591,6 @@ class ToolApplication:
             context['creation_declarations'] = self.state['config']['creation_declarations']
         if self.operations is not None and self.operations.professional:
             context['working_notes'] = self._working_memory(observations=observations)['notes']
-            prior = self.operations.delivery.retained_prior_delivery()
             if prior is not None:
                 context['retained_prior_delivery'] = prior
         inherited = self._retained_working_inputs(targets)

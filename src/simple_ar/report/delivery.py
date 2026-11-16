@@ -184,22 +184,27 @@ class Delivery:
         return request
 
     def retained_prior_delivery(self) -> dict | None:
-        """Present the last retained complete delivery for a continuing request."""
+        """Present retained work and any unfinished requirements to a continuing request."""
         if self.user_requests is None:
             return None
         count = self.user_request_count() if self.user_request_count is not None else len(self.user_requests())
         if count < 2:
             return None
         from simple_ar.tools.delivery_versions import DeliveryVersions
-        row = DeliveryVersions(self.workspace.root).latest_prior(count)
-        if row is None:
+        rows = DeliveryVersions(self.workspace.root).prior_work(count)
+        if not rows:
             return None
-        delivery = row['delivery']
-        return {'record': 'records/' + row['observation'].removeprefix('attempts/'),
-            'artifacts': delivery.get('artifacts', []),
-            **({'project_root': delivery['project_root']} if delivery.get('project_root') else {}),
-            'scope': 'Retained prior work, not the current delivery or proof that live files are unchanged. '
-                'Read its original record for the full claim. Reuse work relevant to the current request; '
+        def present(row):
+            delivery = row['delivery']
+            return {'record': 'records/' + row['observation'].removeprefix('attempts/'),
+                'artifacts': delivery.get('artifacts', []),
+                **({'unresolved': delivery['unresolved']} if delivery.get('unresolved') else {}),
+                **({'project_root': delivery['project_root']} if delivery.get('project_root') else {})}
+        return {**present(rows[0]),
+            **({'earlier_deliveries': [present(row) for row in rows[1:]]} if len(rows) > 1 else {}),
+            'scope': 'Retained prior work, which may be partial, not the current delivery or proof that live files are unchanged. '
+                'Each delivery keeps its own record and unfinished work. Read the original record for the full claim. '
+                'Reuse work relevant to the current request; '
                 'current delivery and review use actual versions.'}
 
     def working_guidance(self, accepted_delivery: dict | None, *, include_lifecycle: bool,

@@ -154,6 +154,22 @@ def freeze_work_context(provider: Callable[[list[str]], dict], targets: list[str
     return json.loads(serialized)
 
 
+def retained_delivery_targets(workspace: Any, retained: dict | None) -> tuple[list[str], list[dict]]:
+    """Resolve only delivered files still available to the current task."""
+    deliveries = [retained, *retained.get('earlier_deliveries', [])] if retained else []
+    paths, unavailable = [], []
+    for locator in dict.fromkeys(path for delivery in deliveries for path in delivery.get('artifacts', [])):
+        try:
+            path = workspace.resolve_material_root(locator)
+            if not path.is_file():
+                raise FileNotFoundError(locator)
+        except (OSError, ValueError):
+            unavailable.append({'path': locator, 'reason': 'current_delivery_path_unavailable'})
+            continue
+        paths.append(str(path))
+    return list(dict.fromkeys(paths)), unavailable
+
+
 def retained_working_inputs(config: dict, *, resolve: Callable[[str], Path],
                             targets: list[str] | None = None) -> dict:
     """Project creation-frozen selected lineage into the common working view.

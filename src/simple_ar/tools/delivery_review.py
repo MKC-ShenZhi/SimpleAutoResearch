@@ -361,6 +361,11 @@ class DeliveryReview:
 
         roots = [self.workspace.resolve(path) for path in targets]
         selected = None
+        versions = {}
+        def current_version(path):
+            if path not in versions:
+                versions[path] = self.workspace.artifact_hashes([str(path)])[str(path)]
+            return versions[path]
         copy_cache = {}
         result, concluded, repeated = [], set(), {}
         rows = (self.observations() if self.observations is not None else []) if observations is None else observations
@@ -368,9 +373,6 @@ class DeliveryReview:
             feedback = self.feedback_from_observation(observed, guidance_only=True)
             if feedback is None:
                 continue
-            if selected is None:
-                selected = {path: self.workspace.artifact_hashes([str(path)])[str(path)]
-                    for path in roots if path.is_file()}
             feedback.pop('_accepted_result', None)  # The original stays in its journal receipt.
             subjects = []
             targets_reviewed = feedback.pop('reviewed_subjects')
@@ -406,14 +408,18 @@ class DeliveryReview:
                     continue
                 if not package and (subject, digest) in concluded and not has_guidance:
                     continue
-                current_path = related_review_target(self.workspace, subject, digest, roots, selected,
+                current_path = related_review_target(self.workspace, subject, digest, roots, {},
                     copy_lineage=True, cache=copy_cache)
+                if current_path is None:
+                    if selected is None:
+                        selected = {path: current_version(path) for path in roots if path.is_file()}
+                    current_path = related_review_target(self.workspace, subject, digest, roots, selected,
+                        copy_lineage=True, cache=copy_cache)
                 if current_path is None:
                     continue
                 if signature is not None:
                     signatures.append(signature)
-                current = (self.workspace.artifact_hashes([str(current_path)])[str(current_path)]
-                    if current_path.is_file() else None)
+                current = current_version(current_path) if current_path.is_file() else None
                 subjects.append({'path': locator, 'reviewed_sha256': digest,
                     'selected_path': str(current_path), 'current_sha256': current,
                     'current_matches_review': current == digest,
@@ -446,7 +452,7 @@ class DeliveryReview:
                 try:
                     path = self.workspace.resolve(locator)
                     if path.is_file():
-                        current = self.workspace.artifact_hashes([str(path)])[str(path)]
+                        current = current_version(path)
                 except (ValueError, OSError):
                     pass  # An inaccessible related subject must not hide selected guidance.
                 subjects.append({'path': locator, 'reviewed_sha256': bindings[locator],

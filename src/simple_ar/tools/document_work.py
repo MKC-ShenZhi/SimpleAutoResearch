@@ -22,7 +22,7 @@ from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.tools.materials import (
     freeze_work_context, material_inventories, material_observation_seed,
     read_bound_material_bytes, read_material_bytes, read_material_window, validate_material_observation,
-    window_key, relative_image_target, document_local_targets,
+    window_key, relative_image_target, document_local_targets, retained_delivery_targets,
 )
 from simple_ar.tools.sources import SourceToolGateway
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
@@ -591,6 +591,13 @@ class DocumentWorkToolGateway:
         targets = [*roots, *([request.prior_draft] if prior else [])]
         context = freeze_work_context(self.work_context or (lambda _targets: {}), targets)
         inventories = material_inventories(self.workspace, roots, identity=identity)
+        # A continuing task already owns these delivered files. Offer their
+        # current locations as candidates, without scanning the workspace or
+        # treating an earlier delivery/review as proof of the present bytes.
+        retained = context['work_context'].get('retained_prior_delivery') if self.context_policy == 'working.v4' else None
+        retained_paths, unavailable = retained_delivery_targets(self.workspace, retained)
+        if retained_paths:
+            inventories.extend(material_inventories(self.workspace, retained_paths, identity=identity))
         # References in the actual current manuscript are part of that work
         # product, even when its directory is outside the original input roots.
         prior_files = ([row['source'] for row in [*prior['images'], *prior_links] if row.get('source')]
@@ -632,19 +639,22 @@ class DocumentWorkToolGateway:
                     target = 'assets/new-' + target.removeprefix('assets/')
                 occupied.add(target)
             candidates.append({'path': path, 'size_bytes': size,
-                'delivery_path': target})
+                'delivery_path': target,
+                **({'role': 'retained_delivery_work'} if path in retained_paths else {})})
         base = {'goal': request.goal, 'work_context': context['work_context'],
             'work_context_scope': {'role': context['role'], 'usage': context['usage']}, 'prior_draft': prior,
             'prior_asset_links': prior_links,
             'material_roots': roots, 'candidates': candidates,
             'original_source_bundles': source_views,
-            'inventory_scope': [item.get('inventory_scope', '') for item in inventories],
-            'omitted_files': [row for item in inventories for row in item.get('omitted_files', [])]}
+            'inventory_scope': [item.get('inventory_scope', '') for item in inventories] + ([
+                'Retained delivery candidates are prior work at their current paths, not original research '
+                'evidence or proof that earlier checks apply to the current files.'] if retained_paths else []),
+            'omitted_files': [row for item in inventories for row in item.get('omitted_files', [])] + unavailable}
         if self.context_policy is None and len(json.dumps(base, ensure_ascii=False).encode('utf-8')) > 256000:
             raise ValueError('Document work input exceeds 256 KB; narrow the work unit without dropping feedback')
         source_paths = {row['path'] for row in source_views}
         seed = material_observation_seed(workspace=self.workspace, inventories=inventories,
-            provider=self.material_observations, roots=roots, context=base,
+            provider=self.material_observations, roots=[*roots, *retained_paths], context=base,
             excluded_paths=source_paths | ({prior_path} if prior_path else set()),
             **({'remaining_bytes': context_input_tokens * 4}
                if self.context_policy else {}))
@@ -1317,12 +1327,15 @@ class DocumentWorkToolGateway:
         artifacts = [candidate['manuscript'], *(row['path'] for row in all_assets)]
         hashes = self.workspace.artifact_hashes(artifacts)
         evidence = []
+        retained_paths = {row['path'] for row in binding['context']['candidates']
+            if row.get('role') == 'retained_delivery_work'}
         for row in candidate['selected']:
             if row['kind'] == 'material_window':
                 data = row['observation']['data']
                 evidence.append({'id': row['id'], 'kind': row['kind'], 'path': data['absolute_path'],
                     'sha256': data['sha256'], 'offset_bytes': data.get('offset_bytes', row['observation']['request'].get('offset_bytes', 0)),
-                    'next_offset_bytes': data['next_offset_bytes'], 'has_more': data['has_more']})
+                    'next_offset_bytes': data['next_offset_bytes'], 'has_more': data['has_more'],
+                    **({'role': 'retained_delivery_work'} if data['absolute_path'] in retained_paths else {})})
             else:
                 evidence.append({'id': row['id'], 'kind': row['kind'], 'path': row['data']['document_path'],
                     'sha256': row['data']['document_sha256'], 'query': row['request']['query'],
@@ -1347,7 +1360,8 @@ class DocumentWorkToolGateway:
                 if binding['context']['prior_draft'] else None),
             'provenance': {'evidence': evidence, 'attachments': all_assets,
                 'observations_record': f'records/{identity}/document_work/observations.json',
-                'scope': 'Selected observed original windows and source passages only; no independent verification.'},
+                'scope': ('Selected observed windows and source passages, including identified prior work; no independent verification.'
+                    if retained_paths else 'Selected observed original windows and source passages only; no independent verification.')},
             'coverage': {'omitted_files': binding['context']['omitted_files'],
                 'scope': 'Inventory and observed windows are bounded; unread content is not evidence of absence.'},
             'gaps': gaps, 'receipt': f'records/{identity}/document_work/receipt.json'}
@@ -1359,8 +1373,9 @@ class DocumentWorkToolGateway:
                 data['review'] = authored['review']
             if authored.get('source_reads_record'):
                 data['provenance']['writer_source_reads'] = authored['source_reads_record']
-                data['provenance']['scope'] = ('Selected original observations and recorded Writer source reads; '
-                    'no independent verification.')
+                data['provenance']['scope'] = (('Selected observed windows, identified prior work and recorded Writer source reads; '
+                    if retained_paths else 'Selected original observations and recorded Writer source reads; ')
+                    + 'no independent verification.')
         if binding['contract'] == 'document_work_operation.v2' or binding['contract'] in _MATERIAL_ID_CONTRACTS:
             data['measurements'] = manuscript_measurements(markdown)
         result = ToolResult(tool_name='work_document', data=data, artifacts=artifacts,

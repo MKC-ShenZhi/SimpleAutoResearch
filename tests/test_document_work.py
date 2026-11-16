@@ -895,6 +895,62 @@ class DocumentWorkTests(unittest.TestCase):
             material_observations=observations, sources=sources, context_policy=context_policy)
         return gateway, clients
 
+    def test_feedback_uses_retained_delivery_without_inventing_evidence_or_scanning_workspace(self):
+        root, source, ledger, workspace = self.workspace()
+        result_file = workspace.workspace / 'result.txt'
+        result_file.write_text('The measured value is 2.\n', encoding='utf-8')
+        baseline = workspace.workspace / 'baseline.txt'
+        baseline.write_text('The original baseline.\n', encoding='utf-8')
+        (workspace.workspace / 'unrelated.txt').write_text('Not delivered.\n', encoding='utf-8')
+        request = {'path': 'workspace/result.txt', 'full_digest': True}
+        observed = workspace.call('read_file', request, identity='previous-read')
+        self.assertTrue(observed.ok)
+        context = {'user_requests': ['Explain the result', 'Clarify its conditions'],
+            'retained_prior_delivery': {'record': 'records/previous/native_result.json',
+                'artifacts': ['workspace/result.txt', 'workspace/missing.txt'],
+                'unresolved': ['The comparison remains open.'],
+                'earlier_deliveries': [{'record': 'records/baseline/native_result.json',
+                    'artifacts': ['workspace/baseline.txt']}]}}
+
+        def references(roots):
+            self.assertIn(str(result_file), roots)
+            return [{'request': request, 'data': observed.data}]
+
+        def decide(view, count):
+            candidates = {row['path']: row for row in view['candidates']}
+            self.assertEqual(candidates[str(result_file)]['role'], 'retained_delivery_work')
+            self.assertEqual(candidates[str(baseline)]['role'], 'retained_delivery_work')
+            self.assertNotIn(str(workspace.workspace / 'unrelated.txt'), candidates)
+            self.assertIn({'path': 'workspace/missing.txt', 'reason': 'current_delivery_path_unavailable'},
+                view['omitted_files'])
+            self.assertEqual(view['work_context']['retained_prior_delivery']['unresolved'],
+                ['The comparison remains open.'])
+            if result_file.read_text(encoding='utf-8').endswith('2.\n'):
+                self.assertEqual(view['observations'][0]['observation']['data']['text'],
+                    'The measured value is 2.\n')
+            elif count == 1:
+                self.assertEqual(view['observations'], [])
+                return {'action': 'investigate', 'read_windows': [{'path': 'workspace/result.txt'}]}
+            else:
+                self.assertEqual(view['observations'][0]['observation']['data']['text'],
+                    'The corrected value is 3.\n')
+            return {'action': 'finish', 'selected_observation_ids': ['o1'],
+                'manuscript_markdown': '# Result\nA bounded result with its actual conditions.\n'}
+
+        gateway, clients = self.gateway(root, source, ledger, workspace, decide,
+            context=context, observations=references, context_policy='working.v4')
+        first = gateway.call('work_document', {'goal': 'Clarify the retained result'}, identity='first')
+        self.assertTrue(first.ok, first.error)
+        self.assertEqual(len(clients[-1].calls), 1)
+        self.assertEqual(first.data['provenance']['evidence'][0]['path'], str(result_file))
+        self.assertEqual(first.data['provenance']['evidence'][0]['role'], 'retained_delivery_work')
+
+        result_file.write_text('The corrected value is 3.\n', encoding='utf-8')
+        second = gateway.call('work_document', {'goal': 'Clarify the corrected result'}, identity='second')
+        self.assertTrue(second.ok, second.error)
+        self.assertEqual(len(clients[-1].calls), 2)
+        self.assertEqual(result_file.read_text(encoding='utf-8'), 'The corrected value is 3.\n')
+
     def test_revision_investigates_originals_and_reuses_parent_read_without_fixed_rounds(self):
         root, source, ledger, workspace = self.workspace()
         ledger.limits['total_tokens'] = 10000
