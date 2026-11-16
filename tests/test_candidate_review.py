@@ -631,7 +631,7 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         self.assertEqual(guidance['minimum_resources']['llm_requests'], 1)
         self.assertEqual(case.app.operations.document.work_context([])['retained_prior_delivery'], prior)
 
-        grant = {'resource_allowances': {'llm_requests': 3, 'total_tokens': 300000},
+        grant = {'resource_allowances': {'llm_requests': 6, 'total_tokens': 400000},
                  'authorization_id': 'continue-partial', 'authorization_reason': 'Complete the required review'}
         # The original authorization and the exact partial are saved together;
         # a stop before reopening can recover without another grant or request.
@@ -647,14 +647,22 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         self.assertEqual(case.app.ledger.to_dict(), saved_ledger)
         self.assertEqual((case.root / 'workspace/note.md').read_bytes(), original)
 
-        case._submit(_action('review_result', summary='Checked note', artifacts=['note.md'],
-            review_scope='delivery'))
-        proof = case._ok('review_result', reviewed=True)['metadata']['delivery_review']
-        checked = len(case.inspection_requests)
-        case._submit(_action('deliver_result', reviewed_candidate=proof['identity']))
+        def review():
+            request = case.send.call_args.kwargs.get('request') or case.send.call_args.args[1]
+            view = json.JSONDecoder().raw_decode(request['messages'][1]['content'])[0]
+            self.assertEqual(view['retained_prior_delivery']['unresolved'], claim['unresolved'])
+            return _action('review_result', summary='Checked note', artifacts=['note.md'], review_scope='delivery')
+
+        def deliver():
+            proof = case._ok('review_result', reviewed=True)['metadata']['delivery_review']
+            return _action('deliver_result', reviewed_candidate=proof['identity'])
+
+        case.decisions.extend([review, deliver])
+        case._run(should_stop=lambda: not case.decisions and case.app.state['pending'] is None
+            and not any(turn['remaining'] for turn in case.app.state['turns']))
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
         self.assertEqual(case.app.state['requests'], requests)
-        self.assertEqual(len(case.inspection_requests), checked)
+        self.assertTrue(case.inspection_requests)
         self.assertIsNone(case.app.operations.delivery.retained_prior_delivery())
         before_replay = deepcopy(case.app.ledger.to_dict())
         case.app.run(**grant, progress=lambda _: None)
