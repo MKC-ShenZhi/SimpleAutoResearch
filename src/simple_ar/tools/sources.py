@@ -367,6 +367,7 @@ class SourceToolGateway:
 
     def __init__(self, root: Path, workspace: Any, ledger: BudgetLedger, *,
                  policy: SourcePolicy | dict[str, Any] | None = None,
+                 default_policy: dict[str, Any] | None = None,
                  registry: SearchProviderRegistry | None = None,
                  client_factory: Callable[[str], Any] | None = None,
                  feasibility_client_factory: Callable[[str], Any] | None = None,
@@ -380,7 +381,7 @@ class SourceToolGateway:
         # Preserve the original config distinction across gateway reconstruction;
         # never add it to SourcePolicy or historical policy snapshots.
         self._policy_supplied = policy is not None
-        self.policy = (SourcePolicy(max_results=20) if policy is None
+        self.policy = (SourcePolicy.model_validate(default_policy or {'max_results': 20}) if policy is None
             else SourcePolicy.model_validate(policy)).model_copy(deep=True)
         self.client_factory, self.feasibility_client_factory = client_factory, feasibility_client_factory
         self.user_requests = user_requests

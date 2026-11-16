@@ -489,14 +489,21 @@ class ResearchIntakeTests(unittest.TestCase):
         from simple_ar.tools.sources import SourcePolicy
 
         self.assertNotIn('extraction_dir', SourcePolicy().model_dump(mode='json'))
-        # A saved task without a source policy reconstructs the gateway default.
+        # New ordinary tasks use the same collection breadth after reload;
+        # a historical task without these defaults retains its saved behavior.
         with TemporaryDirectory() as directory:
             root = Path(directory) / 'saved-task'
-            ToolApplication.create(root, 'Use the supplied work.', model=None, sources={})
+            created = ToolApplication.create(root, 'Use the supplied work.', model=None, sources={})
             resumed = ToolApplication.load(root)
             self.assertIsNone(resumed.state['config']['research_policy'])
             self.assertEqual((resumed.sources.policy.max_fulltext_documents,
-                resumed.sources.policy.max_fulltext_fetch_attempts), (1, 3))
+                resumed.sources.policy.max_fulltext_fetch_attempts), (20, 40))
+            self.assertFalse(resumed.sources._policy_supplied)
+            created.state['config'].pop('source_policy_defaults')
+            created._save()
+            historical = ToolApplication.load(root)
+            self.assertEqual((historical.sources.policy.max_fulltext_documents,
+                historical.sources.policy.max_fulltext_fetch_attempts), (1, 3))
         records = [DocumentRecord(document_id=str(index), title=f'Source {index}', source='test',
             url=f'https://example.org/{index}.html') for index in range(4)]
 

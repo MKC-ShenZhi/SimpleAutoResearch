@@ -2120,6 +2120,10 @@ class ToolApplication:
         if options.get('creation_declarations') is not None and context_protocol not in _CONVERSATION_CONTEXT_PROTOCOLS:
             raise ValueError('Declared inputs require a journal-backed conversation context')
         config, reused, limits, attempts = cls._configuration(root, goal, **options)
+        if config.get('research_policy') is None:
+            # New unconfigured tasks can collect the available source set in
+            # one operation. Saved tasks retain their original default policy.
+            config['source_policy_defaults'] = {'max_results': 20, 'max_documents': 20}
         # Keep independent condition reuse with the scientific owner regardless
         # of the task's model prompt or working-memory selection.
         config['scientific_condition_reuse'] = 'unchanged.v1'

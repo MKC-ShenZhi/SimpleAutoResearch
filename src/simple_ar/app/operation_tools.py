@@ -319,6 +319,7 @@ class OperationTools:
             sandbox_execution=config.get('sandbox_execution', False)),
             self.workspace, request_visible=True)
         self.sources = SourceToolGateway(root, self.workspace, ledger, policy=config.get('research_policy'),
+            default_policy=config.get('source_policy_defaults'),
             authority_revision=config.get('authority_revision', 0), execution_contract=config.get('execution_contract'),
             client_factory=(lambda identity:client_factory(identity, 'task')) if config['model'] is not None else None,
             feasibility_client_factory=feasibility_client_factory,
