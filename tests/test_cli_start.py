@@ -327,7 +327,11 @@ class StartTests(unittest.TestCase):
             with patch('sys.stdin.isatty',return_value=False), patch('simple_ar.cli.main._run_native_start'):
                 prepare_start(args)
             options = native_creation_options(args)
-            self.assertIn(project,options['sources'].values())
+            self.assertEqual(options['creation_declarations']['reuse_origin']['version'], 1)
+            reused = ToolApplication.create(Path(directory)/'reused', 'Revise the supplied project', **options)
+            locator = reused.state['config']['creation_declarations']['material_roles']['project'][0]
+            self.assertEqual((reused.workspace.resolve(locator) / 'compute.py').read_text(encoding='utf-8'),
+                             (project / 'compute.py').read_text(encoding='utf-8'))
             for key in ('code_task','execution_contract','project_python','process_limits'):
                 self.assertIsNone(options[key])
             self.assertFalse(options['allow_execution'])
@@ -358,7 +362,7 @@ class StartTests(unittest.TestCase):
                 if status=='unknown':
                     app.ledger.mark_unknown('unsettled-work',reason='Retained unknown usage')
                 before = app.ledger.to_dict()
-                with self.subTest(status=status), self.assertRaisesRegex(ValueError,'unsettled'):
+                with self.subTest(status=status), self.assertRaisesRegex(ValueError,'unresolved process'):
                     app.reusable_code_project()
                 self.assertEqual(app.ledger.to_dict(),before)
 
@@ -1016,7 +1020,7 @@ class StartTests(unittest.TestCase):
                 self.assertIsNone(app.state['config'].get('execution_contract'))
                 self.assertFalse(app.ledger.entries)
                 self.assertTrue(any((path / 'research_summary.md').exists() for path in (root / 'attempts').iterdir()))
-            self.assertIn('not complete', output.getvalue())
+            self.assertIn('remains unfinished', output.getvalue())
 
     def test_structured_material_and_table_delivery_declare_roles_without_model_or_writer(self):
         from simple_ar.cli.main import main
@@ -1163,6 +1167,13 @@ class StartTests(unittest.TestCase):
         # Keep the real intake compiler; fake only the persistent task factory.
         app = create.return_value
         app.state = {'turns': [], 'pending': None}
+        app.session.manifest.state_refs = {}
+        saved = {}
+        def write(name, value, **_kwargs):
+            saved[name] = value
+            return name
+        app.session.store.write_json.side_effect = write
+        app.session.store.read_json.side_effect = lambda ref: saved[ref]
         app.sources.pending_decision.return_value = {'decision_id': 'caller-protocol',
             'proposal_kind': 'caller_execution_protocol'}
         def capture(*args, **kwargs):
@@ -2313,12 +2324,12 @@ class StartTests(unittest.TestCase):
                 (['start', '--resume-task', 'saved-task', '--output-root', 'elsewhere'], 'retains saved creation settings'),
                 ([*resources, '--yes', '--approve-execution', 'old-command'], 'separately'),
                 (['start', '--authorize-remaining', 'total_tokens=500'], '--resume-task'),
-                (['start', '--resume-task', 'saved-task', '--authorization-id', 'orphan'], 'require --authorize-remaining'),
-                (['start', '--resume-task', 'saved-task', '--authorization-reason', 'orphan'], 'require --authorize-remaining'),
-                (['start', '--resume-task', 'saved-task', '--authorize-remaining', 'total_tokens=500'], 'requires --authorization-id'),
-                (['start', '--resume-task', 'saved-task', '--authorize-remaining', 'total_tokens=500', '--authorization-id', 'missing-reason'], 'requires --authorization-id'),
-                (['start', '--resume-task', 'saved-task', '--authorize-remaining', 'total_tokens=500', '--authorization-reason', 'missing-id'], 'requires --authorization-id'),
-                ([*resources, '--authorization-reason', ' '], 'requires --authorization-id'),
+                (['start', '--resume-task', 'saved-task', '--authorization-id', 'orphan'], 'require an explicit allowance'),
+                (['start', '--resume-task', 'saved-task', '--authorization-reason', 'orphan'], 'require an explicit allowance'),
+                (['start', '--resume-task', 'saved-task', '--authorize-remaining', 'total_tokens=500'], 'require --authorization-id'),
+                (['start', '--resume-task', 'saved-task', '--authorize-remaining', 'total_tokens=500', '--authorization-id', 'missing-reason'], 'require --authorization-id'),
+                (['start', '--resume-task', 'saved-task', '--authorize-remaining', 'total_tokens=500', '--authorization-reason', 'missing-id'], 'require --authorization-id'),
+                ([*resources, '--authorization-reason', ' '], 'require --authorization-id'),
                 ([*resources, '--authorize-remaining', 'total_tokens=600'], 'Duplicate'),
                 ([*resources, '--authorize-remaining', 'bad-format'], 'DIMENSION=AMOUNT'),
             ):
@@ -2584,9 +2595,11 @@ class StartTests(unittest.TestCase):
                 'environment': {'mode': 'current', 'timeout_sec': 5,
                     'check_command': [sys.executable, '-c', 'pass']}}
             app = self._capture_creation(create)
-            app.state = {'turns': [{'origin': 'caller'}], 'pending': {'attempt': 'first'}}
+            app.state = {'turns': [], 'pending': {'attempt': 'first'}}
             app.measurement_completion_actions.return_value = []
             def run_batch(*, actions, approve, progress):
+                turn = len(app.state['turns'])
+                app.state['turns'].append({'origin': 'caller', 'request_count': len(app.state['requests'])})
                 conditions = app.state['config']['execution_contract']['conditions']
                 self.assertEqual({row['tool_name'] for row in actions}, {'measure_experiment'})
                 self.assertEqual({row['arguments']['condition_id'] for row in actions},
@@ -2594,14 +2607,14 @@ class StartTests(unittest.TestCase):
                 self.assertEqual(len(actions), len(conditions))
                 environment_prepared = False
                 for index, action in enumerate(actions):
-                    call = {'id': f'caller-0-{index}', 'function': {'name': action['tool_name'],
+                    call = {'id': f'caller-{turn}-{index}', 'function': {'name': action['tool_name'],
                         'arguments': json.dumps(action['arguments'])}}
                     changed = {**call, 'function': {**call['function'], 'arguments': json.dumps({
                         **action['arguments'], 'timeout_sec': 99})}}
                     self.assertFalse(approve(changed, 'changed-argv'))
-                    app.state['turns'][0]['origin'] = 'model'
+                    app.state['turns'][-1]['origin'] = 'model'
                     self.assertFalse(approve(call, 'model-must-not-inherit-caller-approval'))
-                    app.state['turns'][0]['origin'] = 'caller'
+                    app.state['turns'][-1]['origin'] = 'caller'
                     app.scientific.approval_binding.return_value = ({'environment_preparation': {
                         'steps': [[sys.executable, '-c', 'pass']], 'profile': {'timeout_sec': 5}},
                         'limits': limits} if not environment_prepared else {'shared_environment': {'attempt_id': 'first'}})
@@ -2851,7 +2864,7 @@ class StartTests(unittest.TestCase):
                             patch('simple_ar.cli.start.print_line'), \
                             patch('subprocess.run') as process:
                         app = self._capture_creation(create)
-                        app.state = {'turns': [{'origin': 'caller'}], 'pending': None}
+                        app.state = {'turns': [], 'pending': None}
                         app.run.return_value = {'status': 'completed'}
                         app.measurement_completion_actions.return_value = []
                         self.assertTrue(create_declared_research(args, execution=execution,
@@ -2879,6 +2892,7 @@ class StartTests(unittest.TestCase):
                                 {f'candidate:{index}': [sys.executable, 'measure.py', '--seed', str(seed)]
                                     for index, seed in enumerate((4, 9))})
                         approve = app.run.call_args.kwargs['approve']
+                        app.state['turns'].append({'origin': 'caller', 'request_count': len(app.state['requests'])})
                         for index, action in enumerate(actions):
                             call = {'id': f'caller-0-{index}', 'function': {
                                 'name': action['tool_name'], 'arguments': json.dumps(action['arguments'])}}

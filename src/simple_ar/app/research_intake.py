@@ -85,7 +85,10 @@ def create_structured_research_task(brief: ResearchBrief, *, root: str | Path,
             research_read_max_shortlist=max_results, research_max_iterations=0)
         values = {**defaults, **values}
         values['research_execution_boundary'] = {'timeout_sec': timeout_sec if timeout_sec is not None else 300}
-        attempts = max(30, _creation_model_limits(limits, model_enabled=model_enabled)['llm_requests'] * 10)
+        requested_turns = limits.get('llm_requests')
+        if requested_turns is None:
+            requested_turns = _creation_model_limits(limits, model_enabled=model_enabled)['llm_requests']
+        attempts = max(30, requested_turns * 10)
     else:
         values['interaction'] = interaction or values.get('interaction') or 'checkpoints'
         if research_work:
