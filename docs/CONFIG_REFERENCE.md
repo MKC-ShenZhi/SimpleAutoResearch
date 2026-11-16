@@ -431,7 +431,7 @@ Saved ResearchApplication sessions use `research-session --config PATH --session
 | `decision_response` | Action | accept / reject / revise | Explicit response |
 | `decision_guidance` | Revision facts/direction | Optional string | Explicit response; not process approval |
 
-Repeat identical authorization ID/terms to finish interrupted authorization without replenishing spent capacity; changed terms need a new ID. Increasing budget never erases costs or unknown reservations, nor alone restarts completed work. Saved-session goal/source/execution changes may invalidate dependent plans; incompatible kind/frozen ingestion needs a new task. Report-only changes do not rerun measurement.
+Repeat identical authorization ID/terms to finish interrupted authorization without replenishing spent capacity; changed terms need a new ID. An unfinished partial delivery continues from its retained work; completed work is not restarted. Increasing budget never erases costs or unknown reservations. Saved-session goal/source/execution changes may invalidate dependent plans; incompatible kind/frozen ingestion needs a new task. Report-only changes do not rerun measurement.
 
 <a id="code-file"></a>
 

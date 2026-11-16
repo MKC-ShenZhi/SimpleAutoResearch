@@ -205,7 +205,7 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 
 新任务从当前工作目录读取 .env。来源挂载拒绝符号链接和私有／运行时路径；原生 data-file 偏好仍限 20 MiB。公开 URL 应写入目标并授权联网，不要作为普通 document URL 传入。
 
-恢复保留模型、解释器及累计预算。增加资源应使用 --authorize-remaining，不是新建限额。支持的维度包括 llm_requests、total_tokens、process_invocations、process_wall_seconds、image_requests。要求稳定 ID／原因；保留历史费用及未知预留。这里只授予容量，不授予访问或批准命令。新增访问／资源须与 --approve-execution 分开确认。
+恢复保留模型、解释器及累计预算。增加资源应使用 --authorize-remaining，不是新建限额。部分交付可沿已有成果继续未完成的请求；已完成任务保持完成。支持的维度包括 llm_requests、total_tokens、process_invocations、process_wall_seconds、image_requests。要求稳定 ID／原因；保留历史费用及未知预留。这里只授予容量，不授予访问或批准命令。新增访问／资源须与 --approve-execution 分开确认。
 
 --retry-model 与反馈、访问／资源授权及命令批准分开。它仅在没有已接受回复且保存的有限容量足够时重试已终止的失败决策，不重放工具。缓存回复用普通恢复。进行中请求、无界费用和未知进程副作用须先对账。--switch-model 仅记录，与反馈、重试、补齐、--model 及授权分开。
 
