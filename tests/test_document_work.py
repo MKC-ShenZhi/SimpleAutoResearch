@@ -609,14 +609,22 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertEqual(result.data['resume_work'], 'records/partial-report/document_work')
         original = root / 'attempts/partial-report/document_work'
         saved = {path.relative_to(original): path.read_bytes() for path in original.rglob('*') if path.is_file()}
+        denied = gateway.call('work_document', {**arguments, 'resume_work': result.data['resume_work']},
+            identity='still-out-of-budget')
+        self.assertFalse(denied.ok)
+        self.assertEqual(denied.data['resume_work'], 'records/still-out-of-budget/document_work')
+        self.assertEqual(len(labels), 2)
+        self.assertEqual(len(ledger.entries), 2)
         ledger.authorize_remaining('llm_requests', 3, authorization_id='continue', reason='Complete the report')
-        resumed = gateway.call('work_document', {**arguments, 'resume_work': result.data['resume_work']},
-            identity='continue-report')
+        continuation = {**arguments, 'resume_work': denied.data['resume_work']}
+        resumed = gateway.call('work_document', continuation, identity='continue-report')
         self.assertTrue(resumed.ok, resumed.error)
-        self.assertEqual(resumed.data['continued_from'], result.data['resume_work'])
+        self.assertEqual(resumed.data['continued_from'], denied.data['resume_work'])
         self.assertIn('## Observations', resumed.data['markdown'])
         self.assertIn('## Limits', resumed.data['markdown'])
         self.assertEqual(len([label for label in labels if label == 'document-work-1']), 1)
+        self.assertEqual(len([label for label in labels if label.startswith('report-writer-')]), 2)
+        self.assertEqual(gateway.call('work_document', continuation, identity='continue-report'), resumed)
         self.assertEqual(len([label for label in labels if label.startswith('report-writer-')]), 2)
         self.assertEqual({path.relative_to(original): path.read_bytes() for path in original.rglob('*')
             if path.is_file()}, saved)
