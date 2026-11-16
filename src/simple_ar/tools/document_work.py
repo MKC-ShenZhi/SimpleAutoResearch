@@ -124,8 +124,8 @@ def manuscript_measurements(markdown: str) -> dict:
 
 class WorkDocumentRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
-    goal: str = Field(min_length=1, max_length=16000,
-        description='Actual document goal or feedback; the owner investigates the authorized originals.')
+    goal: str = Field(default='', max_length=16000,
+        description='Actual document goal or feedback for new work; omit when continuing saved sections.')
     material_roots: list[str] = Field(default_factory=list, max_length=1000,
         description='Additional authorized material roots or current result files. Original task roots supplied by the application remain available.')
     prior_draft: str = Field(default='', description='Authorized manuscript file locator to revise, not Markdown content. '
@@ -134,11 +134,11 @@ class WorkDocumentRequest(BaseModel):
         'Omit when the document owner should use the current accessible file.')
     resume_work: str = Field(default='', exclude_if=lambda value: not value,
         description='A returned resume_work locator: continue its saved sections after capacity is available, '
-        'with the same goal and original inputs. New feedback is a separate revision.')
+        'using its original goal and inputs. Omit goal; new feedback is a separate revision.')
 
     @model_validator(mode='after')
     def valid_prior(self) -> 'WorkDocumentRequest':
-        if not self.goal.strip():
+        if not self.resume_work and not self.goal.strip():
             raise ValueError('Document goal must not be blank')
         if self.prior_sha256 and not self.prior_draft:
             raise ValueError('A prior version requires its manuscript')
@@ -228,7 +228,8 @@ def document_work_tool_specs(*, bind_current: bool = False) -> list[CommonToolSp
             'or delivery without a separate inspection merely to view the draft. '
             'Configured report writing may include its own review; independent task inspection, publication '
             'and delivery remain separate operations. Direct simple edits need not use this operation. '
-            'A returned resume_work locator can continue saved sections with the same goal after resources are available. '
+            'A returned resume_work locator can continue saved sections after resources are available; '
+            'the original goal and inputs are reused. '
             'No network or execution.'))]
 
 
@@ -348,9 +349,10 @@ class DocumentWorkToolGateway:
         source = self._store(source_id)
         selection_id = source.read_json('resume.json')['selection_identity'] if source.exists('resume.json') else source_id
         selection = self._retained_report_selection(source, selection_id, allow_unstarted=True)
-        if (not source.exists('failure.json') or source.read_json('request.json')['goal'] != request.goal
-                or selection is None):
+        if not source.exists('failure.json') or selection is None:
             raise ValueError('Saved writing has no matching locally unstarted section; preserve its records')
+        if request.goal.strip() and source.read_json('request.json')['goal'] != request.goal:
+            raise ValueError('Saved sections retain their original goal; submit new feedback as a separate revision')
         from simple_ar.report.requirements import validate_report_requirement
         if (self.report_requirement is None
                 or validate_report_requirement(self.report_requirement) != selection[0]['report_requirement']):

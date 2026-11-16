@@ -783,7 +783,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
         app = ToolApplication.load(root / 'native')
         app.operations.document.client_factory = Client
-        work['arguments']['resume_work'] = locator
+        work['arguments'] = {'resume_work': locator}
         app.run(actions=[work, stop], resource_allowances={'llm_requests': 3},
             authorization_id='continue-writing', authorization_reason='Complete the retained report',
             progress=lambda _: None)

@@ -616,7 +616,11 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertEqual(len(labels), 2)
         self.assertEqual(len(ledger.entries), 2)
         ledger.authorize_remaining('llm_requests', 3, authorization_id='continue', reason='Complete the report')
-        continuation = {**arguments, 'resume_work': denied.data['resume_work']}
+        changed = gateway.call('work_document', {'goal': 'Change the topic', 'resume_work': denied.data['resume_work']},
+            identity='changed-goal')
+        self.assertFalse(changed.ok)
+        self.assertEqual(len(labels), 2)
+        continuation = {'resume_work': denied.data['resume_work']}
         resumed = gateway.call('work_document', continuation, identity='continue-report')
         self.assertTrue(resumed.ok, resumed.error)
         self.assertEqual(resumed.data['continued_from'], denied.data['resume_work'])
