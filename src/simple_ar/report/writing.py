@@ -318,7 +318,9 @@ def article_writing_inputs(*, report_context: ReportContext, documents: Document
 
 
 def _retained_response(store: ArtifactStore, path: str, request: dict[str, Any],
-                       call: Callable[[], Any] | None = None) -> Any:
+                       call: Callable[[], Any] | None = None, *,
+                       retry_unstarted: bool = False,
+                       unstarted: Callable[[Exception], bool] | None = None) -> Any:
     """Freeze the request and retain its response before domain validation."""
     def completion(response: Any) -> dict[str, str]:
         return {key: hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
@@ -342,27 +344,35 @@ def _retained_response(store: ArtifactStore, path: str, request: dict[str, Any],
     if store.exists(path):
         if store.read_json(path) != request:
             raise ValueError('Article/review input changed; preserve it and use a new identity')
-        if not store.exists('response.json') or (request.get('format_correction_contract') and store.exists('response_error.json')):
-            raise ValueError('Article/review request failed or is unknown; inspect its ledger, no blind replay')
-        response = store.read_json('response.json')
-        if atomic:
-            keys = {'response', 'request_sha256', 'response_sha256'}
-            if record_contract == 'atomic_complete.v2' and isinstance(response, dict) and 'normalization' in response:
-                keys.add('normalization')
-            if (not isinstance(response, dict) or set(response) != keys
-                    or {key: response[key] for key in ('request_sha256', 'response_sha256')} != completion(response['response'])):
-                raise ValueError('Retained atomic response changed or has no complete bound record; no blind replay')
-            if 'normalization' in response:
-                check_normalization(response['normalization'], response['response'])
-            return response['response']
-        if request.get('format_correction_contract') and (
-                not store.exists('response_complete.json')
-                or store.read_json('response_complete.json') != completion(response)):
-            raise ValueError('Retained review response is changed or not known complete; no blind replay')
-        return response
+        if not store.exists('response.json'):
+            if not (retry_unstarted and call is not None and store.exists('not_dispatched.json')):
+                raise ValueError('Article/review request failed or is unknown; inspect its ledger, no blind replay')
+            # A new authorized attempt may dispatch a locally rejected request.
+            # Remove the marker first so an interrupted dispatch cannot replay it.
+            store.resolve('not_dispatched.json').unlink()
+        else:
+            if request.get('format_correction_contract') and store.exists('response_error.json'):
+                raise ValueError('Article/review request failed or is unknown; inspect its ledger, no blind replay')
+            response = store.read_json('response.json')
+            if atomic:
+                keys = {'response', 'request_sha256', 'response_sha256'}
+                if record_contract == 'atomic_complete.v2' and isinstance(response, dict) and 'normalization' in response:
+                    keys.add('normalization')
+                if (not isinstance(response, dict) or set(response) != keys
+                        or {key: response[key] for key in ('request_sha256', 'response_sha256')} != completion(response['response'])):
+                    raise ValueError('Retained atomic response changed or has no complete bound record; no blind replay')
+                if 'normalization' in response:
+                    check_normalization(response['normalization'], response['response'])
+                return response['response']
+            if request.get('format_correction_contract') and (
+                    not store.exists('response_complete.json')
+                    or store.read_json('response_complete.json') != completion(response)):
+                raise ValueError('Retained review response is changed or not known complete; no blind replay')
+            return response
     if call is None:
         raise ValueError('Article/review needs a model client or a saved complete response')
-    store.write_json(path, request)
+    if not store.exists(path):
+        store.write_json(path, request)
     normalization = None
     try:
         response = call()
@@ -375,7 +385,9 @@ def _retained_response(store: ArtifactStore, path: str, request: dict[str, Any],
         if normalized is None or not normalized[1]:
             if raw is not None:
                 store.write_json('response.json', {'raw_response': raw})
-            if request.get('format_correction_contract'):
+            if unstarted is not None and unstarted(exc):
+                store.write_json('not_dispatched.json', {'reason': 'budget'})
+            elif request.get('format_correction_contract'):
                 store.write_json('response_error.json', {'type': type(exc).__name__, 'error': str(exc)})
             raise
         response, suffix = normalized
@@ -563,7 +575,7 @@ def _review_pending(reviews: Sequence[Any]) -> bool:
 
 
 def retained_writing_client(*, store: ArtifactStore, identity: str, client: Any,
-                            contract: str = 'atomic_complete.v1') -> Any:
+                            contract: str = 'atomic_complete.v1', retry_unstarted: bool = False) -> Any:
     """Record calls for an explicitly bound section consumer, not a new Writer.
 
     The existing section checkpoint still owns progress. This narrow client port
@@ -637,6 +649,15 @@ def retained_writing_client(*, store: ArtifactStore, identity: str, client: Any,
                 request = retained
             forwarded = {**options, 'budget_call_id': options.get('budget_call_id',
                          f'{identity}:writing:{key}')}
+            def was_not_dispatched(exc: Exception) -> bool:
+                from simple_ar.core.budget import BudgetError, BudgetLedger
+                from simple_ar.integrations.llm import LLMError
+                budget_error = isinstance(exc, BudgetError) or (isinstance(exc, LLMError)
+                    and isinstance(exc.__cause__, BudgetError))
+                ledger = getattr(client, '_budget_ledger', None)
+                return bool(budget_error and isinstance(ledger, BudgetLedger) and not any(
+                    row.logical_call_id == forwarded['budget_call_id'] or row.reservation_id == forwarded['budget_call_id']
+                    for row in ledger.entries))
             if contract == 'atomic_complete.v2':
                 # A changed reconstruction must not evade an interrupted physical
                 # request by acquiring a different content-addressed key.
@@ -645,7 +666,8 @@ def retained_writing_client(*, store: ArtifactStore, identity: str, client: Any,
                     if previous.root != call_store.root:
                         _retained_response(previous, 'request.json', previous.read_json('request.json'))
             result = _retained_response(call_store, 'request.json', request,
-                (lambda: client.ask_json(system, prompt, **forwarded)) if client is not None else None)
+                (lambda: client.ask_json(system, prompt, **forwarded)) if client is not None else None,
+                retry_unstarted=retry_unstarted, unstarted=was_not_dispatched)
             if contract == 'atomic_complete.v2':
                 self.last_inspection_source = {
                     name + '_path': str(call_store.resolve(name + '.json').resolve())

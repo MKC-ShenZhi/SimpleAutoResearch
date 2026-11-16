@@ -69,7 +69,8 @@ def _observed_documents(observations: list[dict]) -> tuple[DocumentBundle, dict]
 def write_observed_report(*, store: ArtifactStore, identity: str, requirement: dict,
                           title: str, goal: str, work_context: dict, observations: list[dict],
                           attachments: list[str], prior_draft: str, client: Any, sources: Any = None,
-                          prior_references: dict | None = None, current_work: bool = False) -> dict:
+                          prior_references: dict | None = None, current_work: bool = False,
+                          retry_unstarted: bool = False) -> dict:
     """Draft, review and assemble using the existing Writer and shared ledger client."""
     from simple_ar.report.capability import ReportAssemblyRequest, run_report_capability
     from simple_ar.report.assembler import ReportAssemblyMode
@@ -141,7 +142,8 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
         completed = store.read_json('report-writer-result.json')
     else:
         writer_client = (retained_writing_client(store=writer, identity=identity, client=client,
-            contract='atomic_complete.v2') if requirement['method'] == 'sections' else client)
+            contract='atomic_complete.v2', retry_unstarted=retry_unstarted)
+            if requirement['method'] == 'sections' else client)
         resume = (store.ref('writer/sections.json', kind='report_checkpoint', schema='report_checkpoint.v1')
             if writer.exists('sections.json') else None)
         result = run_report_writing_capability(context=CapabilityContext(writer, AttemptManifest(identity),

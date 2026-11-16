@@ -589,8 +589,8 @@ class DocumentWorkTests(unittest.TestCase):
                 self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
                 return response
 
-        client = Client(ledger, 'partial-report', None)
-        gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
+        gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session',
+            client_factory=lambda identity: Client(ledger, identity, None),
             material_roots=lambda: ['source0'], context_policy='working.v3', report_requirement=requirement)
         arguments = {'goal': 'Write the requested brief'}
         result = gateway.call('work_document', arguments, identity='partial-report')
@@ -606,6 +606,56 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertFalse(replay.ok)
         self.assertEqual(len(labels), 2)
         self.assertEqual(len(ledger.entries), 2)
+        self.assertEqual(result.data['resume_work'], 'records/partial-report/document_work')
+        original = root / 'attempts/partial-report/document_work'
+        saved = {path.relative_to(original): path.read_bytes() for path in original.rglob('*') if path.is_file()}
+        ledger.authorize_remaining('llm_requests', 3, authorization_id='continue', reason='Complete the report')
+        resumed = gateway.call('work_document', {**arguments, 'resume_work': result.data['resume_work']},
+            identity='continue-report')
+        self.assertTrue(resumed.ok, resumed.error)
+        self.assertEqual(resumed.data['continued_from'], result.data['resume_work'])
+        self.assertIn('## Observations', resumed.data['markdown'])
+        self.assertIn('## Limits', resumed.data['markdown'])
+        self.assertEqual(len([label for label in labels if label == 'document-work-1']), 1)
+        self.assertEqual(len([label for label in labels if label.startswith('report-writer-')]), 2)
+        self.assertEqual({path.relative_to(original): path.read_bytes() for path in original.rglob('*')
+            if path.is_file()}, saved)
+
+    def test_unknown_section_call_is_not_offered_as_a_budget_continuation(self):
+        from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
+        from tests.report_review_fixtures import prompt_payload
+
+        root, _, ledger, workspace = self.workspace()
+        config = ReportRuntimeConfig(outline_strategy='template', reviewer='disabled',
+            max_review_iterations=0, allow_source_backtracking=False)
+        template = ReportTemplateBundle(name='sections', mode='supplied_materials', template_path='',
+            criteria_path='', template_markdown='## First\n\n## Second\n', criteria_markdown='')
+        requirement = {'method': 'sections', 'config': config.model_dump(mode='json'),
+            'template': template.model_dump(mode='json'), 'outline': [
+                {'heading': 'First', 'required': True}, {'heading': 'Second', 'required': True}]}
+        class Client(_Client):
+            def ask_json(self, system, prompt, *, label='', budget_call_id='', **options):
+                self._budget_ledger.reserve(budget_call_id, {'llm_requests': 1, 'total_tokens': 10},
+                    session_id='session', attempt_id=self._budget_attempt_id, purpose='document')
+                if label == 'document-work-1':
+                    response = {'action': 'write', 'title': 'Brief'}
+                else:
+                    view = prompt_payload(prompt)
+                    if view['section']['heading'] == 'Second':
+                        self._budget_ledger.mark_unknown(budget_call_id, reason='interrupted provider call')
+                        raise RuntimeError('Provider response is unknown')
+                    response = {'section_id': view['section']['section_id'],
+                        'heading': view['section']['heading'], 'draft_markdown': 'Saved first section.'}
+                self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
+                return response
+        gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session',
+            client_factory=lambda identity: Client(ledger, identity, None),
+            material_roots=lambda: ['source0'], context_policy='working.v3', report_requirement=requirement)
+        result = gateway.call('work_document', {'goal': 'Write the requested brief'}, identity='unknown-report')
+        self.assertFalse(result.ok)
+        self.assertIn('partial_manuscript', result.data)
+        self.assertNotIn('resume_work', result.data)
+        self.assertTrue(any(entry.status == 'unknown' for entry in ledger.entries))
 
     def test_common_article_feedback_keeps_unaffected_prior_work(self):
         from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
