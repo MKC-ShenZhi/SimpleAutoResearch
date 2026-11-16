@@ -328,7 +328,8 @@ class StartTests(unittest.TestCase):
                 prepare_start(args)
             options = native_creation_options(args)
             self.assertEqual(options['creation_declarations']['reuse_origin']['version'], 1)
-            reused = ToolApplication.create(Path(directory)/'reused', 'Revise the supplied project', **options)
+            reused = ToolApplication.create(Path(directory)/'reused', 'Revise the supplied project',
+                                            **{**options, 'model': None})
             locator = reused.state['config']['creation_declarations']['material_roles']['project'][0]
             self.assertEqual((reused.workspace.resolve(locator) / 'compute.py').read_text(encoding='utf-8'),
                              (project / 'compute.py').read_text(encoding='utf-8'))
