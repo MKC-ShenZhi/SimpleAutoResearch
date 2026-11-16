@@ -22,6 +22,8 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- Working views make room for the task and current evidence before optional history navigation when input capacity is tight.
+- Passage lookup searches the full retained source bundle instead of hiding later passages behind the ingestion chunk limit.
 - Common research design retains the caller's execution context and applies an explicitly prepared project and its metric boundaries even without a separate context description.
 - Structured research preserves the requested attempt capacity when no model is enabled without authorizing model calls.
 - Generated-project review no longer blocks on guessed artifact paths or source-text heuristics; actual validation and required-output checks retain their role, and potential metric defaults remain advisory.

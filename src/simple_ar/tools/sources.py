@@ -425,7 +425,9 @@ class SourceToolGateway:
                         "retained_preview": source_chunk_views(bundle.chunks[:1], max_chars=1200),
                         "scope": "Source identity, retained coverage and a bounded retained-text preview; not full reading. Query passages for consequential claims. Supplied source metadata is not independently verified."}
                 else:
-                    selected = rank_source_chunks(bundle.chunks[:self.policy.max_chunks], request.query,
+                    # The ingestion budget limits what was retained; it must not
+                    # hide later passages already present in an admitted bundle.
+                    selected = rank_source_chunks(bundle.chunks, request.query,
                         limit=min(request.limit, self.policy.max_chunks) if self.policy.max_chunks is not None else request.limit)
                     data = {
                         **identity,

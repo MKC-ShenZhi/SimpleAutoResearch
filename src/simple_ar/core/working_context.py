@@ -676,6 +676,8 @@ def select_working_context(
                 prepared_overview = {'entries': history_view(list(groups.values())),
                     'supplied_entry_ranges': ranges, 'omitted_entries': len(operations) - len(ordered_indices)}
             view['operation_overview'].update(prepared_overview)
+        omitted = [{'record': state['source'].get('record'), 'status': state['status']}
+                   for state in states if state['status'] not in {'native', 'working_view'}]
         context['material_supply'] = {'native_context':[
                 {**state['source'], 'version_status': state['version_status'],
                  **({'version_scope': 'The observed file version matched at selection; this is not a correctness check.'}
@@ -683,8 +685,7 @@ def select_working_context(
                     {'version_scope': 'The observed file version no longer matches the current file.'}
                     if state['version_status'] == 'stale' else {})}
                 for state in states if state['status']=='native'],
-            'omitted':[{'record':state['source'].get('record'),'status':state['status']}
-                for state in states if state['status'] not in {'native','working_view'}][-16:],
+            'omitted':omitted[-16:],
             'scope':'Native context lists observations in retained messages; other selected observations '
                 'are in working_view. Archival receipts remain available through '+history_access+'.'}
         if retained_records:
@@ -737,6 +738,19 @@ def select_working_context(
                     prepared_turns = selection
                 messages = prepared_projector(context)
             measured = schema_tokens+estimate_tokens(json.dumps(messages,ensure_ascii=False))
+            # Recent omission locators are optional navigation, not required
+            # input. Make room for the actual task before declaring overflow;
+            # selected references and original receipts remain available.
+            hints = context['material_supply']['omitted']
+            if measured > context_token_target and hints:
+                hint_cost = max(1, estimate_tokens(dump(hints)))
+                remove = min(len(hints), max(1, math.ceil(
+                    (measured - context_token_target) * len(hints) / hint_cost)))
+                del hints[:remove]
+                context['material_supply']['omitted_count'] = len(omitted)
+                context['material_supply']['omitted_access'] = history_access
+                cost = 0
+                continue
             # A boolean/decimal-width change can reduce the serialized size
             # by one token. Keep the conservative bound rather than oscillate.
             if measured<=cost:

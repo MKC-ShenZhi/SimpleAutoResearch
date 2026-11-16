@@ -1609,9 +1609,9 @@ class InspectionToolGateway:
     def _recorded_opinion(self, identity: str) -> tuple[dict, dict, ToolResult, bool]:
         """Resolve the owner's recorded opinion, without re-investigating its evidence."""
         results = _PRESENTATION_RESULTS.get()
-        key = (self, identity, 'recorded_opinion')
-        if results is not None and key in results:
-            return deepcopy(results[key])
+        cache_key = (self, identity, 'recorded_opinion')
+        if results is not None and cache_key in results:
+            return deepcopy(results[cache_key])
         receipt = self._receipt(identity)
         result_path = self._path(identity, 'result')
         if receipt.get('result_sha256') != self._digest(result_path):
@@ -1637,7 +1637,7 @@ class InspectionToolGateway:
             raise ValueError('Inspection cached assessment path changed; no replay')
         opinion = saved, receipt, result, package
         if results is not None:
-            results[key] = deepcopy(opinion)
+            results[cache_key] = deepcopy(opinion)
         return opinion
 
     def _read_retained_result(self, identity: str, *, current_inputs: bool) -> ToolResult:

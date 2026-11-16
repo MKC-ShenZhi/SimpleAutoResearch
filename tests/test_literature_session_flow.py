@@ -35,7 +35,9 @@ class LiteratureSessionFlowTests(unittest.TestCase):
                     records=[DocumentRecord(document_id=name, title=name, source='fixture')],
                     fulltext_manifest={}, fulltext_extraction={}, sections=[],
                     chunks=[TextChunk(chunk_id=f'{name}-{index}', document_id=name,
-                                      text=f'{name} evidence {index}') for index in range(3)])
+                                      text=('Calibration depends on the observed population.'
+                                            if name == 'second' and index == 4 else f'{name} evidence {index}'))
+                            for index in range(5)])
                 path = sources / f'{name}.json'
                 path.write_text(json.dumps(bundle.to_handoff_dict()), encoding='utf-8')
                 originals[path] = path.read_bytes()
@@ -50,6 +52,11 @@ class LiteratureSessionFlowTests(unittest.TestCase):
             merged = json.loads(app.workspace.resolve(observation['data']['document_record']).read_text())
             self.assertEqual([row['document_id'] for row in merged['chunks']], ['first', 'second', 'first'])
             self.assertEqual({row['document_id'] for row in merged['documents']}, {'first', 'second'})
+            lookup = app.sources.call('find_source_passages', {
+                'document_record': 'papers/second.json', 'query': 'calibration observed population', 'limit': 1},
+                identity='retained-lookup')
+            self.assertTrue(lookup.ok, lookup.error)
+            self.assertEqual([row['chunk_id'] for row in lookup.data['matches']], ['second-4'])
             self.assertEqual({path: path.read_bytes() for path in originals}, originals)
 
     def test_search_to_synthesis_uses_persisted_attempt_handoffs(self) -> None:
