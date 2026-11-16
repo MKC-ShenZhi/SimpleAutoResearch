@@ -164,8 +164,8 @@ class _Decision(BaseModel):
     action: Literal['investigate', 'preview', 'finish']
     read_windows: list[FileWindow] = Field(default_factory=list, max_length=12)
     source_queries: list[_SourceQuery] = Field(default_factory=list, max_length=12)
-    selected_observation_ids: list[str] = Field(default_factory=list, max_length=128)
-    attachments: list[str] = Field(default_factory=list, max_length=12,
+    selected_observation_ids: list[str] = Field(default_factory=list)
+    attachments: list[str] = Field(default_factory=list,
         description='Distinct delivery_path IDs from the supplied candidate inventory; not source file locators.')
     manuscript_markdown: str = Field(default='', max_length=256000)
     gaps: list[str] = Field(default_factory=list, max_length=100)
@@ -193,8 +193,8 @@ class _ReportDecision(BaseModel):
     action: Literal['investigate', 'write']
     read_windows: list[FileWindow] = Field(default_factory=list, max_length=12)
     source_queries: list[_SourceQuery] = Field(default_factory=list, max_length=12)
-    selected_observation_ids: list[str] = Field(default_factory=list, max_length=128)
-    attachments: list[str] = Field(default_factory=list, max_length=12)
+    selected_observation_ids: list[str] = Field(default_factory=list)
+    attachments: list[str] = Field(default_factory=list)
     title: str = Field(default='', max_length=400)
     gaps: list[str] = Field(default_factory=list, max_length=100)
 

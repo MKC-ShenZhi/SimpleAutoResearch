@@ -215,7 +215,7 @@ def retained_working_inputs(config: dict, *, resolve: Callable[[str], Path],
 
 class MaterialSelection(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
-    materials: list[str | FileWindow] = Field(default_factory=list, max_length=12)
+    materials: list[str | FileWindow] = Field(default_factory=list)
     read_windows: list[FileWindow] = Field(default_factory=list, max_length=12)
 
 

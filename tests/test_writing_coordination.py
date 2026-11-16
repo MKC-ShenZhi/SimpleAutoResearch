@@ -122,6 +122,15 @@ class LegacyMaterialBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '16 MiB'):
             writing._document_material_copies([str(oversized)], identity='copy-oversized')
 
+        materials = []
+        for index in range(13):
+            path = source / f'material-{index:02}.txt'
+            path.write_text(f'Material {index}\n', encoding='utf-8')
+            materials.append(str(path))
+        many = writing._document_material_copies(materials, identity='copy-many')
+        self.assertEqual(len(many['materials']), len(materials))
+        self.assertEqual(writing._document_material_copies(materials, identity='copy-many', retained=many), many)
+
 
     def _journal_material(self, root, workspace, raw, **window):
         sources = root / 'originals'

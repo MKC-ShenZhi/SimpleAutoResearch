@@ -1116,6 +1116,31 @@ class DocumentWorkTests(unittest.TestCase):
             identity='selection-repair'), result)
         self.assertEqual(ledger.to_dict(), prefix)
 
+    def test_document_can_retain_all_requested_materials_above_twelve(self):
+        root, source, ledger, workspace = self.workspace()
+        originals = []
+        for index in range(13):
+            path = source / f'material-{index:02}.txt'
+            path.write_text(f'Observation {index}.\n', encoding='utf-8')
+            originals.append(path)
+
+        def decide(view, step):
+            candidates = view['candidates']
+            if step == 1:
+                return {'action': 'investigate', 'read_windows': [{'path': candidates[0]['path']}]}
+            return {'action': 'finish', 'manuscript_markdown': '# Materials\n\nThe supplied materials are attached.\n',
+                'selected_observation_ids': ['o1'],
+                'attachments': [row['delivery_path'] for row in candidates]}
+
+        owner, clients = self.gateway(root, source, ledger, workspace, decide)
+        result = owner.call('work_document', {'goal': 'Retain the supplied materials'}, identity='many-materials')
+        self.assertTrue(result.ok, result.error)
+        attachments = result.data['provenance']['attachments']
+        self.assertEqual({row['source'] for row in attachments}, {str(path) for path in originals})
+        for row in attachments:
+            self.assertEqual(workspace.resolve(row['path']).read_bytes(), Path(row['source']).read_bytes())
+        self.assertEqual(len(clients[0].calls), 2)
+
     def test_original_bundle_is_queried_by_source_owner_and_change_blocks_replay(self):
         root, source, ledger, workspace = self.workspace()
         bundle = DocumentBundle(

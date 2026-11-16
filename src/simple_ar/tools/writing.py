@@ -137,11 +137,11 @@ class ComposeRequest(DocumentWorkRequest):
     finish: bool = Field(default=False, exclude_if=lambda value: value is False,
         description='End this request after independent acceptance and any explicitly requested publication. Requires document-work ownership; does not infer PDF requirements or bypass export approval.')
     sources: list[SelectedSource] = Field(default_factory=list, max_length=40)
-    materials: list[FileWindow] = Field(default_factory=list, max_length=12,
+    materials: list[FileWindow] = Field(default_factory=list,
         description="Selected authorized text/table/result file windows, read through the existing workspace tool. Not literature identities or verified measurements.")
     material_roots: list[str] = Field(default_factory=list, max_length=1000,
         description="Authorized material directories, including retained original-source bundles. The writing owner selects relevant sources/passages, text/result files and figures using a bounded candidate inventory and shared budget. May accompany explicit sources, figures and prior_draft; cannot combine with explicit materials. Unsupported formats and oversized candidates are explicitly omitted before hashing; unlisted does not mean absent.")
-    figures: list[str | ComposeFigure] = Field(default_factory=list, max_length=12,
+    figures: list[str | ComposeFigure] = Field(default_factory=list,
         description="Authorized existing PNG/JPEG/SVG/PDF files: legacy path strings (body), or {path, placement: body|attachment, caption?}. Body is the default; attachments are preserved without requiring a body image. Writer places the optional caption only in the standalone image alt; export owns figure numbering. Contents are not visually or scientifically verified by composition.")
     prior_draft: str = Field(default="", description="Optional mounted Markdown draft for any revision, including review corrections or user feedback. Binds its actual bytes as a prior version, not primary evidence or a new review certificate.")
     adopt_draft: bool = Field(default=False, exclude_if=lambda value: value is False,
@@ -158,7 +158,7 @@ class ComposeRequest(DocumentWorkRequest):
     publication: CompositionPublication | None = Field(default=None,
         exclude_if=lambda value: value is None,
         description='Explicit export options for a same-loop export_report proposal after accepted review. The owner supplies canonical markdown; normal export approval applies. Document-work finish=true adds this unit\'s canonical delivery to that export. Publication intent is never inferred.')
-    delivery_artifacts: list[str] | None = Field(default=None, max_length=32,
+    delivery_artifacts: list[str] | None = Field(default=None,
         exclude_if=lambda value: value is None,
         description='Explicit proposed delivery attachments for joint inspection with prose: scripts, tables and figures. Freezes actual permitted content, versions and proven producers. Omit for historical prose-only scope; [] declares no attachments. Unread, oversized and visual-only attachments remain incomplete, never silently certified.')
 
@@ -183,8 +183,8 @@ class ComposeRequest(DocumentWorkRequest):
 
 class _MaterialSelection(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
-    materials: list[str | FileWindow] = Field(default_factory=list, max_length=12)
-    figures: list[str | ComposeFigure] = Field(default_factory=list, max_length=12,
+    materials: list[str | FileWindow] = Field(default_factory=list)
+    figures: list[str | ComposeFigure] = Field(default_factory=list,
         description='Existing figure paths (legacy body placement), or ComposeFigure objects with explicit body/attachment placement and an optional publication caption. Choose roles from the document goal and inspected evidence, never filename or equal-byte guesses.')
     sources: list[SelectedSource] = Field(default_factory=list, max_length=40)
     read_windows: list[FileWindow] = Field(default_factory=list, max_length=12,
@@ -194,16 +194,16 @@ class _MaterialSelection(BaseModel):
 class _DocumentMaterialSelection(_MaterialSelection):
     title: str = Field(default='', max_length=500,
         description='Choose a nonempty article title from inspected materials when the request omitted title. An explicit request title remains authoritative.')
-    delivery_artifacts: list[str] = Field(default_factory=list, max_length=12,
+    delivery_artifacts: list[str] = Field(default_factory=list,
         description='Minimal inventory files necessary to accompany this document: actual source, tables and necessary data. Select files, never directories or every candidate. Their full bytes are copied with relative paths and jointly inspected with their originals; oversized or unsupported review subjects remain incomplete.')
 
 
 class _LegacyMaterialSelection(_MaterialSelection):
-    figures: list[str] = Field(default_factory=list, max_length=12)
+    figures: list[str] = Field(default_factory=list)
 
 
 class _LegacyDocumentMaterialSelection(_DocumentMaterialSelection):
-    figures: list[str] = Field(default_factory=list, max_length=12)
+    figures: list[str] = Field(default_factory=list)
 
 
 class ReviewRequest(ComposeRequest):
@@ -3216,8 +3216,6 @@ class WritingToolGateway:
                         seen_delivery.add(path)
             else:
                 delivery_artifacts = list(dict.fromkeys(discoveries))
-            if len(delivery_artifacts) > 12:
-                raise ValueError('Document delivery selection exceeds 12 files')
         try:
             resolved_paths = [str(self.workspace.resolve(path)) for path in paths]
         except ValueError:
@@ -3249,8 +3247,6 @@ class WritingToolGateway:
             explicit_paths = {self.workspace.resolve(_figure_spec(row)['path']) for row in figures}
             figures.extend(row for row in selected.figures
                 if self.workspace.resolve(_figure_spec(row)['path']) not in explicit_paths)
-        if len(figures) > 12:
-            raise ValueError('Selected and explicit figures exceed the composition limit')
         coverage = {'roots': roots, 'selected_materials': [window.path for window in windows],
             'selected_figures': selected.model_dump(mode='json')['figures'], 'visible_file_count': len(visible),
             'unselected_file_count': len(visible - set(resolved_paths)),
@@ -3293,8 +3289,6 @@ class WritingToolGateway:
         Copies acquire no producer label. Original process provenance remains
         on the original subjects of the independent joint inspection.
         """
-        if len(paths) > 12:
-            raise ValueError('Document delivery selection exceeds 12 files')
         contract = retained['contract'] if retained is not None else contract or _DOCUMENT_WORK_CONTRACT
         if contract not in _DOCUMENT_WORK_CONTRACTS:
             raise ValueError('Unknown document work contract')
