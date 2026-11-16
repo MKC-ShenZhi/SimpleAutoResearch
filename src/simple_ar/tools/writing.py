@@ -3293,7 +3293,7 @@ class WritingToolGateway:
         if contract not in _DOCUMENT_WORK_CONTRACTS:
             raise ValueError('Unknown document work contract')
         expected_versions = self.workspace.resolved_versions(expected or {})
-        rows, seen, total = [], set(), 0
+        rows, seen = [], set()
         for index, locator in enumerate(paths):
             source = self.workspace.resolve_material_root(locator)
             if source in seen or not source.is_file():
@@ -3302,9 +3302,6 @@ class WritingToolGateway:
             if source.is_relative_to(self.workspace.resolve('workspace/manuscripts')):
                 raise ValueError('Prior manuscript context cannot become a delivered source attachment')
             size = source.stat().st_size
-            total += size
-            if total > 16 * 1024 * 1024:
-                raise ValueError('Selected document materials exceed 16 MiB total')
             roots = [(name, Path(root).resolve()) for name, root in self.workspace.mounts.items()
                 if name != 'records' and source.is_relative_to(Path(root).resolve())]
             if not roots:

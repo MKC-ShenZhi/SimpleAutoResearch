@@ -119,8 +119,8 @@ class LegacyMaterialBoundaryTests(unittest.TestCase):
         oversized = source / 'large.dat'
         with oversized.open('wb') as handle:
             handle.truncate(17 * 1024 * 1024)
-        with self.assertRaisesRegex(ValueError, '16 MiB'):
-            writing._document_material_copies([str(oversized)], identity='copy-oversized')
+        large = writing._document_material_copies([str(oversized)], identity='copy-large')
+        self.assertEqual(workspace.resolve(large['materials'][0]['path']).stat().st_size, 17 * 1024 * 1024)
 
         materials = []
         for index in range(13):
