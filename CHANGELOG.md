@@ -22,6 +22,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- Resuming a task without its injected search provider no longer silently substitutes a same-named built-in provider.
 - Working views make room for the task and current evidence before optional history navigation when input capacity is tight.
 - Passage lookup searches the full retained source bundle instead of hiding later passages behind the ingestion chunk limit.
 - Common research design retains the caller's execution context and applies an explicitly prepared project and its metric boundaries even without a separate context description.

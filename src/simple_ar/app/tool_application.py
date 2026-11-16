@@ -423,6 +423,14 @@ def _runtime_bindings(services: Any | None) -> dict[str, Any]:
     return bindings
 
 
+def _source_registry(services: Any | None, config: dict[str, Any]) -> SearchProviderRegistry | None:
+    """Restore the supplied provider owner without substituting built-ins."""
+    registry = getattr(services, 'search_registry', None)
+    if registry is None and 'search_registry' in config.get('runtime_dependencies', {}):
+        return SearchProviderRegistry()
+    return registry
+
+
 def _review_requirement(config: dict[str, Any], required: bool) -> dict[str, Any]:
     """Apply the caller's review choice to the existing delivery owner."""
     if type(required) is not bool:
@@ -594,7 +602,7 @@ class ToolApplication:
             scientific_revisions=(self._scientific_revision_attempts
                 if config.get('scientific_condition_reuse') == 'unchanged.v1' else None),
             feasibility_client_factory=self._feasibility_client,
-            search_registry=getattr(self.services,'search_registry',None))
+            search_registry=_source_registry(self.services, config))
         self.workspace, self.gateway = self.operations.workspace, self.operations.gateway
         self.sources, self.publication = self.operations.sources, self.operations.publication
         self.extensions = self.operations.extensions
@@ -812,10 +820,7 @@ class ToolApplication:
             client_factory=(lambda identity: self._client(identity, purpose='task', native=False))
                 if config['model'] is not None else None,
             feasibility_client_factory=self._feasibility_client,
-            registry=(getattr(self.services, 'search_registry', None)
-                if getattr(self.services, 'search_registry', None) is not None else
-                SearchProviderRegistry()
-                if 'search_registry' in config.get('runtime_dependencies', {}) else None))
+            registry=_source_registry(self.services, config))
         publication_contract = config.get('publication_preparation')
         if publication_contract not in {None, 'bound_candidate.v1'}:
             raise ValueError('Unsupported publication preparation contract')

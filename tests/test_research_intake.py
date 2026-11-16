@@ -982,6 +982,7 @@ class ResearchIntakeTests(unittest.TestCase):
             restored = ToolApplication.load(root, services=services)
             self.assertIs(restored.sources.registry, registry)
             absent = ToolApplication.load(root)
+            self.assertEqual(absent.sources.registry.names(), ())
             result = absent.run(progress=lambda _: None)
             self.assertIn("saved injected llm_client", result["status_reason"])
             self.assertEqual(absent.session.list_attempts(), ())
@@ -1012,6 +1013,24 @@ class ResearchIntakeTests(unittest.TestCase):
                 (root / 'budget_ledger.json').read_bytes()), before)
             self.assertEqual(primary.calls, [])
             self.assertEqual(reviewer.calls, [])
+
+    def test_missing_custom_provider_is_not_replaced_by_same_named_builtin(self):
+        from types import SimpleNamespace
+
+        registry = SearchProviderRegistry({'openalex': lambda: None})
+        services = SimpleNamespace(search_registry=registry)
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / 'task'
+            ToolApplication.create(root, 'Find the supplied source.', model=None, sources={},
+                allow_network=True, research_policy={'providers': ['openalex'], 'allow_network': True},
+                services=services)
+            absent = ToolApplication.load(root)
+            result = absent.sources.call('search_sources', {
+                'query': 'research methods', 'providers': ['openalex']}, identity='missing-provider')
+            self.assertFalse(result.ok)
+            self.assertIn('Unknown search provider', result.error)
+            self.assertEqual(absent.ledger.entries, ())
+            self.assertIs(ToolApplication.load(root, services=services).sources.registry, registry)
 
     def test_named_model_selector_reconstructs_from_catalog_without_saved_credentials(self) -> None:
         with TemporaryDirectory() as directory:
