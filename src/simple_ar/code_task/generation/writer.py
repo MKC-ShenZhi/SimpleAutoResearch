@@ -249,8 +249,6 @@ def write_implementation_unit(
             'records to decide necessary revisions. Respect current/stale version annotations and distinguish '
             'required corrections from suggestions. Work notes are judgments, not source evidence. '
             'Produce the candidate and proposed execution; no action here executes or approves it. '
-            'Two consecutive read/focus decisions with no distinct new original observation stop '
-            'investigation; restoring a retired window does not count as acquiring new information. '
             'If investigation cannot resolve a gap, disclose it rather than inventing source facts.')
     if edit_contract == 'bound_content.v1':
         system += (' The bound_content.v1 policy grants no edits to immutable inputs, unread or '
@@ -615,10 +613,6 @@ class _SourceRevisionStopped(ValueError):
     reason = 'source_revision_stagnated'
 
 
-class _SourceInvestigationStopped(ValueError):
-    reason = 'source_investigation_stagnated'
-
-
 def _generate_implementation_contents(
     *, client: LLMClient, system: str, prompt: str, planned: list[str] | None,
     original_files: dict[str, dict[str, str]] | None = None,
@@ -672,9 +666,6 @@ def _generate_implementation_contents(
     decisions = None if source_owner_contract else 6 if investigation is not None else retry_attempts
     validation_observations = []
     previous_rejection = None
-    unproductive_reads = 0
-    seen_views = set()
-    candidate_reads = set()
     from simple_ar.code_task.generation.validation import CandidateAdmissionError, check_candidate_sources
     for attempt in ([retained_submission[0]] if retained_submission else count(1)):
         if decisions is not None and attempt > decisions:
@@ -766,22 +757,8 @@ def _generate_implementation_contents(
                 if candidate_draft is not None and name in {'stage_candidate_file', 'read_candidate_file',
                         'write_candidate_file', 'edit_candidate_file'}:
                     operation, response = name, arguments
-                    previous_files = dict(candidate_draft.files)
                     action_result = candidate_draft.call(name, arguments, attempt)
                     write_json(step / 'response.json', {'action': name, 'arguments': arguments})
-                    data = action_result['data']
-                    read_key = (arguments['path'], data.get('sha256'), data.get('offset_bytes',
-                        arguments.get('offset_bytes', 0)), data.get('next_offset_bytes'))
-                    progress = (candidate_draft.files != previous_files or
-                        name == 'read_candidate_file' and read_key not in candidate_reads)
-                    if name == 'read_candidate_file':
-                        candidate_reads.add(read_key)
-                    if candidate_draft.files != previous_files:
-                        seen_views.clear()  # New authored work can make an earlier view useful again.
-                    unproductive_reads = 0 if progress else unproductive_reads + 1
-                    if unproductive_reads >= 2:
-                        raise _SourceInvestigationStopped('Candidate operations repeated without new '
-                            'edited bytes or observed draft ranges; inspect retained diagnostics')
                     previous_rejection = None
                     continue
                 operation = {'read_source_windows': 'read_windows',
@@ -814,36 +791,10 @@ def _generate_implementation_contents(
                     allowed = {'read_windows', 'focus_observations'} if investigation.working_set else {'read_windows'}
                     if not set(response) <= allowed:
                         raise ValueError('Read necessary windows OR return the candidate, not both')
-                    observed_before = len(investigation.observations)
-                    def work_view():
-                        return (investigation.progress_state(),
-                            tuple(sorted(candidate_draft.files.items())) if candidate_draft is not None else ())
-                    if source_owner_contract == 'source_owner.v3':
-                        seen_views.add(work_view())
-                    try:
-                        if 'focus_observations' in response:
-                            investigation.focus(response['focus_observations'])
-                        if 'read_windows' in response:
-                            investigation.read(response['read_windows'])
-                    finally:
-                        if source_owner_contract:
-                            # Focus can restore a previously retired window to
-                            # presentation; that is not a new source observation.
-                            # Count actual deduplicated reads, not action names
-                            # or changing request spellings.
-                            if source_owner_contract == 'source_owner.v3':
-                                current = work_view()
-                                unproductive_reads = unproductive_reads + 1 if current in seen_views else 0
-                                seen_views.add(current)
-                            else:
-                                unproductive_reads = (unproductive_reads + 1
-                                    if len(investigation.observations) == observed_before else 0)
-                            if unproductive_reads >= 2:
-                                raise _SourceInvestigationStopped(
-                                    'Source work repeated an unchanged or previously used observation view; '
-                                    'use retained context or produce the candidate' if source_owner_contract == 'source_owner.v3'
-                                    else 'Consecutive read/focus decisions added no distinct original observation; '
-                                    'inspect retained reads and produce the candidate or choose a necessary new range')
+                    if 'focus_observations' in response:
+                        investigation.focus(response['focus_observations'])
+                    if 'read_windows' in response:
+                        investigation.read(response['read_windows'])
                     write_json(artifact_dir / 'decision-steps' / str(attempt) / 'observations.json', investigation.observations)
                     action_result = {'status': 'observed', 'observations_ref':
                         f'decision-steps/{attempt}/observations.json'}
@@ -938,8 +889,7 @@ def _generate_implementation_contents(
                 previous_rejection = signature
                 diagnosis.update(decisions_remaining=decisions - attempt if decisions is not None else
                         budget.remaining('llm_requests') if isinstance(budget, BudgetLedger) else None,
-                        stop_reason=exc.reason if isinstance(exc, _SourceInvestigationStopped) else
-                            'source_revision_stagnated' if stagnated else
+                        stop_reason='source_revision_stagnated' if stagnated else
                             'decision_ceiling' if attempt == decisions else
                             'llm_requests_exhausted' if exhausted else None)
                 if isinstance(exc, CandidateAdmissionError):
@@ -948,8 +898,6 @@ def _generate_implementation_contents(
                 step_diagnosis = diagnosis
                 if investigation is not None:
                     write_json(artifact_dir / 'decision-steps' / str(attempt) / 'validation.json', diagnosis)
-                if isinstance(exc, _SourceInvestigationStopped):
-                    raise
                 if stagnated:
                     raise _SourceRevisionStopped('The same rejected source proposal was submitted twice; '
                         'inspect retained diagnostics before choosing a new operation') from exc

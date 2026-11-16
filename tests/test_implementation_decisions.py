@@ -1728,7 +1728,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         replay = owner.call('prepare_implementation', arguments, identity='owner-port')
         self.assertEqual(replay.model_dump(mode='json'), frozen)
 
-    def test_source_owner_stops_read_focus_cycles_and_differing_duplicate_requests(self):
+    def test_source_owner_can_reread_or_recall_before_submitting(self):
         for name, actions in (
                 ('duplicates', [{'read_windows': [{'path': 'inputs/note.txt'}]}] * 2),
                 ('focus-reread', [{'focus_observations': []},
@@ -1742,19 +1742,27 @@ class ImplementationDecisionTests(unittest.TestCase):
                 app = self._create('idle-reads-' + name, sources={'inputs': inputs})
                 owner = self._source_owner(app)
                 before = self.send.call_count
-                self.responses = [{'read_windows': [{'path': 'inputs/note.txt'}]}, *actions]
+                self.responses = [{'read_windows': [{'path': 'inputs/note.txt'}]}, *actions,
+                    self._candidate('value = 1\n')]
                 result = owner.call('prepare_implementation', {'goal': 'Prepare source from original material',
                     'material_roots': ['inputs']}, identity='idle-reads')
-                self.assertEqual(result.status, 'error')
-                self.assertEqual(result.data['owner_stop_reason'], 'source_investigation_stagnated')
-                self.assertEqual(self.send.call_count - before, 3)
+                self.assertEqual(result.status, 'ok', result)
+                self.assertEqual(self.send.call_count - before, 4)
                 self.assertEqual(len(result.metadata['material_observations']), 1)
                 path = app.session.store.root / 'attempts/idle-reads/implementation'
-                diagnosis = json.loads((path / 'decision-steps/3/validation.json').read_text())
-                self.assertEqual(diagnosis['stop_reason'], 'source_investigation_stagnated')
-                self.assertFalse((path / 'result.json').exists())
+                self.assertTrue((path / 'result.json').exists())
                 view = owner.coordination_result(result, receipt_path='records/idle-reads/native_result.json')
                 self.assertNotIn('Short original', json.dumps(view))
+
+    def test_incremental_source_owner_can_reread_the_candidate_before_submitting(self):
+        app = self._create('candidate-reread')
+        owner = self._source_owner(app, contract='source_owner.v2')
+        self.responses = [self._draft_action('write_candidate_file', {'path': 'calculate.py', 'content': 'value = 1\n'}),
+            *[self._draft_action('read_candidate_file', {'path': 'calculate.py'}) for _ in range(3)],
+            self._draft_submit()]
+        result = owner.call('prepare_implementation', {'goal': 'Prepare and check source'}, identity='candidate-reread')
+        self.assertEqual(result.status, 'ok', result)
+        self.assertEqual((Path(result.data['project_dir']) / 'calculate.py').read_text(), 'value = 1\n')
 
     def test_native_source_actions_reject_mixed_batches_and_keep_original_protocol_on_reload(self):
         inputs = self.base / 'action-inputs'

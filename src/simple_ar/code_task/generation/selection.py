@@ -561,11 +561,6 @@ class ImplementationSources:
         self.windows[:] = [row for row in self.windows
             if 'request' not in row or row['observation_ref'] in keep]
 
-    def progress_state(self) -> tuple:
-        """Actual observation history and effective view, not action spelling."""
-        return len(self.observations), tuple(sorted(row['observation_ref'] for row in self.windows
-            if 'request' in row))
-
     def material_original(self, destination: str, locator: str) -> dict:
         """Bind a selected authorized text input to a new editable copy.
 
@@ -653,13 +648,10 @@ class ImplementationSources:
                 raise ValueError('Request distinct implementation windows')
             seen.add(key)
             pending.append(window.model_dump(exclude_unset=True))
-        before = [row.get('observation_ref') for row in self.windows]
         for arguments in pending:
             row = read_material_window(self.workspace, arguments, identity=self.identity)
             self._append({'request': arguments, **row['data'],
                 'role': 'owner_observed_material_not_certified_fact'})
-        if [row.get('observation_ref') for row in self.windows] == before:
-            raise ValueError('Requested windows are already observed; implement or read a necessary new range')
         return {'source_windows': self.windows, 'investigation': self.context()}
 
     def bind_response(self, response: dict, *, commit: bool = True) -> tuple[dict, dict]:

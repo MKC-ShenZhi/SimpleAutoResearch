@@ -845,6 +845,73 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertEqual(len(clients[0].calls), calls)
         self.assertEqual(ledger.to_dict(), charges)
 
+    def test_repeated_original_reads_recall_the_record_and_allow_delivery(self):
+        from simple_ar.tools.materials import read_material_window
+
+        for policy in (None, 'working.v4'):
+            with self.subTest(policy=policy):
+                root, source, ledger, workspace = self.workspace()
+                (source / 'evidence.txt').write_text('Observed evidence.\n', encoding='utf-8')
+
+                def decide(view, count):
+                    if count <= 3:
+                        return {'action': 'investigate', 'read_windows': [{'path': 'source0/evidence.txt'}]}
+                    self.assertEqual(view['read_results'][0]['status'], 'recalled')
+                    return {'action': 'finish', 'manuscript_markdown': '# Result\nObserved evidence.\n',
+                        'selected_observation_ids': ['o1']}
+
+                gateway, clients = self.gateway(root, source, ledger, workspace, decide, context_policy=policy)
+                with patch('simple_ar.tools.document_work.read_material_window', wraps=read_material_window) as reads:
+                    result = gateway.call('work_document', {'goal': 'Use the evidence'}, identity='recall')
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(len(clients[0].calls), 4)
+                self.assertEqual(reads.call_count, 1)
+                self.assertEqual(len(result.metadata['material_observations']), 1)
+                self.assertEqual(len(ledger.entries), 4)
+
+    def test_new_evidence_resets_an_old_invalid_investigation(self):
+        root, source, ledger, workspace = self.workspace()
+        (source / 'evidence.txt').write_text('Observed evidence.\n', encoding='utf-8')
+
+        def decide(view, count):
+            if count in (1, 3):
+                return {'action': 'investigate', 'read_windows': [{'path': 'source0/missing.txt'}]}
+            if count == 2:
+                return {'action': 'investigate', 'read_windows': [{'path': 'source0/evidence.txt'}]}
+            return {'action': 'finish', 'manuscript_markdown': '# Result\nObserved evidence.\n',
+                'selected_observation_ids': ['o1']}
+
+        gateway, clients = self.gateway(root, source, ledger, workspace, decide, context_policy='working.v4')
+        result = gateway.call('work_document', {'goal': 'Use the evidence'}, identity='progress')
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(len(clients[0].calls), 4)
+        self.assertEqual(len(result.metadata['material_observations']), 1)
+
+    def test_repeated_source_queries_recall_the_observed_passage(self):
+        root, source, ledger, workspace = self.workspace()
+        bundle = DocumentBundle([DocumentRecord(document_id='paper', title='Original paper', source='local_files',
+            extraction_status='parsed', metadata={'paper_id': 'paper'})], {}, {}, [], [
+                TextChunk('chunk-1', 'paper', 'Calibration depends on the observed population.')])
+        (source / 'original.json').write_text(json.dumps(bundle.to_handoff_dict()), encoding='utf-8')
+        sources = SourceToolGateway(root, workspace, ledger)
+
+        def decide(view, count):
+            if count <= 3:
+                return {'action': 'investigate', 'source_queries': [
+                    {'document_record': 'source0/original.json', 'query': 'calibration population'}]}
+            self.assertEqual(view['read_results'][0]['status'], 'recalled')
+            return {'action': 'finish', 'manuscript_markdown': '# Result\nThe observed population matters.\n',
+                'selected_observation_ids': ['o1']}
+
+        gateway, clients = self.gateway(root, source, ledger, workspace, decide,
+            sources=sources, context_policy='working.v4')
+        with patch.object(sources, 'call', wraps=sources.call) as lookups:
+            result = gateway.call('work_document', {'goal': 'Use the source'}, identity='recall-source')
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(len(clients[0].calls), 4)
+        self.assertEqual(lookups.call_count, 1)
+        self.assertEqual([row['kind'] for row in result.data['provenance']['evidence']], ['source_passages'])
+
     def test_required_document_input_is_checked_against_model_capacity_before_purchase(self):
         root, source, ledger, workspace = self.workspace()
         gateway, clients = self.gateway(root, source, ledger, workspace,

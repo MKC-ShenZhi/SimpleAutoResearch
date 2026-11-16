@@ -816,7 +816,8 @@ class DocumentWorkToolGateway:
             observations.append({'id': f'o{len(observations) + 1}', 'kind': 'material_window', 'observation': row})
         store.write_json('observations.json', observations)
         client = client if client is not None else self._bound_client(identity)
-        seen_reads, seen_queries, no_progress = set(), set(), set()
+        seen_reads, seen_queries = set(), set()
+        previous_rejection = None
         for row in observations:
             seen_reads.add(window_key(self.workspace, FileWindow.model_validate(row['observation']['request'])))
         feedback = []
@@ -871,9 +872,9 @@ class DocumentWorkToolGateway:
                 # bad response and stop if the same mistake repeats.
                 signature = _digest({'response': response, 'error': str(exc)})
                 store.write_json(f'{path}/validation-error.json', {'error': str(exc)})
-                if signature in no_progress:
+                if signature == previous_rejection:
                     raise ValueError('Repeated invalid document decision; inspect the retained responses') from exc
-                no_progress.add(signature)
+                previous_rejection = signature
                 feedback = [{'status': 'invalid_decision', 'error': str(exc),
                     'scope': 'Correct the decision schema; this prior response is not evidence.'}]
                 continue
@@ -887,9 +888,9 @@ class DocumentWorkToolGateway:
                 except _CandidateSelectionError as exc:
                     store.write_json(f'{path}/selection-error.json', {'error': str(exc)})
                     signature = _digest({'selection': response, 'error': str(exc)})
-                    if signature in no_progress:
+                    if signature == previous_rejection:
                         raise ValueError('Repeated invalid report evidence selection') from exc
-                    no_progress.add(signature)
+                    previous_rejection = signature
                     feedback = [{'status': 'candidate_selection_rejected', 'error': str(exc),
                         'scope': 'Choose actually presented observation and attachment IDs.'}]
                     continue
@@ -898,15 +899,12 @@ class DocumentWorkToolGateway:
                 return
             if decision.action == 'preview':
                 measurements = manuscript_measurements(decision.manuscript_markdown)
-                signature = _digest({'preview': measurements['sha256']})
-                if signature in no_progress:
-                    raise ValueError('Repeated unchanged preview; finish or revise the retained manuscript')
-                no_progress.add(signature)
                 preview = {'manuscript_markdown': decision.manuscript_markdown,
                     'measurements': measurements, 'gaps': decision.gaps,
                     'scope': 'Uncommitted producer draft only; no output, inspection or task completion.'}
                 store.write_json(f'{path}/preview.json', preview)
                 feedback = []
+                previous_rejection = None
                 continue
             if decision.action == 'finish':
                 try:
@@ -918,9 +916,9 @@ class DocumentWorkToolGateway:
                         'observations': sorted(decision.selected_observation_ids),
                         'attachments': sorted(decision.attachments)}, 'error': str(exc)})
                     store.write_json(f'{path}/selection-error.json', {'error': str(exc)})
-                    if signature in no_progress:
+                    if signature == previous_rejection:
                         raise ValueError(f'Repeated invalid candidate selection: {exc}; inspect the retained draft and observations') from exc
-                    no_progress.add(signature)
+                    previous_rejection = signature
                     preview = {'manuscript_markdown': decision.manuscript_markdown,
                         'measurements': manuscript_measurements(decision.manuscript_markdown),
                         'selected_observation_ids': decision.selected_observation_ids,
@@ -938,10 +936,12 @@ class DocumentWorkToolGateway:
                     *(row['record'] for row in feedback_projection[1])]
                     if feedback_projection is not None else ()))
             signature = _digest({'decision': response, 'feedback': feedback})
-            if not added:
-                if signature in no_progress:
+            if not added and not any(row.get('status') == 'recalled' for row in feedback):
+                if signature == previous_rejection:
                     raise ValueError('Repeated investigation made no progress; inspect retained read failures')
-                no_progress.add(signature)
+                previous_rejection = signature
+            else:
+                previous_rejection = None
 
     def _complete_report(self, store: ArtifactStore, binding: dict, observations: list[dict],
                          decision: _ReportDecision, step: int, identity: str,
@@ -1094,12 +1094,10 @@ class DocumentWorkToolGateway:
                     raise ValueError('Binary figure/PDF has no text-window reader; preserve it or use an independent reader')
                 key = window_key(self.workspace, window)
                 if key in seen_reads:
-                    if not cumulative_capacity:
-                        row = next(row for row in observations if row['kind'] in {'material_window', 'work_context'}
-                            and window_key(self.workspace, FileWindow.model_validate(row['observation']['request'])) == key)
-                        feedback.append({'status': 'recalled', 'id': row['id']})
-                        continue
-                    raise ValueError('This exact window was already observed')
+                    row = next(row for row in observations if row['kind'] in {'material_window', 'work_context'}
+                        and window_key(self.workspace, FileWindow.model_validate(row['observation']['request'])) == key)
+                    feedback.append({'status': 'recalled', 'id': row['id']})
+                    continue
                 size = self.workspace.resolve_material_root(window.path).stat().st_size
                 if not is_context and size != visible[path]['size_bytes']:
                     raise ValueError('Material candidate changed during investigation')
@@ -1130,13 +1128,11 @@ class DocumentWorkToolGateway:
                 arguments = query.model_dump(mode='json')
                 key = _digest({**arguments, 'document_record': path})
                 if key in seen_queries:
-                    if not cumulative_capacity:
-                        row = next(row for row in observations if row['kind'] == 'source_passages'
-                            and _digest({**row['request'], 'document_record':str(
-                                self.sources.resolve_source_handoff(row['request']['document_record']))}) == key)
-                        feedback.append({'status': 'recalled', 'id': row['id']})
-                        continue
-                    raise ValueError('This exact source query was already observed')
+                    row = next(row for row in observations if row['kind'] == 'source_passages'
+                        and _digest({**row['request'], 'document_record':str(
+                            self.sources.resolve_source_handoff(row['request']['document_record']))}) == key)
+                    feedback.append({'status': 'recalled', 'id': row['id']})
+                    continue
                 result = self.sources.call('find_source_passages', arguments, identity=identity)
                 if result.status != 'ok':
                     raise ValueError(result.error or 'Source passage lookup failed')
