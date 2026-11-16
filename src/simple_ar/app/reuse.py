@@ -241,34 +241,26 @@ def session_materials(root: Path, *, authorize=None, include_project: bool = Tru
     root = root.resolve()
     if version is not None:
         from simple_ar.tools.delivery_versions import DeliveryVersions
-        return DeliveryVersions(root, authorize=authorize).material_paths(version)
+        return DeliveryVersions(root, authorize=authorize).material_paths(version, include_project=include_project)
     if authorize is not None:
-        authorize(root)
         authorize(root / 'session_manifest.json')
-        if read_json(root / 'session_manifest.json').get('transition_recipe') != 'native-tools-v1':
-            raise ValueError('Granted retained-material reading requires a native-tool session; '
-                             'use the historical CLI reader for this task')
+    manifest = read_json(root / 'session_manifest.json')
+    if manifest.get('transition_recipe') == 'native-tools-v1':
+        # A previous delivery is not the current completion during feedback.
+        if manifest.get('status') not in {'completed', 'partial'}:
+            return {}
         reader = RetainedDelivery(root, authorize=authorize)
         available = reader.reusable_materials()
         available.pop('code_project', None)
         if available and include_project and (project := _listed_native_project(reader)) is not None:
             available['code_project'] = [project]
         return available
+    if authorize is not None:
+        raise ValueError('Granted retained-material reading requires a native-tool session; '
+                         'use the historical CLI reader for this task')
     from simple_ar.core.capabilities import CapabilityRegistry
     from simple_ar.core.session import SessionController
     session = SessionController.load(root, registry=CapabilityRegistry())
-    from simple_ar.app.tool_application import ToolApplication
-    if session.manifest.transition_recipe == ToolApplication.RECIPE:
-        # A previous delivery remains on disk during feedback. It is not the
-        # current completion while the revised task is active or paused.
-        if session.manifest.status not in {"completed", "partial"}:
-            return {}
-        reader = RetainedDelivery(root)
-        available = reader.reusable_materials()
-        available.pop('code_project', None)  # Complete project proof is separate from portable file groups.
-        if available and include_project and (project := _listed_native_project(reader)) is not None:
-            available['code_project'] = [project]
-        return available
     available: dict[str, list[Path]] = {}
     project = session_project(session, authorize=authorize)
     if project is not None:

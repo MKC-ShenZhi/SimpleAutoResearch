@@ -108,6 +108,11 @@ class DeliveryVersionTests(unittest.TestCase):
         selection = select_reuse(self.root, ['code_project', 'artifacts'])
         self.assertEqual(selection.version, 1)
         self.assertEqual(session_materials(self.root)['code_project'], [self.root/'workspace/analysis'])
+        admitted = []
+        scoped = session_materials(self.root, authorize=lambda path: admitted.append(path))
+        self.assertEqual(scoped, session_materials(self.root))
+        self.assertIn(self.root/'session_manifest.json', admitted)
+        self.assertNotIn('code_project', session_materials(self.root, version=1, include_project=False))
         groups = DeliveryVersions(self.root).materials(1)
         self.assertEqual(list(groups['code_project']), ['analysis/main.py'])
         self.assertEqual(set(groups['artifacts']), {'analysis/main.py', 'report.md', 'previous-copy/tool.py'})
