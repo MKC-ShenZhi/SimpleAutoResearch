@@ -1036,6 +1036,7 @@ class WorkspaceToolGateway:
         are resolved; process declarations and directory contents are never outputs.
         """
         identities, artifacts, last_delivery, latest_produced = [], [], None, None
+        session_id = None
         last_operation, next_action = None, ''
         for event in observations:
             observed = event['observation']
@@ -1072,37 +1073,37 @@ class WorkspaceToolGateway:
             if isinstance(inspection, dict) and data.get('record') and inspection.get('assessment_sha256'):
                 versions = {**(versions if isinstance(versions, dict) else {}),
                             data['record']: inspection['assessment_sha256']}
-            if successful and name not in {'finish_professional_work', 'return_source_work'} and isinstance(versions, dict):
+            owner_output = successful and name not in {'finish_professional_work', 'return_source_work'} and isinstance(versions, dict)
+            process_output = successful and name == 'run_process' and isinstance(data.get('receipt'), str)
+            if owner_output or process_output:
                 try:
                     from simple_ar.tools.professional_outcomes import accepted_native_result
-                    session_id = read_json(self.root / 'session_manifest.json')['session_id']
+                    if session_id is None:
+                        session_id = read_json(self.root / 'session_manifest.json')['session_id']
                     accepted_native_result(self.root, session_id, observed, Path(event['record']).parent.name,
                                            require_content_binding=True)
                 except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                     pass
                 else:
-                    groups.append((owner, versions, 'professional_output_binding'))
-            # The invocation is the output-binding owner for both fresh and
-            # recovered runs. Never reinterpret argv or bind historical bytes.
-            if successful and name == 'run_process' and isinstance(data.get('receipt'), str):
-                try:
-                    from simple_ar.tools.professional_outcomes import accepted_native_result
-                    session_id = read_json(self.root / 'session_manifest.json')['session_id']
-                    accepted_native_result(self.root, session_id, observed, Path(event['record']).parent.name,
-                                           require_content_binding=True)
-                    receipt = self._process_diagnostic_path(str(self.root / data['receipt']))
-                    if receipt is not None and receipt.name == 'invocation.json':
-                        raw = receipt.read_bytes()
-                        if hashlib.sha256(raw).hexdigest() != data.get('receipt_sha256'):
-                            raise ValueError('Process receipt is not bound to the accepted observation')
-                        process = json.loads(raw.decode('utf-8'))
-                        outputs = _process_artifact_record(process).recorded_outputs
-                        if (receipt.parent.name == Path(event['record']).parent.name
-                                and process.get('invocation_id') == receipt.parent.name and outputs is not None):
-                            groups.append(({**owner, 'receipt': str(receipt)},
-                                           outputs, 'process_output_binding'))
-                except (OSError, ValueError, KeyError, TypeError, RuntimeError):
-                    pass  # Missing or historical unbound execution is not production proof.
+                    if owner_output:
+                        groups.append((owner, versions, 'professional_output_binding'))
+                    if process_output:
+                        # The invocation owns its outputs, including recovered
+                        # runs. Reuse the accepted observation above.
+                        try:
+                            receipt = self._process_diagnostic_path(str(self.root / data['receipt']))
+                            if receipt is not None and receipt.name == 'invocation.json':
+                                raw = receipt.read_bytes()
+                                if hashlib.sha256(raw).hexdigest() != data.get('receipt_sha256'):
+                                    raise ValueError('Process receipt is not bound to the accepted observation')
+                                process = json.loads(raw.decode('utf-8'))
+                                outputs = _process_artifact_record(process).recorded_outputs
+                                if (receipt.parent.name == Path(event['record']).parent.name
+                                        and process.get('invocation_id') == receipt.parent.name and outputs is not None):
+                                    groups.append(({**owner, 'receipt': str(receipt)},
+                                                   outputs, 'process_output_binding'))
+                        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+                            pass  # Unbound historical execution is not production proof.
             # Existing native artifact identities remain visible even without a
             # version binding; primitive write receipts already own their digest.
             native = dict.fromkeys(observed.get('artifacts') or [])
@@ -1316,12 +1317,9 @@ class WorkspaceToolGateway:
             if not processes.is_dir():
                 return [], ()
             rows, stamp = [], []
-            for receipt, record, binding, versions_, successful in self._artifact_producer_records(processes):
-                raw = receipt.read_bytes()
-                if json.loads(raw.decode('utf-8')) != record:
-                    raise ValueError('Process receipt changed during inventory')
+            for receipt, record, binding, versions_, successful in self._artifact_producer_records(
+                    processes, snapshot=stamp):
                 rows.append((receipt, record, binding, versions_, successful))
-                stamp.append((str(receipt), hashlib.sha256(raw).hexdigest()))
             return rows, tuple(sorted(stamp))
 
         try:
@@ -2186,7 +2184,8 @@ class WorkspaceToolGateway:
                     producers[path] = (order, None, None)
         return producers
 
-    def _artifact_producer_records(self, directory: Path, *, reader: RetainedDelivery | None = None
+    def _artifact_producer_records(self, directory: Path, *, reader: RetainedDelivery | None = None,
+                                   snapshot: list | None = None
                                    ) -> Iterable[tuple[Path, dict, dict, dict, dict | None]]:
         """One bounded reader for current owners and retained version history."""
         total = 0
@@ -2209,11 +2208,15 @@ class WorkspaceToolGateway:
             total += receipt.stat().st_size
             if total > _FULL_DIGEST_MAX_BYTES:
                 raise ValueError('Process receipt inventory exceeds 64 MiB')
+            raw = receipt.read_bytes() if snapshot is not None else None
             record = (reader.record(receipt.relative_to(reader.root).as_posix())
-                      if reader is not None else read_json(receipt))
+                      if reader is not None else json.loads(raw.decode('utf-8')) if raw is not None
+                      else read_json(receipt))
             interpreted = _process_artifact_record(record)
             if interpreted.binding is None:
                 continue  # Never invent historical dependency coverage.
+            if snapshot is not None:
+                snapshot.append((str(receipt), hashlib.sha256(raw).hexdigest()))
             yield (receipt, record, interpreted.binding,
                    interpreted.output_versions, interpreted.successful_outputs)
 

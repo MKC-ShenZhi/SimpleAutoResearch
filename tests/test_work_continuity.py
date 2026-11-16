@@ -580,11 +580,19 @@ class WorkingSupplyContinuityTests(unittest.TestCase):
             {'id': 0, 'path': target, 'sha256': 'a', 'state': 'recorded',
                 'edges': [{'kind': 'input', 'node': 1}]},
             {'id': 1, 'path': source, 'sha256': 'a', 'state': 'ordinary', 'edges': []}]}
-        workspace = SimpleNamespace(artifact_sources=lambda *_args, **_kw: {'/target': {'lineage': graph}},
-            resolve=Path)
+        calls = []
+        def sources(*_args, **_kw):
+            calls.append(True)
+            return {'/target': {'lineage': graph}}
+        workspace = SimpleNamespace(artifact_sources=sources, resolve=Path)
         self.assertFalse(_recorded_copy_source(workspace, '/target', 'a', '/source'))
         graph['nodes'][0]['edges'][0]['kind'] = 'copy'
         self.assertTrue(_recorded_copy_source(workspace, '/target', 'a', '/source'))
+        cache = {}
+        calls.clear()
+        self.assertTrue(_recorded_copy_source(workspace, '/target', 'a', '/source', cache=cache))
+        self.assertFalse(_recorded_copy_source(workspace, '/target', 'a', '/other', cache=cache))
+        self.assertEqual(len(calls), 1)
         graph['nodes'][0]['state'] = 'unbound'
         self.assertFalse(_recorded_copy_source(workspace, '/target', 'a', '/source'))
 

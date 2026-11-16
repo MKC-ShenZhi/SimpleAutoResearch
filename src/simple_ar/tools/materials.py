@@ -624,24 +624,36 @@ def _content_target(workspace: Any, request: FileWindow, data: dict, source: dic
 
 def _recorded_copy_source(workspace: Any, target: str, digest: str, source: str,
                           *, cache: dict | None = None) -> bool:
-    """Use the existing version owner graph; equal bytes never invent an edge."""
-    graph = workspace.artifact_sources({target: digest}, cache=cache).get(target, {}).get('lineage')
-    if graph is None:
+    """Relate a copy to its recorded origins within one material projection.
+
+    Callers supply a fresh cache per projection. Several opinions can name the
+    same target, so resolve its existing graph once instead of rereading the
+    whole execution journal for each source. Equal bytes alone add no edge.
+    """
+    target_path, origin = workspace.resolve(target), workspace.resolve(source)
+    if target_path == origin:
         return False
-    nodes = {node['id']: node for node in graph['nodes']}
-    pending, visited = [graph['root']], set()
-    origin = workspace.resolve(source)
-    while pending:
-        identity = pending.pop()
-        if identity in visited:
-            continue
-        visited.add(identity)
-        node = nodes[identity]
-        if node['path'] == origin and node['sha256'] == digest:
-            return identity != graph['root']
-        if node['state'] == 'recorded':
-            pending.extend(edge['node'] for edge in node['edges'] if edge['kind'] == 'copy')
-    return False
+    key = ('copy_origins', str(target_path), digest)
+    origins = cache.get(key) if cache is not None else None
+    if origins is None:
+        origins = set()
+        graph = workspace.artifact_sources({target: digest}, cache=cache).get(target, {}).get('lineage')
+        if graph is not None:
+            nodes = {node['id']: node for node in graph['nodes']}
+            pending, visited = [graph['root']], set()
+            while pending:
+                identity = pending.pop()
+                if identity in visited:
+                    continue
+                visited.add(identity)
+                node = nodes[identity]
+                if identity != graph['root'] and node['sha256'] == digest:
+                    origins.add(node['path'])
+                if node['state'] == 'recorded':
+                    pending.extend(edge['node'] for edge in node['edges'] if edge['kind'] == 'copy')
+        if cache is not None:
+            cache[key] = origins
+    return origin in origins
 
 
 def related_review_target(workspace: Any, subject: Path, digest: str, roots: list[Path],
