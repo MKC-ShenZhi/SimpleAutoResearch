@@ -34,6 +34,7 @@ from simple_ar.code_task.execution.artifact_contract import (
 )
 from simple_ar.code_task.execution.run_history import archive_run_attempt
 from simple_ar.code_task.runtime.state import (
+    benchmark_command,
     code_task_paths,
     load_code_task_manifest,
     manifest_section,
@@ -255,7 +256,7 @@ def run_code_task_benchmark(
         raise FileNotFoundError(f"Missing code-task workspace: {paths.workspace_dir}")
     paths.run_artifact_dir.mkdir(parents=True, exist_ok=True)
 
-    command_text = command or _benchmark_command(manifest)
+    command_text = command or benchmark_command(manifest)
     if not command_text:
         raise CodeTaskRunError(
             "No benchmark command recorded. Pass --command or rerun code-task init "
@@ -1045,14 +1046,6 @@ def _clip_output(text: str) -> tuple[str, bool]:
         return text, False
     suffix = "\n... [truncated by SimpleAutoResearch]\n"
     return text[: OUTPUT_CHAR_LIMIT - len(suffix)] + suffix, True
-
-
-def _benchmark_command(manifest: dict[str, Any]) -> str:
-    benchmark = manifest.get("benchmark", {})
-    if isinstance(benchmark, dict):
-        command = benchmark.get("command")
-        return str(command) if command else ""
-    return ""
 
 
 def _write_runtime_artifact_scan(run_dir: Path, label: str, scan: dict[str, Any]) -> Path:

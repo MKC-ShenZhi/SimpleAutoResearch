@@ -14,7 +14,7 @@ from simple_ar.code_task.editing.scope import (
     prompt_file_inventory,
 )
 from simple_ar.code_task.runtime.state import (
-    code_task_paths, read_required_json as _read_required_json, utcnow_iso as _utcnow_iso,
+    benchmark_command, code_task_paths, read_required_json as _read_required_json, utcnow_iso as _utcnow_iso,
 )
 from simple_ar.code_task.runtime.accounting import account_code_task
 from simple_ar.code_task.analysis.context import (
@@ -122,7 +122,7 @@ def generate_patch_plan(
         max_source_chars_per_file=max_source_chars_per_file,
         message_callback=message_callback,
     )
-    inputs["benchmark_command"] = _benchmark_command(manifest)
+    inputs["benchmark_command"] = benchmark_command(manifest)
     plan_data, mode = _generate_plan_data(
         meta_dir, inputs=inputs, selected_files=selected,
         ask=_ask_llm_for_plan, offline=_offline_plan,
@@ -1038,14 +1038,6 @@ def _new_file_plan_list(value: object) -> list[dict[str, str]]:
             continue
         result.append({"path": path, "reason": _string(item.get("reason"))})
     return result
-
-
-def _benchmark_command(manifest: dict[str, Any]) -> str:
-    benchmark = manifest.get("benchmark", {})
-    if isinstance(benchmark, dict):
-        command = benchmark.get("command")
-        return str(command) if command else ""
-    return ""
 
 
 def _object_dict(value: object) -> dict[str, Any]:

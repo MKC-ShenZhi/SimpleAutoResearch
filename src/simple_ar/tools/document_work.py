@@ -238,11 +238,6 @@ def _digest(value: Any) -> str:
         separators=(',', ':'), allow_nan=False).encode('utf-8')).hexdigest()
 
 
-def _relative_image_target(target: str) -> str | None:
-    """A safe output-relative spelling for an unchanged local Markdown image."""
-    return relative_image_target(target)
-
-
 class DocumentWorkToolGateway:
     """Common operation owner; no task loop, second budget, reviewer or publisher.
 
@@ -676,7 +671,7 @@ class DocumentWorkToolGateway:
         parent = Path(prior['absolute_path']).parent
         images = []
         for target in report_image_targets(prior['text']):
-            row = {'target': target, 'relative_target': _relative_image_target(target)}
+            row = {'target': target, 'relative_target': relative_image_target(target)}
             try:
                 path = _asset_path(parent, target,
                     resolve_image=lambda value: self.workspace.resolve_material_root(str(value)))
@@ -1350,7 +1345,7 @@ class DocumentWorkToolGateway:
         output_root = self.workspace.resolve(candidate['manuscript']).parent
         materialized = {self.workspace.resolve(row['path']) for row in all_assets}
         for target in report_image_targets(markdown):
-            relative = _relative_image_target(target)
+            relative = relative_image_target(target)
             if relative is None or output_root / relative not in materialized:
                 gaps.append('Image is not a materialized document asset: ' + target)
         data = {'manuscript': candidate['manuscript'], 'markdown': markdown, 'sha256': digest,

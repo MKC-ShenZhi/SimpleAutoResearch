@@ -8,6 +8,13 @@ from typing import Any
 from simple_ar.core.artifacts import read_json, write_json
 
 
+def benchmark_command(manifest: dict[str, Any]) -> str:
+    """Return the configured command shared by planning and execution."""
+    benchmark = manifest.get('benchmark', {})
+    command = benchmark.get('command') if isinstance(benchmark, dict) else None
+    return str(command) if command else ''
+
+
 def uses_legacy_greenfield(manifest: dict[str, Any]) -> bool:
     """Keep the saved experimental generator's contract with its consumers."""
     task = manifest.get('code_task', {})

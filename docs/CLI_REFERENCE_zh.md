@@ -872,7 +872,7 @@ simple-ar code-task init [OPTIONS]
 | `--task-file PATH` | Markdown/text 任务描述。除非配置中已设置，否则必填。 | 未设置 |
 | `--output-root PATH` | code-task run 创建位置。 | 未设置 |
 | `--name NAME` | run 名称后缀。 | 未设置 |
-| `--benchmark-command VALUE` | 在 workspace 中 patch 前后运行的命令。 | 未设置 |
+| `--benchmark-command VALUE` | 可选的 patch 前后 workspace 运行命令；未设置时仍可编辑，运行验证会标为未执行。 | 未设置 |
 | `--primary-metric NAME` | before/after verdict 使用的主指标。 | 未设置 |
 | `--metric-direction METRIC=DIRECTION` | 指标方向：`higher`、`lower`、`resource` 或 `ignore`。 可重复。 | [] |
 | `--env-mode CHOICE` | `current` 或 `external`。 可选：`current`, `external`. | 保存／配置策略；未设 current |

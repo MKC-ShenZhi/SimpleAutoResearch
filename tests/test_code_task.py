@@ -5048,6 +5048,36 @@ protected_patterns = ["pyproject.toml"]
                         self.assertEqual(read_json(report)["metric_values"]["accuracy"], 0.75)
                         self.assertTrue(manifest["benchmark"]["runs"]["baseline"]["provided"])
 
+    def test_existing_project_without_benchmark_can_be_edited_but_is_not_run(self) -> None:
+        from simple_ar.code_task.execution.runner import CodeTaskRunError
+
+        with _temporary_root() as root:
+            _, _, run_dir = _initialize_toy_task(root, 'Classify prize messages as spam.', direct_edit=True)
+            workspace = code_task_paths(run_dir).workspace_dir
+            original = (workspace / 'spam_model.py').read_text(encoding='utf-8')
+            fake = _FakeCodeTaskClient()
+            client = LLMClient(LLMSettings(api_key='fixture', api_mode='chat'))
+            with patch.object(LLMClient, 'ask_json', side_effect=fake.ask_json):
+                result = execute_code_task(run_dir, llm_client=client, to_step='run',
+                    apply_proposed_edits=True, approval_note='Authorized project edit', review_use_llm=False)
+            self.assertEqual(result.stop_reason, 'execution_unverified')
+            self.assertNotEqual((workspace / 'spam_model.py').read_text(encoding='utf-8'), original)
+            self.assertEqual(read_json(run_dir / 'manifest.json')['benchmark']['baseline_policy']['status'], 'skipped')
+            self.assertFalse((run_dir / 'code_task/run/patched/execution_report.json').exists())
+            self.assertIn('runtime', result.steps[-1].detail)
+            manifest = read_json(run_dir / 'manifest.json')
+            manifest['benchmark']['command'] = TOY_BENCHMARK_COMMAND
+            write_json(run_dir / 'manifest.json', manifest)
+            with patch('simple_ar.code_task.orchestration.execute.run_code_task_baseline',
+                       side_effect=AssertionError('Edited code is not the unchanged baseline')):
+                resumed = execute_code_task(run_dir, to_step='baseline', use_llm=False)
+            self.assertEqual(resumed.stop_reason, 'stop_point')
+            self.assertEqual(resumed.steps[-1].status, 'skipped')
+        with _temporary_root() as root:
+            _, _, run_dir = _initialize_toy_task(root, 'The caller explicitly requires a baseline.')
+            with self.assertRaisesRegex(CodeTaskRunError, 'No benchmark command'):
+                execute_code_task(run_dir, baseline_policy='run', to_step='baseline', use_llm=False)
+
     def test_execute_baseline_failure_keeps_immediate_and_committed_guards(self) -> None:
         for status in ("failed", "timed_out", "blocked_by_validation", "unknown"):
             for cached, recorded_status in ((False, status), (True, status), (False, None), (False, "passed")):

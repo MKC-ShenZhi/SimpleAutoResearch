@@ -877,7 +877,7 @@ simple-ar code-task init [OPTIONS]
 | `--task-file PATH` | Markdown/text task description. Required unless set in config. | Unset |
 | `--output-root PATH` | Directory where the code-task run is created. | Unset |
 | `--name NAME` | Run name suffix. | Unset |
-| `--benchmark-command VALUE` | Command run inside the workspace before and after edits. | Unset |
+| `--benchmark-command VALUE` | Optional command run inside the workspace before and after edits. Without it, editing can continue; runtime verification is reported as unperformed. | Unset |
 | `--primary-metric NAME` | Primary metric for before/after verdicts. | Unset |
 | `--metric-direction METRIC=DIRECTION` | Metric direction: `higher`, `lower`, `resource`, or `ignore`. Repeatable. | [] |
 | `--env-mode CHOICE` | `current` or `external`. Choices: `current`, `external`. | Saved/config policy; current if unset |

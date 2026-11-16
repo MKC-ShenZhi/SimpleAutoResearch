@@ -27,6 +27,7 @@ from simple_ar.code_task.editing.planning import (
     _string_list,
 )
 from simple_ar.code_task.runtime.state import (
+    benchmark_command,
     code_task_paths,
     save_code_task_manifest,
     utcnow_iso,
@@ -139,7 +140,7 @@ def generate_code_task_work_plan(
         max_source_chars_per_file=max_source_chars_per_file,
         message_callback=message_callback,
     )
-    inputs["benchmark_command"] = _benchmark_command(manifest)
+    inputs["benchmark_command"] = benchmark_command(manifest).strip()
     new_files = _creation_paths(manifest, run_dir=root)
     if new_files:
         inputs["run_context"]["new_files"] = new_files
@@ -783,12 +784,6 @@ def _work_item_refs(value: object) -> list[str]:
         if re.fullmatch(r"W[0-9]{1,3}", normalized) and normalized not in refs:
             refs.append(normalized)
     return refs
-
-
-def _benchmark_command(manifest: dict[str, Any]) -> str:
-    benchmark = _object_dict(manifest.get("benchmark"))
-    command = benchmark.get("command")
-    return command.strip() if isinstance(command, str) else ""
 
 
 def _benchmark_from_context(run_context: dict[str, Any]) -> str:

@@ -157,8 +157,7 @@ def _execution(owner: Any, locator: str, *, successful: bool = False) -> tuple[d
         raise ValueError('Retained diagnostics differ from the physical receipt')
     if owner.workspace.artifact_hashes(binding['source_sha256']) != binding['source_sha256']:
         raise ValueError('Execution inputs changed; no automatic repair')
-    if successful and (not saved['output_sha256']
-            or owner.workspace.artifact_hashes(saved['output_sha256']) != saved['output_sha256']):
+    if successful and owner.workspace.artifact_hashes(saved['output_sha256']) != saved['output_sha256']:
         raise ValueError('Successful execution outputs changed; no review-based repair')
     return saved, observed
 

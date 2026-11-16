@@ -481,7 +481,8 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertIn('Use existing results and the available reading, analysis, editing and execution operations',
                 app.operations.system_text())
             self.assertNotIn('Use a complete script or command', app.operations.system_text())
-            self.assertIn('Use a complete script or command', _executable_work_system())
+            self.assertNotIn('Use a complete script or command', _executable_work_system())
+            self.assertIn('when a scoped project change is needed', _executable_work_system(scoped_code=True))
 
     def test_collection_budget_allows_multiple_sources_and_preserves_explicit_limit(self):
         from simple_ar.research.contracts import DocumentRecord

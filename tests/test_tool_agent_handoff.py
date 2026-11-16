@@ -343,6 +343,32 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(app.ledger.to_dict(), before)
         fake.chat_turn.assert_not_called()
 
+    def test_prepared_validation_can_return_only_a_process_receipt(self) -> None:
+        _, _, fake, _, app, _ = self._historical_native_fixture(process_limits={
+            'process_invocations': 1, 'process_wall_seconds': 10})
+        fake.chat_turn.side_effect = AssertionError('No coordinator decisions')
+        app.implementation.client_factory = lambda _: fake
+        fake.ask_json.return_value = {'summary': 'Prepared validation', 'unresolved': [],
+            'files': [{'path': 'check.py', 'content': "print('checks passed')\n"}],
+            'execution_plan': {'argv': ['python', 'check.py'], 'outputs': [], 'timeout_sec': 3}}
+        stop = {'tool_name': 'ask_user', 'arguments': {'question': 'Await explicit continuation'}}
+        app.run(actions=[{'tool_name': 'prepare_implementation', 'arguments': {
+            'goal': 'Prepare and run a validation check',
+            'files': [{'path': 'check.py', 'purpose': 'Check the behavior'}]}}, stop], progress=lambda _: None)
+        prepared = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(prepared['status'], 'ok', prepared.get('error'))
+        app.run(actions=[{'tool_name': 'execute_implementation', 'arguments': {
+            'prepared_result': prepared['data']['prepared_result']}}, stop],
+            approve=lambda *_: True, progress=lambda _: None)
+        executed = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(executed['status'], 'ok', executed.get('error'))
+        self.assertEqual(executed['data']['output_sha256'], {})
+        self.assertIn('checks passed', executed['data']['stdout'])
+        self.assertEqual(len([row for row in app.ledger.entries if row.purpose == 'local_process']), 1)
+        from simple_ar.tools.implementation_work import _execution
+        retained, _ = _execution(app.implementation, executed['data']['execution_ref'], successful=True)
+        self.assertEqual(retained['status'], 'run_succeeded')
+
     def test_prepared_execution_failure_supplies_real_diagnosis_and_feedback_version(self) -> None:
         _, inputs, fake, _, app, _ = self._historical_native_fixture(process_limits={
             'process_invocations': 3, 'process_wall_seconds': 10})
@@ -401,7 +427,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(len(guidance), 1)
         self.assertEqual(len(prompt['source_windows']), len(material) + len(guidance))
         self.assertEqual(material[0]['request']['path'], 'source0/notes.txt')
-        self.assertEqual(material[0]['text'], (inputs / 'notes.txt').read_text())
+        self.assertEqual(material[0]['text'], (inputs / 'notes.txt').read_bytes().decode('utf-8'))
         self.assertEqual(guidance[0]['work_context']['user_requests'], app.state['requests'])
         self.assertEqual(guidance[0]['work_context']['review_observations'], [])
         self.assertNotIn('request', guidance[0])
@@ -1566,6 +1592,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(refused['reason'], 'observation_capacity')
         self.assertEqual((refused['offset_bytes'], refused['next_offset_bytes']), (94000, 110000))
         self.assertNotIn('text', refused)
+        # When the combined input becomes too large, a later smaller window
+        # can still be admitted without dropping the first observed window.
+        sized = material_observation_seed(workspace=app.workspace, inventories=inventories,
+            provider=lambda _: refs, roots=[str(source)], context={'inventory': 'x' * 140000})
+        self.assertEqual([row['data']['next_offset_bytes'] for row in sized['observations']], [64000, 110000])
+        self.assertEqual(sized['coverage']['not_admitted'][0]['reason'], 'serialized_context_capacity')
         owner = ArtifactStore(app.session.store.root / 'tools/seed-capacity')
         client = Mock()
         client.ask_json.side_effect = [{'read_windows': [windows[0]]}, {'materials': windows[:2]}]
@@ -2574,6 +2606,20 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             2 if dimension == 'llm_requests' else app.ledger.limits[dimension]):
             resources = json.loads(app._messages()[1]['content'])['resources']
             self.assertEqual(resources['model_turns_remaining'], 2)
+
+    def test_longer_process_timeout_obeys_the_shared_budget(self) -> None:
+        with _temporary_run() as directory:
+            root = directory.resolve()
+            ledger = BudgetLedger({'process_invocations': 2, 'process_wall_seconds': 600})
+            workspace = WorkspaceToolGateway(root, {}, ledger)
+            arguments = {'argv': ['python', '-c', "print('completed')"], 'timeout_sec': 600}
+            result = workspace.call('run_process', arguments, identity='longer-allowed')
+            self.assertTrue(result.ok, result.error)
+            self.assertIn('completed', result.data['stdout'])
+            with patch('simple_ar.core.process.subprocess.Popen', side_effect=AssertionError('Budget must reject before execution')):
+                blocked = workspace.call('run_process', {**arguments, 'timeout_sec': 601}, identity='longer-over-budget')
+            self.assertEqual(blocked.status, 'blocked')
+            self.assertEqual(blocked.data.get('failure_kind'), 'resource_exhausted')
 
     def test_native_task_environment_is_shared_by_python_children_and_receipt_recovery(self) -> None:
         import venv
@@ -13508,20 +13554,21 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         invalid = [
             {'argv': []}, {'argv': ['python'] * 41}, {'argv': ['']}, {'argv': ['  ']},
             {'argv': ['python', 1]}, {'argv': ('python',)}, {'argv': 'python compose.py'},
-            {'outputs': []}, {'outputs': [f'{index}.txt' for index in range(25)]},
+            {'outputs': [f'{index}.txt' for index in range(25)]},
             {'outputs': [1]}, {'outputs': ['report.txt', 'REPORT.txt']},
             {'outputs': ['result', 'result/report.txt']}, {'outputs': ['out\\report.txt']},
             {'outputs': ['/report.txt']}, {'outputs': ['out/.ENV.local']},
             {'timeout_sec': True}, {'timeout_sec': '120'}, {'timeout_sec': 1.5},
-            {'timeout_sec': 0}, {'timeout_sec': 301}, {'cwd': '.'},
+            {'timeout_sec': 0}, {'cwd': '.'},
         ]
         for change in invalid:
             with self.subTest(change=change), self.assertRaises(ValidationError):
                 ImplementationRunPlan.model_validate({**valid, **change})
         plan = ImplementationRunPlan.model_validate({'argv': ['python'] * 40,
-            'outputs': [f'{index}.txt' for index in range(24)], 'timeout_sec': 300})
-        self.assertEqual(plan.timeout_sec, 300)
+            'outputs': [f'{index}.txt' for index in range(24)], 'timeout_sec': 600})
+        self.assertEqual(plan.timeout_sec, 600)
         self.assertEqual(ImplementationRunPlan.model_validate(valid).timeout_sec, 120)
+        self.assertEqual(ImplementationRunPlan.model_validate({'argv': ['python', '-m', 'unittest']}).outputs, [])
 
     def test_execution_plan_correction_is_bounded_and_legacy_ignores_it(self) -> None:
         from simple_ar.code_task.generation.writer import (

@@ -114,17 +114,14 @@ _ORDINARY_WORK = (
     "or change the user's request. Formats and scope follow that request."
 )
 
-def _executable_work_system(*, scoped_code: bool = False, reuse_first: bool = False) -> str:
+def _executable_work_system(*, scoped_code: bool = False) -> str:
     execution = (
-        (("Use implement_code_task when a scoped project change is needed; reuse its existing results "
-          "and declared validation when they remain applicable. " if reuse_first else
-          "Use implement_code_task for the scoped project change and its declared validator. ") +
-         "Its work and any other offered operations share the original task authorization and ledger. ")
+        ("Use implement_code_task when a scoped project change is needed; reuse its existing results "
+         "and declared validation when they remain applicable. Its work and any other offered operations "
+         "share the original task authorization and ledger. ")
         if scoped_code else
-        ("Use existing results and the available reading, analysis, editing and execution operations "
-         "as needed for the actual request. " if reuse_first else
-         "Use a complete script or command to investigate related files, implement the affected work "
-         "and return useful results. ") +
+        "Use existing results and the available reading, analysis, editing and execution operations "
+        "as needed for the actual request. " +
         "write_file and run_process share the task authorization, execution "
         "records and physical ledger; no additional runner or permissions exist. Other operations can "
         "be selected through load_tools when useful. "
@@ -132,14 +129,9 @@ def _executable_work_system(*, scoped_code: bool = False, reuse_first: bool = Fa
     delivery = (
         "When a useful candidate is ready, submit its actual claim and inventory with deliver_result. "
         "Use the applicable independent checks and reuse opinions that still apply to the current work. "
-        if reuse_first else
-        "When a useful candidate is ready, submit its actual claim and inventory with deliver_result. "
-        "The existing delivery owner investigates it independently before committing that exact version; "
-        "this one submission already includes checking. Do not add a separate review-then-deliver ritual. "
     )
     return (
-        ("Complete the user's requested outcome in coherent work units. Start from the goal, " if reuse_first else
-         "Complete the user's requested outcome in coherent executable work units. Start from the goal, ") +
+        "Complete the user's requested outcome in coherent work units. Start from the goal, " +
         "authorized sources, usable prior results and consequential unresolved claims. " + execution +
         "Do not translate an investigation into repeated inventories, "
         "one-file decisions or an exhaustive producer self-audit. Preserve originals and prior versions. "
@@ -441,8 +433,7 @@ class OperationTools:
         if config.get('work_method') == 'goal.v1':
             self.system = _goal_work_system(candidate=False, recent=False)
         elif config.get('work_method') in EXECUTABLE_WORK_METHODS and config.get('professional_operations') not in PRODUCTION_OWNER_CONTRACTS:
-            self.system = _executable_work_system(scoped_code=config.get('code_work_policy') == 'shared.v2',
-                reuse_first=config.get('work_method') == 'execute.v3')
+            self.system = _executable_work_system(scoped_code=config.get('code_work_policy') == 'shared.v2')
         if exact or (preparation is not None or source_owner) and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
             self.implementation = ImplementationToolGateway(root,self.workspace,ledger,config['model'],session_id,

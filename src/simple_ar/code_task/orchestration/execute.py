@@ -57,6 +57,7 @@ from simple_ar.code_task.memory import (
     task_memory_context,
 )
 from simple_ar.code_task.runtime.state import (
+    benchmark_command,
     code_task_paths,
     code_task_workspace_boundary,
     load_code_task_manifest,
@@ -223,9 +224,10 @@ def execute_code_task(
         stream_benchmark_output: Relay benchmark stdout/stderr while baseline
             or patched runs are executing. ``True`` uses ``auto`` mode, which
             understands carriage-return progress output such as tqdm.
-        baseline_policy: Existing-project baseline handling. ``auto`` and
-            ``run`` execute the benchmark, ``skip``/``none`` continue without
-            comparison evidence, and ``provided`` records user-supplied metrics.
+        baseline_policy: Existing-project baseline handling. ``auto`` runs a
+            configured benchmark before editing, ``run`` requires one,
+            ``skip``/``none`` continue without a comparison, and ``provided``
+            records metrics.
         baseline_metrics_file: JSON or metric-line file used when
             ``baseline_policy`` is ``provided``.
         apply_proposed_edits: Authorize application of an existing or generated
@@ -315,6 +317,11 @@ def execute_code_task(
         elif baseline_policy == 'auto':
             # A new project has no unchanged implementation to benchmark.
             baseline_policy = 'skip'
+    if baseline_policy == 'auto' and (not benchmark_command(manifest).strip()
+                                      or _patch_status(manifest) == 'applied'):
+        # An optional baseline must not block editing or label edited code as
+        # the unchanged implementation when a task is resumed.
+        baseline_policy = 'skip'
     if direct_edit is None:
         direct_edit = direct_edit_available(manifest, paths.task_dir, to_step=to_step, use_llm=use_llm)
     ensure_task_memory(root)
@@ -335,7 +342,8 @@ def execute_code_task(
         result = probe_code_task_environment(root, env_mode=env_mode, python_executable=python_executable,
             budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
             process_protection=({'process_invocations': 1, 'process_wall_seconds': timeout_sec}
-                if to_step != 'probe' and process_scope is None else None),
+                if to_step != 'probe' and process_scope is None
+                and (greenfield or benchmark_command(manifest).strip()) else None),
             **({'process_scope': process_scope} if process_scope is not None else {}))
         _record(steps, "probe", "done", f"wrote {result.report_path}")
         _memory_event(root, "probe", "Recorded environment and resource signals for greenfield generation."
@@ -687,7 +695,8 @@ def execute_code_task(
             edit_budget_overrides=edit_budget_overrides,
             message_callback=message_callback,
             process_protection=({'process_invocations': 1, 'process_wall_seconds': timeout_sec}
-                if to_step in {'run', 'analyze-failure', 'repair'} else None),
+                if to_step in {'run', 'analyze-failure', 'repair'}
+                and benchmark_command(manifest).strip() else None),
             **({'task_only': True} if direct_without_plan else {}),
             **({'process_scope': process_scope} if process_scope is not None else {}),
         )
@@ -835,7 +844,8 @@ def execute_code_task(
         max_file_bytes=validation_max_file_bytes, process_scope=process_scope, message_callback=message_callback,
         budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
         process_protection=({'process_invocations': 1, 'process_wall_seconds': timeout_sec}
-            if to_step in {'run', 'analyze-failure', 'repair'} else None))
+            if to_step in {'run', 'analyze-failure', 'repair'}
+            and benchmark_command(load_code_task_manifest(root)).strip() else None))
     if validation.error_count or validation.warning_count:
         severity = "blocking" if validation.error_count else "warning"
         record_review_finding(
@@ -878,6 +888,11 @@ def execute_code_task(
 
     if _patch_status(load_code_task_manifest(root)) != "applied":
         return _result(paths, steps, "patch_not_applied", "Apply reviewed edits before running benchmark.")
+    if not benchmark_command(load_code_task_manifest(root)).strip():
+        _record(steps, 'run', 'skipped', 'No benchmark command was provided; runtime behavior is unverified')
+        return _result(paths, steps, 'execution_unverified',
+            'Static validation finished. Use code-task run with --command for any needed runtime verification.')
+
     result = _run_validated_candidate(root, steps, timeout_sec=timeout_sec, env_mode=env_mode,
         python_executable=python_executable, stream_output=stream_benchmark_output,
         message_callback=message_callback, budget_ledger=budget_ledger,

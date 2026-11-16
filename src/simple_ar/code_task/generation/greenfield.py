@@ -15,6 +15,7 @@ from simple_ar.code_task.editing.scope import (
 )
 from simple_ar.code_task.execution.summary import write_code_task_summary
 from simple_ar.code_task.runtime.state import (
+    benchmark_command,
     code_task_paths,
     code_task_workspace_boundary,
     review_workspace_boundary,
@@ -819,10 +820,7 @@ def _benchmark_command(manifest: dict[str, Any]) -> str:
         from simple_ar.experiment.execution.measurement import representative_measurement_execution
         measurement = representative_measurement_execution(measurement)
         return _argv_command(project_command(measurement['command'], Path(measurement['cwd']), Path('.')))
-    benchmark = manifest.get("benchmark")
-    if isinstance(benchmark, dict) and benchmark.get("command"):
-        return str(benchmark["command"])
-    return "python generated_project/main.py"
+    return benchmark_command(manifest) or "python generated_project/main.py"
 
 
 def _read_task(path: Path, *, limit: int) -> str:

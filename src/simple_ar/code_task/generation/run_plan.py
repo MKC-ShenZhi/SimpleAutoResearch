@@ -14,8 +14,10 @@ class ImplementationRunPlan(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
 
     argv: list[str] = Field(min_length=1, max_length=40)
-    outputs: list[str] = Field(min_length=1, max_length=24)
-    timeout_sec: int = Field(default=120, gt=0, le=300)
+    outputs: list[str] = Field(default_factory=list, max_length=24,
+        description='Produced files to retain; a validation-only command may have no file outputs.')
+    timeout_sec: int = Field(default=120, gt=0,
+        description='Positive wall-clock timeout subject to the task process budget and approval.')
 
     @field_validator('argv')
     @classmethod

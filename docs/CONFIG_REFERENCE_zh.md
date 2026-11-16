@@ -523,7 +523,7 @@ init 读取项目／工作区；execute 读取执行／模型／预算。研究�
 | `execute.skip_validation`、`strict_validation` | execute 下验证控制 | 布尔 false | 下次执行 |
 | `execute.validation_max_file_bytes` | 静态上限 | 正整数；safety 回退，再 500000 | 下次执行 |
 | `execute.stream_benchmark_output` | 终端输出 | 字符串／布尔 off/false；另有 line、auto/true、summary | 下次执行 |
-| `execute.baseline_policy` | 基线处理 | auto；另有 run、skip、none、provided | 下次执行；provided 不复测 |
+| `execute.baseline_policy` | 基线处理 | auto 在编辑前有命令时运行，否则跳过；另有 run、skip、none、provided | 下次执行；provided 不复测，运行验证需要命令 |
 | `execute.baseline_metrics_file` | 已供数值 JSON | 可选路径；平映射或 metrics/metric_values 包装 | 下次执行 |
 | `execute.apply_proposed_edits`、`allow_large_edits`、`allow_planning_fallback` | execute 下显式选择 | 布尔 false | 下次执行；保留正常检查 |
 | `execute.planning_mode`、`planning_review_rounds` | execute 下规划／兼容项 | compact（tool_agent 弃用别名）；整数 0 | 新规划；旧审阅设置不授予调用 |

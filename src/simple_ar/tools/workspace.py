@@ -328,7 +328,8 @@ class _Run(BaseModel):
     host_access: bool = Field(default=False, exclude_if=lambda value: not value,
         description='Request host execution when the task needs resources outside the workspace boundary, such as GPU or network. Requires explicit approval of this command; the host process is not sandboxed.')
     cwd: str = "workspace"
-    timeout_sec: int = Field(default=60, ge=1, le=300)
+    timeout_sec: int = Field(default=60, ge=1,
+        description='Positive wall-clock timeout; the task process budget and execution approval still apply.')
     inputs: list[str] = Field(default_factory=list, max_length=64, exclude_if=lambda value: not value,
         description='Optional existing regular-file inputs read at the start, including pre-existing scripts and data. An in-place edit can declare the same file as input and output. Files created by this command are outputs, even if the command later uses them. No dependency inference or extra permission. At most 64 MiB total per binding.')
     input_snapshot: dict[str, str] | None = Field(default=None, exclude_if=lambda value: value is None,

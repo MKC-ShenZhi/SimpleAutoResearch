@@ -525,7 +525,7 @@ New standalone CLI tasks retain model and benchmark usage in their own task ledg
 | `execute.skip_validation`, `strict_validation` | Validation controls under execute | Booleans false | Next execute |
 | `execute.validation_max_file_bytes` | Static ceiling | Positive integer; safety fallback then 500000 | Next execute |
 | `execute.stream_benchmark_output` | Terminal output mode | String/bool off/false; line, auto/true, summary | Next execute |
-| `execute.baseline_policy` | Baseline treatment | auto; also run, skip, none, provided | Next execute; provided not remeasured |
+| `execute.baseline_policy` | Baseline treatment | auto runs a configured command before editing, otherwise skips; also run, skip, none, provided | Next execute; provided not remeasured; runtime verification requires a command |
 | `execute.baseline_metrics_file` | Supplied numeric JSON | Optional path; flat map or metrics/metric_values wrapper | Next execute |
 | `execute.apply_proposed_edits`, `allow_large_edits`, `allow_planning_fallback` | Opt-ins under execute | Booleans false | Next execute; normal gates remain |
 | `execute.planning_mode`, `planning_review_rounds` | Planning/compatibility controls under execute | compact (tool_agent deprecated alias); integer 0 | New planning; old review setting grants no calls |

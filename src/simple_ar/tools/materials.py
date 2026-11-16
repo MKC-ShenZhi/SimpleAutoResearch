@@ -725,10 +725,14 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict] | None 
             FileWindow.model_validate(row['request']), row['data'])
         seen.add((path, digest, start, end))
     used = 0
+    # The context is unchanged during this selection. Count each new window
+    # once instead of serializing the complete context for every candidate.
+    context_size = None
+    observation_size = 0
     excluded = excluded_paths or set()
 
     def admit(row: dict, request: FileWindow, coverage: dict) -> None:
-        nonlocal used
+        nonlocal used, context_size, observation_size
         data = row['data']
         if not data['text']:
             raise ValueError('empty_material_window')
@@ -742,10 +746,14 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict] | None 
         cost = end - start if remaining_bytes is not None else len(data['text'])
         if used + cost > limit:
             raise ValueError('observation_capacity')
-        if len(json.dumps({**context, 'observations': observations + [row]},
-                ensure_ascii=False).encode('utf-8')) > serialized_limit:
+        if context_size is None:
+            context_size = len(json.dumps({**context, 'observations': []}, ensure_ascii=False).encode('utf-8'))
+        row_size = len(json.dumps(row, ensure_ascii=False).encode('utf-8'))
+        separator_size = 2 if observations else 0  # Default JSON list separator: comma and space.
+        if context_size + observation_size + separator_size + row_size > serialized_limit:
             raise ValueError('serialized_context_capacity')
         observations.append(row)
+        observation_size += separator_size + row_size
         admitted.append(coverage)
         seen.add(key)
         used += cost
