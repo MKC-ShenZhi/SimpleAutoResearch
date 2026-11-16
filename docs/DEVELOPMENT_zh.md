@@ -79,6 +79,8 @@ flowchart LR
 `create_research_task` 和 `start_research_task`。已保存会话和显式兼容 API 仍可由
 [ResearchApplication](../src/simple_ar/app/research_application.py)承接，沿保存的执行合同恢复。
 
+新建独立 Python 代码任务对已有和新建项目均使用共同编辑器。空项目可创建自己的测试；复制项目的验证材料仍受保护。确需保留的实验性生成器时，可在 `initialize_code_task` 中显式传入 `direct_edit=False`；已保存任务继续使用原实现。
+
 ## 实施一项改动
 
 沿一个真实消费者，从输入追到交付结果：

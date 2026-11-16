@@ -1395,12 +1395,9 @@ class ImplementationToolGateway:
             execution, task_text, RunRequest(contract.validation_command, root, contract.timeout_sec),
             run_dir=run, source_project=origin if contract.project_path else None,
             data_paths=tuple(origin / name for name in data_inputs), generation_source=generation_source,
-            respect_allowed_paths=self.code_work_policy == 'shared.v2'))
+            respect_allowed_paths=self.code_work_policy == 'shared.v2',
+            direct_edit=shared_greenfield if preparation and preparation.kind == 'greenfield' else self.direct_code_edit))
         manifest = load_code_task_manifest(run)
-        if shared_greenfield:
-            # Persist the selected owner with the candidate, including revisions
-            # copied from a prepared source. Saved legacy candidates keep theirs.
-            manifest['code_task']['auto_edit_policy'] = 'direct.v1'
         manifest['code_task']['native_binding'] = approval
         initialized = native_workspace_binding(manifest, code_task_paths(run).workspace_dir)
         if preparation is not None and manifest['workspace']['selected_mode'] == 'git_worktree':

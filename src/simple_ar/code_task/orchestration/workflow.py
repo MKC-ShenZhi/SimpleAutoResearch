@@ -86,11 +86,10 @@ def initialize_code_task(
     edit_scope_mode: str | None = None,
     edit_scope_allowed_patterns: tuple[str, ...] = (),
     edit_scope_protected_patterns: tuple[str, ...] = (),
-    respect_allowed_paths: bool = False,
+    respect_allowed_paths: bool | None = None,
     data_inputs: tuple[str, ...] = (),
     initial_files: tuple[str, ...] = (),
     direct_edit: bool = True,
-    direct_greenfield: bool = False,
     standalone: bool = True,
 ) -> CodeTaskInitResult:
     """Initialize a local code-task run without modifying the source project.
@@ -129,16 +128,16 @@ def initialize_code_task(
             patterns that are read-only for patch proposals and applications.
         respect_allowed_paths: Use the caller's explicit scope for test and
             benchmark files; protected validation inputs remain read-only.
+            By default, a new empty project can create its own tests; copied
+            projects keep existing tests and benchmarks protected.
         data_inputs: Explicit project-relative data files/directories. Independent
             copies retain their runtime paths and become protected edit inputs;
             incidental file-size limits do not apply to this selection.
         initial_files: Explicit new Python adapters, never inferred from edit scope.
             Fail-closed placeholders are created only in the isolated workspace.
-        direct_edit: New existing-project tasks may propose edits without a
-            separate plan; applying them remains subject to caller approval.
-            Use False when retaining an explicitly planned historical task.
-        direct_greenfield: Use that same editor for a new project. The default
-            retains the experimental generator for existing Python callers.
+        direct_edit: New tasks may propose edits without a separate plan;
+            applying them remains subject to caller approval. Set False for
+            an explicitly planned task or the retained new-project generator.
         standalone: Create and use this task's own ledger. Embedded work passes
             False and uses its enclosing task's ledger instead.
 
@@ -186,6 +185,9 @@ def initialize_code_task(
     )
     workspace_dir = workspace.project_root
     copy_report = workspace.copy_report
+    if respect_allowed_paths is None:
+        respect_allowed_paths = (normalized_kind == 'greenfield' and direct_edit
+            and workspace.selected_mode == 'empty')
     edit_scope = default_edit_scope(
         mode=edit_scope_mode or ('authorized_scope.v1' if respect_allowed_paths else None),
         allowed_patterns=edit_scope_allowed_patterns,
@@ -269,7 +271,7 @@ def initialize_code_task(
         edit_scope=edit_scope,
         environment_policy=environment_policy,
         kind=normalized_kind,
-        direct_edit=direct_edit and (normalized_kind != 'greenfield' or direct_greenfield),
+        direct_edit=direct_edit,
     )
     if standalone:
         from simple_ar.core.budget import BudgetLedger

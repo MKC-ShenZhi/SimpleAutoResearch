@@ -1813,8 +1813,6 @@ def _print_code_task_init(args: argparse.Namespace) -> None:
             edit_scope_mode=options.edit_scope_mode,
             edit_scope_allowed_patterns=options.edit_scope_allowed_patterns,
             edit_scope_protected_patterns=options.edit_scope_protected_patterns,
-            respect_allowed_paths=options.kind == 'greenfield' and options.workspace_mode == 'empty',
-            direct_greenfield=True,
         )
     except (
         FileExistsError,

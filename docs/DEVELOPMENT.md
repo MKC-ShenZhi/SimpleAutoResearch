@@ -149,6 +149,12 @@ New Python research tasks use `create_research_task` and `start_research_task` f
 explicit compatibility APIs may still use [ResearchApplication](../src/simple_ar/app/research_application.py)
 and retain their recorded execution contracts.
 
+New standalone Python code tasks use the shared editor for existing and new
+projects. An empty new project may create its own tests; copied validation
+inputs remain protected. To explicitly select the retained experimental
+generator for a new project, pass `direct_edit=False` to
+`initialize_code_task`. Saved tasks keep their original implementation owner.
+
 ## Implement a change
 
 Trace one real consumer from its input to the delivered result:

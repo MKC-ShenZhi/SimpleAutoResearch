@@ -1473,9 +1473,25 @@ primary_metric = "accuracy"
             self.assertEqual(list(result.workspace_dir.iterdir()), [])
             manifest = read_json(run_dir / "manifest.json")
             self.assertEqual(manifest["code_task"]["kind"], "greenfield")
+            self.assertEqual(manifest["code_task"]["auto_edit_policy"], "direct.v1")
+            self.assertNotIn('tests/**', manifest['edit_scope']['protected_patterns'])
             self.assertEqual(manifest["workspace"]["mode"], "empty")
             self.assertEqual(manifest["source"]["code_root"], "")
             self.assertFalse((run_dir / "code_task" / "meta" / "task_contract.json").exists())
+
+            source = root / 'scaffold'
+            write_text(source / 'tests/test_example.py', 'def test_example(): pass\n')
+            copied = initialize_code_task(run_dir=root / 'copied', code_root=source, task_file=task_file,
+                kind='greenfield', workspace_mode='copy')
+            copied_manifest = read_json(copied.manifest_path)
+            self.assertEqual(copied_manifest['code_task']['auto_edit_policy'], 'direct.v1')
+            self.assertIn('tests/**', copied_manifest['edit_scope']['protected_patterns'])
+
+            legacy = initialize_code_task(run_dir=root / 'legacy', code_root=None, task_file=task_file,
+                kind='greenfield', workspace_mode='empty', direct_edit=False)
+            legacy_manifest = read_json(legacy.manifest_path)
+            self.assertNotIn('auto_edit_policy', legacy_manifest['code_task'])
+            self.assertIn('tests/**', legacy_manifest['edit_scope']['protected_patterns'])
 
     def test_persisted_repair_counters_do_not_silently_grant_new_attempts(self) -> None:
         from simple_ar.code_task.orchestration.execute import _greenfield_repair_available
@@ -1874,7 +1890,7 @@ primary_metric = "accuracy"
             task = root / 'task.md'
             write_text(task, 'Generate a runnable project with an external handoff.')
             run = root / 'run'
-            _initialize_greenfield(run_dir=run, task_file=task, primary_metric='accuracy', direct_greenfield=True)
+            _initialize_greenfield(run_dir=run, task_file=task, primary_metric='accuracy', direct_edit=True)
             self.assertEqual(read_json(run / 'manifest.json')['code_task']['auto_edit_policy'], 'direct.v1')
             preview = execute_code_task(run, use_llm=False, dry_run=True,
                 implementation_provider='fake', implementation_agent_mode='handoff')
@@ -5194,15 +5210,20 @@ protected_patterns = ["pyproject.toml"]
             self.assertEqual(manifest["plan"]["status"], "approved")
 
     def test_new_standalone_project_supports_direct_and_explicitly_planned_work(self):
-        for planned in (False, True):
-            with self.subTest(planned=planned), _temporary_root() as root:
+        for entry, planned in ((entry, planned) for entry in ('cli', 'python') for planned in (False, True)):
+            with self.subTest(entry=entry, planned=planned), _temporary_root() as root:
                 task = root / 'task.md'
                 write_text(task, 'Create a reusable double function and its test.')
-                with contextlib.redirect_stdout(io.StringIO()):
-                    main(['code-task', 'init', '--kind', 'greenfield', '--task-file', str(task),
-                        '--output-root', str(root / 'runs'), '--name', 'new', '--benchmark-command',
-                        'python -m unittest discover -s tests'])
-                run = next((root / 'runs').glob('*/manifest.json')).parent
+                if entry == 'cli':
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        main(['code-task', 'init', '--kind', 'greenfield', '--task-file', str(task),
+                            '--output-root', str(root / 'runs'), '--name', 'new', '--benchmark-command',
+                            'python -m unittest discover -s tests'])
+                    run = next((root / 'runs').glob('*/manifest.json')).parent
+                else:
+                    run = root / 'python-run'
+                    initialize_code_task(run_dir=run, code_root=None, task_file=task, kind='greenfield',
+                        workspace_mode='empty', benchmark_command='python -m unittest discover -s tests')
                 manifest = read_json(run / 'manifest.json')
                 self.assertEqual(manifest['code_task']['auto_edit_policy'], 'direct.v1')
                 files = {'pkg/math.py': 'def double(value):\n    return value * 2\n',
@@ -5925,7 +5946,8 @@ def _project_bytes(project: Path) -> dict:
 
 
 def _initialize_greenfield(run_dir: Path, task_file: Path, **overrides):
-    """Shared empty-project boundary, with metric and resource choices explicit."""
+    """Exercise the retained generated-project contract explicitly."""
+    overrides.setdefault('direct_edit', False)
     return initialize_code_task(run_dir=run_dir, code_root=None, task_file=task_file,
         kind="greenfield", workspace_mode="empty",
         benchmark_command="python generated_project/main.py", **overrides)

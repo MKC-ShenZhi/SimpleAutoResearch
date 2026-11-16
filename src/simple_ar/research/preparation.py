@@ -136,6 +136,7 @@ class PreparationRequest:
     data_paths: tuple[Path, ...] = ()
     generation_source: Mapping[str, Any] | None = None
     respect_allowed_paths: bool = False
+    direct_edit: bool = False
 
 
 def inspect_project_preparation(
@@ -537,9 +538,9 @@ def run_preparation_capability(*, context: CapabilityContext, request: Preparati
         edit_scope_protected_patterns=tuple(protected),
         data_inputs=data_inputs,
         initial_files=initial_files,
-        # A retained research controller decides its own saved plan contract;
-        # common code work explicitly chooses its editor at execution time.
-        direct_edit=False,
+        # Historical controllers keep their saved plan; common work declares
+        # its editor before preparation rather than rewriting the new manifest.
+        direct_edit=request.direct_edit,
         standalone=False,
     )
     if source_snapshot is not None:
