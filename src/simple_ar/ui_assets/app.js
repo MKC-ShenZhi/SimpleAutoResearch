@@ -27,8 +27,10 @@ function saveDrafts() {
   if (selected) {
     const previous = view.tasks[selected] || {};
     const feedback = $('feedback').value;
-    view.tasks[selected] = {...previous, feedback,
-      submission: previous.submission?.feedback === feedback ? previous.submission : undefined,
+    const feedbackReview = $('feedbackReview').checked;
+    view.tasks[selected] = {...previous, feedback, feedbackReview,
+      submission: previous.submission?.feedback === feedback &&
+        (previous.submission?.independent_review_required ?? null) === (feedbackReview ? true : null) ? previous.submission : undefined,
       switchReason: $('switchReason').value, switchProfile: $('switchProfile').value,
       mount: $('mount').value || previous.mount || '', folder, preview: previewTarget};
   }
@@ -44,6 +46,7 @@ function selectTask(task, save = true) {
   folder = draft.folder || '';
   previewTarget = draft.preview || null;
   $('feedback').value = draft.feedback || '';
+  $('feedbackReview').checked = draft.feedbackReview === true;
   $('switchReason').value = draft.switchReason || '';
   $('switchProfile').value = draft.switchProfile || '';
   $('mount').replaceChildren();
@@ -89,6 +92,7 @@ function renderActivity() {
   for (const receipt of snapshot.feedback_submissions || []) {
     paragraph($('currentAction'), '反馈 ' + receipt.submission_id + ' · ' +
       (receipt.status === 'applied' ? '已采用' : '已收到，待安全边界采用') +
+      (receipt.independent_review_required === true ? '\n正式交付需要独立复核' : '') +
       (receipt.reason ? '\n' + receipt.reason : ''), 'receipt');
   }
   const rows = snapshot.activity || [];
@@ -158,8 +162,9 @@ async function action(op, extra = {}, task = selected) {
     // This identity belongs to the exact draft, including uncertain transport
     // responses. Reusing it cannot append or execute the same feedback twice.
     const draft = view.tasks[task] ||= {};
-    if (draft.submission?.feedback !== extra.feedback) {
-      draft.submission = {submission_id: crypto.randomUUID(), feedback: extra.feedback};
+    const review = extra.independent_review_required ?? null;
+    if (draft.submission?.feedback !== extra.feedback || (draft.submission?.independent_review_required ?? null) !== review) {
+      draft.submission = {submission_id: crypto.randomUUID(), feedback: extra.feedback, independent_review_required: review};
     }
     extra = {...extra, submission_id: draft.submission.submission_id};
     persistView();
@@ -503,7 +508,8 @@ $('reject').onclick = () => {
   if (!reason) { notice('请填写不执行的原因。'); return; }
   action('reject', {token: snapshot.approval.token, reason});
 };
-$('feedbackForm').onsubmit = async event => { event.preventDefault(); await action('feedback', {feedback: $('feedback').value}); };
+$('feedbackForm').onsubmit = async event => { event.preventDefault(); await action('feedback', {feedback: $('feedback').value,
+  ...($('feedbackReview').checked ? {independent_review_required: true} : {})}); };
 $('switch').onclick = () => {
   const model = $('switchProfile').value;
   const profile = metadata.profiles.find(p => p.selector === model);
@@ -521,7 +527,7 @@ $('switch').onclick = () => {
 };
 $('mount').onchange = () => { folder = ''; saveDrafts(); files(); };
 $('root').onclick = () => { folder = ''; saveDrafts(); files(); };
-for (const id of [...createFields, 'feedback', 'switchReason', 'switchProfile']) {
+for (const id of [...createFields, 'feedback', 'feedbackReview', 'switchReason', 'switchProfile']) {
   $(id).addEventListener('input', saveDrafts);
   $(id).addEventListener('change', saveDrafts);
 }

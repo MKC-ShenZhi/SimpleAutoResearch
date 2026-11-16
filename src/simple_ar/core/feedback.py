@@ -3,7 +3,7 @@
 Reception never writes actions, the manifest or the ledger. The execution owner
 alone adopts inputs under its session mutation lock; adoption and request index
 are committed together in actions.json. A short independent reception lock uses
-the same OS lock and atomic file writer, so accepting text cannot race a tool
+the same OS lock and atomic file writer, so accepting feedback cannot race a tool
 result or wait for a provider call to finish.
 """
 from __future__ import annotations
@@ -22,11 +22,13 @@ class FeedbackSubmissions:
         self.store = store
 
     @staticmethod
-    def validate(submission_id: str, feedback: str) -> None:
+    def validate(submission_id: str, feedback: str, independent_review_required: bool | None = None) -> None:
         if not isinstance(submission_id, str) or not submission_id.strip():
             raise ValueError('Feedback requires a stable nonempty submission_id')
         if not isinstance(feedback, str) or not feedback.strip():
             raise ValueError('Feedback requires nonempty text')
+        if independent_review_required is not None and type(independent_review_required) is not bool:
+            raise ValueError('Independent review selection must be a boolean')
 
     def records(self) -> list[dict]:
         if not self.store.exists(self.path):
@@ -37,23 +39,27 @@ class FeedbackSubmissions:
         rows = journal['submissions']
         seen = set()
         for row in rows:
-            self.validate(row['submission_id'], row['feedback'])
+            self.validate(row['submission_id'], row['feedback'], row.get('independent_review_required'))
             if row['submission_id'] in seen:
                 raise ValueError('Duplicate feedback submission in retained journal')
             seen.add(row['submission_id'])
         return rows
 
-    def accept(self, submission_id: str, feedback: str) -> dict:
-        self.validate(submission_id, feedback)
+    def accept(self, submission_id: str, feedback: str, *, independent_review_required: bool | None = None) -> dict:
+        self.validate(submission_id, feedback, independent_review_required)
         with SessionFileLock(self.store.root / 'tools/submissions/.feedback.lock'):
             rows = self.records()
             existing = next((row for row in rows if row['submission_id'] == submission_id), None)
             if existing is not None:
                 if existing['feedback'] != feedback:
                     raise ValueError('Feedback submission_id already exists with different text')
+                if existing.get('independent_review_required') != independent_review_required:
+                    raise ValueError('Feedback submission_id already exists with a different review choice')
                 return existing
             row = {'submission_id': submission_id, 'feedback': feedback,
-                'received_at': datetime.now(timezone.utc).isoformat(timespec='microseconds')}
+                'received_at': datetime.now(timezone.utc).isoformat(timespec='microseconds'),
+                **({'independent_review_required': independent_review_required}
+                   if independent_review_required is not None else {})}
             self.store.write_json(self.path, {'schema_version': 'feedback_submissions.v1',
                 'submissions': [*rows, row]}, kind='caller_submission')
             return row
@@ -70,6 +76,9 @@ class FeedbackSubmissions:
             if (type(index) is not int or not 0 < index < len(state['requests'])
                     or state['requests'][index] != row['feedback']):
                 raise ValueError('Adopted feedback differs from its original request journal')
+            if (row.get('independent_review_required') is not None
+                    and adoption.get('independent_review_required') != row['independent_review_required']):
+                raise ValueError('Adopted feedback differs from its original review selection')
             receipt['request_index'] = index
         else:
             receipt['reason'] = adoption.get('reason', 'Waiting for a safe execution boundary')

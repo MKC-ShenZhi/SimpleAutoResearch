@@ -423,6 +423,25 @@ def _runtime_bindings(services: Any | None) -> dict[str, Any]:
     return bindings
 
 
+def _review_requirement(config: dict[str, Any], required: bool) -> dict[str, Any]:
+    """Apply the caller's review choice to the existing delivery owner."""
+    if type(required) is not bool:
+        raise ValueError('Independent review selection must be a boolean')
+    if required and (config.get('model') is None or config.get('control_protocol') != 'operations.v1'
+            or config.get('delivery_review_protocol') not in {'task.v3', 'task.v4', 'task.v5'}):
+        raise ValueError('This task needs a model and shared delivery review to require an independent review')
+    updated = {**config, 'independent_review_required': required}
+    selection = updated.get('delivery_review_selection')
+    if (required and updated.get('code_task') is not None and updated.get('code_work_policy') == 'shared.v2'
+            and updated.get('delivery_review_protocol') == 'task.v5' and selection in MODEL_REVIEW_SELECTIONS):
+        preparation = updated['code_task'].get('preparation') or {}
+        updated['code_review_policy'] = 'delivery.v2' if preparation.get('kind') == 'greenfield' else 'delivery.v1'
+    elif (not required and selection in MODEL_REVIEW_SELECTIONS
+            and updated.get('code_review_policy') in {'delivery.v1', 'delivery.v2'}):
+        updated['code_review_policy'] = None
+    return updated
+
+
 class ToolApplication:
     RECIPE = "native-tools-v1"
 
@@ -2390,16 +2409,17 @@ class ToolApplication:
         return FeedbackSubmissions(store)
 
     @classmethod
-    def submit_feedback(cls, root: Path, *, submission_id: str, feedback: str) -> dict:
+    def submit_feedback(cls, root: Path, *, submission_id: str, feedback: str,
+                        independent_review_required: bool | None = None) -> dict:
         """Receive exact text once, including while run() owns the execution lock.
 
-        Reuse the same id and exact text on transport retry; a conflicting text
-        raises ValueError without replacing the original. This never starts or
+        Reuse the same id, text and review choice on transport retry; conflicting
+        terms raise ValueError without replacing the original. This never starts or
         retries work, changes access, or reserves resources. ``status=pending``
         acknowledges receipt only; run() adopts it at a safe action boundary.
         """
         journal = cls._feedback_journal(root)
-        row = journal.accept(submission_id, feedback)
+        row = journal.accept(submission_id, feedback, independent_review_required=independent_review_required)
         return journal.receipt(row, journal.store.read_json('actions.json'))
 
     @classmethod
@@ -2411,13 +2431,16 @@ class ToolApplication:
                 return journal.receipt(row, journal.store.read_json('actions.json'))
         raise ValueError('Unknown feedback submission_id; no receipt is recorded')
 
-    def _apply_feedback(self, feedback: str, *, submission_id: str | None = None) -> bool:
+    def _apply_feedback(self, feedback: str, *, submission_id: str | None = None,
+                        independent_review_required: bool | None = None) -> bool:
         """Adopt a request through the original cancellation/lifecycle boundary."""
         try:
             if self.state.get('pending_supply') is not None:
                 raise ValueError('Complete the retained caller supply before adopting feedback')
             if self.state['pending'] and self.state['pending']['kind'] == 'model':
                 raise ValueError('Unreconciled model operation; feedback cannot silently replay it')
+            config = (_review_requirement(self.state['config'], independent_review_required)
+                if independent_review_required is not None else self.state['config'])
             self._check_cancellation()
             if self.session.manifest.status not in {'created', 'running'}:
                 self.session.continue_with_revision(feedback)
@@ -2432,11 +2455,17 @@ class ToolApplication:
         # IO failures and errors committing request/adoption must propagate;
         # they are not policy refusals and cannot be marked as adopted earlier.
         self._cancel_unstarted('Unstarted action cancelled by new user feedback')
+        changed_config = config != self.state['config']
+        self.state['config'] = config
         self.state['requests'].append(feedback)
         if submission_id is not None:
             self.state.setdefault('feedback_submissions', {})[submission_id] = {
-                'status': 'applied', 'request_index': len(self.state['requests']) - 1}
+                'status': 'applied', 'request_index': len(self.state['requests']) - 1,
+                **({'independent_review_required': independent_review_required}
+                   if independent_review_required is not None else {})}
         self._save()
+        if changed_config:
+            self._configure_tools()
         return True
 
     def _consume_feedback(self) -> bool:
@@ -2452,7 +2481,8 @@ class ToolApplication:
         for row in journal.records():
             if journal.receipt(row, self.state)['status'] == 'applied':
                 continue
-            if not self._apply_feedback(row['feedback'], submission_id=row['submission_id']):
+            if not self._apply_feedback(row['feedback'], submission_id=row['submission_id'],
+                    independent_review_required=row.get('independent_review_required')):
                 break  # Arrival order is preserved, including deferred input.
             applied = True
         return applied
@@ -2658,16 +2688,11 @@ class ToolApplication:
                     config['code_review_policy'] = None
             elif 'code_task' in supplied and supplied['code_task'] is None:
                 config['code_work_policy'] = config['code_review_policy'] = config['code_implementation_policy'] = None
-            if (supplied.get('independent_review_required') is True and config.get('code_task') is not None
-                    and config.get('code_work_policy') == 'shared.v2'
-                    and config.get('delivery_review_protocol') == 'task.v5'
-                    and old.get('delivery_review_selection') in MODEL_REVIEW_SELECTIONS):
-                preparation = config['code_task'].get('preparation') or {}
-                config['code_review_policy'] = 'delivery.v2' if preparation.get('kind') == 'greenfield' else 'delivery.v1'
-            if (supplied.get('independent_review_required') is False
-                    and old.get('delivery_review_selection') in MODEL_REVIEW_SELECTIONS
-                    and old.get('code_review_policy') in {'delivery.v1', 'delivery.v2'}):
-                config['code_review_policy'] = None
+            if 'independent_review_required' in supplied:
+                review_config = _review_requirement({**old, **config}, supplied['independent_review_required'])
+                config['independent_review_required'] = review_config['independent_review_required']
+                if 'code_review_policy' in review_config:
+                    config['code_review_policy'] = review_config['code_review_policy']
             if old.get('source_snapshots'):
                 config['source_snapshots'] = {name: value for name, value in old['source_snapshots'].items()
                     if old['sources'][name] == config['sources'].get(name)}

@@ -799,6 +799,43 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             if path.is_file()}, before)
         fake.chat_turn.assert_not_called()
 
+    def test_feedback_review_selection_uses_the_original_task_and_submission(self):
+        import threading
+        from simple_ar.tools.workspace import DeliveryRequest
+        from simple_ar.ui import Workspace
+
+        root, inputs, fake, _, app, _ = self._native_fixture(goal='Deliver the research', max_turns=8)
+        workspace = Workspace(root, [inputs], root)
+        live = Mock()
+        live.is_alive.return_value = True
+        workspace.workers['native'] = live, threading.Event()
+        original = {name: (app.session.store.root / name).read_bytes() for name in
+            ('actions.json', 'session_manifest.json', 'budget_ledger.json')}
+        request = {'op': 'feedback', 'task': 'native', 'submission_id': 'feedback-review',
+            'feedback': 'Revise the retained result.', 'independent_review_required': True}
+        first = workspace.mutate(request)
+        self.assertEqual(first['submission']['status'], 'pending')
+        self.assertEqual(workspace.mutate(request)['submission'], first['submission'])
+        with self.assertRaisesRegex(ValueError, 'different review choice'):
+            workspace.mutate({**request, 'independent_review_required': False})
+        self.assertEqual({name: (app.session.store.root / name).read_bytes() for name in original}, original)
+
+        del workspace.workers['native']
+        app.run(submission_id=request['submission_id'], should_stop=lambda: True, progress=lambda _: None)
+        receipt = ToolApplication.feedback_status(app.session.store.root, submission_id=request['submission_id'])
+        self.assertEqual(receipt['status'], 'applied')
+        self.assertTrue(receipt['independent_review_required'])
+        self.assertEqual(app.state['requests'], ['Deliver the research', 'Revise the retained result.'])
+        self.assertTrue(app.state['config']['independent_review_required'])
+        candidate = DeliveryRequest(summary='A proposed result', independent_review=False)
+        self.assertTrue(app.operations.delivery.requires_review(candidate))
+        self.assertEqual((app.session.store.root / 'budget_ledger.json').read_bytes(), original['budget_ledger.json'])
+        restored = ToolApplication.load(app.session.store.root)
+        self.assertEqual(restored.feedback_status(restored.session.store.root,
+            submission_id=request['submission_id']), receipt)
+        self.assertTrue(restored.state['config']['independent_review_required'])
+        fake.chat_turn.assert_not_called()
+
     def _historical_native_fixture(self, **options):
         """Explicit saved native control/projection; current tools use _native_fixture."""
         return self._native_fixture(operation_control=False, **options)

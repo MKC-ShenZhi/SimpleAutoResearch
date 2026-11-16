@@ -15,6 +15,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - CodeTask reuses the running Python version and recorded initial syntax findings. Environment and dependency probes use the task process ledger, leaving necessary execution capacity intact.
 - Retained work hands original observations to the material owner without an extra handoff read. Research and writing derive source previews, passages and their versions from the same read; independent review can use observations without inheriting an opinion.
 - Common article revisions can return either local replacements or a complete revised draft, using the existing writing and review flow.
+- Feedback can explicitly require independent review through the existing task submission; the review choice and feedback are adopted together without changing the task ledger.
 
 ### Fixed
 

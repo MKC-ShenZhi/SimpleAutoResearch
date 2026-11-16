@@ -287,6 +287,8 @@ connection, sources, permissions and caps; **Continue** starts execution.
 Review the destination, operation and caps before confirming creation, command
 approval or a connection change. After a failed submission, inspect the task
 before trying again. Feedback and approvals continue the same task and ledger.
+Feedback can also explicitly require independent review for this and later
+complete deliveries; leaving the option unchecked keeps the existing policy.
 
 ### Inspect and stop work
 

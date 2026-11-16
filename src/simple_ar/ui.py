@@ -460,7 +460,7 @@ class Workspace:
             # Reception has its own original owner/lock. A running worker must
             # not prevent acceptance or write feedback into a loaded snapshot.
             receipt = ToolApplication.submit_feedback(root, submission_id=data['submission_id'],
-                feedback=data['feedback'])
+                feedback=data['feedback'], independent_review_required=data.get('independent_review_required'))
             result = {'task': name, 'submission': receipt,
                 'message': 'Feedback received; adoption remains pending at a safe action boundary'}
             with self.lock:
