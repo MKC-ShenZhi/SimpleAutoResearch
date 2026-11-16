@@ -1608,6 +1608,10 @@ class InspectionToolGateway:
 
     def _recorded_opinion(self, identity: str) -> tuple[dict, dict, ToolResult, bool]:
         """Resolve the owner's recorded opinion, without re-investigating its evidence."""
+        results = _PRESENTATION_RESULTS.get()
+        key = (self, identity, 'recorded_opinion')
+        if results is not None and key in results:
+            return deepcopy(results[key])
         receipt = self._receipt(identity)
         result_path = self._path(identity, 'result')
         if receipt.get('result_sha256') != self._digest(result_path):
@@ -1631,7 +1635,10 @@ class InspectionToolGateway:
         if self.protocol and (binding.get('assessment_path') != artifact
                 or result.data.get('record') != artifact or result.artifacts != [artifact]):
             raise ValueError('Inspection cached assessment path changed; no replay')
-        return saved, receipt, result, package
+        opinion = saved, receipt, result, package
+        if results is not None:
+            results[key] = deepcopy(opinion)
+        return opinion
 
     def _read_retained_result(self, identity: str, *, current_inputs: bool) -> ToolResult:
         """Verify saved investigation evidence before applying an opinion."""
