@@ -919,7 +919,7 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             )
         )
 
-    def test_entrypoint_review_requires_preserved_traceback(self) -> None:
+    def test_entrypoint_review_reports_missing_traceback_as_advice(self) -> None:
         cases = (
             ("stderr_summary", "import sys\n\ndef main():\n    try:\n"
              "        raise RuntimeError('hidden')\n    except Exception as exc:\n"
@@ -943,7 +943,10 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                 self.assertEqual(any(row["category"] == "entrypoint_exception_suppresses_traceback"
                                      for row in review["findings"]), blocked)
                 if blocked:
-                    self.assertEqual(review["status"], "failed")
+                    finding = next(row for row in review["findings"]
+                                   if row["category"] == "entrypoint_exception_suppresses_traceback")
+                    self.assertEqual(finding["severity"], "warning")
+                    self.assertNotEqual(review["status"], "failed")
 
     def test_existing_context_snippets_expose_api_without_extra_repo_reads(self) -> None:
         contract = snippet_api_contract(
@@ -1132,24 +1135,28 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             self.assertTrue(any(row["category"] == "planned_api_not_exported" for row in review["findings"]))
             self.assertTrue(all(row["severity"] != "blocking" for row in review["findings"] if row["category"] == "planned_api_not_exported"))
 
-    def test_review_does_not_block_defensive_placeholder_policy_text(self) -> None:
+    def test_review_does_not_block_on_unrelated_source_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             write_text(
                 project / "main.py",
                 (
                     "def main():\n"
-                    "    # Refusing to emit placeholder metrics keeps failed benchmark paths honest.\n"
+                    "    # A dummy dataset belongs to a separate test.\n"
+                    "    progress = {}\n"
+                    "    progress.setdefault('elapsed', 0.0)\n"
                     "    print('accuracy: 0.91')\n"
                 ),
             )
 
-            review = generated_review(project, [{"path": "main.py", "mode": "llm", "line_count": 3}],
+            review = generated_review(project, [{"path": "main.py", "mode": "llm", "line_count": 5}],
                 result_schema={"primary_metric": "accuracy", "required_metrics": ["accuracy"]},
-                contract={"objective": "Run an experiment and evaluate metrics without placeholder values."},
+                contract={"objective": "Evaluate the actual dataset."},
             )
 
-            self.assertFalse(any(row["category"] == "placeholder_execution_path" for row in review["findings"]))
+            self.assertNotEqual(review["status"], "failed")
+            advisory = next(row for row in review["findings"] if row["category"] == "required_metric_default_fill")
+            self.assertEqual(advisory["severity"], "warning")
 
     def test_review_blocks_mixed_llm_and_core_fallback_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

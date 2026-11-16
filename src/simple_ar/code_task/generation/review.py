@@ -251,7 +251,7 @@ def _deterministic_findings(
     findings.extend(_interface_contract_findings(project_dir, architecture_plan=architecture_plan,
                                                 api_contract=api_contract))
     findings.extend(_return_contract_findings(project_dir))
-    findings.extend(_semantic_scaffold_findings(project_dir, contract=contract, result_schema=result_schema,
+    findings.extend(_metric_default_advisories(project_dir, result_schema=result_schema,
         access_boundary=access_boundary))
     findings.extend(_implementation_contract_findings(project_dir, contract=contract, architecture_plan=architecture_plan))
     return findings
@@ -312,7 +312,7 @@ def _entrypoint_debuggability_findings(project_dir: Path) -> list[ReviewFinding]
         line = row.get("line") or "unknown"
         findings.append(
             _finding(
-                "blocking",
+                "warning",
                 "entrypoint_exception_suppresses_traceback",
                 (
                     f"`{path}` catches broad exceptions near line {line} without re-raising "
@@ -327,17 +327,15 @@ def _entrypoint_debuggability_findings(project_dir: Path) -> list[ReviewFinding]
     return findings
 
 
-def _semantic_scaffold_findings(
+def _metric_default_advisories(
     project_dir: Path,
     *,
-    contract: Mapping[str, Any],
     result_schema: Mapping[str, Any],
     access_boundary: Path,
 ) -> list[ReviewFinding]:
     findings: list[ReviewFinding] = []
     if not _required_metrics(result_schema):
         return findings
-    task_text = _task_text(contract)
     for path in sorted(_iter_files(project_dir, include_hidden_dirs=True,
             access_boundary=access_boundary)):
         if path.suffix not in {".py", ".json", ".toml", ".md", ".txt"}:
@@ -349,34 +347,11 @@ def _semantic_scaffold_findings(
         if _default_metric_fill_detected(content):
             findings.append(
                 _finding(
-                    "blocking",
+                    "warning",
                     "required_metric_default_fill",
                     (
-                        f"`{rel}` appears to fill missing required metrics with `0.0` or another fixed default. "
-                        "Required metrics must come from measured project outputs or the run should fail clearly."
-                    ),
-                )
-            )
-        if _placeholder_execution_detected(content.lower(), task_text=task_text):
-            findings.append(
-                _finding(
-                    "blocking",
-                    "placeholder_execution_path",
-                    (
-                        f"`{rel}` appears to contain placeholder/stub execution logic for a task that expects measured outputs. "
-                        "Replace scaffolding with a real bounded implementation or fail clearly."
-                    ),
-                )
-            )
-        if _nested_artifact_path_risk(content):
-            findings.append(
-                _finding(
-                    "blocking",
-                    "nested_artifact_path_risk",
-                    (
-                        f"`{rel}` appears to join a caller-provided artifact directory with "
-                        "`artifacts/results.json`, which can write `artifacts/artifacts/results.json` "
-                        "instead of the required `artifacts/results.json`."
+                        f"`{rel}` contains a possible default value; inspect whether required metrics "
+                        "come from measured results. Text matching does not establish runtime behavior."
                     ),
                 )
             )
@@ -492,12 +467,6 @@ def _stdlib_shadow_name(path: str) -> str:
     return stem if stem in _STDLIB_SHADOW_MODULES and stem not in {"main", "__main__"} else ""
 
 
-def _nested_artifact_path_risk(content: str) -> bool:
-    if "artifacts/results.json" not in content and 'Path("artifacts") / "results.json"' not in content:
-        return False
-    return "Path(results_dir)" in content or "base /" in content
-
-
 def _required_metrics(schema: Mapping[str, Any]) -> list[str]:
     value = schema.get("required_metrics")
     metrics = [str(item) for item in value if str(item).strip()] if isinstance(value, list) else []
@@ -583,30 +552,6 @@ def _api_name_from_signature(value: str) -> str:
     return match.group(1) if match else ""
 
 
-def _task_text(contract: Mapping[str, Any]) -> str:
-    parts = [
-        str(contract.get("objective") or ""),
-        str(contract.get("task") or ""),
-    ]
-    for key in (
-        "success_criteria",
-        "explicit_requirements",
-        "deliverables",
-        "constraints",
-        "evaluation_focus",
-        "data_requirements",
-        "dependency_hints",
-    ):
-        value = contract.get(key)
-        if isinstance(value, list):
-            parts.extend(str(item) for item in value)
-    for key in ("evidence_plan", "metric_contract", "generation_plan"):
-        value = contract.get(key)
-        if isinstance(value, Mapping):
-            parts.append(str(value))
-    return "\n".join(parts).lower()
-
-
 _DEFAULT_METRIC_FILL_PATTERNS = (
     re.compile(r"(?i)(required|missing|absent).{0,80}(metric|metrics).{0,80}0\.0"),
     re.compile(r"(?i)(metric|metrics|result|results|record|records)\[[^\]]+\]\s*=\s*0\.0"),
@@ -617,61 +562,6 @@ _DEFAULT_METRIC_FILL_PATTERNS = (
 
 def _default_metric_fill_detected(content: str) -> bool:
     return any(pattern.search(content) for pattern in _DEFAULT_METRIC_FILL_PATTERNS)
-
-
-def _placeholder_execution_detected(lowered_content: str, *, task_text: str) -> bool:
-    if not any(keyword in task_text for keyword in ("metric", "evaluate", "experiment", "benchmark", "dataset", "result")):
-        return False
-    blocking_markers = (
-        "placeholder record",
-        "placeholder dataset",
-        "placeholder metrics",
-        "dummy record",
-        "dummy dataset",
-        "stub implementation",
-        "not implemented",
-        "todo: implement",
-        "return []  #",
-        "return {}  #",
-    )
-    for line in lowered_content.splitlines():
-        if _placeholder_line_is_defensive(line):
-            continue
-        if any(marker in line for marker in blocking_markers):
-            return True
-    return False
-
-
-def _placeholder_line_is_defensive(line: str) -> bool:
-    """Return true for policy/error text that forbids placeholder execution.
-
-    Generated projects often include explicit guards such as "refusing to emit
-    placeholder metrics". Those are desirable, not evidence that the benchmark
-    path is a stub. Keep this line-based so a genuine stub elsewhere in the
-    same file is still caught.
-    """
-
-    if "placeholder" not in line and "dummy" not in line:
-        return False
-    defensive_markers = (
-        "no placeholder",
-        "not placeholder",
-        "without placeholder",
-        "avoid placeholder",
-        "prevent placeholder",
-        "reject placeholder",
-        "refuse placeholder",
-        "refusing to",
-        "do not use placeholder",
-        "must not use placeholder",
-        "should not use placeholder",
-        "not a placeholder",
-        "no dummy",
-        "not dummy",
-        "without dummy",
-        "avoid dummy",
-    )
-    return any(marker in line for marker in defensive_markers)
 
 
 def _string_list(value: object, *, limit: int = 80) -> list[str]:

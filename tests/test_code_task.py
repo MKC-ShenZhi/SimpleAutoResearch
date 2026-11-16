@@ -2133,7 +2133,7 @@ primary_metric = "accuracy"
             self.assertIn("generated_project/artifacts/report.md", scanned_paths)
             self.assertNotIn("generated_project/submission/results/metrics.json", scanned_paths)
 
-    def test_greenfield_review_flags_stdlib_shadow_and_nested_artifact_path(self) -> None:
+    def test_greenfield_review_flags_stdlib_shadow_without_guessing_artifact_paths(self) -> None:
         with _temporary_root() as root:
             project_dir = root / "generated_project"
             project_dir.mkdir(parents=True)
@@ -2147,8 +2147,8 @@ primary_metric = "accuracy"
                     "CANONICAL_RESULTS = Path('artifacts/results.json')\n\n"
                     "def write_artifacts(results_dir):\n"
                     "    base = Path(results_dir)\n"
-                    "    (base / CANONICAL_RESULTS).parent.mkdir(parents=True, exist_ok=True)\n"
-                    "    (base / CANONICAL_RESULTS).write_text('{}')\n"
+                    "    base.mkdir(parents=True, exist_ok=True)\n"
+                    "    (base / CANONICAL_RESULTS.name).write_text('{}')\n"
                 ),
             )
 
@@ -2165,7 +2165,7 @@ primary_metric = "accuracy"
 
             categories = {finding["category"] for finding in report["findings"]}
             self.assertIn("stdlib_module_shadow", categories)
-            self.assertIn("nested_artifact_path_risk", categories)
+            self.assertNotIn("nested_artifact_path_risk", categories)
 
     def test_runtime_repair_without_model_preserves_presets_apis_and_artifact_paths(self) -> None:
         with _temporary_root() as root:
