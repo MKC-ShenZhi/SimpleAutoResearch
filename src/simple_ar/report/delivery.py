@@ -188,8 +188,6 @@ class Delivery:
         if self.user_requests is None:
             return None
         count = self.user_request_count() if self.user_request_count is not None else len(self.user_requests())
-        if count < 2:
-            return None
         from simple_ar.tools.delivery_versions import DeliveryVersions
         rows = DeliveryVersions(self.workspace.root).prior_work(count)
         if not rows:
@@ -202,7 +200,7 @@ class Delivery:
                 **({'project_root': delivery['project_root']} if delivery.get('project_root') else {})}
         return {**present(rows[0]),
             **({'earlier_deliveries': [present(row) for row in rows[1:]]} if len(rows) > 1 else {}),
-            'scope': 'Retained prior work, which may be partial, not the current delivery or proof that live files are unchanged. '
+            'scope': 'Retained earlier work, including partial delivery in this request, not proof of completion or unchanged live files. '
                 'Each delivery keeps its own record and unfinished work. Read the original record for the full claim. '
                 'Reuse work relevant to the current request; '
                 'current delivery and review use actual versions.'}
@@ -343,7 +341,7 @@ class Delivery:
             and (previously_delivered or work_after_review))
         committed_review = self._committed_review(proposal, observations)
         needs_review = (self.review_owner is not None
-            and not (previously_delivered and delivered_current_request)
+            and not (previously_delivered and delivered_current_request and not prior_unresolved)
             and (self.config.get('independent_review_required')
                  or self.config.get('delivery_review_selection') not in MODEL_REVIEW_SELECTIONS
                  or possible_candidate or committed_review))

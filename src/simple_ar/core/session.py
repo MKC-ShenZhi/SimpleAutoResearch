@@ -130,6 +130,7 @@ class BudgetState:
         no_progress: int = 0,
         resource_allowances: dict[str, int | float] | None = None,
         reason: str,
+        resume_after: str | None = None,
     ) -> bool:
         """Record explicit caps without executing work or resetting observed use.
 
@@ -152,6 +153,8 @@ class BudgetState:
             "resource_allowances": resources,
             "reason": reason,
         }
+        if resume_after is not None:
+            terms['resume_after'] = resume_after
         existing = self.continuation_authorizations.get(authorization_id)
         if existing is not None:
             if existing != terms:

@@ -549,6 +549,9 @@ class NativeWorkQueueTests(unittest.TestCase):
             artifacts=['note.md'], unresolved=unfinished))
         self.drain()
         self.assertEqual(c.app.session.manifest.status, 'partial')
+        continuing = c.app.operations.delivery.retained_prior_delivery()
+        self.assertEqual(continuing['unresolved'], unfinished)
+        self.assertEqual(continuing['earlier_deliveries'][0]['artifacts'], baseline)
 
         c._submit(fixture._action('read_file', path='note.md'),
             feedback='Continue the comparison using the existing note.')

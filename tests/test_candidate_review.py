@@ -606,6 +606,61 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         self.assertIsNotNone(previous)
         self.assertEqual([Path(path).name for path in previous['artifacts']], ['note.md'])
 
+    def test_resource_continuation_resumes_partial_work_and_preserves_required_review(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
+
+        case = OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.app = ToolApplication.create(case.root, 'Independently check the existing note.',
+            model='fixture', sources={}, services=case.services, max_turns=20,
+            max_tokens=900000, max_attempts=100, independent_review_required=True)
+        case._write('note.md', 'The retained editable result.\n')
+        case._submit(_action('deliver_result', summary='Note awaiting review', artifacts=['note.md'],
+            unresolved=['Independent review remains unfinished.']))
+        self.assertEqual(case.app.session.manifest.status, 'partial')
+        requests = list(case.app.state['requests'])
+        original = (case.root / 'workspace/note.md').read_bytes()
+        ledger = deepcopy(case.app.ledger.to_dict())
+        claim = case.app.session.store.read_json('delivery.json')
+        prior = case.app.operations.delivery.retained_prior_delivery()
+        self.assertEqual(prior['artifacts'], claim['artifacts'])
+        self.assertEqual(prior['unresolved'], claim['unresolved'])
+        guidance, _ = case.app.operations.delivery.working_guidance(claim, include_lifecycle=True)
+        self.assertEqual(guidance['minimum_resources']['llm_requests'], 1)
+        self.assertEqual(case.app.operations.document.work_context([])['retained_prior_delivery'], prior)
+
+        grant = {'resource_allowances': {'llm_requests': 3, 'total_tokens': 300000},
+                 'authorization_id': 'continue-partial', 'authorization_reason': 'Complete the required review'}
+        # The original authorization and the exact partial are saved together;
+        # a stop before reopening can recover without another grant or request.
+        with patch.object(case.app.session, 'continue_with_revision', side_effect=RuntimeError('interrupted')):
+            with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                case.app.run(**grant, progress=lambda _: None)
+        case._reload()
+        saved_ledger = deepcopy(case.app.ledger.to_dict())
+        self.assertEqual(saved_ledger['entries'][:len(ledger['entries'])], ledger['entries'])
+        case.app.run(progress=lambda _: None, should_stop=lambda: True)
+        self.assertEqual(case.app.session.manifest.status, 'paused')
+        self.assertEqual(case.app.state['requests'], requests)
+        self.assertEqual(case.app.ledger.to_dict(), saved_ledger)
+        self.assertEqual((case.root / 'workspace/note.md').read_bytes(), original)
+
+        case._submit(_action('review_result', summary='Checked note', artifacts=['note.md'],
+            review_scope='delivery'))
+        proof = case._ok('review_result', reviewed=True)['metadata']['delivery_review']
+        checked = len(case.inspection_requests)
+        case._submit(_action('deliver_result', reviewed_candidate=proof['identity']))
+        self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
+        self.assertEqual(case.app.state['requests'], requests)
+        self.assertEqual(len(case.inspection_requests), checked)
+        self.assertIsNone(case.app.operations.delivery.retained_prior_delivery())
+        before_replay = deepcopy(case.app.ledger.to_dict())
+        case.app.run(**grant, progress=lambda _: None)
+        self.assertEqual(case.app.session.manifest.status, 'completed')
+        self.assertEqual(case.app.ledger.to_dict(), before_replay)
+
     def test_caller_can_spend_the_last_call_on_an_explicit_review(self):
         from simple_ar.app.tool_application import ToolApplication
         from tests.test_professional_work_loop import OperationsWorkLoopTests, _action

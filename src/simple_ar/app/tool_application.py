@@ -5783,10 +5783,26 @@ class ToolApplication:
         return self.operations.delivery.feedback(self._operation_observations(),
             self.session.store.read_json('delivery.json') if self.session.store.exists('delivery.json') else None)
 
+    def _partial_resource_continuation(self) -> str | None:
+        """Find an authorized continuation of the last partial delivery."""
+        if not self.state['turns']:
+            return None
+        turn = self.state['turns'][-1]
+        if (turn['remaining'] or not turn['tools']
+                or turn.get('request_count', 1) != len(self.state['requests'])):
+            return None
+        record = turn['tools'][-1]['result']
+        terms = self.session.manifest.budget.continuation_authorizations
+        return next((identity for identity in reversed(self._professional_resource_authorizations())
+            if terms[identity].get('resume_after') == record), None)
+
     def _commit_terminal(self, progress: Callable[[str], None]) -> bool:
         """Consume a closed current-revision observation before any new decision."""
         if not self.state['turns'] or self.state['pending'] is not None:
             return False
+        if (self.session.manifest.status not in {'partial', 'completed'}
+                and self._partial_resource_continuation() is not None):
+            return False  # The committed partial was explicitly reopened, not replayed.
         turn = self.state['turns'][-1]
         if (turn['remaining'] or not turn['tools']
                 or turn.get('request_count', 1) != len(self.state['requests'])):
@@ -6253,7 +6269,8 @@ class ToolApplication:
                              authorization_id: str, reason: str, *,
                              additional_attempts: int | None = None,
                              additional_no_progress: int | None = None,
-                             model_binding: dict[str, Any] | None = None, persist: bool = True) -> None:
+                             model_binding: dict[str, Any] | None = None, persist: bool = True,
+                             resume_after: str | None = None) -> None:
         for value in (additional_attempts, additional_no_progress):
             if value is not None and (type(value) is not int or value < 0):
                 raise ValueError('Additional attempt allowances must be non-negative integers')
@@ -6273,7 +6290,8 @@ class ToolApplication:
             self.ledger.validate_remaining(allowances, authorization_id=authorization_id, reason=reason)
         self.session.manifest.budget.authorize_additional(authorization_id,
             attempts=requests * 10 if additional_attempts is None else additional_attempts,
-            no_progress=additional_no_progress or 0, resource_allowances=allowances, reason=reason)
+            no_progress=additional_no_progress or 0, resource_allowances=allowances, reason=reason,
+            resume_after=resume_after)
         self.session.save()
         if allowances:
             self.ledger.authorize_remaining(allowances, authorization_id=authorization_id, reason=reason)
@@ -6678,14 +6696,26 @@ class ToolApplication:
                         or authorization_id or authorization_reason):
                     raise ValueError('Use --retry-model separately from feedback, access, resource or tool authorization')
                 self._retry_model(retry_model_selector)
+            capacity = bool(resource_allowances or additional_attempts or additional_no_progress)
+            previous_grant = self.session.manifest.budget.continuation_authorizations.get(authorization_id.strip())
+            resume_after = previous_grant.get('resume_after') if previous_grant is not None else None
+            if capacity and previous_grant is None and not feedback and self.session.manifest.status == 'partial':
+                if not self._commit_terminal(progress):
+                    raise ValueError('Reconcile the partial delivery before continuing it')
+                resume_after = self.state['turns'][-1]['tools'][-1]['result']
             self._authorize_resources(resource_allowances or {}, authorization_id, authorization_reason,
-                additional_attempts=additional_attempts, additional_no_progress=additional_no_progress)
+                additional_attempts=additional_attempts, additional_no_progress=additional_no_progress,
+                resume_after=resume_after)
             authorization = self._authorize(read_only_sources, execution=allow_execution,
                                             network=allow_network, vision=allow_vision)
             if authorization:
                 feedback = authorization + ('\n' + feedback if feedback else '')
             if feedback:
                 self._apply_feedback(feedback, independent_review_required=independent_review_required)
+            if self.session.manifest.status == 'partial' and not feedback:
+                resumed = self._partial_resource_continuation()
+                if resumed is not None:
+                    self.session.continue_with_revision('Explicit resource continuation: ' + resumed)
             if actions is not None:
                 self._submit_actions(actions)
             if (resource_allowances or additional_attempts or additional_no_progress) and self.session.manifest.status in {'paused', 'blocked', 'failed'}:

@@ -134,15 +134,19 @@ class DeliveryVersions:
         return rows
 
     def prior_work(self, request_count: int) -> list[dict]:
-        """Find partial continuations and their last complete retained delivery."""
+        """Find unfinished work and its last complete retained delivery."""
         results = []
         for record, turn in reversed(list(self._closed())):
-            if turn.get('request_count', 1) >= request_count:
+            if turn.get('request_count', 1) > request_count:
                 continue
             try:
                 owner = self._owner(record, turn)
                 if owner is None:
                     continue
+                # A completed delivery ends this request. An earlier partial is
+                # useful only when work continued after that completion.
+                if owner[2] == request_count and not owner[1].get('unresolved') and not results:
+                    return []
                 saved = self._load(record, *owner)
                 if saved is not None:
                     results.append(saved)
