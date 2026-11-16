@@ -522,6 +522,8 @@ def _create_research_task(brief: ResearchBrief, *, root: str | Path, services: A
     if selected_model is None and attempt_limit is None:
         attempt_limit = 16
     request_context = brief.to_dict()
+    if policy.execution_context and projection is not None and not research_work and not confirm_execution:
+        request_context['execution_context'] = policy.execution_context
     task_kind = str(config.get('research_task_kind') or '').strip()
     if task_kind and task_kind.lower() != 'auto':
         request_context['research_task_kind'] = task_kind

@@ -19,6 +19,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Fixed
 
+- Common research design retains the caller's execution context and applies supplied project and metric boundaries even without a separate context description.
 - Common research work carries the original request and feedback into planning, reading, synthesis and design, and honors older callers' deterministic planning and planning limits. Source selection retains an explicit publication range; new and historical research use the same source-version selection when combining retained bundles with new material, preserve the selected acquisition and extraction records, and do not charge old retrievals to the current allowance. Idea assessment can reuse that reading without replacing the initial assessment with the subsequent design review.
 - Research feasibility review uses the caller's saved reviewer connection and the same task ledger.
 - Structured data analysis can request independent review of its results and supporting materials without also requesting a report.

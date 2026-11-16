@@ -8748,6 +8748,22 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             AttemptManifest('research-design', capability='native_tool'))
         return root, workspace, owner, context
 
+    def test_research_design_receives_the_callers_saved_execution_context(self) -> None:
+        from simple_ar.research.design import run_research_design_capability
+        from simple_ar.tools.sources import SourceToolGateway
+
+        root, workspace, previous, context = self._professional_design_fixture()
+        saved_context = 'Keep the supplied evaluation period and reference method.'
+        policy = previous.policy.model_copy(update={'execution_context': saved_context})
+        owner = SourceToolGateway(root, workspace, workspace.ledger, policy=policy)
+        with patch('simple_ar.tools.sources.run_research_design_capability',
+                   wraps=run_research_design_capability) as design:
+            result = owner.execute_tool('research', context, {
+                'operation': 'design', 'question': 'Test the chosen method',
+                'synthesis_record': 'source0/synthesis.json'})
+        self.assertEqual(result.status, 'ok', result.error)
+        self.assertEqual(design.call_args.kwargs['request'].execution_context, saved_context)
+
     def test_design_reuse_binds_original_locator_to_retained_baseline_bytes(self) -> None:
         from simple_ar.tools.sources import SourceToolGateway
         from simple_ar.tools.scientific import freeze_measurement_set

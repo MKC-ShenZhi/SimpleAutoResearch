@@ -1322,9 +1322,6 @@ class ResearchDesignTests(unittest.TestCase):
                     "required_metrics": ["accuracy", "macro_f1"],
                 },
                 execution_boundary={"code_task": {"code_root": "examples/code_task_digits_mlp/project"}},
-                execution_context=(
-                    "Prepared project: examples/code_task_digits_mlp/project."
-                ),
             )
         )
 

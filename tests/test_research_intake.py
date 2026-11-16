@@ -67,6 +67,24 @@ def _reply(name, arguments):
 
 
 class ResearchIntakeTests(unittest.TestCase):
+    def test_legacy_execution_context_reaches_common_research_and_survives_reload(self):
+        from simple_ar.tools.sources import SourcePolicy
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / 'task'
+            services = ResearchApplicationServices(config={
+                'research_materials_only': True,
+                'research_execution_context': 'Use the supplied observations and fixed evaluation period.',
+            })
+            app = create_research_task(ResearchBrief(request_text='Design a research study.'),
+                root=root, services=services)
+            restored = ToolApplication.load(root)
+            expected = 'Use the supplied observations and fixed evaluation period.'
+            self.assertEqual(app.sources.policy.execution_context, expected)
+            self.assertEqual(restored.sources.policy.execution_context, expected)
+            # An absent optional field does not alter retained historical bindings.
+            self.assertNotIn('execution_context', SourcePolicy().model_dump(mode='json'))
+
     def test_legacy_planning_controls_are_honored_by_common_research(self):
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
 

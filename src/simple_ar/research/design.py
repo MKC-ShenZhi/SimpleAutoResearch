@@ -855,7 +855,7 @@ def _apply_execution_boundary(
     synthesis handoff for prompts and audit.
     """
 
-    if not execution_context.strip() and not configured_protocol:
+    if not (execution_context.strip() or execution_schema or prepared_execution or configured_protocol):
         return contract
     raw_metrics = execution_schema.get("required_metrics")
     metrics = (

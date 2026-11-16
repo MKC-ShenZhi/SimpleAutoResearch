@@ -76,6 +76,7 @@ class SourcePolicy(BaseModel):
     interaction: Literal['assisted', 'checkpoints', 'autonomous'] = 'checkpoints'
     require_summary: bool = False
     selected_idea_id: str | None = None
+    execution_context: str = Field(default='', exclude_if=lambda value: not value)
     execution_schema: dict[str, Any] = Field(default_factory=dict)
     execution_boundary: dict[str, Any] = Field(default_factory=dict)
     entry_facts: dict[str, Any] = Field(default_factory=dict)
@@ -980,7 +981,8 @@ class SourceToolGateway:
                 run(run_research_design_capability, ResearchDesignRequest(synthesis=synthesis,
                     topic=request.question, idea_id=selected, idea_id_is_fixed=True,
                     execution_schema=policy.execution_schema, execution_boundary=policy.execution_boundary,
-                    entry_facts=facts, source_workspace=source, source_index=index,
+                    execution_context=policy.execution_context, entry_facts=facts,
+                    source_workspace=source, source_index=index,
                     previous_design=previous, implementation_feedback={'guidance': request.guidance} if previous else {},
                     use_llm=request.use_llm, llm_client=client(), feasibility_llm_client=reviewer,
                     user_requests=user_requests))
