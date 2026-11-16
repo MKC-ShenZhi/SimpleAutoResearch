@@ -138,7 +138,8 @@ def revise_research_task(app: Any, *, research_settings: Mapping[str, Any] | Non
 
     saved = app.state['config']
     mounts = dict(saved['sources'])
-    policy = dict(saved.get('research_policy') or {'allow_network': saved['allow_network']})
+    policy = dict(saved.get('research_policy') or {
+        **app.sources.policy.model_dump(mode='json'), 'allow_network': saved['allow_network']})
     selected = list(policy.get('materials', ()))
     has_source_work = bool(research_settings)
     confirm_protocol = bool((research_settings or {}).get('interaction') in {'assisted', 'checkpoints'}

@@ -504,6 +504,14 @@ class ResearchIntakeTests(unittest.TestCase):
             historical = ToolApplication.load(root)
             self.assertEqual((historical.sources.policy.max_fulltext_documents,
                 historical.sources.policy.max_fulltext_fetch_attempts), (1, 3))
+            note = Path(directory) / 'extra.txt'
+            note.write_text('An additional source.', encoding='utf-8')
+            revised = ToolApplication.create(Path(directory) / 'revised', 'Use supplied work.', model=None, sources={})
+            self.assertTrue(revise_research_task(revised, materials=[(note, 'material')]))
+            resumed = ToolApplication.load(Path(directory) / 'revised')
+            self.assertEqual((resumed.sources.policy.max_fulltext_documents,
+                resumed.sources.policy.max_fulltext_fetch_attempts), (20, 40))
+            self.assertEqual(resumed.sources.policy.materials, ('source0',))
         records = [DocumentRecord(document_id=str(index), title=f'Source {index}', source='test',
             url=f'https://example.org/{index}.html') for index in range(4)]
 
