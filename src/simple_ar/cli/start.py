@@ -134,7 +134,7 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     native.add_argument("--sandbox-execution", action="store_true", help="With --allow-execution, authorize ordinary commands and report rendering inside the Linux task workspace; requires bubblewrap. Source materials must be copied into the workspace and process networking is disabled.")
     native.add_argument("--allow-network", action="store_true", help="Native task: authorize public source search/acquisition, including bounded PDFs; no installation or command authorization.")
     native.add_argument("--allow-vision", action="store_true", help="Native task: authorize sending mounted rendered images to the named TOML vision route, sharing the task model budget.")
-    native.add_argument("--independent-review-required", action="store_true", help="Require an independent review before complete delivery; unfinished work can still be delivered as partial.")
+    native.add_argument("--independent-review-required", action="store_true", help="Require an independent review before complete delivery; on resume, combine with feedback. Unfinished work can still be delivered as partial.")
     native.add_argument("--max-images", type=int, default=0, help="Native task: authorize this many image generation/edit submissions through the named image route (default: disabled); retained on resume.")
     native.add_argument("--approve-execution", default="", help="Native resume: exact approval token printed for its pending process.")
     native.add_argument("--remember-execution", action="store_true",

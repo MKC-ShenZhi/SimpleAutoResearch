@@ -88,6 +88,8 @@ def validate_resume_options(args: argparse.Namespace) -> None:
     creation.update(name for name in ('max_processes', 'max_process_seconds')
                     if getattr(args, name, None) is not None)
     creation.update(name for name in ('max_images', 'project_python') if getattr(args, name, None))
+    if getattr(args, 'independent_review_required', False) and (args.request or args.goal):
+        creation.discard('independent_review_required')
     if creation:
         raise ValueError('Resume retains saved creation settings: ' + ', '.join(sorted(creation))
                          + '; use --authorize-remaining for resource changes, or --supply-task for contract changes')

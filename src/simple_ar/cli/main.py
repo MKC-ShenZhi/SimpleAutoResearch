@@ -2685,12 +2685,13 @@ def _run_native_conversation(app: Any, initial_run: Callable[[], dict[str, Any]]
             print_line(f'Task view unavailable: {type(exc).__name__}: {str(exc)[:300]}')
             print_line(f'Diagnostics: {app.session.store.root / "session_manifest.json"}; {app.session.store.root / "attempts"}')
 
-    def run(feedback: str | None = None) -> bool:
+    def run(feedback: str | None = None, *, require_review: bool = False) -> bool:
         try:
             if feedback is None:
                 initial_run()
             else:
-                app.run(feedback=feedback, approve=approve, progress=print_line)
+                app.run(feedback=feedback, approve=approve, progress=print_line,
+                    **({'independent_review_required': True} if require_review else {}))
         except (EOFError, KeyboardInterrupt):
             return False
         except (OSError, ValueError, RuntimeError, LLMError) as exc:
@@ -2705,7 +2706,7 @@ def _run_native_conversation(app: Any, initial_run: Callable[[], dict[str, Any]]
         if not run():
             return
         display()
-        print_line('Feedback / 反馈; /status reads saved facts; /exit leaves this task saved.')
+        print_line('Feedback / 反馈; /review FEEDBACK requires independent review; /status reads saved facts; /exit leaves this task saved.')
         while True:
             feedback = input('Task / 任务> ')
             command = feedback.strip()
@@ -2714,6 +2715,15 @@ def _run_native_conversation(app: Any, initial_run: Callable[[], dict[str, Any]]
             if command == '/exit':
                 return
             if command == '/status':
+                display()
+                continue
+            if command == '/review' or command.startswith('/review '):
+                revision = command[len('/review'):].strip()
+                if not revision:
+                    print_line('Use /review followed by feedback; no feedback submitted.')
+                    continue
+                if not run(revision, require_review=True):
+                    return
                 display()
                 continue
             if command.startswith('/'):
@@ -2978,6 +2988,8 @@ def _run_native_start(args: argparse.Namespace) -> None:
 
         def run_initial():
             status = app.run(feedback=feedback, approved_execution=args.approve_execution,
+                **({'independent_review_required': True}
+                   if args.resume_task and getattr(args, 'independent_review_required', False) else {}),
                 remember_execution=getattr(args, 'remember_execution', False),
                 retry_model=args.retry_model,
                 retry_model_selector=replacement_model if args.resume_task else '',

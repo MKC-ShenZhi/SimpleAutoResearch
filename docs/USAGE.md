@@ -205,7 +205,7 @@ Interactive selection requires a terminal; scripts use an exact listed directory
 Recorded status does not certify quality; `partial` retains unresolved work.
 Feedback continues the same task and ledger; starting from a configuration again creates a new task.
 
-For continued conversation, run `uv run simple-ar start --resume-task SESSION --interactive`. Enter feedback after each turn, use `/status` to inspect progress, and `/exit` to leave while retaining the task.
+To require an independent review for a revision, add `--independent-review-required` to its resume command. For continued conversation, run `uv run simple-ar start --resume-task SESSION --interactive`: enter feedback after each turn, use `/review FEEDBACK` to require review, `/status` to inspect progress, and `/exit` to leave while retaining the task.
 Creation flags cannot reset saved process limits on resume; additional resources require explicit continuation authorization.
 
 ### Change a configured connection

@@ -834,6 +834,13 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(restored.feedback_status(restored.session.store.root,
             submission_id=request['submission_id']), receipt)
         self.assertTrue(restored.state['config']['independent_review_required'])
+        restored.run(feedback='The next revision no longer needs an independent review.',
+            independent_review_required=False, should_stop=lambda: True, progress=lambda _: None)
+        restored.run(feedback='Independently review the revised result.',
+            independent_review_required=True, should_stop=lambda: True, progress=lambda _: None)
+        self.assertTrue(ToolApplication.load(restored.session.store.root).state['config']['independent_review_required'])
+        self.assertTrue(restored.operations.delivery.requires_review(candidate))
+        self.assertEqual((app.session.store.root / 'budget_ledger.json').read_bytes(), original['budget_ledger.json'])
         fake.chat_turn.assert_not_called()
 
     def _historical_native_fixture(self, **options):

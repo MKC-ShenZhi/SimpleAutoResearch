@@ -6568,6 +6568,7 @@ class ToolApplication:
         return result
 
     def run(self, *, feedback: str = "", submission_id: str | None = None,
+            independent_review_required: bool | None = None,
             approved_execution: str = "", remember_execution: bool = False,
             actions: list[dict[str, Any]] | None = None,
             retry_model: bool = False, retry_model_selector: str = "",
@@ -6582,6 +6583,9 @@ class ToolApplication:
             should_stop: Callable[[], bool] | None = None) -> dict[str, Any]:
         if remember_execution and not approved_execution:
             raise ValueError('Remembering execution requires the exact pending approval token')
+        if independent_review_required is not None and (type(independent_review_required) is not bool
+                or not feedback.strip()):
+            raise ValueError('A review selection requires feedback and a boolean choice')
         if submission_id is not None:
             if (actions is not None or approved_execution or retry_model or retry_model_selector
                     or read_only_sources or allow_execution or allow_network or allow_vision
@@ -6589,7 +6593,8 @@ class ToolApplication:
                     or authorization_id or authorization_reason or decision is not None):
                 raise ValueError('Run a feedback submission separately from actions, retries or authorization')
             if feedback:
-                self.submit_feedback(self.session.store.root, submission_id=submission_id, feedback=feedback)
+                self.submit_feedback(self.session.store.root, submission_id=submission_id, feedback=feedback,
+                    independent_review_required=independent_review_required)
             else:
                 self.feedback_status(self.session.store.root, submission_id=submission_id)
             feedback = ''  # The reception journal, not the legacy string path, owns adoption.
@@ -6675,7 +6680,7 @@ class ToolApplication:
             if authorization:
                 feedback = authorization + ('\n' + feedback if feedback else '')
             if feedback:
-                self._apply_feedback(feedback)
+                self._apply_feedback(feedback, independent_review_required=independent_review_required)
             if actions is not None:
                 self._submit_actions(actions)
             if (resource_allowances or additional_attempts or additional_no_progress) and self.session.manifest.status in {'paused', 'blocked', 'failed'}:

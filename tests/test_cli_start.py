@@ -69,6 +69,29 @@ class StartTests(unittest.TestCase):
         self.assertIn('Unknown command', output.getvalue())
         self.assertIn(str(app.session.store.root), output.getvalue())
 
+    def test_feedback_can_request_review_in_interactive_or_one_shot_cli(self):
+        from simple_ar.cli.main import main
+
+        app = self._interactive_cli_app()
+        with patch('sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', side_effect=['/review', '/review Check the revised result', '/exit']), \
+                patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            main(['start', '--resume-task', str(app.session.store.root), '--interactive'])
+        self.assertEqual(app.run.call_count, 2)
+        self.assertEqual(app.run.call_args.kwargs['feedback'], 'Check the revised result')
+        self.assertTrue(app.run.call_args.kwargs['independent_review_required'])
+        self.assertIn('no feedback submitted', output.getvalue())
+
+        app = self._interactive_cli_app()
+        with patch('sys.stdin.isatty', return_value=False), \
+                patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+                contextlib.redirect_stdout(io.StringIO()):
+            main(['start', '--resume-task', str(app.session.store.root),
+                  'Check the revised result', '--independent-review-required', '--yes'])
+        self.assertEqual(app.run.call_args.kwargs['feedback'], 'Check the revised result')
+        self.assertTrue(app.run.call_args.kwargs['independent_review_required'])
+
     def test_interactive_native_creation_enters_same_feedback_consumer(self):
         from simple_ar.cli.main import main
         app = self._interactive_cli_app()
