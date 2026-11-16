@@ -514,6 +514,7 @@ function json(path, data) {
   $('network').checked = true;
   selectTask('alpha');
   $('feedback').value = 'Revise the figure and caption';
+  $('feedbackReview').checked = true;
   $('switchReason').value = 'Existing authorization';
   $('mount').value = 'source0'; folder = 'measurements';
   previewTarget = {mount: 'workspace', path: 'figures/plot.png', name: 'plot.png'};
@@ -521,10 +522,12 @@ function json(path, data) {
   selectTask('beta');
   assert.equal($('rememberExecution').checked, false);
   assert.equal($('feedback').value, '');
+  assert.equal($('feedbackReview').checked, false);
   assert.equal(folder, '');
   $('feedback').value = 'Other project feedback';
   selectTask('alpha');
   assert.equal($('feedback').value, 'Revise the figure and caption');
+  assert.equal($('feedbackReview').checked, true);
   assert.equal(folder, 'measurements');
   assert.equal($('mount').value, ''); // Rebound only after owner snapshot.
   assert.equal(view.tasks.alpha.mount, 'source0');
@@ -538,10 +541,11 @@ function json(path, data) {
   view = saved;
   selectTask(view.selected, false);
   assert.equal($('feedback').value, 'Revise the figure and caption');
-  const first = action('feedback', {feedback: $('feedback').value});
+  const first = action('feedback', {feedback: $('feedback').value, independent_review_required: true});
   await action('feedback', {feedback: 'double click'});
   assert.equal(requests.length, 1);
   assert.equal(requests[0].task, 'alpha');
+  assert.equal(requests[0].independent_review_required, true);
   assert.equal(typeof requests[0].submission_id, 'string');
   selectTask('beta');
   finish({task: 'alpha', message: 'accepted'});
