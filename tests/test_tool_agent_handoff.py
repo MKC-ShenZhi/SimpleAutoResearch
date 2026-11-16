@@ -730,6 +730,75 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(context['requested_report']['max_cited_sources'], 2)
         self.assertEqual(context['requested_report']['template'], requirement['template']['template_markdown'])
 
+    def test_common_task_continues_saved_sections_after_resource_grant(self):
+        from simple_ar.report.schema import ReportRuntimeConfig, ReportTemplateBundle
+        from tests.report_review_fixtures import prompt_payload
+
+        config = ReportRuntimeConfig(outline_strategy='template', reviewer='disabled',
+            max_review_iterations=0, allow_source_backtracking=False)
+        template = ReportTemplateBundle(name='sections', mode='supplied_materials', template_path='',
+            criteria_path='', template_markdown='## Findings\n\n## Limits\n', criteria_markdown='')
+        requirement = {'method': 'sections', 'config': config.model_dump(mode='json'),
+            'template': template.model_dump(mode='json'), 'outline': [
+                {'heading': 'Findings', 'required': True}, {'heading': 'Limits', 'required': True}]}
+        root, _, fake, _, app, _ = self._native_fixture(goal='Write a brief',
+            max_turns=2, report_requirement=requirement)
+        calls = []
+
+        class Client:
+            _settings = SimpleNamespace(context_input_tokens=24000)
+
+            def __init__(self, identity):
+                self._budget_ledger = app.ledger
+                self._budget_session_id = app.session.manifest.session_id
+                self._budget_attempt_id = identity
+
+            def ask_json(self, system, prompt, *, label='', budget_call_id='', **options):
+                self._budget_ledger.reserve(budget_call_id, {'llm_requests': 1, 'total_tokens': 10},
+                    session_id=self._budget_session_id, attempt_id=self._budget_attempt_id, purpose='document')
+                calls.append(label)
+                if label == 'document-work-1':
+                    response = {'action': 'write', 'title': 'Brief'}
+                else:
+                    section = prompt_payload(prompt)['section']
+                    response = {'section_id': section['section_id'], 'heading': section['heading'],
+                        'draft_markdown': 'The selected section is retained.'}
+                self._budget_ledger.settle(budget_call_id, {'llm_requests': 1, 'total_tokens': 10})
+                return response
+
+        app.operations.document.client_factory = Client
+        stop = {'tool_name': 'ask_user', 'arguments': {'question': 'Pause after this work'}}
+        work = {'tool_name': 'work_document', 'arguments': {'goal': 'Write a brief'}}
+        app.run(actions=[work, stop], progress=lambda _: None)
+        record = app.state['turns'][-1]['tools'][0]['result']
+        failed = app.session.store.read_json(record)
+        self.assertEqual(failed['status'], 'error', failed)
+        locator = failed['data']['resume_work']
+        shown = app._coordination_result(failed, 'records/' + record.removeprefix('attempts/'))
+        self.assertEqual(shown['data']['resume_work'], locator)
+        self.assertTrue(app.workspace.resolve(failed['data']['partial_manuscript']).is_file())
+        original = app.workspace.resolve(locator)
+        before = {path.relative_to(original): path.read_bytes() for path in original.rglob('*') if path.is_file()}
+        old_ledger = app.ledger.to_dict()
+
+        app = ToolApplication.load(root / 'native')
+        app.operations.document.client_factory = Client
+        work['arguments']['resume_work'] = locator
+        app.run(actions=[work, stop], resource_allowances={'llm_requests': 3},
+            authorization_id='continue-writing', authorization_reason='Complete the retained report',
+            progress=lambda _: None)
+        resumed = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(resumed['status'], 'ok', resumed)
+        self.assertEqual(resumed['data']['continued_from'], locator)
+        self.assertIn('## Findings', resumed['data']['markdown'])
+        self.assertIn('## Limits', resumed['data']['markdown'])
+        self.assertEqual(calls.count('document-work-1'), 1)
+        self.assertEqual(len([label for label in calls if label.startswith('report-writer-')]), 2)
+        self.assertEqual(app.ledger.to_dict()['entries'][:len(old_ledger['entries'])], old_ledger['entries'])
+        self.assertEqual({path.relative_to(original): path.read_bytes() for path in original.rglob('*')
+            if path.is_file()}, before)
+        fake.chat_turn.assert_not_called()
+
     def _historical_native_fixture(self, **options):
         """Explicit saved native control/projection; current tools use _native_fixture."""
         return self._native_fixture(operation_control=False, **options)
