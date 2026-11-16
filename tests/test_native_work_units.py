@@ -559,7 +559,9 @@ class NativeWorkQueueTests(unittest.TestCase):
         self.assertNotEqual(prior['record'], prior['earlier_deliveries'][0]['record'])
         self.assertEqual(c.app._work_context(['note.md'])['retained_prior_delivery'], prior)
         document_context = c.app.operations.document.work_context([str(c.inputs)])
-        self.assertIn('baseline.txt', json.dumps(document_context['professional_findings']))
+        self.assertTrue(any(row.get('delivery_context', {}).get('claim', {}).get('summary') == 'Completed baseline'
+            and row.get('reviewed_version_status', {}).get('matching', 0) for row in
+            document_context['professional_findings']))
 
     def test_new_model_review_defaults_to_candidate_scope_without_claiming_delivery(self):
         c = self.case
