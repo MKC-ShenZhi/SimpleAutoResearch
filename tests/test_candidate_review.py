@@ -422,7 +422,17 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         self.assertEqual(len(case.inspection_requests), checked)
         case.review = case._review_complete_targets
         case._submit(_action('review_result', **claim, review_scope='delivery'))
-        case._ok('review_result', reviewed=True)
+        proof = case._ok('review_result', reviewed=True)['metadata']['delivery_review']
+        inspector = case.app.operations.inspection
+        with patch.object(inspector, '_receipt', wraps=inspector._receipt) as read_receipt:
+            with inspector.presentation_scope():
+                first = inspector.feedback_observation(proof['identity'], proof['result'], guidance_only=True)
+                second = inspector.feedback_observation(proof['identity'], proof['result'], guidance_only=True)
+                self.assertTrue(first['opinion_available'])
+                self.assertEqual(first, second)
+                self.assertEqual(read_receipt.call_count, 1)
+            inspector.feedback_observation(proof['identity'], proof['result'], guidance_only=True)
+            self.assertEqual(read_receipt.call_count, 2)  # A later decision reads its own opinion.
         checked = len(case.inspection_requests)
         case._submit(_action('deliver_result', **claim, independent_review=False))
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
