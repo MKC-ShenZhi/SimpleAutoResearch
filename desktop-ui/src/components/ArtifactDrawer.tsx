@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { api } from '../api';
 import type { DeliveryFile, DeliverySnapshot, FileEntry, TaskSnapshot } from '../types';
+import { summarizeResources } from '../utils/resources';
 import { MarkdownView } from './MarkdownView';
 
 interface ArtifactDrawerProps {
@@ -157,6 +158,7 @@ export function ArtifactDrawer({
   };
 
   const mounts = ['workspace', 'evidence', ...snapshot.sources.filter((s) => snapshot.source_access[s])];
+  const resSummary = summarizeResources(snapshot.resources);
 
   return (
     <aside
@@ -460,25 +462,25 @@ export function ArtifactDrawer({
               <div className="rounded-lg p-2" style={{ backgroundColor: 'var(--bg-app)' }}>
                 <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>模型调用</div>
                 <div className="mt-0.5 font-semibold">
-                  {snapshot.resources?.used?.llm_requests ?? 0} / {snapshot.resources?.limits?.llm_requests ?? '∞'}
+                  {resSummary.llmRequests} / {resSummary.llmLimit ?? '∞'}
                 </div>
               </div>
               <div className="rounded-lg p-2" style={{ backgroundColor: 'var(--bg-app)' }}>
                 <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>总 Tokens</div>
                 <div className="mt-0.5 font-semibold">
-                  {(snapshot.resources?.used?.total_tokens ?? 0).toLocaleString()}
+                  {resSummary.totalTokens.toLocaleString()}
                 </div>
               </div>
               <div className="rounded-lg p-2" style={{ backgroundColor: 'var(--bg-app)' }}>
                 <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>进程调用</div>
                 <div className="mt-0.5 font-semibold">
-                  {snapshot.resources?.used?.process_invocations ?? 0}
+                  {resSummary.processInvocations}
                 </div>
               </div>
               <div className="rounded-lg p-2" style={{ backgroundColor: 'var(--bg-app)' }}>
                 <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>未知预留</div>
                 <div className="mt-0.5 font-semibold">
-                  {snapshot.resources?.unknown_reservations ?? 0}
+                  {resSummary.unknownCount}
                 </div>
               </div>
             </div>

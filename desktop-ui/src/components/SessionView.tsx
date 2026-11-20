@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { api } from '../api';
 import type { DeliveryFile, DeliverySnapshot, MetaResponse, TaskSnapshot } from '../types';
+import { summarizeResources } from '../utils/resources';
 import { MarkdownView } from './MarkdownView';
 
 interface SessionViewProps {
@@ -78,8 +79,9 @@ export function SessionView({
   const [showRejectBox, setShowRejectBox] = useState(false);
 
   const statusBadge = formatStatus(snapshot.manifest.status, snapshot.worker_live);
-  const usedTokens = snapshot.resources?.used?.total_tokens ?? 0;
-  const usedCalls = snapshot.resources?.used?.llm_requests ?? 0;
+  const resSummary = summarizeResources(snapshot.resources);
+  const usedTokens = resSummary.totalTokens;
+  const usedCalls = resSummary.llmRequests;
 
   const handlePause = async () => {
     try {
