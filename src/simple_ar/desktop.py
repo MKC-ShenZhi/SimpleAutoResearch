@@ -69,6 +69,20 @@ def _shutdown_workspace(httpd, workspace: Workspace) -> None:
         thread.join(timeout=3.0)
 
 
+def _load_project_env(project_root: Path) -> None:
+    """Load project .env (without overriding shell env) and default to project models.toml if present."""
+    from dotenv import load_dotenv
+
+    env_file = project_root / ".env"
+    if env_file.is_file():
+        load_dotenv(env_file, override=False)
+    if not os.environ.get("SIMPLE_AR_MODELS_CONFIG", "").strip():
+        for candidate in (project_root / ".local" / "models.toml", project_root / "models.toml"):
+            if candidate.is_file():
+                os.environ["SIMPLE_AR_MODELS_CONFIG"] = str(candidate.resolve())
+                break
+
+
 def run(project_root: Path, read_roots: list[Path], task_root: Path, *, browser: bool = False) -> None:
     assets_index = Path(__file__).parent / "desktop_assets" / "index.html"
     if not assets_index.is_file():
@@ -76,8 +90,11 @@ def run(project_root: Path, read_roots: list[Path], task_root: Path, *, browser:
             "Desktop UI assets not found. Build desktop-ui first: cd desktop-ui && npm run build"
         )
 
+    resolved_project = project_root.expanduser().resolve()
+    _load_project_env(resolved_project)
+
     workspace = Workspace(
-        project_root.expanduser().resolve(),
+        resolved_project,
         [p.expanduser().resolve() for p in read_roots],
         task_root.expanduser().resolve(),
     )

@@ -185,6 +185,21 @@ class Workspace:
         )
         return dict(settings=self.model_settings(), profiles=self.profiles())
 
+    def set_models_config_path(self, data: dict) -> dict:
+        import os
+
+        raw_path = str(data.get('path', '')).strip()
+        if not raw_path:
+            os.environ.pop('SIMPLE_AR_MODELS_CONFIG', None)
+        else:
+            target = Path(raw_path).expanduser().resolve()
+            if target.suffix.lower() != '.toml':
+                raise ValueError('模型配置文件路径需要以 .toml 结尾。')
+            if target.exists() and target.is_dir():
+                raise ValueError('请选择具体的 .toml 文件路径，而不是目录。')
+            os.environ['SIMPLE_AR_MODELS_CONFIG'] = str(target)
+        return dict(settings=self.model_settings(), profiles=self.profiles())
+
     def creation_defaults(self) -> dict:
         args = native_arguments()
         options = native_creation_options(args)
@@ -505,6 +520,8 @@ class Workspace:
         name = data.get('task', '')
         if op == 'save_model_profile':
             return self.save_model_profile(data)
+        if op == 'set_models_config_path':
+            return self.set_models_config_path(data)
         if op == 'feedback':
             root = self.task(name)
             for path in ('session_manifest.json', 'actions.json',
@@ -752,7 +769,7 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
             except PermissionError:
                 self.send(403, {'error': 'Local host/origin/session protection rejected request'})
             except ValueError as exc:
-                if op == 'save_model_profile' and str(exc):
+                if op in {'save_model_profile', 'set_models_config_path'} and str(exc):
                     self.send(400, {'error': public_text(str(exc))})
                 else:
                     self.send(400, {'error': 'Action rejected; check confirmation, caps, current proposal and original task records'})

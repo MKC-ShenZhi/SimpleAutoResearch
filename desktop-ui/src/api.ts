@@ -147,6 +147,12 @@ export const api = {
       op: 'save_model_profile',
       ...payload,
     }),
+
+  setModelsConfigPath: (path: string) =>
+    apiPost<{ settings: ModelSettingsResponse; profiles: ModelProfileSummary[] }>({
+      op: 'set_models_config_path',
+      path,
+    }),
 };
 
 export const desktopBridge = {

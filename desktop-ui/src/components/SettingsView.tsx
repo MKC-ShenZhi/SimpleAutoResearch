@@ -21,6 +21,8 @@ export function SettingsView({ onUpdated, onNotify }: SettingsViewProps) {
   const [settings, setSettings] = useState<ModelSettingsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [configPathDraft, setConfigPathDraft] = useState('');
+  const [switchingPath, setSwitchingPath] = useState(false);
 
   const [selectedName, setSelectedName] = useState<string>('__new__');
   const [name, setName] = useState('');
@@ -55,6 +57,7 @@ export function SettingsView({ onUpdated, onNotify }: SettingsViewProps) {
       setLoading(true);
       const data = await api.getModelSettings();
       setSettings(data);
+      setConfigPathDraft(data.path);
       if (data.profiles.length > 0) {
         const target =
           data.profiles.find((p) => p.name === selectedName) ||
@@ -127,26 +130,73 @@ export function SettingsView({ onUpdated, onNotify }: SettingsViewProps) {
     );
   };
 
+  const handleSwitchConfigPath = async () => {
+    try {
+      setSwitchingPath(true);
+      const res = await api.setModelsConfigPath(configPathDraft.trim());
+      setSettings(res.settings);
+      setConfigPathDraft(res.settings.path);
+      if (res.settings.profiles.length > 0) {
+        loadForm(res.settings.profiles.find((p) => p.is_default) || res.settings.profiles[0]);
+      } else {
+        loadForm(null);
+      }
+      await onUpdated();
+      onNotify(`已切换配置文件至 ${res.settings.path}`);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '切换配置文件失败', 'error');
+    } finally {
+      setSwitchingPath(false);
+    }
+  };
+
   return (
     <div className="flex h-full flex-col overflow-hidden">
       <header
-        className="flex shrink-0 items-center justify-between border-b px-6 py-4"
+        className="flex shrink-0 flex-col gap-2.5 border-b px-6 py-4"
         style={{ borderColor: 'var(--border-subtle)' }}
       >
-        <div>
+        <div className="flex items-center justify-between">
           <h1 className="text-[17px] font-semibold">模型与连接设置</h1>
-          <p className="mt-0.5 font-mono text-[12px]" style={{ color: 'var(--text-muted)' }}>
-            配置文件：{settings?.path || '加载中…'}（与 CLI 共用 models.toml）
-          </p>
+          <button
+            onClick={() => void fetchSettings()}
+            className="inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12.5px] cursor-pointer"
+            style={{ borderColor: 'var(--border-subtle)', backgroundColor: 'var(--bg-surface)' }}
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+            <span>刷新</span>
+          </button>
         </div>
-        <button
-          onClick={() => void fetchSettings()}
-          className="inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12.5px] cursor-pointer"
-          style={{ borderColor: 'var(--border-subtle)', backgroundColor: 'var(--bg-surface)' }}
-        >
-          <RefreshCw className="h-3.5 w-3.5" />
-          <span>刷新</span>
-        </button>
+        <div className="flex items-center gap-2">
+          <span className="shrink-0 text-[12px]" style={{ color: 'var(--text-muted)' }}>
+            配置文件：
+          </span>
+          <input
+            value={configPathDraft}
+            onChange={(e) => setConfigPathDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                void handleSwitchConfigPath();
+              }
+            }}
+            placeholder="输入 models.toml 路径（如项目内 .local/models.toml）"
+            className="flex-1 rounded-lg border px-2.5 py-1 font-mono text-[12px] outline-none"
+            style={{ borderColor: 'var(--border-subtle)', backgroundColor: 'var(--bg-surface)' }}
+          />
+          <button
+            onClick={() => void handleSwitchConfigPath()}
+            disabled={switchingPath || configPathDraft.trim() === (settings?.path || '')}
+            className="shrink-0 rounded-lg border px-3 py-1 text-[12px] font-medium disabled:opacity-40 cursor-pointer"
+            style={{
+              borderColor: 'var(--accent)',
+              backgroundColor: 'var(--accent-soft)',
+              color: 'var(--accent)',
+            }}
+          >
+            {switchingPath ? '切换中…' : '切换路径'}
+          </button>
+        </div>
       </header>
 
       {loading ? (
