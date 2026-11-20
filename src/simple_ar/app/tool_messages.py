@@ -1263,7 +1263,7 @@ class _ToolMessagesMixin:
                                 'reason': str(error)}}
                             presented_results[call_id] = presented
                             block[-1]['content'] = json.dumps(presented, ensure_ascii=False, separators=(',', ':'))
-                        if authored is not None:
+                        if authored is not None and len(authored.get('text') or '') <= 4000:
                             authored = {**authored, 'turn': position, 'record': record, 'call_id': call_id}
                             working_rows.append(authored)
                             # Only the actually presented field can supply a
@@ -1274,6 +1274,10 @@ class _ToolMessagesMixin:
                                     and all(visible.get(key) == authored[key] for key in ('absolute_path', 'sha256'))):
                                 native_observations.append({key: value for key, value in authored.items()
                                     if key != 'text'})
+                        elif authored is not None:
+                            # Large edited files (>4 KB) stay on disk and in the receipt;
+                            # avoid re-injecting 30+ KB full file bodies into every subsequent turn.
+                            authored = None
                     read_arguments = self._recorded_arguments(call) if receipt_supply else {}
                     read_windows = journal_read_windows(result, read_arguments if isinstance(read_arguments, dict) else {})
                     retained_inputs = config.get('professional_operations') in RETAINED_PROFESSIONAL_CONTRACTS
