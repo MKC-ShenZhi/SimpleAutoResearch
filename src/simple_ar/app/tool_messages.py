@@ -1559,6 +1559,8 @@ class _ToolMessagesMixin:
                 system_text=prefix[0]['content'],base_context=context,
                 turn_blocks=[block if position>=boundary else [] for position,block in enumerate(blocks)],
                 observations=working_rows, schema_tokens=schema_cost,context_token_target=target,
+                steady_working_target=(min(target, max(36000, target // 3))
+                    if config.get('context_checkpoint_policy') == 'economic.v3' else None),
                 native_observations=native_observations if receipt_supply else None,
                 preserve_material_observations=config.get('work_lifecycle') == 'integrated.v1',
                 working_set_policy=(config.get('working_set_policy', 'recent.v2')

@@ -241,6 +241,7 @@ def select_working_context(
     message_projector: Callable | None = None,
     preserve_material_observations: bool = False,
     working_set_policy: Literal['recent.v2', 'recent.v3', 'recent.v4', 'recent.v5', 'recent.v6'] | None = None,
+    steady_working_target: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -834,9 +835,13 @@ def select_working_context(
         view['history'] = old_history
         view['stale_native_observations'] = old_stale
 
-    # Keep a bounded evidence share beside fresh work.
-    material_ceiling = (context_token_target if whole_records else
-                        min(context_token_target, required_cost + context_token_target // 3))
+    # Keep a bounded evidence share beside fresh work. When a steady working-set
+    # target is supplied, optional history and optional observations stay within
+    # that steady budget while mandatory/explicit inputs retain the full window.
+    working_ceiling = (context_token_target if steady_working_target is None
+                       else min(context_token_target, max(0, steady_working_target)))
+    material_ceiling = (working_ceiling if whole_records else
+                        min(working_ceiling, required_cost + working_ceiling // 3))
     note_states = [{'index': i, 'records': deepcopy(note.get('records', [])),
                     'status': 'working_view' if not fit_work_notes and (
                         require_work_notes or owner_records or summarized_through_turn) else 'capacity',
@@ -1112,13 +1117,15 @@ def select_working_context(
             elif archived_turns is None and sparse_handoffs:
                 supplied_handoffs = set()  # Unmarked notes cannot retire individual turns.
             if supplied_handoffs:
+                note_records = {
+                    record for note in view['notes'] if active(note) for record in note.get('records', ())}
                 ordered = [i for i in ordered if rows[i].get('turn') not in supplied_handoffs
                     or rows[i].get('record') in explicit_references
                     or i in related_feedback
                     or i in reusable_material
                     or preserve_material_observations and not recent_set and rows[i].get('kind') in {'source_text', 'authored_text'}
-                    or recent_set and (rows[i].get('record') in {
-                        record for note in view['notes'] if active(note) for record in note.get('records', ())}
+                    or recent_set and not (focused_working_set and rows[i].get('kind') == 'authored_text') and (
+                        rows[i].get('record') in note_records
                         or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts)
                     or not working_records and (rows[i].get('path') in artifacts
                         or rows[i].get('absolute_path') in artifacts)]
@@ -1188,7 +1195,7 @@ def select_working_context(
                     if not in_native(entry['observation'], recent)]
                 if recent_set:
                     refresh_material_views()
-            if project()[1] > context_token_target:
+            if project()[1] > working_ceiling:
                 # Restore presentation and admission states together. Calling
                 # mark_native here would turn settled capacity omissions back
                 # into not_attempted and enlarge the model-visible bookkeeping.

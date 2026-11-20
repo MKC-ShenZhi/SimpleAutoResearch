@@ -898,6 +898,29 @@ class WorkingContextTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             select(turn_blocks=[block(0, 'result')[:1]])
 
+    def test_steady_working_target_bounds_optional_history_without_blocking_large_latest_turn(self):
+        blocks = [block(i, f'old-turn-{i}-' + ('x' * 600)) for i in range(4)]
+        blocks.append(block(4, 'latest-large-' + ('y' * 2400)))
+        messages, budget = select(
+            turn_blocks=blocks,
+            observations=[],
+            context_token_target=12000,
+            steady_working_target=3500,
+            material_policy='working',
+            working_set_policy='recent.v6',
+            require_work_notes=True,
+            fit_work_notes=True,
+            processed_turns=(),
+            sparse_handoffs=True,
+            estimate_tokens=lambda text: len(text),
+        )
+        # Mandatory latest turn fits within the full 12000 hardware window even
+        # when optional older turns are trimmed to the 3500 steady target.
+        self.assertFalse(budget['context_exceeds_input_target'])
+        self.assertIn('latest-large-', json.dumps(messages))
+        self.assertGreater(budget['recent_start_turn'], 0)
+        self.assertTrue(budget['compaction_needed'])
+
 
 class RetainedWorkingContextTests(unittest.TestCase):
     def test_current_revision_keeps_related_recent_inputs_together_before_old_inventory(self):
