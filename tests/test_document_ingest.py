@@ -19,7 +19,6 @@ from simple_ar.research.documents.fulltext import build_fulltext_manifest
 from simple_ar.research.documents.ingest import build_document_bundle, build_supporting_material_bundle
 from simple_ar.research.documents.records import build_document_records
 from simple_ar.research.sources.base import build_source_plan
-from simple_ar._legacy.documents import load_search_document_bundle
 
 
 class DocumentIngestTests(unittest.TestCase):
@@ -693,74 +692,6 @@ class DocumentIngestTests(unittest.TestCase):
             write_json(saved, invalid)
             with self.assertRaisesRegex(ValueError, "unknown document"):
                 retained_document_materials([saved])
-
-    def test_search_document_bundle_loads_legacy_artifacts(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            run_dir = Path(tmp) / "run"
-            search_dir = run_dir / "02-search"
-            write_jsonl(
-                search_dir / "documents" / "documents.jsonl",
-                [
-                    DocumentRecord(
-                        document_id="openalex-p1",
-                        source_id="p1",
-                        title="A paper",
-                        source="openalex",
-                    ).to_row()
-                ],
-            )
-            write_jsonl(
-                search_dir / "research_index" / "chunks.jsonl",
-                [
-                    TextChunk(
-                        chunk_id="openalex-p1#chunk-001",
-                        document_id="openalex-p1",
-                        text="A source passage.",
-                    ).to_row()
-                ],
-            )
-
-            bundle = load_search_document_bundle(
-                run_dir / "02-search"
-            )
-
-            self.assertEqual([record.document_id for record in bundle.records], ["openalex-p1"])
-            self.assertEqual([chunk.chunk_id for chunk in bundle.chunks], ["openalex-p1#chunk-001"])
-            self.assertEqual(bundle.sections, [])
-            self.assertEqual(bundle.fulltext_manifest, {})
-
-    def test_read_cards_match_shortlist_paper_ids_to_document_records(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            run_dir = Path(tmp) / "run"
-            write_jsonl(
-                run_dir / "02-search" / "documents" / "documents.jsonl",
-                [
-                    DocumentRecord(
-                        document_id="openalex-p1",
-                        source_id="p1",
-                        title="A paper",
-                        source="openalex",
-                        abstract="A method improves accuracy on a benchmark.",
-                    ).to_row()
-                ],
-            )
-            write_jsonl(
-                run_dir / "02-search" / "research_index" / "chunks.jsonl",
-                [
-                    TextChunk(
-                        chunk_id="openalex-p1#chunk-001",
-                        document_id="openalex-p1",
-                        text="A method improves accuracy on a benchmark.",
-                    ).to_row()
-                ],
-            )
-            bundle = load_search_document_bundle(
-                run_dir / "02-search"
-            )
-            result = read_documents(ReadRequest(bundle=bundle, paper_ids=("p1",)))
-            self.assertEqual(len(result.paper_cards), 1)
-            self.assertEqual(result.paper_cards[0].title, "A paper")
-            self.assertEqual(result.paper_cards[0].paper_id, "openalex-p1")
 
 
 if __name__ == "__main__":

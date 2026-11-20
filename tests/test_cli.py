@@ -2035,12 +2035,6 @@ code = "daily"
         renderer = patch('simple_ar.cli.main._render_native_result')
         renderer.start()
         self.addCleanup(renderer.stop)
-        # Current creation consumes canonical options; the old public Python
-        # bridge remains compatible, but must not be a production middle layer.
-        bridge = patch('simple_ar.experiment.code_task_bridge.spec.code_task_project_spec',
-                       side_effect=AssertionError('Do not reconstruct a second experiment spec'))
-        bridge.start()
-        self.addCleanup(bridge.stop)
         TEST_ROOT.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
             root = Path(tmp)

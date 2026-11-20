@@ -8,8 +8,6 @@ New workflow execution belongs in test_research_application.py.
 import json
 from pathlib import Path
 
-from simple_ar.app.research_session import load_research_session_result
-
 
 def historical_session(
     root: Path, *, failed: bool = False, code_task: bool = False,
@@ -106,10 +104,7 @@ def historical_session(
         "decisions": [{"capability": "analysis", "attempt_id": "analysis-001", "action": "accept",
                        "result_status": "completed", "next_capability": "experiment" if failed else "report"}],
     })
-    if code_task:
-        from simple_ar.app.research_code_task import load_research_code_task_session_result
-        return load_research_code_task_session_result(root)
-    return load_research_session_result(root)
+    return root
 
 
 def session_files(root: Path):

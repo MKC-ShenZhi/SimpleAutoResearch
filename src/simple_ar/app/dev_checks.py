@@ -82,9 +82,6 @@ CHECK_GROUPS: dict[str, CheckGroup] = {
             "tests.test_synthesis_capability",
             "tests.test_research_brief",
             "tests.test_research_application",
-            "tests.test_research_session_application",
-            "tests.test_research_report_application",
-            "tests.test_research_code_task_application",
             "tests.test_analysis_capability",
             "tests.test_experiment_capability",
             "tests.test_report_ports",
@@ -127,7 +124,7 @@ CHECK_GROUPS: dict[str, CheckGroup] = {
     ),
     "report": CheckGroup(
         description="Report assembly, writing/revision, audit, recovery and application smoke tests.",
-        targets=("tests.test_report", "tests.test_report_checkpoints", "tests.test_report_measurement_audit", "tests.test_report_ports", "tests.test_report_capability", "tests.test_research_report_application",
+        targets=("tests.test_report", "tests.test_report_checkpoints", "tests.test_report_measurement_audit", "tests.test_report_ports", "tests.test_report_capability",
                  "tests.test_report_document_first", "tests.test_report_narrative"),
     ),
     "intake": CheckGroup(

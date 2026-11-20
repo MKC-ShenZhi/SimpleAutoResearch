@@ -13,12 +13,6 @@ class PublicApiTests(unittest.TestCase):
                     with self.subTest(name=name):
                         self.assertIsNotNone(getattr(module, name))
 
-    def test_legacy_module_paths_remain_aliases(self) -> None:
-        legacy_cli = importlib.import_module("simple_ar._legacy.cli")
-        current_cli = importlib.import_module("simple_ar.cli.main")
-
-        self.assertIs(legacy_cli, current_cli)
-
 
 if __name__ == "__main__":
     unittest.main()

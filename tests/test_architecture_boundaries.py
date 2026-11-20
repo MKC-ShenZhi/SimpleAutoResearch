@@ -2,11 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-import tempfile
 import unittest
-from pathlib import Path
-
-from simple_ar.experiment.code_task_bridge import code_task_project_spec
 
 
 SUBPROCESS_TIMEOUT_SEC = 45
@@ -114,40 +110,6 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             timeout=SUBPROCESS_TIMEOUT_SEC, check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
-
-    def test_embedded_code_task_spec_reads_large_edit_approval_from_toml(self) -> None:
-        test_tmp_root = Path(__file__).resolve().parents[1] / ".tmp_tests"
-        test_tmp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=test_tmp_root) as tmp:
-            root = Path(tmp)
-            project = root / "project"
-            project.mkdir()
-            task = root / "task.md"
-            task.write_text("# Task\n\nImprove the project.\n", encoding="utf-8")
-            config = root / "code_task.toml"
-            config.write_text(
-                "\n".join(
-                    (
-                        "[code_task]",
-                        f'code_root = "{project.as_posix()}"',
-                        f'task_file = "{task.as_posix()}"',
-                        "",
-                        "[benchmark]",
-                        'command = "python -c \'print(1)\'"',
-                        "",
-                        "[execute]",
-                        "use_llm = true",
-                        "allow_large_edits = true",
-                    )
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            spec = code_task_project_spec({"code_task_config": str(config)})
-
-            self.assertTrue(spec.allow_large_edits)
-            self.assertEqual(spec.result_schema(), {'required_metrics': []})
 
 
 if __name__ == "__main__":
