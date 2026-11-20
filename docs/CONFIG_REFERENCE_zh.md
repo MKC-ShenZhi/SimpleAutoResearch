@@ -157,6 +157,8 @@ DeepSeek V4.1 Chat 连接可安装 `simple-autoresearch[deepseek-tokenizer]`，�
 
 `simple-ar start --write-task-config task.toml` 导出带注释的输入，不创建任务。审阅后执行 `simple-ar start --task-config task.toml`。**使用 `--task-config` 会创建新任务；修改这份文件不会更新已经运行的任务。** 继续已有任务请用 `--resume-task`，调整额度见 [CLI 参考](CLI_REFERENCE_zh.md)。
 
+命令行与本地界面都展示实际生效的配置。进程额度在界面留空或在 TOML 省略时，沿用依模型调用额度推导的值。填入 0 则显式禁止该项资源。
+
 ```toml
 [task]
 request = "比较所提供的证据并解释其限制。"
@@ -183,7 +185,7 @@ max_tokens = 1000000 # 示例：将本次新任务的 token 总额度设为一�
 | `sandbox_execution` | 允许工作区进程、报告构建及符合范围的代码／测量操作自动执行 | 布尔 false | 需开启 `allow_execution`、Linux 和 bubblewrap；进程不能联网或直接访问原始材料。环境准备、外部输入等超出隔离范围的工作仍须批准 |
 | `allow_network` | 公共来源获取 | 布尔 false | 新任务；不授权安装 |
 | `allow_vision` | 将挂载图像发送给视觉路由 | 布尔 false | 新任务；与生成分开 |
-| `independent_review_required` | 正式交付前需要独立复核 | 布尔 false | 新任务；可复用适用的复核，未完成工作可部分交付 |
+| `independent_review_required` | 正式交付前需要独立复核 | 布尔，新建普通模型任务默认 true | 新任务；可复用适用的复核，未完成工作可部分交付 |
 | `max_turns`、`max_tokens` | 共享模型请求／token 额度 | 整数 30、600000 | 新账本上限 |
 | `max_processes` | 累计进程次数，含后端进程 | 非负整数；max_turns × 10 | 新账本；零禁用 |
 | `max_process_seconds` | 累计进程墙钟时间 | 非负有限数；max_turns × 300 秒 | 新账本；不是单命令时限 |
@@ -232,7 +234,7 @@ papers = ["paper.md"]
 | `task.goal` | 目标／交付 | 必填字符串 | 新任务 |
 | `task.kind` | 结构化合同 | auto；另支持 survey、bug_fix、measurement、reproduction、writing、data_analysis | 新任务 |
 | `task.outputs` | 请求成果 | 可选列表：summary、report、experiments、bug_fix、code_task、data_analysis | 新任务；不与 CLI 报告开关合用 |
-| `task.independent_review_required` | 正式交付前需要独立复核 | 布尔 false | 新建模型任务；已有共同任务通过补齐修改 |
+| `task.independent_review_required` | 正式交付前需要独立复核 | 布尔，结构化研究会话默认 false | 新建模型任务；已有共同任务通过补齐修改 |
 | `task.output_root` | 输出父目录 | 路径 runs/research-session | 新位置 |
 | `task.selected_idea_id` | 已有且有依据的候选 ID | 可选字符串 | 新选择 |
 | `model.name` | 连接选择器 | TOML 默认 env；空字符串用于确定性工作 | 新任务 |

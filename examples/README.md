@@ -36,7 +36,7 @@ are not included in a fresh checkout; it is not a quick-start case.
   interpreters belong in the task TOML; `{config_dir}` keeps case paths portable.
 - `runs/`: generated state, workspaces, measurements and reports.
 - `tests/fixtures/`: internal regression material, not additional user examples.
-- `scripts/research_session_smoke.py`: offline developer wiring check, not an acceptance case.
+- `scripts/research_session_smoke.py`: offline compatibility check for the stepwise `ResearchApplication` API.
 
 Keep credentials out of committed templates. Do not start GPU examples just to
 validate configuration. Removed historical cases

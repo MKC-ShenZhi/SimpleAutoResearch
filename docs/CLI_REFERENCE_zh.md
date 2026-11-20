@@ -13,6 +13,16 @@
 | 读取进度、停止条件及资源用量，不调用模型 | [`simple-ar status`](#simple-ar-status) |
 | 查看本地连接、路由及凭据是否存在，不调用 API 或测试提供商 | [`simple-ar models`](#simple-ar-models) |
 
+## 本地桌面研究工作台
+
+```powershell
+simple-ar-desktop --task-root "SESSION_PARENT" --project-root "PROJECT"
+```
+
+使用带 Tk 支持的 Python 打开原生窗口。建议选择包含会话的父目录。左侧切换会话，中间提交新的研究目标或向原会话发送反馈。可以从任务栏查看待审批操作、暂停或继续本地任务。右侧「成果」按需打开，支持查看交付版本、文本和 PNG。工作台复用现有会话与权限接口。项目之外的材料须通过 `--read-root` 指定访问范围。源码运行用 `python -m simple_ar.desktop`。
+
+左侧「设置 · 模型连接」可以新增连接，编辑 Base URL、模型 ID 和凭据，并设定默认文本连接。保存使用 CLI 同一份 `models.toml`。Windows 下可用系统凭据管理器保存 Key，环境变量优先。留空可沿用原有凭据，改变 URL 后需要为新地址提供凭据。输入框右下角可选用已配置的 Chat 连接，已有会话换模要在操作边界显式确认。高级路由及其他连接类型仍可通过 [模型目录配置](CONFIG_REFERENCE_zh.md#model-file) 管理。
+
 ## 独立工具
 
 | 用途 | 命令 |
@@ -101,6 +111,8 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--output-root PATH` | 新任务／运行目录的父目录。 | runs/assistant |
 | `--prepare-only` | 保存／预览，不调用模型／进程；新原生任务仍检查凭据。 | 关闭 |
 | `--interactive` | 在终端中持续使用同一个普通任务：输入反馈继续工作，`/status` 查看状态，`/exit` 退出并保留任务。沿用原权限和额度；与结构化设置的 `--chat` 不同。 | 关闭 |
+
+普通 `start` 任务运行时，按 Ctrl+C 请求在下一个工作边界暂停。已发出的操作可能先完成并记账。用 `start --resume-task SESSION` 沿原任务和账本继续。
 | `--yes` | 接受显示的新建／访问／资源摘要；不批准待执行的原生进程。 | 关闭 |
 
 #### 访问与资源额度
@@ -113,16 +125,18 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--sandbox-execution` | 在任务工作区内自动执行普通命令、报告构建及符合范围的代码／测量操作，无需逐条批准。进程不能访问外网、宿主机 GPU 或原始材料挂载，所需材料须先复制到工作区；环境准备、外部输入等超出范围的工作仍须批准。 | 需同时设置 `--allow-execution`、Linux 和 bubblewrap |
 | `--allow-network` | 授权公开来源检索／获取；不授权安装软件包或任意命令。 | 关闭 |
 | `--allow-vision` | 将挂载的 PNG/JPEG/WebP 渲染图发往 vision 路由；共用模型预算。 | 关闭 |
-| `--independent-review-required` | 正式交付前需要独立复核；未完成时仍可如实部分交付。 | 关闭 |
+| `--independent-review-required` / `--no-independent-review-required` | 要求正式交付前独立复核，或设为可选。未完成时仍可如实部分交付。 | 新建普通模型任务默认要求 |
 | `--max-images N` | 通过 image 路由生成／编辑图片的提交额度；与视觉检查分开。 | 0 |
-| `--max-turns N` | 原生任务累计模型请求额度，含反馈。 | 30 |
-| `--max-tokens N` | 原生任务累计模型 token 额度，含反馈。请求前输入量为估算，实际结算可能超出额度。 | 600000 |
+| `--max-turns N` | 原生任务，或新 `--chat` 设置及其后续任务，共用的累计模型请求额度。 | 30 |
+| `--max-tokens N` | 原生任务，或新 `--chat` 设置及其后续任务，共用的累计模型 token 额度；请求前输入量为估算，实际结算可能超出额度。 | 600000 |
 
 范围内代码工作使用复制的项目，任务解释器须与框架当前 Python 一致，且不包含环境准备或外部验证输入；范围内测量使用工作区材料且无需额外环境准备。其他专业操作仍须明确批准。
 
-自然语言中的复核要求由模型理解；需要将独立复核作为完整交付的确定条件时，请设置 `--independent-review-required`。
+独立复核方根据原始要求和实际成果确定核查范围。续接时可随反馈指定上述任一选项，调整原任务的复核要求。
 
 结构化 `--chat` 设置可以将独立复核请求列入建议设置，确认后沿用同一完整交付条件。预设数据分析可使用模型复核分析成果，不必同时要求报告。
+
+新的 `--chat` 设置会将已记录模型用量带入后续任务。设置尚未完成时可使用 `--resume-setup` 配合 `--authorize-remaining`、`--authorization-id` 和 `--authorization-reason` 追加额度；旧设置沿用保存时的记账方式。
 
 #### 显式结构化兼容
 
@@ -159,10 +173,11 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | 参数 | 说明 | 默认值或使用条件 |
 | --- | --- | --- |
 | `--resume-task PATH` | 恢复已有原生任务；配合 --tasks-in 也接受列表显示的精确名称。 | 未设置 |
+| `--submission-id ID` | 以固定编号保存反馈。重试时使用相同编号、文字和复核选择，也可省略文字，续接已记录的反馈。 | 未设置，需配合 `--resume-task` |
 | `--tasks-in PATH` | 列出本目录及直接子目录的原生任务，最多 256 项；不递归搜索。 | 未设置 |
 | `--select-task` | 从 --tasks-in 交互选择；空输入取消。 | 关闭 |
 | `--supply-task PATH` | 恢复时记录 TOML 条件或首次模型绑定，不执行；replace_existing=true 修订合同，保留证据／账目。 | 要求 --resume-task；独立操作 |
-| `--retry-model` | 恢复时以剩余预算重试已终止的失败模型决策；可用 --model 改为兼容 Chat 连接。 | 关闭 |
+| `--retry-model` | 恢复时以剩余预算重试已终止的主模型决策或独立复核中的连接故障。仅主决策可用 --model 改为兼容 Chat 连接。 | 关闭 |
 | `--switch-model profile:NAME` | 恢复时记录 profile:NAME 或 route:NAME 文本连接变更；要求切换 ID／原因。仅记录，不执行。 | 未设置 |
 | `--switch-id NAME` | --switch-model 的稳定幂等 ID。 | 未设置 |
 | `--switch-reason TEXT` | --switch-model 的人类可读原因。 | 未设置 |
@@ -208,6 +223,8 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 恢复保留模型、解释器及累计预算。增加资源应使用 --authorize-remaining，不是新建限额。部分交付可沿已有成果继续未完成的请求；已完成任务保持完成。支持的维度包括 llm_requests、total_tokens、process_invocations、process_wall_seconds、image_requests。要求稳定 ID／原因；保留历史费用及未知预留。这里只授予容量，不授予访问或批准命令。新增访问／资源须与 --approve-execution 分开确认。
 
 --retry-model 与反馈、访问／资源授权及命令批准分开。它仅在没有已接受回复且保存的有限容量足够时重试已终止的失败决策，不重放工具。缓存回复用普通恢复。进行中请求、无界费用和未知进程副作用须先对账。--switch-model 仅记录，与反馈、重试、补齐、--model 及授权分开。
+
+独立复核沿原连接重试保存的那一步请求，已有证据和工具结果继续复用。重试追加独立尝试和费用，原请求的已知或未知费用继续保留。能恢复的回复由原操作采用。
 
 新原生任务的 assisted／checkpoints 等待设计／协议回复；autonomous 可在保存限额内接受有效设计。没有额外阶段／交付里程碑对话。接受设计不批准进程；即使 --yes 仍要求精确待执行命令令牌。
 
@@ -531,7 +548,7 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 | `--outputs CHOICE ...` | 请求的成果；不能与 --with-report 或 --no-report 同用。 可选：`summary`, `report`, `experiments`, `bug_fix`, `code_task`, `data_analysis`. | 未设置 |
 | `--material PATH` | 笔记、草稿或分析包，可重复。普通材料未经核验，不等同文献论文。 | [] |
 | `--model SELECTOR` | 模型选择器：env、profile:NAME 或 route:NAME。 | 直接 CLI：无；TOML 通常 env；恢复保留模型 |
-| `--independent-review-required` | 正式交付前需要独立复核，允许如实部分交付。 | 模型驱动的共同任务；默认关闭 |
+| `--independent-review-required` / `--no-independent-review-required` | 要求正式交付前独立复核，或设为可选。允许如实部分交付。 | 结构化研究会话默认可选 |
 | `--feasibility-review-model SELECTOR` | 用于有来源依据的可行性审阅的独立模型。 | 未设置 |
 | `--output-root PATH` | 新任务／运行目录的父目录。 | runs/research-session |
 | `--cache-dir PATH` | 可选共享全文缓存位置。 | 会话本地缓存 |
@@ -858,7 +875,7 @@ simple-ar research-session-migrate --source-root OLD_SESSION --destination-root 
 
 为显式已有项目或从零创建合同准备隔离工作区。
 
-新建的独立 CLI 任务将计划、编辑、修复和 execute 的模型调用，以及 execute、baseline、run 的基准运行记入 `RUN_DIR/budget_ledger.json`。账本记录用量，不自动设置调用次数或 token 上限；旧任务保留原有记账方式。环境探测不在此范围内。
+新建的独立 CLI 和 Python 任务将计划、编辑、审阅、修复、环境探测和运行记入 `RUN_DIR/budget_ledger.json`。账本记录用量，不自动设置调用次数或 token 上限；旧任务保留原有记账方式。
 
 ```text
 simple-ar code-task init [OPTIONS]
@@ -908,7 +925,7 @@ simple-ar code-task execute RUN_DIR [OPTIONS]
 | `--no-llm` | 尽可能使用 deterministic fallback。 | 关闭 |
 | `--timeout N` | benchmark timeout。 | 60 |
 | `--yes` | 普通 execute 模式下自动批准 inline 审核门；与 `--interactive` 一起使用时自动继续逐步提示。新建现有项目任务直接生成改动建议，不再另制补丁计划；不使用 `--yes` 时，应用改动仍需批准。显式计划步骤和已保存任务保留原路径。 | 关闭 |
-| `--interactive` | 调试模式：逐个 primitive step 确认，而不是连续运行到下一个审核门。 | 关闭 |
+| `--interactive` | 到达新步骤时确认，可继续到已请求的失败分析。已保存的步骤可复用，计划和应用编辑仍各有审批入口。 | 关闭 |
 | `--no-review-inline` | 禁用 inline 审核提示，在审核门直接停止。 | 关闭 |
 | `--skip-validation` | 静态验证未通过时仍运行 benchmark。 | 关闭 |
 | `--strict-validation` | 将较高风险 validation warning 视为 error。 | 关闭 |

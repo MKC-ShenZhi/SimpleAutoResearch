@@ -39,6 +39,11 @@ flowchart LR
 
 The application coordinates work; domain modules own their professional operations.
 Ordinary shared actions use the task's execution records and resource accounting.
+For new Python research integrations, import `ResearchBrief`, `create_research_task`,
+`load_research_task`, and `start_research_task` from `simple_ar.research`.
+Creation records the task. Use `start_research_task` for the initial structured
+work and `load_research_task(root).run()` to resume a saved task.
+Existing `ResearchApplication` callers and saved stepwise sessions use their original API.
 CodeTask initialization creates a ledger for standalone Python and CLI tasks;
 embedded work sets `standalone=False` and uses the enclosing task's ledger.
 Injected model clients must support the existing task-ledger binding.
@@ -79,9 +84,10 @@ New ordinary tasks can submit an unfinished candidate for independent investigat
 before publication. Its dedicated request contains the current claim, existing files
 and known gaps; final report status and requested formats belong to final delivery.
 This binds the actual claim and files; its opinion is not a complete-delivery certificate. Final acceptance checks required outputs,
-publication versions and applicable independent findings. New ordinary tasks may choose
-direct delivery when independent review is unnecessary; the default still requests review,
-and existing required findings cannot be waived. Saved tasks retain their review contract.
+publication versions and applicable independent findings. New native tasks with a model
+require independent review by default. The reviewer determines the appropriate depth
+from the request and evidence. Callers can make review optional. Saved tasks retain
+their existing review contract.
 Delivery projects current
 obligations into the shared work view. Early candidate investigation protects model capacity
 for revision, submission, a final independent check and a truthful fallback on the

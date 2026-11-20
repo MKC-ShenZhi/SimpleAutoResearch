@@ -5,7 +5,33 @@
 User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## Unreleased
+
+- Ctrl+C requests a work-boundary pause during ordinary terminal tasks. Resume with the existing task and ledger.
+- The retained delivery catalog identifies project methods by their delivered `SKILL.md` paths so a new task can select an earlier method before copying the project.
+- Resuming a declared measurement set completes a ready comparison in the original task using the recorded measurements and ledger.
+- Writing reuses material windows and bindings already checked during the same operation.
+- Interactive CodeTask execution confirms steps in the executor and can continue from a failed benchmark to requested diagnosis or repair using that run's records.
+- Report recovery reuses the saved assembly. A mismatch between the authored record and assembled body leaves the saved work available for inspection.
+- Declared source summaries and table analyses can finish from saved results after interruption. Outstanding research and report requirements remain pending.
+- New sessions are listed once their initial records and ledger exist. Historical writing reuses the verified independent-review and delivery evidence for the same version.
+
+## 2026-11-18
+
+### Improved
+
+- PDF preview transfers one rendered page at a time, restores the last viewed page after reopening, and transfers the complete file on download.
+
+### Fixed
+
+- Export with a supplied LaTeX template reports missing glyphs and retains the editable project without offering an incomplete PDF for delivery.
+
 ## 2026-11-16
+
+### Added
+
+- Tasks can discover retained deliveries in a mounted task directory and copy a selected project or retained artifacts into a new workspace with their saved layout.
+- The local UI previews authorized PDFs page by page using Poppler. Resume commands accept a stable feedback submission ID for safe retries.
 
 ### Improved
 
@@ -18,12 +44,14 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - Retained work hands original observations to the material owner without an extra handoff read. Research and writing derive source previews, passages and their versions from the same read; independent review can use observations without inheriting an opinion. Feedback continuations can find recent partial deliveries, unresolved work and earlier completed results; common document work can use delivered files and related feedback when needed.
 - Common article revisions can return either local replacements or a complete revised draft, using the existing writing and review flow.
 - Feedback can explicitly require independent review through the existing task submission; the review choice and feedback are adopted together without changing the task ledger.
-- Terminal feedback can carry the same independent-review choice in a resume command or interactive conversation.
+- Terminal and local UI feedback share the saved submission journal and review choice. Both show effective creation settings from the same task owner.
 
 ### Fixed
 
+- Independent review retains supported checks when an outcome cites a file outside the delivery. That outcome stays unconfirmed until its delivery is established.
+- Workspace write receipts provide reusable paths for process declarations. PDF export supports common scientific comparison and arrow symbols in pdfLaTeX.
 - Resuming a task without its injected search provider no longer silently substitutes a same-named built-in provider.
-- Working views make room for the task and current evidence before optional history navigation when input capacity is tight.
+- Working views prioritize the current task and evidence ahead of optional history. Resuming a partial delivery brings forward outstanding independent findings and matching source text.
 - Passage lookup searches the full retained source bundle instead of hiding later passages behind the ingestion chunk limit.
 - Common research design retains the caller's execution context and applies an explicitly prepared project and its metric boundaries even without a separate context description.
 - Structured research preserves the requested attempt capacity when no model is enabled without authorizing model calls.

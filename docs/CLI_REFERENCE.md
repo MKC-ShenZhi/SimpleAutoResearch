@@ -13,6 +13,16 @@ Look up syntax, parameters and recovery limits here. Prefix examples with `uv ru
 | Read saved progress, stop conditions and resource use without model calls | [`simple-ar status`](#simple-ar-status) |
 | Inspect local connections, routes and credential presence without API calls or provider tests. | [`simple-ar models`](#simple-ar-models) |
 
+## Local desktop research workspace
+
+```text
+simple-ar-desktop --task-root "SESSION_PARENT" --project-root "PROJECT"
+```
+
+Open a native window with a Python installation that includes Tk. Select a directory containing saved sessions. Use the composer to start research or send feedback to an existing session. Review pending approvals and pause or resume local work from the task toolbar. Open the delivery pane for versions, text and PNG previews. The workspace uses the existing task and authorization interfaces. Add `--read-root` to grant access to material outside the project. To launch from source, use `python -m simple_ar.desktop`.
+
+Use Model Connections settings to edit a connection, its base URL, model ID, and credential, or select the default text connection. The desktop and CLI use the same `models.toml`. Windows Credential Manager can store keys by endpoint and credential reference, with existing environment variables taking precedence. The composer selects a configured Chat connection. Switching an existing session requires an explicit confirmation at a safe action boundary.
+
 ## Standalone tools
 
 | Need | Command |
@@ -101,6 +111,8 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--output-root PATH` | Parent directory for a new task/run. | runs/assistant |
 | `--prepare-only` | Save/preview without model/process calls; new native tasks still check credentials. | Off |
 | `--interactive` | Continue the same ordinary task in a terminal: enter feedback, use `/status` to view it, or `/exit` to leave it saved. Existing permissions and allowances apply. Separate from structured `--chat` setup. | Off |
+
+While an ordinary `start` task is running, Ctrl+C requests a pause at the next work boundary. An operation already sent may finish and be recorded before the pause. Use `start --resume-task SESSION` to continue with the original task and accounting.
 | `--yes` | Accept displayed creation/access/resource summary; never approves a pending native process. | Off |
 
 #### Access and resource allowances
@@ -113,16 +125,18 @@ simple-ar start --resume-task SESSION [FEEDBACK] [OPTIONS]
 | `--sandbox-execution` | Run workspace commands, report rendering and eligible code/measurement operations without per-command approval. Processes have no external network, host GPU or direct access to original source mounts; copy needed inputs first. Setup, external inputs and other work outside this scope still require approval. | Requires `--allow-execution`, Linux and bubblewrap |
 | `--allow-network` | Authorize public-source search/acquisition; not package installation or arbitrary commands. | Off |
 | `--allow-vision` | Send mounted rendered PNG/JPEG/WebP to the vision route; shares the model budget. | Off |
-| `--independent-review-required` | Require an independent review for complete delivery; useful unfinished work can still be delivered as partial. | Off |
+| `--independent-review-required` / `--no-independent-review-required` | Require independent review for complete delivery or make it optional. Useful unfinished work remains available as partial delivery. | Required for new native tasks with a model |
 | `--max-images N` | Image generation/edit submissions through the image route; separate from visual inspection. | 0 |
-| `--max-turns N` | Cumulative native model-request allowance, including feedback. | 30 |
-| `--max-tokens N` | Cumulative native model-token allowance, including feedback. Input is estimated before a request; actual settled usage may exceed the allowance. | 600000 |
+| `--max-turns N` | Cumulative model-request allowance for a native task or new `--chat` setup and its task. | 30 |
+| `--max-tokens N` | Cumulative model-token allowance for a native task or new `--chat` setup and its task. Input is estimated before a request; actual settled usage may exceed the allowance. | 600000 |
 
 Scoped code work uses a copied project and a task interpreter matching the framework's running Python, without environment setup or external validator inputs. Scoped measurements use workspace inputs and no additional environment preparation; other specialized operations still require explicit approval.
 
-Natural-language review requests are interpreted by the model. Set `--independent-review-required` when independent review must be an enforced condition of complete delivery.
+The independent reviewer assesses what the original request and the delivered work need. When continuing a saved task, combine either flag with feedback to change its review requirement.
 
 In structured `--chat` setup, an independent-review request can be included in the proposed settings; once confirmed it uses the same complete-delivery condition. Preset data analysis can use a model to review its results without requesting a report.
+
+New `--chat` setups carry their recorded model usage into the resulting task. To add capacity before a saved setup finishes, use `--resume-setup` with `--authorize-remaining`, `--authorization-id` and `--authorization-reason`. Older setups keep their saved accounting.
 
 #### Explicit structured compatibility
 
@@ -159,10 +173,11 @@ In structured `--chat` setup, an independent-review request can be included in t
 | Parameter | Meaning | Default or conditions |
 | --- | --- | --- |
 | `--resume-task PATH` | Resume a saved native task; with --tasks-in, also accepts an exact displayed name. | Unset |
+| `--submission-id ID` | Save feedback in the task journal using a stable ID. Repeat the ID with the same text and review choice, or omit the text to continue the recorded submission. | Unset; requires `--resume-task` |
 | `--tasks-in PATH` | List native tasks here and in immediate children, at most 256 entries; no recursive search. | Unset |
 | `--select-task` | Interactively select from --tasks-in; blank input cancels. | Off |
 | `--supply-task PATH` | On resume, record TOML contracts or first model binding without execution; replace_existing=true revises contracts, retaining evidence/accounting. | Requires --resume-task; separate operation |
-| `--retry-model` | On resume, retry a terminated failed model decision with remaining budget; optional --model changes to a compatible Chat connection. | Off |
+| `--retry-model` | On resume, retry a terminated main model decision or a connection failure within an independent inspection using remaining budget. Only main decisions support an optional --model change. | Off |
 | `--switch-model profile:NAME` | On resume, record profile:NAME or route:NAME text connection change; requires switch ID/reason. Records only, no execution. | Unset |
 | `--switch-id NAME` | Stable idempotency key for --switch-model. | Unset |
 | `--switch-reason TEXT` | Human-readable reason for --switch-model. | Unset |
@@ -208,6 +223,8 @@ New tasks read .env from the current working directory. Source mounts reject sym
 Resume retains model, interpreter and cumulative budgets. Use --authorize-remaining, not creation limits, to add resources. A partial delivery resumes its unfinished request with the saved work; a completed task stays completed. Supported dimensions include llm_requests, total_tokens, process_invocations, process_wall_seconds and image_requests. Stable ID/reason are required; prior charges and unknown reservations remain. This grants capacity, not access or command approval. Confirm added access/resources separately from --approve-execution.
 
 Keep --retry-model separate from feedback, access/resource grants and command approval. It retries only a terminated failed decision without an accepted reply and with sufficient saved finite capacity; it does not replay tools. Cached replies use ordinary resume. In-flight requests, unbounded charges and unknown process side effects require reconciliation. --switch-model is record-only and separate from feedback, retry, supply, --model and grants.
+
+An independent inspection retries the saved step on the original connection. Earlier evidence, completed tool results and the original charge remain in place. The retry records a separate physical attempt.
 
 For new native tasks, assisted/checkpoints wait for design/protocol replies; autonomous can accept valid designs within saved limits. There are no extra stage/delivery milestone dialogs. Design acceptance does not approve a process. Exact pending command tokens are required even with --yes.
 
@@ -532,7 +549,7 @@ simple-ar research-session --topic TEXT [OPTIONS] [--command ARGV...]
 | `--outputs CHOICE ...` | Requested outputs; cannot combine with --with-report or --no-report. Choices: `summary`, `report`, `experiments`, `bug_fix`, `code_task`, `data_analysis`. | Unset |
 | `--material PATH` | Notes, drafts or an analysis package; repeatable. Ordinary materials are unverified, not bibliographic papers. | [] |
 | `--model SELECTOR` | Model selector: env, profile:NAME or route:NAME. | Direct CLI: none; TOML normally env; resume keeps model |
-| `--independent-review-required` | Require independent review before complete delivery; partial delivery remains available. | Model-backed common task; off |
+| `--independent-review-required` / `--no-independent-review-required` | Require independent review before complete delivery or make it optional. Partial delivery remains available. | Optional in structured research sessions |
 | `--feasibility-review-model SELECTOR` | Independent model for source-backed feasibility review. | Unset |
 | `--output-root PATH` | Parent directory for a new task/run. | runs/research-session |
 | `--cache-dir PATH` | Optional shared full-text cache location. | Session-local cache |
@@ -860,10 +877,9 @@ simple-ar research-session-migrate --source-root OLD_SESSION --destination-root 
 
 Prepare an isolated workspace for an explicit existing-project or greenfield contract.
 
-New standalone CLI tasks keep model calls from planning, editing, repair and execute,
-and benchmark runs from execute, baseline or run, in `RUN_DIR/budget_ledger.json`.
-This ledger records usage without adding a call or token limit. Older tasks retain
-their existing accounting; environment probes are not included.
+New standalone CLI and Python tasks record planning, editing, review, repair,
+environment probes and execution in `RUN_DIR/budget_ledger.json`. This records
+usage without adding a call or token limit. Older tasks retain their accounting.
 
 ```text
 simple-ar code-task init [OPTIONS]
@@ -913,7 +929,7 @@ simple-ar code-task execute RUN_DIR [OPTIONS]
 | `--no-llm` | Use deterministic fallbacks where possible. | Off |
 | `--timeout N` | Benchmark timeout. | 60 |
 | `--yes` | Auto-approve inline review gates in normal execute mode; with `--interactive`, auto-continue primitive prompts. New existing-project tasks propose edits without a separate plan; without `--yes`, applying them still requires approval. Explicit plan steps and saved tasks retain their original path. | Off |
-| `--interactive` | Debug mode: confirm each primitive step instead of running continuously to the next review gate. | Off |
+| `--interactive` | Confirm new steps as the task reaches them, including requested failure analysis. Saved steps are reused. Plan and edit approvals still use their own commands and options. | Off |
 | `--no-review-inline` | Disable inline review prompts and stop at review gates instead. | Off |
 | `--skip-validation` | Run benchmark even when static validation has not passed. | Off |
 | `--strict-validation` | Treat higher-risk validation warnings as errors. | Off |

@@ -155,6 +155,8 @@ Missing names/credentials/capabilities fail without provider fallback. Native de
 
 Priority is defaults → TOML → explicit CLI arguments; CLI lists replace file lists. Paths in this file are relative to its directory; CLI paths are relative to the command’s current directory.
 
+Both the terminal and local UI show the effective settings before creation. Leave process limits blank in the UI or omit them from TOML to derive them from the model request limit. Zero is an explicit limit.
+
 `simple-ar start --write-task-config task.toml` exports commented inputs without creating a task. Review, then run `simple-ar start --task-config task.toml`. **Using `--task-config` creates a new task; editing this file does not update a task already running.** Use `--resume-task` to continue existing work; see the [CLI reference](CLI_REFERENCE.md) for allowance changes.
 
 ```toml
@@ -183,7 +185,7 @@ Place `notes.md` beside the file. All fields below belong to `[task]`; paths use
 | `sandbox_execution` | Authorize workspace processes, report rendering and eligible code/measurement operations | Boolean false | Requires `allow_execution`, Linux and bubblewrap; no process network or direct source mounts. Environment setup, external inputs and other work outside the isolated scope still require approval |
 | `allow_network` | Public-source acquisition | Boolean false | New task; not installation authorization |
 | `allow_vision` | Send mounted images to vision route | Boolean false | New task; separate from generation |
-| `independent_review_required` | Require independent review of a complete delivery | Boolean false | New task; applicable reviews can be reused and unfinished work can be delivered as partial |
+| `independent_review_required` | Require independent review of a complete delivery | Boolean, defaults to true for new native tasks with a model | New task; applicable reviews can be reused and unfinished work can be delivered as partial |
 | `max_turns`, `max_tokens` | Shared model request/token allowances | Integers `30`, `600000` | New ledger limits |
 | `max_processes` | Cumulative process invocations, including backend processes | Nonnegative integer; max_turns × 10 | New ledger limit; zero disables |
 | `max_process_seconds` | Cumulative process wall time | Nonnegative finite number; max_turns × 300 seconds | New ledger limit; not command timeout |
@@ -232,7 +234,7 @@ This assumes a configured model and adjacent `paper.md`. Unknown sections/fields
 | `task.goal` | Goal/deliverables | Required string | New task |
 | `task.kind` | Structured contract | `auto`; also survey, bug_fix, measurement, reproduction, writing, data_analysis | New task |
 | `task.outputs` | Requested outputs | Optional list: summary, report, experiments, bug_fix, code_task, data_analysis | New task; do not combine with CLI report toggles |
-| `task.independent_review_required` | Require independent review before complete delivery | Boolean false | New model-backed task; use task supply for an existing common task |
+| `task.independent_review_required` | Require independent review before complete delivery | Boolean, defaults to false for structured research sessions | New model-backed task; use task supply for an existing common task |
 | `task.output_root` | Output parent | Path string `runs/research-session` | New location |
 | `task.selected_idea_id` | Existing grounded candidate ID | Optional string | New selection |
 | `model.name` | Connection selector | String `env` for TOML; empty for deterministic work | New task |
