@@ -743,7 +743,7 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
         def log_message(self, *_):
             pass  # URLs and task content never enter access logs.
 
-        def send(self, status, content, kind='application/json', *, headers=None):
+        def send(self, status, content, kind='application/json', *, headers=None, allow_inline_style=False):
             raw = content if isinstance(content, bytes) else json.dumps(public_data(content), ensure_ascii=False).encode()
             self.send_response(status)
             self.send_header('Content-Type', kind)
@@ -751,7 +751,8 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Referrer-Policy', 'no-referrer')
-            self.send_header('Content-Security-Policy', "default-src 'self'; img-src 'self' blob:; script-src 'self'; style-src 'self'; object-src 'none'; frame-ancestors 'none'")
+            style_src = "style-src 'self' 'unsafe-inline'" if allow_inline_style else "style-src 'self'"
+            self.send_header('Content-Security-Policy', f"default-src 'self'; img-src 'self' blob:; script-src 'self'; {style_src}; object-src 'none'; frame-ancestors 'none'")
             for name, value in (headers or {}).items():
                 self.send_header(name, value)
             self.end_headers()
@@ -790,7 +791,7 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
                         mime = 'text/css; charset=utf-8'
                     elif target.suffix.lower() == '.html':
                         mime = 'text/html; charset=utf-8'
-                    self.send(200, target.read_bytes(), mime)
+                    self.send(200, target.read_bytes(), mime, allow_inline_style=True)
                     return
                 self.guard()
                 q = {k: v[0] for k, v in parse_qs(url.query, keep_blank_values=True).items()}
