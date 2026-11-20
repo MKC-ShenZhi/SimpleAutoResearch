@@ -292,23 +292,43 @@ export function SessionView({
             </div>
           )}
 
-          {/* User Requests Bubbles */}
-          {snapshot.requests.map((req, idx) => (
-            <div key={idx} className="flex justify-end">
-              <div
-                className="max-w-[85%] rounded-2xl rounded-tr-sm border px-4 py-2.5 text-[14px] leading-relaxed"
-                style={{
-                  backgroundColor: 'var(--bg-surface-hover)',
-                  borderColor: 'var(--border-subtle)',
-                }}
-              >
-                <div className="mb-1 text-[11px] font-medium" style={{ color: 'var(--text-muted)' }}>
-                  {idx === 0 ? '初始研究目标' : `追问与反馈 #${idx}`}
+          {/* User Requests & Assistant Replies Stream */}
+          {snapshot.requests.map((req, idx) => {
+            const turnReplies = (snapshot.replies || []).filter(
+              (r) => r.request_count === idx + 1 || (idx === snapshot.requests.length - 1 && r.request_count > snapshot.requests.length)
+            );
+            return (
+              <div key={idx} className="space-y-4">
+                <div className="flex justify-end">
+                  <div
+                    className="max-w-[85%] rounded-2xl rounded-tr-sm border px-4 py-2.5 text-[14px] leading-relaxed"
+                    style={{
+                      backgroundColor: 'var(--bg-surface-hover)',
+                      borderColor: 'var(--border-subtle)',
+                    }}
+                  >
+                    <div className="mb-1 text-[11px] font-medium" style={{ color: 'var(--text-muted)' }}>
+                      {idx === 0 ? '初始研究目标' : `追问与反馈 #${idx}`}
+                    </div>
+                    <div className="whitespace-pre-wrap">{req}</div>
+                  </div>
                 </div>
-                <div className="whitespace-pre-wrap">{req}</div>
+
+                {turnReplies.map((reply) => (
+                  <div
+                    key={reply.turn}
+                    className="rounded-2xl border px-5 py-4"
+                    style={{
+                      backgroundColor: 'var(--bg-surface)',
+                      borderColor: 'var(--border-subtle)',
+                    }}
+                  >
+                    <MarkdownView content={reply.content} />
+                  </div>
+                ))}
               </div>
-            </div>
-          ))}
+            );
+          })}
 
           {/* Status Reason Note */}
           {snapshot.manifest.status_reason && (

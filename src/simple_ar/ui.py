@@ -470,10 +470,31 @@ class Workspace:
             error = self.errors.get(name)
             local_workers = [task for task, (thread, _) in self.workers.items() if thread.is_alive()]
             auto_approve = name in self.auto_approve
+        replies = []
+        try:
+            root = self.task(name)
+            state = self.record(root, 'actions.json')
+            for idx, turn in enumerate(state.get('turns', [])):
+                reply_ref = turn.get('reply')
+                if not reply_ref:
+                    continue
+                try:
+                    content = (self.record(root, reply_ref).get('content') or '').strip()
+                except Exception:
+                    continue
+                if content:
+                    replies.append(dict(
+                        turn=idx,
+                        request_count=turn.get('request_count', 1),
+                        content=public_text(content[:32768]),
+                    ))
+            replies = replies[-16:]
+        except Exception:
+            replies = []
         return dict(view, task=name, source_access=source_access,
             mode='live execution' if live else 'saved results browser',
             worker_live=live, stop_requested=stopping, worker_error=error,
-            local_workers=local_workers, auto_approve=auto_approve)
+            local_workers=local_workers, auto_approve=auto_approve, replies=replies)
 
     def file(self, name: str, mount: str, relative: str) -> Path:
         root = self.task(name)

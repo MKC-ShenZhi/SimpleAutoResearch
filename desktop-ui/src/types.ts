@@ -79,6 +79,11 @@ export interface TaskSnapshot {
   worker_error: string | null;
   local_workers: string[];
   auto_approve?: boolean;
+  replies?: Array<{
+    turn: number;
+    request_count: number;
+    content: string;
+  }>;
   manifest: {
     session_id?: string;
     topic?: string;

@@ -8,6 +8,8 @@
     "build": "vite build"
   },
   "dependencies": {
+    "@types/katex": "^0.16.8",
+    "katex": "^0.19.1",
     "lucide-react": "^0.511.0",
     "marked": "^15.0.12",
     "react": "^19.1.0",
