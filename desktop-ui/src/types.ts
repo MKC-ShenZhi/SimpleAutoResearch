@@ -33,6 +33,7 @@ export interface TaskListItem {
   task: string;
   topic: string;
   status: string;
+  worker_live?: boolean;
 }
 
 export interface ActivityItem {

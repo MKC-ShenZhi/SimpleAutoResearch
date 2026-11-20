@@ -359,8 +359,10 @@ class Workspace:
 
     def listing(self) -> list[dict]:
         tasks, _ = discover_project_tasks(self.tasks)
-        return [dict(task='.' if task.path == self.tasks else task.path.name,
-                     topic=task.goal, status=task.status) for task in tasks]
+        with self.lock:
+            live = {name for name, (thread, _) in self.workers.items() if thread.is_alive()}
+        return [dict(task=(name := '.' if task.path == self.tasks else task.path.name),
+                     topic=task.goal, status=task.status, worker_live=name in live) for task in tasks]
 
     def validate_sources(self, root: Path) -> None:
         config = self.record(root, 'actions.json')['config']

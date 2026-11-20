@@ -25,10 +25,13 @@ interface SidebarProps {
   onCollapse: () => void;
 }
 
-function statusMeta(status: string): { color: string; label: string; pulse?: boolean } {
+function statusMeta(status: string, workerLive?: boolean): { color: string; label: string; pulse?: boolean } {
+  if (workerLive) {
+    return { color: 'bg-blue-500', label: '运行中', pulse: true };
+  }
   switch (status) {
     case 'running':
-      return { color: 'bg-blue-500', label: '运行中', pulse: true };
+      return { color: 'bg-amber-400', label: '待继续' };
     case 'completed':
       return { color: 'bg-emerald-500', label: '已完成' };
     case 'partial':
@@ -40,7 +43,7 @@ function statusMeta(status: string): { color: string; label: string; pulse?: boo
     case 'failed':
       return { color: 'bg-rose-500', label: '失败' };
     default:
-      return { color: 'bg-slate-400', label: status || '新建' };
+      return { color: 'bg-slate-400', label: status === 'created' ? '待启动' : status || '新建' };
   }
 }
 
@@ -188,7 +191,7 @@ export function Sidebar({
         ) : (
           filtered.map((item) => {
             const selected = viewMode === 'session' && activeTask === item.task;
-            const st = statusMeta(item.status);
+            const st = statusMeta(item.status, item.worker_live);
             return (
               <button
                 key={item.task}
