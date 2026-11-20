@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, create_autospec, patch
+from unittest.mock import MagicMock, patch
 
 from rich.console import Console
 
@@ -76,7 +76,6 @@ class CliTests(unittest.TestCase):
     def test_new_declared_execution_calls_unified_entry_without_legacy_creation(self):
         with tempfile.TemporaryDirectory() as directory, \
                 patch('simple_ar.cli.start.create_declared_research', return_value=True) as create, \
-                patch('simple_ar.app.research_application.create_session') as legacy, \
                 contextlib.redirect_stdout(io.StringIO()):
             root = Path(directory).resolve()
             argv = ['research-session', '--task-kind', 'measurement', '--topic', 'Literal measurement',
@@ -96,7 +95,6 @@ class CliTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, 'Invalid declared execution'):
                 main(argv)
             create.assert_called_once()
-            legacy.assert_not_called()
 
     def test_fixed_measurement_creation_uses_common_approval_and_original_execution(self):
         from simple_ar.app.tool_application import ToolApplication
@@ -116,7 +114,6 @@ class CliTests(unittest.TestCase):
             command = [sys.executable, 'measure.py', 'observations input.tsv']
             with patch('simple_ar.cli.main.sys.stdin.isatty', return_value=False), \
                     patch('simple_ar.app.tool_application.LLMClient.from_env', side_effect=AssertionError('No model')), \
-                    patch('simple_ar.app.research_application.create_session', side_effect=AssertionError('No old new-task controller')), \
                     patch.dict(os.environ, {'SAR_MEASUREMENT_TEST_POLICY': 'inherited-value'}), \
                     contextlib.redirect_stdout(io.StringIO()):
                 main(['research-session', '--topic', 'Measure the declared observations',
@@ -202,11 +199,9 @@ class CliTests(unittest.TestCase):
                         patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
                         patch('simple_ar.app.tool_application.ToolApplication.create', side_effect=_make_app) as create, \
                         patch('simple_ar.cli.main._render_native_result'), \
-                        patch('simple_ar.app.research_application.create_session') as legacy, \
                         patch('subprocess.run') as process, contextlib.redirect_stdout(io.StringIO()):
                     main(['research-session', '--config', str(config)])
                 create.assert_called_once()
-                legacy.assert_not_called()
                 process.assert_not_called()
                 routed = create.call_args.kwargs
                 rows = routed['execution_contract']['conditions']
@@ -447,8 +442,6 @@ code = "daily"
         with patch("simple_ar.cli.start.migrate_structured_creation") as migrate, \
                 patch("simple_ar.cli.main._optional_research_llm_client",
                       side_effect=lambda model, *a, **k: object() if model else None), \
-                patch("simple_ar.app.research_application.create_session",
-                      side_effect=AssertionError("New tasks must use ToolApplication")), \
                 contextlib.redirect_stdout(io.StringIO()):
             yield migrate
 
@@ -487,7 +480,7 @@ code = "daily"
         self.assertEqual(create.call_args.args[0].model, 'fixture')
 
     def test_structured_resume_adopts_materials_and_capacity_in_the_original_task(self):
-        from simple_ar.app.research_application import ResearchApplicationServices
+        from simple_ar.app.services import ResearchApplicationServices
         from simple_ar.app.research_intake import create_research_task
         from simple_ar.app.tool_application import ToolApplication
         from simple_ar.research.workflow_contracts import ResearchBrief
@@ -596,8 +589,6 @@ code = "daily"
                 with self.subTest(contract=contract), \
                         patch("simple_ar.app.tool_application.LLMClient.from_env",
                               side_effect=AssertionError("Deterministic work needs no model")), \
-                        patch("simple_ar.app.research_application.create_session",
-                              side_effect=AssertionError("No legacy creation")), \
                         contextlib.redirect_stdout(io.StringIO()):
                     main([*flags, "--topic", "Describe supplied evidence", "--output-root", str(output)])
                     manifest, = output.rglob("session_manifest.json")
@@ -999,115 +990,6 @@ code = "daily"
         self.assertIn("--report-template", delivery_output)
         self.assertIn("analysis_report", delivery_output)
 
-    def test_delivery_revision_uses_the_pending_reply_not_request_report(self):
-        from dataclasses import replace
-        from simple_ar.app.research_application import (
-            ResearchApplicationServices, create_session, load_session,
-        )
-        from simple_ar.research.workflow_contracts import ResearchBrief
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Scope\nA supplied source for report delivery.", encoding="utf-8")
-            session = root / "session"
-            app = create_session(ResearchBrief(
-                request_text="Summarize the supplied source.", objective="Summarize the supplied source.",
-                requested_outputs=("report",),
-                asset_requests=({"locator": str(paper), "role": "paper"},),
-            ), root=session, services=ResearchApplicationServices(config={
-                "interaction": "checkpoints", "research_materials_only": True,
-                "report": {"mode": "research_only", "template": "auto"},
-            }))
-            for _ in range(16):
-                if app.view().next_action == "report_write":
-                    break
-                app.advance()
-            self.assertEqual(app.view().next_action, "report_write")
-            decision_id = "abcdef0123456789"
-            decision = {
-                "action": "continue",
-                "interaction": {
-                    "id": decision_id, "stage": "delivery", "status": "pending",
-                    "question": "Choose a report form.", "reason": "The requested delivery is unresolved.",
-                    "options": [{"id": "accept"}, {"id": "revise"}, {"id": "reject"}],
-                    "identity": app._interaction_identity(
-                        "delivery", "report_write", delivery={"template": "analysis_report"},
-                    ),
-                },
-            }
-            proposal_ref = app.controller.store.write_json(
-                f"outputs/research-decision-{decision_id}.json", decision,
-                kind="research_decision", schema="research_decision.v1", producer="test",
-            )
-            app.controller.manifest.state_refs["decision"] = proposal_ref
-            app.controller.save()
-            app.controller.pause("Choose a report form.")
-            base = ["research-session", "--session-root", str(session), "--topic", app.brief.objective]
-            prompt = io.StringIO()
-            with (
-                patch("simple_ar.cli.main._optional_research_llm_client", return_value=None),
-                patch("simple_ar.app.research_application.load_session", return_value=app),
-                contextlib.redirect_stdout(prompt),
-            ):
-                with self.assertRaisesRegex(SystemExit, "status 'paused'"):
-                    main(base)
-            self.assertIn(decision_id, prompt.getvalue())
-            self.assertIn("--report-template", prompt.getvalue())
-            self.assertIn("analysis_report", prompt.getvalue())
-            # Other resume branches must not silently discard a requested mode.
-            for extra in (["--reanalyze"], ["--report-template", "analysis_report"]):
-                with (
-                    patch("simple_ar.cli.main._optional_research_llm_client", return_value=None),
-                    patch("simple_ar.app.research_application.load_session", return_value=app),
-                    contextlib.redirect_stdout(io.StringIO()),
-                ):
-                    with self.assertRaisesRegex(SystemExit, "interaction mode change in a separate resume"):
-                        main(base + ["--interaction", "autonomous"] + extra)
-                self.assertEqual(app.services.config["interaction"], "checkpoints")
-            argv = base + ["--interaction", "autonomous",
-                           "--decision-id", decision_id, "--decision-response", "revise",
-                           "--report-template", "analysis_report"]
-
-            def stop_before_writer(**_kwargs):
-                return replace(app.view(), status="paused", next_action=None,
-                               status_reason="Test stops before report writing.")
-
-            with (
-                patch("simple_ar.cli.main._optional_research_llm_client", return_value=None),
-                patch("simple_ar.app.research_application.load_session", return_value=app),
-                patch.object(app, "advance", side_effect=stop_before_writer),
-                patch.object(app, "request_report", wraps=app.request_report) as request_report,
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                with self.assertRaisesRegex(SystemExit, "status 'paused'"):
-                    main(argv)
-            request_report.assert_not_called()
-            response = app.controller.store.read_json(
-                f"outputs/research-decision-{decision_id}-response.json",
-            )
-            self.assertEqual(response["interaction"]["response"]["revision"], {
-                "report": {"template": "analysis_report"},
-            })
-            self.assertEqual(response["prior_decision_ref"], proposal_ref.to_dict())
-            self.assertEqual(app.services.config["report"]["template"], "analysis_report")
-            self.assertEqual(app.services.config["interaction"], "autonomous")
-            restored = load_session(session)
-            self.assertEqual(restored.services.config["report"]["template"], "analysis_report")
-            self.assertEqual(restored.services.config["interaction"], "autonomous")
-
-    def test_research_report_does_not_rewrite_or_execute_a_historical_session(self):
-        from tests.legacy_session_fixture import historical_session
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "session"
-            historical_session(root)
-            before = {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
-            with patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()):
-                with self.assertRaisesRegex(SystemExit, "No legacy workflow was executed"):
-                    main(["research-report", "--session-root", str(root), "--model", "scripted"])
-            after = {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
-            self.assertEqual(before, after)
-
     def test_segmented_code_task_report_retires_before_loading_config(self):
         with self.assertRaisesRegex(SystemExit, "research-session"):
             main(["research-code-task", "--topic", "task", "--synthesis-file", "missing.json",
@@ -1182,27 +1064,6 @@ code = "daily"
             self.assertEqual(saved.read_bytes(), before)
             native.assert_not_called()
 
-    def test_research_session_cli_resume_without_model_fails_before_mutation(self) -> None:
-        from simple_ar.app.research_application import (
-            ResearchApplicationServices, create_session,
-        )
-        from simple_ar.research.workflow_contracts import ResearchBrief
-
-        with tempfile.TemporaryDirectory() as tmp:
-            session = Path(tmp) / "session"
-            create_session(ResearchBrief(
-                request_text="Summarize this question.",
-                objective="Summarize this question.",
-                requested_outputs=("summary",),
-            ), root=session, services=ResearchApplicationServices(llm_client=object()))
-            before = {path.relative_to(session): path.read_bytes()
-                      for path in session.rglob("*") if path.is_file()}
-            with self.assertRaisesRegex(SystemExit, "--model env or --model MODEL"):
-                main(["research-session", "--session-root", str(session)])
-            after = {path.relative_to(session): path.read_bytes()
-                     for path in session.rglob("*") if path.is_file()}
-            self.assertEqual(after, before)
-
     def test_brief_alias_uses_structured_summary_and_keeps_compatibility_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -1254,46 +1115,6 @@ code = "daily"
             args.command_argv,
             [sys.executable, "-c", "print('accuracy: 0.9')"],
         )
-
-    def test_canonical_recovery_cli_uses_application_retry_boundary(self) -> None:
-        TEST_ROOT.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
-            root = Path(tmp) / "session"
-            root.mkdir()
-            (root / "session_manifest.json").write_text("{}", encoding="utf-8")
-            view = SimpleNamespace(
-                session_root=root,
-                status="completed",
-                next_action=None,
-                state_refs={
-                    "experiment": SimpleNamespace(
-                        path="attempts/experiment-0002/experiment_result.json"
-                    )
-                },
-            )
-            app = MagicMock()
-            app.retry_experiment.return_value = view
-            stdout = io.StringIO()
-            with patch(
-                "simple_ar.app.research_application.load_session", return_value=app
-            ), contextlib.redirect_stdout(stdout):
-                main([
-                    "research-session-continue",
-                    "--session-root",
-                    str(root),
-                    "--cwd",
-                    str(root),
-                    "--command",
-                    sys.executable,
-                    "-c",
-                    "print('accuracy: 0.9')",
-                ])
-
-            call = app.retry_experiment.call_args
-            self.assertEqual(call.kwargs["command"], (sys.executable, "-c", "print('accuracy: 0.9')"))
-            self.assertIsNone(call.kwargs["parent_attempt_id"])
-            self.assertIn("Status: completed", stdout.getvalue())
-            self.assertIn("experiment-0002", stdout.getvalue())
 
     def test_common_research_retry_uses_the_same_task_and_process_ledger(self) -> None:
         from simple_ar.app.tool_application import ToolApplication
@@ -1360,7 +1181,7 @@ code = "daily"
                 self.assertEqual(ToolApplication.load(root).ledger.to_dict()['entries'], entries)
 
     def test_common_research_retry_reuses_unchanged_comparison_condition(self) -> None:
-        from simple_ar.app.research_application import retry_experiment
+        from simple_ar.app.research_intake import retry_research_experiment as retry_experiment
         from simple_ar.app.tool_application import ToolApplication
         from simple_ar.tools.scientific import ScientificToolGateway
 
@@ -1503,22 +1324,6 @@ code = "daily"
                 with self.assertRaisesRegex(ValueError, 'preparation inputs'):
                     restored.scientific.approval_binding({**row['execution'],
                         **({'condition_id': row['id']} if paired else {})}, identity='changed-setup')
-
-    def test_legacy_session_continue_does_not_execute_or_rewrite_history(self) -> None:
-        from tests.legacy_session_fixture import historical_session
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "legacy"
-            historical_session(root, failed=True)
-            before = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
-            with self.assertRaises(SystemExit):
-                main([
-                    "research-session-continue", "--session-root", str(root),
-                    "--cwd", str(root), "--command", sys.executable, "-c",
-                    "from pathlib import Path; Path('unexpected-execution').touch()",
-                ])
-            after = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
-            self.assertEqual(after, before)
 
     def test_research_session_migrate_parser_accepts_explicit_artifacts(self) -> None:
         args = build_parser().parse_args(
@@ -1718,198 +1523,6 @@ code = "daily"
             self.assertIn("0 running", status_text)
 
 
-    def test_research_report_cli_routes_existing_evidence_and_refresh(self) -> None:
-        args = build_parser().parse_args([
-            "research-report", "--session-root", "session", "--model", "env", "--draft-scope", "document"])
-        self.assertEqual(args.draft_scope, "document")
-        with tempfile.TemporaryDirectory() as tmp:
-            session_root = Path(tmp) / "existing-session"
-            session_root.mkdir()
-            final_view = SimpleNamespace(session_root=session_root, status="completed",
-                status_reason="", next_action=None,
-                state_refs={"report": SimpleNamespace(path="attempts/report-001/report.md")},
-                attempts=())
-            for flags, expected in (
-                ([], {}),
-                (["--template", "survey"], {
-                    "report_config": {"template": "survey"},
-                    "reason": "Apply explicit report settings and rebuild only report deliverables from existing evidence."}),
-                (["--refresh"], {"refresh": True, "report_config": {},
-                    "reason": "Explicitly regenerate the report from existing research evidence."}),
-            ):
-                with self.subTest(flags=flags):
-                    saved = {"report_writing_method": "article", "report": {
-                        "reviewer": "llm", "document_review": True, "review_scope": "document",
-                        "draft_scope": "auto", "max_review_iterations": 3, "allow_source_backtracking": False}}
-                    app = MagicMock()
-                    app.brief = SimpleNamespace(requested_outputs=("experiments",))
-                    app.services = SimpleNamespace(max_attempts=4, config=saved.copy())
-                    from simple_ar.report.requirements import report_config_overrides
-                    app.report_config_overrides.side_effect = (
-                        lambda supplied, session_resume=False: report_config_overrides(
-                            supplied, app.services.config, session_resume=session_resume
-                        )
-                    )
-                    app.controller.manifest.budget.max_attempts = 4
-                    app.view.return_value = SimpleNamespace(session_root=session_root,
-                        status="completed", status_reason="", next_action=None,
-                        state_refs={}, attempts=())
-                    app.request_report.return_value = SimpleNamespace(session_root=session_root,
-                        status="running", status_reason="", next_action=None,
-                        state_refs={}, attempts=())
-                    app.advance.return_value = final_view
-                    stdout = io.StringIO()
-                    with patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()), \
-                            patch("simple_ar.app.research_application.load_session", return_value=app) as loader, \
-                            patch("simple_ar.app.research_application.create_session",
-                                  side_effect=AssertionError("must not create a new session")), \
-                            contextlib.redirect_stdout(stdout):
-                        main(["research-report", "--session-root", str(session_root),
-                              "--model", "gpt-5.4", *flags])
-                    loader.assert_called_once()
-                    self.assertEqual(loader.call_args.args[0], session_root)
-                    app.request_report.assert_called_once_with(**expected)
-                    self.assertEqual(app.services.config, saved)
-                    self.assertEqual(loader.call_args.kwargs["services"].config, {})
-                    self.assertEqual(app.advance.call_args.kwargs['max_actions'], 12)
-                    self.assertIn("Status: completed", stdout.getvalue())
-                    self.assertIn(str(session_root / "attempts/report-001/report.md"), stdout.getvalue())
-
-    def test_report_resume_uses_real_interface_and_persisted_attempt_limit(self):
-        from simple_ar.app.research_application import ResearchApplication
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "session"
-            app = create_autospec(ResearchApplication, instance=True)
-            app.brief = SimpleNamespace(objective="A bounded report", requested_outputs=("report",))
-            app.services = SimpleNamespace(
-                max_attempts=1, llm_client=SimpleNamespace(model="scripted"), config={},
-            )
-            app.controller = SimpleNamespace(
-                manifest=SimpleNamespace(budget=SimpleNamespace(max_attempts=3)),
-            )
-            paused = SimpleNamespace(
-                session_root=root, status="paused", status_reason="retry report",
-                next_action="report_write", state_refs={},
-            )
-            running = SimpleNamespace(
-                session_root=root, status="running", status_reason="",
-                next_action="report_write", state_refs={},
-            )
-            completed = SimpleNamespace(
-                session_root=root, status="completed", status_reason="",
-                next_action=None,
-                state_refs={"report": SimpleNamespace(path="attempts/report-001/report.md")},
-            )
-            app.view.return_value = paused
-            app.report_config_overrides.return_value = {}
-            app.continue_session.return_value = running
-            app.advance.return_value = completed
-            with (
-                patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()),
-                patch("simple_ar.app.research_application.load_session", return_value=app),
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                main(["research-report", "--session-root", str(root), "--model", "scripted"])
-            app.continue_session.assert_called_once_with(
-                reason="Resume the canonical report lifecycle within the persisted session budget.",
-            )
-            self.assertEqual(app.advance.call_args.kwargs['max_actions'], 11)
-
-    def test_exhausted_report_resume_shows_bounded_authorization_entrypoint(self):
-        from simple_ar.app.research_application import ResearchApplication
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "session"
-            app = create_autospec(ResearchApplication, instance=True)
-            app.brief = SimpleNamespace(objective="A bounded report", requested_outputs=("report",))
-            app.services = SimpleNamespace(config={}, llm_client=SimpleNamespace(model="scripted"))
-            app.controller = SimpleNamespace(
-                manifest=SimpleNamespace(
-                    budget=SimpleNamespace(
-                        attempts=5, max_attempts=5, no_progress=3, max_no_progress=3,
-                    ),
-                    session_id="session-123", revision=7,
-                ),
-                store=SimpleNamespace(root=root),
-            )
-            app.budget_ledger = SimpleNamespace(
-                limits={"process_invocations": 0, "process_wall_seconds": 0},
-                remaining=lambda _name: None,
-            )
-            app.view.return_value = SimpleNamespace(
-                session_root=root, status="paused", next_action="report_write", state_refs={},
-            )
-            app.report_config_overrides.return_value = {}
-            app.continue_session.side_effect = RuntimeError("Session budget is exhausted.")
-            output = io.StringIO()
-            with (
-                patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()),
-                patch("simple_ar.app.research_application.load_session", return_value=app),
-                contextlib.redirect_stdout(output),
-            ):
-                with self.assertRaisesRegex(
-                    SystemExit, "--additional-attempts 3 --additional-no-progress 1",
-                ) as raised:
-                    main(["research-report", "--session-root", str(root), "--model", "scripted"])
-            self.assertIn("simple-ar research-session", str(raised.exception))
-            self.assertIn("--topic 'A bounded report'", str(raised.exception))
-            self.assertNotIn("allow_no_progress_exhausted", str(raised.exception))
-            self.assertNotIn("process_invocations=", str(raised.exception))
-            self.assertNotIn("process_wall_seconds=", str(raised.exception))
-
-    def test_research_session_cli_routes_recovery_and_explicit_allowances(self):
-        from simple_ar.app.research_application import ResearchApplicationServices
-        from simple_ar.research.workflow_contracts import ResearchBrief
-
-        with tempfile.TemporaryDirectory() as tmp:
-            session = Path(tmp) / "session"
-            session.mkdir()
-            app = MagicMock()
-            app.brief = ResearchBrief(request_text="Review calibration.",
-                objective="Review calibration.", requested_outputs=("report",))
-            app.services = ResearchApplicationServices(config={})
-            app.controller.manifest.budget.max_attempts = 5
-            completed = SimpleNamespace(session_root=session, status="completed",
-                status_reason="", next_action=None, state_refs={}, attempts=())
-            app.view.return_value = app.advance.return_value = completed
-            base = ["research-session", "--session-root", str(session),
-                    "--topic", app.brief.objective]
-            cases = (
-                ([], False, None, None, None),
-                (["--recover-interrupted"], True, None, None, None),
-                (["--authorization-id", "report-refresh-1",
-                  "--authorization-reason", "One bounded refresh.",
-                  "--additional-attempts", "4", "--additional-no-progress", "1",
-                  "--authorize-remaining", "total_tokens=200"], False, 4, 1,
-                 {"total_tokens": 200}),
-                (["--additional-attempts", "0", "--additional-no-progress", "0"],
-                 False, 0, 0, None),
-            )
-            with patch("simple_ar.cli.main._optional_research_llm_client", return_value=None), \
-                    patch("simple_ar.app.research_application.saved_research_intent",
-                          return_value=(app.brief, "survey")), \
-                    patch("simple_ar.app.research_application.load_session", return_value=app) as loader, \
-                    patch("simple_ar.cli.start.migrate_structured_creation",
-                          side_effect=AssertionError("Historical continuation must retain its owner")), \
-                    contextlib.redirect_stdout(io.StringIO()):
-                for flags, recover, attempts, no_progress, resources in cases:
-                    with self.subTest(flags=flags):
-                        app.continue_session.reset_mock()
-                        loader.reset_mock()
-                        main(base + flags)
-                        loader.assert_called_once()
-                        app.continue_session.assert_called_once()
-                        routed = app.continue_session.call_args.kwargs
-                        self.assertEqual(routed["recover_interrupted"], recover)
-                        self.assertEqual(routed["additional_attempts"], attempts)
-                        self.assertEqual(routed["additional_no_progress"], no_progress)
-                        self.assertEqual(routed["authorize_remaining"], resources)
-                        self.assertIsNone(routed["report_writing_method"])
-                        if resources:
-                            self.assertEqual(routed["authorization_id"], "report-refresh-1")
-                            self.assertEqual(routed["authorization_reason"], "One bounded refresh.")
-
     def test_structured_report_saves_common_writer_contract_before_generation(self):
         from simple_ar.app.tool_application import ToolApplication
 
@@ -2095,12 +1708,10 @@ code = "daily"
                         patch('simple_ar.app.tool_application.LLMClient.from_env', side_effect=bind_fake), \
                         patch('subprocess.run') as process, \
                         patch('sys.stdin.isatty', return_value=False), \
-                        patch('simple_ar.app.research_application.create_session') as old, \
                         contextlib.redirect_stdout(io.StringIO()):
                     with self.assertRaisesRegex(SystemExit, 'ended with status'):
                         main(['research-session', '--config', str(public), '--topic', 'fixture research',
                               '--model', 'fixture-model', '--no-report', '--output-root', str(root / 'sessions')])
-                old.assert_not_called()
                 create.assert_called_once()
                 fake.chat_turn.assert_called_once()
                 process.assert_not_called()
@@ -2147,13 +1758,11 @@ code = "daily"
                 with self.subTest(repairs=repairs, explicit=explicit), \
                         patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()), \
                         patch.object(ToolApplication, 'create', side_effect=capture_creation) as create, \
-                        patch("simple_ar.app.research_application.create_session") as created, \
                         contextlib.redirect_stdout(io.StringIO()):
                     config.write_text(original_config + f"repair_rounds = {repairs}\n")
                     main(["research-session", "--task-kind", "bug_fix", "--topic", "Repair the project",
                           "--model", "gpt-5.4", "--code-task-config", str(config), "--with-report",
                           *(["--process-invocations", "0", "--process-wall-seconds", "0"] if explicit else [])])
-                    created.assert_not_called()
                     routed = create.call_args.kwargs
                     self.assertEqual(routed['process_limits'], {'process_invocations': count, 'process_wall_seconds': seconds})
                     self.assertEqual(routed['code_task']['preparation']['max_repairs'], repairs)
@@ -2179,10 +1788,8 @@ code = "daily"
                 with self.subTest(greenfield_options=options), \
                         patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
                         patch.object(ToolApplication, 'create', side_effect=capture_creation) as create, \
-                        patch('simple_ar.app.research_application.create_session') as legacy, \
                         contextlib.redirect_stdout(io.StringIO()):
                     main(['research-session', '--topic', 'Create a project', '--model', 'fixture', *options])
-                legacy.assert_not_called()
                 create.assert_called_once()
                 routed = create.call_args.kwargs
                 exact = routed['code_task']
@@ -2228,12 +1835,10 @@ code = "daily"
                 with self.subTest(kind=kind, environment=environment), \
                         patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
                         patch.object(ToolApplication, 'create', side_effect=capture_creation) as create, \
-                        patch('simple_ar.app.research_application.create_session') as legacy, \
                         patch('subprocess.run') as process, contextlib.redirect_stdout(io.StringIO()):
                     main(['research-session', '--config', str(reproduction), '--outputs', 'experiments',
                           *(['report'] if report else []),
                           *(['--process-invocations', '0', '--process-wall-seconds', '0'] if environment == 'venv' else [])])
-                legacy.assert_not_called()
                 process.assert_not_called()
                 create.assert_called_once()
                 routed = create.call_args.kwargs
@@ -2284,11 +1889,9 @@ code = "daily"
                 'check_command=["python","-c","import math"]\n', encoding='utf-8')
             with patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
                     patch.object(ToolApplication, 'create', side_effect=capture_creation) as create, \
-                    patch('simple_ar.app.research_application.create_session') as legacy, \
                     patch('subprocess.run') as process, contextlib.redirect_stdout(io.StringIO()):
                 main(['research-session', '--config', str(reproduction)])
             create.assert_called_once()
-            legacy.assert_not_called()
             process.assert_not_called()
             code_only = create.call_args.kwargs
             self.assertIsNone(code_only['execution_contract'])
@@ -2434,14 +2037,12 @@ code = "daily"
             )
             with (
                 patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()),
-                patch("simple_ar.app.research_application.create_session") as old,
                 patch.object(ToolApplication, "create", side_effect=capture_creation) as create,
                 patch("simple_ar.cli.main._render_native_result"),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 main(["research-session", "--config", str(case / "research.toml")])
 
-            old.assert_not_called()
             create.assert_called_once()
             app.run.assert_called_once()
             self.assertNotIn('approve', app.run.call_args.kwargs)
@@ -2489,7 +2090,6 @@ code = "daily"
             with (
                 contextlib.chdir(caller),
                 patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()),
-                patch('simple_ar.app.research_application.create_session') as old,
                 patch.object(ToolApplication, 'create', side_effect=capture_creation) as create,
                 patch('simple_ar.cli.main._render_native_result'),
                 patch('subprocess.run') as process,
@@ -2497,7 +2097,6 @@ code = "daily"
             ):
                 main(['research-session', '--config', str(public),
                       '--local-document', 'paper.md', '--material', 'notes.md'])
-            old.assert_not_called()
             process.assert_not_called()
             create.assert_called_once()
             app.run.assert_called_once()

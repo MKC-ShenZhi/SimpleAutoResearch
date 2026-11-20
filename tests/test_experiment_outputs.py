@@ -440,29 +440,5 @@ class ExperimentOutputTests(unittest.TestCase):
                         arguments={"output_handle": "output:raw"}))
                     self.assertEqual(result.status, "error")
 
-    def test_application_grants_only_producer_registered_output_inputs(self):
-        from simple_ar.app.research_application import create_session, load_session
-        from simple_ar.research.workflow_contracts import ResearchBrief
-        from simple_ar.report.schema import SourceHandle
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            app = create_session(ResearchBrief(request_text="Write recorded results"), root=root / "session")
-            attempt_store = ArtifactStore(app.controller.store.root / "attempts" / "experiment-1")
-            raw = attempt_store.write_text("outputs/raw.csv", "recorded", kind="experiment_output", schema="text.v1")
-            attempt_store.write_attempt_manifest(AttemptManifest("experiment-1", capability="experiment", outputs=(raw,)))
-            expected = app.controller.store.ref("attempts/experiment-1/outputs/raw.csv",
-                kind=raw.kind, schema=raw.schema, producer=raw.producer)
-            context = ReportContext(topic="Measurements", report_mode="experiment", source_handles=[
-                SourceHandle(handle="output:raw", kind="experiment_output", artifact=expected.path),
-                SourceHandle(handle="output:unregistered", kind="experiment_output", artifact="outside.csv")])
-            config = ReportRuntimeConfig()
-            parts = (context, ReportMemory(), config, load_report_template_bundle(report_mode="experiment", config=config), {})
-            for candidate in (app, load_session(root / "session")):
-                with patch.object(candidate, "_report_writing_parts", return_value=parts), patch.object(candidate, "_execute", return_value=True) as execute:
-                    self.assertTrue(candidate._run_report_write_action())
-                    granted = [ref for ref in execute.call_args.args[3] if ref.kind == "experiment_output"]
-                    self.assertEqual(granted, [expected])
-
-
 if __name__ == "__main__":
     unittest.main()

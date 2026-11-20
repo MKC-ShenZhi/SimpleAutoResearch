@@ -10,7 +10,6 @@ import io
 import tempfile
 import unittest
 
-from simple_ar.app.research_application import ResearchApplication
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.literature.models import Paper
 from simple_ar.research.documents.fulltext import build_fulltext_manifest
@@ -166,15 +165,6 @@ class SuppliedPdfIngestTest(unittest.TestCase):
                              {bundle.records[0].document_id})
             self.assertEqual({row['chunk_id'] for row in reads[0]['source_spans']},
                              {chunk.chunk_id for chunk in bundle.chunks})
-
-    def test_application_passes_local_pdf_to_source_plan(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            paper = Path(directory) / "method.pdf"
-            paper.write_bytes(b"%PDF-1.7\nfixture")
-            application = SimpleNamespace(assets=(SimpleNamespace(
-                locator=str(paper), role="paper", availability="available",
-            ),))
-            self.assertEqual(ResearchApplication._local_documents(application), (paper,))
 
     def test_local_pdf_is_read_without_remote_fulltext_permission(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

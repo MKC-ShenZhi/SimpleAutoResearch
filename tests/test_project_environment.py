@@ -20,41 +20,6 @@ from simple_ar.research.task_plan import TaskPlanRequest, default_task_steps, bu
 
 
 class ProjectEnvironmentTests(unittest.TestCase):
-    def test_session_reuses_completed_check_and_measures_only_the_formal_command(self):
-        # Historical sessions retain their separate preparation/resume contract.
-        from simple_ar.app.research_application import create_session, load_session, ResearchApplicationServices
-        from simple_ar.research.workflow_contracts import ResearchBrief
-        with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            (root / 'data.txt').write_text('0.5')
-            paper = root / 'paper.md'
-            paper.write_text('# Fixture\nMeasure the supplied value, not the preparation score.')
-            check = "from pathlib import Path; assert Path('data.txt').is_file(); Path('checks').write_text('once'); print('score: 999')"
-            formal = "from pathlib import Path; Path('runs').write_text('once'); print('score: ' + Path('data.txt').read_text())"
-            app = create_session(ResearchBrief(request_text='Measure supplied data', requested_outputs=('experiments',),
-                asset_requests=({'locator': str(paper), 'role': 'paper'},)), root=root / 'session',
-                services=ResearchApplicationServices(config={'research_task_kind': 'measurement', 'execution': {
-                    'command': [sys.executable, '-c', formal], 'cwd': str(root), 'timeout_sec': 5,
-                    'result_schema': {'primary_metric': 'score', 'required_metrics': ['score']},
-                    'environment': {'mode': 'current', 'check_command': [sys.executable, '-c', check], 'timeout_sec': 5}}},
-                    budget_limits={'process_invocations': 2, 'process_wall_seconds': 10}))
-            for _ in range(10):
-                if app.view().next_action == 'experiment':
-                    break
-                app.advance()
-            self.assertEqual(app.view().next_action, 'experiment', app.view().status_reason)
-            self.assertTrue((root / 'checks').exists())
-            self.assertFalse((root / 'runs').exists())
-            app = load_session(root / 'session')
-            view = app.advance(max_actions=10)
-            self.assertEqual(view.status, 'completed', view.status_reason)
-            measured = app.controller.store.read_json(view.state_refs['experiment'])
-            self.assertEqual(measured['metrics']['score'], 0.5)
-            self.assertEqual(app.budget_ledger.remaining('process_invocations'), 0)
-            snapshots = {name: (root / name).stat().st_mtime_ns for name in ('checks', 'runs')}
-            self.assertEqual(load_session(root / 'session').advance(max_actions=10).status, 'completed')
-            self.assertEqual(snapshots, {name: (root / name).stat().st_mtime_ns for name in snapshots})
-
     def test_current_check_executes_without_installation_and_never_publishes_check_metrics(self):
         from simple_ar.experiment.execution.backend import LocalExecutionBackend
         for program, timeout, expected in (
@@ -134,7 +99,6 @@ class ProjectEnvironmentTests(unittest.TestCase):
                     ('process_invocations', 'process_wall_seconds')), encoding='utf-8')
             with patch('sys.stdin.isatty', return_value=False), contextlib.redirect_stdout(io.StringIO()) as output, \
                     patch.dict('os.environ', {'SAR_ENV_DISPLAY_SECRET': 'not-for-approval-display'}), \
-                    patch('simple_ar.app.research_application.create_session', side_effect=AssertionError('No legacy new session')), \
                     patch('simple_ar.app.tool_application.LLMClient.from_env', side_effect=AssertionError('No model')):
                 main(['research-session', '--config', str(measurement), '--output-root', str(root / 'native')])
                 display = ' '.join(output.getvalue().split())
@@ -179,20 +143,6 @@ class ProjectEnvironmentTests(unittest.TestCase):
                 self.assertEqual(ToolApplication.load(app.session.store.root).session.manifest.status, 'completed')
                 self.assertEqual((root / 'checks').read_text().splitlines(), ['checked'])
                 self.assertEqual((root / 'measurements.log').read_text().splitlines(), ['measured'])
-
-    def test_application_preparation_requires_declared_scope_not_fake_research_design(self):
-        from simple_ar.app.research_application import create_session, ResearchApplicationServices
-        from simple_ar.research.workflow_contracts import ResearchBrief
-        with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            config = {'execution': {'command': ['python', 'run.py'], 'cwd': str(root), 'timeout_sec': 7,
-                                   'environment': {'mode': 'venv'}}, 'research_task_kind': 'measurement'}
-            app = create_session(ResearchBrief(request_text='Prepare declared environment', requested_outputs=('experiments',)),
-                                 root=root / 'session', services=ResearchApplicationServices(config=config))
-            with patch.object(app, '_execute', return_value=True) as execute:
-                self.assertTrue(app._run_prepare_execution_action())
-            self.assertNotIn('design', [ref.kind for ref in execute.call_args.args[3]])
-            self.assertEqual(execute.call_args.args[2].execution['environment']['mode'], 'venv')
 
     def context(self, root):
         return CapabilityContext(ArtifactStore(root / 'attempt'), AttemptManifest('prepare-1'))

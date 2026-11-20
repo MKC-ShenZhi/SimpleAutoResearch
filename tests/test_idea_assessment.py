@@ -13,61 +13,9 @@ from simple_ar.research.assessment import (
 )
 from simple_ar.research.contracts import ClaimCard, IdeaCandidate, NoveltyCheck, TextChunk
 from simple_ar.integrations.llm import LLMError
-from simple_ar.app.research_application import _idea_assessment_execution_boundary
 
 
 class IdeaAssessmentTests(unittest.TestCase):
-    def test_assessment_receives_bounded_active_config_and_edit_scope(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            config = root / "exp" / "active.toml"
-            config.parent.mkdir()
-            config.write_text("[model]\nshare_training_batches = false\n", encoding="utf-8")
-            execution = {
-                "code_task": {"code_root": str(root), "allowed_patterns": ["model.py"],
-                              "protected_patterns": ["exp/**"]},
-                "protocol": {"comparison_conditions": {"source_config": "exp/active.toml"}},
-            }
-            boundary = _idea_assessment_execution_boundary(execution)
-            self.assertEqual(boundary["active_source_config"]["status"], "observed")
-            self.assertIn("share_training_batches = false",
-                          boundary["active_source_config"]["excerpts"][0]["text"])
-            self.assertEqual(boundary["edit_scope"]["protected_patterns"], ["exp/**"])
-
-            candidate = IdeaCandidate(idea_id="a", title="Candidate", hypothesis="Effect",
-                                      proposed_change="Share batches", expected_outcome="Improvement",
-                                      motivation_refs=["c"], metrics=["accuracy"])
-            class Client:
-                def ask_json(self, system, user, **kwargs):
-                    self.system = system
-                    self.payload = json.loads(user)
-                    return {"assessments": [{"idea_id": "a", "relevance": "Relevant",
-                             "differentiation": "Unknown", "feasibility": "Needs design",
-                             "cost": "One run", "falsifiability": "No gain", "recommendation": "Inspect",
-                             "supporting_evidence_refs": ["c"], "counter_evidence_refs": [],
-                             "unknowns": []}], "recommended_idea_id": "a",
-                            "recommendation_reason": "Further design audit is required."}
-            client = Client()
-            assess_ideas(IdeaAssessmentRequest(
-                candidates=(candidate,), available_evidence_refs=("c",),
-                evidence_chunks=(TextChunk(chunk_id="c", document_id="d", text="Evidence"),),
-                constraints={"execution_boundary": boundary}, llm_client=client,
-            ))
-            self.assertEqual(client.payload["constraints"]["execution_boundary"], boundary)
-            self.assertIn("active configuration", client.system)
-
-    def test_assessment_does_not_read_source_config_outside_project(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "project"
-            root.mkdir()
-            (Path(tmp) / "private.toml").write_text("[private]\ntoken = 'do-not-read'\n", encoding="utf-8")
-            boundary = _idea_assessment_execution_boundary({
-                "code_task": {"code_root": str(root)},
-                "protocol": {"comparison_conditions": {"source_config": "../private.toml"}},
-            })
-            self.assertEqual(boundary["active_source_config"]["status"], "unavailable")
-            self.assertNotIn("excerpts", boundary["active_source_config"])
-
     def test_comparison_accepts_source_backed_card_but_not_unresolved_card(self):
         candidate = IdeaCandidate(idea_id="a", title="Candidate", hypothesis="Effect",
                                   proposed_change="Change training", expected_outcome="Improvement",

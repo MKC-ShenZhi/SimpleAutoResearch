@@ -12,7 +12,6 @@ from typing import Any, Callable, Sequence
 from uuid import uuid4
 
 from simple_ar.core.artifacts import read_json
-from simple_ar.cli.research_view import ResearchConsole, report_audit_line
 from simple_ar.cli.code_task_commands import (
     _print_code_task_analyze_failure,
     _print_code_task_apply_edits,
@@ -434,7 +433,6 @@ def _print_research_session(args: argparse.Namespace) -> None:
     from simple_ar.app.session_roots import new_research_session_root
     from simple_ar.research.workflow_contracts import ResearchBrief
 
-    saved_outputs = ()
     if getattr(args, "session_root", None) is not None:
         if is_common_research_session(args.session_root):
             from simple_ar.cli.start import resume_structured_task
@@ -445,17 +443,10 @@ def _print_research_session(args: argparse.Namespace) -> None:
             return
         if 'independent_review_required' in getattr(args, '_explicit_resume_destinations', ()):
             raise SystemExit('This option requires an existing common task; historical research sessions retain their saved review contract.')
-        from simple_ar.app.research_application import saved_research_intent
-
-        try:
-            saved_brief, saved_kind = saved_research_intent(args.session_root)
-            saved_outputs = saved_brief.requested_outputs
-            if not getattr(args, "topic", None):
-                args.topic = saved_brief.objective
-            if getattr(args, "task_kind", "auto") == "auto" and saved_kind == "data_analysis":
-                args.task_kind = "data_analysis"
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise SystemExit(f"Could not restore the saved session goal: {exc}") from exc
+        raise SystemExit(
+            f"Cannot continue historical pre-v2.10 session {args.session_root}: "
+            "historical sessions remain readable, but execution now requires a native task created with `simple-ar start`."
+        )
 
     from simple_ar.cli.research_config import report_settings, report_writing_method, validate_session_arguments
 
@@ -521,7 +512,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
     if args.with_report and args.no_report:
         raise SystemExit("Use either --with-report or --no-report for research-session, not both.")
     analysis_only = task_kind == "data_analysis" and not (args.with_report or
-        ("report" in (outputs if outputs is not None else saved_outputs) and not args.no_report))
+        ("report" in (outputs or ()) and not args.no_report))
     model_enabled = bool(args.model) and (not analysis_only or getattr(args, 'independent_review_required', False))
     review_model = (getattr(args, "feasibility_review_model", None) or "").strip()
     if review_model and not model_enabled:
@@ -732,123 +723,22 @@ def _print_research_session(args: argparse.Namespace) -> None:
     ):
         raise SystemExit("Continuation allowances require --session-root.")
     try:
-        if resume_root is None:
-            if execution is None:
-                from simple_ar.cli.start import migrate_structured_creation
-                migrate_structured_creation(args, request=brief.request_text,
-                    outputs=brief.requested_outputs, sources=brief.asset_requests,
-                    limits=limits, root=session_root, research_config=config,
-                    report_config=report_config, writing_method=writing_method,
-                    data_analysis=data_analysis, review_model=review_model or None)
-                return
-            from simple_ar.cli.start import create_declared_research
-            create_declared_research(args, execution=execution, request=brief.request_text,
+        if execution is None:
+            from simple_ar.cli.start import migrate_structured_creation
+            migrate_structured_creation(args, request=brief.request_text,
                 outputs=brief.requested_outputs, sources=brief.asset_requests,
-                limits=limits, root=session_root,
-                report_config=report_config, writing_method=writing_method, research_config=config)
+                limits=limits, root=session_root, research_config=config,
+                report_config=report_config, writing_method=writing_method,
+                data_analysis=data_analysis, review_model=review_model or None)
             return
-        else:
-            from simple_ar.app.research_application import ResearchApplicationServices, load_session, run_research_handoff
-            from dataclasses import replace
-            llm_client = (None if analysis_only else _optional_research_llm_client(
-                args.model, "research session", max_output_tokens=getattr(args, "max_output_tokens", None)))
-            feasibility_client = (None if task_kind == "data_analysis" else _optional_research_llm_client(
-                review_model or None, "feasibility review", max_output_tokens=getattr(args, "max_output_tokens", None)))
-            display = ResearchConsole()
-            validation_runs = 1 + execute_options.repair_rounds if task_kind == "bug_fix" and code_task_spec is not None else 1
-            process_count = validation_runs if task_kind == 'bug_fix' else 8 if execution is not None else 0
-            process_wall = (max(30, timeout_sec) * validation_runs if task_kind == 'bug_fix'
-                else max(60, timeout_sec * 8) if execution is not None else 0)
-            services = ResearchApplicationServices(
-                llm_client=llm_client,
-                feasibility_llm_client=feasibility_client,
-                cache_dir=Path(args.cache_dir).resolve() if args.cache_dir else None,
-                input_base_dir=Path.cwd(),
-                budget_limits={
-                    "llm_requests": args.llm_requests,
-                    "total_tokens": args.total_tokens,
-                    "process_invocations": args.process_invocations if getattr(args, "process_invocations", None) is not None else process_count,
-                    "process_wall_seconds": args.process_wall_seconds if getattr(args, "process_wall_seconds", None) is not None else process_wall,
-                },
-                message_callback=display.message,
-            )
-            app = load_session(session_root, services=services)
-            saved_review_model = str(app.services.config.get("feasibility_review_model") or "")
-            if saved_review_model and app.services.feasibility_llm_client is None:
-                reviewer = _optional_research_llm_client(
-                    saved_review_model, "feasibility review",
-                    max_output_tokens=getattr(args, "max_output_tokens", None),
-                )
-                app.services = replace(app.services, feasibility_llm_client=reviewer.with_budget(
-                    app.budget_ledger, session_id=app.controller.manifest.session_id,
-                ))
-            from simple_ar.cli.research_config import report_settings
-            explicit = getattr(args, "_explicit_resume_destinations", set())
-            revised_brief = _merge_resume_brief(
-                app.brief, brief, task_text=task_text, outputs=outputs,
-                with_report=args.with_report, no_report=args.no_report,
-            )
-            report_overrides = report_settings(args, explicit_destinations=explicit)
-            app.continue_session(
-                reason="Resume from research-session with explicit input/budget revision.",
-                resume_if_needed=True,
-                revised_brief=revised_brief if revised_brief != app.brief else None,
-                revised_execution=execution,
-                interaction=args.interaction if "interaction" in explicit else None,
-                task_kind=task_kind,
-                report_writing_method=args.report_writing_method if "report_writing_method" in explicit else None,
-                feasibility_review_model=review_model,
-                research_settings=_resume_research_settings(args),
-                reanalyze=getattr(args, "reanalyze", False),
-                recover_interrupted=getattr(args, "recover_interrupted", False),
-                decision_id=args.decision_id,
-                decision_response=args.decision_response,
-                decision_guidance=args.decision_guidance,
-                revised_report_config=report_overrides if report_overrides else None,
-                **{**continuation, "authorize_remaining": continuation["authorize_remaining"]
-                   if "authorize_remaining" in explicit else None,
-                   "additional_attempts": continuation["additional_attempts"] if "additional_attempts" in explicit else None,
-                   "additional_no_progress": continuation["additional_no_progress"] if "additional_no_progress" in explicit else None},
-            )
-        view = app.view()
-        display.start(
-            view,
-            model=getattr(llm_client, "model", "configured") if llm_client is not None else "deterministic",
-            topic=app.brief.objective,
-        )
-        view = run_research_handoff(app, action_context=display.action, observe=display.state)
+        from simple_ar.cli.start import create_declared_research
+        create_declared_research(args, execution=execution, request=brief.request_text,
+            outputs=brief.requested_outputs, sources=brief.asset_requests,
+            limits=limits, root=session_root,
+            report_config=report_config, writing_method=writing_method, research_config=config)
+        return
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
-    print_line(f"Research session: {view.session_root}")
-    print_line(f"Status: {view.status}")
-    print_line(f"Mode: {'llm' if llm_client is not None else 'deterministic'}")
-    print_line(f"Next action: {view.next_action or 'none'}")
-    print_line(f"Artifacts: {len(view.state_refs)}; attempts: {len(view.attempts)}")
-    # A bare --session-root restores the saved execution; do not describe a
-    # code/experiment session as literature-only just because no config was
-    # repeated on the resume command line.
-    display_execution = app.services.config.get("execution") if resume_root is not None else execution
-    display_outputs = set(app.brief.requested_outputs if resume_root is not None else requested_outputs)
-    display_task_kind = app.task_kind if resume_root is not None else task_kind
-    print_line(
-        "Implementation: "
-        + ("bug-fix CodeTask" if display_task_kind == "bug_fix"
-           else "existing Code-Task backend" if isinstance(display_execution, dict) and isinstance(display_execution.get("code_task"), dict)
-           else "explicit command" if display_execution is not None
-           else "preparation required" if "experiments" in display_outputs
-           else "not requested (supplied-material writing)" if display_task_kind == "writing"
-           else "not requested (descriptive data analysis)" if display_task_kind == "data_analysis"
-           else "not requested (literature-only)")
-    )
-    display.finish(view)
-    summary_ref = view.state_refs.get("summary")
-    if summary_ref is not None:
-        print_line(f"summary: {view.session_root / summary_ref.path}")
-    _ensure_research_cli_success(
-        view.status,
-        operation="Research session",
-        root=view.session_root,
-    )
 
 
 def _split_cli_command(value: str) -> list[str]:
@@ -1146,78 +1036,16 @@ def _print_research_report(args: argparse.Namespace) -> None:
 
     if args.max_review_iterations < 0:
         raise SystemExit("--max-review-iterations cannot be negative.")
+    from simple_ar.cli.research_config import report_settings
+    explicit = getattr(args, '_explicit_resume_destinations', set())
+    report_settings(args, explicit_destinations=explicit)
     from simple_ar.app.research_intake import is_common_research_session
     if is_common_research_session(args.session_root):
         _print_common_research_report(args)
         return
-    from simple_ar.cli.research_config import report_settings
-    explicit = getattr(args, '_explicit_resume_destinations', set())
-    settings = report_settings(args, explicit_destinations=explicit)
-    session_root = Path(args.session_root)
-    client = _optional_research_llm_client(args.model, "research report")
-    if client is None:
-        raise SystemExit("--model is required for research-report.")
-
-    # Report generation belongs to the canonical application lifecycle.
-    from simple_ar.app.research_application import (
-        ResearchApplicationError,
-        ResearchApplicationServices,
-        load_session,
-        prepare_report_continuation,
-        run_research_handoff,
-    )
-
-    app = None
-    try:
-        app = load_session(
-            session_root,
-            services=ResearchApplicationServices(
-                llm_client=client,
-            ),
-        )
-    except ResearchApplicationError as exc:
-        raise SystemExit(
-            f"Cannot continue this report session: {exc}. Historical sessions remain readable; "
-            "new research uses research-session. No legacy workflow was executed."
-        ) from exc
-    try:
-        prepare_report_continuation(app, refresh=args.refresh, settings=settings)
-        _print_report_writing_plan(app.services.config.get("report_writing_method", "sections"),
-                                   app.services.config.get("report", {}))
-        def observe(updated):
-            print_line(
-                f"Status: {updated.status}; next: {updated.next_action or 'none'}"
-                + (f"; {updated.status_reason}" if updated.status_reason else "")
-            )
-        from contextlib import contextmanager
-
-        @contextmanager
-        def log_action(action):
-            print_line(f"Action: {action}")
-            yield
-
-        view = run_research_handoff(app, action_context=log_action, observe=observe)
-    except (ResearchApplicationError, OSError, RuntimeError, TypeError, ValueError) as exc:
-        guidance = _report_budget_authorization_guidance(app) if app is not None else None
-        if guidance is not None:
-            raise SystemExit(f"{exc}\n{guidance}") from exc
-        raise SystemExit(str(exc)) from exc
-    print_line(f"Research report session: {view.session_root}")
-    print_line(f"Status: {view.status}")
-    audit_line = report_audit_line(view)
-    if audit_line is not None:
-        print_line(audit_line)
-    for name in ("report", "report_audit"):
-        if name in view.state_refs:
-            print_line(f"{name}: {view.session_root / view.state_refs[name].path}")
-    if view.status in {"paused", "blocked"}:
-        guidance = _report_budget_authorization_guidance(app)
-        if guidance is not None:
-            print_line(guidance)
-    _ensure_research_cli_success(
-        view.status,
-        operation="Research report",
-        root=view.session_root,
+    raise SystemExit(
+        f"Cannot continue historical pre-v2.10 session {args.session_root} with research-report: "
+        "historical sessions remain readable; new research uses `simple-ar start`. No legacy workflow was executed."
     )
     return
 

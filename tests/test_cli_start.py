@@ -1040,8 +1040,6 @@ class StartTests(unittest.TestCase):
         from simple_ar.app.tool_application import ToolApplication
         with tempfile.TemporaryDirectory() as directory, patch('simple_ar.integrations.llm.LLMClient.from_env',
                 side_effect=AssertionError('Deferred collection must not resolve model credentials')), \
-                patch('simple_ar.app.research_application.create_session',
-                    side_effect=AssertionError('No fallback creation for deferred experiments')), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             base = Path(directory).resolve()
             paper = base / 'paper.md'
@@ -2520,7 +2518,6 @@ class StartTests(unittest.TestCase):
         from simple_ar.cli.start import create_declared_research
         with tempfile.TemporaryDirectory() as directory, \
                 patch('simple_ar.app.tool_application.ToolApplication.create') as create, \
-                patch('simple_ar.app.research_application.create_session') as legacy, \
                 patch('simple_ar.cli.main._render_native_result'), patch('simple_ar.cli.start.print_line'):
             root = Path(directory).resolve()
             args = build_parser().parse_args(['research-session', '--task-kind', 'measurement',
@@ -2556,13 +2553,11 @@ class StartTests(unittest.TestCase):
                     measurement = next(row['arguments'] for row in actions
                         if row['tool_name'] == 'measure_experiment')
                     self.assertEqual(measurement['command'], execution['command'])
-            legacy.assert_not_called()
 
     def test_code_outputs_compose_with_sources_summary_and_fixed_experiments(self):
         from simple_ar.cli.start import create_declared_research
         with tempfile.TemporaryDirectory() as directory, \
                 patch('simple_ar.app.tool_application.ToolApplication.create') as create, \
-                patch('simple_ar.app.research_application.create_session') as legacy, \
                 patch('simple_ar.cli.main._render_native_result'), patch('simple_ar.cli.start.print_line'):
             root = Path(directory).resolve()
             project = root / 'project'
@@ -2602,7 +2597,6 @@ class StartTests(unittest.TestCase):
                     if key != 'code_task'}, request=args.topic, outputs=('experiments', 'code_task'),
                     root=root / 'invalid', limits={})
             create.assert_not_called()
-            legacy.assert_not_called()
             self.assertEqual(paper.read_text(encoding='utf-8'), 'Supplied adapter requirements')
             self.assertEqual(list(project.iterdir()), [])
 

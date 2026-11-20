@@ -8,7 +8,6 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from simple_ar.app.research_application import ResearchApplicationServices, create_session, load_session
 from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
 from simple_ar.integrations.llm import LLMClient, LLMError, LLMSettings
 from simple_ar.research.workflow_contracts import ResearchBrief
@@ -75,47 +74,6 @@ class AnalysisWritingTests(unittest.TestCase):
                     else:
                         self.assertEqual(validate_session_arguments(args).outputs, ['data_analysis', 'report'])
 
-    def test_documentation_is_retained_as_material_not_measurement_after_resume(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source, notes = root / 'values.csv', root / 'dictionary.md'
-            source.write_text('score\n1\n3\n', encoding='utf-8')
-            notes.write_text('# Variables\nOne row is a recorded specimen. Values are already scaled; do not rescale.\n', encoding='utf-8')
-            app = create_session(ResearchBrief(request_text='Explain the supplied values using their dictionary',
-                requested_outputs=('data_analysis', 'report'), asset_requests=({
-                    'locator': str(notes), 'role': 'material', 'mutability': 'read_only',
-                    'allowed_uses': ['read', 'reference']},)), root=root / 'session',
-                services=ResearchApplicationServices(config={'research_task_kind': 'data_analysis',
-                    'data_analysis': {'file': str(source), 'value_columns': ['score'], 'observation_unit': 'specimen'}},
-                    budget_limits={'process_invocations': 0}))
-            view = app.advance(max_actions=4)
-            self.assertEqual(view.next_action, 'report_write', view.status_reason)
-            documents_ref = view.state_refs['documents']
-            documents = app.controller.store.resolve(documents_ref).read_bytes()
-            notes.unlink()
-            source.unlink()
-            restored = load_session(root / 'session', services=ResearchApplicationServices(
-                llm_client=LLMClient(LLMSettings(api_key='fixture'))))
-
-            def writer(**kwargs):
-                handles = kwargs['context'].source_handles
-                data = [row for row in handles if row.metadata['evidence_role'] == 'recomputed_from_user_supplied_data']
-                material = [row for row in handles if row.metadata['evidence_role'] == 'user_supplied_unverified']
-                self.assertEqual(len(data), 1)
-                self.assertEqual(len(material), 1)
-                self.assertEqual(material[0].kind, 'material')
-                self.assertIn('already scaled', json.dumps(material[0].metadata['evidence_passages']))
-                self.assertEqual(kwargs['context'].results['supplied_analyses'][0]['records'][0]['mean'], 2)
-                return AgentReportResult(report_body='', memory=kwargs['memory'], used_agent=True,
-                    sections=[ReportSectionDraft(section_id='findings', heading='Findings',
-                        draft_markdown='The recorded mean is 2. The supplied dictionary describes scaled values.')])
-
-            with patch('simple_ar.report.writing.run_report_agent', side_effect=writer):
-                view = restored.advance(max_actions=3)
-            self.assertEqual(view.status, 'completed', view.status_reason)
-            self.assertEqual(restored.controller.store.resolve(documents_ref).read_bytes(), documents)
-            self.assertFalse({'search', 'read', 'synthesis', 'experiment'} & view.state_refs.keys())
-
     def test_guided_analysis_can_request_report_in_its_own_configuration(self):
         from simple_ar.cli.parser import build_parser
         from simple_ar.cli.start import prepare_start
@@ -165,13 +123,11 @@ class AnalysisWritingTests(unittest.TestCase):
             # recovery and delivery behavior have their own domain tests below.
             with patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
                     patch('simple_ar.app.tool_application.ToolApplication.create') as create_native, \
-                    patch('simple_ar.app.research_application.create_session') as create_legacy, \
                     patch('simple_ar.cli.main._render_native_result'), \
                     contextlib.redirect_stdout(io.StringIO()):
                 create_native.return_value.run.return_value = {'status': 'completed'}
                 main(['research-session', '--config', str(report), '--interaction', 'autonomous'])
             create_native.assert_called_once()
-            create_legacy.assert_not_called()
             options = create_native.call_args.kwargs
             self.assertEqual(options['report_requirement'], freeze_report_requirement(settings, method=method))
             self.assertEqual(options['table_analysis'], {'path': 'source0',
@@ -184,50 +140,6 @@ class AnalysisWritingTests(unittest.TestCase):
             self.assertEqual(options['process_limits'], {'process_invocations': 0, 'process_wall_seconds': 0})
             create_native.return_value.run.assert_called_once()
             self.assertNotIn('actions', create_native.return_value.run.call_args.kwargs)
-
-    def test_analysis_report_uses_same_session_and_restores_frozen_analysis(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = root / 'source.csv'
-            source.write_text('label,score\nA,1\nA,3\nB,-2\n', encoding='utf-8')
-            app = create_session(ResearchBrief(request_text='Analyze and write a results note',
-                requested_outputs=('data_analysis', 'report')), root=root / 'session',
-                services=ResearchApplicationServices(config={'research_task_kind': 'data_analysis',
-                    'data_analysis': {'file': str(source), 'value_columns': ['score'],
-                        'observation_unit': 'one supplied row', 'value_unit': 'points', 'group_column': 'label'}},
-                    budget_limits={'process_invocations': 0}))
-            view = app.advance(max_actions=4)
-            self.assertEqual(view.next_action, 'report_write', view.status_reason)
-            analysis_ref = view.state_refs['data_analysis']
-            frozen = app.controller.store.resolve(analysis_ref).read_bytes()
-            source.unlink()
-            app = load_session(root / 'session', services=ResearchApplicationServices(
-                llm_client=LLMClient(LLMSettings(api_key='fixture'))))
-
-            def writer(**kwargs):
-                context, memory = kwargs['context'], kwargs['memory']
-                self.assertEqual(context.report_mode, 'supplied_materials')
-                self.assertEqual(context.results['session_execution'], 'not_requested')
-                self.assertEqual(context.results['supplied_analyses'][0]['records'][0]['mean'], 2)
-                self.assertEqual(context.source_handles[0].metadata['evidence_role'],
-                                 'recomputed_from_user_supplied_data')
-                return AgentReportResult(report_body='', memory=memory, used_agent=True,
-                    sections=[ReportSectionDraft(section_id='discussion', heading='Discussion',
-                        draft_markdown='These supplied descriptive values do not establish causality or significance.')])
-
-            with patch('simple_ar.report.writing.run_report_agent', side_effect=writer):
-                view = app.advance(max_actions=3)
-            self.assertEqual(view.status, 'completed', view.status_reason)
-            self.assertEqual(app.controller.store.resolve(analysis_ref).read_bytes(), frozen)
-            self.assertFalse({'experiment', 'read', 'synthesis', 'search'} & view.state_refs.keys())
-            self.assertEqual(len([a for a in app.controller.list_attempts() if a.capability == 'data_analysis']), 1)
-            output = app.controller.store.resolve(view.state_refs['report']).parent
-            moved = root / 'portable report'
-            shutil.copytree(output, moved)
-            shutil.rmtree(root / 'session')
-            package = moved / 'analyses/analysis-001/analysis.json'
-            rebuild(package)
-            self.assertEqual(load_analysis_package(package)[0]['records'][0]['mean'], 2)
 
     def test_data_report_plan_has_no_research_prerequisites_and_rejects_execution(self):
         from simple_ar.research.task_plan import TaskPlanRequest, build_task_plan
@@ -246,16 +158,22 @@ class AnalysisWritingTests(unittest.TestCase):
                 'research_local_documents': ['dictionary.md']}}, requested_outputs=('data_analysis',)))
 
     def package(self, root, mode='observations'):
+        from simple_ar.app.research_intake import create_research_task, start_research_task
+        from simple_ar.app.services import ResearchApplicationServices
         source = root / 'source.csv'
         source.write_text('label,score\nA,1\nA,3\nB,-2\n' if mode == 'observations' else 'label,score\nA,2\nB,-2\n', encoding='utf-8')
-        app = create_session(ResearchBrief(request_text='Describe', requested_outputs=('data_analysis',)),
+        app = create_research_task(ResearchBrief(request_text='Describe', requested_outputs=('data_analysis',)),
             root=root / 'data-session', services=ResearchApplicationServices(config={
                 'research_task_kind': 'data_analysis', 'data_analysis': {'file': str(source),
                     'value_columns': ['score'], 'observation_unit': 'one supplied row', 'value_unit': 'points',
                     'group_column': 'label', 'mode': mode}}))
-        view = app.advance(max_actions=10)
-        self.assertEqual(view.status, 'completed', view.status_reason)
-        return app.controller.store.resolve(view.state_refs['data_analysis'])
+        result = start_research_task(app, progress=lambda _: None)
+        self.assertEqual(result['status'], 'completed', result)
+        return next(
+            (root / 'data-session' / item)
+            for item in result['retained_work']['artifacts']
+            if str(item).endswith('.json')
+        )
 
     def package_input(self, root):
         path = self.package(root)
@@ -331,85 +249,6 @@ class AnalysisWritingTests(unittest.TestCase):
             with patch('sys.stdin.isatty', return_value=False), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(ValueError):
                 prepare_start(build_parser().parse_args(argv))
             self.assertFalse((root / 'invalid').exists())
-
-    def test_writing_freezes_rechecked_data_and_delivers_movable_figures_without_experiments(self):
-        from simple_ar.report.agent import _compact_execution_results, _prompt_handle_view
-        for mode in ('observations', 'values'):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                path = self.package(root, mode)
-                app = create_session(ResearchBrief(request_text='Explain supplied data', requested_outputs=('report',),
-                    asset_requests=({'locator': str(path), 'role': 'material'},)), root=root / 'writing-session',
-                    services=ResearchApplicationServices(config={'research_task_kind': 'writing'}, budget_limits={'process_invocations': 0}))
-                view = app.advance(max_actions=2)
-                self.assertEqual(view.next_action, 'report_write', view.status_reason)
-                (root / 'data-session').rename(root / 'hidden-original-data-session')
-                app = load_session(root / 'writing-session', services=ResearchApplicationServices(
-                    llm_client=LLMClient(LLMSettings(api_key='fixture'))))
-                with patch('simple_ar.report.writing.run_report_agent', side_effect=LLMError('Temporary outage')):
-                    self.assertEqual(app.advance(max_actions=1).status, 'paused')
-                app = load_session(root / 'writing-session', services=ResearchApplicationServices(
-                    llm_client=LLMClient(LLMSettings(api_key='fixture'))))
-                app.continue_session()
-
-                def writer(**kwargs):
-                    context, memory = kwargs['context'], kwargs['memory']
-                    from simple_ar.report.document_plan import supplied_figure_sources
-                    figures = supplied_figure_sources(context)
-                    self.assertEqual(len(figures), 1)
-                    self.assertEqual(figures[0]['figure_count'], 1)
-                    self.assertNotIn('captions', figures[0])
-                    handle = context.source_handles[0]
-                    self.assertEqual(figures[0]['handle'], handle.handle)
-                    self.assertFalse(any('![Descriptive values]' in passage['text']
-                        for passage in handle.metadata['evidence_passages']))
-                    self.assertEqual(_prompt_handle_view(handle)['metadata']['evidence_role'], 'recomputed_from_user_supplied_data')
-                    compact = _compact_execution_results(context.results)['supplied_analyses'][0]
-                    self.assertTrue(compact['figures'][0]['caption'])
-                    self.assertEqual(figures[0]['document_id'], compact['document_id'])
-                    self.assertEqual(compact['records'][0]['mean' if mode == 'observations' else 'value'], 2)
-                    self.assertEqual(compact['input_row_count'], 3 if mode == 'observations' else 2)
-                    self.assertIn('not individual raw rows' if mode == 'observations' else 'Supplied values/coordinates', compact['records_scope'])
-                    self.assertEqual(context.metric_sources, [])
-                    self.assertEqual(context.results['session_execution'], 'not_requested')
-                    return AgentReportResult(report_body='', memory=memory, used_agent=True,
-                        sections=[ReportSectionDraft(section_id='discussion', heading='Discussion',
-                            draft_markdown='These are descriptive values from supplied data. No experiment, significance test or causal analysis was performed.')])
-
-                with patch('simple_ar.report.writing.run_report_agent', side_effect=writer):
-                    view = app.advance(max_actions=3)
-                self.assertEqual(view.status, 'completed', view.status_reason)
-                self.assertNotIn('experiment', view.state_refs)
-                self.assertNotIn('synthesis', view.state_refs)
-                output = app.controller.store.resolve(view.state_refs['report']).parent
-                body = (output / 'report_body.md').read_text(encoding='utf-8')
-                self.assertIn('Supplied Descriptive Data', body)
-                self.assertNotIn('Verified Experiment Metrics', body)
-                self.assertNotIn('| A | score |', body)
-                self.assertIn('[numerical records](analyses/analysis-001/analysis.json)', body)
-                self.assertTrue((output / 'analyses/analysis-001/figures/value-1-1.svg').is_file())
-                moved = root / 'moved report with spaces'
-                shutil.copytree(output, moved)
-                (root / 'writing-session').rename(root / 'hidden-writing-session')
-                rebuild(moved / 'analyses/analysis-001/analysis.json')
-                self.assertEqual(load_analysis_package(moved / 'analyses/analysis-001/analysis.json')[0]['records'][0]
-                                 ['mean' if mode == 'observations' else 'value'], 2)
-                app = load_session(root / 'hidden-writing-session')
-                before = len(app.controller.list_attempts())
-                self.assertEqual(app.advance(max_actions=10).status, 'completed')
-                self.assertEqual(len(app.controller.list_attempts()), before)
-
-    def test_unknown_json_pauses_before_writer(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            path = root / 'raw.json'
-            path.write_text('[{"score": 1}]', encoding='utf-8')
-            app = create_session(ResearchBrief(request_text='Write', requested_outputs=('report',),
-                asset_requests=({'locator': str(path), 'role': 'material'},)), root=root / 'session',
-                services=ResearchApplicationServices(config={'research_task_kind': 'writing'}))
-            view = app.advance(max_actions=10)
-            self.assertEqual(view.status, 'paused')
-            self.assertNotIn('writer', view.state_refs)
 
     def test_assembly_places_data_only_with_unique_frozen_source_owner_and_preserves_full_records(self):
         from simple_ar.report.schema import ReportDocumentPlan, ReportSectionPlan

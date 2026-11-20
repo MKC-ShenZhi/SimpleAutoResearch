@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from simple_ar.app.research_application import ResearchApplicationServices
+from simple_ar.app.services import ResearchApplicationServices
 from simple_ar.app.research_intake import (
     ResearchInputError,
     create_structured_research_task,
@@ -67,14 +67,12 @@ def _reply(name, arguments):
 
 class ResearchIntakeTests(unittest.TestCase):
     def test_research_creation_publishes_only_with_inputs_and_ledger(self):
-        from simple_ar.app.research_application import create_session
         from simple_ar.core.capabilities import ArtifactStore
 
         write = ArtifactStore.write_json
         brief = ResearchBrief(request_text='Inspect a research task.')
         for create, first_input in (
-                (create_research_task, 'inputs/research_assets.json'),
-                (create_session, 'inputs/runtime_config.json')):
+                (create_research_task, 'inputs/research_assets.json'),):
             with self.subTest(entry=create.__name__), TemporaryDirectory() as directory:
                 root = Path(directory) / 'session'
 
@@ -916,7 +914,6 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertNotIn('run_process', denied._specialist_catalog())
 
     def test_native_default_attempts_do_not_inherit_legacy_stage_units(self):
-        from simple_ar.app.research_application import create_session, load_session
         with TemporaryDirectory() as directory:
             root = Path(directory)
             note = root / 'note.md'
@@ -953,13 +950,6 @@ class ResearchIntakeTests(unittest.TestCase):
                 root=root / 'experiments', services=services)
             self.assertEqual(experiments.session.manifest.budget.max_attempts, 300)
             self.assertEqual(experiments.ledger.remaining('process_invocations'), 16)
-            legacy = create_session(brief, root=root / 'legacy', services=replace(services, llm_client=None))
-            self.assertEqual(legacy.services.max_attempts, 16)
-            with patch('simple_ar.app.research_intake.create_research_task',
-                    side_effect=AssertionError('Restore must not create a successor')):
-                restored = load_session(root / 'legacy', services=ResearchApplicationServices(max_attempts=999))
-            self.assertEqual(restored.services.max_attempts, 16)
-            self.assertEqual(restored.controller.manifest.budget.max_attempts, 16)
             for invalid in (0, -1, True, 1.5, '16'):
                 with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                     ResearchApplicationServices(max_attempts=invalid)

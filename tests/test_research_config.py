@@ -217,12 +217,10 @@ class ReportDocumentArgumentsTests(unittest.TestCase):
         for command, required in (("research-session", ["--topic", "Scope", "--model", "fixture"]),
                                   ("research-report", ["--session-root", "unused", "--model", "fixture"])):
             with self.subTest(command=command), \
-                 patch("simple_ar.cli.main._optional_research_llm_client") as setup, \
-                 patch("simple_ar.app.research_application.create_session") as create:
+                 patch("simple_ar.cli.main._optional_research_llm_client") as setup:
                 with self.assertRaisesRegex(SystemExit, "cannot be negative"):
                     main([command, *required, "--max-section-tokens", "-1"])
                 setup.assert_not_called()
-                create.assert_not_called()
 
     def test_shared_controls_keep_defaults_names_and_explicit_disable(self):
         parser = build_parser()
@@ -270,22 +268,6 @@ class DocumentReviewCapacityConfigTests(unittest.TestCase):
 
 
 class ResearchConfigTests(unittest.TestCase):
-    def _historical_summary(self, session, papers, *, goal, limits=None):
-        """Seed the retained historical owner, not today's public new route."""
-        from simple_ar.app.research_application import ResearchApplication, ResearchApplicationServices
-        from simple_ar.research.workflow_contracts import ResearchBrief
-        app = ResearchApplication.create(ResearchBrief(request_text=goal, objective=goal,
-            intents=('research',), requested_outputs=('summary',), asset_requests=tuple({
-                'locator': str(path), 'kind': 'file', 'role': 'paper', 'mutability': 'read_only',
-                'allowed_uses': ['read', 'reference']} for path in papers)), root=session,
-            services=ResearchApplicationServices(max_results=10, max_chunks=300,
-                budget_limits=limits or {}, max_attempts=20,
-                config={'research_sources': ['local_files'], 'research_materials_only': True,
-                    'interaction': 'autonomous', 'report_writing_method': 'sections',
-                    'report': {'mode': 'research_only', 'template': 'survey', 'reviewer': 'llm'}}))
-        self.assertEqual(app.advance(max_actions=20).status, 'completed')
-        return app
-
     def test_named_experiment_data_resolves_relative_config_paths_and_explicit_cli_override(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -332,12 +314,10 @@ class ResearchConfigTests(unittest.TestCase):
                                (['--report-writing-method', 'article', '--report-outline-strategy', 'adaptive'],
                                 'cannot execute.*outline_strategy')):
             with self.subTest(flags=flags), \
-                 patch('simple_ar.cli.main._optional_research_llm_client') as setup, \
-                 patch('simple_ar.app.research_application.create_session') as create:
+                 patch('simple_ar.cli.main._optional_research_llm_client') as setup:
                 with self.assertRaisesRegex(SystemExit, message):
                     main(['research-session', '--topic', 'Explain supplied material', '--model', 'fixture', *flags])
                 setup.assert_not_called()
-                create.assert_not_called()
 
     def test_data_tables_share_toml_cli_and_resume_override(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -598,181 +578,6 @@ class ResearchConfigTests(unittest.TestCase):
                               for ref in hashes}, hashes)
             self.assertEqual((root / "calls.txt").read_text().splitlines(), calls)
 
-    def test_resume_attaches_execution_without_research_replay_or_budget_reset(self):
-        from simple_ar.cli.main import main
-        from simple_ar.app.research_application import ResearchApplication, ResearchApplicationServices, load_session
-        from simple_ar.research.workflow_contracts import ResearchBrief
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "paper.md").write_text("# Replay learning\nMemory stores previous examples for classification.", encoding="utf-8")
-            (root / "measure.py").write_text('from pathlib import Path\np = Path("calls.txt")\np.write_text(p.read_text() + "x" if p.exists() else "x")\nprint("accuracy: 0.8")\n', encoding="utf-8")
-            path = root / "research.toml"
-            path.write_text('[task]\ngoal="Replay learning"\noutputs=["experiments"]\noutput_root="out"\n'
-                            '[model]\nname=""\n[research]\nproviders=["local_files"]\n[assets]\npapers=["paper.md"]\n'
-                            '[budget]\ntotal_tokens=123456\nprocess_invocations=2\nprocess_wall_seconds=60\n', encoding="utf-8")
-            argv = ["research-session", "--config", str(path)]
-            args = build_parser(research_defaults=research_defaults(argv)).parse_args(argv)
-            session = root / "out" / "historical-attach"
-            # This resume contract belongs to sessions created by the historical owner.
-            app = ResearchApplication.create(ResearchBrief(
-                request_text=args.topic, objective=args.topic, intents=("research", "experiment"),
-                requested_outputs=tuple(args.outputs), asset_requests=tuple({
-                    "locator": paper, "kind": "file", "role": "paper", "mutability": "read_only",
-                    "allowed_uses": ["read", "reference"]} for paper in args.local_document)),
-                root=session, services=ResearchApplicationServices(
-                    max_results=args.max_results, max_chunks=args.max_chunks, idea_limit=args.idea_limit,
-                    input_base_dir=root, max_attempts=20,
-                    budget_limits={name: getattr(args, name) for name in (
-                        "llm_requests", "total_tokens", "process_invocations", "process_wall_seconds")},
-                    config={"research_sources": args.providers,
-                        "research_max_documents": args.max_results,
-                        "research_max_iterations": args.max_research_iterations,
-                        "interaction": "checkpoints",
-                        "report": {**report_settings(args), "mode": "experiment", "template": args.report_template}}))
-            self.assertEqual(app.advance(max_actions=20).status, "paused")
-            before = load_session(session).view()
-            original_inputs = {
-                key: (session / before.state_refs[key].path).read_bytes()
-                for key in ("brief", "brief_markdown", "assets")
-            }
-            path.write_text(path.read_text(encoding="utf-8").replace("123456", "999999") +
-                            '\n[execution]\ncommand=[' + json.dumps(sys.executable) + ', "measure.py"]\ncwd="."\ntimeout_sec=20\nprimary_metric="accuracy"\n', encoding="utf-8")
-            argv = ["research-session", "--config", str(path), "--session-root", str(session)]
-            with redirect_stdout(io.StringIO()), self.assertRaisesRegex(SystemExit, "paused"):
-                main(argv)
-            gate = load_session(session).view().work_plan["interaction"]["decision"]
-            self.assertEqual(gate["stage"], "execution_protocol")
-            self.assertFalse((root / "calls.txt").exists())
-            with redirect_stdout(io.StringIO()):
-                main(argv + ["--decision-id", gate["id"], "--decision-response", "accept"])
-            app = load_session(session)
-            after = app.view()
-            self.assertEqual(after.status, "completed")
-            for key, ref in before.state_refs.items():
-                if key not in {"brief", "assets", "brief_markdown", "runtime_config", "diagnostics", "task_plan", "design", "research_design"}:
-                    self.assertEqual(after.state_refs[key], ref)
-            for key, content in original_inputs.items():
-                self.assertEqual((session / before.state_refs[key].path).read_bytes(), content)
-                self.assertNotEqual(after.state_refs[key], before.state_refs[key])
-            old_brief = json.loads(original_inputs["brief"])
-            new_brief = json.loads((session / after.state_refs["brief"].path).read_text(encoding="utf-8"))
-            self.assertEqual(new_brief["revision"], old_brief["revision"] + 1)
-            self.assertEqual(new_brief["parent_revision"], old_brief["revision"])
-            self.assertEqual(
-                {key: value for key, value in new_brief.items() if key not in {"revision", "parent_revision"}},
-                {key: value for key, value in old_brief.items() if key not in {"revision", "parent_revision"}},
-            )
-            self.assertNotEqual(after.state_refs["task_plan"], before.state_refs["task_plan"])
-            self.assertEqual(app.budget_ledger.limits["total_tokens"], 123456)
-            self.assertEqual((root / "calls.txt").read_text(), "x")
-            with redirect_stdout(io.StringIO()):
-                main(argv)
-            self.assertEqual(load_session(session).view().attempts, after.attempts)
-            self.assertEqual((root / "calls.txt").read_text(), "x")
-
-    def test_toml_continuation_adds_material_and_replays_authorization_once(self):
-        from simple_ar.cli.main import main
-        from simple_ar.app.research_application import load_session
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            papers = [root / f"paper-{index}.md" for index in range(1, 4)]
-            for index, paper in enumerate(papers, start=1):
-                paper.write_text(f"# Fixture {index}\nA local supplied source on small-memory learning.\n", encoding="utf-8")
-            config = root / "research.toml"
-
-            def write_config(selected_papers, *, continuation=True):
-                paper_rows = ", ".join(json.dumps(str(path)) for path in selected_papers)
-                continuation_config = (
-                    '[continuation]\nauthorization_id="review-20260924-1"\n'
-                    'reason="Bounded continuation after review."\nadditional_attempts=2\nadditional_no_progress=1\n'
-                    'remaining={total_tokens=200, llm_requests=3}\n'
-                ) if continuation else ""
-                config.write_text(
-                    '[task]\ngoal="Summarize the supplied local sources"\noutputs=["summary"]\noutput_root="out"\n'
-                    '[model]\nname=""\n[research]\nproviders=["local_files"]\nmaterials_only=true\n'
-                    f'[assets]\npapers=[{paper_rows}]\n'
-                    '[budget]\ntotal_tokens=100\nllm_requests=2\nprocess_invocations=0\nprocess_wall_seconds=0\n'
-                    + continuation_config,
-                    encoding="utf-8",
-                )
-
-            write_config(papers[:1], continuation=False)
-            session = root / 'out' / 'historical'
-            initial = self._historical_summary(session, papers[:1], goal='Summarize the supplied local sources',
-                limits={'total_tokens': 100, 'llm_requests': 2, 'process_invocations': 0, 'process_wall_seconds': 0})
-            initial_view = initial.view()
-            original_attempts = initial_view.attempts
-            initial_cap = initial.controller.manifest.budget.max_attempts
-            from simple_ar.core.budget import BudgetError, BudgetLedger
-            initial.budget_ledger.reserve("historical-token-use", {"total_tokens": 7})
-            initial.budget_ledger.settle("historical-token-use", {"total_tokens": 7})
-            historical_entry = initial.budget_ledger.entries[0].to_dict()
-
-            write_config(papers[:2])
-            argv = ["research-session", "--config", str(config), "--session-root", str(session)]
-            original_authorize = BudgetLedger.authorize_remaining
-
-            def fail_ledger_once(ledger, *args, **kwargs):
-                if kwargs.get("authorization_id") == "review-20260924-1":
-                    raise BudgetError("injected manifest-ledger gap")
-                return original_authorize(ledger, *args, **kwargs)
-
-            with patch.object(BudgetLedger, "authorize_remaining", new=fail_ledger_once):
-                with redirect_stdout(io.StringIO()), self.assertRaisesRegex(
-                    SystemExit, "injected manifest-ledger gap",
-                ):
-                    main(argv)
-            after_manifest_only = load_session(session)
-            self.assertEqual(after_manifest_only.controller.manifest.budget.max_attempts, initial_cap + 2)
-            self.assertEqual(after_manifest_only.budget_ledger.limits["total_tokens"], 100)
-            self.assertEqual(after_manifest_only.budget_ledger.entries[0].to_dict(), historical_entry)
-            self.assertEqual(after_manifest_only.view().attempts, original_attempts)
-
-            from simple_ar.core.session import SessionController
-            with patch.object(
-                SessionController, "continue_with_revision",
-                side_effect=RuntimeError("injected session continuation failure"),
-            ):
-                with redirect_stdout(io.StringIO()), self.assertRaisesRegex(
-                    SystemExit, "injected session continuation failure",
-                ):
-                    main(argv)
-            after_ledger_only = load_session(session)
-            self.assertEqual(after_ledger_only.view().status, "completed")
-            self.assertEqual(after_ledger_only.controller.manifest.budget.max_attempts, initial_cap + 2)
-            self.assertEqual(after_ledger_only.budget_ledger.limits["total_tokens"], 200)
-            self.assertEqual(after_ledger_only.budget_ledger.entries[0].to_dict(), historical_entry)
-            self.assertEqual(after_ledger_only.view().attempts, original_attempts)
-
-            with redirect_stdout(io.StringIO()):
-                main(argv)
-            first_resume = load_session(session)
-            first_view = first_resume.view()
-            self.assertEqual(first_view.status, "completed")
-            self.assertGreater(len(first_view.attempts), len(original_attempts))
-            self.assertEqual(first_resume.controller.manifest.budget.attempts, len(first_view.attempts))
-            self.assertEqual(first_resume.controller.manifest.budget.max_attempts, initial_cap + 2)
-            self.assertEqual(first_resume.budget_ledger.limits["total_tokens"], 200)
-            self.assertEqual(first_resume.budget_ledger.limits["llm_requests"], 3)
-            self.assertEqual(len(first_resume._local_documents()), 2)
-
-            with redirect_stdout(io.StringIO()):
-                main(argv)
-            exact_replay = load_session(session)
-            self.assertEqual(exact_replay.view().attempts, first_view.attempts)
-            self.assertEqual(exact_replay.controller.manifest.budget.max_attempts, initial_cap + 2)
-            self.assertEqual(exact_replay.budget_ledger.limits["total_tokens"], 200)
-
-            write_config(papers)
-            with redirect_stdout(io.StringIO()):
-                main(argv)
-            replayed = load_session(session)
-            self.assertEqual(replayed.view().status, "completed")
-            self.assertEqual(replayed.controller.manifest.budget.max_attempts, initial_cap + 2)
-            self.assertEqual(replayed.controller.manifest.budget.continuation_authorizations[
-                "review-20260924-1"]["resource_allowances"], {"total_tokens": 200, "llm_requests": 3})
-            self.assertEqual(len(replayed._local_documents()), 3)
-
     def test_config_runs_local_summary_and_persists_budget_without_processes(self):
         from simple_ar.cli.main import main
         with tempfile.TemporaryDirectory() as directory:
@@ -927,141 +732,6 @@ class ResearchConfigTests(unittest.TestCase):
             args = build_parser(research_defaults=defaults).parse_args(argv)
             self.assertEqual(args.selected_idea_id, "idea-replay")
 
-    def test_resume_applies_report_only_changes_and_rejects_unapplied_research_changes(self):
-        from dataclasses import replace
-        from simple_ar.cli.main import main
-        from simple_ar.app.research_application import (
-            ResearchApplication, ResearchApplicationError, ResearchApplicationServices, load_session,
-        )
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            paper = root / "paper.md"
-            paper.write_text("# Local evidence\nA small supplied source for a bounded summary.\n", encoding="utf-8")
-            config = root / "research.toml"
-
-            def write_config(*, max_results=10, reviewer="llm", outputs=("summary",), model=""):
-                config.write_text(
-                    '[task]\ngoal="Summarize local evidence"\n'
-                    f'outputs={json.dumps(list(outputs))}\noutput_root="out"\n'
-                    f'[model]\nname="{model}"\n'
-                    '[research]\nproviders=["local_files"]\nmaterials_only=true\n'
-                    f'max_results={max_results}\n'
-                    f'[assets]\npapers=[{json.dumps(str(paper))}]\n'
-                    f'[report]\nreviewer="{reviewer}"\n',
-                    encoding="utf-8",
-                )
-
-            write_config()
-            session = root / 'out' / 'historical'
-            self._historical_summary(session, [paper], goal='Summarize local evidence')
-            before = load_session(session).view()
-
-            def snapshot():
-                return {str(path.relative_to(session)): path.read_bytes()
-                        for path in session.rglob("*") if path.is_file()}
-
-            # The same application entry owns CLI and programmatic rejection;
-            # explicit empty/zero terms cannot disappear into omitted defaults.
-            original_files = snapshot()
-            for request, message in (
-                ({"research_settings": {"max_results": 11}}, "max_results.*not applied"),
-                ({"research_settings": {"research_materials_only": False}}, "research_materials_only.*not applied"),
-                ({"report_writing_method": "article"}, "Saved reports keep their writing method"),
-                ({"reanalyze": True, "additional_attempts": 0}, "cannot be combined"),
-                ({"recover_interrupted": True, "authorize_remaining": {}}, "separate resume"),
-                ({"recover_interrupted": True, "revised_report_config": {}}, "separate resume"),
-                ({"reanalyze": True, "revised_brief": replace(load_session(session).brief, objective="Changed goal")}, "cannot be combined"),
-                ({"decision_id": "0123456789abcdef", "decision_response": "reject"}, "not the current pending"),
-            ):
-                with self.subTest(request=request), self.assertRaisesRegex(ResearchApplicationError, message):
-                    load_session(session).continue_session(**request)
-                self.assertEqual(snapshot(), original_files)
-            load_session(session).continue_session(resume_if_needed=True)
-            self.assertEqual(snapshot(), original_files)
-
-            write_config(max_results=11)
-            with redirect_stdout(io.StringIO()), self.assertRaisesRegex(SystemExit, "max_results.*not applied"):
-                main(["research-session", "--config", str(config), "--session-root", str(session)])
-            unchanged = load_session(session).view()
-            self.assertEqual(unchanged.state_refs, before.state_refs)
-            self.assertEqual(unchanged.attempts, before.attempts)
-
-            write_config(reviewer="disabled")
-            with redirect_stdout(io.StringIO()), self.assertRaisesRegex(
-                SystemExit, "Report settings do not request a report deliverable",
-            ):
-                main(["research-session", "--config", str(config), "--session-root", str(session)])
-            no_report_change = load_session(session).view()
-            self.assertEqual(no_report_change.state_refs, before.state_refs)
-            self.assertEqual(no_report_change.attempts, before.attempts)
-
-            report_app = load_session(session)
-            # Pre-method sessions retain section/checkpoint behavior when the
-            # caller omits today's new-task Writer default.
-            report_app.services = replace(report_app.services, config={
-                key: value for key, value in report_app.services.config.items()
-                if key != "report_writing_method"
-            })
-            report_app.request_report()
-            report_app.controller.pause("test checkpoint before report writing")
-            before_report = load_session(session).view()
-
-            write_config(
-                reviewer="disabled", outputs=("summary", "report"), model="scripted",
-            )
-            with (
-                patch.object(ResearchApplication, "continue_session", autospec=True,
-                             side_effect=ResearchApplication.continue_session) as resume,
-                patch.object(ResearchApplication, "advance", side_effect=RuntimeError("stop before report work")),
-                patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()),
-                redirect_stdout(io.StringIO()),
-                self.assertRaisesRegex(SystemExit, "stop before report work"),
-            ):
-                main(["research-session", "--config", str(config), "--session-root", str(session)])
-            forwarded = resume.call_args.kwargs
-            self.assertTrue(forwarded["resume_if_needed"])
-            self.assertEqual(forwarded["revised_report_config"], {"reviewer": "disabled"})
-            for key in ("interaction", "report_writing_method", "authorize_remaining",
-                        "additional_attempts", "additional_no_progress"):
-                self.assertIsNone(forwarded[key], key)
-            reply_services = ResearchApplicationServices(llm_client=object())
-            refreshed = load_session(session, services=reply_services)
-            self.assertEqual(refreshed.services.config["report"]["reviewer"], "disabled")
-            self.assertEqual(refreshed.view().state_refs["summary"], before_report.state_refs["summary"])
-            self.assertEqual(refreshed.view().attempts, before_report.attempts)
-
-            # A delivery answer binds the complete explicit revision, including
-            # false, zero and an empty mapping. Later replies retain that binding
-            # even after another decision becomes current.
-            refreshed._store_interaction_checkpoint(
-                stage="delivery", action="report_write", question="Confirm delivery",
-                reason="Review report configuration", options=({"id": "revise", "label": "Revise"},),
-                evidence_refs=[], identity=refreshed._interaction_identity("delivery", "report_write"),
-            )
-            gate = refreshed.view().work_plan["interaction"]["decision"]
-            terms = {"reviewer": "llm", "document_review": False, "max_section_tokens": 0, "figures": {}}
-            reply = {"decision_id": gate["id"], "decision_response": "revise", "revised_report_config": terms}
-            revised = refreshed.continue_session(**reply)
-            self.assertEqual(revised.attempts, before_report.attempts)
-            self.assertEqual(revised.state_refs["summary"], before_report.state_refs["summary"])
-            for key, value in terms.items():
-                self.assertEqual(refreshed.services.config["report"][key], value)
-            self.assertNotIn("report_writing_method", refreshed.services.config)
-            refreshed._store_interaction_checkpoint(
-                stage="required_input", action="report_write", question="Specify audience",
-                reason="Await audience", options=({"id": "revise", "label": "Clarify"},),
-                evidence_refs=[], identity=refreshed._interaction_identity("required_input", "report_write"),
-            )
-            saved_files = snapshot()
-            load_session(session, services=reply_services).continue_session(**reply)
-            self.assertEqual(snapshot(), saved_files)
-            with self.assertRaisesRegex(ResearchApplicationError, "different terms"):
-                load_session(session, services=reply_services).continue_session(
-                    **{**reply, "revised_report_config": {**terms, "max_section_tokens": 1}},
-                )
-            self.assertEqual(snapshot(), saved_files)
-
     def test_unknown_or_invalid_values_do_not_silently_use_defaults(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "research.toml"
@@ -1116,7 +786,7 @@ class ResearchConfigTests(unittest.TestCase):
                                            "python", "train.py", "--config", "missing.toml"]), {})
 
     def test_templates_parse_with_same_defaults(self):
-        from simple_ar.app.research_application import ResearchApplicationServices
+        from simple_ar.app.services import ResearchApplicationServices
 
         defaults = build_parser().parse_args(["research-session", "--topic", "A research goal"])
         self.assertIsNone(defaults.total_tokens)

@@ -40,7 +40,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
     def test_canonical_session_import_does_not_load_frozen_pipeline(self) -> None:
         probe = (
             "import sys; "
-            "import simple_ar.app.research_application; "
+            "import simple_ar.app.tool_application; "
             "import simple_ar.report.writing; "
             "assert not any(name.startswith('simple_ar.pipeline_stages') "
             "for name in sys.modules), sorted(name for name in sys.modules "
@@ -58,7 +58,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
     def test_canonical_research_modules_do_not_load_compatibility_layers(self) -> None:
         probe = (
             "import sys; "
-            "import simple_ar.app.research_application; "
+            "import simple_ar.app.tool_application; "
             "import simple_ar.research.sources.capability; "
             "import simple_ar.research.evidence.reader; "
             "import simple_ar.research.synthesis; "
@@ -79,7 +79,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
     def test_canonical_application_does_not_load_legacy_report_adapter(self) -> None:
         probe = (
             "import sys; "
-            "import simple_ar.app.research_application; "
+            "import simple_ar.app.tool_application; "
             "import simple_ar.report.projection; "
             "assert 'simple_ar.app.research_report' not in sys.modules"
         )

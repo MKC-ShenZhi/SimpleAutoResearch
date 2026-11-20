@@ -9,7 +9,6 @@ import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
-from simple_ar.app.research_application import create_session, load_session, ResearchApplicationServices
 from simple_ar.research.workflow_contracts import ResearchBrief
 from simple_ar.result_analysis.table import (
     TableSpec, parse_table, describe_table, rebuild, copy_analysis_package,
@@ -129,41 +128,6 @@ class TableAnalysisTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Data actions require'):
             build_task_plan(replace(request, use_llm=True, llm_client=client))
 
-    def test_snapshot_survives_changed_deleted_input_and_moved_rebuild(self):
-        import shutil
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = root / 'observations.csv'
-            source.write_text('group,value\nA,1\nA,3\nB,-2\n', encoding='utf-8')
-            config = {'research_task_kind': 'data_analysis', 'data_analysis': {
-                'file': str(source), 'value_columns': ['value'], 'group_column': 'group', 'observation_unit': 'one run'}}
-            brief = ResearchBrief(request_text='Describe supplied values', requested_outputs=('data_analysis',),
-                                  asset_requests=({'locator': str(source), 'kind': 'file', 'role': 'dataset'},))
-            app = create_session(brief, root=root / 'session', services=ResearchApplicationServices(config=config))
-            view = app.advance(max_actions=2)
-            self.assertEqual(view.next_action, 'data_analysis', view.status_reason)
-            source.write_text('group,value\nA,999\n', encoding='utf-8')
-            source.unlink()
-            app = load_session(root / 'session')
-            view = app.advance()
-            self.assertEqual(view.status, 'completed', view.status_reason)
-            self.assertEqual([step['action'] for step in view.work_plan['steps']], ['data_ingest', 'data_analysis'])
-            self.assertNotIn('experiment', view.state_refs)
-            ref = view.state_refs['data_analysis']
-            result = app.controller.store.read_json(ref)
-            self.assertEqual(result['records'][0]['mean'], 2)
-            output = (root / 'session' / ref.path).parent
-            self.assertEqual((output / 'input.csv').read_bytes(), b'group,value\nA,1\nA,3\nB,-2\n')
-            for figure in result['figures']:
-                ET.parse(output / figure['path'])
-            moved = root / 'delivery'
-            shutil.copytree(output, moved)
-            shutil.rmtree(root / 'session')
-            rebuild(moved / 'analysis.json')
-            (moved / 'input.csv').write_text('group,value\nA,999\n', encoding='utf-8')
-            with self.assertRaisesRegex(ValueError, 'no longer matches'):
-                rebuild(moved / 'analysis.json')
-
     def test_plot_packages_preserve_formats_on_move_rebuild_and_writing_import(self):
         from simple_ar.core.budget import BudgetLedger
         from simple_ar.tools.analysis import AnalysisToolGateway
@@ -229,23 +193,6 @@ class TableAnalysisTests(unittest.TestCase):
                 with self.subTest(extra=extra), patch('sys.stdin.isatty', return_value=False), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(ValueError):
                     prepare_start(build_parser().parse_args([*base, *extra]))
             self.assertFalse((root / 'runs').exists())
-
-    def test_byte_snapshot_keeps_bom_crlf_and_quoted_multiline_labels(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            raw = b'\xef\xbb\xbfgroup,value\r\n"line one\r\nline two",2\r\n'
-            source = root / 'source.csv'
-            source.write_bytes(raw)
-            brief = ResearchBrief(request_text='Describe', requested_outputs=('data_analysis',))
-            config = {'research_task_kind': 'data_analysis', 'data_analysis': {
-                'file': str(source), 'value_columns': ['value'], 'group_column': 'group', 'observation_unit': 'one observation'}}
-            app = create_session(brief, root=root / 'session', services=ResearchApplicationServices(config=config))
-            view = app.advance(max_actions=10)
-            self.assertEqual(view.status, 'completed', view.status_reason)
-            result = app.controller.store.read_json(view.state_refs['data_analysis'])
-            output = (root / 'session' / view.state_refs['data_analysis'].path).parent
-            self.assertEqual((output / 'input.csv').read_bytes(), raw)
-            self.assertEqual(result['records'][0]['group'], 'line one\r\nline two')
 
     def test_figures_keep_all_categories_negative_values_and_xml_escaping(self):
         from simple_ar.report.figures import render_table_figures

@@ -81,7 +81,6 @@ CHECK_GROUPS: dict[str, CheckGroup] = {
             "tests.test_document_ports",
             "tests.test_synthesis_capability",
             "tests.test_research_brief",
-            "tests.test_research_application",
             "tests.test_analysis_capability",
             "tests.test_experiment_capability",
             "tests.test_report_ports",
@@ -115,7 +114,7 @@ CHECK_GROUPS: dict[str, CheckGroup] = {
     ),
     "application": CheckGroup(
         description="Current work loop, delivery and recovery; historical application compatibility.",
-        targets=("tests.test_research_intake", "tests.test_research_application", "tests.test_idea_assessment", "tests.test_research_design", "tests.test_session_migration", "tests.test_tool_agent_handoff",
+        targets=("tests.test_research_intake", "tests.test_idea_assessment", "tests.test_research_design", "tests.test_session_migration", "tests.test_tool_agent_handoff",
                  "tests.test_professional_work_loop", "tests.test_goal_work_method", "tests.test_delivery_review", "tests.test_working_context"),
     ),
     "llm": CheckGroup(

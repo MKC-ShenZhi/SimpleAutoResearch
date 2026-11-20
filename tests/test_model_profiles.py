@@ -748,21 +748,6 @@ class ModelProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(LLMError, 'Named models require'):
             LLMClient.from_env('profile:writer', fallback_models_config=hint)
 
-    def test_saved_session_rejects_connection_drift_before_execution(self):
-        from simple_ar.app.research_application import (
-            create_session, load_session, ResearchApplicationServices, ResearchApplicationError)
-        from simple_ar.research.workflow_contracts import ResearchBrief
-        root = self.root / "session"
-        create_session(ResearchBrief(request_text="Compare supplied evidence", requested_outputs=("summary",)),
-                       root=root, services=ResearchApplicationServices(llm_client=LLMClient.from_env()))
-        os.environ["WRITER_KEY"] = "rotated"
-        restored = load_session(root, services=ResearchApplicationServices(llm_client=LLMClient.from_env()))
-        restored.require_llm_binding()
-        self._write_catalog("writer-model", "changed-model")
-        changed = load_session(root, services=ResearchApplicationServices(llm_client=LLMClient.from_env()))
-        with self.assertRaisesRegex(ResearchApplicationError, "connections differ"):
-            changed.require_llm_binding()
-
     def test_explicit_code_connection_survives_nested_task_clients(self):
         self._write_catalog('code = "coder"', 'code = "writer"')
         chosen = LLMClient.from_env(model="profile:coder", purpose="code")

@@ -127,37 +127,5 @@ class PairedTableTests(unittest.TestCase):
             self.assertEqual(defaults['value_column'], ['baseline', 'candidate'])
             self.assertTrue(any('baseline' in call.args[0] and "'3'" in call.args[0] for call in printed.call_args_list))
 
-    def test_paired_package_reaches_material_writer_as_recomputed_evidence(self):
-        from simple_ar.app.research_application import ResearchApplicationServices, create_session
-        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
-        from simple_ar.research.workflow_contracts import ResearchBrief
-        from simple_ar.research.documents.ingest import DocumentBundle, DocumentIngestRequest, run_document_ingest_capability
-        from simple_ar.research.contracts import SourcePlan
-        from simple_ar.report.projection import build_material_report_inputs
-        from simple_ar.report.narrative import _compact_execution_results
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = root / 'input.json'
-            source.write_text(json.dumps(self.rows))
-            app = create_session(ResearchBrief(request_text='Compare matched observations', requested_outputs=('data_analysis',)),
-                root=root / 'session', services=ResearchApplicationServices(config={
-                    'research_task_kind': 'data_analysis', 'data_analysis': {'file': str(source), **asdict(self.spec)}}))
-            view = app.advance(max_actions=10)
-            self.assertEqual(view.status, 'completed', view.status_reason)
-            package = app.controller.store.resolve(view.state_refs['data_analysis'])
-            store = ArtifactStore(root / 'material')
-            result = run_document_ingest_capability(context=CapabilityContext(store=store, attempt=AttemptManifest('ingest')),
-                request=DocumentIngestRequest(papers=(), source_plan=SourcePlan(queries=[], local_documents=[]),
-                    extraction_dir=root / 'extraction', analysis_paths=(package,)))
-            bundle = DocumentBundle.from_handoff_dict(store.read_json(result.artifacts[0]))
-            context, _ = build_material_report_inputs(topic='Paired observations', documents=bundle, documents_ref=result.artifacts[0], assets=())
-            full_pair = context.results['supplied_analyses'][0]['paired_comparisons'][0]
-            self.assertEqual(full_pair['mean_difference'], 2)
-            projection = _compact_execution_results(context.results)['supplied_analyses'][0]['paired_comparisons'][0]
-            self.assertEqual(projection['standard_error'], 1)
-            self.assertNotIn('differences', projection)
-
-
-
 if __name__ == "__main__":
     unittest.main()
