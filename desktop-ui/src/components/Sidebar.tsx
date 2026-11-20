@@ -93,7 +93,7 @@ export function Sidebar({
       <div className="flex items-center justify-between px-4 pt-4 pb-3">
         <div className="flex items-center gap-2.5 min-w-0">
           <img
-            src="/desktop/logo.png"
+            src="/desktop/logo.svg"
             alt="SimpleAutoResearch"
             className="h-7 w-7 shrink-0 rounded-lg shadow-sm"
           />
