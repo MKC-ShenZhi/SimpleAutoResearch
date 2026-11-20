@@ -143,26 +143,26 @@ class ReportDelivery(BaseModel):
     manuscript: str | None = None
     formats: list[Literal['markdown','tex','pdf']] = Field(default_factory=list,max_length=3,
         exclude_if=lambda value:not value,
-        description='Claimed output formats (pdf/tex require matching export).')
+        description='Requested output formats claimed by this delivery. PDF/TeX require a current publication of this manuscript. Empty retains historical declarations.')
 
 
 class DeliveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     summary: str = Field(min_length=1)
     summary_source: FileWindow | None = Field(default=None, exclude_if=lambda value: value is None,
-        description='Optional UTF-8 window of a delivered text file to use as summary.')
+        description='Optional exact UTF-8 window of an actual delivered text file. After final work succeeds, the delivery owner replaces summary with this window and checks its existing delivery byte binding. No semantic representativeness or scientific correctness is certified. Omit to retain the free summary contract.')
     artifacts: list[str] = Field(default_factory=list,
-        description='Existing workspace or evidence-mount file/directory paths to deliver (max 200 files/dir).')
+        description="Existing workspace outputs (workspace-relative or explicitly mounted paths) or retained files in this task's evidence mount. Evidence remains read-only and is not certified. Directories expand to at most 200 accessible files; private paths, environments, bytecode caches and symlinks are excluded by existing inventory rules. New formal deliveries retain exact selected file bytes at the original terminal attempt. Storage failure prevents commit. Old deliveries without retained bytes are not reconstructed. This is not a whole-workspace archive or correctness certificate.")
     project_root: str | None = Field(default=None, min_length=1, exclude_if=lambda value: value is None,
-        description='Optional workspace project root for later reuse.')
+        description='Optional workspace project root for later reuse. Only delivered artifacts below this root are included; other files, permissions and execution state are not transferred. State missing dependencies or data in the delivery when relevant.')
     unresolved: list[str] = Field(default_factory=list,
-        description='Unfinished requested work or open required defects (nonempty makes delivery partial).')
+        description='Requested work still unfinished or a required defect still unresolved; nonempty makes delivery partial. Put inherent evidence limits in limitations instead.')
     limitations: list[str] = Field(default_factory=list,exclude_if=lambda value:not value,
-        description='Scope, evidence limits, or uncertainty in completed work.')
+        description='Scope, unavailable evidence and uncertainty honestly stated in the completed work. These do not by themselves mean the requested task is unfinished, and cannot waive required findings.')
     independent_review: bool | None = Field(default=None, exclude_if=lambda value: value is None,
-        description='Omit or true to request independent review; false only when allowed and unnecessary.')
+        description='For tasks that allow a review decision, set false only when independent review is unnecessary for the request and result. Omit or set true to request it. This cannot waive required findings or change saved task policies.')
     report: ReportDelivery | None = Field(default=None, exclude_if=lambda value: value is None,
-        description='Optional formal report manuscript and requested formats.')
+        description='For a formal report, identify the current editable manuscript and requested formats. Canonical means current required checks passed; candidate means unfinished work disclosed. Publication must match that manuscript; no scientific certification.')
 
     @field_serializer('summary_source')
     def serialize_summary_source(self, value: FileWindow | None) -> dict[str, Any] | None:
@@ -174,26 +174,28 @@ class DeliveryRequest(BaseModel):
 class CandidateReviewRequest(DeliveryRequest):
     """Investigate available work without claiming a completed delivery."""
     review_scope: Literal['candidate', 'delivery'] = Field(default='candidate',
-        description='candidate for partial work review; delivery for final complete delivery.')
+        description='Use candidate to investigate the selected work without claiming the whole task is ready; '
+        'use delivery only when this claim and inventory are intended as the complete final delivery. '
+        'If omitted for a new model decision, the review covers the candidate.')
     summary: str = Field(min_length=1,
-        description='Claim to investigate in the candidate.')
+        description='The current claim to investigate in the available candidate, not a declaration that the task is complete.')
     artifacts: list[str] = Field(min_length=1,
-        description='At least one existing workspace or evidence file to investigate.')
+        description='Select at least one actual existing workspace output or retained task-evidence file to investigate now. Do not list planned or missing files. A complete final inventory, finished publication and producer self-audit are not prerequisites. Existing path permissions and bounded directory expansion still apply.')
     unresolved: list[str] = Field(default_factory=list,
-        description='Known unfinished work or open defects.')
+        description='Known requested work or required corrections still unfinished. These gaps do not prevent independent investigation of the available candidate.')
     limitations: list[str] = Field(default_factory=list, exclude_if=lambda value: not value,
-        description='Known evidence limits or uncertainty.')
+        description='Known evidence limits, scope and uncertainty relevant to the current claim; these do not certify correctness or waive required findings.')
     independent_review: Literal[True] | None = Field(default=None, exclude_if=lambda value: value is None,
-        description='Always requests independent review.')
+        description='An explicit candidate review always requests independent investigation.')
 
 
 class ReviewedDeliveryRequest(DeliveryRequest):
     """Deliver a new claim, or select an existing independently reviewed one."""
 
-    summary: str = Field(default='', description='Completion claim; omit when using reviewed_candidate.')
+    summary: str = Field(default='', description='Completion claim; omit when selecting a reviewed candidate.')
     reviewed_candidate: str | None = Field(default=None, min_length=1,
         exclude_if=lambda value: value is None,
-        description='Passed delivery-scope review_result record/id to deliver unchanged (omit other fields).')
+        description='A passed delivery-scope review_result record or inspection identity. Deliver its unchanged complete claim and inventory without copying them. A local candidate review cannot represent the full delivery. Omit all other delivery fields when using this.')
 
     @model_validator(mode='after')
     def select_claim(self) -> 'ReviewedDeliveryRequest':
@@ -250,9 +252,9 @@ def prepared_report_delivery_schema(schema: dict, field: str) -> None:
 
 class _Write(_Path):
     content: str = Field(max_length=256000)
-    expected_sha256: str = Field(default="", description="Observed SHA256 when replacing an existing file; empty for new.")
+    expected_sha256: str = Field(default="", description="Current digest required before replacing an existing file; empty for a new file.")
     delivery: DeliveryRequest | None = Field(default=None,
-        description="Optional final delivery when this write finishes the task.")
+        description="Optional explicit final delivery when this write finishes the task. Include this file and actual existing artifacts; disclose unresolved work. Does not certify scientific correctness. Saves the normal delivery manifest without another model turn.")
 
 
 class _Replacement(BaseModel):
@@ -321,19 +323,20 @@ class _Run(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     argv: list[str] = Field(min_length=1, max_length=40)
     literal_argv: bool = Field(default=False, exclude_if=lambda value: not value,
-        description='Pass literal OS argv without mount-alias expansion.')
+        description='Use literal OS arguments relative to cwd, without mount-alias expansion. Bare python/python3 still selects the task interpreter. Does not add authority or sandboxing.')
     host_access: bool = Field(default=False, exclude_if=lambda value: not value,
-        description='Request unsandboxed host execution (e.g. GPU/network); requires approval.')
+        description='Request host execution when the task needs resources outside the workspace boundary, such as GPU or network. Requires explicit approval of this command; the host process is not sandboxed.')
     cwd: str = "workspace"
-    timeout_sec: int = Field(default=60, ge=1, description='Wall-clock timeout in seconds.')
+    timeout_sec: int = Field(default=60, ge=1,
+        description='Positive wall-clock timeout; the task process budget and execution approval still apply.')
     inputs: list[str] = Field(default_factory=list, max_length=64, exclude_if=lambda value: not value,
-        description='Optional existing input files read by this command (max 64 MiB total).')
+        description='Optional existing regular-file inputs read at the start, including pre-existing scripts and data. An in-place edit can declare the same file as input and output. Files created by this command are outputs, even if the command later uses them. No dependency inference or extra permission. At most 64 MiB total per binding.')
     input_snapshot: dict[str, str] | None = Field(default=None, exclude_if=lambda value: value is None,
-        description='Optional implementation execution owner reference.')
+        description='Internal reference to an approved implementation execution owner; not an additional input or authority grant.')
     outputs: list[str] = Field(default_factory=list, max_length=64, exclude_if=lambda value: not value,
-        description='Optional workspace output file paths created by this command.')
+        description='Optional explicit workspace regular-file output locators. Bytes captured only after success in the process receipt; directories/globs are not expanded. Does not require other commands to declare outputs or certify correctness.')
     delivery: DeliveryRequest | None = Field(default=None, exclude_if=lambda value: value is None,
-        description='Optional final delivery if this command succeeds and finishes the task.')
+        description="Optional explicit final delivery after this authorized process succeeds. Select actual output paths, including files produced by the command, and disclose unresolved work. Nonzero exit, stopping or missing artifacts never delivers. Does not certify scientific correctness. Use only as the last action, not instead of inspecting unknown results.")
 
 
 class _Question(BaseModel):

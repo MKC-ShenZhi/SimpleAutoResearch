@@ -1148,44 +1148,7 @@ class _ToolMessagesMixin:
             calls = {call['id']: call for call in reply.get('tool_calls', [])}
             results = {item['id']: item for item in turn['tools']}
             complete = not turn.get('remaining') and set(calls) == set(results)
-            projected_reply = reply
-            if position < len(turns) - 1 and complete and reply.get('tool_calls'):
-                new_calls = None
-                for idx, call in enumerate(reply['tool_calls']):
-                    fn = call.get('function') or {}
-                    if fn.get('name') != 'write_file':
-                        continue
-                    item = results.get(call.get('id'))
-                    if not item:
-                        continue
-                    res = self._decision_record(item['result'], decision_views)
-                    if res.get('status') != 'ok':
-                        continue
-                    raw_args = fn.get('arguments')
-                    if not isinstance(raw_args, str) or len(raw_args) <= 2000:
-                        continue
-                    try:
-                        parsed = json.loads(raw_args)
-                    except (ValueError, TypeError):
-                        continue
-                    content_val = parsed.get('content')
-                    if isinstance(content_val, str) and len(content_val) > 2000:
-                        if new_calls is None:
-                            new_calls = list(reply['tool_calls'])
-                        compact_args = {
-                            **parsed,
-                            'content': (
-                                f"<omitted {len(content_val)} chars already written to "
-                                f"{parsed.get('path', '')}; use read_file or read_history if needed>"
-                            ),
-                        }
-                        new_calls[idx] = {
-                            **call,
-                            'function': {**fn, 'arguments': json.dumps(compact_args, ensure_ascii=False)},
-                        }
-                if new_calls is not None:
-                    projected_reply = {**reply, 'tool_calls': new_calls}
-            block.append(projected_reply)
+            block.append(reply)
             operations, supplied, presented_results = [], [], {}
             for call_id in [*results, *(key for key in calls if key not in results)]:
                 call = calls[call_id]
