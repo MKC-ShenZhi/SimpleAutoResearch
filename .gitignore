@@ -24,6 +24,7 @@ wheels/
 .tmp_tests/
 .simple_ar_cache/
 .tmp_codex_tests/
+desktop-ui/node_modules/
 
 # Runtime outputs
 .local/

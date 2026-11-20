@@ -126,6 +126,65 @@ class Workspace:
                 continue
         return rows
 
+    def model_settings(self) -> dict:
+        import os
+        from simple_ar.integrations.model_credentials import read_key
+        from simple_ar.integrations.model_settings import read_settings, settings_path
+
+        path = settings_path()
+        raw, catalog = read_settings(path)
+        default_text = None
+        if catalog:
+            try:
+                default_text = catalog.select(purpose='text')[0]
+            except ValueError:
+                default_text = None
+        items = []
+        for name, profile in (catalog.profiles.items() if catalog else []):
+            env_name = profile.api_key_env or ''
+            if env_name and os.environ.get(env_name, '').strip():
+                cred = 'env'
+            elif env_name and read_key(env_name, profile.base_url):
+                cred = 'keyring'
+            else:
+                cred = 'missing'
+            items.append(dict(
+                name=name,
+                api=profile.api,
+                base_url=profile.base_url,
+                model=profile.model,
+                api_key_env=env_name,
+                capabilities=list(profile.capabilities),
+                credential_source=cred,
+                is_default=name == default_text,
+            ))
+        return dict(
+            path=str(path),
+            catalog_sha256=hashlib.sha256(raw).hexdigest(),
+            default_text=default_text,
+            profiles=items,
+        )
+
+    def save_model_profile(self, data: dict) -> dict:
+        from simple_ar.integrations.model_settings import read_settings, save_profile, settings_path
+
+        path = settings_path()
+        raw, _ = read_settings(path)
+        expected_sha = data.get('catalog_sha256')
+        if expected_sha and hashlib.sha256(raw).hexdigest() != expected_sha:
+            raise ValueError('模型目录已变化，请刷新设置后重试。')
+        save_profile(
+            path,
+            raw,
+            name=str(data.get('name', '')),
+            endpoint=str(data.get('base_url', '')),
+            model=str(data.get('model', '')),
+            reference=str(data.get('api_key_env', '')),
+            key=str(data.get('api_key', '')),
+            default=bool(data.get('default', False)),
+        )
+        return dict(settings=self.model_settings(), profiles=self.profiles())
+
     def creation_defaults(self) -> dict:
         args = native_arguments()
         options = native_creation_options(args)
@@ -444,6 +503,8 @@ class Workspace:
     def mutate(self, data: dict) -> dict:
         op = data['op']
         name = data.get('task', '')
+        if op == 'save_model_profile':
+            return self.save_model_profile(data)
         if op == 'feedback':
             root = self.task(name)
             for path in ('session_manifest.json', 'actions.json',
@@ -604,12 +665,31 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
                     self.send(200, (Path(__file__).parent / 'ui_assets' / filename).read_bytes(),
                               mimetypes.guess_type(filename)[0] or 'text/plain')
                     return
+                if url.path == '/desktop' or url.path.startswith('/desktop/'):
+                    if self.headers.get('Host') != self.server.authority:
+                        raise PermissionError
+                    assets_root = (Path(__file__).parent / 'desktop_assets').resolve()
+                    rel = url.path[len('/desktop/'):] if url.path.startswith('/desktop/') else ''
+                    target = bounded(assets_root / (rel or 'index.html'), assets_root)
+                    if not target.is_file():
+                        target = bounded(assets_root / 'index.html', assets_root)
+                    mime = mimetypes.guess_type(target.name)[0] or 'application/octet-stream'
+                    if target.suffix.lower() in {'.js', '.mjs'}:
+                        mime = 'application/javascript; charset=utf-8'
+                    elif target.suffix.lower() == '.css':
+                        mime = 'text/css; charset=utf-8'
+                    elif target.suffix.lower() == '.html':
+                        mime = 'text/html; charset=utf-8'
+                    self.send(200, target.read_bytes(), mime)
+                    return
                 self.guard()
                 q = {k: v[0] for k, v in parse_qs(url.query, keep_blank_values=True).items()}
                 if url.path == '/api/meta':
                     self.send(200, dict(project=str(workspace.project), reads=list(map(str, workspace.reads)),
                                         tasks=str(workspace.tasks), profiles=workspace.profiles(),
                                         creation_defaults=workspace.creation_defaults()))
+                elif url.path == '/api/model-settings':
+                    self.send(200, workspace.model_settings())
                 elif url.path == '/api/tasks':
                     self.send(200, workspace.listing())
                 elif url.path == '/api/task':
@@ -658,6 +738,7 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
                 self.send(400, {'error': 'Unavailable record, path or configuration; inspect launch grants and original task'})
 
         def do_POST(self):
+            op = None
             try:
                 self.guard(mutation=True)
                 if self.path != '/api/action' or self.headers.get_content_type() != 'application/json':
@@ -666,9 +747,15 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
                 if not 0 < size <= 65536:
                     raise ValueError
                 data = json.loads(self.rfile.read(size))
+                op = data.get('op') if isinstance(data, dict) else None
                 self.send(200, workspace.mutate(data))
             except PermissionError:
                 self.send(403, {'error': 'Local host/origin/session protection rejected request'})
+            except ValueError as exc:
+                if op == 'save_model_profile' and str(exc):
+                    self.send(400, {'error': public_text(str(exc))})
+                else:
+                    self.send(400, {'error': 'Action rejected; check confirmation, caps, current proposal and original task records'})
             except Exception:
                 self.send(400, {'error': 'Action rejected; check confirmation, caps, current proposal and original task records'})
 

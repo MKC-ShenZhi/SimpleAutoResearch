@@ -22,6 +22,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+desktop = ["pywebview>=5.3"]
 litellm = ["litellm>=1.86.2"]
 examples = ["scikit-learn>=1.8.0"]
 http2 = ["h2>=4,<5"]

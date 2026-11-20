@@ -16,6 +16,18 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 - Declared source summaries and table analyses can finish from saved results after interruption. Outstanding research and report requirements remain pending.
 - New sessions are listed once their initial records and ledger exist. Historical writing reuses the verified independent-review and delivery evidence for the same version.
 
+## 2026-11-20
+
+### Added
+
+- Rebuilt the local desktop workbench (`simple-ar-desktop`) with a modern React + Tailwind UI hosted in a native WebView2 window (`pywebview`), featuring dark/light themes, a three-pane layout (sessions sidebar, conversation & collapsible tool activity stream, and an on-demand artifact/file/ledger drawer), and inline Markdown, image, and paginated PDF previews.
+- Added an in-app Model & Connection Settings view backed by the shared `models.toml` catalog and Windows Credential Manager.
+
+### Fixed
+
+- Fixed lingering background `pythonw.exe` processes after closing the desktop window by shutting down the local HTTP server and signaling cooperative boundary pauses cleanly on exit.
+- Fixed an `AttributeError` when running workspace processes without a bound ledger, and included the `path` field in retained material observation checks to avoid false content-change rejections.
+
 ## 2026-11-18
 
 ### Improved
