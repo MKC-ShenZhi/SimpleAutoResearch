@@ -535,6 +535,31 @@ class Workspace:
                 else:
                     self.auto_approve.discard(name)
             return {'task': name, 'auto_approve': enabled}
+        if op in {'archive_task', 'delete_task'}:
+            if not name or name == '.':
+                raise ValueError('不能归档或删除当前任务根目录。')
+            root = self.task(name)
+            if not (root / 'session_manifest.json').is_file():
+                raise ValueError('目标不是有效的会话目录。')
+            with self.lock:
+                worker = self.workers.get(name)
+                if worker and worker[0].is_alive():
+                    raise ValueError('该会话正在运行，请先停止后再清理。')
+                self.auto_approve.discard(name)
+                self.errors.pop(name, None)
+                if op == 'archive_task':
+                    archive_dir = self.tasks / '.archived'
+                    archive_dir.mkdir(parents=True, exist_ok=True)
+                    dest = archive_dir / name
+                    if dest.exists():
+                        dest = archive_dir / f'{name}-{secrets.token_hex(3)}'
+                    root.rename(dest)
+                    return {'task': name, 'archived_to': str(dest)}
+                if data.get('confirmed') is not True:
+                    raise ValueError('彻底删除会话需要显式确认。')
+                import shutil
+                shutil.rmtree(root)
+                return {'task': name, 'deleted': True}
         if op == 'grant_access':
             root = self.task(name)
             with self.lock:
@@ -813,7 +838,7 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
             except PermissionError:
                 self.send(403, {'error': 'Local host/origin/session protection rejected request'})
             except ValueError as exc:
-                if op in {'save_model_profile', 'set_models_config_path', 'switch', 'grant_access'} and str(exc):
+                if op in {'save_model_profile', 'set_models_config_path', 'switch', 'grant_access', 'archive_task', 'delete_task'} and str(exc):
                     self.send(400, {'error': public_text(str(exc))})
                 else:
                     self.send(400, {'error': 'Action rejected; check confirmation, caps, current proposal and original task records'})

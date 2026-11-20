@@ -108,6 +108,40 @@ export function App() {
     notify('研究会话已创建并开始运行');
   };
 
+  const handleArchiveTask = async (name: string) => {
+    try {
+      await api.archiveTask(name);
+      if (activeTask === name) {
+        setActiveTask(null);
+        setSnapshot(null);
+        setDelivery(null);
+        setViewMode('new');
+        setDrawerOpen(false);
+      }
+      await loadMetaAndTasks();
+      notify('会话已归档至 runs/.archived/');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : '归档失败', 'error');
+    }
+  };
+
+  const handleDeleteTask = async (name: string) => {
+    try {
+      await api.deleteTask(name);
+      if (activeTask === name) {
+        setActiveTask(null);
+        setSnapshot(null);
+        setDelivery(null);
+        setViewMode('new');
+        setDrawerOpen(false);
+      }
+      await loadMetaAndTasks();
+      notify('会话已彻底删除');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : '删除失败', 'error');
+    }
+  };
+
   return (
     <div className="relative flex h-full w-full overflow-hidden">
       {/* Left Sidebar */}
@@ -124,6 +158,8 @@ export function App() {
             setDrawerOpen(false);
           }}
           onSelectTask={handleSelectTask}
+          onArchiveTask={handleArchiveTask}
+          onDeleteTask={handleDeleteTask}
           onOpenSettings={() => {
             setViewMode('settings');
             setDrawerOpen(false);

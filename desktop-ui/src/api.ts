@@ -130,6 +130,19 @@ export const api = {
       auto_approve: autoApprove,
     }),
 
+  archiveTask: (task: string) =>
+    apiPost<{ task: string; archived_to: string }>({
+      op: 'archive_task',
+      task,
+    }),
+
+  deleteTask: (task: string) =>
+    apiPost<{ task: string; deleted: boolean }>({
+      op: 'delete_task',
+      task,
+      confirmed: true,
+    }),
+
   approveExecution: (task: string, token: string, remember: boolean) =>
     apiPost<{ task: string; message: string }>({
       op: 'approve',

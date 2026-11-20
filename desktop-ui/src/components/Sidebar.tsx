@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import {
+  Archive,
   FolderOpen,
   Moon,
   PanelLeftClose,
@@ -8,6 +9,7 @@ import {
   Search,
   Settings,
   Sun,
+  Trash2,
 } from 'lucide-react';
 import type { MetaResponse, TaskListItem } from '../types';
 
@@ -20,6 +22,8 @@ interface SidebarProps {
   onToggleTheme: () => void;
   onNewResearch: () => void;
   onSelectTask: (task: string) => void;
+  onArchiveTask: (task: string) => Promise<void>;
+  onDeleteTask: (task: string) => Promise<void>;
   onOpenSettings: () => void;
   onRefresh: () => void;
   onCollapse: () => void;
@@ -56,11 +60,14 @@ export function Sidebar({
   onToggleTheme,
   onNewResearch,
   onSelectTask,
+  onArchiveTask,
+  onDeleteTask,
   onOpenSettings,
   onRefresh,
   onCollapse,
 }: SidebarProps) {
   const [query, setQuery] = useState('');
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -192,35 +199,95 @@ export function Sidebar({
           filtered.map((item) => {
             const selected = viewMode === 'session' && activeTask === item.task;
             const st = statusMeta(item.status, item.worker_live);
+            const confirming = confirmDelete === item.task;
             return (
-              <button
+              <div
                 key={item.task}
-                onClick={() => onSelectTask(item.task)}
-                className="group flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors cursor-pointer"
+                className="group relative rounded-lg transition-colors"
                 style={{
                   backgroundColor: selected ? 'var(--bg-surface-hover)' : 'transparent',
                 }}
               >
-                <span className="relative mt-1.5 flex h-2 w-2 shrink-0" title={st.label}>
-                  {st.pulse && (
-                    <span className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-75 ${st.color}`} />
-                  )}
-                  <span className={`relative inline-flex h-2 w-2 rounded-full ${st.color}`} />
-                </span>
-                <div className="min-w-0 flex-1">
-                  <div
-                    className="truncate text-[13px] font-medium leading-snug"
-                    style={{ color: selected ? 'var(--text-primary)' : 'var(--text-secondary)' }}
+                <div className="flex items-start gap-2.5 px-2.5 py-2">
+                  <button
+                    onClick={() => onSelectTask(item.task)}
+                    className="flex min-w-0 flex-1 items-start gap-2.5 text-left cursor-pointer"
                   >
-                    {item.topic || item.task}
-                  </div>
-                  <div className="mt-0.5 flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                    <span className="shrink-0 whitespace-nowrap">{st.label}</span>
-                    <span className="shrink-0">·</span>
-                    <span className="truncate font-mono">{item.task}</span>
-                  </div>
+                    <span className="relative mt-1.5 flex h-2 w-2 shrink-0" title={st.label}>
+                      {st.pulse && (
+                        <span className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-75 ${st.color}`} />
+                      )}
+                      <span className={`relative inline-flex h-2 w-2 rounded-full ${st.color}`} />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div
+                        className="truncate text-[13px] font-medium leading-snug"
+                        style={{ color: selected ? 'var(--text-primary)' : 'var(--text-secondary)' }}
+                      >
+                        {item.topic || item.task}
+                      </div>
+                      <div className="mt-0.5 flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                        <span className="shrink-0 whitespace-nowrap">{st.label}</span>
+                        <span className="shrink-0">·</span>
+                        <span className="truncate font-mono">{item.task}</span>
+                      </div>
+                    </div>
+                  </button>
+
+                  {item.task !== '.' && !item.worker_live && (
+                    <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void onArchiveTask(item.task);
+                        }}
+                        title="归档会话（移入 .archived/，可随时找回）"
+                        className="rounded p-1 hover:bg-white/10 cursor-pointer"
+                        style={{ color: 'var(--text-muted)' }}
+                      >
+                        <Archive className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setConfirmDelete(confirming ? null : item.task);
+                        }}
+                        title="彻底删除会话"
+                        className="rounded p-1 hover:bg-rose-500/15 hover:text-rose-400 cursor-pointer"
+                        style={{ color: 'var(--text-muted)' }}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  )}
                 </div>
-              </button>
+
+                {confirming && (
+                  <div
+                    className="mx-2 mb-2 flex items-center justify-between gap-2 rounded-lg border border-rose-500/35 bg-rose-500/10 px-2.5 py-1.5 text-[11.5px]"
+                  >
+                    <span className="text-rose-400">确认彻底删除？</span>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => setConfirmDelete(null)}
+                        className="rounded px-1.5 py-0.5 cursor-pointer"
+                        style={{ color: 'var(--text-secondary)' }}
+                      >
+                        取消
+                      </button>
+                      <button
+                        onClick={() => {
+                          setConfirmDelete(null);
+                          void onDeleteTask(item.task);
+                        }}
+                        className="rounded bg-rose-600 px-2 py-0.5 font-medium text-white hover:bg-rose-500 cursor-pointer"
+                      >
+                        删除
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
             );
           })
         )}
