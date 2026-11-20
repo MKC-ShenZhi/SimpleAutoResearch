@@ -66,10 +66,9 @@ class PublicationTemplate(BaseModel):
 
 class PublicationChecks(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
-    max_pages: int | None = Field(default=None, gt=0,
-        description='User-declared maximum for all PDF pages, including references and appendices; not an inferred venue policy.')
+    max_pages: int | None = Field(default=None, gt=0, description='User-declared max PDF pages.')
     forbidden_identifiers: list[str] | None = Field(default=None, min_length=1, max_length=32,
-        description='User-supplied exact case-sensitive Unicode literals, 1–32 unique nonblank strings of at most 200 characters without controls. Checks extracted text only; no regex, OCR or anonymity certification.')
+        description='User-supplied exact case-sensitive strings forbidden in extracted PDF text (1-32 items).')
 
     @model_validator(mode='after')
     def validate_rules(self) -> PublicationChecks:
@@ -79,27 +78,27 @@ class PublicationChecks(BaseModel):
 
 class PublicationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    markdown: str = Field(description="Workspace Markdown file. Local image paths are relative to it; modern tasks authorize referenced images through existing workspace/source grants. references.bib and trusted templates retain manuscript-directory scope.")
+    markdown: str = Field(description="Workspace Markdown manuscript path.")
     title: str = Field(default="", max_length=500)
     compile_pdf: bool = Field(default=True,
-        description='Compile the explicitly requested publication to PDF. Set false for an editable TeX project only. Ordinary Markdown/figure delivery does not require this export tool; the historical default within an export request is unchanged.')
+        description='Compile to PDF (true) or emit editable TeX project only (false).')
     layout: Literal['article', 'acm'] | None = Field(default=None,
         exclude_if=lambda value: value is None,
-        description='Built-in layout: article is a single-column report; acm is the ACM manuscript. Article selects pdfLaTeX or XeLaTeX with CTeX/Fandol from the content. Choose layout or a trusted template; omit both for historical ACM. This does not request export or certify quality.')
+        description='Built-in layout: article (single-column, auto XeLaTeX/CTeX) or acm. Mutually exclusive with template.')
     citation_style: Literal['numeric', 'template'] | None = Field(default=None,
         exclude_if=lambda value: value is None,
-        description='Optional publication presentation choice. Select numeric for readable bracketed numbers, including narrative citations and authorless sources; supplied templates must load natbib and the default bibliography style becomes plainurl (TeX urlbst package, retaining URL/DOI; a literal template style still owns its choice). Select template to explicitly honor template citation defaults (built-in ACM stays numeric). May be chosen from the ordinary publication goal; no hashes or source metadata edits needed. Omit/null preserves historical rendering, request bindings and manifest shape. Exact citekeys, BibTeX records and template class/body remain unchanged.')
+        description='Citation style: numeric (bracketed numbers) or template (honor template default).')
     caption_source: Literal['markdown', 'manifest', 'adjacent'] | None = Field(default=None,
         exclude_if=lambda value: value is None,
-        description='Choose figure captions in the Markdown image text, in figures/figures_manifest.json, or in the paragraph immediately following each image (adjacent). Adjacent paragraphs are complete captions, including any authored labels; their labels are not duplicated. Omit for the existing authoring owner (Markdown for an ordinary file); ordinary prose is never inferred to be a caption.')
+        description='Figure caption source: markdown image alt, figures_manifest.json, or adjacent paragraph.')
     checks: PublicationChecks | None = Field(default=None, exclude_if=lambda value: value is None,
-        description='Optional finite rules explicitly supplied by the user. Requires compile_pdf=true and installed Poppler tools. Missing tools, bounded-output failure or rule failure retain diagnostics and prevent final delivery. No automatic edits or recompile; absence of literals never certifies anonymity.')
+        description='Optional user-declared PDF checks (requires compile_pdf=true).')
     template: PublicationTemplate | None = Field(default=None,
-        description='Explicit user-provided trusted template bundle, mutually exclusive with layout. Omit both for the historical ACM manuscript layout. Compilation does not establish anonymous/page/official compliance.')
+        description='Optional trusted Pandoc template bundle (mutually exclusive with layout).')
     render_preview: bool = Field(default=False, exclude_if=lambda value: value is False,
-        description="Explicitly render every compiled PDF page with Poppler at 120 DPI, scaled to a maximum 1600 pixels per dimension. Requires compile_pdf=true. Returns PNG locators for optional inspect_images; rendering is not visual review. Incomplete previews prevent delivery. False preserves historical request bindings.")
+        description='Render compiled PDF pages to PNG previews (requires compile_pdf=true).')
     delivery: DeliveryRequest | None = Field(default=None,
-        description="Optional explicit final delivery after successful export/compilation. Exported files are added automatically; artifacts selects other already-existing outputs or retained task evidence. Disclose unresolved work. This does not certify scientific or visual quality. Request this operation alone when delivering.")
+        description='Optional final delivery after successful export/compilation (request alone).')
     @model_validator(mode="after")
     def validate_preview(self) -> PublicationRequest:
         if self.layout is not None and self.template is not None:
