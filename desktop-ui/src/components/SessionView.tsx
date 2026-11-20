@@ -14,6 +14,7 @@ import {
   Play,
   ShieldAlert,
   ShieldCheck,
+  Square,
   Terminal,
   Wrench,
   XCircle,
@@ -557,9 +558,32 @@ export function SessionView({
 
           {/* Running Indicator */}
           {snapshot.worker_live && (
-            <div className="flex items-center gap-2 text-[13px]" style={{ color: 'var(--text-muted)' }}>
-              <Loader2 className="h-4 w-4 animate-spin" style={{ color: 'var(--accent)' }} />
-              <span>研究任务正在推进中，界面将自动刷新最新回执与成果…</span>
+            <div
+              className="flex items-center justify-between rounded-xl border px-4 py-2.5 text-[13px]"
+              style={{
+                backgroundColor: 'var(--bg-surface)',
+                borderColor: 'var(--border-subtle)',
+                color: 'var(--text-secondary)',
+              }}
+            >
+              <div className="flex items-center gap-2">
+                <Loader2 className="h-4 w-4 animate-spin" style={{ color: 'var(--accent)' }} />
+                <span>
+                  {snapshot.stop_requested
+                    ? '已请求打断，正在当前操作边界安全保存并暂停…'
+                    : '研究任务正在推进中，界面将自动刷新最新回执与成果…'}
+                </span>
+              </div>
+              {!snapshot.stop_requested && (
+                <button
+                  onClick={handlePause}
+                  disabled={busy === 'stop'}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-rose-500/40 bg-rose-500/10 px-2.5 py-1 text-[12px] font-medium text-rose-400 hover:bg-rose-500/20 cursor-pointer"
+                >
+                  <Square className="h-3 w-3 fill-current" />
+                  <span>打断暂停</span>
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -689,19 +713,31 @@ export function SessionView({
                 </div>
               )}
 
-              <button
-                onClick={handleSendFeedback}
-                disabled={busy === 'feedback' || !feedback.trim()}
-                className="inline-flex items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-[12.5px] font-medium disabled:opacity-35 cursor-pointer"
-                style={{ backgroundColor: 'var(--btn-primary-bg)', color: 'var(--btn-primary-fg)' }}
-              >
-                {busy === 'feedback' ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <ArrowUp className="h-3.5 w-3.5" />
-                )}
-                <span>发送反馈</span>
-              </button>
+              {snapshot.worker_live && !feedback.trim() ? (
+                <button
+                  onClick={handlePause}
+                  disabled={busy === 'stop' || snapshot.stop_requested}
+                  title="在安全边界打断并暂停当前任务"
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-rose-500/40 bg-rose-500/15 px-3.5 py-1.5 text-[12.5px] font-medium text-rose-400 hover:bg-rose-500/25 disabled:opacity-50 cursor-pointer"
+                >
+                  <Square className="h-3.5 w-3.5 fill-current" />
+                  <span>{snapshot.stop_requested ? '暂停中…' : '停止'}</span>
+                </button>
+              ) : (
+                <button
+                  onClick={handleSendFeedback}
+                  disabled={busy === 'feedback' || !feedback.trim()}
+                  className="inline-flex items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-[12.5px] font-medium disabled:opacity-35 cursor-pointer"
+                  style={{ backgroundColor: 'var(--btn-primary-bg)', color: 'var(--btn-primary-fg)' }}
+                >
+                  {busy === 'feedback' ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <ArrowUp className="h-3.5 w-3.5" />
+                  )}
+                  <span>发送反馈</span>
+                </button>
+              )}
             </div>
           </div>
         </div>
