@@ -769,7 +769,7 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
             except PermissionError:
                 self.send(403, {'error': 'Local host/origin/session protection rejected request'})
             except ValueError as exc:
-                if op in {'save_model_profile', 'set_models_config_path'} and str(exc):
+                if op in {'save_model_profile', 'set_models_config_path', 'switch'} and str(exc):
                     self.send(400, {'error': public_text(str(exc))})
                 else:
                     self.send(400, {'error': 'Action rejected; check confirmation, caps, current proposal and original task records'})

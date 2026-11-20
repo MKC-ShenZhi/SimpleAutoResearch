@@ -71,9 +71,6 @@ export function SessionView({
   const [rejectReason, setRejectReason] = useState('');
   const [showRejectBox, setShowRejectBox] = useState(false);
 
-  const [showModelSwitch, setShowModelSwitch] = useState(false);
-  const [switchSelector, setSwitchSelector] = useState('');
-
   const statusBadge = formatStatus(snapshot.manifest.status, snapshot.worker_live);
   const usedTokens = snapshot.resources?.used?.total_tokens ?? 0;
   const usedCalls = snapshot.resources?.used?.llm_requests ?? 0;
@@ -150,17 +147,21 @@ export function SessionView({
     }
   };
 
-  const handleSwitchModel = async () => {
-    const profile = meta?.profiles.find((p) => p.selector === switchSelector);
-    if (!profile) return;
+  const handleSwitchModel = async (targetSelector: string) => {
+    const profile = meta?.profiles.find((p) => p.selector === targetSelector);
+    if (!profile || targetSelector === snapshot.model) return;
     try {
       setBusy('switch');
       await api.switchModel(snapshot.task, profile.selector, profile.binding_id, '桌面端切换模型');
-      setShowModelSwitch(false);
       onNotify(`已切换会话模型至 ${profile.model}`);
       await onReload();
     } catch (err) {
-      onNotify(err instanceof Error ? err.message : '切换模型失败', 'error');
+      const msg = err instanceof Error ? err.message : '切换模型失败';
+      if (msg.includes('Reconcile pending')) {
+        onNotify('当前会话存在未结算的失败/待处理调用，按账本安全规则暂不可直接换模；建议新建研究会话使用新模型。', 'error');
+      } else {
+        onNotify(msg, 'error');
+      }
     } finally {
       setBusy(null);
     }
@@ -199,71 +200,6 @@ export function SessionView({
             <span>{usedCalls} 次</span>
             <span>·</span>
             <span>{usedTokens.toLocaleString()} tok</span>
-          </div>
-
-          {/* Model Badge / Switcher */}
-          <div className="relative">
-            <button
-              onClick={() => {
-                setSwitchSelector(meta?.profiles[0]?.selector || '');
-                setShowModelSwitch((v) => !v);
-              }}
-              className="inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px] font-mono transition-colors cursor-pointer"
-              style={{
-                backgroundColor: 'var(--bg-surface)',
-                borderColor: 'var(--border-subtle)',
-                color: 'var(--text-secondary)',
-              }}
-              title="点击切换当前会话模型"
-            >
-              <Cpu className="h-3.5 w-3.5" />
-              <span className="max-w-[140px] truncate">{snapshot.model || '无模型'}</span>
-            </button>
-
-            {showModelSwitch && meta && (
-              <div
-                className="absolute right-0 top-full z-30 mt-1.5 w-72 rounded-xl border p-3 shadow-lg"
-                style={{
-                  backgroundColor: 'var(--bg-elevated)',
-                  borderColor: 'var(--border-strong)',
-                }}
-              >
-                <div className="mb-2 text-[12.5px] font-medium">切换会话模型（保留原账本）</div>
-                <select
-                  value={switchSelector}
-                  onChange={(e) => setSwitchSelector(e.target.value)}
-                  className="mb-2.5 w-full rounded-lg border px-2 py-1.5 text-[12.5px] font-mono outline-none"
-                  style={{
-                    backgroundColor: 'var(--bg-surface)',
-                    borderColor: 'var(--border-subtle)',
-                    color: 'var(--text-primary)',
-                  }}
-                >
-                  {meta.profiles.map((p) => (
-                    <option key={p.selector} value={p.selector}>
-                      {p.model} ({p.selector.replace('profile:', '')})
-                    </option>
-                  ))}
-                </select>
-                <div className="flex justify-end gap-1.5">
-                  <button
-                    onClick={() => setShowModelSwitch(false)}
-                    className="rounded-lg px-2.5 py-1 text-[12px] cursor-pointer"
-                    style={{ color: 'var(--text-muted)' }}
-                  >
-                    取消
-                  </button>
-                  <button
-                    onClick={handleSwitchModel}
-                    disabled={busy === 'switch' || !switchSelector}
-                    className="rounded-lg px-3 py-1 text-[12px] font-medium text-white cursor-pointer"
-                    style={{ backgroundColor: 'var(--accent)' }}
-                  >
-                    确认切换
-                  </button>
-                </div>
-              </div>
-            )}
           </div>
 
           {/* Pause / Resume Button */}
@@ -631,19 +567,56 @@ export function SessionView({
               <ShieldCheck className="h-3.5 w-3.5" />
               <span>本次修改要求独立复核</span>
             </button>
-            <button
-              onClick={handleSendFeedback}
-              disabled={busy === 'feedback' || !feedback.trim()}
-              className="inline-flex items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-[12.5px] font-medium disabled:opacity-35 cursor-pointer"
-              style={{ backgroundColor: 'var(--btn-primary-bg)', color: 'var(--btn-primary-fg)' }}
-            >
-              {busy === 'feedback' ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <ArrowUp className="h-3.5 w-3.5" />
+            <div className="flex items-center gap-2">
+              {meta && meta.profiles.length > 0 && (
+                <div
+                  className="inline-flex items-center gap-1.5 rounded-lg border px-2 py-1"
+                  style={{ borderColor: 'var(--border-subtle)', backgroundColor: 'var(--bg-app)' }}
+                  title="切换当前会话模型（保留原账本）"
+                >
+                  <Cpu className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--text-muted)' }} />
+                  <select
+                    value={snapshot.model || ''}
+                    disabled={busy === 'switch' || snapshot.worker_live}
+                    onChange={(e) => void handleSwitchModel(e.target.value)}
+                    className="max-w-[180px] bg-transparent text-[12px] font-mono outline-none cursor-pointer disabled:opacity-50"
+                    style={{ color: 'var(--text-primary)' }}
+                  >
+                    {snapshot.model && !meta.profiles.some((p) => p.selector === snapshot.model) && (
+                      <option
+                        value={snapshot.model}
+                        style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--text-primary)' }}
+                      >
+                        {snapshot.model}
+                      </option>
+                    )}
+                    {meta.profiles.map((p) => (
+                      <option
+                        key={p.selector}
+                        value={p.selector}
+                        style={{ backgroundColor: 'var(--bg-surface)', color: 'var(--text-primary)' }}
+                      >
+                        {p.model} ({p.selector.replace('profile:', '')})
+                      </option>
+                    ))}
+                  </select>
+                </div>
               )}
-              <span>发送反馈</span>
-            </button>
+
+              <button
+                onClick={handleSendFeedback}
+                disabled={busy === 'feedback' || !feedback.trim()}
+                className="inline-flex items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-[12.5px] font-medium disabled:opacity-35 cursor-pointer"
+                style={{ backgroundColor: 'var(--btn-primary-bg)', color: 'var(--btn-primary-fg)' }}
+              >
+                {busy === 'feedback' ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <ArrowUp className="h-3.5 w-3.5" />
+                )}
+                <span>发送反馈</span>
+              </button>
+            </div>
           </div>
         </div>
       </div>
