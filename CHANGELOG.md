@@ -5,23 +5,19 @@
 User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
-## Unreleased
-
-- Ctrl+C requests a work-boundary pause during ordinary terminal tasks. Resume with the existing task and ledger.
-- The retained delivery catalog identifies project methods by their delivered `SKILL.md` paths so a new task can select an earlier method before copying the project.
-- Resuming a declared measurement set completes a ready comparison in the original task using the recorded measurements and ledger.
-- Writing reuses material windows and bindings already checked during the same operation.
-- Interactive CodeTask execution confirms steps in the executor and can continue from a failed benchmark to requested diagnosis or repair using that run's records.
-- Report recovery reuses the saved assembly. A mismatch between the authored record and assembled body leaves the saved work available for inspection.
-- Declared source summaries and table analyses can finish from saved results after interruption. Outstanding research and report requirements remain pending.
-- New sessions are listed once their initial records and ledger exist. Historical writing reuses the verified independent-review and delivery evidence for the same version.
-
 ## 2026-11-20
 
 ### Added
 
 - Rebuilt the local desktop workbench (`simple-ar-desktop`) with a modern React + Tailwind UI hosted in a native WebView2 window (`pywebview`), featuring dark/light themes, a three-pane layout (sessions sidebar, conversation & collapsible tool activity stream, and an on-demand artifact/file/ledger drawer), and inline Markdown, image, and paginated PDF previews.
 - Added an in-app Model & Connection Settings view backed by the shared `models.toml` catalog and Windows Credential Manager.
+
+### Improved
+
+- Ordinary CLI tasks support Ctrl+C work-boundary pause and resume with the existing task and ledger.
+- The retained delivery catalog surfaces delivered `SKILL.md` paths so new tasks can pick a method version before adopting project outputs.
+- Interrupted declared measurements, source summaries, and table analyses can resume from saved receipts in the original session.
+- Writing and recovery reuse checked material windows and saved assemblies; interactive CodeTask execution confirms steps directly in the executor.
 
 ### Fixed
 
