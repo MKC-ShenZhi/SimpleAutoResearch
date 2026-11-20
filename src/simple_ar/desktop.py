@@ -124,6 +124,16 @@ def run(project_root: Path, read_roots: list[Path], task_root: Path, *, browser:
             "or launch with `--browser`."
         ) from exc
 
+    icon_path = Path(__file__).parent / "desktop_icon.ico"
+    icon_arg = str(icon_path) if icon_path.is_file() else None
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SimpleAutoResearch.Desktop")
+        except Exception:
+            pass
+
     bridge = _DesktopBridge(workspace.project)
     window = webview.create_window(
         title="SimpleAutoResearch",
@@ -136,6 +146,31 @@ def run(project_root: Path, read_roots: list[Path], task_root: Path, *, browser:
     )
     bridge.bind(window)
 
+    def _apply_windows_icon() -> None:
+        if os.name != "nt" or not icon_arg:
+            return
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = user32.FindWindowW(None, "SimpleAutoResearch")
+            if not hwnd:
+                return
+            IMAGE_ICON = 1
+            LR_LOADFROMFILE = 0x0010
+            LR_DEFAULTSIZE = 0x0040
+            WM_SETICON = 0x0080
+            hicon_small = user32.LoadImageW(None, icon_arg, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+            hicon_big = user32.LoadImageW(None, icon_arg, IMAGE_ICON, 32, 32, LR_LOADFROMFILE | LR_DEFAULTSIZE)
+            if hicon_small:
+                user32.SendMessageW(hwnd, WM_SETICON, 0, hicon_small)
+            if hicon_big:
+                user32.SendMessageW(hwnd, WM_SETICON, 1, hicon_big)
+        except Exception:
+            pass
+
+    def on_shown() -> None:
+        _apply_windows_icon()
+
     def on_closing() -> bool:
         with workspace.lock:
             running = any(thread.is_alive() for thread, _ in workspace.workers.values())
@@ -146,10 +181,11 @@ def run(project_root: Path, read_roots: list[Path], task_root: Path, *, browser:
                     stop.set()
         return True
 
+    window.events.shown += on_shown
     window.events.closing += on_closing
 
     try:
-        webview.start(debug=False)
+        webview.start(debug=False, icon=icon_arg)
     finally:
         _shutdown_workspace(httpd, workspace)
         # Ensure no lingering non-daemon threads keep pythonw.exe alive on Windows.

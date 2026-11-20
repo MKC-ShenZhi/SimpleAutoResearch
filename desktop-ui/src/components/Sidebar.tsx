@@ -1,6 +1,5 @@
 import { useMemo, useState } from 'react';
 import {
-  FlaskConical,
   FolderOpen,
   Moon,
   PanelLeftClose,
@@ -93,23 +92,13 @@ export function Sidebar({
       {/* Top Brand Bar */}
       <div className="flex items-center justify-between px-4 pt-4 pb-3">
         <div className="flex items-center gap-2.5 min-w-0">
-          <div
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-white shadow-sm"
-            style={{ backgroundColor: 'var(--accent)' }}
-          >
-            <FlaskConical className="h-4 w-4" />
-          </div>
+          <img
+            src="/desktop/logo.png"
+            alt="SimpleAutoResearch"
+            className="h-7 w-7 shrink-0 rounded-lg shadow-sm"
+          />
           <div className="flex items-baseline gap-1.5 min-w-0">
-            <span className="font-semibold tracking-tight text-[15px] truncate">SimpleAR</span>
-            <span
-              className="rounded px-1.5 py-0.5 text-[10px] font-medium tracking-wide uppercase"
-              style={{
-                backgroundColor: 'var(--accent-soft)',
-                color: 'var(--accent)',
-              }}
-            >
-              v2.10
-            </span>
+            <span className="font-semibold tracking-tight text-[15px] truncate">SimpleAutoResearch</span>
           </div>
         </div>
         <button
@@ -223,8 +212,8 @@ export function Sidebar({
                     {item.topic || item.task}
                   </div>
                   <div className="mt-0.5 flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
-                    <span>{st.label}</span>
-                    <span>·</span>
+                    <span className="shrink-0 whitespace-nowrap">{st.label}</span>
+                    <span className="shrink-0">·</span>
                     <span className="truncate font-mono">{item.task}</span>
                   </div>
                 </div>
