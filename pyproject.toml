@@ -17,6 +17,7 @@ dependencies = [
     "pypdf[fonts]>=6.19.0",
     "python-dotenv>=1.2.2",
     "rich>=15.0.0",
+    "tomlkit>=0.13",
     "tqdm>=4.67.3",
 ]
 
@@ -29,6 +30,7 @@ deepseek-tokenizer = ["deepseek-recipe>=0.2,<0.3"]
 [project.scripts]
 simple-ar = "simple_ar.cli.main:main"
 simple-ar-checks = "simple_ar.app.dev_checks:main"
+simple-ar-desktop = "simple_ar.desktop:main"
 
 [build-system]
 requires = ["hatchling"]
