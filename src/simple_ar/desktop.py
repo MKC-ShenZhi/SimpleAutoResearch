@@ -141,7 +141,7 @@ def run(project_root: Path, read_roots: list[Path], task_root: Path, *, browser:
         width=1360,
         height=860,
         min_size=(960, 640),
-        background_color="#141518",
+        background_color="#111113",
         js_api=bridge,
     )
     bridge.bind(window)

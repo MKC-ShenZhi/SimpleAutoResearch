@@ -491,8 +491,8 @@ export function NewResearchView({
               <button
                 onClick={handlePreview}
                 disabled={busy !== null || !goal.trim()}
-                className="inline-flex items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-[13px] font-medium text-white transition-opacity disabled:opacity-40 cursor-pointer"
-                style={{ backgroundColor: 'var(--accent)' }}
+                className="inline-flex items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-[13px] font-medium transition-opacity disabled:opacity-35 cursor-pointer"
+                style={{ backgroundColor: 'var(--btn-primary-bg)', color: 'var(--btn-primary-fg)' }}
               >
                 {busy === 'preview' ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -558,8 +558,8 @@ export function NewResearchView({
               <button
                 onClick={handleCreate}
                 disabled={busy === 'create'}
-                className="inline-flex items-center gap-1.5 rounded-lg px-4 py-1.5 text-[12.5px] font-medium text-white cursor-pointer"
-                style={{ backgroundColor: 'var(--accent)' }}
+                className="inline-flex items-center gap-1.5 rounded-lg px-4 py-1.5 text-[12.5px] font-medium cursor-pointer"
+                style={{ backgroundColor: 'var(--btn-primary-bg)', color: 'var(--btn-primary-fg)' }}
               >
                 {busy === 'create' && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                 <span>确认创建会话</span>

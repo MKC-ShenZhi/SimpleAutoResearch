@@ -117,9 +117,9 @@ export function Sidebar({
           onClick={onNewResearch}
           className="flex w-full items-center justify-center gap-2 rounded-xl border px-3 py-2 text-[13.5px] font-medium transition-all cursor-pointer"
           style={{
-            backgroundColor: viewMode === 'new' ? 'var(--accent-soft)' : 'var(--bg-surface)',
-            borderColor: viewMode === 'new' ? 'var(--accent)' : 'var(--border-subtle)',
-            color: viewMode === 'new' ? 'var(--accent)' : 'var(--text-primary)',
+            backgroundColor: viewMode === 'new' ? 'var(--bg-surface-hover)' : 'var(--bg-surface)',
+            borderColor: viewMode === 'new' ? 'var(--border-strong)' : 'var(--border-subtle)',
+            color: 'var(--text-primary)',
           }}
         >
           <Plus className="h-4 w-4" />

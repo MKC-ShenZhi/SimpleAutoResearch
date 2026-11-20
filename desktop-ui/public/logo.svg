@@ -1,25 +1,18 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
   <defs>
     <linearGradient id="sar-bg" x1="6" y1="4" x2="58" y2="60" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#17233d"/>
-      <stop offset="100%" stop-color="#0c1322"/>
+      <stop offset="0%" stop-color="#222226"/>
+      <stop offset="100%" stop-color="#111113"/>
     </linearGradient>
-    <linearGradient id="sar-stroke" x1="12" y1="14" x2="52" y2="50" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#60a5fa"/>
-      <stop offset="52%" stop-color="#38bdf8"/>
+    <linearGradient id="sar-stroke" x1="12" y1="16" x2="52" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#f4f4f5"/>
+      <stop offset="55%" stop-color="#d4d4d8"/>
       <stop offset="100%" stop-color="#2dd4bf"/>
-    </linearGradient>
-    <linearGradient id="sar-glow" x1="16" y1="16" x2="48" y2="48" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.22"/>
-      <stop offset="100%" stop-color="#2dd4bf" stop-opacity="0.06"/>
     </linearGradient>
   </defs>
 
-  <!-- App Icon Backdrop -->
-  <rect x="2" y="2" width="60" height="60" rx="15" fill="url(#sar-bg)" stroke="#2c3e63" stroke-width="1.5"/>
-  <rect x="5" y="5" width="54" height="54" rx="12" fill="url(#sar-glow)"/>
+  <rect x="2" y="2" width="60" height="60" rx="15" fill="url(#sar-bg)" stroke="#35353b" stroke-width="1.5"/>
 
-  <!-- Open Book Pages + Continuous Infinity Loop -->
   <path
     d="M32 23.5
        C28.5 18.2, 21.5 16.5, 14.5 17.8
@@ -38,23 +31,20 @@
     stroke-linejoin="round"
   />
 
-  <!-- Center Spine -->
-  <path d="M32 23.5 L32 33.2" stroke="url(#sar-stroke)" stroke-width="3.0" stroke-linecap="round"/>
+  <path d="M32 23.5 L32 33.2" stroke="#e4e4e7" stroke-width="3.0" stroke-linecap="round"/>
 
-  <!-- Crossing Infinity Curve -->
   <path
     d="M15.8 39.2
        C19.2 35.0, 26.2 35.4, 32 38.8
        C37.8 35.4, 44.8 35.0, 48.2 39.2"
-    stroke="url(#sar-stroke)"
+    stroke="#2dd4bf"
     stroke-width="3.4"
     stroke-linecap="round"
     stroke-linejoin="round"
   />
 
-  <!-- Minimal Page Lines (Left & Right) -->
-  <path d="M19.2 24.4 L25.6 25.5" stroke="#93c5fd" stroke-width="2.4" stroke-linecap="round" opacity="0.9"/>
-  <path d="M19.2 29.8 L25.0 30.8" stroke="#93c5fd" stroke-width="2.4" stroke-linecap="round" opacity="0.65"/>
+  <path d="M19.2 24.4 L25.6 25.5" stroke="#e4e4e7" stroke-width="2.4" stroke-linecap="round" opacity="0.85"/>
+  <path d="M19.2 29.8 L25.0 30.8" stroke="#a1a1aa" stroke-width="2.4" stroke-linecap="round" opacity="0.7"/>
   <path d="M44.8 24.4 L38.4 25.5" stroke="#5eead4" stroke-width="2.4" stroke-linecap="round" opacity="0.9"/>
-  <path d="M44.8 29.8 L39.0 30.8" stroke="#5eead4" stroke-width="2.4" stroke-linecap="round" opacity="0.65"/>
+  <path d="M44.8 29.8 L39.0 30.8" stroke="#2dd4bf" stroke-width="2.4" stroke-linecap="round" opacity="0.7"/>
 </svg>

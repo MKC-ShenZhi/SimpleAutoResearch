@@ -352,8 +352,8 @@ export function SettingsView({ onUpdated, onNotify }: SettingsViewProps) {
                 <button
                   type="submit"
                   disabled={saving}
-                  className="inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-[13px] font-medium text-white cursor-pointer disabled:opacity-50"
-                  style={{ backgroundColor: 'var(--accent)' }}
+                  className="inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-[13px] font-medium cursor-pointer disabled:opacity-50"
+                  style={{ backgroundColor: 'var(--btn-primary-bg)', color: 'var(--btn-primary-fg)' }}
                 >
                   {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                   <span>保存连接</span>

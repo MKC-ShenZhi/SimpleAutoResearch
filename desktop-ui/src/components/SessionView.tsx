@@ -280,8 +280,8 @@ export function SessionView({
             <button
               onClick={handleResume}
               disabled={busy === 'resume'}
-              className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[12.5px] font-medium text-white cursor-pointer disabled:opacity-50"
-              style={{ backgroundColor: 'var(--accent)' }}
+              className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[12.5px] font-medium cursor-pointer disabled:opacity-50"
+              style={{ backgroundColor: 'var(--btn-primary-bg)', color: 'var(--btn-primary-fg)' }}
             >
               {busy === 'resume' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
               <span>继续</span>
@@ -634,8 +634,8 @@ export function SessionView({
             <button
               onClick={handleSendFeedback}
               disabled={busy === 'feedback' || !feedback.trim()}
-              className="inline-flex items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-[12.5px] font-medium text-white disabled:opacity-40 cursor-pointer"
-              style={{ backgroundColor: 'var(--accent)' }}
+              className="inline-flex items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-[12.5px] font-medium disabled:opacity-35 cursor-pointer"
+              style={{ backgroundColor: 'var(--btn-primary-bg)', color: 'var(--btn-primary-fg)' }}
             >
               {busy === 'feedback' ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
