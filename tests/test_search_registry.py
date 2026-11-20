@@ -16,6 +16,22 @@ TEST_ROOT = Path(__file__).resolve().parents[1] / ".tmp_tests"
 
 
 class SearchProviderRegistryTests(unittest.TestCase):
+    def test_known_title_is_resolved_from_provider_results(self) -> None:
+        from simple_ar.research.connectors.arxiv import ArxivConnector
+
+        client = Mock()
+        title = 'Measuring uncertainty: A comparison'
+        client.search.return_value = [
+            Paper(id='other', title='A comparison of linear models', authors=[], abstract='', url=''),
+            Paper(id='matched', title='Measuring uncertainty — a comparison', authors=[], abstract='', url=''),
+        ]
+        registry = SearchProviderRegistry({'arxiv': lambda: ArxivConnector(client)})
+        result = search_sources(SearchRequest((title,), ('arxiv',), filters={'match_title': True}),
+            registry=registry)
+        client.search.assert_called_once_with(f'ti:"{title}"', max_results=10)
+        self.assertEqual([paper.id for paper in result.papers], ['matched'])
+        self.assertEqual([paper.id for paper in result.responses[0].papers], ['matched'])
+
     def test_native_temporal_filters_use_existing_connectors_and_http_params(self) -> None:
         from simple_ar.research.connectors.arxiv import ArxivConnector
         from simple_ar.research.connectors.openalex import OpenAlexConnector

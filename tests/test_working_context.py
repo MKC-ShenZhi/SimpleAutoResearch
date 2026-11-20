@@ -11,7 +11,8 @@ import unittest
 from unittest.mock import Mock, PropertyMock, patch
 
 from simple_ar.core.working_context import (
-    CITATION_HANDOFF_POLICY, TURN_SUPPLY_POLICY, current_material_paths, history_view, processed_journal_turns, select_working_context)
+    CITATION_HANDOFF_POLICY, TURN_SUPPLY_POLICY, current_material_paths, history_view,
+    processed_journal_turns, select_working_context, working_view_encoder)
 from simple_ar.app.work_memory import (
     _bound_response, compact_work, checkpoint_arguments, checkpoint_artifacts, checkpoint_decisions, checkpoint_entries, observation_digest,
     prepare_checkpoint_input, summary_coverage, validate_checkpoint_sources)
@@ -57,9 +58,21 @@ def expand_history_view(view):
 
 
 class WorkingContextTests(unittest.TestCase):
+    def test_failed_process_history_preserves_the_tail_without_claiming_output_success(self):
+        from simple_ar.app.task_view import history_observation
+
+        call = {'function': {'name': 'run_process', 'arguments': '{}'}}
+        output = 'progress\n' * 800 + 'Error: the upstream program exited before producing results'
+        result = {'tool_name': 'run_process', 'status': 'error', 'error': 'Declared artifact is missing',
+                  'data': {'returncode': 0, 'stdout': output, 'stderr': ''}}
+        fact = history_observation(call, result, 'attempts/native-tool-1/native_result.json')
+        self.assertEqual(fact['status'], 'error')
+        self.assertEqual(fact['observed']['returncode'], 0)
+        self.assertEqual(fact['observed']['stdout_tail']['text'], output[-512:])
+
     def test_work_view_serialization_preserves_material_selection(self):
         from simple_ar.app.professional_conversation import (
-            _working_view_encoder, prepare_recorded_work_messages, prepare_work_unit_messages)
+            prepare_recorded_work_messages, prepare_work_unit_messages)
         observations = [observation(i, ('内容 "quoted" \\ text ' * 40) + str(i)) for i in range(8)]
         arguments = dict(base_context={'permissions': {'write': ['outputs/']}, 'resources': {}},
             turn_blocks=[block(i, observations[i]['text']) for i in range(8)],
@@ -69,7 +82,7 @@ class WorkingContextTests(unittest.TestCase):
         for prepare in (prepare_recorded_work_messages, prepare_work_unit_messages):
             with self.subTest(prepare=prepare):
                 expected = select(**arguments, message_projector=prepare)
-                encode = _working_view_encoder()
+                encode = working_view_encoder()
                 actual = select(**arguments,
                     message_projector=lambda messages: prepare(messages, encode_context=encode))
                 self.assertEqual(actual, expected)

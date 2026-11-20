@@ -148,6 +148,18 @@ def _validate_schema(schema: dict, value: Any = None, *, check_value: bool = Fal
 class LocalExtension:
     """A normal domain owner; results and recovery remain controller artifacts."""
 
+    @classmethod
+    def register_task_packages(cls, config: dict, registry: Any, host_call: Any) -> list["LocalExtension"]:
+        """Register the saved extension contracts in their original order."""
+        protocol = config.get('extension_host_protocol')
+        if protocol not in {None, 'nested_calls.v1'}:
+            raise ValueError('Unknown saved extension host-call protocol')
+        extensions = [cls(item, host_call, host_protocol=protocol) for item in config.get('extensions', [])]
+        for extension in extensions:
+            extension.verify()
+            registry.register_package(extension.specs(), extension, request_visible=True)
+        return extensions
+
     def __init__(self, frozen: dict, host_call: Any, *, host_protocol: str | None = 'nested_calls.v1') -> None:
         # Keep caller-owned configuration and published schemas out of the saved identity.
         frozen = deepcopy(frozen)

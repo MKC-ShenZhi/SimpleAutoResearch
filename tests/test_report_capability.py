@@ -179,7 +179,7 @@ class ReportAuditCapabilityTests(unittest.TestCase):
             self.assertIn("baseline", text)
             self.assertIn("candidate", text)
             for suffix in ("pdf", "png"):
-                self.assertEqual(figure.exports[suffix], str(Path(figure.path).with_suffix("." + suffix)))
+                self.assertEqual(figure.exports[suffix], Path(figure.path).with_suffix("." + suffix).as_posix())
                 self.assertTrue((root / figure.exports[suffix]).is_file())
             self.assertIn("fraction", figure.title)
             self.assertIn(figure.path, result.report_markdown)

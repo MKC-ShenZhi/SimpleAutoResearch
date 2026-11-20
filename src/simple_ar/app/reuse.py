@@ -93,7 +93,7 @@ def _delivered_project_version(reader: RetainedDelivery) -> tuple[int, Path] | N
             or not reader.state['turns'][-1]['tools']
             or versions[-1]['observation'] != reader.state['turns'][-1]['tools'][-1]['result']):
         return None
-    groups, project = owner._material_groups(len(versions))
+    groups, project = owner._material_groups(versions[-1])
     if project is None or not groups.get('code_project'):
         return None
     return len(versions), reader.mounts['workspace'] / project

@@ -12,11 +12,9 @@ from unittest.mock import patch
 from simple_ar.app.research_application import ResearchApplicationServices
 from simple_ar.app.research_intake import (
     ResearchInputError,
-    create_research_task,
     create_structured_research_task,
     declared_research_work,
     revise_research_task,
-    start_research_task,
     normalize_assets,
     parse_research_input,
     validate_brief,
@@ -24,6 +22,7 @@ from simple_ar.app.research_intake import (
 )
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.integrations.llm import LLMClient
+from simple_ar.research import create_research_task, load_research_task, start_research_task
 from simple_ar.research.sources import SearchProviderRegistry
 from simple_ar.research.workflow_contracts import ResearchBrief
 
@@ -67,6 +66,39 @@ def _reply(name, arguments):
 
 
 class ResearchIntakeTests(unittest.TestCase):
+    def test_research_creation_publishes_only_with_inputs_and_ledger(self):
+        from simple_ar.app.research_application import create_session
+        from simple_ar.core.capabilities import ArtifactStore
+
+        write = ArtifactStore.write_json
+        brief = ResearchBrief(request_text='Inspect a research task.')
+        for create, first_input in (
+                (create_research_task, 'inputs/research_assets.json'),
+                (create_session, 'inputs/runtime_config.json')):
+            with self.subTest(entry=create.__name__), TemporaryDirectory() as directory:
+                root = Path(directory) / 'session'
+
+                def interrupted(store, name, payload, **options):
+                    if name == first_input:
+                        self.assertFalse((root / 'session_manifest.json').exists())
+                        raise OSError('Interrupted initialization')
+                    return write(store, name, payload, **options)
+
+                with patch.object(ArtifactStore, 'write_json', interrupted), self.assertRaisesRegex(
+                        OSError, 'Interrupted initialization'):
+                    create(brief, root=root)
+                self.assertFalse((root / 'session_manifest.json').exists())
+
+                def check_first_manifest(store, name, payload, **options):
+                    if name == 'session_manifest.json' and not (root / name).exists():
+                        self.assertTrue({'brief', 'assets'} <= payload['state_refs'].keys())
+                        self.assertTrue((root / payload['budget_ledger_ref']['path']).is_file())
+                    return write(store, name, payload, **options)
+
+                with patch.object(ArtifactStore, 'write_json', check_first_manifest):
+                    create(brief, root=root)
+                self.assertTrue((root / 'session_manifest.json').is_file())
+
     def test_legacy_execution_context_reaches_common_research_and_survives_reload(self):
         from simple_ar.tools.sources import SourcePolicy
 
@@ -78,7 +110,7 @@ class ResearchIntakeTests(unittest.TestCase):
             })
             app = create_research_task(ResearchBrief(request_text='Design a research study.'),
                 root=root, services=services)
-            restored = ToolApplication.load(root)
+            restored = load_research_task(root)
             expected = 'Use the supplied observations and fixed evaluation period.'
             self.assertEqual(app.sources.policy.execution_context, expected)
             self.assertEqual(restored.sources.policy.execution_context, expected)
@@ -204,6 +236,39 @@ class ResearchIntakeTests(unittest.TestCase):
                     self.assertEqual(observations[-1]['tool_name'], 'ask_user')
                     self.assertTrue(all(not row.actual.get('llm_requests') for row in app.ledger.entries))
 
+    def test_cli_resumes_declared_collection_from_the_original_receipt(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.cli.main import main
+
+        with TemporaryDirectory() as directory, patch.object(LLMClient, 'from_env',
+                side_effect=AssertionError('No model was authorized')):
+            base = Path(directory).resolve()
+            source = base / 'source.html'
+            source.write_text('<p>An original source about a recorded result.</p>', encoding='utf-8')
+            brief = ResearchBrief(request_text='Summarize the supplied source.', requested_outputs=('summary',),
+                asset_requests=({'locator': str(source), 'role': 'paper'},))
+            root = base / 'task'
+            app = create_research_task(brief, root=root, config={'research_materials_only': True})
+            stopped = start_research_task(app, progress=lambda _: None,
+                should_stop=lambda: app.state['pending'] is None and bool(app.state['turns'][-1]['tools']))
+            self.assertEqual(stopped['status_reason'], 'Caller requested boundary stop')
+            self.assertFalse(app.session.store.exists('delivery.json'))
+            original = [(app.session.store.root / turn['tools'][0]['result']).read_bytes()
+                        for turn in app.state['turns']]
+            ledger = app.ledger.to_dict()
+
+            with redirect_stdout(StringIO()):
+                main(['start', '--resume-task', str(root), '--yes'])
+            resumed = ToolApplication.load(root)
+            self.assertEqual(resumed.session.manifest.status, 'completed')
+            self.assertEqual(resumed.session.manifest.session_id, stopped['session_id'])
+            self.assertEqual(resumed.ledger.to_dict(), ledger)
+            self.assertEqual([row['tool_name'] for row in resumed._operation_observations()],
+                ['research', 'deliver_result'])
+            self.assertEqual((root / resumed.state['turns'][0]['tools'][0]['result']).read_bytes(), original[0])
+
     def test_declared_measurement_does_not_claim_other_requested_outputs(self):
         import sys
 
@@ -235,6 +300,38 @@ class ResearchIntakeTests(unittest.TestCase):
                         self.assertEqual(app.measurement_completion_actions(), [])
                     self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in app.ledger.entries),
                         2 if paired else 1)
+
+    def test_resume_finishes_the_saved_comparison_without_repeating_measurements(self):
+        import sys
+        from simple_ar.app.research_intake import start_declared_measurements
+        from simple_ar.app.tool_application import ToolApplication
+
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            brief = ResearchBrief(request_text='Compare the declared conditions.', requested_outputs=('experiments',))
+            execution = {'command': [sys.executable, '-c', "print('score: 3')"],
+                'cwd': str(base), 'timeout_sec': 5, 'baseline_policy': 'run',
+                'result_schema': {'primary_metric': 'score'}}
+            app = create_structured_research_task(brief, root=base / 'task', model=None,
+                config={'execution': execution, 'require_design': False},
+                budget_limits={'process_invocations': 2, 'process_wall_seconds': 10},
+                max_results=5, research_work=False)
+            paused = start_declared_measurements(app, progress=lambda _: None,
+                should_stop=lambda: not app.state['pending'] and len(app.state['turns'][-1]['tools']) == 2)
+            self.assertEqual(paused['status_reason'], 'Caller requested boundary stop')
+            self.assertFalse(app.session.store.exists('delivery.json'))
+            ledger = app.ledger.to_dict()
+
+            resumed = ToolApplication.load(base / 'task')
+            delivered = resumed.run(progress=lambda _: None, finish_declared_work=True)
+            self.assertEqual(delivered['status'], 'partial')  # The fixture has no verified comparison conditions.
+            self.assertEqual(delivered['session_id'], paused['session_id'])
+            self.assertTrue(resumed.session.store.read_json('delivery.json')['unresolved'])
+            self.assertEqual(resumed.ledger.to_dict(), ledger)
+            operations = [row['tool_name'] for row in resumed._operation_observations(domain='scientific')]
+            self.assertEqual(operations, ['measure_experiment', 'measure_experiment', 'analyze_measurements'])
+            resumed.run(progress=lambda _: None, finish_declared_work=True)
+            self.assertEqual(len(resumed._operation_observations(domain='scientific')), 3)
 
     def test_declared_material_intent_is_shared_by_startup_and_creation(self):
         import sys
@@ -435,6 +532,35 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertTrue(restored.state['config']['independent_review_required'])
             self.assertEqual(restored.ledger.to_dict(), ledger)
             self.assertEqual(restored.session.manifest.session_id, app.session.manifest.session_id)
+
+    def test_preparation_usage_and_unknown_charges_follow_the_common_task(self):
+        from types import SimpleNamespace
+        from simple_ar.core.budget import BudgetLedger
+
+        for unknown in (False, True):
+            with self.subTest(unknown=unknown), TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                setup = BudgetLedger({'llm_requests': 5, 'total_tokens': 1000},
+                    storage_path=root / 'setup_budget.json')
+                setup.reserve('setup-call', {'llm_requests': 1, 'total_tokens': 200},
+                    session_id='setup', attempt_id='setup', purpose='setup')
+                if unknown:
+                    setup.mark_unknown('setup-call', reason='Provider usage unavailable',
+                        known_actual={'llm_requests': 1})
+                else:
+                    setup.settle('setup-call', {'llm_requests': 1, 'total_tokens': 120})
+                original = setup.to_dict()
+                services = SimpleNamespace(llm_client=_JSONClient())
+                app = create_structured_research_task(ResearchBrief(request_text='Use the supplied question.'),
+                    root=root / 'task', model=None, services=services, max_results=1,
+                    config={'research_materials_only': True},
+                    budget_limits={'llm_requests': 5, 'total_tokens': 1000},
+                    preparation_ledger=original)
+                restored = ToolApplication.load(root / 'task', services=services)
+                self.assertEqual(setup.to_dict(), original)
+                self.assertEqual([entry.to_dict() for entry in restored.ledger.entries], original['entries'])
+                self.assertEqual(restored.ledger.remaining('llm_requests'), 4)
+                self.assertEqual(restored.ledger.remaining('total_tokens'), None if unknown else 880)
 
     def test_structured_analysis_can_require_review_without_a_report(self):
         from types import SimpleNamespace

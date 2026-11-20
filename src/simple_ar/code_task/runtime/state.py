@@ -8,6 +8,20 @@ from typing import Any
 from simple_ar.core.artifacts import read_json, write_json
 
 
+def read_optional_object(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    data = read_json(path)
+    return data if isinstance(data, dict) else {}
+
+
+def patch_plan_status(manifest: dict[str, object]) -> str:
+    plan = manifest.get("plan", {})
+    if not isinstance(plan, dict):
+        return "not_started"
+    return str(plan.get("status") or "not_started")
+
+
 def benchmark_command(manifest: dict[str, Any]) -> str:
     """Return the configured command shared by planning and execution."""
     benchmark = manifest.get('benchmark', {})

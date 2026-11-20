@@ -36,6 +36,28 @@ from tests.code_task_fixtures import (
 )
 
 class ResearchApplicationTests(unittest.TestCase):
+    def test_saved_intent_does_not_provision_a_missing_legacy_ledger(self):
+        from simple_ar.app.research_application import saved_research_intent
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'session'
+            app = create_session(ResearchBrief(request_text='Analyze the declared observations.',
+                requested_outputs=('summary',)), root=root,
+                services=ResearchApplicationServices(config={'research_task_kind': 'data_analysis'}))
+            app.controller.manifest.budget_ledger_ref = None
+            app.controller.save()
+            ledger_path = root / 'budget_ledger.json'
+            ledger_path.unlink()
+            manifest_path = root / 'session_manifest.json'
+            before = manifest_path.read_bytes()
+
+            brief, kind = saved_research_intent(root)
+
+            self.assertEqual(brief, app.brief)
+            self.assertEqual(kind, 'data_analysis')
+            self.assertFalse(ledger_path.exists())
+            self.assertEqual(manifest_path.read_bytes(), before)
+
     def _paper_session(self, root, text, *, filename="paper.md", services=None, **brief_fields):
         """Create a real session with one supplied paper; callers own the protocol."""
         paper = root / filename
@@ -288,6 +310,27 @@ class ResearchApplicationTests(unittest.TestCase):
                 restored.controller.store.read_text(refreshed.state_refs["report"]))
             self.assertEqual(restored.budget_ledger.to_dict(), json.loads(ledger))
 
+    def test_load_early_session_reads_original_ledger_without_rewriting_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'research'
+            app = create_session(ResearchBrief(request_text='Review the supplied observations.'), root=root,
+                services=ResearchApplicationServices(budget_limits={'llm_requests': 4}))
+            app.budget_ledger.reserve('earlier-call', {'llm_requests': 1})
+            app.budget_ledger.settle('earlier-call', {'llm_requests': 1})
+            manifest = root / 'session_manifest.json'
+            saved = read_json(manifest)
+            saved.pop('budget_ledger_ref')
+            manifest.write_text(json.dumps(saved), encoding='utf-8')
+            before = manifest.read_bytes()
+            ledger = root / 'budget_ledger.json'
+            recorded = ledger.read_bytes()
+
+            restored = load_session(root)
+
+            self.assertEqual(restored.budget_ledger.remaining('llm_requests'), 3)
+            self.assertEqual(manifest.read_bytes(), before)
+            self.assertEqual(ledger.read_bytes(), recorded)
+
     def test_writing_preserves_paper_material_roles_and_missing_text(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -444,6 +487,10 @@ class ResearchApplicationTests(unittest.TestCase):
                 with patch("simple_ar.app.research_application.new_source_queries",
                            return_value=() if outcome == "web" else ("seed", "new question")):
                     app._execute("read", "read", ReadRequest(bundle=bundle, topic="Study"), ())
+                    with patch.object(app, '_schedule_evidence_followup',
+                                      side_effect=AssertionError('Viewing saved work cannot schedule a step')):
+                        view = app.view()
+                        self.assertEqual(view.next_action, view.work_plan['next_action'])
                     base_refs = {name: refs[name] for name in ("search", "documents", "read")}
                     # Supplied cached bundles are merged after acquisition;
                     # they must not consume the reserved followup allowance.
@@ -2308,7 +2355,10 @@ class ResearchApplicationTests(unittest.TestCase):
                     self.assertEqual(result["status"], "passed")
             self.assertEqual((root / "runs.txt").read_text().splitlines(),
                              ["baseline-0", "baseline-1", "candidate-0", "candidate-1"])
-            self.assertEqual(len(app.budget_ledger.entries), 4)
+            process_entries = [entry for entry in app.budget_ledger.entries
+                if 'process_invocations' in entry.reserved]
+            self.assertEqual([(entry.status, entry.actual.get('process_invocations')) for entry in process_entries],
+                [('settled', 1)] * 4)
             analysis = app.controller.store.read_json(final.state_refs["analysis"])
             self.assertEqual(analysis["execution_ref"], final.state_refs["matrix_results"].to_dict())
             self.assertTrue(analysis["analysis"]["claims"])
@@ -2358,6 +2408,7 @@ class ResearchApplicationTests(unittest.TestCase):
                         draft_markdown=f"Fixture paired evaluation; no significance claim [@{paper_id}].",
                         used_sources=[paper_id]) for i, heading in enumerate(("Abstract", "Introduction", "Related Work",
                             "Method", "Experimental Setup", "Results", "Limitations", "Conclusion"))])
+            before_report = app.budget_ledger.to_dict()
             with patch("simple_ar.report.writing.run_report_agent", side_effect=writer):
                 final = app.advance(max_actions=3)
             self.assertEqual(final.status, "completed", final.status_reason)
@@ -2379,7 +2430,7 @@ class ResearchApplicationTests(unittest.TestCase):
             self.assertIn("Measured comparisons", report_text, msg=report_text)
             self.assertTrue((app.controller.store.resolve(report_dir / "figures" / "paired-1.svg")).is_file())
             self.assertIn("paired-1.svg", report_text)
-            self.assertEqual(len(app.budget_ledger.entries), 4)
+            self.assertEqual(app.budget_ledger.to_dict(), before_report)
 
     def test_compact_seed_protocol_skips_baseline_and_reloads_without_rerun(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3382,7 +3433,8 @@ class ResearchApplicationTests(unittest.TestCase):
                 self.assertIn("summary", view.state_refs)
                 self.assertNotIn("experiment", view.state_refs)
                 self.assertFalse((root / "ran").exists())
-                self.assertEqual(len(app.budget_ledger.entries), 0)
+                self.assertFalse(any({'process_invocations', 'process_wall_seconds'} & entry.reserved.keys()
+                    for entry in app.budget_ledger.entries))
 
     def test_explicit_retry_reuses_research_and_reanalyzes_corrected_command(self):
         with tempfile.TemporaryDirectory() as tmp:

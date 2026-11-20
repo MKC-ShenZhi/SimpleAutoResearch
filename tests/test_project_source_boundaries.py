@@ -186,7 +186,7 @@ class ProjectSourceBoundaryTests(unittest.TestCase):
             self.assertEqual(unrelated.read_text(), 'not a CodeTask manifest')
 
     def test_restored_private_or_external_projects_are_blocked_before_reads_and_writes(self):
-        from simple_ar.code_task.orchestration.execute import _rerun_greenfield_review
+        from simple_ar.code_task.orchestration.verification import review_saved_greenfield
         from simple_ar.code_task.runtime.state import code_task_paths
         with tempfile.TemporaryDirectory() as folder:
             run = Path(folder)
@@ -249,7 +249,7 @@ class ProjectSourceBoundaryTests(unittest.TestCase):
                                        lambda: review_generated_project(project_dir=code_task_paths(run).workspace_dir,
                                            access_boundary=code_task_workspace_boundary(run), code_artifacts={},
                                            result_schema={}, resource_plan={}, use_llm=False),
-                                       lambda: _rerun_greenfield_review(run, code_task_paths(run),
+                                       lambda: review_saved_greenfield(run, code_task_paths(run),
                                            max_files=12, max_generated_lines=1000)):
                             with self.assertRaisesRegex(ValueError, 'private|boundary'):
                                 review()

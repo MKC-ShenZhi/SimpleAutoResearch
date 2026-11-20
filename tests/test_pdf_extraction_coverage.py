@@ -52,7 +52,8 @@ class PDFExtractionCoverageTests(unittest.TestCase):
             def extraction(path, *, max_pages, coverage):
                 _read_pdf(path, max_pages=max_pages, coverage=coverage)
                 coverage['empty_text_pages'] = []
-                return 'Abstract\nA supplied summary.\nMethods\nObserved source text. Symbol \ud835\udc00; malformed \ud835.\n'
+                return ('Abstract\nA supplied summary.\nMethods\nObserved source text. '
+                        'Symbol \ud835\udc00; malformed \ud835. Ligature a\x00b\x01c.\n')
             with patch('simple_ar.research.documents.extractors._read_pdf', side_effect=extraction):
                 bundle = build_local_document_bundle([pdf], extraction_dir=Path(folder)/'extracted',
                                                     parser=LocalDocumentParser(max_pdf_pages=3))
@@ -60,9 +61,11 @@ class PDFExtractionCoverageTests(unittest.TestCase):
             coverage = restored.records[0].metadata['fulltext_extraction']['coverage']
             self.assertEqual(coverage['extracted_pages'], 3)
             self.assertEqual(coverage['unpaired_unicode_replacements'], 1)
+            self.assertEqual(coverage['escaped_control_characters'], 2)
             text = Path(restored.records[0].local_path).read_text(encoding='utf-8')
             self.assertIn('\U0001d400', text)
             self.assertIn('malformed \ufffd', text)
+            self.assertIn(r'a\u0000b\u0001c', text)
             self.assertEqual(restored.fulltext_extraction['documents'][0]['coverage'], coverage)
             read = read_documents(ReadRequest(restored))
             self.assertEqual(read.status, 'partial')
@@ -71,6 +74,7 @@ class PDFExtractionCoverageTests(unittest.TestCase):
                 documents_ref=ArtifactRef('documents.json'), assets=[SimpleNamespace(locator=str(pdf), role='paper')])
             self.assertTrue(any('3/23' in note for note in memory.limitations))
             self.assertTrue(any('unpaired Unicode' in note for note in memory.limitations))
+            self.assertTrue(any('control characters' in note for note in memory.limitations))
             self.assertEqual(context.source_handles[0].metadata['extraction_coverage'], coverage)
             context, memory = attach_report_read_evidence(context, memory, documents=restored,
                                                         read=read, read_ref=ArtifactRef('read.json'))

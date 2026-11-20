@@ -28,6 +28,7 @@ class CommonToolGateway:
         debug_payloads: bool = False,
         domain_gateways: dict[str, Any] | None = None,
         work_input_owners: dict[str, Any] | None = None,
+        saved_complete_work: bool = False,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.registry = registry or default_tool_registry(include_report=report_context is not None)
@@ -41,6 +42,7 @@ class CommonToolGateway:
         self._trace = ToolTraceWriter(trace_path or self.run_dir / "tools" / "tool_trace.jsonl", debug_payloads=debug_payloads)
         self._domain_gateways = self.registry.domain_gateways()
         self._work_input_owners = work_input_owners or {}
+        self.saved_complete_work = saved_complete_work
         for domain, owner in (domain_gateways or {}).items():
             if domain in self._domain_gateways and self._domain_gateways[domain] is not owner:
                 raise ValueError('Conflicting registered domain owner: ' + domain)
@@ -146,9 +148,11 @@ class CommonToolGateway:
     def local_continuation(self, name: str | None = None) -> bool:
         """An explicitly composed owner may sequence only its own operations.
 
-        Historical owners without this port retain the saved application gate.
+        Saved complete-work protocols also allowed cross-domain handoff.
         No new dispatcher, authority or durable continuation state is created.
         """
+        if self.saved_complete_work:
+            return True
         if name is not None:
             owner = self.domain_owner(name)
             return name in getattr(owner, 'local_continuations', ())
@@ -188,6 +192,30 @@ class CommonToolGateway:
         if action is None and fallback is not None:
             action = fallback(observed, attempt_id)
         return owner, action
+
+    def resume_professional_action(self, observed: dict, source: str, *, reason: str,
+                                   grant_added: bool, return_gap: bool,
+                                   consume_outcome: bool) -> tuple[Any, dict | None] | None:
+        """Apply a saved stop's owner policy before the common queue is reopened."""
+        owner = self.domain_owner(observed.get('tool_name', ''))
+        attempt_id = Path(source).parent.name
+        if return_gap:
+            gap = getattr(owner, 'can_return_gap', None)
+            ordinary = getattr(owner, 'continuation', None)
+            if gap is not None and gap(observed, attempt_id):
+                return self.professional_action(observed, source, resume=True, consume_outcome=consume_outcome)
+            proposal = ordinary(observed, attempt_id) if ordinary is not None else None
+            if isinstance(proposal, dict) and proposal.get('tool_name') and 'stop' not in proposal:
+                return self.professional_action(observed, source, resume=True,
+                    consume_outcome=consume_outcome)
+        if not grant_added:
+            return None
+        if reason == 'shared_budget_exhausted':
+            return self.professional_action(observed, source, resume=True, consume_outcome=consume_outcome)
+        resume = getattr(owner, 'resume_after_budget', None)
+        if reason == 'work_gap' and resume is not None and (action := resume(observed, attempt_id)) is not None:
+            return owner, action
+        return None
 
     def _bound_context(self, call: ToolCall, context: Any) -> bool:
         """A path-shaped context is not evidence of controller ownership."""

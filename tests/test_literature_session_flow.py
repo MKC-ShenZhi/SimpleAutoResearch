@@ -22,6 +22,22 @@ from simple_ar.research import register_research_capabilities
 
 
 class LiteratureSessionFlowTests(unittest.TestCase):
+    def test_retained_source_view_distinguishes_drafts_and_derived_results(self) -> None:
+        from simple_ar.tools.sources import SourceToolGateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = DocumentBundle(records=[
+                DocumentRecord(document_id='paper', title='Paper', source='arxiv'),
+                DocumentRecord(document_id='draft', title='Draft', source='local_files',
+                    metadata={'kind': 'prior_draft'}),
+                DocumentRecord(document_id='analysis', title='Analysis', source='local_analysis'),
+            ], fulltext_manifest={}, fulltext_extraction={}, sections=[], chunks=[])
+            path = Path(tmp) / 'materials.json'
+            path.write_text(json.dumps(bundle.to_handoff_dict()), encoding='utf-8')
+            rows = SourceToolGateway.inventory_source(path)['documents']
+            self.assertEqual([(row['source'], row['content_role']) for row in rows],
+                [('arxiv', 'source_text'), ('local_files', 'prior_draft'), ('local_analysis', 'derived_analysis')])
+
     def test_retained_documents_share_the_source_window(self) -> None:
         from simple_ar.app.tool_application import ToolApplication
 

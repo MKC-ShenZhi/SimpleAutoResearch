@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 from dataclasses import replace
 from pathlib import Path
 import re
@@ -29,7 +30,8 @@ from simple_ar.research.documents.fulltext import fulltext_fetch_attempt_cap
 from simple_ar.research.store.retrieval import rank_source_chunks, source_chunk_views
 from simple_ar.research.store.chunking import bounded_document_coverage
 from simple_ar.research.preparation_assets import validate_public_url
-from simple_ar.research.sources.capability import SearchRequest, SearchResult, SearchSelectionPolicy, search_sources, select_search_result
+from simple_ar.research.sources.capability import (SearchRequest, SearchResult, SearchSelectionPolicy,
+    run_source_operation, search_sources, select_search_result)
 from simple_ar.research.sources.registry import SearchProviderRegistry, default_search_provider_registry
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 
@@ -158,6 +160,7 @@ class _Search(BaseModel):
     providers: list[str] = Field(
         default_factory=lambda: ["arxiv", "openalex"], min_length=1, max_length=5)
     max_results: int = Field(default=5, ge=1, le=1000)
+    match_title: bool = Field(default=False, description='Set for a known paper title. Return only matching bibliographic titles so their saved IDs can be used to fetch the original.')
 
 
 class _Acquire(BaseModel):
@@ -182,7 +185,7 @@ def source_tool_specs() -> list[CommonToolSpec]:
     return [CommonToolSpec(name=name, description=description, input_schema=model.model_json_schema(),
         permission_level=permission, risk_level="medium" if permission == "network" else "low", domain="sources")
         for name, model, permission, description in (
-            ("search_sources", _Search, "network", "Search selected scholarly/web providers. Save metadata and failure history; excerpts are not original full text."),
+            ("search_sources", _Search, "network", "Search selected scholarly/web providers. For a known paper use match_title with its title, then acquire the saved result. Save metadata and provider outcomes; excerpts are not original full text."),
             ("acquire_source", _Acquire, "network", "Acquire one saved search result or explicit public HTTPS source using existing bounded document parsers. Save original evidence and expose readable chunks; retrieval may fail."),
             ('research', _Research, 'read_only', 'Perform the requested professional research operation over authorized material or saved handoffs. No network. Design returns a frozen protocol for caller confirmation; it does not execute experiments.'),
             ('research_collect', _Research, 'network', 'Perform the requested ingest or summary, searching exact policy queries when no materials are supplied. Uses the same bounded source owner; no experiment execution.'),
@@ -193,8 +196,10 @@ def _source_identity(record: DocumentRecord, bundle: DocumentBundle) -> dict[str
     """Project observed extraction coverage without certifying paper access."""
     extraction = record.metadata.get('fulltext_extraction') or {}
     coverage = extraction.get('coverage') or {}
+    role = ('prior_draft' if record.is_prior_draft else
+        'derived_analysis' if not record.is_original_source else 'source_text')
     row = {'id': record.document_id, 'title': record.title, 'url': record.url,
-           'status': record.extraction_status}
+           'source': record.source, 'content_role': role, 'status': record.extraction_status}
     if extraction.get('hint_kind'):
         row['hint_kind'] = extraction['hint_kind']
     # Older saved bundles retain this qualification only in the acquisition
@@ -225,6 +230,19 @@ def _source_identity(record: DocumentRecord, bundle: DocumentBundle) -> dict[str
 
 
 class SourceToolGateway:
+    @classmethod
+    def for_task(cls, root: Path, workspace: Any, config: dict, *,
+                 client_factory: Callable[[str], Any],
+                 registry: SearchProviderRegistry | None,
+                 feasibility_client_factory: Callable[[str], Any] | None = None,
+                 default_policy: dict | None = None,
+                 user_requests: Callable[[], list[str]] | None = None) -> "SourceToolGateway":
+        return cls(root, workspace, workspace.ledger, policy=config.get('research_policy'),
+            default_policy=default_policy, authority_revision=config.get('authority_revision', 0),
+            execution_contract=config.get('execution_contract'),
+            client_factory=client_factory if config['model'] is not None else None,
+            registry=registry, feasibility_client_factory=feasibility_client_factory, user_requests=user_requests)
+
     @staticmethod
     def _load_source_bundle(path: Path) -> tuple[DocumentBundle, bytes] | None:
         """Read the original once so its view and version describe the same bytes."""
@@ -399,6 +417,36 @@ class SourceToolGateway:
 
     context_tools = {'research', 'research_collect'}
 
+    def _search_providers(self) -> list[str]:
+        return [name for name in self.policy.providers if self.registry.has(name)
+            and (name != 'web' or not self._builtin_registry or os.environ.get('TAVILY_API_KEY', '').strip())]
+
+    def _search_defaults(self, providers: list[str]) -> dict:
+        scholarly = [name for name in ('arxiv', 'openalex') if name in providers]
+        return {'providers': scholarly or providers[:1], 'max_results': min(5, self.policy.max_results)}
+
+    def tool_specs(self) -> list[CommonToolSpec]:
+        """Offer the task's real search contract through its registered owner."""
+        specs = source_tool_specs()
+        search = next(spec for spec in specs if spec.name == 'search_sources')
+        properties = search.input_schema['properties']
+        providers = self._search_providers()
+        defaults = self._search_defaults(providers)
+        if providers:
+            properties['providers']['items']['enum'] = providers
+            properties['providers']['default'] = defaults['providers']
+            properties['providers']['description'] = (
+                'Allowed providers in this task. Choose complementary indexes for different evidence.')
+        else:
+            search.description = 'No search provider is available under the current task configuration.'
+        properties['max_results'].update(maximum=self.policy.max_results, default=defaults['max_results'])
+        properties['query']['description'] = (
+            'Search metadata with concise research concepts. arXiv plain terms are combined with AND. '
+            'Appendix or figure clues generally require acquiring candidate originals.')
+        if self.policy.queries:
+            properties['query']['enum'] = list(self.policy.queries)
+        return specs
+
     def call(self, name: str, arguments: dict[str, Any], *, identity: str) -> ToolResult:
         try:
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,100}", identity):
@@ -435,13 +483,14 @@ class SourceToolGateway:
                         "selected_chunks": len(selected),
                         "scope": "Lexical lookup in retained text; not full reading or proof of absence"}
                 return ToolResult(tool_name=name, data=data)
-            request = (_Search if name == "search_sources" else _Acquire).model_validate(arguments)
             directory = self.root / "evidence" / identity
             if name == "search_sources":
+                request = _Search.model_validate({**self._search_defaults(self._search_providers()), **arguments})
                 self._validate_search(request)
                 operation = lambda: self._search(request, directory)
                 count = len(set(request.providers))
             else:
+                request = _Acquire.model_validate(arguments)
                 backend = request.web_extract_backend
                 if (backend is not None and self._policy_supplied
                         and backend != self.policy.web_extract_backend):
@@ -479,31 +528,19 @@ class SourceToolGateway:
                         metadata={"parent_document_id": "explicit_task_source"})]
                 operation = lambda: self._acquire(papers, records, directory, web_extract_backend=backend)
                 count = 1
-            # Counts adapter/provider operations, not physical HTTP requests or
-            # vendor credits. Existing acquisition owns redirect/byte limits.
-            reservation = f"source:{identity}"
-            if any(entry.reservation_id == reservation for entry in self.ledger.entries):
-                raise ValueError("Source invocation already recorded; inspect its result before any replay")
-            entry = self.ledger.reserve(reservation, {"source_operations": count}, purpose=name)
-            if entry.status != "reserved":
-                raise ValueError("Source operation already accounted; cannot replay")
             directory.mkdir(parents=True, exist_ok=True)
-            try:
-                data = operation()
-            except Exception:
-                self.ledger.settle(reservation, {"source_operations": count}, actual_source="adapter",
-                    reason="Source adapter attempted; operation failed")
-                raise
-            except BaseException:
-                self.ledger.mark_unknown(reservation, reason="Source operation interrupted; inspect saved records before replay")
-                raise
-            # Bind provider/credit provenance to the original manifest, without
-            # equating adapter operations with vendor credits or HTTP requests.
-            reason = (f"Acquisition provenance: {data['document_record']}; "
-                f"web_extract_backend={data['acquisition']['budget']['web_extract_backend']}"
-                if name == 'acquire_source' else '')
-            self.ledger.settle(reservation, {"source_operations": count}, actual_source="adapter", reason=reason)
-            return ToolResult(tool_name=name, data=data)
+            def provenance(data: dict) -> str:
+                if name != 'acquire_source':
+                    return ''
+                return (f"Acquisition provenance: {data['document_record']}; "
+                    f"web_extract_backend={data['acquisition']['budget']['web_extract_backend']}")
+
+            data = run_source_operation(self.ledger, f'source:{identity}', count, operation,
+                purpose=name, attempt_id=identity, outcome_reason=provenance)
+            summary = ''
+            if data.get('status') == 'no_readable_text':
+                summary = 'No readable original text was acquired. The acquisition record retains the provider or extraction outcome.'
+            return ToolResult(tool_name=name, data=data, summary=summary)
         except (ValueError, KeyError, OSError, BudgetError) as exc:
             return ToolResult(tool_name=name, status="blocked", error=str(exc),
                 data={'failure_kind': 'resource_exhausted'} if isinstance(exc, BudgetExceededError) else {})
@@ -512,7 +549,9 @@ class SourceToolGateway:
                 client: Any = None, plan: ResearchPlanResult | None = None, question: str = '') -> dict[str, Any]:
         for query in queries or (request.query,):
             self._validate_search(request.model_copy(update={'query': query}))
-        filters = plan.source_plan.filters if plan else {}
+        filters = dict(plan.source_plan.filters) if plan else {}
+        if request.match_title:
+            filters['match_title'] = True
         result = search_sources(SearchRequest(queries=queries or (request.query,),
             providers=tuple(dict.fromkeys(request.providers)), max_results_per_query=request.max_results,
             cache_dir=self._cache_dir(), cache_enabled=self.policy.cache_enabled,
@@ -537,9 +576,11 @@ class SourceToolGateway:
         text = "\n\n".join(f"[{chunk.chunk_id}; document={chunk.document_id}; page={chunk.page}]\n{chunk.text}"
                            for chunk in bundle.chunks)
         (directory / "passages.txt").write_text(text, encoding="utf-8")
-        return {"document_record": f"evidence/{directory.name}/document.json",
+        documents = [_source_identity(record, bundle) for record in bundle.records]
+        return {"status": "text_available" if text else "no_readable_text",
+            "document_record": f"evidence/{directory.name}/document.json",
             "passages": f"evidence/{directory.name}/passages.txt", "text_bytes": len(text.encode()),
-            "documents": [_source_identity(record, bundle) for record in bundle.records],
+            "documents": documents,
             "acquisition": bundle.fulltext_manifest, "extraction": bundle.fulltext_extraction,
             "scope": "Only acquired passages support original-text claims; metadata is not full text"}
 
@@ -565,8 +606,9 @@ class SourceToolGateway:
         # Source-network authority is independent of a connector's name or IO.
         if not self.policy.allow_network and not (self._builtin_registry and set(providers) == {'local_files'}):
             raise ValueError('Source policy denies network search')
-        if not set(providers) <= set(self.policy.providers):
-            raise ValueError('Search providers/results exceed source policy')
+        if unavailable := set(providers) - set(self.policy.providers):
+            raise ValueError('Search providers exceed source policy: ' + ', '.join(sorted(unavailable))
+                + '. Available: ' + (', '.join(self._search_providers()) or 'none'))
         unknown = set(providers) - set(self.registry.names())
         if unknown:
             raise ValueError('Unknown search provider: ' + ', '.join(sorted(unknown)))
@@ -576,7 +618,7 @@ class SourceToolGateway:
         if self.policy.queries and request.query not in self.policy.queries:
             raise ValueError('Query is outside the exact source policy')
         if request.max_results > self.policy.max_results:
-            raise ValueError('Search providers/results exceed source policy')
+            raise ValueError(f'Search result limit exceeds source policy: max_results must be at most {self.policy.max_results}')
 
     @staticmethod
     def _digest(path: Path) -> str:
@@ -844,38 +886,22 @@ class SourceToolGateway:
                         if self._record_revision(binding) == self.authority_revision)
                     if collections > 1 + policy.max_iterations:
                         raise ValueError('Research collection iteration limit reached; initial collection plus configured followups only')
-                    count = len(queries) * len(policy.providers)
-                    reservation = f'source:{identity}'
-                    if any(row.reservation_id == reservation for row in self.ledger.entries):
-                        raise ValueError('Collection already recorded; no blind replay')
-                    self.ledger.reserve(reservation, {'source_operations': count}, attempt_id=identity,
-                        purpose='research collection')
-                    try:
-                        directory = self.root / 'evidence' / identity
-                        directory.mkdir(parents=True, exist_ok=True)
-                        self._search(_Search(query=queries[0], providers=list(policy.providers),
-                            max_results=policy.max_results), directory, queries=queries,
-                            client=client(), plan=plan, question=request.question)
-                        found = SearchResult.from_handoff_dict(json.loads((directory / 'search.json').read_text()))
-                        artifacts.append(context.store.write_json('search_result.json', found.to_handoff_dict(), kind='search_result'))
-                        papers.extend(found.selected_papers)
-                        outcomes.append({'status': found.status, 'diagnostics': list(found.diagnostics)})
-                        self.ledger.settle(reservation, {'source_operations': count}, actual_source='adapter')
-                    except BaseException:
-                        self.ledger.mark_unknown(reservation, reason='Collection interrupted; inspect saved responses')
-                        raise
+                    directory = self.root / 'evidence' / identity
+                    directory.mkdir(parents=True, exist_ok=True)
+                    search_request = _Search(query=queries[0], providers=list(policy.providers),
+                        max_results=policy.max_results)
+                    run_source_operation(self.ledger, f'source:{identity}', len(queries) * len(policy.providers),
+                        lambda: self._search(search_request, directory, queries=queries,
+                            client=client(), plan=plan, question=request.question),
+                        purpose='research collection', attempt_id=identity)
+                    found = SearchResult.from_handoff_dict(json.loads((directory / 'search.json').read_text()))
+                    artifacts.append(context.store.write_json('search_result.json', found.to_handoff_dict(), kind='search_result'))
+                    papers.extend(found.selected_papers)
+                    outcomes.append({'status': found.status, 'diagnostics': list(found.diagnostics)})
                 papers = list({paper.id: paper for paper in papers}.values())[:policy.max_documents]
-                reservation = f'source:{identity}:ingest'
-                if papers and network:
-                    self.ledger.reserve(reservation, {'source_operations': 1}, attempt_id=identity, purpose='research ingest')
-                try:
-                    incoming = material_bundle(paths, papers, network=network)
-                except BaseException:
-                    if papers and network:
-                        self.ledger.mark_unknown(reservation, reason='Acquisition interrupted; no blind replay')
-                    raise
-                if papers and network:
-                    self.ledger.settle(reservation, {'source_operations': 1}, actual_source='adapter')
+                incoming = run_source_operation(self.ledger if papers and network else None,
+                    f'source:{identity}:ingest', 1, lambda: material_bundle(paths, papers, network=network),
+                    purpose='research ingest', attempt_id=identity)
                 bundle = add_materials(bundle, incoming)
             if bundle is not None:
                 if len(bundle.records) > policy.max_documents:

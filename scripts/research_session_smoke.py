@@ -1,8 +1,8 @@
-"""Run the smallest complete canonical research-session path locally.
+"""Check the compatibility API for stepwise research sessions locally.
 
 This smoke uses a local literature fixture, a one-line experiment, and a
-fixture report writer. It is safe on a laptop while still exercising the same
-ResearchApplication lifecycle as the online entrypoint.
+fixture report writer. It checks the public ResearchApplication lifecycle
+and its saved state references.
 """
 
 from __future__ import annotations

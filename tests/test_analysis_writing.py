@@ -33,7 +33,7 @@ class AnalysisWritingTests(unittest.TestCase):
                 '--material', str(notes), '--document', str(paper), '--output-root', str(root / 'runs'), '--prepare-only']
             parser = build_parser()
             with patch('sys.stdin.isatty', return_value=False), contextlib.redirect_stdout(io.StringIO()):
-                with self.assertRaisesRegex(ValueError, 'requires writing|require --with-report'):
+                with self.assertRaisesRegex(ValueError, r'--material requires .*analysis with a report'):
                     prepare_start(parser.parse_args(common))
                 config = prepare_start(parser.parse_args([*common, '--with-report']))
             defaults = research_defaults(['research-session', '--config', str(config)])
@@ -486,8 +486,10 @@ class AnalysisWritingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             _, inputs, ref = self.package_input(root)
-            for settings, included in (({'enabled': True}, True), ({'enabled': False}, False), ({'mode': 'off'}, False)):
-                store = ArtifactStore(root / str(settings))
+            cases = (('enabled', {'enabled': True}, True), ('disabled', {'enabled': False}, False),
+                     ('off', {'mode': 'off'}, False))
+            for name, settings, included in cases:
+                store = ArtifactStore(root / name)
                 request = ReportAssemblyRequest(title='Describe', sections=(ReportSectionDraft(section_id='discussion',
                     heading='Discussion', draft_markdown='Supplied data only.'),), table_analyses=(ref,),
                     config={'figures': settings})

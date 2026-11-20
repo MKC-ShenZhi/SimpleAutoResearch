@@ -3,25 +3,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
 import shlex
 import sys
-import tomllib
 
-
-FIELDS = {
-    'request': str, 'model': str, 'source': list, 'output_root': str,
-    'kind': str, 'project': str, 'document': list, 'material': list,
-    'extensions': list, 'from_session': str, 'reuse': list, 'reuse_version': int,
-    'data_file': str, 'data_path': list,
-    'project_python': str, 'allow_execution': bool, 'sandbox_execution': bool, 'allow_network': bool,
-    'allow_vision': bool, 'independent_review_required': bool,
-    'max_images': int, 'max_turns': int, 'max_tokens': int,
-    'max_processes': int, 'max_process_seconds': (int, float),
-}
-PATHS = {'output_root', 'project_python', 'project', 'data_file', 'from_session'}
-PATH_LISTS = {'source', 'document', 'material', 'data_path', 'extensions'}
+from simple_ar.app.task_creation import (FIELDS, PATH_LISTS, PATHS, native_process_limits,
+    apply_task_config as _apply_task_config)
 
 
 def shell_path(path: Path) -> str:
@@ -62,20 +49,6 @@ def validate_interactive_options(args: argparse.Namespace) -> None:
         raise ValueError('Use slash commands at the --interactive prompt, not as positional feedback')
 
 
-def native_process_limits(args: argparse.Namespace) -> dict | None:
-    limits = dict(getattr(args, '_process_limits', None) or {})
-    for name, dimension in (('max_processes', 'process_invocations'),
-                            ('max_process_seconds', 'process_wall_seconds')):
-        value = getattr(args, name, None)
-        if value is not None:
-            if value < 0 or not math.isfinite(value):
-                raise ValueError(f'{name} must be finite and nonnegative')
-            if dimension in limits and limits[dimension] != value:
-                raise ValueError(f'Conflicting {dimension} in task and structured contract')
-            limits[dimension] = value
-    return limits or None
-
-
 def validate_resume_options(args: argparse.Namespace) -> None:
     """Reject creation settings instead of silently ignoring them on resume."""
     if not args.resume_task:
@@ -88,54 +61,18 @@ def validate_resume_options(args: argparse.Namespace) -> None:
     creation.update(name for name in ('max_processes', 'max_process_seconds')
                     if getattr(args, name, None) is not None)
     creation.update(name for name in ('max_images', 'project_python') if getattr(args, name, None))
-    if getattr(args, 'independent_review_required', False) and (args.request or args.goal):
+    if getattr(args, 'independent_review_required', None) is not None and (args.request or args.goal):
         creation.discard('independent_review_required')
     if creation:
         raise ValueError('Resume retains saved creation settings: ' + ', '.join(sorted(creation))
                          + '; use --authorize-remaining for resource changes, or --supply-task for contract changes')
 
 
-def apply_task_config(args: argparse.Namespace) -> None:
-    path = getattr(args, 'task_config', None)
-    if path is None:
-        return
+def apply_task_config(args: argparse.Namespace) -> str | None:
+    if args.task_config is None:
+        return None
     _creation_only(args)
-    path = path.expanduser().resolve()
-    if path.stat().st_size > 65536:
-        raise ValueError('Task configuration must be at most 64 KiB')
-    with path.open('rb') as stream:
-        document = tomllib.load(stream)
-    if set(document) != {'task'} or not isinstance(document['task'], dict):
-        raise ValueError('Task configuration requires one [task] table')
-    unknown = set(document['task']) - FIELDS.keys()
-    if unknown:
-        raise ValueError('Unknown task settings: ' + ', '.join(sorted(unknown)))
-    explicit = args._explicit_start_destinations
-    for name, value in document['task'].items():
-        types = FIELDS[name] if isinstance(FIELDS[name], tuple) else (FIELDS[name],)
-        if type(value) not in types or isinstance(value, float) and not math.isfinite(value):
-            raise ValueError(f'Invalid task setting type: {name}')
-        if name == 'kind':
-            from simple_ar.cli.start import FUNCTION_LABELS
-            if value not in FUNCTION_LABELS:
-                raise ValueError('Unknown task outcome preference: ' + value)
-        if name == 'reuse' and (any(type(item) is not str or not item.strip() for item in value)
-                               or len(set(value)) != len(value)):
-            raise ValueError('Task reuse must list distinct nonempty registered result names')
-        if name in PATH_LISTS:
-            if any(type(item) is not str or not item.strip() for item in value):
-                raise ValueError(f'Task {name} must list nonempty file/directory paths')
-            value = [(path.parent / Path(item).expanduser()).resolve() for item in value]
-        elif name in PATHS:
-            candidate = path.parent / Path(value).expanduser()
-            # A venv executable's symlink target belongs to the base runtime;
-            # resolving it silently selects a different Python environment.
-            value = candidate.absolute() if name == 'project_python' else candidate.resolve()
-        if name not in explicit and not (name == 'request' and (args.request is not None or args.goal)):
-            setattr(args, name, value)
-            explicit.add(name)
-    args._task_config_source = str(path)
-    native_process_limits(args)
+    return _apply_task_config(args)
 
 
 def write_task_config(args: argparse.Namespace) -> bool:
@@ -144,7 +81,10 @@ def write_task_config(args: argparse.Namespace) -> bool:
         return False
     _creation_only(args)
     path = destination.expanduser().absolute()
-    limits = native_process_limits(args) or {}
+    from simple_ar.app.tool_application import ToolApplication
+
+    limits = ToolApplication.creation_limits(args.max_turns, args.max_tokens, args.max_images,
+        process_limits=native_process_limits(args))
     values = {name: getattr(args, name, None) for name in FIELDS}
     values['request'] = args.request or args.goal or 'Describe your goal and required deliverables here.'
     for name in PATH_LISTS:
@@ -152,8 +92,8 @@ def write_task_config(args: argparse.Namespace) -> bool:
     for name in PATHS:
         if values[name] is not None:
             values[name] = str(Path(values[name]).expanduser().absolute())
-    values['max_processes'] = limits.get('process_invocations', args.max_turns * 10)
-    values['max_process_seconds'] = limits.get('process_wall_seconds', args.max_turns * 300)
+    values['max_processes'] = limits['process_invocations']
+    values['max_process_seconds'] = limits['process_wall_seconds']
     comments = {
         'request': 'Goal, language, length and intended figures belong here; the assistant chooses tools as needed.',
         'model': 'Named connection from your global models.toml; never put credentials in this file.',

@@ -9,12 +9,15 @@ artifact projection remain separate capabilities.
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, Mapping
+from typing import Any, Callable, Iterable, Literal, Mapping, TypeVar
 from urllib.error import HTTPError
 
 from simple_ar.core.capabilities import CapabilityContext, CapabilityResult
+from simple_ar.core.budget import BudgetLedger
 from simple_ar.literature.cache import get_cached, put_cache
 from simple_ar.literature.models import Paper
 from simple_ar.research.contracts import DocumentRecord, QueryPlan, ResearchQuestion
@@ -23,6 +26,30 @@ from simple_ar.research.sources.registry import SearchProviderRegistry
 
 
 SearchStatus = Literal["completed", "partial", "empty", "failed"]
+_Result = TypeVar('_Result')
+
+
+def run_source_operation(ledger: BudgetLedger | None, reservation: str, count: int,
+                         operation: Callable[[], _Result], *, purpose: str, attempt_id: str = '',
+                         session_id: str = '', outcome_reason: Callable[[_Result], str] | None = None) -> _Result:
+    """Account admitted adapter work separately from HTTP requests and provider charges."""
+    if ledger is None:
+        return operation()
+    if any(entry.reservation_id == reservation for entry in ledger.entries):
+        raise ValueError('Source operation already recorded; inspect its original result before retry')
+    amount = {'source_operations': count}
+    ledger.reserve(reservation, amount, attempt_id=attempt_id, session_id=session_id, purpose=purpose)
+    try:
+        result = operation()
+    except Exception:
+        ledger.settle(reservation, amount, actual_source='adapter', reason='Source adapter work failed')
+        raise
+    except BaseException:
+        ledger.mark_unknown(reservation, reason='Source operation interrupted; inspect retained results')
+        raise
+    ledger.settle(reservation, amount, actual_source='adapter',
+        reason=outcome_reason(result) if outcome_reason is not None else '')
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +332,10 @@ def search_sources(
             )
             if response.status == "rate_limited" and rate_limited is None:
                 rate_limited = response
+            title = _normalized_title(query) if request.filters.get('match_title') else ()
+            if title and _response_succeeded(response):
+                response = replace(response, papers=[paper for paper in response.papers
+                    if _normalized_title(paper.title) == title])
             response = _apply_optional_cache(
                 response,
                 query=query,
@@ -334,6 +365,11 @@ def search_sources(
     )
 
 
+def _normalized_title(text: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize('NFKC', text).casefold()
+    return tuple(re.findall(r'[^\W_]+', normalized))
+
+
 def _apply_optional_cache(
     response: SearchResponse,
     *,
@@ -351,6 +387,8 @@ def _apply_optional_cache(
 
     if not request.cache_enabled or request.cache_dir is None:
         return response
+    if request.filters.get('match_title'):
+        query = f'{query} [match:title]'
     scope = temporal_scope(request.filters)
     if scope is not None:
         # Cache APIs already key by query; scoped entries must not replace or
@@ -413,6 +451,8 @@ def run_search_capability(
     excluded_paper_keys: frozenset[str] = frozenset(),
     linked_records: tuple[DocumentRecord, ...] = (),
     emit: Callable[[str], None] | None = None,
+    budget_ledger: BudgetLedger | None = None,
+    session_id: str = '',
 ) -> CapabilityResult:
     """Persist one explicit search handoff for a controller-managed attempt.
 
@@ -422,7 +462,14 @@ def run_search_capability(
     visible; repeated queries and rounds without new paper identities stop.
     """
 
-    result = search_sources(request, registry=registry, emit=emit)
+    attempt = context.attempt.attempt_id
+
+    def search_round(value: SearchRequest, number: int) -> SearchResult:
+        return run_source_operation(budget_ledger, f'source-search:{attempt}:{number}',
+            len(value.queries) * len(value.providers), lambda: search_sources(value, registry=registry, emit=emit),
+            purpose='research search', attempt_id=attempt, session_id=session_id)
+
+    result = search_round(request, 1)
     if linked_records:
         supplied = provided_materials_result(linked_records)
         candidates = tuple(replace(paper, abstract=str(record.metadata.get("parent_quote") or record.abstract))
@@ -439,6 +486,8 @@ def run_search_capability(
         policy = selection_policy
         result = replace(result, response_rounds=(1,) * len(result.responses))
         remaining_queries = policy.next_query_limit
+        if budget_ledger is not None and (available := budget_ledger.remaining('source_operations')) is not None:
+            remaining_queries = min(remaining_queries, max(0, int(available) // len(request.providers)))
         executed = {_query_key(response.query) for response in result.responses}
         identities: set[str] = set()
         round_index = 1
@@ -473,9 +522,9 @@ def run_search_capability(
                     paper_limit = request.stop_after_papers
                     if paper_limit is not None:
                         paper_limit -= len({paper.id for paper in result.papers})
-                    followup = search_sources(
+                    followup = search_round(
                         replace(request, queries=tuple(next_queries), stop_after_papers=paper_limit),
-                        registry=registry, emit=emit,
+                        round_index,
                     )
                     last_round_status = followup.status
                     executed.update(_query_key(response.query) for response in followup.responses)

@@ -50,6 +50,9 @@ def fulltext_hints_for_paper(paper: Paper, *, document_id: str) -> list[Fulltext
         hints.append(_hint_from_url(document_id=document_id, url=paper.fulltext_url, source=paper.source, reason="provider_fulltext_url"))
     elif paper.url and not (paper.source == "arxiv" and arxiv_id):
         hints.append(_hint_from_url(document_id=document_id, url=paper.url, source=paper.source, reason="metadata_url"))
+    if paper.source == "arxiv" and arxiv_id:
+        hints.append(FulltextHint(document_id=document_id, kind="landing", source="arxiv",
+            url=f"https://arxiv.org/html/{arxiv_id}", access="open", reason="arxiv_html_alternative"))
     return _deduplicate_hints(hints)
 
 
@@ -100,10 +103,14 @@ def build_fulltext_manifest(
         fetch_attempt_count += 1
     for record in records:
         hints = _hints_for_record(record)
-        hint_count += len(hints)
         selected_for_fetch = False
         row_hints: list[dict[str, Any]] = []
         for hint in hints:
+            if hint.reason == 'arxiv_html_alternative':
+                fetched = {row['status'] for row in row_hints}
+                if 'fetch_failed' not in fetched or 'cached' in fetched:
+                    continue
+            hint_count += 1
             planned = _plan_hint(
                 hint,
                 require_fulltext=source_plan.require_fulltext,

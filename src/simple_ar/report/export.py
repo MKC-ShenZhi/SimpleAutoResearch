@@ -635,6 +635,8 @@ def _scientific_unicode_symbols() -> dict[str, str]:
     symbols = {char: "\\" + name if name != "o" else "o" for char, name in greek.items()}
     symbols.update({"ς": r"\varsigma", "ϑ": r"\vartheta", "ϕ": r"\varphi", "ϵ": r"\varepsilon",
                     "∞": r"\infty", "≤": r"\leq", "≥": r"\geq", "≠": r"\neq",
+                    "≪": r"\ll", "≫": r"\gg",
+                    "←": r"\leftarrow", "→": r"\rightarrow", "↔": r"\leftrightarrow",
                     "≈": r"\approx", "±": r"\pm", "∓": r"\mp", "×": r"\times",
                     "÷": r"\div", "∈": r"\in", "∉": r"\notin", "∂": r"\partial",
                     "∇": r"\nabla", "∑": r"\sum", "∏": r"\prod", "∫": r"\int",
@@ -1254,7 +1256,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             manifest.update(_compile(output, bool(citations), runner=runner,
                 **({'preflight': preflight, 'following_processes': pdf_needs} if preflight is not None else {}),
                 **({'engine': engine} if template_files or article else {}),
-                **({'fail_on_missing_glyphs': True} if article else {})))
+                **({'fail_on_missing_glyphs': True} if article or template_files else {})))
         if manifest['compiled'] and preflight is not None and pdf_needs['process_invocations']:
             preflight(pdf_needs)
         pdf_info = {}  # Same-export observations only; never upgrade history.
@@ -1377,6 +1379,30 @@ def _check_publication_pdf(output: Path, receipt: dict[str, Any], *, runner: Cal
                          else 'blocked' if any(row['status'] == 'blocked' for row in results.values()) else 'failed')
 
 
+def _pdf_preview_command(executable: str, source: str, first: int, last: int,
+                         *, prefix: Path | None = None) -> list[str]:
+    argv = [executable, '-png', '-r', '120', '-scale-to', '1600', '-f', str(first), '-l', str(last)]
+    return [*argv, '-singlefile', source] if prefix is None else [*argv, source, str(prefix)]
+
+
+def render_pdf_page(content: bytes, page: int) -> tuple[bytes, int]:
+    """Render one page of the caller's already read PDF version to PNG."""
+    from io import BytesIO
+    from pypdf import PdfReader
+
+    executable = shutil.which('pdftoppm')
+    if executable is None:
+        raise ReportExportError('PDF page preview requires Poppler pdftoppm')
+    count = len(PdfReader(BytesIO(content)).pages)
+    if not 1 <= page <= count:
+        raise ValueError('PDF page is outside the document')
+    rendered = subprocess.run(_pdf_preview_command(executable, '-', page, page),
+        input=content, capture_output=True, timeout=30, check=False)
+    if rendered.returncode != 0 or not rendered.stdout.startswith(b'\x89PNG\r\n\x1a\n'):
+        raise ReportExportError('Poppler could not render the selected PDF page')
+    return rendered.stdout, count
+
+
 def _render_pdf_preview(output: Path, *, runner: Callable, pdf_info: dict | None = None) -> dict[str, Any]:
     """Render all actual pages; never infer visual quality."""
     pdftoppm = shutil.which('pdftoppm')
@@ -1395,8 +1421,8 @@ def _render_pdf_preview(output: Path, *, runner: Callable, pdf_info: dict | None
         raise ReportExportError(f"PDF has {page_count} pages; full preview requires at least one page")
     previews = output / 'previews'
     previews.mkdir()
-    runner([pdftoppm, '-png', '-r', '120', '-scale-to', '1600', '-f', '1', '-l', str(page_count),
-            str(pdf), str(previews / 'page')], cwd=output, timeout=90)
+    runner(_pdf_preview_command(pdftoppm, str(pdf), 1, page_count, prefix=previews / 'page'),
+        cwd=output, timeout=90)
     expected = [previews / f'page-{page:0{len(str(page_count))}d}.png' for page in range(1, page_count + 1)]
     if set(previews.iterdir()) != set(expected):
         raise ReportExportError("Poppler preview files do not match every requested PDF page; retained output is incomplete or unexpected")
@@ -1498,7 +1524,7 @@ def _compile(output: Path, has_citations: bool, *, runner: Callable | None = Non
             missing = [name for name, available in ((engine, latex), ('bibtex', bibtex if has_citations else True))
                 if not available]
             return {'status': 'compile_failed', 'compiled': False,
-                'compile_note': 'Missing article dependencies: ' + ', '.join(missing)
+                'compile_note': 'Missing publication dependencies: ' + ', '.join(missing)
                     + ('; Unicode content selected XeLaTeX, requiring CTeX and Fandol fonts.' if engine == 'xelatex' else '.')
                     + ' Editable project retained; no engine fallback or automatic installation.'}
         return {"status": "exported", "compiled": False, "compile_note": "TeX unavailable; editable source retained."}
@@ -1517,8 +1543,7 @@ def _compile(output: Path, has_citations: bool, *, runner: Callable | None = Non
             if fail_on_missing_glyphs:
                 missing = _missing_tex_glyphs(output, logs[-1])
                 if missing:
-                    raise ReportExportError('Article font lacks required glyphs: ' + '; '.join(dict.fromkeys(missing))
-                        + '. Retain the original content and choose a trusted template with suitable fonts; no fallback.')
+                    raise ReportExportError('Required glyphs are missing: ' + '; '.join(missing))
     except ReportExportResourceError as exc:
         logs.append(str(exc))
         raise
@@ -1529,8 +1554,8 @@ def _compile(output: Path, has_citations: bool, *, runner: Callable | None = Non
             missing = _missing_tex_glyphs(output, note)
             if missing:
                 note = 'Required glyphs are missing: ' + '; '.join(missing)
-            note = (f'Article {engine} compilation failed; '
-                + ('install the required Unicode packages and fonts listed in README.txt. ' if engine == 'xelatex' else '')
+            note = (f'Publication {engine} compilation failed; '
+                + ('check the Unicode packages and fonts selected for this publication. ' if engine == 'xelatex' else '')
                 + 'No engine fallback or content substitution. ' + note)
         return {"status": "compile_failed", "compiled": False, "compile_note": note}
     finally:

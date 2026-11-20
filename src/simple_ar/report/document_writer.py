@@ -76,7 +76,7 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
     from simple_ar.report.assembler import ReportAssemblyMode
     from simple_ar.report.memory import initialize_report_memory
     from simple_ar.report.ports import DeterministicFigureRenderer
-    from simple_ar.report.writing import ReportWritingRequest, retained_writing_client, run_report_writing_capability
+    from simple_ar.report.writing import ReportWritingRequest, write_bound_document
 
     documents, source_bindings = _observed_documents(observations)
 
@@ -141,16 +141,12 @@ def write_observed_report(*, store: ArtifactStore, identity: str, requirement: d
     if store.exists('report-writer-result.json'):
         completed = store.read_json('report-writer-result.json')
     else:
-        writer_client = (retained_writing_client(store=writer, identity=identity, client=client,
-            contract='atomic_complete.v2', retry_unstarted=retry_unstarted)
-            if requirement['method'] == 'sections' else client)
-        resume = (store.ref('writer/sections.json', kind='report_checkpoint', schema='report_checkpoint.v1')
-            if writer.exists('sections.json') else None)
-        result = run_report_writing_capability(context=CapabilityContext(writer, AttemptManifest(identity),
-            inputs=(documents_ref, *((resume,) if resume else ())), input_store=store), request=ReportWritingRequest(report_context=context,
-                memory=memory, config=config, template=template, llm_client=writer_client,
+        result = write_bound_document(owner=store, writer=writer, identity=identity, inputs=(documents_ref,),
+            response_contract='atomic_complete.v2' if requirement['method'] == 'sections' else None,
+            retry_unstarted=retry_unstarted, request=ReportWritingRequest(report_context=context,
+                memory=memory, config=config, template=template, llm_client=client,
                 method=requirement['method'], prior_draft=prior_draft, output_outline=requirement['outline'],
-                resume_ref=resume, source_reader=read_source, flexible_article_revision=current_work))
+                source_reader=read_source, flexible_article_revision=current_work))
         writer_ref = next((row for row in reversed(result.artifacts) if row.kind == 'report_writer_result'), None)
         if writer_ref is None:
             raise ValueError('Report writing has no complete candidate; retain its checkpoint: ' + '; '.join(result.diagnostics))

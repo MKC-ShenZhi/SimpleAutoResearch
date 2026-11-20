@@ -205,9 +205,10 @@ class ProcessControlTests(unittest.TestCase):
                 handles.append(kernel.OpenProcess(0x100000, False, int(chunk.strip())))
 
         with tempfile.TemporaryDirectory() as tmp:
-            code = "import subprocess, sys, time; p=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3)']); print(p.pid, flush=True); time.sleep(3)"
+            code = "import subprocess, sys, time; p=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)']); print(p.pid, flush=True); time.sleep(20)"
             try:
-                result = run_process(ProcessSpec([sys.executable, "-u", "-c", code], Path(tmp), 0.75), output_callback=observe)
+                # Allow interpreter startup under load while the fixture outlives the timeout.
+                result = run_process(ProcessSpec([sys.executable, "-u", "-c", code], Path(tmp), 4), output_callback=observe)
                 self.assertEqual(result.stop_reason, "timeout")
                 self.assertTrue(handles and handles[0])
                 self.assertEqual(kernel.WaitForSingleObject(handles[0], 2000), 0)

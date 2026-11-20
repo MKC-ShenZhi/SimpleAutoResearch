@@ -131,6 +131,35 @@ class NativeGoalWorkTests(unittest.TestCase):
         self.assertEqual(text_final, final)
         self.assertEqual(text_bindings, bindings)
 
+        # A readable file elsewhere in the task is still unavailable when the
+        # reviewer never received its body. Keep the other supported finding.
+        current = {**saved, 'inspection_evidence_policy': 'presented.v6', 'evidence': [
+            {'subject': 'evidence-2', 'readable': True, 'sha256': 'other', 'windows': [{}]}]}
+        current_model = owner._claim_response_model(current)
+        current_schema = owner._delivery_schema(current, current_model, subjects={'evidence-1'})
+        offer = [{'type': 'function', 'function': {'name': 'record_inspection', 'parameters': current_schema}}]
+        opinion = deepcopy(original)
+        opinion['investigations'][1].update(basis='observed', evidence=['evidence-2'])
+        opinion['requested_outcomes'] = [{'outcome': 'Editable report', 'status': 'delivered',
+            'artifacts': ['report.md'], 'explanation': 'The report is present.'}]
+        tool_call = {**call, 'function': {**call['function'], 'arguments': json.dumps(opinion)}}
+        _, error, retained, resolutions = owner._admit_response(
+            current, [tool_call], offer, current_model, set(), shared=True)
+        self.assertEqual(error, '')
+        self.assertEqual(retained['conclusion'], 'incomplete')
+        self.assertEqual(retained['investigations'][1]['outcome'], 'unresolved')
+        self.assertEqual(retained['investigations'][0]['findings'][0]['message'], 'Correct the split.')
+        self.assertIn('not available in the opinion offer', resolutions[-1]['reason'])
+        _, error, closing, _ = owner._admit_response(current, [], offer, current_model, set(),
+            shared=True, content=json.dumps(opinion), closing=True)
+        self.assertEqual(error, '')
+        self.assertEqual(closing, retained)
+
+        del opinion['requested_outcomes'][0]['artifacts']
+        tool_call['function']['arguments'] = json.dumps(opinion)
+        _, error, _, _ = owner._admit_response(current, [tool_call], offer, current_model, set(), shared=True)
+        self.assertIn("$.requested_outcomes[0]: 'artifacts' is a required property", error)
+
         # Unknown substantive material cannot be silently dropped, and the
         # relaxation never applies to actions that read or change the workspace.
         response['findings'] = [{'message': 'A separate unbound concern.'}]
@@ -220,8 +249,20 @@ class NativeGoalWorkTests(unittest.TestCase):
         old_offer = [{'type': 'function', 'function': {'name': 'record_inspection', 'parameters': old_schema}}]
         self.assertEqual(admit(old, old_offer)[1], '')
         missing = deepcopy(response)
-        missing['requested_outcomes'][0]['artifacts'] = ['workspace/project/missing.md']
-        self.assertIn('artifacts in the proposed delivery', admit(missing)[1])
+        missing['requested_outcomes'][0]['artifacts'] = [visible, 'workspace/project/missing.md']
+        _, error, final, _ = admit(missing)
+        self.assertEqual(error, '')
+        outcome, = final['requested_outcomes']
+        self.assertEqual((outcome['status'], outcome['artifacts']), ('uncertain', [artifact]))
+        self.assertIn('workspace/project/missing.md', outcome['explanation'])
+        self.assertEqual(final['investigations'][0]['outcome'], 'supported')
+        missing['requested_outcomes'][0]['status'] = 'missing'
+        _, error, final, _ = admit(missing)
+        self.assertEqual(error, '')
+        outcome, = final['requested_outcomes']
+        self.assertEqual((outcome['status'], outcome['artifacts']), ('missing', [artifact]))
+        self.assertIn('workspace/project/missing.md', outcome['explanation'])
+        self.assertEqual(missing['requested_outcomes'][0]['artifacts'], [visible, 'workspace/project/missing.md'])
         missing = deepcopy(response)
         missing['investigations'][0]['execution_records'] = ['tools/inspection/unknown']
         error = admit(missing)[1]
@@ -1296,7 +1337,7 @@ class GoalWorkTests(unittest.TestCase):
                     outputs=[work['path'] + '/checked.json'], timeout_sec=5)]
             details = view['executed_check_details']
             self.assertEqual(set(details), set(view['executed_checks']))
-            self.assertTrue(all(record.endswith('/invocation.json') for record in details))
+            self.assertTrue(all(Path(record).name == 'invocation.json' for record in details))
             self.assertEqual(next(iter(details.values()))['cwd'], work['path'])
             self.assertIn('argv_preview', next(iter(details.values())))
             paths = ['measurements/observations.csv', work['path'] + '/checked.json', 'claim.md']
@@ -1382,6 +1423,23 @@ class GoalWorkTests(unittest.TestCase):
         self.assertEqual(len(case._process_receipts()), 1)
         self.assertEqual(case.send.call_count, calls)
         self.assertEqual(protected, {name:(case.root/name).read_bytes() for name in protected})
+
+    def test_model_requested_review_yields_token_forecast_but_keeps_followup_call(self):
+        from types import SimpleNamespace
+        from simple_ar.core.budget import BudgetLedger
+
+        ledger = BudgetLedger({'llm_requests': 2, 'total_tokens': 100})
+        owner = SimpleNamespace(ledger=ledger, _terminal_batch=lambda: False,
+            _completion_floor=lambda client, dispatch: {'llm_requests': 1, 'total_tokens': 90},
+            state={'config': {'work_lifecycle': 'integrated.v3', 'independent_review_required': True},
+                   'turns': [{'origin': 'model'}]})
+        with ToolApplication._review_capacity(owner, None, candidate=True):
+            self.assertTrue(ledger.yield_protection_for({'llm_requests': 1, 'total_tokens': 30}))
+            self.assertEqual(ledger.remaining('llm_requests'), 1)
+            ledger.reserve('review', {'llm_requests': 1, 'total_tokens': 30})
+            self.assertEqual(ledger.remaining('llm_requests'), 0)
+            self.assertFalse(ledger.yield_protection_for({'llm_requests': 1}))
+        self.assertEqual(ledger.remaining('llm_requests'), 1)
 
     def test_saved_selector_interface_retains_its_operation_offer_and_permissions(self):
         case = self.case
@@ -1592,7 +1650,7 @@ class GoalWorkTests(unittest.TestCase):
                 files = {'method.py': 'def calculate():\n    return 17\n',
                          'result.txt': 'Observed result: 17\n'}
                 for name, content in files.items():
-                    (root / 'workspace' / name).write_text(content, encoding='utf-8')
+                    (root / 'workspace' / name).write_bytes(content.encode('utf-8'))
                 case.inspection_requests.clear()
                 case.review = lambda _: {'conclusion': 'incomplete', 'findings': [], 'evidence': [],
                     'limitations': ['Controlled fixture has not independently judged the work.']}

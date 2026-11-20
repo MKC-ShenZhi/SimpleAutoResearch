@@ -645,7 +645,7 @@ class ImplementationSources:
                 raise ValueError('Requested read is outside the authorized candidate inventory')
             key = (str(path), window.offset_bytes, window.max_bytes, window.start_line, window.max_lines)
             if key in seen:
-                raise ValueError('Request distinct implementation windows')
+                continue
             seen.add(key)
             pending.append(window.model_dump(exclude_unset=True))
         for arguments in pending:

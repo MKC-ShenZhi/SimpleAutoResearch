@@ -28,6 +28,7 @@ from simple_ar.code_task.editing.scope import (
 from simple_ar.code_task.editing.snapshots import FileSnapshotSet, create_file_snapshot_set
 from simple_ar.code_task.runtime.accounting import account_code_task
 from simple_ar.code_task.runtime.state import (
+    patch_plan_status,
     code_task_paths, read_required_json as _read_required_json,
     utcnow_iso as _utcnow_iso, workspace_file as _workspace_file,
 )
@@ -487,6 +488,14 @@ def propose_patch_edits(
     if proposal is None:
         proposal = _offline_proposal(selected, read_only_context=read_only_context)
 
+    if context_followup is not None:
+        # A replacement proposal can use additional evidence obtained by the
+        # same owner without expanding the authorized edit scope.
+        selected = list(dict.fromkeys([*selected, *(row['path'] for row in acquired_snippets)]))
+        read_only_context = list(dict.fromkeys([
+            *read_only_context, *(row['path'] for row in acquired_references),
+        ]))
+
     normalized = _normalize_edit_proposal(
         proposal,
         index=index,
@@ -571,7 +580,7 @@ def apply_patch_edits(
     workspace_dir = paths.workspace_dir
     manifest_path = paths.manifest_path
     manifest = _load_code_task_manifest(manifest_path)
-    if not allow_unapproved_plan and _plan_status(manifest) != "approved":
+    if not allow_unapproved_plan and patch_plan_status(manifest) != "approved":
         raise PermissionError(
             "Patch plan is not approved. Run `simple-ar code-task decide-plan "
             "<run-dir> --decision approve` before applying edits."
@@ -1868,13 +1877,6 @@ def _hash_rows_for_prepared(
 def _sha256(path: Path) -> str:
     with path.open("rb") as handle:
         return hashlib.file_digest(handle, "sha256").hexdigest()
-
-
-def _plan_status(manifest: dict[str, Any]) -> str:
-    plan = manifest.get("plan", {})
-    if isinstance(plan, dict):
-        return str(plan.get("status", ""))
-    return ""
 
 
 def _dict_value(data: dict[str, Any], key: str) -> dict[str, Any]:

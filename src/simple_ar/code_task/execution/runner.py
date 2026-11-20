@@ -218,7 +218,8 @@ def run_code_task_benchmark(
     session_id: str = "",
     attempt_id: str = "",
     process_scope: Any | None = None,
-) -> CodeTaskRunResult:
+    _recovery_only: bool = False,
+) -> CodeTaskRunResult | None:
     """Run the recorded benchmark command inside the copied workspace.
 
     Args:
@@ -252,6 +253,14 @@ def run_code_task_benchmark(
 
     manifest = load_code_task_manifest(run_dir)
     paths = code_task_paths(run_dir)
+    recovered = None
+    if _recovery_only:
+        if manifest.get('code_task', {}).get('native_binding') is None:
+            return None
+        recovered = recover_implementation_process(run_dir, budget_ledger=budget_ledger,
+            session_id=session_id, attempt_id=attempt_id)
+        if recovered is None:
+            return None
     if not paths.workspace_dir.is_dir():
         raise FileNotFoundError(f"Missing code-task workspace: {paths.workspace_dir}")
     paths.run_artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -271,7 +280,7 @@ def run_code_task_benchmark(
     )
     command_args = _split_command(command_text, environment_policy=environment_policy)
 
-    if not skip_validation:
+    if not skip_validation and not _recovery_only:
         validation = validate_code_task(run_dir,
             budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
             process_protection={'process_invocations': 1, 'process_wall_seconds': timeout_sec},
@@ -292,8 +301,9 @@ def run_code_task_benchmark(
     watchdog = _OutputWatchdog()
     mode = normalize_stream_output_mode(stream_output)
     binding = manifest.get('code_task', {}).get('native_binding')
-    recovered = recover_implementation_process(run_dir, budget_ledger=budget_ledger,
-        session_id=session_id, attempt_id=attempt_id) if binding is not None else None
+    if binding is not None and not _recovery_only:
+        recovered = recover_implementation_process(run_dir, budget_ledger=budget_ledger,
+            session_id=session_id, attempt_id=attempt_id)
     if binding is not None:
         from simple_ar.code_task.execution.environment import native_validation_command
         expected = _split_command(

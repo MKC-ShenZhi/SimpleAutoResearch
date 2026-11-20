@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from copy import deepcopy
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 from typing import Any, Callable, Literal
@@ -218,7 +217,8 @@ class _RequestedOutcome(BaseModel):
         'Accessible supporting evidence is not automatically delivered.')
     artifacts: list[str] = Field(description='Included delivery artifacts that fulfill this outcome; '
         'empty is valid for an outcome answered directly in the delivery text.')
-    explanation: str = Field(min_length=1, description='Why the included work does or does not fulfill this outcome.')
+    explanation: str = Field(min_length=1, description='Why the included work does or does not fulfill this outcome. '
+        'Name missing files here and use investigations for evidence outside the delivery.')
 
 
 class _PresentedClaimDeliveryResponseV4(_PresentedClaimDeliveryResponseV3):
@@ -828,7 +828,8 @@ class InspectionToolGateway:
         path = Path(value)
         if path.is_absolute() or path.parts[:1] == ('workspace',):
             return arguments
-        return {**arguments, 'path':str(Path('workspace') / 'inspection-work' / saved['identity'] / path)}
+        destination = Path('workspace') / 'inspection-work' / saved['identity'] / path
+        return {**arguments, 'path': destination.as_posix()}
 
     def _shared_destination(self, identity: str, value: str, saved: dict) -> Path:
         base = self.workspace.workspace.resolve() / 'inspection-work' / identity
@@ -2391,9 +2392,13 @@ class InspectionToolGateway:
             raise ValueError('Requested outcomes may name only artifacts in the proposed delivery')
         return decision
 
-    def _retain_valid_investigations(self, saved: dict, value: dict) -> tuple[dict, list[dict]]:
+    def _retain_valid_investigations(self, saved: dict, value: dict, *,
+                                     unavailable_evidence: dict[int, str] | None = None) -> tuple[dict, list[dict]]:
         """Keep independently supported checks when another check cannot be bound."""
+        unavailable_evidence = unavailable_evidence or {}
         try:
+            if unavailable_evidence:
+                raise ValueError(next(iter(unavailable_evidence.values())))
             self._delivery_decision(saved, value)
             return value, []
         except ValueError as original:
@@ -2404,6 +2409,8 @@ class InspectionToolGateway:
             single = {**result, 'conclusion': 'incomplete', 'investigations': [row],
                       'reassessed_prior': []}
             try:
+                if index in unavailable_evidence:
+                    raise ValueError(unavailable_evidence[index])
                 self._delivery_decision(saved, single)
             except ValueError as exc:
                 resolutions.append({'investigation_index': index, 'resolution': 'unresolved',
@@ -2489,19 +2496,35 @@ class InspectionToolGateway:
             leaf:self._digest(self._path(previous['identity'], leaf)) for leaf in ('input', 'response', 'result')}}
         saved['retained_investigations'] = [*previous.get('retained_investigations', []), pinned]
         parents = self._retained_inputs(saved)
+        delivery = saved.get('delivery_context', {})
+        if delivery.get('scope_policy') == 'applicable.v2' and parents:
+            versions = delivery['artifacts']
+            for parent in reversed(parents):
+                prior = parent.get('delivery_context', {}).get('artifacts', {})
+                if not versions.keys() & prior.keys() or versions == prior:
+                    continue
+                # Changed and newly introduced sources are the starting point.
+                saved['revision_sources'] = [path for path, digest in versions.items()
+                    if path in prior and prior[path] != digest]
+                saved['introduced_artifacts'] = [path for path in versions if path not in prior]
+                saved['removed_artifacts'] = [path for path in prior if path not in versions]
+                break
         owners = {(row['path'], row['sha256']):row for row in saved['evidence'] if row.get('sha256')}
         selected_paths = None
         if saved.get('source_priming_policy') in {'priority.v3', 'priority.v4'}:
             selected_paths = {row['path'] for row in [*saved['targets'], *saved['evidence']]
                 if row.get('path')}
             if 'delivery_context' in saved:
-                selected_paths.update(saved['delivery_context']['artifacts'])
+                if 'revision_sources' not in saved:
+                    selected_paths.update(saved['delivery_context']['artifacts'])
                 selected_paths.update(self._delivery_source_paths(saved))
         number = max((int(row['subject'].split('-')[1]) for row in saved['evidence']), default=0)
         for parent in reversed(parents):
             for row in [*parent['targets'], *parent['evidence']]:
                 if not row.get('readable') or not row.get('sha256'):
                     continue
+                if 'revision_sources' in saved and selected_paths is not None and row['path'] not in selected_paths:
+                    continue  # The original inspection supplies the history locator.
                 try:
                     if self.workspace.artifact_hashes([row['path']])[row['path']] != row['sha256']:
                         continue
@@ -2921,16 +2944,12 @@ class InspectionToolGateway:
             ref = attempt_store.write_json(f'inspection/{key}.json', assessment, **ref_options)
         else:
             ref = attempt_store.ref(f'inspection/{key}.json', **ref_options)
-            if attempt_store.read_json(ref) != assessment:
-                raise ValueError('Inspection retained assessment differs from its completed response; no overwrite')
         artifact_path = f'attempts/{identity}/{ref.path}'
-        assessment_digest = self._digest(artifact_path)
-        if saved.get('source_provenance') in {'versions.v1', 'versions.v2'}:
-            encoded = (json.dumps(assessment, indent=2, ensure_ascii=False) + '\n').replace(
-                '\n', os.linesep).encode('utf-8')
-            assessment_digest = hashlib.sha256(encoded).hexdigest()
-            if self._digest(artifact_path) != assessment_digest:
-                raise ValueError('Inspection assessment changed during publication')
+        published = attempt_store.require(ref).read_bytes()
+        if (not persist or saved.get('source_provenance') in {'versions.v1', 'versions.v2'}) and (
+                json.loads(published) != assessment):
+            raise ValueError('Inspection assessment differs from its completed response; no overwrite')
+        assessment_digest = hashlib.sha256(published).hexdigest()
         diagnostics = {}
         if self.adaptive and error and saved.get('source_rounds'):
             trace_path = self._path(identity, f"sources-{len(saved['source_rounds'])-1}")
@@ -3080,6 +3099,8 @@ class InspectionToolGateway:
 
     def work_inputs(self, targets: list[str], *, include_observations: bool = False) -> list[dict]:
         """Supply relevant current opinions to source work, not another copy of its evidence."""
+        if include_observations:
+            return []
         roots = [self.workspace.resolve(path) for path in targets]
         result = []
         for assessment in self.prior_assessments() if self.prior_assessments else []:
@@ -3168,6 +3189,14 @@ class InspectionToolGateway:
                     for row in saved.get('prior_work_opinions', [])]
             if self._applicable_scope(saved):
                 view['proposed_delivery']['scope_policy'] = saved['delivery_context']['scope_policy']
+                if 'revision_sources' in saved:
+                    view['proposed_delivery']['revision'] = {
+                        'changed': saved['revision_sources'],
+                        'added': saved.get('introduced_artifacts', []),
+                        'removed': saved.get('removed_artifacts', []),
+                        'scope': 'Investigate new or changed claims and the sources affected by this revision. '
+                            'Retained original observations can support unchanged claims when applicable. '
+                            'This inventory comparison does not transfer an earlier verdict.'}
                 history = saved.get('source_history', {})
                 view['source_history'] = {'indexed_paths': len(history.get('entries', [])),
                     'scope': history.get('scope', 'No parent read locators available; use authorized roots.'),
@@ -3195,7 +3224,9 @@ class InspectionToolGateway:
             targets, evidence = role_versions['targets'], role_versions['evidence']
             shared = None
             if all(path not in targets or targets[path] == digest for path, digest in evidence.items()):
-                versions = {**targets, **evidence}
+                introduced = {path: saved['delivery_context']['artifacts'][path]
+                    for path in saved.get('introduced_artifacts', ())}
+                versions = {**introduced, **targets, **evidence}
                 try:
                     shared = (self.workspace.artifact_sources(versions,
                         records=saved.get('source_invocations', []), cache=source_cache) if versions else {})
@@ -3203,6 +3234,32 @@ class InspectionToolGateway:
                     pass  # Keep the previous per-role availability boundary below.
             if shared is not None:
                 source_views = {'targets': shared, 'evidence': shared}
+                copies = []
+                delivery_versions = saved.get('delivery_context', {}).get('artifacts', {})
+                # Copy provenance is compact and version-bound. It remains
+                # relevant for unchanged deliverables already observed in a
+                # revision, even when their old bodies are deliberately omitted.
+                for path, digest in versions.items():
+                    if delivery_versions.get(path) != digest:
+                        continue
+                    graph = shared[path].get('lineage')
+                    if graph is None:
+                        continue
+                    nodes = {node['id']: node for node in graph['nodes']}
+                    root = nodes[graph['root']]
+                    if root['state'] != 'recorded':
+                        continue
+                    for edge in root['edges']:
+                        original = nodes[edge['node']]
+                        origin = str(original['path'])
+                        if edge['kind'] == 'copy' and origin != path and original['sha256'] == digest:
+                            copies.append({'artifact': path, 'original_at_copy': origin,
+                                'sha256': digest, 'record': root['owner']['record']})
+                if copies:
+                    view['proposed_delivery']['recorded_copies'] = {
+                        'files': copies,
+                        'scope': 'A bound copy proves byte identity with the original at copy time. '
+                            'It supplies neither the file body nor a scientific judgment.'}
             else:
                 for role, versions in role_versions.items():
                     try:
@@ -3313,6 +3370,14 @@ class InspectionToolGateway:
         base = self._view(saved, request)
         if saved.get('execution_protocol') == 'shared.v2':
             ledger = client._budget_ledger
+            capabilities = {row['function']['name'] for row in offered}
+            base['available_evidence'] = {
+                'rendered_image_observation': 'inspect_images' in capabilities,
+                'new_execution': 'run_process' in capabilities,
+                'scope': ('Judge each requirement with evidence that can actually be obtained. '
+                    'Use recorded observations when applicable. If required evidence cannot be obtained, '
+                    'return the supported findings and the explicit gap. Text, metadata and a successful render '
+                    'do not establish visual quality; only pursue a measurement if it can answer the specific question.')}
             base['resource_handoff'] = {
                 'spendable_after_caller_protection': {key: ledger.remaining(key)
                     for key in ledger.limits},
@@ -4157,7 +4222,9 @@ class InspectionToolGateway:
 
     def _inspection_projector(self, saved, request, messages, tools, terminal, finish, client, response_model):
         """Build both investigation and final offers with the same evidence contract."""
-        from simple_ar.app.professional_conversation import ConversationInput
+        from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
+
+        conversation = ProfessionalConversation(client)
 
         previously_supplied = (self._offered_text_ranges(saved)
             if response_model is not None and self._delivery_scope(saved)
@@ -4165,7 +4232,10 @@ class InspectionToolGateway:
 
         def project(closing):
             offered = [terminal] if closing else [*tools, terminal]
-            projected, metadata = self._working_messages(saved, request, messages, offered, client,
+            limit = (conversation.closing_output_limit()
+                if closing and saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS else None)
+            projected, metadata = self._working_messages(saved, request, messages, offered,
+                conversation.projection_client(limit),
                 finish=finish if closing else None,
                 prioritize_delivery=closing and saved.get('source_priming_policy') == 'priority.v4')
             if (response_model is not None and self._delivery_scope(saved)
@@ -4186,7 +4256,7 @@ class InspectionToolGateway:
                 final = deepcopy(terminal)
                 final['function']['parameters'] = self._delivery_schema(saved, response_model, subjects=subjects)
                 offered = [final] if closing else [*tools, final]
-            return ConversationInput(projected, offered, metadata)
+            return ConversationInput(projected, offered, metadata, output_limit=limit)
 
         return project
 
@@ -4200,10 +4270,11 @@ class InspectionToolGateway:
         trace = self._path(saved['identity'], f'sources-{number}')
         last_floor = {}
         project = self._inspection_projector(saved, request, messages, tools, terminal, finish, client, response_model)
+        exit_first = saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS
 
         def followup(value):
             nonlocal last_floor
-            last_floor = conversation.request_resources(project(True))
+            last_floor = conversation.request_resources(value if exit_first else project(True))
             return last_floor
 
         def shared_checkpoint(checkpoint_input, *, restore_floor):
@@ -4361,7 +4432,7 @@ class InspectionToolGateway:
             checkpoint=None if checkpoint_input is not None else checkpoint,
             followup=followup,
             force_close=remaining[0] <= 0, additional=True,
-            exit_first=saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS)
+            exit_first=exit_first)
         return conversation, value
 
     def _legacy_inspection_input(self, saved, request, messages, tools, terminal, client, finish, number, remaining):
@@ -4458,6 +4529,12 @@ class InspectionToolGateway:
             (claim.get('summary_source') or {}).get('path')) if path]
         artifacts = [path for path in saved['delivery_context']['artifacts']
                      if Path(path).suffix.lower() not in _BINARY]
+        if 'revision_sources' in saved:
+            pending = [path for finding in saved.get('prior_required', ())
+                       for path in finding.get('pending_subjects', ())]
+            return list(dict.fromkeys([*primary,
+                *(path for path in [*pending, *saved['revision_sources'], *saved.get('introduced_artifacts', ())]
+                  if path in artifacts)]))
         if include_artifacts or saved['delivery_context'].get('scope_policy') == 'applicable.v1':
             # This contract primes the whole delivery, so its other originals
             # must get a window before a long manuscript consumes the input.
@@ -4481,7 +4558,10 @@ class InspectionToolGateway:
             originals = []
             if delivery.get('scope_policy') == 'applicable.v2':
                 receipts = {}
-                for source in self.workspace.artifact_sources(delivery['artifacts']).values():
+                artifacts = delivery['artifacts']
+                if 'revision_sources' in saved:
+                    artifacts = {path: artifacts[path] for path in priority if path in artifacts}
+                for source in self.workspace.artifact_sources(artifacts).values():
                     graph = source.get('lineage')
                     if graph is None:
                         continue
@@ -4492,8 +4572,9 @@ class InspectionToolGateway:
                 # A useful execution need not produce a deliverable. Reuse the
                 # existing parent execution projection as historical evidence,
                 # never as an independent check or a proof of undeclared inputs.
-                for path, digest in saved.get('parent_process_receipts', {}).items():
-                    receipts.setdefault(path, digest)
+                if 'revision_sources' not in saved:
+                    for path, digest in saved.get('parent_process_receipts', {}).items():
+                        receipts.setdefault(path, digest)
                 saved['production_receipts'] = list(receipts)
                 priority = ([*priority, *receipts] if terminal_only else [*receipts, *priority])
                 for path, digest in receipts.items():
@@ -4699,6 +4780,20 @@ class InspectionToolGateway:
             schemas = ({item['function']['name']:item['function']['parameters'] for item in offered}
                 if shared else {})
             final_arguments = None
+            unavailable_evidence: dict[int, str] = {}
+
+            def validate_offer(name: str, value: Any) -> None:
+                from jsonschema import Draft202012Validator
+
+                for error in Draft202012Validator(schemas[name]).iter_errors(value):
+                    path = list(error.absolute_path)
+                    if (name == 'record_inspection' and saved.get('inspection_evidence_policy') == 'presented.v6'
+                            and len(path) >= 3 and path[0] == 'investigations' and path[2] == 'evidence'
+                            and error.validator in {'enum', 'maxItems'}):
+                        unavailable_evidence[path[1]] = 'Cited evidence was not available in the opinion offer: ' + error.message
+                        continue
+                    raise ValueError(f'Inspection operation arguments do not match the offered schema '
+                                     f'at {error.json_path}: {error.message}')
 
             def terminal_opinion(value: Any) -> Any:
                 # Empty, undeclared containers carry no opinion to adopt. Keep
@@ -4729,12 +4824,8 @@ class InspectionToolGateway:
                 parsed.append((name, arguments))
                 if shared and (name != 'record_inspection'
                         or saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES):
-                    from jsonschema import Draft202012Validator
                     checked = terminal_opinion(arguments) if name == 'record_inspection' else arguments
-                    errors = list(Draft202012Validator(schemas[name]).iter_errors(checked))
-                    if errors:
-                        raise ValueError('Inspection operation arguments do not match the offered schema: '
-                            + errors[0].message)
+                    validate_offer(name, checked)
                     if name == 'record_inspection':
                         final_arguments = checked
             finals = sum(name == 'record_inspection' for name, _ in parsed)
@@ -4751,6 +4842,8 @@ class InspectionToolGateway:
                 value = (final_arguments if final_arguments is not None else parsed[0][1]) if finals else json.loads(content)
                 if content_final and saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES:
                     value = terminal_opinion(value)
+                    if saved.get('inspection_evidence_policy') == 'presented.v6':
+                        validate_offer('record_inspection', value)
                 if not isinstance(value, dict):
                     raise ValueError('Inspection final opinion must be a JSON object')
                 if saved.get('prior_reference_policy') == 'short.v1':
@@ -4780,6 +4873,16 @@ class InspectionToolGateway:
                             *(finding for check in final['investigations'] for finding in check['findings'])]
                         for row in rows:
                             row['artifacts'] = [artifacts.get(path, path) for path in row['artifacts']]
+                        inventory = saved['delivery_context']['artifacts']
+                        for row in final.get('requested_outcomes', []):
+                            omitted = [path for path in row['artifacts'] if path not in inventory]
+                            if omitted:
+                                # A cited outside file cannot establish delivery. Keep the other
+                                # independently supported outcomes and retain this one as a gap.
+                                if row['status'] == 'delivered':
+                                    row['status'] = 'uncertain'
+                                row['artifacts'] = [path for path in row['artifacts'] if path in inventory]
+                                row['explanation'] += ' Named outside this delivery: ' + ', '.join(omitted) + '.'
                         if (saved.get('inspection_material_policy') == 'operations.v3'
                                 and any(check['execution_records'] for check in final['investigations'])):
                             executions = self._review_execution_names(self._execution_facts(saved))
@@ -4787,7 +4890,8 @@ class InspectionToolGateway:
                                 check['execution_records'] = [executions.get(path, path)
                                     for path in check['execution_records']]
                     if saved.get('inspection_evidence_policy') in {'presented.v3', 'presented.v4', 'presented.v5', 'presented.v6'}:
-                        final, resolutions = self._retain_valid_investigations(saved, final)
+                        final, resolutions = self._retain_valid_investigations(
+                            saved, final, unavailable_evidence=unavailable_evidence)
                         owner_bindings.extend(resolutions)
                     self._delivery_decision(saved, final)
                 elif self.protocol:
@@ -4966,6 +5070,10 @@ class InspectionToolGateway:
             'description':'Finish this inspection with findings and scope limitations. '
                 'Return this alone after reading evidence; it executes no external operation.',
             'parameters':response_model.model_json_schema()}}
+        if saved.get('inspection_evidence_policy') == 'presented.v6':
+            terminal['function']['description'] += (
+                ' Use the opinion schema only. The proposed delivery is input, not a response template. '
+                'Name delivered artifacts inside requested_outcomes or the relevant finding.')
         finish = {'role':'user','content':(
             'The available inspection resources permit only the final opinion now; no more reads will execute. '
             'Submit record_inspection. If necessary investigation remains, set conclusion=incomplete '
@@ -5089,7 +5197,7 @@ class InspectionToolGateway:
                     if saved.get('memory_protocol') == 'journal.v1':
                         conversation = ProfessionalConversation(client)
                         value = ConversationInput(call_messages, offered, projection,
-                            closing=terminal_only, reserve=offer['reserve'])
+                            closing=terminal_only, reserve=offer['reserve'], output_limit=offer.get('output_limit'))
                     working_input = record.get('working_input', {})
                 else:
                     if saved.get('memory_protocol') == 'journal.v1':
@@ -5107,7 +5215,10 @@ class InspectionToolGateway:
                     working_input = {'messages':call_messages, 'projection':projection} if self.progressive else {}
                     record.update(offer={'messages':call_messages, 'tools':offered,
                         'projection':projection, 'closing':terminal_only, 'reserve':reserve,
-                        'final_tokens':final_tokens}, working_input=working_input)
+                        'final_tokens':final_tokens,
+                        **({'output_limit':value.output_limit}
+                           if conversation and value.output_limit is not None else {})},
+                        working_input=working_input)
                     save_round()
                 if 'response' in record:
                     response = record['response']
@@ -5530,6 +5641,8 @@ class InspectionToolGateway:
                         raise ValueError('Delivery inspection requires its owner-projected prior concerns')
                 else:
                     saved['prior_work_opinions'] = deepcopy(prior_work_opinions or [])
+            if package and self.finding_policy == 'linked.v1':
+                saved['prior_required'] = deepcopy(prior_required)
             if saved.get('execution_protocol') not in _SHARED_EXECUTION_PROTOCOLS:
                 self.store.write_json(input_path, saved)
             saved['evidence'] = [self._observe(value, f'evidence-{i + 1}', identity, remaining)
@@ -5558,16 +5671,20 @@ class InspectionToolGateway:
                         reserve = min(remaining[0], window + sum(priority.values()))
                         reusable = [remaining[0] - reserve]
                 if self.adaptive and self.material_observations is not None:
-                    self._reuse_observations(saved, reusable)
+                    from simple_ar.tools.materials import material_journal_scope
+                    shared_index = (self._applicable_scope(saved)
+                        and saved.get('source_priming_policy') in _PRIORITY_SOURCE_POLICIES)
+                    with material_journal_scope() if shared_index else nullcontext():
+                        self._reuse_observations(saved, reusable)
                 if retained_from is not None:
                     self._inherit_investigation(saved, retained_from, reusable)
                 if reusable is not remaining:
                     remaining[0] = reserve + reusable[0]
                 saved['initial_subjects'] = [row['subject'] for row in [*saved['targets'],*saved['evidence']]]
             self._mark_evidence(saved)
-            saved['prior_required'] = (deepcopy(prior_required) if package and self.finding_policy == 'linked.v1'
-                else self._prior(saved['targets'], current_policy=saved.get('coverage_policy') == 'offered.v2',
-                    linked=self.finding_policy == 'linked.v1'))
+            if 'prior_required' not in saved:
+                saved['prior_required'] = self._prior(saved['targets'],
+                    current_policy=saved.get('coverage_policy') == 'offered.v2', linked=self.finding_policy == 'linked.v1')
             if saved.get('execution_protocol') in _SHARED_EXECUTION_PROTOCOLS:
                 saved['initial_read_remaining'] = remaining[0]
                 saved['immutable_paths'] = [row['path'] for row in [*saved['targets'], *saved['evidence']]

@@ -156,6 +156,29 @@ class DeliveryVersions:
                 continue  # An unavailable retained version is not current work.
         return results
 
+    def catalog(self) -> list[dict]:
+        """Describe what can be selected without reading live project files."""
+        return [self.describe(number, row) for number, row in enumerate(self.versions(), 1)]
+
+    def describe(self, number: int, row: dict) -> dict:
+        return {
+            'version': number,
+            'status': row['status'],
+            'summary': row['delivery'].get('summary'),
+            'project_root': row['delivery'].get('project_root'),
+            'artifact_count': len(row['files']),
+            'unresolved': len(row['delivery'].get('unresolved') or []),
+            'binding': row['binding'],
+            'observation': row['observation'],
+            'request_count': row['request_count'],
+            'receipt': self._receipt(row['observation']) if row['status'] == 'retained' else None,
+            'method_paths': sorted({
+                (PurePosixPath('workspace') / path).as_posix()
+                for locator in row['files']
+                if (path := self._workspace_relative(locator)) is not None and path.name == 'SKILL.md'
+            }),
+        }
+
     def select(self, version: int) -> dict:
         """Select an explicit retained delivery, independently of current work."""
         rows = self.versions()
@@ -183,11 +206,10 @@ class DeliveryVersions:
             return path
         return None
 
-    def _material_groups(self, version: int, *, include_project: bool = True
+    def _material_groups(self, selected: dict, *, include_project: bool = True
                          ) -> tuple[dict[str, dict[str, dict]], PurePosixPath | None]:
         """Portable groups and, when declared, the delivered project layout."""
         from simple_ar.tools.workspace import _CopyProject
-        selected = self.select(version)
         files = selected['files']
         groups = {'artifacts': dict(files)} if files else {}
         explicit = selected['delivery'].get('project_root')
@@ -235,7 +257,7 @@ class DeliveryVersions:
         raise ValueError('Selected delivery no longer belongs to the original journal')
 
     def materials(self, version: int, *, include_project: bool = True) -> dict[str, dict[str, dict]]:
-        return self._material_groups(version, include_project=include_project)[0]
+        return self._material_groups(self.select(version), include_project=include_project)[0]
 
     def snapshot(self, version: int, names: list[str], *, max_bytes: int,
                  working_context: bool = False) -> tuple[dict, list[tuple[str, bytes]]]:
@@ -244,26 +266,27 @@ class DeliveryVersions:
         The existing creation transaction writes these bytes. No cache, old-task
         write, execution permission or current completion is created here.
         """
-        groups, project = self._material_groups(version, include_project='code_project' in names)
+        selected = self.select(version)
+        if names == ['artifacts']:
+            groups, project = {'artifacts': selected['files']} if selected['files'] else {}, None
+        else:
+            groups, project = self._material_groups(selected, include_project='code_project' in names)
         if not names or any(name not in groups for name in names):
             raise ValueError('Selected version does not contain every requested portable result group')
         files = {path: row for name in names for path, row in groups[name].items()}
         result, sources, layout, total = [], {}, {}, 0
         for locator, row in files.items():
-            path = PurePosixPath(locator.replace('\\', '/'))
-            if path.is_absolute():
-                try:
-                    path = path.relative_to(self.root.as_posix())
-                except ValueError:
-                    candidates = []
-                    for alias, mount in self.reader.mounts.items():
-                        original = PurePosixPath(mount.as_posix())
-                        if path == original:
-                            candidates.append(PurePosixPath(alias) / path.name)
-                        elif original in path.parents:
-                            candidates.append(PurePosixPath(alias) / path.relative_to(original))
+            native = Path(locator)
+            path = PurePosixPath(native.as_posix())
+            if native.is_absolute():
+                if native.is_relative_to(self.root):
+                    path = PurePosixPath(native.relative_to(self.root).as_posix())
+                else:
+                    candidates = [PurePosixPath(alias) / (
+                        native.name if native == mount else native.relative_to(mount).as_posix())
+                        for alias, mount in self.reader.mounts.items() if native.is_relative_to(mount)]
                     if not candidates:
-                        raise ValueError('Retained external files have no portable source layout') from None
+                        raise ValueError('Retained external files have no portable source layout')
                     path = min(candidates, key=lambda value: len(value.parts))
             elif path.parts and path.parts[0] not in self.reader.mounts:
                 path = PurePosixPath('workspace') / path
@@ -283,7 +306,7 @@ class DeliveryVersions:
                 raise ValueError('Retained delivery has conflicting portable paths')
             sources[relative] = {'sha256': row['sha256'], 'size_bytes': len(content)}
             result.append((relative, content))
-        handoff = self.working_context(version, files, layout, dict(result)) if working_context else None
+        handoff = self._working_context(selected, files, layout, dict(result)) if working_context else None
         if handoff is not None and total + len(json.dumps(handoff, ensure_ascii=False).encode('utf-8')) > max_bytes:
             raise ValueError('Selected retained inputs and work context exceed max_snapshot_bytes; narrow the selected groups')
         if self.reader.record('actions.json') != self.reader.state:
@@ -294,7 +317,7 @@ class DeliveryVersions:
             **({'project_root': project_layout} if project_layout is not None else {}),
             **({'working_context': handoff} if handoff is not None else {})}, result
 
-    def working_context(self, version: int, files: dict, layout: dict, contents: dict) -> dict:
+    def _working_context(self, selected: dict, files: dict, layout: dict, contents: dict) -> dict:
         """Original observations of explicitly selected bytes, not task authority.
 
         An equal hash at another path never establishes lineage. Only the
@@ -304,7 +327,6 @@ class DeliveryVersions:
         """
         from simple_ar.tools.materials import journal_read_windows, lossless_text_window
         from simple_ar.tools.professional_outcomes import accepted_native_result
-        selected = self.select(version)
         subjects = {}
         for locator in files:
             try:

@@ -25,20 +25,18 @@ from urllib.parse import parse_qs, urlsplit
 from simple_ar.app.tool_application import ExecutionRejection, ToolApplication
 from simple_ar.app.reuse import ReuseAccess
 from simple_ar.app.task_view import read_task_view, saved_model_recipients
-from simple_ar.cli.project_tasks import discover_project_tasks
-from simple_ar.cli.start import add_start_parser, migrate_new_start, native_creation_options
-from simple_ar.cli.task_options import apply_task_config
-from simple_ar.core.budget import BudgetLedger
+from simple_ar.app.task_creation import (NativeTaskInputs, apply_task_config,
+    native_creation_options, prepare_client_inputs, read_task_config_bytes)
 from simple_ar.integrations.llm import LLMClient
 from simple_ar.integrations.model_profiles import load_model_catalog
+from simple_ar.tools.project_results import discover_project_tasks
 from simple_ar.tools.sources import SourceToolGateway
-from simple_ar.tools.workspace import RetainedDelivery, resolve_mounted_path, resolve_source_mount
+from simple_ar.tools.workspace import (RetainedDelivery, current_delivery_turn, resolve_mounted_path,
+    resolve_source_mount)
 
 
-def native_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    add_start_parser(parser.add_subparsers(dest='command'))
-    return parser.parse_args(['start'])
+def native_arguments() -> NativeTaskInputs:
+    return NativeTaskInputs()
 
 
 def bounded(path: Path, root: Path) -> Path:
@@ -131,10 +129,7 @@ class Workspace:
     def creation_defaults(self) -> dict:
         args = native_arguments()
         options = native_creation_options(args)
-        # The native configuration owner resolves automatic process limits.
-        # No model or material is authorized for this read-only projection.
-        options.update(model=None, sources={})
-        _, _, limits, _ = ToolApplication.preview_creation(self.tasks, 'Configuration preview', **options)
+        limits = ToolApplication.creation_limits(args.max_turns, args.max_tokens, args.max_images)
         return {key: options[key] for key in ('max_turns', 'max_tokens', 'max_images',
                     'allow_execution', 'sandbox_execution', 'allow_network', 'allow_vision',
                     'independent_review_required')} | {
@@ -172,18 +167,12 @@ class Workspace:
             descriptors[str(path)] = hashlib.sha256(raw).hexdigest()
         return descriptors
 
-    def creation_inputs(self, data: dict) -> tuple[argparse.Namespace, str | None]:
+    def creation_inputs(self, data: dict) -> tuple[NativeTaskInputs, str | None]:
         args = native_arguments()
-        args._explicit_start_destinations = set()
         config_digest = None
         if data.get('task_config'):
             args.task_config = self.read(Path(data['task_config']).expanduser().absolute())
-            if args.task_config.stat().st_size > 65536:
-                raise ValueError('Task configuration must be at most 64 KiB')
-            config_digest = hashlib.sha256(args.task_config.read_bytes()).hexdigest()
-            apply_task_config(args)
-            if hashlib.sha256(args.task_config.read_bytes()).hexdigest() != config_digest:
-                raise ValueError('Task configuration changed during inspection')
+            config_digest = apply_task_config(args)
             if ('output_root' in args._explicit_start_destinations
                     and args.output_root != self.tasks.resolve()):
                 raise ValueError('Task output_root must match the UI launch task root')
@@ -198,9 +187,11 @@ class Workspace:
             args.allow_execution = data.get('execution') is True
             args.sandbox_execution = data.get('sandbox_execution') is True
             args.allow_network = data.get('network') is True
-            args.independent_review_required = data.get('independent_review_required') is True
+            args.independent_review_required = data.get('independent_review_required')
             for field, destination in (('max_turns', 'max_turns'), ('max_tokens', 'max_tokens'),
                     ('process_invocations', 'max_processes'), ('process_wall_seconds', 'max_process_seconds')):
+                if field not in data:
+                    continue
                 value = data[field]
                 allowed = {int, float} if field == 'process_wall_seconds' else {int}
                 if type(value) not in allowed:
@@ -215,16 +206,13 @@ class Workspace:
         args.extensions = [self.read(p) for p in args.extensions]
         if args.from_session is not None:
             args.from_session = self.read(args.from_session)
-        # Common CLI migration rechecks declared analysis packages. Grant their
+        # Common creation rechecks declared analysis packages. Grant their
         # explicitly referenced attachments BEFORE that owner opens any bytes.
         # This is path admission, not a second package validator or importer.
         self.material_grants(args.material)
         if not (args.request or args.goal or '').strip():
             raise ValueError('Supply a nonempty task goal')
-        # UI main detaches terminal input. These flags suppress access/selection
-        # questions: the browser previews and confirms the complete projection.
-        args.yes = args.prepare_only = True
-        migrate_new_start(args, reuse_access=ReuseAccess(authorize=self.read, preflight=self.material_grants))
+        prepare_client_inputs(args, access=ReuseAccess(authorize=self.read, preflight=self.material_grants))
         args.source = [self.read(p) for p in args.source]
         args.request = args.request or args.goal
         catalog = load_model_catalog()
@@ -232,8 +220,6 @@ class Workspace:
             raise ValueError('Select a named Chat connection')
         name, _ = catalog.select(None if args.model == 'env' else args.model, purpose='text')
         args.model = 'profile:' + name
-        if args.model not in {p['selector'] for p in self.profiles()}:
-            raise ValueError('Select an available named Chat profile')
         _, identity = self.connection(args.model)
         if not data.get('task_config') and data.get('binding_id') != identity:
             raise ValueError('Connection changed after selection')
@@ -262,7 +248,7 @@ class Workspace:
                 raise ValueError('Extension descriptor changed during inspection')
         return result
 
-    def creation_identity(self, args: argparse.Namespace, config_digest: str | None,
+    def creation_identity(self, args: NativeTaskInputs, config_digest: str | None,
                           options: dict, result: tuple) -> tuple[str, dict | None]:
         image = None
         if args.max_images:
@@ -287,6 +273,7 @@ class Workspace:
         if image:
             recipients['image'] = {k: image[k] for k in ('profile', 'api', 'base_url', 'model')}
         return dict(preview_id=seal, goal=args.request, task_config=str(args.task_config) if args.task_config else None,
+            task_config_fields=getattr(args, '_task_config_fields', []),
             creation_declarations=config['creation_declarations'],
             task_root=str(self.tasks), model=config['model'],
             binding_id=hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest(),
@@ -327,18 +314,14 @@ class Workspace:
                           limitations=saved.get('limitations', []), files=[])
             from simple_ar.tools.delivery_versions import DeliveryVersions
             try:
-                result['versions'] = [dict(number=number, status=row['status'],
-                    summary=row['delivery'].get('summary'), file_count=len(row['files']),
-                    origin=dict(from_session=str(root), reuse_version=number, reuse=['artifacts']))
-                    for number, row in enumerate(DeliveryVersions(root,
-                        authorize=lambda path: bounded(path, root)).versions(), 1)]
+                result['versions'] = [dict(number=row['version'], status=row['status'],
+                    summary=row['summary'], file_count=row['artifact_count'],
+                    origin=dict(from_session=str(root), reuse_version=row['version'], reuse=['artifacts']))
+                    for row in DeliveryVersions(root, authorize=lambda path: bounded(path, root)).catalog()]
             except (OSError, ValueError, KeyError, TypeError):
                 result['versions'] = []
             worker = self.workers.get(name)
-            if (worker and worker[0].is_alive() or state.get('pending')
-                    or manifest['status'] not in {'completed', 'partial'} or not state['turns']
-                    or state['turns'][-1].get('request_count', 1) != len(state['requests'])
-                    or state['turns'][-1]['remaining']):
+            if worker and worker[0].is_alive() or current_delivery_turn(manifest, state) is None:
                 return result
             try:
                 for directory in ('workspace', 'evidence'):
@@ -389,7 +372,6 @@ class Workspace:
                     raise ValueError('Prepared task directory unavailable')
 
         return read_task_view(root, read_record=lambda name: self.record(root, name),
-            ledger=BudgetLedger.load(bounded(root / 'budget_ledger.json', root)),
             authorize_execution=admit_execution, native_recipe=ToolApplication.RECIPE)
 
     def snapshot(self, name: str) -> dict:
@@ -449,6 +431,16 @@ class Workspace:
         except (ValueError, TypeError, KeyError):
             return None  # Malformed declarations remain downloadable text.
 
+    def download(self, name: str, mount: str, relative: str) -> tuple[Path, bytes]:
+        path = self.file(name, mount, relative)
+        if not path.is_file():
+            raise ValueError('Select a regular file')
+        with path.open('rb') as stream:
+            raw = stream.read(16 * 1024 * 1024 + 1)
+        if len(raw) > 16 * 1024 * 1024:
+            raise ValueError('Preview/download limit is 16 MiB')
+        return path, raw
+
     def mutate(self, data: dict) -> dict:
         op = data['op']
         name = data.get('task', '')
@@ -491,24 +483,21 @@ class Workspace:
             if op == 'create':
                 if data.get('confirmed') is not True:
                     raise ValueError('Confirm displayed access and hard caps')
-                args, _ = self.creation_inputs(data)
+                args, digest = self.creation_inputs(data)
                 root = self.task('task-' + secrets.token_hex(8))
                 options = native_creation_options(args)
                 descriptors = self.extension_grants(options['extensions'])
 
                 def verify(result):
-                    # Check the owner's actual projection and fresh grants
-                    # before it creates the session or its ledger.
-                    current, digest = self.creation_inputs(data)
-                    current_options = native_creation_options(current)
-                    if current.request != args.request or current_options != options:
+                    # The creation owner already resolved these input values.
+                    # Compare the file snapshot and actual binding before committing.
+                    if args.task_config and hashlib.sha256(read_task_config_bytes(
+                            self.read(args.task_config))).hexdigest() != digest:
                         raise ValueError('Task configuration changed during creation')
-                    current_descriptors = self.extension_grants(current_options['extensions'])
                     for extension in result[0].get('extensions', []):
-                        if (descriptors.get(extension['path']) != extension['descriptor_sha256']
-                                or current_descriptors.get(extension['path']) != extension['descriptor_sha256']):
+                        if descriptors.get(extension['path']) != extension['descriptor_sha256']:
                             raise ValueError('Extension descriptor changed during inspection')
-                    identity, _ = self.creation_identity(current, digest, current_options, result)
+                    identity, _ = self.creation_identity(args, digest, options, result)
                     if not hmac.compare_digest(str(data.get('preview_id', '')), identity):
                         raise ValueError('Effective configuration changed; preview and confirm again')
 
@@ -521,8 +510,6 @@ class Workspace:
             if op == 'switch':
                 if data.get('confirmed') is not True:
                     raise ValueError('Confirm the selected recipient connection')
-                if data['model'] not in {p['selector'] for p in self.profiles()}:
-                    raise ValueError('Unknown named profile')
                 binding, identity = self.connection(data['model'])
                 if data.get('binding_id') != identity:
                     raise ValueError('Connection changed after confirmation')
@@ -585,7 +572,7 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
         def log_message(self, *_):
             pass  # URLs and task content never enter access logs.
 
-        def send(self, status, content, kind='application/json'):
+        def send(self, status, content, kind='application/json', *, headers=None):
             raw = content if isinstance(content, bytes) else json.dumps(public_data(content), ensure_ascii=False).encode()
             self.send_response(status)
             self.send_header('Content-Type', kind)
@@ -594,6 +581,8 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Referrer-Policy', 'no-referrer')
             self.send_header('Content-Security-Policy', "default-src 'self'; img-src 'self' blob:; script-src 'self'; style-src 'self'; object-src 'none'; frame-ancestors 'none'")
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(raw)
 
@@ -646,11 +635,16 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
                         self.send(200, rows)
                     else:
                         self.send(200, [dict(name=p.name, path='', directory=False)])
+                elif url.path == '/api/pdf-page':
+                    from simple_ar.report.export import render_pdf_page
+
+                    p, raw = workspace.download(q['task'], q['mount'], q.get('path', ''))
+                    if p.suffix.lower() != '.pdf':
+                        raise ValueError('Page preview requires a PDF')
+                    page, count = render_pdf_page(raw, int(q['page']))
+                    self.send(200, page, 'image/png', headers={'X-PDF-Pages': str(count)})
                 elif url.path == '/api/file':
-                    p = workspace.file(q['task'], q['mount'], q.get('path', ''))
-                    if not p.is_file() or p.stat().st_size > 16 * 1024 * 1024:
-                        raise ValueError('Preview/download limit is 16 MiB')
-                    raw = p.read_bytes()
+                    p, raw = workspace.download(q['task'], q['mount'], q.get('path', ''))
                     kind = mimetypes.guess_type(p.name)[0] or 'application/octet-stream'
                     if p.suffix.lower() not in {'.png', '.jpg', '.jpeg', '.webp', '.pdf', '.zip'}:
                         raw = public_text(raw.decode('utf-8')).encode()

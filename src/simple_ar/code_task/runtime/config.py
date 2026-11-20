@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -293,6 +293,12 @@ class CodeTaskExecuteOptions:
     env_mode: str | None
     python_executable: str | None
     config_path: str | None
+
+    def execution_kwargs(self) -> dict[str, Any]:
+        """Forward resolved execution settings to the CodeTask orchestrator."""
+        options = asdict(self)
+        del options['config_path'], options['summarizer_model']
+        return options
 
 
 def parse_metric_direction_arg(value: str) -> tuple[str, str]:

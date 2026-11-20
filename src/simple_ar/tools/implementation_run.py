@@ -74,7 +74,7 @@ def candidate_source(owner: Any, locator: str) -> tuple[Path, dict, dict]:
     completion = source['request'].get('producer_completion')
     if completion not in {None, 'goal_findings.v1'} or data.get('producer_completion') != completion:
         raise ValueError('Prepared completion semantics differ from the retained request')
-    from simple_ar.tools.implementation_work import REGISTERED_PROJECT_GENERATION
+    from simple_ar.tools.implementation_preparation import REGISTERED_PROJECT_GENERATION
     if source.get('generation_method') == REGISTERED_PROJECT_GENERATION:
         from simple_ar.code_task.generation.selection import registered_project_files
         registered_project_files(owner.workspace, source['prior_candidate'])
@@ -127,7 +127,7 @@ def prepared_unit(owner: Any, locator: str) -> tuple[dict, Path, dict]:
         previous = owner.workspace.resolve(prior['result_ref'])
         inputs[str(previous)] = prior['result_sha256']
         inputs[str(previous.parent / 'request.json')] = prior['source_binding_sha256']
-        from simple_ar.tools.implementation_work import REGISTERED_PROJECT_GENERATION
+        from simple_ar.tools.implementation_preparation import REGISTERED_PROJECT_GENERATION
         if source.get('generation_method') == REGISTERED_PROJECT_GENERATION:
             from simple_ar.code_task.generation.selection import registered_project_files
             inputs.update({str(Path(prior['project_root']) / name): digest for name, digest in

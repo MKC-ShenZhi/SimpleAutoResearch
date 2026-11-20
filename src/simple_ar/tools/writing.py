@@ -5,10 +5,9 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
@@ -16,7 +15,7 @@ from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, Capabili
 from simple_ar.report.requirements import freeze_report_requirement, validate_report_requirement
 from simple_ar.report.legacy_contract import BOUND_REPORT_REVISION, ProfessionalReview, material_report_binding
 from simple_ar.report.composition_receipts import (
-    composition_owner, accepted_composition_receipt, read_composition_receipt,
+    composition_owner, read_composition_receipt,
     check_work_receipt, read_composition_review, read_composition_candidate,
     read_repair_review, check_composition_inputs, RetainedDocumentReview,
 )
@@ -246,8 +245,7 @@ class _AssemblyStore(ArtifactStore):
         file = self.resolve(path)
         if not file.exists():
             return False
-        expected = text.replace('\n', os.linesep).encode('utf-8')
-        if file.read_bytes() != expected:
+        if file.read_bytes() != text.encode('utf-8'):
             raise ValueError('Retained assembly output changed; preserve it and use a new identity')
         return True
 
@@ -309,6 +307,7 @@ class WritingToolGateway:
         self.producer_completion = None
         self.publication_inspection = None
         self.prepared_publication: Callable[[str], dict] | None = None
+        self.check_publication_delivery: Callable[..., set[Path]] | None = None
 
     def finishes_request(self, arguments: dict) -> bool:
         """Describe requested work granularity, never a completed observation."""
@@ -340,7 +339,7 @@ class WritingToolGateway:
 
     def _admit_document_source(self, owner: ArtifactStore, arguments: dict,
                                binding: dict | None, selection: dict | None,
-                               report: dict | None) -> dict | None:
+                               report: dict | None) -> tuple[dict | None, dict | None]:
         """One version gate; retain intent before attempting internal resolution.
 
         The admission shares the existing selection receipt. Investigation later
@@ -353,7 +352,7 @@ class WritingToolGateway:
             if (saved is not None or self.document_source_contract is None
                     or not set(arguments) <= DocumentWorkRequest.model_fields.keys()
                     or (self.root / 'attempts' / owner.root.name / 'native_result.json').exists()):
-                return None
+                return None, selection
             contract = self.document_source_contract
         else:
             contract = source['contract']
@@ -366,7 +365,7 @@ class WritingToolGateway:
                 raise ValueError('Retained document work intent changed')
             for path in [*(source['access_roots'] or []), *source['investigation_roots']]:
                 self.workspace.resolve_material_root(path)
-            return source
+            return source, selection
         roots = intent['material_roots'] or (report or {}).get('selection_paths') or [
             str(path) for name, path in self.workspace.mounts.items() if name not in {'workspace', 'records'}]
         roots = [*roots, *(report or {}).get('selection_paths', [])]
@@ -377,13 +376,13 @@ class WritingToolGateway:
         from simple_ar.report.review_evidence import SCOPED_DELIVERY_INSPECTION
         admission = {'document_work': _DOCUMENT_WORK_CONTRACT, 'work_source': source,
             'inspection_contract': SCOPED_DELIVERY_INSPECTION}
-        owner.write_json('selection-input.json', admission)
         if self.work_context is not None:
             from simple_ar.tools.materials import freeze_work_context
+            owner.write_json('selection-input.json', admission)
             targets = [*roots, *([intent['prior_draft']] if intent['prior_draft'] else [])]
             admission['work_context'] = freeze_work_context(self.work_context, list(dict.fromkeys(targets)))
         owner.write_json('selection-input.json', admission)
-        return source
+        return source, admission
 
     @staticmethod
     def _check_document_source_contract(contract: str) -> None:
@@ -1376,9 +1375,7 @@ class WritingToolGateway:
                 if binding['request'].get('finish'):
                     # Inspect the actual retained independent response, not a
                     # status flag, before expressing this unit's final delivery.
-                    from simple_ar.report.writing import validate_document_inspection
-                    self.check_delivery(data)
-                    validate_document_inspection(store, binding, data, review_result=review)
+                    self._check_bound_delivery(store, binding, data, review=review, independent=True)
                     if data.get('document_work') != binding['document_work']:
                         return None
                     for row in binding['document_work']['materials']:
@@ -1402,17 +1399,20 @@ class WritingToolGateway:
     def final_review(self, data: dict) -> dict:
         return read_composition_review(self.workspace, data)
 
-    def _composition_publication(self, store: ArtifactStore, binding: dict, data: dict) -> dict | None:
+    def _composition_publication(self, store: ArtifactStore, binding: dict, data: dict, *,
+                                 review: dict | None = None) -> dict | None:
         """One retained publication proof for fresh checking and final export."""
-        review = self.final_review(data)
+        review = self.final_review(data) if review is None else review
         receipt = review.get('inspection_source') or {}
         prepared = None
         if receipt:
             path = store.resolve(receipt['request_path']).resolve()
-            if (not path.is_relative_to(store.root.resolve())
-                    or hashlib.sha256(path.read_bytes()).hexdigest() != receipt['request_sha256']):
+            if not path.is_relative_to(store.root.resolve()):
+                raise ValueError('Publication inspection request is outside the composition')
+            raw = path.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != receipt['request_sha256']:
                 raise ValueError('Publication inspection request changed')
-            prepared = json.loads(json.loads(path.read_bytes())['prompt']).get('prepared_publication')
+            prepared = json.loads(json.loads(raw)['prompt']).get('prepared_publication')
         if prepared is None:
             if binding.get('publication_inspection_contract') == 'prepared_document.v1':
                 raise ValueError('Retained publication inspection view is missing')
@@ -1649,12 +1649,12 @@ class WritingToolGateway:
             reason, detail = 'owner_state_unresolved', 'Admitted material investigation has no bound composition; preserve its decisions and accounting'
         if composed and observed.get('status') == 'ok' and not observed.get('error'):
             try:
-                _, binding, retained = self._composition_receipt(attempt_id, observed)
+                store, binding, retained = self._composition_receipt(attempt_id, observed)
                 review = self.final_review(retained)
                 if review.get('review_status') != 'reviewed':
                     reason, detail = 'work_gap', 'Writing review retains unresolved findings; no proven producer continuation is available'
                 elif reason is None:
-                    self.check_delivery(retained)
+                    self._check_bound_delivery(store, binding, retained, review=review)
                     if binding['request'].get('publication'):
                         reason, detail = 'owner_state_unresolved', 'Requested publication has no validated export continuation'
             except (OSError, ValueError, KeyError, TypeError):
@@ -1668,43 +1668,53 @@ class WritingToolGateway:
             return stop_decision(self, observed, attempt_id, reason, detail)
         return None
 
+    def _review_ledgers(self):
+        """One ledger in current tasks; older writing may have a separate owner."""
+        return tuple(dict.fromkeys(ledger for ledger in (self.ledger, getattr(self.workspace, 'ledger', None))
+                                   if ledger is not None))
+
     def _review_capacity(self) -> bool | None:
         """Read shared/owner accounting; None means continuation is unsafe."""
-        ledgers = [self.ledger, getattr(self.workspace, 'ledger', None)]
         if self.ledger is None:
             return None
+        ledgers = self._review_ledgers()
         if any(row.status in {'reserved', 'unknown'}
-                for ledger in ledgers if ledger is not None for row in ledger.entries):
+                for ledger in ledgers for row in ledger.entries):
             return None
         return all(remaining is None or remaining >= 1
-            for ledger in ledgers if ledger is not None
+            for ledger in ledgers
             for resource in ('llm_requests', 'total_tokens')
             for remaining in (ledger.remaining(resource),))
 
-    def _budget_review_action(self, observed: dict, attempt_id: str) -> dict | None:
+    def _budget_review_action(self, observed: dict, attempt_id: str, *,
+                              automatic: bool = False) -> dict | None:
         """Prove one retained pending revision and its unchanged original recipe.
 
         This only describes work. The application owns the explicit new grant;
         neither this proof nor its callers reserve resources or write receipts.
         """
         data = observed.get('data') or {}
-        if (not self.document_work or self._review_capacity() is None
+        if (not self.document_work
                 or observed.get('tool_name') != 'compose_document'
                 or not (self._inspection_interrupted(data)
                     or observed.get('status') == 'error' and data.get('incomplete'))):
             return None
         try:
             from simple_ar.report.writing import retained_article_candidate, article_inspection_enabled, professional_writer_config
-            store = composition_owner(root=self.root, workspace=self.workspace,
-                session_id=self.session_id, identity=attempt_id)
-            binding = store.read_json('request.json')
             if observed.get('status') == 'ok':
                 store, binding, data = self._composition_receipt(attempt_id, observed)
+            else:
+                store = composition_owner(root=self.root, workspace=self.workspace,
+                    session_id=self.session_id, identity=attempt_id)
+                binding = store.read_json('request.json')
             accepted_native_result(self.root, self.session_id, observed, attempt_id)
             if (binding.get('document_work', {}).get('contract') not in _DOCUMENT_WORK_CONTRACTS
                     or not article_inspection_enabled(professional_writer_config(binding))):
                 return None
-            if binding.get('report_binding', {}).get('requirement', {}).get('method') == 'sections':
+            method = binding.get('report_binding', {}).get('requirement', {}).get('method')
+            if automatic and (binding.get('continued_source_review') is not None or method != 'sections'):
+                return None
+            if method == 'sections':
                 source, candidate = self._section_author_source(store, author_only=True)
                 self._unstarted_section_inspection(store, candidate)
             else:
@@ -1729,10 +1739,6 @@ class WritingToolGateway:
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
-    def can_resume_after_budget(self, observed: dict, attempt_id: str) -> bool:
-        """Pure eligibility proof; an explicit new grant is checked by the app."""
-        return self.resume_after_budget(observed, attempt_id) is not None
-
     def _unstarted_section_inspection(self, store: ArtifactStore, candidate: dict) -> None:
         """Prove a never-dispatched check, not merely a missing response.
 
@@ -1743,8 +1749,7 @@ class WritingToolGateway:
         """
         if self._review_capacity() is None:
             raise ValueError('Pending inspection has unresolved or unavailable accounting')
-        entries = [entry for ledger in (self.ledger, getattr(self.workspace, 'ledger', None))
-            if ledger is not None for entry in ledger.entries]
+        entries = [entry for ledger in self._review_ledgers() for entry in ledger.entries]
         expected = {row['section_id']: {'section_id': row['section_id'],
             'heading': row['heading'], 'markdown': row['draft_markdown']} for row in candidate['sections']}
         pending, accounted_author = 0, False
@@ -1782,28 +1787,18 @@ class WritingToolGateway:
         if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', attempt_id)
                 or self._review_capacity() is not True):
             return None
-        action = self._budget_review_action(observed, attempt_id)
-        if action is None:
-            return None
-        binding = composition_owner(root=self.root, workspace=self.workspace,
-            session_id=self.session_id, identity=attempt_id).read_json('request.json')
-        if (binding.get('continued_source_review') is not None
-                or binding.get('report_binding', {}).get('requirement', {}).get('method') != 'sections'):
-            return None  # Legacy article stops keep their explicit resource-grant contract.
-        return action
+        return self._budget_review_action(observed, attempt_id, automatic=True)
 
     def resume_after_budget(self, observed: dict, attempt_id: str) -> dict | None:
         """Propose inspection only after the app grants additional resources."""
         return self._budget_review_action(observed, attempt_id) if self._review_capacity() is True else None
 
-    def check_delivery(self, data: dict[str, Any]) -> None:
-        """Validate the current manuscript, source bytes and declared body assets."""
+    def _check_bound_delivery(self, store: ArtifactStore, binding: dict, data: dict, *,
+                              review: dict | None = None, independent: bool = False) -> None:
         if (not data.get('editable_markdown')
                 or data['editable_markdown'] == f"{data.get('version')}/candidate.md"):
             raise ValueError('Unresolved work is not an adopted canonical delivery')
         from simple_ar.report.export import missing_report_images
-        identity = Path(data['version']).name
-        binding = ArtifactStore(self.root / 'tools/writing' / identity).read_json('request.json')
         missing = missing_report_images(self.workspace.resolve(data['editable_markdown']).read_text(encoding='utf-8'),
             binding.get('delivery_review', {}).get('required_figures', []))
         if missing:
@@ -1816,12 +1811,12 @@ class WritingToolGateway:
             context = freeze_producer_context(self, snapshot['artifacts'])
             if any(snapshot.get(key) != value for key, value in context.items()):
                 raise ValueError('Original producer notes or their source versions changed')
-            review = self.final_review(data)
+        if independent or snapshot.get('producer_completion') == 'goal_findings.v1':
+            review = self.final_review(data) if review is None else review
             if review.get('review_status') != 'reviewed' or data.get('unresolved') or data.get('incomplete'):
                 raise ValueError('Goal/findings delivery requires a current completed independent review')
             from simple_ar.report.writing import validate_document_inspection
-            validate_document_inspection(ArtifactStore(self.root / 'tools/writing' / identity),
-                binding, data, review_result=review)
+            validate_document_inspection(store, binding, data, review_result=review)
         self._check_input_bytes(data['inputs'])
         self._check_document_copy_review(data)
         self.workspace.check_artifact_producers(row['path'] for row in data['inputs'])
@@ -1873,7 +1868,8 @@ class WritingToolGateway:
                            proposed: Any = None) -> list[dict]:
         """Read-only adoption proof from this delivery's actual joint review."""
         from simple_ar.tools.producer_declarations import delivery_adoptions
-        return delivery_adoptions(self, observations, delivery, proposed)
+        return delivery_adoptions(self, observations, delivery, proposed,
+            check_publication=self.check_publication_delivery)
 
     def check_delivery_set(self, identity: dict, artifacts: list[str],
                            publication_artifacts: set[Path]) -> None:
@@ -1888,17 +1884,18 @@ class WritingToolGateway:
         if match is None:
             raise ValueError('Joint delivery set requires the validated canonical composition identity')
         store = ArtifactStore(self.root / 'tools/writing' / match[1])
-        data = store.read_json('result.json')['data']
-        self._check_document_copy_review(data)
+        receipt = store.resolve('result.json').read_bytes()
+        data = json.loads(receipt)['data']
+        if (identity.get('artifact_sha256') != data.get('artifact_sha256')
+                or identity.get('receipt_sha256') != hashlib.sha256(receipt).hexdigest()):
+            raise ValueError('Canonical composition identity changed before checking delivery extras')
         delivered = {self.workspace.resolve(path) for path in artifacts}
         for unit in data.get('document_work', {}).get('producer_units', []):
             if not {self.workspace.resolve(path) for path in unit['files']} <= delivered:
                 raise ValueError('Deliver the complete registered professional unit, not a selected subset')
-        if (identity.get('artifact_sha256') != data.get('artifact_sha256')
-                or identity.get('receipt_sha256') != hashlib.sha256(store.resolve('result.json').read_bytes()).hexdigest()):
-            raise ValueError('Canonical composition identity changed before checking delivery extras')
         allowed = {self.workspace.resolve(path): digest for path, digest in data['artifact_sha256'].items()}
-        for row in store.read_json('request.json')['inputs']:
+        request = store.read_json('request.json')
+        for row in request['inputs']:
             if 'manuscript_path' in row:
                 copied = f"{version}/{row['manuscript_path']}"
                 if data['artifact_sha256'].get(copied) == row.get('sha256'):
@@ -1906,7 +1903,7 @@ class WritingToolGateway:
         inspection = data.get('delivery_review', {})
         if inspection.get('status') == 'reviewed':
             from simple_ar.report.review_evidence import delivery_target_pointer
-            for index, row in enumerate(store.read_json('request.json')['delivery_review']['artifacts']):
+            for index, row in enumerate(request['delivery_review']['artifacts']):
                 if delivery_target_pointer(row, index) is not None:
                     allowed[self.workspace.resolve(row['path'])] = row['sha256']
                     for copy in row.get('copies', []):
@@ -2216,7 +2213,7 @@ class WritingToolGateway:
             # Registered plan-only repairs deliberately carry no editable text.
             # Their complete prior membership is the existing source authority,
             # not a reason to rediscover/retransmit every unchanged original.
-            from simple_ar.tools.implementation_work import REGISTERED_PROJECT_GENERATION
+            from simple_ar.tools.implementation_preparation import REGISTERED_PROJECT_GENERATION
             if source.get('generation_method') == REGISTERED_PROJECT_GENERATION:
                 from simple_ar.code_task.generation.selection import registered_project_files
                 prior = source['prior_candidate']
@@ -2538,13 +2535,6 @@ class WritingToolGateway:
         return paths, consumers
 
     @staticmethod
-    def _check_professional_writer(store: ArtifactStore) -> None:
-        """Retain historical publication proof without upgrading input reuse."""
-        completed = store.read_json('professional_result.json')
-        if hashlib.sha256(store.resolve('writer/' + completed['writer_path']).read_bytes()).hexdigest() != completed['writer_sha256']:
-            raise ValueError('Report Writer evidence changed; no completed delivery')
-
-    @staticmethod
     def _same_report_content(saved: dict, current: dict, intent: dict | None) -> bool:
         if saved == current:
             return True
@@ -2759,7 +2749,8 @@ class WritingToolGateway:
         return lookup
 
     def publication_source(self, markdown: str, binding: dict | None, *, intent: dict | None = None,
-                           adopted: dict | None = None, observation: dict | None = None) -> dict:
+                           adopted: dict | None = None, observation: dict | None = None,
+                           review: dict | None = None) -> dict:
         """Prove one canonical authoring version, never infer identity from prose."""
         path = self.workspace.resolve(markdown)
         candidate_root = self.workspace.workspace/'manuscripts'
@@ -2789,22 +2780,21 @@ class WritingToolGateway:
             raise ValueError('Canonical report has unresolved writing findings/review; deliver a candidate with explicit unresolved work')
         if not self._same_report_content(data.get('report_binding'), binding, intent):
             raise ValueError('Canonical report receipt, source binding or authoring artifacts changed')
-        self.check_delivery(data)
-        from simple_ar.report.writing import completed_composition_writer
-        if (request.get('writing_owner') == 'professional_report.v1'
-                and 'section_response_contract' not in request
-                and request['report_binding']['requirement']['method'] == 'sections'):
-            self._check_professional_writer(store)
-        else:
-            completed_composition_writer(store=store, binding=request, identity=identity)
+        prepared = request.get('publication_inspection_contract') == 'prepared_document.v1'
+        independent = review is not None
+        if prepared and review is None:
+            review = self.final_review(data)
+        self._check_bound_delivery(store, request, data, review=review, independent=independent)
+        from simple_ar.report.writing import check_retained_composition_writer
+        check_retained_composition_writer(store=store, binding=request, identity=identity)
         result = {'composition': data['version'], 'manuscript': data['editable_markdown'],
             'receipt_sha256': hashlib.sha256(store.resolve('result.json').read_bytes()).hexdigest(),
             'artifact_sha256': data['artifact_sha256']}
         from simple_ar.report.writing import provided_caption_bindings
         if provided_caption_bindings(request):
             result['figure_caption_owner'] = 'manifest'
-        if request.get('publication_inspection_contract') == 'prepared_document.v1':
-            current = self._composition_publication(store, request, data)
+        if prepared:
+            current = self._composition_publication(store, request, data, review=review)
             result['prepared_publication'] = {key: current[key] for key in
                 ('prepared_result', 'prepared_result_sha256', 'view_path', 'view_sha256')}
             result['publication_options'] = current['source']['publication_options']
@@ -2829,58 +2819,19 @@ class WritingToolGateway:
                 return self.publication_source(data['editable_markdown'], binding, intent=intent, observation=row)
             store = ArtifactStore(self.root / 'tools/writing' / Path(data['version']).name)
             saved = store.read_json('result.json')
+            request = store.read_json('request.json')
             if (saved.get('data') != data or saved.get('artifacts') != row['artifacts']
-                    or store.read_json('request.json').get('report_binding') != data.get('report_binding')
+                    or request.get('report_binding') != data.get('report_binding')
                     or self.workspace.artifact_hashes(row['artifacts']) != data.get('artifact_sha256')):
                 continue
-            self.check_delivery(data)  # Historical receipts keep their original proof strength.
-            self._check_professional_writer(store)
+            self._check_bound_delivery(store, request, data)
+            from simple_ar.report.writing import check_legacy_writer_receipt
+            check_legacy_writer_receipt(store)
             return {'manuscript': data['editable_markdown']}
         raise ValueError('Report delivery needs a current canonical composition receipt, intact manuscript and original evidence; deliver an explicit candidate when incomplete')
 
     def _check_input_bytes(self, inputs: list[dict[str, Any]]) -> None:
         check_composition_inputs(self.workspace, inputs)
-
-    @staticmethod
-    def _completed_writer(store: ArtifactStore, expected: dict[str, Any], identity: str) -> dict:
-        from simple_ar.report.schema import AgentReportResult
-        from simple_ar.report.writing import _writing_identity
-
-        if not all(store.exists(path) for path in ('report_inputs.json', 'sections.json', 'writer.json')):
-            raise ValueError('Interrupted composition has no complete Writer; no blind replay')
-        snapshot = store.read_json('report_inputs.json')
-        # Reuse the Writer owner's identity rules, including historical path
-        # normalization. Never manufacture a new identity for retained work.
-        snapshot_id = snapshot.get('snapshot_id')
-        if (not isinstance(snapshot_id, str) or not re.fullmatch(r'[0-9a-f]{64}', snapshot_id)
-                or _writing_identity(snapshot) != _writing_identity(expected)):
-            raise ValueError('Writer input snapshot changed or is not bound to this request')
-        checkpoint = store.read_json('sections.json')
-        written = store.read_json('writer.json')
-        completed = checkpoint.get('completed', {})
-        if (checkpoint.get('snapshot_id') != snapshot_id or checkpoint.get('source_attempt') != identity
-                or written.get('snapshot_id') != snapshot_id
-                or written.get('schema_version') != 'report_agent_result.v1'
-                or written.get('input_snapshot') != store.ref('report_inputs.json',
-                    kind='report_snapshot', schema='report_snapshot.v1').to_dict()
-                or completed.get('pending_draft', True) is not None
-                or any(key not in completed or written.get(key) != completed[key] for key in
-                    ('memory', 'sections', 'iterations', 'reviewer_findings', 'tool_results'))):
-            raise ValueError('Writer result is partial or differs from its complete checkpoint')
-        payload = {key: written[key] for key in
-            ('memory', 'sections', 'iterations', 'reviewer_findings', 'tool_results', 'used_agent')}
-        result = AgentReportResult.model_validate({'report_body': '', **payload})
-        plans = expected['memory']['section_plan']
-        if (not result.used_agent or len(result.sections) != len(plans)
-                or [row.section_id for row in result.sections] != [row['section_id'] for row in plans]
-                or any(row.status == 'skipped' or not row.draft_markdown.strip() for row in result.sections)
-                or any(row.type in {'document_review_unavailable', 'document_revision_unavailable'}
-                    for row in result.memory.reviewer_findings)):
-            raise ValueError('Writer did not complete; retained checkpoint is not an accepted article')
-        config = snapshot['config']
-        if config['reviewer'] != 'disabled' or config['document_review'] or config['max_review_iterations'] != 0:
-            raise ValueError('This composition cannot certify an interrupted review')
-        return written
 
     def _select_materials(self, request: ComposeRequest, owner: Any,
                           identity: str, client: Any, previous: str,
@@ -3054,8 +3005,9 @@ class WritingToolGateway:
             response = owner.read_json('selection-response.json')
         else:
             index = [{'root': self.workspace.locator(item['project_path']), 'files': [
-                [self.workspace.locator(path), self.workspace.resolve(path).stat().st_size]
-                for path in inventory_paths(item)], 'scope': item['inventory_scope']} for item in inventories]
+                [self.workspace.locator(path), value if candidates else self.workspace.resolve(path).stat().st_size]
+                for path, value in inventory_paths(item).items()],
+                'scope': item['inventory_scope']} for item in inventories]
             for view, item in zip(index, inventories):
                 if 'omitted_files' in item:
                     view['omitted_files'] = [{**row, 'path': self.workspace.locator(row['path'])}
@@ -3083,8 +3035,7 @@ class WritingToolGateway:
                 from simple_ar.report.review_evidence import project_document_feedback
                 prompt['source_feedback'] = (project_document_feedback(work_source['diagnosis'])
                     if feedback_projection is not None else work_source['diagnosis'])
-            prompt = json.dumps(prompt, ensure_ascii=False)
-            if len(prompt.encode('utf-8')) > 128000:
+            if len(json.dumps(prompt, ensure_ascii=False).encode('utf-8')) > 128000:
                 raise ValueError('Material selection inventory exceeds 128 KB; choose focused roots')
             from simple_ar.tools.materials import material_observation_seed
             # Source bundles keep their own exclusion owner; draft exclusion
@@ -3092,7 +3043,7 @@ class WritingToolGateway:
             excluded_paths = context_only_paths | {
                 str(self.workspace.resolve(row['document_record'])) for row in source_views}
             seed = material_observation_seed(workspace=self.workspace, inventories=inventories,
-                provider=self.material_observations, roots=roots, context=json.loads(prompt),
+                provider=self.material_observations, roots=roots, context=prompt,
                 excluded_paths=excluded_paths)
             if seed is not None:
                 inputs['journal_observations'] = {'coverage': seed['coverage']}
@@ -3167,7 +3118,7 @@ class WritingToolGateway:
                 selected_material_windows(self.workspace, selection_model.model_validate(response),
                     observations, identity=identity)
 
-            response = inspect_materials(workspace=self.workspace, context=json.loads(prompt),
+            response = inspect_materials(workspace=self.workspace, context=prompt,
                 instructions=instructions, inventories=inventories, owner=owner, identity=identity,
                 client=client, response_model=selection_model, label='composition-selection',
                 seed=seed,
@@ -3176,14 +3127,14 @@ class WritingToolGateway:
                 **({'validate_selection': validate_selection} if selection_validation is not None else {}))
             owner.write_json('selection-response.json', response)
         selected = selection_model.model_validate(response)
-        if selected.read_windows:
-            raise ValueError('Material selection ended without a final selection')
         windows = [FileWindow(path=row) if isinstance(row, str) else row for row in selected.materials]
         if any(str(self.workspace.resolve(window.path)) in context_only_paths for window in windows):
             raise ValueError('The bound prior draft is revision context, not selectable material evidence')
         observations = owner.read_json('selection-observations.json') if investigating else []
-        if investigating:
+        if investigating and (retained is not None or selection_validation is None):
             selected_material_windows(self.workspace, selected, observations, identity=identity)
+        elif selected.read_windows:
+            raise ValueError('Material selection ended without a final selection')
         if not selected.materials and not selected.sources and not request.sources:
             raise ValueError('Select readable materials or original source passages; figures alone are not factual evidence')
         paths = ([window.path for window in windows] + [_figure_spec(row)['path'] for row in selected.figures]
@@ -3347,7 +3298,6 @@ class WritingToolGateway:
         from simple_ar.report.writing import (ARTICLE_OWNER, SECTION_ARTICLE_OWNER,
             article_writing_inputs, run_composition_article, write_section_article)
         from simple_ar.research.documents.ingest import DocumentBundle
-        from simple_ar.research.contracts import DocumentRecord, TextChunk
         from simple_ar.research.store.retrieval import rank_source_chunks
         from simple_ar.report.ports import ReportPublicationRequired
 
@@ -3372,6 +3322,7 @@ class WritingToolGateway:
                 raise ValueError('Retained composition lacks its original request binding; no blind replay')
             original_binding = owner.read_json('request.json') if recovering else None
             selection_binding = owner.read_json('selection-input.json') if owner.exists('selection-input.json') else None
+            saved_selection = selection_binding
             document_contract = (original_binding.get('document_work', {}).get('contract') if recovering else
                 selection_binding.get('document_work') if selection_binding is not None else
                 _DOCUMENT_WORK_CONTRACT if self.document_work else None)
@@ -3406,8 +3357,10 @@ class WritingToolGateway:
                     {'max_revision_rounds': 1})
                 if review is not None:
                     request = request.model_copy(update={'professional_review': ProfessionalReview.model_validate(review)})
-            work_source = (self._admit_document_source(owner, caller_arguments, original_binding,
-                selection_binding, report_binding) if document_work else None)
+            work_source = None
+            if document_work:
+                work_source, selection_binding = self._admit_document_source(owner, caller_arguments,
+                    original_binding, selection_binding, report_binding)
             failure_kind = ('owner_state_unresolved' if work_source is not None else
                 'review_incomplete' if inspecting else 'composition_incomplete')
             resolved = self._resolve_document_inputs(request, identity, report=report_binding,
@@ -3421,10 +3374,10 @@ class WritingToolGateway:
                 work_source = {**work_source, 'access_roots': scope}
                 if resolved.investigation is not None:
                     work_source['diagnosis'] = resolved.investigation
-                if not owner.exists('selection-input.json') or 'inventories' not in owner.read_json('selection-input.json'):
-                    admission = owner.read_json('selection-input.json') if owner.exists('selection-input.json') else {
-                        'document_work': document_contract}
-                    owner.write_json('selection-input.json', {**admission, 'work_source': work_source})
+                if not selection_binding or 'inventories' not in selection_binding:
+                    selection_binding = {**(selection_binding or {'document_work': document_contract}),
+                        'work_source': work_source}
+                    owner.write_json('selection-input.json', selection_binding)
             failure_kind = 'review_incomplete' if inspecting else 'composition_incomplete'
             if not document_work and not request.title:
                 raise ValueError('An explicit nonempty title is required by the historical writing contract')
@@ -3552,14 +3505,14 @@ class WritingToolGateway:
             retained_work = original_binding['document_work'] if recovering and document_work else None
             from simple_ar.report.review_evidence import CLAIM_ADOPTION_V2
             adopt_units = document_work and ('producer_units' in retained_work if recovering else
-                selection_binding.get('producer_unit_contract') is not None if selection_binding is not None else
+                saved_selection.get('producer_unit_contract') is not None if saved_selection is not None else
                 (self.producer_completion == 'goal_findings.v1'
                     or self.declaration_adoption_contract == CLAIM_ADOPTION_V2) and (not any(key in caller_fields
                     for key in ('title', 'sources', 'materials', 'figures', 'delivery_artifacts',
                         'adopt_draft', 'reuse_prior_inputs', 'producer_repair'))
                     or reuse_linkage is not None and 'producer_units' in reuse_binding.get('document_work', {})))
             subject_contract = (original_binding.get('delivery_subject_contract') if recovering else
-                selection_binding.get('delivery_subject_contract') if selection_binding is not None else
+                saved_selection.get('delivery_subject_contract') if saved_selection is not None else
                 _DELIVERY_SUBJECT_CONTRACT if adopt_units else None)
             if subject_contract not in {None, _DELIVERY_SUBJECT_CONTRACT}:
                 raise ValueError('Unknown retained delivery subject contract')
@@ -3567,7 +3520,7 @@ class WritingToolGateway:
                 raise ValueError('Declared delivery subjects require the professional unit ownership contract')
             material_selection, client = None, None
             if request.material_roots:
-                selected = owner.exists('selection-input.json') and 'inventories' in owner.read_json('selection-input.json')
+                selected = selection_binding is not None and 'inventories' in selection_binding
                 if not selected and recovering:
                     raise ValueError('Retained composition has no bound material selection')
                 if not selected:
@@ -3598,6 +3551,8 @@ class WritingToolGateway:
                             for figure in request.figures
                             for locator in [_figure_spec(figure)['path']]
                             for path, raw in [explicit_figures[locator]]])
+                if not selected:
+                    selection_binding = owner.read_json('selection-input.json')
             if document_work and not request.title.strip():
                 raise ValueError('Document work requires a title selected from actual material or its prior recipe')
             bindings, records, chunks, sections = [], {}, {}, {}
@@ -3826,7 +3781,7 @@ class WritingToolGateway:
                 bindings.extend({'path': path, 'sha256': digest} for path, digest in delivery_inputs.items()
                     if not any(row['path'] == path and row['sha256'] == digest for row in bindings))
             if material_selection is not None:
-                previews = owner.read_json('selection-input.json').get('source_previews', [])
+                previews = selection_binding.get('source_previews', [])
                 preview_hashes = {row['path']: row['sha256'] for row in previews}
                 for row in bindings:
                     path = str(self.workspace.resolve(row['path']))
@@ -3835,11 +3790,17 @@ class WritingToolGateway:
                 inspected = material_selection.get('inspected_inputs', [])
                 if inspected:
                     expected = {row['path']: row['sha256'] for row in inspected}
-                    if self.workspace.artifact_hashes(expected) != expected:
-                        raise ValueError('Inspected material changed before writing; use a new identity')
                     bound = {str(self.workspace.resolve(row['path'])): row['sha256'] for row in bindings}
-                    bindings.extend({'path': path, 'sha256': digest} for path, digest in expected.items()
-                        if bound.get(str(self.workspace.resolve(path))) != digest)
+                    extra = {}
+                    for path, digest in expected.items():
+                        resolved = str(self.workspace.resolve(path))
+                        if resolved not in bound:
+                            extra[path] = digest
+                        elif bound[resolved] != digest:
+                            raise ValueError('Inspected material changed before writing; use a new identity')
+                    if extra and self.workspace.artifact_hashes(extra) != extra:
+                        raise ValueError('Inspected material changed before writing; use a new identity')
+                    bindings.extend({'path': path, 'sha256': digest} for path, digest in extra.items())
             document_materials = None
             document_figure_paths = []
             if document_work:
@@ -3989,8 +3950,8 @@ class WritingToolGateway:
                         # Never reinterpret a saved window-based inspection,
                         # including earlier unit bindings without this marker.
                         review_units = None
-                elif owner.exists('selection-input.json'):
-                    admission = owner.read_json('selection-input.json').get('inspection_contract')
+                elif selection_binding is not None:
+                    admission = selection_binding.get('inspection_contract')
                     if admission is not None:
                         if admission != SCOPED_DELIVERY_INSPECTION:
                             raise ValueError('Unknown document inspection admission contract')
@@ -4104,8 +4065,7 @@ class WritingToolGateway:
             if revision_feedback is not None:
                 binding['revision_feedback'] = revision_feedback
             feedback_projection = (original_binding.get('source_feedback_projection') if recovering else
-                owner.read_json('selection-input.json').get('source_feedback_projection')
-                    if owner.exists('selection-input.json') else None)
+                (selection_binding or {}).get('source_feedback_projection'))
             if feedback_projection not in {None, 'shared_producers.v1'}:
                 raise ValueError('Unknown source feedback projection contract')
             if feedback_projection is not None:
@@ -4113,14 +4073,16 @@ class WritingToolGateway:
             if recovering:
                 if 'work_context' in original_binding:
                     binding['work_context'] = original_binding['work_context']
-            elif owner.exists('selection-input.json') and 'work_context' in owner.read_json('selection-input.json'):
-                binding['work_context'] = owner.read_json('selection-input.json')['work_context']
-            elif self.work_context is not None:
-                from simple_ar.tools.materials import freeze_work_context
-                targets = [str(self.workspace.resolve_source_record(row['path'])
-                    if index < len(request.sources) else self.workspace.resolve(row['path']))
-                    for index, row in enumerate(selected_bindings)]
-                binding['work_context'] = freeze_work_context(self.work_context, list(dict.fromkeys(targets)))
+            else:
+                selection_input = selection_binding or {}
+                if 'work_context' in selection_input:
+                    binding['work_context'] = selection_input['work_context']
+                elif self.work_context is not None:
+                    from simple_ar.tools.materials import freeze_work_context
+                    targets = [str(self.workspace.resolve_source_record(row['path'])
+                        if index < len(request.sources) else self.workspace.resolve(row['path']))
+                        for index, row in enumerate(selected_bindings)]
+                    binding['work_context'] = freeze_work_context(self.work_context, list(dict.fromkeys(targets)))
             if report_binding is not None:
                 binding['report_binding'] = report_binding
                 if writing_owner == 'professional_report.v1':
@@ -4377,7 +4339,7 @@ class WritingToolGateway:
             if writing_owner == 'professional_report.v1':
                 from simple_ar.report.memory import initialize_report_memory
                 from simple_ar.report.schema import ReportTemplateBundle
-                from simple_ar.report.writing import ReportWritingRequest, run_report_writing_capability, professional_writer_config
+                from simple_ar.report.writing import ReportWritingRequest, write_bound_document, professional_writer_config
                 requirement = validate_report_requirement(report_binding['requirement'])
                 config = professional_writer_config(binding)
                 template = ReportTemplateBundle.model_validate(requirement['template'])
@@ -4401,7 +4363,6 @@ class WritingToolGateway:
                         'contract': binding['section_delivery_review_contract'],
                         'assembly': {'title': request.title, 'assembly_mode': 'section_drafts',
                             **supplied_caption_options(context)}}
-                resume = owner.ref('writer/sections.json', kind='report_checkpoint', schema='report_checkpoint.v1') if writer_store.exists('sections.json') else None
                 # The existing Writer/editor owns drafting, adaptive planning,
                 # revision, prompt caps and interrupted request recovery.
                 if owner.exists('professional_result.json'):
@@ -4411,15 +4372,11 @@ class WritingToolGateway:
                 else:
                     client = client or (self.client_factory(identity) if self.client_factory else LLMClient.from_env(
                         self.model, budget_ledger=self.ledger, budget_session_id=self.session_id, budget_attempt_id=identity))
-                    if binding.get('section_response_contract') in {'atomic_complete.v1', 'atomic_complete.v2'}:
-                        from simple_ar.report.writing import retained_writing_client
-                        client = retained_writing_client(store=writer_store, identity=identity, client=client,
-                            contract=binding['section_response_contract'])
-                    result = run_report_writing_capability(context=CapabilityContext(writer_store,
-                        AttemptManifest(identity), inputs=(ref, *((resume,) if resume else ())),
-                        input_store=owner), request=ReportWritingRequest(report_context=context, memory=memory,
+                    result = write_bound_document(owner=owner, writer=writer_store, identity=identity,
+                        inputs=(ref,), response_contract=binding.get('section_response_contract'),
+                        request=ReportWritingRequest(report_context=context, memory=memory,
                             config=config, template=template, llm_client=client, method=requirement['method'],
-                            prior_draft=previous, resume_ref=resume,
+                            prior_draft=previous,
                             output_outline=binding.get('output_outline', ()),
                             candidate_source=binding.get('candidate_source'), publication_view=publication_view))
                     writer_ref = next((row for row in reversed(result.artifacts) if row.kind == 'report_writer_result'), None)
@@ -4552,7 +4509,8 @@ class WritingToolGateway:
                 template = template.model_copy(update={'template_markdown': intended_use_guidance(template)})
                 expected = {'context': context.model_dump(mode='json'), 'memory': memory.model_dump(mode='json'),
                     'config': config.model_dump(mode='json'), 'template': template.model_dump(mode='json'), 'sources': [ref.to_dict()]}
-                written = self._completed_writer(writer_store, expected, identity)
+                from simple_ar.report.writing import completed_interrupted_writer
+                written = completed_interrupted_writer(writer_store, expected, identity)
                 config = ReportRuntimeConfig.model_validate(writer_store.read_json('report_inputs.json')['config'])
                 memory = ReportMemory.model_validate(written['memory'])
                 context, memory = apply_report_bibliography(context, memory, documents=documents,
@@ -4713,7 +4671,7 @@ class WritingToolGateway:
             # a newly certified version. Check the whole prefix before writing.
             if recovering:
                 for target_name, text in text_outputs.items():
-                    published_bytes = text.replace('\n', os.linesep).encode('utf-8')
+                    published_bytes = text.encode('utf-8')
                     if output_store.exists(target_name) and output_store.resolve(target_name).read_bytes() != published_bytes:
                         raise ValueError('Retained publication changed; preserve it and use a new identity')
                 for target, raw in assets.items():

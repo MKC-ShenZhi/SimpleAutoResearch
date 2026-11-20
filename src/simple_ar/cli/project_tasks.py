@@ -1,88 +1,11 @@
-"""Bounded, read-only discovery; the native application still owns resume/state."""
+"""Terminal navigation for the shared read-only project task listing."""
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-from itertools import islice
-import json
-import os
-from pathlib import Path
-import stat
 
+from simple_ar.cli.task_options import resume_command
 from simple_ar.core.console import print_line
-
-
-MAX_ENTRIES = 256
-MAX_MANIFEST_BYTES = 256 * 1024
-
-
-@dataclass(frozen=True)
-class ProjectTask:
-    path: Path
-    goal: str
-    status: str
-
-    @property
-    def resume_command(self) -> str:
-        from simple_ar.cli.task_options import resume_command
-        return resume_command(self.path)
-
-
-def _linked(path: Path) -> bool:
-    metadata = path.lstat()
-    return stat.S_ISLNK(metadata.st_mode) or bool(
-        getattr(metadata, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
-
-
-def discover_project_tasks(directory: Path) -> tuple[list[ProjectTask], int]:
-    """Inspect only directory and direct children; return tasks and skipped count.
-
-    No application/controller loading, attempt/artifact scanning or state writes.
-    Oversized inventories fail closed instead of selecting from a partial listing.
-    """
-    from simple_ar.app.tool_application import ToolApplication
-    from simple_ar.core.session import SessionManifest
-
-    directory = directory.expanduser().absolute()
-    for ancestor in reversed((directory, *directory.parents)):
-        if _linked(ancestor):
-            raise ValueError('--tasks-in and its ancestors must not be links/junctions')
-    directory = directory.resolve(strict=True)
-    with os.scandir(directory) as entries:
-        children = list(islice(entries, MAX_ENTRIES + 1))
-    if len(children) > MAX_ENTRIES:
-        raise ValueError(f'--tasks-in exceeds {MAX_ENTRIES} entries; choose a narrower directory')
-    tasks, skipped = [], 0
-    candidates = [directory] + sorted((Path(entry.path) for entry in children), key=lambda p: p.name)
-    for candidate in candidates:
-        try:
-            if _linked(candidate):
-                skipped += 1
-                continue
-            if not candidate.is_dir():
-                continue
-            manifest_path = candidate / 'session_manifest.json'
-            if not manifest_path.exists() and not manifest_path.is_symlink():
-                continue
-            if (_linked(manifest_path) or not stat.S_ISREG(manifest_path.lstat().st_mode)
-                    or manifest_path.resolve().parent != candidate):
-                raise ValueError('Linked or nonregular manifest')
-            with manifest_path.open('rb') as stream:
-                content = stream.read(MAX_MANIFEST_BYTES + 1)
-            if len(content) > MAX_MANIFEST_BYTES:
-                raise ValueError('Manifest size limit exceeded')
-            payload = json.loads(content)
-            if not isinstance(payload, dict):
-                raise ValueError('Manifest must be an object')
-            if (payload.get('schema_version') != 'session_manifest.v2'
-                    or payload.get('transition_recipe') != ToolApplication.RECIPE):
-                skipped += 1
-                continue
-            manifest = SessionManifest.from_dict(payload)
-            tasks.append(ProjectTask(candidate, manifest.topic, manifest.status))
-        except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
-            skipped += 1
-    return tasks, skipped
+from simple_ar.tools.project_results import discover_project_tasks
 
 
 def handle_project_tasks(args: argparse.Namespace, *, interactive: bool) -> bool:
@@ -114,7 +37,7 @@ def handle_project_tasks(args: argparse.Namespace, *, interactive: bool) -> bool
     for index, (name, task) in enumerate(choices.items(), 1):
         goal = ' '.join(task.goal.split())
         print_line(f'{index}. {name} | status={task.status} | goal={goal[:240]}' + ('…' if len(goal) > 240 else ''))
-        print_line(task.resume_command)
+        print_line(resume_command(task.path))
     print_line(f'{len(tasks)} native tasks; {skipped} skipped linked, unsupported or unreadable entries. '
                'Only this directory and immediate children inspected. Recorded status is not quality verification; '
                'partial retains unresolved work.')

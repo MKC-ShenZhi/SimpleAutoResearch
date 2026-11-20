@@ -41,6 +41,50 @@ class SelectedWorkContinuityTests(unittest.TestCase):
         return ToolApplication.create(self.base / 'fresh', 'Different current goal', model=None,
             sources={}, creation_declarations={'reuse_origin': selection.origin})
 
+    def test_discover_and_apply_a_delivered_project_method_to_new_inputs(self):
+        retained = self.app.run(feedback='Keep a reusable calculation method', actions=[
+            action('write_file', path='method/SKILL.md', content='Run sum.py on the current measurements.'),
+            action('write_file', path='method/sum.py', content=
+                'import json\nfrom pathlib import Path\n'
+                'values = [int(row) for row in Path("measurements.txt").read_text().splitlines()]\n'
+                'Path("result.json").write_text(json.dumps({"sum": sum(values)}))\n'),
+            action('deliver_result', summary='Reusable calculation', project_root='workspace/method',
+                artifacts=['workspace/method/SKILL.md', str(self.app.workspace.workspace / 'method/sum.py')])],
+            progress=lambda _: None)
+        self.assertEqual(retained['status'], 'completed')
+        old_root = self.app.session.store.root
+        before = [(old_root / name).read_bytes() for name in ('actions.json', 'budget_ledger.json')]
+        (self.app.workspace.workspace / 'method/sum.py').write_text('raise SystemExit("changed live work")')
+
+        new = ToolApplication.create(self.base / 'new', 'Sum the new inputs', model=None,
+            sources={'history': self.base}, allow_execution=True, control_protocol='operations.v1')
+        new.run(actions=[action('list_project_results', path='history'),
+            action('list_project_results', path='history/old', deliveries=True)], progress=lambda _: None)
+        new = ToolApplication.load(new.session.store.root)
+        catalog, versions = [row['data']['entries'] for row in new._operation_observations()
+                             if row['tool_name'] == 'list_project_results']
+        self.assertIn('history/old', [row['path'] for row in catalog])
+        self.assertEqual(versions[0]['version'], 2)
+        self.assertEqual(versions[0]['method_paths'], ['workspace/method/SKILL.md'])
+        self.assertEqual(versions[1]['method_paths'], [])
+        completed = new.run(actions=[
+            action('copy_project', source='history/old', delivery_version=1, delivery_group='artifacts', path='previous'),
+            action('copy_project', source='history/old', delivery_version=2, path='method'),
+            action('write_file', path='method/measurements.txt', content='6\n3\n'),
+            action('run_process', argv=['python', 'sum.py'], cwd='workspace/method',
+                inputs=['workspace/method/sum.py', 'workspace/method/measurements.txt'],
+                outputs=['workspace/method/result.json'], timeout_sec=10),
+            action('deliver_result', summary='The new values sum to 9.', artifacts=['workspace/method/result.json'])],
+            approve=lambda *_: True, progress=lambda _: None)
+        self.assertEqual(completed['status'], 'completed', completed)
+        self.assertEqual(read_json(new.workspace.workspace / 'method/result.json'), {'sum': 9})
+        created, = [row['data'] for row in new._operation_observations() if row['tool_name'] == 'write_file']
+        self.assertEqual(created['workspace_path'], 'workspace/method/measurements.txt')
+        self.assertEqual((new.workspace.workspace / 'previous/workspace/selected.txt').read_bytes(),
+            b'first\nsecond\nthird\n')
+        self.assertEqual((new.workspace.workspace / 'method/SKILL.md').read_text(), 'Run sum.py on the current measurements.')
+        self.assertEqual([(old_root / name).read_bytes() for name in ('actions.json', 'budget_ledger.json')], before)
+
     def test_native_read_rows_keep_full_and_partial_offsets_and_needed_sources_after_archiving(self):
         from simple_ar.integrations.llm import LLMClient, LLMSettings
         from tests.report_review_fixtures import goal_work_decision
@@ -461,6 +505,12 @@ class WorkingSupplyContinuityTests(unittest.TestCase):
                     working_set_policy=policy)
                 self.assertEqual({x['source']['record'] for x in selected['selected_records']},
                     {'records/1.json', 'records/2.json', 'records/3.json'})
+        _, focused = select_working_context(**common, working_set_policy='recent.v6')
+        self.assertEqual({x['source']['record'] for x in focused['selected_records']},
+            {'records/2.json', 'records/3.json'})
+        _, requested = select_working_context(**common, working_set_policy='recent.v6',
+            selected_records=['records/1.json'])
+        self.assertIn('records/1.json', {x['source']['record'] for x in requested['selected_records']})
 
     def test_active_read_windows_survive_archiving_without_pinning_unrelated_files(self):
         def read(turn, name, text, digest='a' * 64):

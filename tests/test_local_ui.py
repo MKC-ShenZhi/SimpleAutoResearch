@@ -4,6 +4,7 @@ Run on the verification server: python -m unittest discover -s tests -p test_loc
 """
 import http.client
 import hashlib
+from contextlib import closing
 from copy import deepcopy
 import json
 import os
@@ -33,6 +34,41 @@ def call(name, arguments, identity='test-call'):
 
 
 class LocalWorkspaceTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('pdftoppm'), 'Poppler is needed for physical PDF preview')
+    def test_pdf_preview_paginates_an_authorized_file_without_working_the_task(self):
+        from pypdf import PdfWriter
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            app = ToolApplication.create(root / 'tasks' / 'saved', 'Read the report', model=None, sources={})
+            pdf = app.workspace.workspace / 'report.pdf'
+            writer = PdfWriter()
+            for _ in range(13):
+                writer.add_blank_page(width=120, height=160)
+            writer.write(pdf)
+            before = app.session.store.resolve('actions.json').read_bytes()
+            httpd = server(Workspace(root, [], root / 'tasks'))
+            worker = threading.Thread(target=httpd.serve_forever, daemon=True)
+            worker.start()
+            try:
+                connection = http.client.HTTPConnection('127.0.0.1', httpd.server_port, timeout=15)
+                with closing(connection) as opened:
+                    route = '/api/pdf-page?task=saved&mount=workspace&path=report.pdf&page='
+                    headers = {'Authorization': 'Bearer ' + httpd.session_token}
+                    opened.request('GET', route + '13', headers=headers)
+                    rendered = opened.getresponse()
+                    self.assertEqual((rendered.status, rendered.getheader('X-PDF-Pages')), (200, '13'))
+                    self.assertTrue(rendered.read().startswith(b'\x89PNG\r\n\x1a\n'))
+                    opened.request('GET', route + '14', headers=headers)
+                    invalid = opened.getresponse()
+                    self.assertEqual(invalid.status, 400)
+                    invalid.read()
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                worker.join(5)
+            self.assertEqual(app.session.store.resolve('actions.json').read_bytes(), before)
+
     def test_snapshot_exposes_only_currently_accessible_saved_sources(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -164,6 +200,7 @@ class LocalWorkspaceTests(unittest.TestCase):
                     ['retained_delivery/workspace/package'])
 
     def test_granted_project_reuse_uses_shared_proof_without_loading_old_task(self):
+        from simple_ar.cli.parser import build_parser
         from simple_ar.cli.start import migrate_new_start, native_creation_options
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -191,7 +228,7 @@ class LocalWorkspaceTests(unittest.TestCase):
                 self.assertEqual(selected.project, (project, None, {}))
                 self.assertEqual(selected.package_mounts, ())
                 args, _ = workspace.creation_inputs({'task_config': str(config)})
-                cli = native_arguments()
+                cli = build_parser().parse_args(['start'])
                 cli.request, cli.from_session, cli.reuse = args.request, base / 'old', ['code_project', 'artifacts']
                 cli.yes = cli.prepare_only = True
                 migrate_new_start(cli)
@@ -514,7 +551,7 @@ function json(path, data) {
   $('network').checked = true;
   selectTask('alpha');
   $('feedback').value = 'Revise the figure and caption';
-  $('feedbackReview').checked = true;
+  $('feedbackReview').value = 'required';
   $('switchReason').value = 'Existing authorization';
   $('mount').value = 'source0'; folder = 'measurements';
   previewTarget = {mount: 'workspace', path: 'figures/plot.png', name: 'plot.png'};
@@ -522,12 +559,12 @@ function json(path, data) {
   selectTask('beta');
   assert.equal($('rememberExecution').checked, false);
   assert.equal($('feedback').value, '');
-  assert.equal($('feedbackReview').checked, false);
+  assert.equal($('feedbackReview').value, '');
   assert.equal(folder, '');
   $('feedback').value = 'Other project feedback';
   selectTask('alpha');
   assert.equal($('feedback').value, 'Revise the figure and caption');
-  assert.equal($('feedbackReview').checked, true);
+  assert.equal($('feedbackReview').value, 'required');
   assert.equal(folder, 'measurements');
   assert.equal($('mount').value, ''); // Rebound only after owner snapshot.
   assert.equal(view.tasks.alpha.mount, 'source0');
@@ -1131,6 +1168,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                      'function': {'name': tool, 'arguments': json.dumps(arguments)}}]}
 
             with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(catalog), 'SAR_UI_TEST_KEY': 'fake-ui-credential'}), \
+                    patch('simple_ar.integrations.llm.load_dotenv'), \
                     patch.object(LLMClient, 'chat_turn', new=fake_turn), \
                     patch.object(LLMClient, '_complete_request', side_effect=AssertionError('No provider traffic')):
                 httpd = server(workspace)
@@ -1159,7 +1197,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     self.assertEqual(defaults['max_tokens'], args.max_tokens)
                     self.assertEqual(defaults['allow_execution'], args.allow_execution)
                     self.assertEqual(defaults['sandbox_execution'], args.sandbox_execution)
-                    self.assertFalse(defaults['independent_review_required'])
+                    self.assertEqual(defaults['independent_review_required'], args.independent_review_required)
                     _, _, owner_limits, _ = ToolApplication.preview_creation(workspace.tasks,
                         'Configuration preview', model=None, sources={},
                         max_turns=args.max_turns, max_tokens=args.max_tokens)
@@ -1170,7 +1208,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                         'allow_execution', 'sandbox_execution', 'allow_network', 'allow_vision',
                         'independent_review_required',
                         'process_invocations', 'process_wall_seconds'})
-                    # Parser changes flow into metadata without a second UI default.
+                    # Application defaults flow into metadata without a second UI default.
                     args.max_turns += 1
                     args.max_tokens += 1
                     with patch('simple_ar.ui.native_arguments', return_value=args):
@@ -1342,7 +1380,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     outside_session.mkdir()
                     config_path.write_text('[task]\nrequest="Reuse a project"\nfrom_session='
                         + json.dumps(str(outside_session)) + '\nreuse=["code_project"]\n', encoding='utf-8')
-                    with patch('simple_ar.ui.migrate_new_start',
+                    with patch('simple_ar.ui.prepare_client_inputs',
                             side_effect=AssertionError('Reject ungranted sessions before their owner reads them')):
                         with self.assertRaises(ValueError):
                             workspace.preview_creation({'task_config': str(config_path)})

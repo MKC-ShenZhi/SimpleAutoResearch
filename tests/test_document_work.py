@@ -481,7 +481,24 @@ class DocumentWorkTests(unittest.TestCase):
             gateway.call('work_document', {'goal': 'Explain the observation'}, identity='report')
         saved_usage = ledger.to_dict()
         saved_calls = len(calls)
-        with patch('simple_ar.tools.document_work._system_for', return_value='Updated instruction for new work'):
+        def interrupt_after_assembly(owner, path, *args, **kwargs):
+            result = write(owner, path, *args, **kwargs)
+            if path == 'decisions/2/authored.json':
+                raise KeyboardInterrupt('Stop after saving the assembled report')
+            return result
+        with patch.object(ArtifactStore, 'write_json', interrupt_after_assembly), self.assertRaises(KeyboardInterrupt):
+            gateway.call('work_document', {'goal': 'Explain the observation'}, identity='report')
+        authored = root / 'attempts/report/document_work/decisions/2/authored.json'
+        saved_authored = authored.read_bytes()
+        authored.write_text(json.dumps({**json.loads(saved_authored), 'markdown': 'Changed body'}), encoding='utf-8')
+        self.assertFalse(gateway.can_reconcile('work_document', 'report'))
+        self.assertEqual(ledger.to_dict(), saved_usage)
+        authored.write_bytes(saved_authored)
+        with (
+            patch('simple_ar.tools.document_work._system_for', return_value='Updated instruction for new work'),
+            patch('simple_ar.report.document_writer.write_observed_report',
+                  side_effect=AssertionError('Saved assembly should be reused')),
+        ):
             self.assertTrue(gateway.can_reconcile('work_document', 'report'))
             result = gateway.call('work_document', {'goal': 'Explain the observation'}, identity='report')
         self.assertTrue(result.ok, result.error)
@@ -792,7 +809,7 @@ class DocumentWorkTests(unittest.TestCase):
                     'result': {'message': 'Relevant evidence and revision guidance. ' * 350}}
                    for number in range(20)]
         app = SimpleNamespace(state={'requests': ['Revise the supplied work'], 'config': {}},
-            operations=None, _work_feedback=lambda targets: {'review_observations': reviews},
+            operations=None, _work_feedback=lambda targets, **_: {'review_observations': reviews},
             _retained_working_inputs=lambda targets: {'notes': []})
         context = ToolApplication._work_context(app, ['workspace/project'])
         self.assertGreater(len(json.dumps(context).encode()), 256000)
@@ -965,7 +982,7 @@ class DocumentWorkTests(unittest.TestCase):
     def test_feedback_uses_retained_delivery_without_inventing_evidence_or_scanning_workspace(self):
         root, source, ledger, workspace = self.workspace()
         result_file = workspace.workspace / 'result.txt'
-        result_file.write_text('The measured value is 2.\n', encoding='utf-8')
+        result_file.write_bytes(b'The measured value is 2.\n')
         baseline = workspace.workspace / 'baseline.txt'
         baseline.write_text('The original baseline.\n', encoding='utf-8')
         (workspace.workspace / 'unrelated.txt').write_text('Not delivered.\n', encoding='utf-8')
@@ -1012,7 +1029,7 @@ class DocumentWorkTests(unittest.TestCase):
         self.assertEqual(first.data['provenance']['evidence'][0]['path'], str(result_file))
         self.assertEqual(first.data['provenance']['evidence'][0]['role'], 'retained_delivery_work')
 
-        result_file.write_text('The corrected value is 3.\n', encoding='utf-8')
+        result_file.write_bytes(b'The corrected value is 3.\n')
         second = gateway.call('work_document', {'goal': 'Clarify the corrected result'}, identity='second')
         self.assertTrue(second.ok, second.error)
         self.assertEqual(len(clients[-1].calls), 2)

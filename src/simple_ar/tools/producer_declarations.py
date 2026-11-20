@@ -8,9 +8,10 @@ neither rewrites original notes or introduces a second audit store.
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 import re
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 from simple_ar.core.capabilities import ArtifactStore
 
@@ -378,11 +379,10 @@ def freeze_producer_context(owner: Any, artifacts: list[dict]) -> dict:
 
 
 def delivery_adoptions(owner: Any, observations: list[dict], delivery: dict | None,
-                       proposed: Any = None) -> list[dict]:
+                       proposed: Any = None, *, check_publication: Callable[..., set[Path]] | None) -> list[dict]:
     """Writing owner's proof for the canonical manuscript actually delivered."""
     from simple_ar.report.composition_receipts import accepted_composition_receipt
-    from simple_ar.report.writing import validate_document_inspection
-    if not delivery:
+    if not delivery or check_publication is None:
         return []
     from simple_ar.tools.workspace import DeliveryRequest
     try:
@@ -405,7 +405,7 @@ def delivery_adoptions(owner: Any, observations: list[dict], delivery: dict | No
                 and 'declaration_adoption' not in data.get('delivery_review', {})):
             return []  # This receipt has findings, never declaration-waiver authority.
         try:
-            store, binding, data = accepted_composition_receipt(root=owner.root,
+            _, binding, data = accepted_composition_receipt(root=owner.root,
                 workspace=owner.workspace, session_id=owner.session_id, ledger=owner.ledger,
                 observed=observed)
             if (data.get('unresolved') or data.get('incomplete')
@@ -425,16 +425,14 @@ def delivery_adoptions(owner: Any, observations: list[dict], delivery: dict | No
             # this adopter does not invent a second definition of a manuscript
             # or treat unrelated attachments as having passed its inspection.
             authoring = owner.publication_source(data['editable_markdown'], data.get('report_binding'),
-                observation=observed)
-            from simple_ar.tools.publication import PublicationToolGateway
+                observation=observed, review=review)
             publication_proposal = (proposed.arguments
                 if proposed is not None and proposed.tool_name == 'export_report' else None)
-            published = PublicationToolGateway.check_report_delivery(owner, observations, authoring,
+            published = check_publication(observations, authoring,
                 delivery['artifacts'], formats=(data.get('report_binding') or {}).get(
                     'obligation', {}).get('formats', ['markdown']),
                 manuscript=report['manuscript'], proposed=publication_proposal)
             owner.check_delivery_set(authoring, delivery['artifacts'], published)
-            validate_document_inspection(store, binding, data, review_result=review)
             adoption = data['delivery_review'].get('declaration_adoption', {})
             from simple_ar.report.review_evidence import declaration_adoption_contract
             contract = declaration_adoption_contract(binding['delivery_review'])

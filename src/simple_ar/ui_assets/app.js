@@ -12,9 +12,14 @@ history.replaceState(null, '', location.pathname);
 let selected = '', snapshot = null, metadata = null, folder = '', previewURL = '', listingKey = '', activityKey = '', deliveryKey = '';
 let confirmation = null, confirmationSending = false, actionSending = false, creationPreviewSending = false, viewEpoch = 0, refreshSequence = 0, previewSequence = 0;
 let previewTarget = null;
+let previewPageURL = '';
 let reuseOrigin = null;
 let viewKey = '', view = {selected: '', tasks: {}, create: {}};
 const createFields = ['taskConfig', 'goal', 'materials', 'profile', 'turns', 'tokens', 'processes', 'seconds', 'network', 'execution', 'sandboxExecution', 'requiredReview'];
+function feedbackReviewChoice() {
+  const value = $('feedbackReview').value;
+  return value === 'required' ? true : value === 'optional' ? false : null;
+}
 function persistView() {
   if (!viewKey) return;
   try { sessionStorage.setItem(viewKey, JSON.stringify(view)); }
@@ -27,10 +32,10 @@ function saveDrafts() {
   if (selected) {
     const previous = view.tasks[selected] || {};
     const feedback = $('feedback').value;
-    const feedbackReview = $('feedbackReview').checked;
-    view.tasks[selected] = {...previous, feedback, feedbackReview,
+    const feedbackReview = feedbackReviewChoice();
+    view.tasks[selected] = {...previous, feedback, feedbackReview: $('feedbackReview').value,
       submission: previous.submission?.feedback === feedback &&
-        (previous.submission?.independent_review_required ?? null) === (feedbackReview ? true : null) ? previous.submission : undefined,
+        (previous.submission?.independent_review_required ?? null) === feedbackReview ? previous.submission : undefined,
       switchReason: $('switchReason').value, switchProfile: $('switchProfile').value,
       mount: $('mount').value || previous.mount || '', folder, preview: previewTarget};
   }
@@ -46,15 +51,20 @@ function selectTask(task, save = true) {
   folder = draft.folder || '';
   previewTarget = draft.preview || null;
   $('feedback').value = draft.feedback || '';
-  $('feedbackReview').checked = draft.feedbackReview === true;
+  $('feedbackReview').value = draft.feedbackReview === true ? 'required' : draft.feedbackReview || '';
   $('switchReason').value = draft.switchReason || '';
   $('switchProfile').value = draft.switchProfile || '';
   $('mount').replaceChildren();
   $('preview').replaceChildren(); $('files').replaceChildren();
-  if (previewURL) { URL.revokeObjectURL(previewURL); previewURL = ''; }
+  clearPreviewURLs();
   $('create').hidden = !!task; $('detail').hidden = true;
   $('mode').textContent = task ? '正在读取保存记录…' : 'Local workspace';
   view.selected = task; persistView();
+}
+function clearPreviewURLs() {
+  if (previewURL) URL.revokeObjectURL(previewURL);
+  if (previewPageURL) URL.revokeObjectURL(previewPageURL);
+  previewURL = previewPageURL = '';
 }
 const pretty = value => JSON.stringify(value, null, 2);
 const toolLabels = {acquire_source: '获取来源', search_sources: '检索来源', find_source_passages: '查阅原文',
@@ -402,7 +412,7 @@ async function files() {
       };
       $('files').append(button);
     }
-    if (!previewURL && previewTarget) {
+    if (previewTarget && !$('preview').hasChildNodes()) {
       await previewFile({task: selected, mount: previewTarget.mount}, previewTarget);
     }
   } catch (error) { notice(error.message); }
@@ -411,16 +421,33 @@ async function previewFile(values, row) {
   const sequence = ++previewSequence, epoch = viewEpoch;
   try {
     const target = {...values, path: row.path};
-    // Inspection is explicit, not a recursive JSON scan during polling.
-    const source = await json(query('/api/source-preview', target));
-    const response = await api(query('/api/file', target));
-    const blob = await response.blob();
+    const pdf = row.name.toLowerCase().endsWith('.pdf');
+    // A PDF page is its own response. The complete file is fetched on download.
+    const source = pdf ? null : await json(query('/api/source-preview', target));
+    const blob = pdf ? null : await (await api(query('/api/file', target))).blob();
     if (selected !== values.task || epoch !== viewEpoch || sequence !== previewSequence) return;
-    previewTarget = {mount: values.mount, path: row.path, name: row.name};
+    previewTarget = {mount: values.mount, path: row.path, name: row.name, ...(pdf && {page: row.page || 1})};
     saveDrafts();
-    if (previewURL) URL.revokeObjectURL(previewURL);
-    previewURL = URL.createObjectURL(blob); $('preview').replaceChildren();
-    const link = document.createElement('a'); link.href = previewURL; link.download = row.name;
+    clearPreviewURLs();
+    $('preview').replaceChildren();
+    const link = document.createElement(pdf ? 'button' : 'a');
+    if (pdf) {
+      link.type = 'button';
+      link.onclick = async () => {
+        link.disabled = true;
+        try {
+          const file = await (await api(query('/api/file', target))).blob();
+          if (sequence !== previewSequence || epoch !== viewEpoch) return;
+          if (previewURL) URL.revokeObjectURL(previewURL);
+          previewURL = URL.createObjectURL(file);
+          const download = document.createElement('a');
+          download.href = previewURL; download.download = row.name; download.click();
+        } catch (error) { notice(error.message); }
+        finally { link.disabled = false; }
+      };
+    } else {
+      previewURL = URL.createObjectURL(blob); link.href = previewURL; link.download = row.name;
+    }
     link.textContent = '下载 ' + row.name; $('preview').append(link);
     if (source) {
       paragraph($('preview'), '声明的来源包 · ' + row.name, 'source-title');
@@ -445,6 +472,36 @@ async function previewFile(values, row) {
       if (epoch !== viewEpoch || sequence !== previewSequence) return;
       details.append(summary, raw); $('preview').append(details);
     }
+    else if (pdf) {
+      const previous = document.createElement('button'), next = document.createElement('button');
+      const label = document.createElement('span'), image = document.createElement('img');
+      previous.textContent = '上一页'; next.textContent = '下一页'; label.setAttribute('aria-live', 'polite');
+      $('preview').append(previous, next, label, image);
+      let page = row.page || 1, count = 0;
+      async function showPage(requested, reopening = false) {
+        previous.disabled = next.disabled = true;
+        try {
+          const response = await api(query('/api/pdf-page', {...target, page: requested}));
+          const rendered = await response.blob();
+          if (sequence !== previewSequence || epoch !== viewEpoch) return;
+          if (previewPageURL) URL.revokeObjectURL(previewPageURL);
+          previewPageURL = URL.createObjectURL(rendered);
+          page = requested; count = Number(response.headers.get('X-PDF-Pages'));
+          image.src = previewPageURL; image.alt = `${row.name}，第 ${page} 页`;
+          label.textContent = `第 ${page} / ${count} 页`;
+          previewTarget.page = page; saveDrafts();
+        } catch (_) {
+          if (sequence !== previewSequence || epoch !== viewEpoch) return;
+          if (reopening && requested > 1) return showPage(1);
+          label.textContent = '这页暂时无法预览，可下载 PDF 查看。';
+        }
+        previous.disabled = page <= 1 || !count;
+        next.disabled = page >= count;
+      }
+      previous.onclick = () => showPage(page - 1);
+      next.onclick = () => showPage(page + 1);
+      await showPage(page, true);
+    }
     else if (['image/png', 'image/jpeg', 'image/webp'].includes(blob.type)) { const image = document.createElement('img'); image.src = previewURL; image.alt = row.name; $('preview').append(image); }
     else if (blob.type.startsWith('text/')) {
       const text = await blob.text();
@@ -463,7 +520,8 @@ $('createForm').onsubmit = async event => {
   const data = task_config ? {task_config} : {goal: $('goal').value, materials: $('materials').value.split('\n').map(p => p.trim()).filter(Boolean),
     model: $('profile').value, binding_id: metadata.profiles.find(p => p.selector === $('profile').value)?.binding_id,
     max_turns: Number($('turns').value), max_tokens: Number($('tokens').value),
-    process_invocations: Number($('processes').value), process_wall_seconds: Number($('seconds').value),
+    ...($('processes').value === '' ? {} : {process_invocations: Number($('processes').value)}),
+    ...($('seconds').value === '' ? {} : {process_wall_seconds: Number($('seconds').value)}),
     network: $('network').checked, execution: $('execution').checked,
     sandbox_execution: $('sandboxExecution').checked,
     independent_review_required: $('requiredReview').checked, ...(reuseOrigin || {})};
@@ -473,7 +531,7 @@ $('createForm').onsubmit = async event => {
     const preview = await json('/api/action', {op: 'preview_create', ...data});
     if (epoch !== viewEpoch || selected) return;
     reviewAction('确认配置并创建任务', 'create', {...data, preview_id: preview.preview_id, confirmed: true}, {
-      '目标、配置来源与任务目录': {goal: preview.goal, task_config: preview.task_config, task_root: preview.task_root},
+      '目标、配置来源与任务目录': {goal: preview.goal, task_config: preview.task_config, file_settings: preview.task_config_fields, task_root: preview.task_root},
       '实际命名连接与接收方': {model: preview.model, binding_id: preview.binding_id, recipients: preview.recipients},
       '只读材料与执行 Python': {sources: preview.sources, project_python: preview.project_python},
       '实际额度': {limits: preview.limits, attempts: preview.attempts,
@@ -508,8 +566,12 @@ $('reject').onclick = () => {
   if (!reason) { notice('请填写不执行的原因。'); return; }
   action('reject', {token: snapshot.approval.token, reason});
 };
-$('feedbackForm').onsubmit = async event => { event.preventDefault(); await action('feedback', {feedback: $('feedback').value,
-  ...($('feedbackReview').checked ? {independent_review_required: true} : {})}); };
+$('feedbackForm').onsubmit = async event => {
+  event.preventDefault();
+  const review = feedbackReviewChoice();
+  await action('feedback', {feedback: $('feedback').value,
+    ...(review === null ? {} : {independent_review_required: review})});
+};
 $('switch').onclick = () => {
   const model = $('switchProfile').value;
   const profile = metadata.profiles.find(p => p.selector === model);
@@ -545,12 +607,11 @@ async function poll() {
 (async () => {
   try {
     metadata = await json('/api/meta'); $('grants').textContent = '项目：' + metadata.project + '\n只读授权：' + metadata.reads.join('；') + '\n任务：' + metadata.tasks;
-    for (const [id, field] of [['turns', 'max_turns'], ['tokens', 'max_tokens'],
-                             ['processes', 'process_invocations'], ['seconds', 'process_wall_seconds']]) {
+    for (const [id, field] of [['turns', 'max_turns'], ['tokens', 'max_tokens']]) {
       $(id).value = metadata.creation_defaults[field];
     }
     $('network').checked = metadata.creation_defaults.allow_network;
-    $('requiredReview').checked = metadata.creation_defaults.independent_review_required;
+    $('requiredReview').checked = metadata.creation_defaults.independent_review_required ?? true;
     $('execution').checked = metadata.creation_defaults.allow_execution;
     $('sandboxExecution').checked = metadata.creation_defaults.sandbox_execution;
     effectiveAccess(); $('createSubmit').disabled = false;

@@ -16,11 +16,11 @@ from dataclasses import dataclass, field, replace
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, ContextManager, Sequence
 from uuid import uuid4
 from simple_ar.integrations.model_profiles import model_connections_compatible
 
-from simple_ar.app.research_intake import brief_input_base, normalize_assets, retry_research_experiment, validate_brief, write_intake_artifacts
+from simple_ar.app.research_intake import prepare_research_inputs, retry_research_experiment, validate_brief, write_intake_artifacts
 from simple_ar.app.research_execution import (
     code_task_validation,
     analysis_contract_context,
@@ -43,9 +43,11 @@ from simple_ar.core import (
     BudgetState,
     BudgetError,
     BudgetLedger,
+    CapabilityResult,
     CapabilityRegistry,
     SessionController,
 )
+from simple_ar.core.capabilities import AttemptManifest
 from simple_ar.research.brief import assessment_evidence_from_read, evidence_pack_from_read
 from simple_ar.research.assessment import IdeaAssessmentRequest
 from simple_ar.research.design import ResearchDesignRequest
@@ -228,11 +230,19 @@ class ResearchApplication:
         settings = services or ResearchApplicationServices()
         if settings.max_attempts is None:
             settings = replace(settings, max_attempts=16)
-        assets = normalize_assets(brief, input_base_dir=brief_input_base(brief, settings.input_base_dir))
-        diagnostics = validate_brief(brief, assets)
+        assets, diagnostics, _, _ = prepare_research_inputs(brief, input_base_dir=settings.input_base_dir)
         _raise_on_errors(diagnostics)
         session_root = Path(root).expanduser().absolute()
-        controller = SessionController.create(
+        ledger = BudgetLedger(settings.budget_limits)
+        app: ResearchApplication
+
+        def initialize(controller: SessionController) -> None:
+            nonlocal app
+            bound = _bind_budget_services(settings, ledger, controller.manifest.session_id)
+            app = cls(controller, brief, assets, bound, ledger)
+            app._persist_inputs(diagnostics, publish=False)
+
+        SessionController.create(
             session_root,
             session_id=session_root.name or "research-session",
             topic=(brief.objective or brief.request_text).strip()[:500],
@@ -241,23 +251,8 @@ class ResearchApplication:
                 max_attempts=settings.max_attempts,
                 max_no_progress=settings.max_no_progress,
             ),
+            budget_ledger=ledger, budget_producer="research_application", initialize=initialize,
         )
-        ledger = BudgetLedger(
-            settings.budget_limits,
-            storage_path=session_root / "budget_ledger.json",
-        )
-        settings = _bind_budget_services(settings, ledger, controller.manifest.session_id)
-        app = cls(controller, brief, assets, settings, ledger)
-        with controller.mutation_scope():
-            ledger.save()
-            controller.manifest.budget_ledger_ref = controller.store.ref(
-                "budget_ledger.json",
-                kind="budget_ledger",
-                schema=BudgetLedger.schema_version,
-                producer="research_application",
-            )
-            controller.save()
-            app._persist_inputs(diagnostics)
         return app
 
     @classmethod
@@ -269,18 +264,17 @@ class ResearchApplication:
     ) -> "ResearchApplication":
         settings = services or ResearchApplicationServices()
         controller = SessionController.load(root, registry=_research_registry())
+        brief = _read_saved_brief(controller)
         try:
-            brief_payload = controller.store.read_json(controller.manifest.state_refs["brief"])
             assets_payload = controller.store.read_json(controller.manifest.state_refs["assets"])
         except (KeyError, FileNotFoundError, OSError, ValueError) as exc:
             raise ResearchApplicationError(f"Application inputs are incomplete: {exc}") from exc
-        if not isinstance(brief_payload, Mapping) or not isinstance(assets_payload, Mapping):
+        if not isinstance(assets_payload, Mapping):
             raise ResearchApplicationError("Application inputs must be JSON objects.")
         rows = assets_payload.get("assets", [])
         if not isinstance(rows, list):
             raise ResearchApplicationError("Persisted assets must be a list.")
         try:
-            brief = ResearchBrief.from_dict(brief_payload)
             if any(not isinstance(row, Mapping) for row in rows):
                 raise ValueError("Persisted asset entries must be JSON objects.")
             assets = tuple(ResearchAsset.from_dict(row) for row in rows)
@@ -299,24 +293,11 @@ class ResearchApplication:
             config=config,
         )
         try:
-            if controller.manifest.budget_ledger_ref is None:
-                ledger = BudgetLedger(
-                    settings.budget_limits,
-                    storage_path=controller.store.root / "budget_ledger.json",
-                )
-                with controller.mutation_scope():
-                    ledger.save()
-                    controller.manifest.budget_ledger_ref = controller.store.ref(
-                        "budget_ledger.json",
-                        kind="budget_ledger",
-                        schema=BudgetLedger.schema_version,
-                        producer="research_application",
-                    )
-                    controller.save()
+            if controller.manifest.budget_ledger_ref is None and not controller.store.exists('budget_ledger.json'):
+                ledger = BudgetLedger(settings.budget_limits)
+                controller.attach_budget(ledger, producer="research_application")
             else:
-                ledger = BudgetLedger.load(
-                    controller.store.root / controller.manifest.budget_ledger_ref.path
-                )
+                ledger = controller.load_budget()
         except (BudgetError, OSError, RuntimeError, ValueError) as exc:
             raise ResearchApplicationError(f"Could not restore application budget ledger: {exc}") from exc
         settings = _bind_budget_services(settings, ledger, controller.manifest.session_id)
@@ -356,6 +337,7 @@ class ResearchApplication:
 
     def view(self) -> ResearchApplicationView:
         manifest = self.controller.manifest
+        next_action = self._next_action()
         diagnostics = list(self._input_diagnostics())
         if manifest.status_reason.strip():
             diagnostics.append(manifest.status_reason.strip())
@@ -367,46 +349,33 @@ class ResearchApplication:
             status_reason=manifest.status_reason,
             revision=manifest.revision,
             requested_outputs=self.brief.requested_outputs,
-            next_action=self._next_action(),
+            next_action=next_action,
             state_refs=dict(manifest.state_refs),
             attempts=tuple(item.to_dict() for item in self.controller.list_attempts()),
             budget=manifest.budget.to_dict(),
             diagnostics=tuple(_unique(diagnostics)),
-            work_plan=self._build_work_plan(),
+            work_plan=self._build_work_plan(next_action),
             parent_session=manifest.parent_session,
         )
 
-    def advance(self, *, max_actions: int = 1) -> ResearchApplicationView:
+    def advance(self, *, max_actions: int = 1,
+                action_context: Callable[[str], ContextManager] | None = None,
+                observe: Callable[[ResearchApplicationView], None] | None = None) -> ResearchApplicationView:
         """Run at most ``max_actions`` actions and return current state."""
         if max_actions < 1:
             raise ValueError("max_actions must be positive.")
         self.require_llm_binding()
         with self.controller.mutation_scope():
             self._reconcile_running_attempt()
-            self._reconcile_terminal_usage()
+            self.controller.close_inactive_reservations(self.budget_ledger)
             if self.controller.manifest.status in {"paused", "blocked", "completed"}:
                 return self.view()
-            for _ in range(max_actions):
-                action = self._next_action()
-                if action is None:
-                    break
-                if self._ensure_interaction_checkpoint(action):
-                    break
-                if not self._run_action(action):
-                    break
-            self._finish_available_work()
+            self._schedule_evidence_followup()
+            self.controller.advance_actions(max_actions=max_actions, select=self._next_action,
+                dispatch=lambda action: not self._ensure_interaction_checkpoint(action) and self._run_action(action),
+                finish=self._finish_available_work, action_context=action_context,
+                observe=(lambda: observe(self.view())) if observe is not None else None)
             return self.view()
-
-    def _reconcile_terminal_usage(self) -> None:
-        """Ended attempts cannot retain live calls, nor claim zero consumption."""
-        terminal = {attempt.attempt_id for attempt in self.controller.list_attempts()
-                    if attempt.status in {"completed", "failed"}}
-        for entry in self.budget_ledger.entries:
-            if entry.status == "reserved" and entry.attempt_id in terminal:
-                self.budget_ledger.mark_unknown(
-                    entry.reservation_id, retain_reservation=True,
-                    reason="Attempt ended without persisted usage; retain its reservation, not zero consumption.",
-                )
 
     def recover_interrupted_attempt(
         self,
@@ -426,7 +395,7 @@ class ResearchApplication:
                     "Interrupted recovery requires exactly one current running attempt."
                 )
             self.controller.recover_interrupted(running[0].attempt_id, reason=reason)
-            self._reconcile_terminal_usage()
+            self.controller.close_inactive_reservations(self.budget_ledger)
             return self.view()
 
     def continue_session(
@@ -1564,7 +1533,8 @@ class ResearchApplication:
 
     def _schedule_evidence_followup(self) -> None:
         refs = self.controller.manifest.state_refs
-        if not {"task_plan", "plan", "search", "documents", "read"} <= refs.keys():
+        if (not {"task_plan", "plan", "search", "documents", "read"} <= refs.keys()
+                or not self._interaction_allows_dispatch()):
             return
         task = self._load_task_plan()
         if any(s.action == "read_evidence:1" for s in task.steps):
@@ -1610,7 +1580,6 @@ class ResearchApplication:
         joint_selection = bool(self._state_payload("evidence_followup_context_1").get("joint_selection"))
         if action == "search_evidence:1":
             if not queries:
-                from simple_ar.core.capabilities import CapabilityResult
                 def empty_search(*, context, **kwargs):
                     output = context.store.write_json("search_result.json", SearchResult("empty", ()).to_handoff_dict(),
                         kind="search_result", schema="search_handoff.v1", producer="research_application")
@@ -1832,25 +1801,24 @@ class ResearchApplication:
         # Attachment handles come from measured results, but read permission
         # comes from the producing attempt's registered outputs, not model text.
         output_paths = {handle.artifact for handle in report_context.source_handles if handle.kind == "experiment_output"}
+        attempts = self.controller.list_attempts()
         attachments = tuple(
             self.controller.store.ref(Path("attempts") / attempt.attempt_id / ref.path,
                                       kind=ref.kind, schema=ref.schema, producer=ref.producer, status=ref.status)
-            for attempt in self.controller.list_attempts() for ref in attempt.outputs
+            for attempt in attempts for ref in attempt.outputs
             if ref.kind == "experiment_output"
             and str(Path("attempts") / attempt.attempt_id / ref.path).replace("\\", "/") in output_paths
         )
         sources += attachments
+        method = str(self.services.config.get("report_writing_method", "sections"))
         resume_ref, prior_draft = resolve_report_writing_resume(
             report_context=report_context, memory=memory, config=config, template=template,
-            sources=sources, store=self.controller.store, attempts=self.controller.list_attempts(),
-            method=str(self.services.config.get("report_writing_method", "sections")),
+            sources=sources, store=self.controller.store, attempts=attempts, method=method,
         )
         return self._execute(
             "report_write", "writer",
             ReportWritingRequest(report_context, memory, config, template, self.services.llm_client, resume_ref,
-                                 self.services.message_callback,
-                                 method=str(self.services.config.get("report_writing_method", "sections")),
-                                 prior_draft=prior_draft),
+                                 self.services.message_callback, method=method, prior_draft=prior_draft),
             sources + ((resume_ref,) if resume_ref else ()),
         )
 
@@ -2625,7 +2593,6 @@ class ResearchApplication:
         parent_attempt_id: str | None = None,
         **kwargs: Any,
     ) -> bool:
-        _, artifact_kind, _ = _CAPABILITY_OUTPUTS[capability]
         if capability == "experiment":
             for resource in ("process_invocations", "process_wall_seconds"):
                 if self.budget_ledger.remaining(resource) is None:
@@ -2645,6 +2612,8 @@ class ResearchApplication:
                 inputs += (diagnosis_ref,)
         attempt_id = self.controller.allocate_attempt_id(capability)
         request = self._request_for_attempt(request, attempt_id)
+        if capability in {'search', 'document_ingest'}:
+            kwargs.update(budget_ledger=self.budget_ledger, session_id=self.controller.manifest.session_id)
         if request is not None:
             kwargs["request"] = request
         result = self.controller.execute_attempt(
@@ -2652,7 +2621,14 @@ class ResearchApplication:
             trigger=f"application:{state_name}",
             **kwargs,
         )
-        accepted = {"completed", "partial"} if allow_partial else {"completed"}
+        return self._adopt_attempt_outcome(capability, state_name, attempt_id, result,
+            allow_partial=allow_partial)
+
+    def _adopt_attempt_outcome(self, capability: str, state_name: str, attempt_id: str,
+                               result: CapabilityResult, *, allow_partial: bool, recovered: bool = False) -> bool:
+        """Apply the research disposition to an outcome committed by the session."""
+        artifact_kind = _CAPABILITY_OUTPUTS[capability][1]
+        accepted = result.status == "completed" or allow_partial and result.status == "partial"
         # Failed measurements and their diagnostic analyses remain outputs,
         # not implicit requests to rerun. Errors without artifacts still pause.
         measured_failure = capability in {"experiment", "analysis"} and result.status == "failed" and any(
@@ -2661,20 +2637,27 @@ class ResearchApplication:
         audited_failure = capability == "report_audit" and result.status == "failed" and any(
             ref.kind == artifact_kind for ref in result.artifacts
         )
-        if audited_failure:
+        if audited_failure and not recovered:
             # A failed quality gate is still an inspectable artifact. Keep its
             # ref and stop this run; do not turn it into a successful delivery.
             self._record_attempt_outputs(capability, state_name, attempt_id, result)
             return self._pause_action("Report audit failed; inspect report_audit.json before delivery or revision.")
-        if result.status not in accepted and not measured_failure and not self._empty_evidence_ingest(state_name, attempt_id, result):
+        if not accepted and not measured_failure and not self._empty_evidence_ingest(state_name, attempt_id, result):
             if capability == "implement" and self._schedule_implementation_refinement(state_name, attempt_id, result):
                 self._persist_application_views()
                 return True
-            detail = "; ".join(str(item) for item in result.diagnostics if str(item).strip())
-            self.controller.pause(f"{capability} returned {result.status!r}" + (f": {detail}" if detail else "."))
+            if recovered:
+                reason = f"Recovered {capability} as {result.status!r}: {'; '.join(result.diagnostics)}"
+            else:
+                detail = "; ".join(str(item) for item in result.diagnostics if str(item).strip())
+                reason = f"{capability} returned {result.status!r}" + (f": {detail}" if detail else ".")
+            self.controller.pause(reason)
             return False
         self._record_attempt_outputs(capability, state_name, attempt_id, result)
-        self._persist_application_views()
+        if recovered:
+            self.controller.save()
+        else:
+            self._persist_application_views()
         return True
 
     def _implementation_design_ref(self) -> ArtifactRef:
@@ -3752,30 +3735,15 @@ class ResearchApplication:
             updates["attempt_id"] = attempt_id
         if hasattr(request, "session_id"):
             updates["session_id"] = self.controller.manifest.session_id
-        client = getattr(request, "llm_client", None)
-        binder = getattr(client, "with_budget", None) if client is not None else None
-        if callable(binder):
-            bound_client = binder(
-                self.budget_ledger,
-                session_id=self.controller.manifest.session_id,
-                attempt_id=attempt_id,
-            )
-            updates["llm_client"] = bound_client
-            nested = getattr(request, "task_plan_request", None)
-            if nested is not None and hasattr(nested, "llm_client"):
-                updates["task_plan_request"] = replace(nested, llm_client=bound_client)
-        reviewer = getattr(request, "feasibility_llm_client", None)
-        reviewer_binder = getattr(reviewer, "with_budget", None) if reviewer is not None else None
-        if callable(reviewer_binder):
-            updates["feasibility_llm_client"] = reviewer_binder(
-                self.budget_ledger,
-                session_id=self.controller.manifest.session_id,
-                attempt_id=attempt_id,
-            )
+        updates.update(_bound_research_clients(request, self.budget_ledger,
+            self.controller.manifest.session_id, attempt_id=attempt_id))
+        nested = getattr(request, "task_plan_request", None)
+        if "llm_client" in updates and nested is not None and hasattr(nested, "llm_client"):
+            updates["task_plan_request"] = replace(nested, llm_client=updates["llm_client"])
         return replace(request, **updates) if updates else request
 
-    def _finish_available_work(self) -> None:
-        if self._next_action() is not None or self.controller.manifest.status in {"paused", "blocked", "completed"}:
+    def _finish_available_work(self, next_action: str | None) -> None:
+        if next_action is not None or self.controller.manifest.status in {"paused", "blocked", "completed"}:
             return
         decision_ref = self._ensure_research_decision()
         decision = self._state_payload("decision") if "decision" in self.controller.manifest.state_refs else {}
@@ -3813,7 +3781,7 @@ class ResearchApplication:
                 self.controller.complete("Requested research artifacts are ready.")
         self._persist_application_views()
 
-    def _persist_inputs(self, diagnostics: tuple[Diagnostic, ...]) -> None:
+    def _persist_inputs(self, diagnostics: tuple[Diagnostic, ...], *, publish: bool = True) -> None:
         revision, store = self.brief.revision, self.controller.store
         paths = write_intake_artifacts(self.brief, self.assets, store.root / "inputs", revision=revision)
         refs = {
@@ -3860,11 +3828,12 @@ class ResearchApplication:
         self.controller.manifest.state_refs.update(refs)
         self.controller.manifest.lifecycle_owner = "research_application"
         self.controller.manifest.status_reason = _diagnostic_text(d for d in diagnostics if d.severity != "error")
-        self._persist_application_views()
+        self._persist_application_views(publish=publish)
 
-    def _persist_application_views(self) -> None:
+    def _persist_application_views(self, *, publish: bool = True) -> None:
         """Persist one derived progress view after a state mutation."""
 
+        self._schedule_evidence_followup()
         execution = self._execution_config().get("execution")
         pairs = execution_pairs(execution, task_text=self.brief.request_text) if isinstance(execution, Mapping) else ()
         if pairs:
@@ -3909,7 +3878,7 @@ class ResearchApplication:
                         for i, row in enumerate(pairs)],
                 }, kind="experiment_set", schema="experiment_set.v1", producer="research_application",
             )
-        plan = self._build_work_plan()
+        plan = self._build_work_plan(self._next_action())
         store = self.controller.store
         refs = {
             "work_plan": store.write_json(
@@ -3924,7 +3893,8 @@ class ResearchApplication:
             ),
         }
         self.controller.manifest.state_refs.update(refs)
-        self.controller.save()
+        if publish:
+            self.controller.save()
 
     def latest_experiment_ref(self) -> ArtifactRef | None:
         """Read the last completed experiment named by the accepted plan."""
@@ -3938,7 +3908,7 @@ class ResearchApplication:
                     return ref
         return None
 
-    def _build_work_plan(self) -> dict[str, Any]:
+    def _build_work_plan(self, next_action: str | None) -> dict[str, Any]:
         refs = {
             name: ref.to_dict()
             for name, ref in self.controller.manifest.state_refs.items()
@@ -4010,7 +3980,6 @@ class ResearchApplication:
                 row["artifact"] = artifact.to_dict()
             deliverables.append(row)
 
-        next_action = self._next_action()
         step_rows = self._planned_step_rows(next_action)
         task_kind = self._task_kind()
         task = {
@@ -4147,8 +4116,7 @@ class ResearchApplication:
             brief, revision=self.brief.revision + 1,
             parent_revision=self.brief.revision,
         )
-        assets = normalize_assets(candidate, input_base_dir=brief_input_base(candidate, self.services.input_base_dir))
-        diagnostics = validate_brief(candidate, assets)
+        assets, diagnostics, _, _ = prepare_research_inputs(candidate, input_base_dir=self.services.input_base_dir)
         _raise_on_errors(diagnostics)
         return candidate, assets, diagnostics
 
@@ -4426,27 +4394,16 @@ class ResearchApplication:
                 "the saved evidence and report checkpoints are retained."
             )
         result = self.controller.reconcile_attempt(attempt.attempt_id)
-        measured_failure = attempt.capability in {"experiment", "analysis"} and result.status == "failed" and any(
-            ref.kind == _CAPABILITY_OUTPUTS[attempt.capability][1]
-            for ref in result.artifacts
-        )
-        if result.status not in {"completed", "partial"} and not measured_failure and not self._empty_evidence_ingest(
-                attempt.trigger.removeprefix("application:"), attempt.attempt_id, result):
-            if attempt.capability == "implement":
-                state_name = attempt.trigger.removeprefix("application:")
-                if self._schedule_implementation_refinement(state_name, attempt.attempt_id, result):
-                    self._persist_application_views()
-                    return
-            self.controller.pause(f"Recovered {attempt.capability} as {result.status!r}: {'; '.join(result.diagnostics)}")
+        capability = attempt.capability or ""
+        state = _CAPABILITY_OUTPUTS.get(capability)
+        if state is None:
+            if result.status not in {"completed", "partial"}:
+                self.controller.pause(f"Recovered {attempt.capability} as {result.status!r}: {'; '.join(result.diagnostics)}")
             return
-        state = _CAPABILITY_OUTPUTS.get(attempt.capability or "")
-        if state:
-            state_name = (
-                attempt.trigger.removeprefix("application:")
-                if attempt.trigger.startswith("application:") else state[0]
-            )
-            self._record_attempt_outputs(attempt.capability, state_name, attempt.attempt_id, result)
-            self.controller.save()
+        state_name = (attempt.trigger.removeprefix("application:")
+            if attempt.trigger.startswith("application:") else state[0])
+        self._adopt_attempt_outcome(capability, state_name, attempt.attempt_id, result,
+            allow_partial=True, recovered=True)
 
     def _interaction_mode(self) -> str | None:
         value = self.services.config.get("interaction")
@@ -4730,20 +4687,24 @@ class ResearchApplication:
             )
         return False
 
-    def _next_action(self) -> str | None:
+    def _interaction_allows_dispatch(self) -> bool:
         # A persisted interaction decision is a boundary before dispatch.
         decision = self._state_payload("decision") if "decision" in self.controller.manifest.state_refs else {}
         interaction = decision.get("interaction") if isinstance(decision, Mapping) else None
         if isinstance(interaction, Mapping):
             status, stage = interaction.get("status"), interaction.get("stage")
             if status == "pending" or (status == "rejected" and stage != "research_choice"):
-                return None
+                return False
         # Historical request_input decisions predate the formal reply entry.
         if isinstance(decision, Mapping) and decision.get("action") == "request_input" and not isinstance(interaction, Mapping):
+            return False
+        return True
+
+    def _next_action(self) -> str | None:
+        if not self._interaction_allows_dispatch():
             return None
         if "task_plan" not in self.controller.manifest.state_refs:
             return "plan"
-        self._schedule_evidence_followup()
         plan = self._load_task_plan()
         if self._needs_execution_plan_extension(plan):
             # The first accepted plan intentionally ends at the design
@@ -4768,8 +4729,9 @@ class ResearchApplication:
             )
             if not execution_checkpoint:
                 return "plan"
+        attempts_by_output = self.controller.attempts_by_output()
         for step in plan.steps:
-            if self._step_completed(step):
+            if self._step_completed(step, attempts_by_output=attempts_by_output):
                 continue
             if not self._step_condition_applies(step):
                 continue
@@ -4795,12 +4757,13 @@ class ResearchApplication:
     def _accepted_plan_steps(self) -> tuple[dict[str, Any], ...]:
         return tuple(step.to_dict() for step in self._load_task_plan().steps)
 
-    def _step_completed(self, step: Any) -> bool:
+    def _step_completed(self, step: Any, *,
+                        attempts_by_output: dict[str, AttemptManifest] | None = None) -> bool:
         state_name = step.state_name
         ref = self.controller.manifest.state_refs.get(state_name)
         if ref is None:
             return False
-        attempt = self._attempt_for_ref(ref)
+        attempt = self._attempt_for_ref(ref, attempts_by_output=attempts_by_output)
         if state_name == "documents_evidence_1" and attempt is not None and attempt.trigger == f"application:{state_name}":
             return attempt.capability == "document_ingest" and attempt.status in {"completed", "blocked"}
         completed = bool(
@@ -4936,24 +4899,7 @@ class ResearchApplication:
         return self._task_kind()
 
     def _task_kind(self) -> str:
-        configured = str(self._effective_config().get("research_task_kind") or "").strip().lower()
-        bug_intents = {"bug", "bug_fix", "bug_repair", "repair"}
-        if configured in bug_intents:
-            return "bug_fix"
-        if configured in {"measurement", "reproduction", "writing", "data_analysis"}:
-            return configured
-        if any(str(item).strip().lower() in bug_intents for item in self.brief.intents):
-            return "bug_fix"
-        if configured == "survey" or any(
-            str(item).strip().lower() == "survey" for item in self.brief.intents
-        ):
-            return "survey"
-        if configured in {"research", "experiment", "prepared_research"}:
-            return "research"
-        requested = {item.strip().lower() for item in self.brief.requested_outputs}
-        if not requested & _EXECUTION_OUTPUTS:
-            return "survey"
-        return "research"
+        return _research_task_kind(self.brief, self.services.config)
 
     def _planned_step_rows(self, next_action: str | None) -> list[dict[str, Any]]:
         if "task_plan" not in self.controller.manifest.state_refs:
@@ -4968,12 +4914,13 @@ class ResearchApplication:
             }]
         rows: list[dict[str, Any]] = []
         refs = self.controller.manifest.state_refs
+        attempts_by_output = self.controller.attempts_by_output()
         for step in self._load_task_plan().steps:
             row = step.to_dict()
-            if self._step_completed(step):
+            if self._step_completed(step, attempts_by_output=attempts_by_output):
                 row["status"] = "completed"
                 row["result_ref"] = refs[step.state_name].to_dict()
-                attempt = self._attempt_for_ref(refs[step.state_name])
+                attempt = attempts_by_output.get(refs[step.state_name].path)
                 if attempt is not None:
                     row["attempt_id"] = attempt.attempt_id
             elif not self._step_condition_applies(step):
@@ -4983,16 +4930,11 @@ class ResearchApplication:
             rows.append(row)
         return rows
 
-    def _attempt_for_ref(self, ref: ArtifactRef):
-        for attempt in reversed(self.controller.list_attempts()):
-            prefix = (Path("attempts") / attempt.attempt_id).as_posix() + "/"
-            if any(
-                output.path == ref.path
-                or ref.path == prefix + output.path.replace("\\", "/")
-                for output in attempt.outputs
-            ):
-                return attempt
-        return None
+    def _attempt_for_ref(self, ref: ArtifactRef, *,
+                         attempts_by_output: dict[str, AttemptManifest] | None = None) -> AttemptManifest | None:
+        if attempts_by_output is None:
+            attempts_by_output = self.controller.attempts_by_output()
+        return attempts_by_output.get(ref.path)
 
     def _input_refs(self, *names: str) -> tuple[ArtifactRef, ...]:
         try:
@@ -5606,12 +5548,48 @@ def _attempt_id_from_ref(ref: ArtifactRef) -> str:
         ) from exc
 
 
+def run_research_handoff(
+    app: ResearchApplication, *, action_context: Callable[[str], ContextManager] | None = None,
+    observe: Callable[[ResearchApplicationView], None] | None = None,
+) -> ResearchApplicationView:
+    """Advance a saved research contract and publish its current session view."""
+    view = app.advance(max_actions=app.controller.manifest.budget.max_attempts + 8,
+        action_context=action_context, observe=observe)
+    app.export_session()
+    return view
+
+
+def prepare_report_continuation(app: ResearchApplication, *, refresh: bool,
+                                settings: Mapping[str, object]) -> None:
+    """Select a report-only revision or resume the report already requested."""
+    overrides = app.report_config_overrides(settings, session_resume=False)
+    if refresh:
+        app.request_report(refresh=True, report_config=overrides,
+            reason='Explicitly regenerate the report from existing research evidence.')
+    elif overrides:
+        app.request_report(report_config=overrides,
+            reason='Apply explicit report settings and rebuild only report deliverables from existing evidence.')
+    elif not {'report', 'paper', 'full_paper'} & {item.strip().lower() for item in app.brief.requested_outputs}:
+        app.request_report()
+    else:
+        view = app.view()
+        if view.status in {'paused', 'blocked'} and view.next_action is not None:
+            app.continue_session(reason='Resume the canonical report lifecycle within the persisted session budget.')
+
+
 def create_session(brief: ResearchBrief, *, root: str | Path, services: ResearchApplicationServices | None = None) -> ResearchApplication:
     return ResearchApplication.create(brief, root=root, services=services)
 
 
 def load_session(root: str | Path, *, services: ResearchApplicationServices | None = None) -> ResearchApplication:
     return ResearchApplication.load(root, services=services)
+
+
+def saved_research_intent(root: str | Path) -> tuple[ResearchBrief, str]:
+    """Read defaults for historical CLI continuation before opening execution."""
+    controller = SessionController.load(root, registry=CapabilityRegistry())
+    brief = _read_saved_brief(controller)
+    return brief, _research_task_kind(brief, dict(_read_runtime_config(controller)['config']))
 
 
 def advance_session(root: str | Path, *, services: ResearchApplicationServices | None = None, max_actions: int = 1) -> ResearchApplicationView:
@@ -5681,21 +5659,53 @@ def _read_runtime_config(controller: SessionController) -> Mapping[str, Any]:
     return payload
 
 
+def _read_saved_brief(controller: SessionController) -> ResearchBrief:
+    try:
+        payload = controller.store.read_json(controller.manifest.state_refs['brief'])
+    except (KeyError, OSError, ValueError) as exc:
+        raise ResearchApplicationError(f"Application inputs are incomplete: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise ResearchApplicationError("Application inputs must be JSON objects.")
+    try:
+        return ResearchBrief.from_dict(payload)
+    except (TypeError, ValueError) as exc:
+        raise ResearchApplicationError(f"Could not restore application inputs: {exc}") from exc
+
+
+def _research_task_kind(brief: ResearchBrief, config: Mapping[str, object]) -> str:
+    configured = str(config.get('research_task_kind') or '').strip().lower()
+    intents = {str(item).strip().lower() for item in brief.intents}
+    bug_intents = {'bug', 'bug_fix', 'bug_repair', 'repair'}
+    if configured in bug_intents:
+        return 'bug_fix'
+    if configured in {'measurement', 'reproduction', 'writing', 'data_analysis'}:
+        return configured
+    if intents & bug_intents:
+        return 'bug_fix'
+    if configured == 'survey' or 'survey' in intents:
+        return 'survey'
+    requested = {item.strip().lower() for item in brief.requested_outputs}
+    if configured in {'research', 'experiment', 'prepared_research'} or requested & _EXECUTION_OUTPUTS:
+        return 'research'
+    return 'survey'
+
+
 def _bind_budget_services(
     services: ResearchApplicationServices,
     ledger: BudgetLedger,
     session_id: str,
 ) -> ResearchApplicationServices:
-    client = services.llm_client
-    binder = getattr(client, "with_budget", None) if client is not None else None
-    if callable(binder):
-        client = binder(ledger, session_id=session_id)
-        services = replace(services, llm_client=client)
-    reviewer = services.feasibility_llm_client
-    reviewer_binder = getattr(reviewer, "with_budget", None) if reviewer is not None else None
-    if callable(reviewer_binder):
-        services = replace(services, feasibility_llm_client=reviewer_binder(ledger, session_id=session_id))
-    return services
+    return replace(services, **_bound_research_clients(services, ledger, session_id))
+
+
+def _bound_research_clients(owner: Any, ledger: BudgetLedger, session_id: str,
+                            *, attempt_id: str | None = None) -> dict:
+    """Bind either research role through its existing client port."""
+    identity = {"session_id": session_id}
+    if attempt_id is not None:
+        identity["attempt_id"] = attempt_id
+    return {role: bind(ledger, **identity) for role in ("llm_client", "feasibility_llm_client")
+            if callable(bind := getattr(getattr(owner, role, None), "with_budget", None))}
 
 
 def _requested_outputs(brief: ResearchBrief) -> tuple[str, ...]:

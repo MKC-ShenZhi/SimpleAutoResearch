@@ -21,6 +21,9 @@ from simple_ar.research.contracts import (
 )
 from simple_ar.research.workflow_contracts import Diagnostic, ResearchAsset, ResearchBrief
 __all__ = [
+    "create_research_task",
+    "load_research_task",
+    "start_research_task",
     "ClaimCard",
     "CodeLink",
     "DatasetCard",
@@ -103,6 +106,9 @@ __all__ = [
 ]
 
 _LAZY_EXPORTS = {
+    "create_research_task": ("simple_ar.app.research_intake", "create_research_task"),
+    "load_research_task": ("simple_ar.app.research_intake", "load_research_task"),
+    "start_research_task": ("simple_ar.app.research_intake", "start_research_task"),
     "ResearchPlanRequest": (
         "simple_ar.research.planning.capability",
         "ResearchPlanRequest",

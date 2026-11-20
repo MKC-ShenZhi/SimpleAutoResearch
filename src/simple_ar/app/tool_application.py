@@ -6,7 +6,7 @@ stage selection for the migrated entry, rather than calling ResearchApplication.
 """
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
@@ -39,10 +39,10 @@ from simple_ar.tools.workspace import (WorkspaceToolGateway, workspace_tool_spec
     DeliveryRequest, FileWindow, validate_workspace_arguments, workspace_observation_view,
     resolve_source_mount)
 from simple_ar.tools.materials import (
-    authored_snapshot, read_material_window, journal_material_references, journal_read_windows, observe_text_window,
+    authored_snapshot, read_material_window, journal_material_references, journal_read_windows, journal_tool_calls, observe_text_window,
     current_text_window, admit_text_window, uncovered_text_ranges, observed_window_key,
 )
-from simple_ar.tools.sources import SourcePolicy, SourceToolGateway, source_tool_specs
+from simple_ar.tools.sources import SourcePolicy, SourceToolGateway
 from simple_ar.tools.visual import VisualToolGateway, visual_tool_specs
 from simple_ar.tools.images import ImageToolGateway, image_tool_specs
 from simple_ar.tools.publication import (PublicationToolGateway, publication_tool_specs, ExportRequest,
@@ -61,6 +61,7 @@ _DEFERRED_WORKSPACE_TOOLS = {'write_file', 'edit_file', 'run_process'}
 _COMPLETION_POLICIES = {'protected_decision.v1', 'closing_decision.v2'}
 _OPERATION_COMPLETION = 'available_operations.v1'
 _OPERATION_EXIT = 'available_operations.v2'
+_CALLER_ACTIONS_CONSUMED = 'Caller actions consumed; submit explicit next work or delivery. No model decision was requested.'
 _REPORT_PROTOCOL = 'canonical_report.v1'
 _OWNERS = 'owners.v1'
 _SHARED_OWNERS = 'owners.v2'
@@ -464,7 +465,7 @@ class ToolApplication:
             supplied = _runtime_bindings(services)
             if any(name not in declared or binding != declared[name] for name, binding in supplied.items()):
                 raise ValueError('Injected runtime dependency differs from the saved task; no silent replacement')
-        self.ledger = BudgetLedger.load(controller.store.root / "budget_ledger.json")
+        self.ledger = controller.load_budget()
         self._configure_tools()
         controller.registry.register("native_turn", self._model)
         controller.registry.register("native_tool", self._tool)
@@ -609,27 +610,32 @@ class ToolApplication:
         self.writing = None
         self.implementation, self.scientific = self.operations.implementation, self.operations.scientific
 
-    def _operation_observations(self, *, domain: str | None = None, verify: bool = True) -> list[dict]:
-        from simple_ar.tools.professional_outcomes import accepted_native_result
+    def _decision_record(self, path: str, views: dict | None) -> dict:
+        if views is None:
+            return self.session.store.read_json(path)
+        key = ('journal_record', path)
+        if key not in views:
+            views[key] = self.session.store.read_json(path)
+        return views[key]
+
+    def _operation_observations(self, *, domain: str | None = None, verify: bool = True,
+                                decision_views: dict | None = None) -> list[dict]:
+        from simple_ar.tools.professional_outcomes import verify_native_observations
         active = {name: {id(turn) for turn in self._evidence_turns(name)}
                   for name in ((domain,) if domain else ('sources', 'analysis', 'scientific', 'implementation'))}
-        result = []
+        result, accepted = [], []
         for turn in self.state['turns']:
-            calls = {call['id']: call for call in
-                     self.session.store.read_json(turn['reply']).get('tool_calls', [])}
-            for item in turn['tools']:
-                call = calls[item['id']]
+            reply = self._decision_record(turn['reply'], decision_views) if turn['tools'] else None
+            for item, call in journal_tool_calls(self.session.store, turn, reply=reply):
                 spec = self.gateway.registry.get(call['function']['name'])
                 if domain is not None and (spec is None or spec.domain != domain):
                     continue
-                observed = self.session.store.read_json(item['result'])
+                observed = self._decision_record(item['result'], decision_views)
                 if verify and observed.get('status') == 'ok':
                     # Prove the original producer before projecting its record.
                     # A separate review can reject delivery without changing
                     # production identity or silently settling its charges.
-                    accepted_native_result(self.session.store.root,self.session.manifest.session_id,
-                        observed,Path(item['result']).parent.name,
-                        ledger=None if self.operations is not None and self.operations.professional else self.ledger)
+                    accepted.append((Path(item['result']).parent.name, observed))
                 observation = self._operation_observation(observed, call, item['result'],
                     current_request=turn.get('request_count', 1) == len(self.state['requests']),
                     request_count=turn.get('request_count', 1),
@@ -645,6 +651,9 @@ class ToolApplication:
                         observation['contract_current'] = self.scientific.unchanged_condition_observation(
                             observation['arguments'].get('condition_id'), configs)
                 result.append(observation)
+        if accepted:
+            verify_native_observations(self.session.store.root, self.session.manifest.session_id, accepted,
+                ledger=None if self.operations is not None and self.operations.professional else self.ledger)
         return result
 
     @staticmethod
@@ -698,6 +707,7 @@ class ToolApplication:
         self.operations = None
         if config.get('control_protocol') is not None:
             self._configure_operations()
+            self.gateway.saved_complete_work = config.get('professional_work') in _PROFESSIONAL_WORK
             return
         from simple_ar.tools.writing import WritingToolGateway, writing_tool_specs
         from simple_ar.tools.materials import verify_source_snapshots
@@ -719,28 +729,12 @@ class ToolApplication:
             _CreationDeclarations.model_validate(config['creation_declarations']).freeze(config['sources'])
         if config.get('professional_work') not in {None, *_PROFESSIONAL_WORK}:
             raise ValueError('Unknown saved professional work contract')
-        evidence = controller.store.root / "evidence"
-        evidence.mkdir(exist_ok=True)
-        self.workspace = WorkspaceToolGateway(controller.store.root,
-            {**{name: Path(path) for name, path in config["sources"].items()},
-             "evidence": evidence,
-             "records": controller.store.root / "attempts"}, self.ledger,
-            project_python=Path(config['project_python']) if config.get('project_python') else None,
-            record_artifacts=self._record_artifacts,
-            process_artifact_paths=config.get('process_artifact_paths'),
-            candidate_review_protocol=config.get('candidate_review_protocol'),
-            sandbox_execution=config.get('sandbox_execution', False))
+        self.workspace = WorkspaceToolGateway.for_task(controller.store.root, config, self.ledger,
+            record_artifacts=self._record_artifacts)
         registry = ToolRegistry()
         registry.register_package(workspace_tool_specs(sandbox_execution=config.get('sandbox_execution', False)), self.workspace,
             request_visible={'ask_user', 'deliver_result', 'read_file', 'list_directory'})
-        if config.get('extension_host_protocol') not in {None, 'nested_calls.v1'}:
-            raise ValueError('Unknown saved extension host-call protocol')
-        self.extensions = [LocalExtension(item, self._extension_host_call,
-            host_protocol=config.get('extension_host_protocol'))
-            for item in config.get('extensions', [])]
-        for extension in self.extensions:
-            extension.verify()
-            registry.register_package(extension.specs(), extension, request_visible=True)
+        self.extensions = LocalExtension.register_task_packages(config, registry, self._extension_host_call)
         coordination = [CommonToolSpec(name='read_history', domain='coordination',
             permission_level='read_only', risk_level='low', input_schema=_ReadHistory.model_json_schema(),
             description='Read a bounded byte window of closed accepted turn observation indexes, including archived history and inline cancellation receipts. Turn indexes are zero-based, not attempt numbers. Continue with the returned end_turn pinned and next_offset_bytes while has_more_bytes; otherwise next_turn starts the next range. Original replies and attempt results remain readable at their record locators. Historical identities and statuses are not current file contents, authorization, verified success or resolved failures. No model call or new state.')]
@@ -756,11 +750,6 @@ class ToolApplication:
                 permission_level='plan', risk_level='low', input_schema=_ToolSelection.model_json_schema(),
                 description='Choose exact named tool contracts from available_specialists for upcoming model decisions. Replaces the previous optional selection; default contracts remain. No model/network call, execution, new permission or task pipeline. Choices are retained through normal action receipts and resume. This operation does not perform the selected work.'))
         registry.register_package(coordination, self, request_visible=True)
-        permissions = {"read_only", "plan", "write_patch"}
-        if config["allow_execution"]:
-            permissions.add("execution")
-        if config.get("allow_network", False) or config.get("allow_vision", False) or config.get("max_images", 0) > 0:
-            permissions.add("network")
         self.writing = WritingToolGateway(controller.store.root, self.workspace, self.ledger,
             config['model'], controller.manifest.session_id,
             client_factory=lambda identity: self._client(identity, purpose='writing', native=False),
@@ -813,12 +802,8 @@ class ToolApplication:
                 research_contract=lambda: self.sources.accepted_execution_contract(),
                 research_requirements=lambda: self.sources.execution_issues())
         self.scientific = scientific.get('scientific')
-        self.sources = SourceToolGateway(controller.store.root, self.workspace, self.ledger,
-            policy=config.get('research_policy'),
-            authority_revision=config.get('authority_revision', 0),
-            execution_contract=config.get('execution_contract'),
-            client_factory=(lambda identity: self._client(identity, purpose='task', native=False))
-                if config['model'] is not None else None,
+        self.sources = SourceToolGateway.for_task(controller.store.root, self.workspace, config,
+            client_factory=lambda identity: self._client(identity, purpose='task', native=False),
             feasibility_client_factory=self._feasibility_client,
             registry=_source_registry(self.services, config))
         publication_contract = config.get('publication_preparation')
@@ -836,13 +821,14 @@ class ToolApplication:
             candidate_source=self.writing.preparation_source,
             owned_execution=publication_contract == 'bound_candidate.v1',
             report_source=report_source if config.get('report_protocol') == _REPORT_PROTOCOL else None)
+        self.writing.check_publication_delivery = self.publication.check_report_delivery
         if publication_contract == 'bound_candidate.v1':
             self.writing.publication_inspection = 'prepared_document.v1'
             self.writing.prepared_publication = lambda ref: self.publication.inspection_source(
                 ref, session_id=controller.manifest.session_id)
         # Contracts and owners enter together; discovery and dispatch consume
         # this same registration, including explicitly selected local packages.
-        registry.register_package(source_tool_specs(), self.sources, request_visible=True)
+        registry.register_package(self.sources.tool_specs(), self.sources, request_visible=True)
         registry.register_package(publication_tool_specs(sandbox_execution=config.get('sandbox_execution', False)),
             self.publication, request_visible=True)
         registry.register_package(writing_tool_specs(), self.writing, request_visible=True)
@@ -863,17 +849,6 @@ class ToolApplication:
         if config.get('max_images', 0) > 0:
             registry.register_package(image_tool_specs(), ImageToolGateway(self.workspace, self.ledger,
                 fallback_models_config=config.get('model_catalogs', {}).get('image')), request_visible=True)
-        blocked = set() if config.get('allow_network', False) else {
-            spec.name for spec in registry.list_specs()
-            if spec.domain == 'sources' and spec.permission_level == 'network'}
-        if config.get('code_task') is not None:
-            # An exact contract owns candidate mutations and its validator.
-            # Generic workspace writes/processes cannot bypass that authority.
-            blocked.update(spec.name for spec in registry.list_specs()
-                if spec.domain == 'workspace' and spec.permission_level in {'write_patch', 'execution'})
-            if not config.get('scientific_lineage', False):
-                blocked.update(spec.name for spec in registry.list_specs()
-                    if spec.domain == 'scientific' and spec.permission_level == 'execution')
         if config.get('report_protocol') != _REPORT_PROTOCOL:
             # Disabled protocol fields must not consume historical context in
             # every nested delivery schema (or change the old planning shape).
@@ -891,8 +866,8 @@ class ToolApplication:
                     schema['properties']['steps']['minItems'] = 1
                     schema['required'] = ['steps']
         self.gateway = CommonToolGateway(controller.store.root, registry=registry,
-            policy=ToolPermissionPolicy(allowed_permissions=permissions, max_risk_level="high",
-                blocked_tools=blocked))
+            policy=ToolPermissionPolicy.for_task(config, registry.list_specs()),
+            saved_complete_work=config.get('professional_work') in _PROFESSIONAL_WORK)
 
     def _tool_selection(self) -> set[str]:
         """Project the last accepted selection, not a second mutable tool state."""
@@ -1161,14 +1136,14 @@ class ToolApplication:
                 error='Local extension services permit only host workspace read/plan operations')
         return self.gateway.call(ToolCall(tool_name=name, arguments=arguments, trace_id=identity))
 
-    def _work_focus(self) -> dict[str, Any]:
+    def _work_focus(self, *, decision_views: dict | None = None) -> dict[str, Any]:
         """Project the latest closed decision; no second mutable work state."""
         selected = None
         boundary = {}
         for index in range(len(self.state['turns']) - 1, -1, -1):
             turn = self.state['turns'][index]
             for observed in reversed(turn['tools']):
-                result = self.session.store.read_json(observed['result'])
+                result = self._decision_record(observed['result'], decision_views)
                 if result.get('tool_name') == 'focus_work' and result.get('status') == 'ok':
                     data = result['data']
                     if 'native_history_start_turn' in data:
@@ -1190,12 +1165,12 @@ class ToolApplication:
         # A same-connection focus must not reopen an older provider session.
         return {**(selected or {'purpose': 'task', 'goal': ''}), **boundary}
 
-    def _coordinator_purpose(self) -> str:
+    def _coordinator_purpose(self, *, decision_views: dict | None = None) -> str:
         """Native decisions/retries stay on task; explicit domain clients keep their routes."""
         if self.operations is not None and self.operations.methods is not None:
             return self.operations.methods.purpose()
         return ('task' if self.state['config'].get('professional_work') in _OWNER_MODES
-            else self._work_focus()['purpose'])
+            else self._work_focus(decision_views=decision_views)['purpose'])
 
     def _validate_professional_route(self, purpose: str) -> None:
         """A work scope cannot silently switch protocol or context contract."""
@@ -1216,11 +1191,11 @@ class ToolApplication:
                     return index + 1
         return 0
 
-    def _work_plan(self) -> dict[str, Any] | None:
+    def _work_plan(self, *, decision_views: dict | None = None) -> dict[str, Any] | None:
         """One view of closed tool receipts; never another mutable plan store."""
         for turn in reversed(self.state['turns']):
             for item in reversed(turn['tools']):
-                result = self.session.store.read_json(item['result'])
+                result = self._decision_record(item['result'], decision_views)
                 if (result.get('tool_name') == 'update_work_plan' and result.get('status') == 'ok'
                         and result['data'].get('request_count') == len(self.state['requests'])):
                     return {**result['data'],
@@ -1244,7 +1219,8 @@ class ToolApplication:
         return {'records/'+item['result'].removeprefix('attempts/'):
                 self._recorded_arguments(calls[item['id']]) for item in turn['tools']}
 
-    def _working_memory(self, *, observations: list[dict] | None = None) -> dict:
+    def _working_memory(self, *, observations: list[dict] | None = None,
+                        decision_views: dict | None = None) -> dict:
         """Working understanding from the original journal, including prior feedback.
 
         This is model-authored working understanding, never another fact store.
@@ -1285,7 +1261,7 @@ class ToolApplication:
                 for path in notes.get(attempt.attempt_id, []):
                     if self.state['config'].get('work_method') == GOAL_WORK_METHOD:
                         continue  # Manual agendas remain history; only knowledge checkpoints supply notes.
-                    result = self.session.store.read_json(path)
+                    result = self._decision_record(path, decision_views)
                     data = result.get('data') or {}
                     if (result.get('tool_name') == 'update_work_plan' and result.get('status') == 'ok'
                             and isinstance(data.get('notes'), list)):
@@ -1308,7 +1284,7 @@ class ToolApplication:
                     view=store.read_json('memory_input.json'),operations_for_turn=self._memory_operations)
                 memory = {'notes':checkpoint['notes'],'through_turn':coverage}
             for item in turn['tools']:
-                result = self.session.store.read_json(item['result'])
+                result = self._decision_record(item['result'], decision_views)
                 data = result.get('data') or {}
                 if (result.get('tool_name') == 'update_work_plan' and result.get('status') == 'ok'
                         and isinstance(data.get('notes'), list)):
@@ -1466,7 +1442,7 @@ class ToolApplication:
                if journal else {}))
         return refs
 
-    def _report_projection(self) -> dict[str, Any]:
+    def _report_projection(self, *, decision_views: dict | None = None) -> dict[str, Any]:
         from simple_ar.report.legacy_contract import project_report
         # A new report supersedes an earlier conversion or no-report choice;
         # a compatible earlier report still carries its requested formats.
@@ -1476,7 +1452,7 @@ class ToolApplication:
         def observations():
             for turn in reversed(self.state['turns']):
                 for item in reversed(turn['tools']):
-                    row = self.session.store.read_json(item['result'])
+                    row = self._decision_record(item['result'], decision_views)
                     intent = (row.get('data') or {}).get('report_intent')
                     if (turn.get('request_count', 1) < start and row.get('tool_name') == 'update_work_plan'
                             and row.get('status') == 'ok' and intent
@@ -1535,7 +1511,7 @@ class ToolApplication:
                 continue
             request = {'path': row['path'], 'offset_bytes': row['offset_bytes'],
                 'max_bytes': row['next_offset_bytes'] - row['offset_bytes'], 'full_digest': True}
-            data = {'text': row['text'], 'sha256': row['sha256'], 'size_bytes': row['size_bytes'],
+            data = {'text': row['text'], 'path': row['path'], 'sha256': row['sha256'], 'size_bytes': row['size_bytes'],
                 'next_offset_bytes': row['next_offset_bytes'],
                 'has_more': row['next_offset_bytes'] < row['size_bytes'], 'absolute_path': row['absolute_path']}
             references.append({'request': request, 'data': data, 'source_reference': row['source']})
@@ -1544,7 +1520,8 @@ class ToolApplication:
         return ([{**row, 'copy_lineage_required': True} for row in references]
             if self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES else references)
 
-    def _work_feedback(self, targets: list[str], *, observations: list[dict] | None = None) -> dict[str, Any]:
+    def _work_feedback(self, targets: list[str], *, observations: list[dict] | None = None,
+                       decision_views: dict | None = None) -> dict[str, Any]:
         """Find related original feedback for the requesting work owner.
 
         Only accepted checks with an intact owner/input binding are eligible.
@@ -1552,9 +1529,10 @@ class ToolApplication:
         """
         inspection = self.operations.inspection if self.operations is not None else None
         with inspection.presentation_scope() if inspection is not None else nullcontext():
-            return self._collect_work_feedback(targets, observations=observations)
+            return self._collect_work_feedback(targets, observations=observations, decision_views=decision_views)
 
-    def _collect_work_feedback(self, targets: list[str], *, observations: list[dict] | None = None) -> dict[str, Any]:
+    def _collect_work_feedback(self, targets: list[str], *, observations: list[dict] | None = None,
+                               decision_views: dict | None = None) -> dict[str, Any]:
         # The operations contract never exposed the historical document-review
         # tool. Avoid rereading its whole journal when neither historical
         # document reviews nor vision reviews can exist in this saved task.
@@ -1567,7 +1545,8 @@ class ToolApplication:
         context = {'review_observations': related_feedback(
             self.workspace, self.session.store, self.session.manifest.session_id,
             self.state['turns'], targets, owners,
-            copy_lineage=self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES)
+            copy_lineage=self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES,
+            read_record=lambda path: self._decision_record(path, decision_views))
             if owners else []}
         findings = self.gateway.professional_inputs(targets, observations=observations)
         if findings:
@@ -1582,10 +1561,10 @@ class ToolApplication:
             from simple_ar.tools.materials import retained_delivery_targets
             retained, _ = retained_delivery_targets(self.workspace, prior)
             targets = list(dict.fromkeys([*targets, *retained]))
-        observations = (self._operation_observations()
+        decision_views = {}
+        observations = (self._operation_observations(decision_views=decision_views)
                         if self.operations is not None and self.operations.professional else None)
-        feedback = (self._work_feedback(targets, observations=observations)
-                    if observations is not None else self._work_feedback(targets))
+        feedback = self._work_feedback(targets, observations=observations, decision_views=decision_views)
         requests = (self._professional_user_requests()
             if self.state['config'].get('delivery_review_selection') == 'model.v3' else list(self.state['requests']))
         context = {'user_requests': requests, 'review_observations': feedback['review_observations'],
@@ -1595,7 +1574,8 @@ class ToolApplication:
         if self.state['config'].get('input_contract') == _DECLARED_INPUTS:
             context['creation_declarations'] = self.state['config']['creation_declarations']
         if self.operations is not None and self.operations.professional:
-            context['working_notes'] = self._working_memory(observations=observations)['notes']
+            context['working_notes'] = self._working_memory(observations=observations,
+                decision_views=decision_views)['notes']
             if prior is not None:
                 context['retained_prior_delivery'] = prior
         inherited = self._retained_working_inputs(targets)
@@ -1620,10 +1600,7 @@ class ToolApplication:
                 call_record = str(self.workspace.resolve(str(self.session.store.root / turn['reply'])))
             except ValueError:
                 continue  # Some caller submissions are outside the existing records grant.
-            reply = self.session.store.read_json(turn['reply'])
-            calls = {call['id']: call for call in reply.get('tool_calls', [])}
-            for item in turn['tools']:
-                call = calls[item['id']]
+            for item, call in journal_tool_calls(self.session.store, turn):
                 spec = self.gateway.registry.get(call['function']['name'])
                 if spec is None or spec.permission_level != 'write_patch':
                     continue
@@ -1646,10 +1623,7 @@ class ToolApplication:
         latest = failure = None
         history = []
         for turn in reversed(self._evidence_turns('implementation')):
-            reply = self.session.store.read_json(turn['reply'])
-            calls = {call['id']: call for call in reply.get('tool_calls', [])}
-            for item in reversed(turn['tools']):
-                call = calls[item['id']]
+            for item, call in journal_tool_calls(self.session.store, turn, newest_first=True):
                 spec = self.gateway.registry.get(call['function']['name'])
                 if spec is None or spec.permission_level != 'execution':
                     continue
@@ -1693,13 +1667,11 @@ class ToolApplication:
                     raise ValueError('Pinned history end is outside this closed bounded range')
                 turns = []
                 for turn in self.state['turns'][page.start_turn:end]:
-                    reply = self.session.store.read_json(turn['reply'])
-                    calls = {call['id']: call for call in reply.get('tool_calls', [])}
                     turns.append({'reply': 'records/' + turn['reply'].removeprefix('attempts/'),
                         'request_count': turn.get('request_count', 1),
-                        'observations': [self._history_observation(calls[item['id']],
+                        'observations': [self._history_observation(call,
                             self.session.store.read_json(item['result']), item['result'])
-                            for item in turn['tools']]})
+                            for item, call in journal_tool_calls(self.session.store, turn)]})
                 raw = json.dumps(self._history_view(turns), ensure_ascii=False).encode('utf-8')
                 if page.offset_bytes > len(raw):
                     raise ValueError('History byte offset is beyond this range')
@@ -1809,7 +1781,7 @@ class ToolApplication:
                tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
                completion_policy: str | None = None, control_protocol: str | None = None,
                delivery_files: list[str] | None = None,
-               independent_review_required: bool = False,
+               independent_review_required: bool | None = None,
                model_catalogs: dict[str, str | None] | None = None,
                extensions: list[Path] | None = None,
                creation_declarations: dict[str, Any] | None = None,
@@ -1817,7 +1789,13 @@ class ToolApplication:
         """Validate caller contracts before creation or supply; never execute or persist."""
         if control_protocol not in {None, 'operations.v1'}:
             raise ValueError('Unsupported operation control protocol')
-        if type(independent_review_required) is not bool:
+        if independent_review_required is None:
+            # A free-text request may require review even if the producing model
+            # overlooks that requirement. The independent owner decides how much
+            # investigation is needed. Only the caller can make it optional.
+            independent_review_required = (model is not None and control_protocol == 'operations.v1'
+                and not retained)
+        elif type(independent_review_required) is not bool:
             raise ValueError('independent_review_required must be a boolean')
         if independent_review_required and (model is None or control_protocol != 'operations.v1'):
             raise ValueError('A required independent review needs a model and the common operation delivery owner')
@@ -2089,7 +2067,14 @@ class ToolApplication:
             origin['prior_drafts'] = [alias + '/' + path for path in selected['groups'].get('report', [])]
         if max_output_tokens is not None:
             config['max_output_tokens'] = max_output_tokens
-        limits = {"llm_requests": max_turns, "total_tokens": max_tokens,
+        return config, reused_inputs, ToolApplication.creation_limits(max_turns, max_tokens, max_images,
+            process_limits=process_limits, source_operations=source_operations), attempt_limit
+
+    @staticmethod
+    def creation_limits(max_turns: int | None, max_tokens: int | None, max_images: int, *,
+                        process_limits: dict | None = None, source_operations: int | None = None) -> dict:
+        """Resolve the resource defaults for a new task's physical ledger."""
+        return {"llm_requests": max_turns, "total_tokens": max_tokens,
             # One model turn can contain multiple bounded tool operations.
             # Search backends share process receipts, but must not consume a
             # one-process-per-model-turn allowance before validation starts.
@@ -2098,7 +2083,6 @@ class ToolApplication:
             "source_operations": source_operations if source_operations is not None else
                 max_turns * 3 if max_turns is not None else None,
             "image_requests": max_images, **(process_limits or {})}
-        return config, reused_inputs, limits, attempt_limit
 
     @classmethod
     def preview_creation(cls, root: Path, goal: str, **options: Any) -> tuple[dict[str, Any], list, dict[str, Any], int]:
@@ -2204,13 +2188,15 @@ class ToolApplication:
                extensions: list[Path] | None = None,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
                delivery_files: list[str] | None = None,
-               independent_review_required: bool = False,
+               independent_review_required: bool | None = None,
                tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
                completion_policy: str | None = None, professional_inputs: bool = False,
                investigate_results: bool = True,
+               preparation_ledger: dict[str, Any] | None = None,
                control_protocol: Literal['operations.v1'] = 'operations.v1',
                creation_declarations: dict[str, Any] | None = None,
                verify_creation: Callable[[tuple[dict[str, Any], list, dict[str, Any], int]], None] | None = None,
+               initialize_session: Callable[[SessionController], None] | None = None,
                context_protocol: Literal['auto', 'conversation.v1', 'working.v1', 'working.v2', 'working.v3', 'working.v4'] | None = 'auto') -> ToolApplication:
         """Create work on the operation-composed loop.
 
@@ -2233,20 +2219,26 @@ class ToolApplication:
         if verify_creation is not None:
             verify_creation(deepcopy(prepared))
         config, reused, limits, attempts = prepared
-        session = SessionController.create(root, session_id=root.name, topic=goal,
-            registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6))
-        session.manifest.transition_recipe = cls.RECIPE
+        ledger = (BudgetLedger.from_dict({**preparation_ledger, 'limits': {**preparation_ledger['limits'], **limits}})
+                  if preparation_ledger is not None else BudgetLedger(limits))
         from simple_ar.core.artifacts import write_atomically
-        for relative, content in reused:
-            write_atomically(session.store.resolve(relative), content)
-        session.store.write_json('actions.json', {'config': config, 'requests': [goal], 'turns': [], 'pending': None})
-        BudgetLedger(limits, storage_path=root / 'budget_ledger.json').save()
-        session.manifest.state_refs["actions"] = session.store.ref("actions.json", kind="native_actions")
-        session.manifest.budget_ledger_ref = session.store.ref("budget_ledger.json", kind="budget_ledger")
-        session.save()
-        app = cls(session, services=services)
-        app.state['config']['tool_completions'] = app.gateway.registry.completions()
-        app._save()
+        app: ToolApplication
+
+        def initialize(session: SessionController) -> None:
+            nonlocal app
+            for relative, content in reused:
+                write_atomically(session.store.resolve(relative), content)
+            session.manifest.state_refs['actions'] = session.store.write_json('actions.json',
+                {'config': config, 'requests': [goal], 'turns': [], 'pending': None}, kind='native_actions')
+            if initialize_session is not None:
+                initialize_session(session)
+            app = cls(session, services=services)
+            app.state['config']['tool_completions'] = app.gateway.registry.completions()
+            session.store.write_json('actions.json', app.state)
+
+        SessionController.create(root, session_id=root.name, topic=goal,
+            registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6),
+            transition_recipe=cls.RECIPE, budget_ledger=ledger, initialize=initialize)
         return app
 
     @classmethod
@@ -2955,48 +2947,24 @@ class ToolApplication:
             and (grant.get('additional_attempts') or grant.get('additional_no_progress')))
         return sorted(committed)
 
-    def _professional_stop_can_resume(self, retained: dict) -> bool:
+    def _resume_professional_stop(self, retained: dict) -> tuple[str, dict, Any, dict | None] | None:
         known = retained.get('resource_authorizations')
         stop = retained.get('owner_stop') or {}
-        if (self.state['config'].get('professional_work') == _REQUEST_OWNER
-                and stop.get('reason') in {'work_gap', 'owner_failed'}):
-            # A checked negative outcome may return to its request owner without
-            # buying more work, even when an older caller recorded owner_failed.
-            # This does not rewrite that stop or replay its physical operation.
-            # Prove the retained receipt before consulting its
-            # domain owner; this grants no retry, adoption or extra resources.
-            source = retained['source_result']
-            self._check_professional_stop(source, stop)
-            observed = self.session.store.read_json(source)
-            owner = self.gateway.domain_owner(observed.get('tool_name', ''))
-            gap = getattr(owner, 'can_return_gap', None)
-            if gap is not None and gap(observed, Path(source).parent.name):
-                return True
-            # A domain may prove a distinct, never-dispatched operation from
-            # completed work. Its proposal still goes through the same journal,
-            # permissions and budget; a saved failure is never replayed here.
-            continuation = getattr(owner, 'continuation', None)
-            action = continuation(observed, Path(source).parent.name) if continuation is not None else None
-            if isinstance(action, dict) and action.get('tool_name') and 'stop' not in action:
-                return True
-        if (not isinstance(known, list)
-                or not set(self._professional_resource_authorizations()).difference(known)):
-            return False
-        if stop.get('reason') == 'shared_budget_exhausted':
-            return True
-        if stop.get('reason') != 'work_gap':
-            return False
-        # Older owners could retain complete authored work as a generic gap
-        # when its final check had not completed. Only its original owner may
-        # prove a check-only continuation after an explicit new resource grant;
-        # neither a grant nor a coordinator label turns a negative review into
-        # permission to repeat editing or replay a failed provider operation.
+        reason = stop.get('reason')
+        returns_to_request = (self.state['config'].get('professional_work') == _REQUEST_OWNER
+            and reason in {'work_gap', 'owner_failed'})
+        grant_added = (reason in {'work_gap', 'shared_budget_exhausted'} and isinstance(known, list)
+            and bool(set(self._professional_resource_authorizations()).difference(known)))
+        if not returns_to_request and not grant_added:
+            return None
+
         source = retained['source_result']
         self._check_professional_stop(source, stop)
         observed = self.session.store.read_json(source)
-        owner = self.gateway.domain_owner(observed.get('tool_name', ''))
-        eligible = getattr(owner, 'can_resume_after_budget', None)
-        return bool(eligible and eligible(observed, Path(source).parent.name))
+        resolved = self.gateway.resume_professional_action(observed, source, reason=reason,
+            grant_added=grant_added, return_gap=returns_to_request,
+            consume_outcome=self.state['config'].get('professional_work') in _OUTCOME_WORK)
+        return (source, observed, *resolved) if resolved is not None else None
 
     def _check_professional_stop(self, source: str, stop: dict) -> None:
         """A semantic handoff and a pause require the same source proof."""
@@ -3027,7 +2995,7 @@ class ToolApplication:
         self.session.pause('Professional owner stopped: ' + stop['reason'] + ': ' + stop['detail'])
         self._save()
 
-    def _continue_professional_work(self) -> bool:
+    def _continue_professional_work(self, resumed: tuple[str, tuple] | None = None) -> bool:
         """Journal an owner's next local operation through the same action loop.
 
         Only the final completed observation in the current request may continue.
@@ -3035,34 +3003,36 @@ class ToolApplication:
         the ordinary dispatcher. The saved reply identifies the producing receipt,
         rather than pretending another model made a decision.
         """
-        legacy_continuation = self.state['config'].get('professional_work') in _PROFESSIONAL_WORK
-        if not legacy_continuation and not self.gateway.local_continuation():
+        if not self.gateway.local_continuation():
             return False
         turns = self.state['turns']
         if (self.state['pending'] is not None or not turns or turns[-1]['remaining']
                 or turns[-1].get('request_count', 1) != len(self.state['requests'])):
             return False
-        source, resumed_stop = None, False
+        prepared = None
         if turns[-1].get('origin') == 'professional':
             retained = self.session.store.read_json(turns[-1]['reply'])
             if stop := retained.get('owner_stop'):
-                if not self._professional_stop_can_resume(retained):
+                prepared = (resumed[1] if resumed is not None and resumed[0] == turns[-1]['reply']
+                            else self._resume_professional_stop(retained))
+                if prepared is None:
                     self.session.pause('Professional owner stopped: ' + stop['reason'] + ': ' + stop['detail'])
                     self._save()
                     return True
-                source, resumed_stop = retained['source_result'], True
-                self._check_professional_stop(source, stop)
-        if source is None and not turns[-1]['tools']:
-            return False
-        source = source or turns[-1]['tools'][-1]['result']
-        observed = self.session.store.read_json(source)
-        if not legacy_continuation and not self.gateway.local_continuation(observed.get('tool_name', '')):
-            return False
-        owner, action = self.gateway.professional_action(observed, source, resume=resumed_stop,
-            consume_outcome=self.state['config'].get('professional_work') in _OUTCOME_WORK)
+        if prepared is not None:
+            source, observed, owner, action = prepared
+        else:
+            if not turns[-1]['tools']:
+                return False
+            source = turns[-1]['tools'][-1]['result']
+            observed = self.session.store.read_json(source)
+            if not self.gateway.local_continuation(observed.get('tool_name', '')):
+                return False
+            owner, action = self.gateway.professional_action(observed, source, resume=False,
+                consume_outcome=self.state['config'].get('professional_work') in _OUTCOME_WORK)
         if owner is None:
             return False
-        if action is None and resumed_stop:
+        if action is None and prepared is not None:
             action = stop_decision(owner, observed, Path(source).parent.name, 'owner_state_unresolved',
                 'New resource authorization cannot establish a safe continuation from the original source')
         if action is None:
@@ -3140,7 +3110,8 @@ class ToolApplication:
                     'their minimum resource estimates do not guarantee completion. Preserve capacity '
                     'for a truthful exit. Deliver useful existing work with actual unfinished requirements '
                     'in unresolved when checking, publication or repair cannot finish. If no honest '
-                    'delivery is ready, useful final actions can leave their results for continuation. A candidate review '
+                    'delivery is ready, prefer an action that directly creates or validates requested work '
+                    'without another decision. Preserve genuine gaps for continuation. A candidate review '
                     'is independent evidence, not formal delivery. Final acceptance remains unchanged.')
                 if (selection := getattr(self.operations, 'selection', None)) is not None and selection.policy == 'outcomes.v1':
                     exit_text = selection.closing_system
@@ -3203,17 +3174,34 @@ class ToolApplication:
             return decision
         resources = lifecycle['minimum_resources']
         requests = resources.get('llm_requests', 0)
-        # Owner request minima plus the actually measured exit projection are
-        # planning estimates, not reservations or a guarantee of review completion.
+        # A review uses its own selected evidence, tools and output allowance.
+        # Its next request slot is known before that evidence is assembled;
+        # the producer's input size is not a cost estimate for the reviewer.
         return {**resources, 'llm_requests': decision['llm_requests'] + requests,
-            'total_tokens': decision['total_tokens'] + resources.get('total_tokens',
-                requests * decision['total_tokens'])}
+            'total_tokens': decision['total_tokens'] + resources.get('total_tokens', 0)}
 
-    def _review_floor(self, client: Any, *, candidate: bool) -> dict:
-        if (not candidate and self.state['turns'] and self._terminal_batch()
-                and self.state['turns'][-1].get('origin') == 'caller'):
-            return {}
-        return self._completion_floor(client, dispatch=True)
+    @contextmanager
+    def _review_capacity(self, client: Any, *, candidate: bool, partial: bool = False):
+        terminal = self._terminal_batch()
+        floor = {} if terminal and not candidate else self._completion_floor(client, dispatch=True)
+        # A standalone check of work proposed as complete still needs a
+        # coordinator decision. An explicitly unfinished candidate can leave
+        # an opinion as its partial result. Token forecasts can yield to evidence.
+        after_review = False
+        if (self.state['config'].get('work_lifecycle') == 'integrated.v3'
+                and self.state['turns'] and self.state['turns'][-1].get('origin') != 'caller'):
+            if not candidate and terminal:
+                # A direct submission can use the last call for its opinion.
+                # With spare capacity, preserve recovery if that opinion
+                # cannot authorize the submitted delivery.
+                available = self.ledger.remaining('llm_requests')
+                after_review = available is not None and available > 1
+            else:
+                after_review = (candidate and not partial and not terminal and floor.get('llm_requests')
+                    and self.state['config'].get('independent_review_required'))
+        with self.ledger.protect_remaining({'llm_requests': 1} if after_review else {}), \
+                self.ledger.protect_remaining(floor, yield_to_work=True):
+            yield
 
     def _terminal_batch(self) -> bool:
         """A fitting task exit or professional return needs no later decision."""
@@ -4018,12 +4006,16 @@ class ToolApplication:
         No file discovery, source reads, model calls or new persisted state.
         """
         config, turns = self.state['config'], self.state['turns']
+        # Raw inputs and owner projections may be shared across offers prepared
+        # for this decision. The next decision reads the journal again.
+        if decision_views is None:
+            decision_views = {}
         working_mode = config.get('context_protocol') in _WORKING_CONTEXT_PROTOCOLS
         receipt_supply = config.get('native_supply_policy') in RECEIPT_SUPPLY_POLICIES
         operation_history = [] if config.get('context_protocol') in {'working.v3', 'working.v4'} else None
         declared = config.get('input_contract') == _DECLARED_INPUTS
-        client = client or self._client()
-        focus = self._work_focus()
+        client = client or self._client(purpose=self._coordinator_purpose(decision_views=decision_views))
+        focus = self._work_focus(decision_views=decision_views)
         if native_history_start_turn is None:
             rebindings = config.get('model_rebindings', [])
             native_history_start_turn = rebindings[-1].get('native_history_start_turn', 0) if rebindings else 0
@@ -4035,8 +4027,8 @@ class ToolApplication:
         remaining = self.ledger.remaining('total_tokens')
         target = input_capacity(client._settings.context_input_tokens, remaining, output)
         requests = self._request_capacity()
-        report = self._report_projection()
-        plan = None if config.get('work_method') == GOAL_WORK_METHOD else self._work_plan()
+        report = self._report_projection(decision_views=decision_views)
+        plan = None if config.get('work_method') == GOAL_WORK_METHOD else self._work_plan(decision_views=decision_views)
         context = {
             'context_protocol': config['context_protocol'], 'requests': self.state['requests'],
             'mounts': config['sources'], 'workspace': str(self.workspace.workspace),
@@ -4071,12 +4063,16 @@ class ToolApplication:
                 'scope': 'Original historical observations in native messages, not current file state or verified facts. '
                     'No read text or write payload is replaced. Archived text is not supplied; use read_history for original receipts.'},
         }
+        files = {alias: path.name for alias, path in self.workspace.mounts.items() if path.is_file()}
+        if files:
+            context['file_mounts'] = {'paths': files,
+                'scope': 'These aliases are usable file paths as written. The displayed names are not suffixes.'}
         delivery_guidance = None
         observations = None
         if self.operations is not None:
             # All consumers in this projection see the same original journal.
             # A later decision rebuilds it after any action or checkpoint.
-            observations = (self._operation_observations() if decision_observations is None
+            observations = (self._operation_observations(decision_views=decision_views) if decision_observations is None
                             else decision_observations)
             if decision_guidance is None:
                 accepted_delivery = (self.session.store.read_json('delivery.json')
@@ -4090,12 +4086,9 @@ class ToolApplication:
             context['delivery_conditions'] = dict(delivery_guidance[0])
             context['delivery_conditions'].pop('review_followup', None)
             key = ('retained_prior_delivery',)
-            if decision_views is None or key not in decision_views:
-                prior = self.operations.delivery.retained_prior_delivery()
-                if decision_views is not None:
-                    decision_views[key] = prior
-            else:
-                prior = decision_views[key]
+            if key not in decision_views:
+                decision_views[key] = self.operations.delivery.retained_prior_delivery()
+            prior = decision_views[key]
             if prior is not None:
                 context['retained_prior_delivery'] = prior
             if schemas is not None:
@@ -4179,7 +4172,7 @@ class ToolApplication:
                 ensure_ascii=False) if declared else self.state['requests'][number])} for number in range(count, current)]
             block = list(request_messages)
             count = current
-            reply = self.session.store.read_json(turn['reply'])
+            reply = self._decision_record(turn['reply'], decision_views)
             calls = {call['id']: call for call in reply.get('tool_calls', [])}
             results = {item['id']: item for item in turn['tools']}
             complete = not turn.get('remaining') and set(calls) == set(results)
@@ -4188,20 +4181,22 @@ class ToolApplication:
             for call_id in [*results, *(key for key in calls if key not in results)]:
                 call = calls[call_id]
                 item = results.get(call_id)
-                result = self.session.store.read_json(item['result']) if item else {'status': 'not_executed'}
                 if item:
+                    result = self._decision_record(item['result'], decision_views)
                     owner_observations.append({'record': item['result'], 'observation': result,
                                                'request_count': current})
+                else:
+                    result = {'status': 'not_executed'}
                 record = 'records/' + item['result'].removeprefix('attempts/') if item else None
                 if item:
                     key = ('observation', record, item.get('review_result'))
-                    if decision_views is not None and decision_guidance is not None and key in decision_views:
+                    if decision_guidance is not None and key in decision_views:
                         presented = decision_views[key]
                     else:
                         presented = self._coordination_result(result, record,
                             delivery_feedback=delivery_feedback if self.operations is not None else None,
                             review_record=item.get('review_result'))
-                        if decision_views is not None and decision_guidance is not None:
+                        if decision_guidance is not None:
                             decision_views[key] = presented
                 else:
                     presented = result
@@ -4301,10 +4296,11 @@ class ToolApplication:
                                 # the entire inspection on each production decision. Opinions
                                 # needing action still supply their supporting originals.
                                 selected = {}
-                            text_rows.extend((row['data'], row['field'], review_record, 'inspect_artifacts', row['request'])
-                                for row in journal_read_windows(review['receipt'], {})
-                                if selected.get(row['data'].get('absolute_path')) == row['data'].get('sha256')
-                                and row['data'].get('sha256'))
+                            if selected:
+                                text_rows.extend((row['data'], row['field'], review_record, 'inspect_artifacts', row['request'])
+                                    for row in journal_read_windows(review['receipt'], {})
+                                    if selected.get(row['data'].get('absolute_path')) == row['data'].get('sha256')
+                                    and row['data'].get('sha256'))
                             for action in self.operations.inspection.investigation_actions(Path(item['result']).parent.name):
                                 observed = self._history_observation(action['call'], action['result'],
                                     action['record'], navigation=True)
@@ -4485,8 +4481,12 @@ class ToolApplication:
                 except (ValueError,OSError):
                     return None
             journal = config.get('memory_protocol') == 'journal.v1'
-            memory = self._working_memory(observations=observations) if working_memory is None else working_memory
-            inherited = self._retained_working_inputs()
+            memory = (self._working_memory(observations=observations, decision_views=decision_views)
+                      if working_memory is None else working_memory)
+            key = ('retained_working_inputs',)
+            if key not in decision_views:
+                decision_views[key] = self._retained_working_inputs()
+            inherited = decision_views[key]
             working_rows.extend(inherited['observations'])
             work_notes = [*memory['notes'], *inherited['notes']]
             selected_records = list((plan or {}).get('evidence_records', []))
@@ -4539,12 +4539,10 @@ class ToolApplication:
                 if feedback_targets:
                     targets = tuple(sorted(feedback_targets))
                     key = ('feedback', *targets)
-                    if decision_views is None:
-                        feedback = self._work_feedback(list(targets), observations=decision_observations)
-                    else:
-                        if key not in decision_views:
-                            decision_views[key] = self._work_feedback(list(targets), observations=decision_observations)
-                        feedback = decision_views[key]
+                    if key not in decision_views:
+                        decision_views[key] = self._work_feedback(list(targets), observations=observations,
+                                                                  decision_views=decision_views)
+                    feedback = decision_views[key]
                     related.extend(feedback_observations(feedback))
                 additions = []
                 for row in related:
@@ -4561,6 +4559,26 @@ class ToolApplication:
             journal_rows = [{'turn':number, 'record':'records/'+path.removeprefix('attempts/')}
                 for number, turn in enumerate(turns) if not turn.get('remaining')
                 for path in ([item['result'] for item in turn['tools']] or [turn['reply']])] if journal else []
+            revision = context.get('delivery_conditions', {}).get('revision')
+            priority_sources = []
+            if revision:
+                # Read windows from the accepted opinion are already in this
+                # view. Prefer affected files and short supporting originals;
+                # the shared selector checks versions and fits actual windows.
+                from simple_ar.tools.workspace import FileWindow
+
+                affected = {path for finding in revision['findings'] for path in finding['artifacts']}
+                priority_sources = list(dict.fromkeys(row['absolute_path'] for row in sorted(
+                    (row for row in working_rows if row['kind'] == 'source_text' and row.get('absolute_path')
+                     and row['text_bytes'] <= FileWindow.model_fields['max_bytes'].default
+                     and row.get('offset_bytes') == 0 and row.get('next_offset_bytes') == row.get('size_bytes')
+                     and (row['absolute_path'] in affected or row['record'] == revision['record'])),
+                    key=lambda row: row['absolute_path'] not in affected)))
+                if operation_history is not None:
+                    # Older operation listings stay in read_history; the
+                    # handoff already identifies the relevant prior work.
+                    operation_history = [row for row in operation_history
+                        if row['request_count'] == len(self.state['requests'])]
             messages, selection = fit_working_context(
                 measure_input=lambda value: estimate_native_input_tokens(client, value, selected_schemas),
                 user_requests=self.state['requests'],
@@ -4571,8 +4589,7 @@ class ToolApplication:
                 observations=working_rows, schema_tokens=schema_cost,context_token_target=target,
                 native_observations=native_observations if receipt_supply else None,
                 preserve_material_observations=config.get('work_lifecycle') == 'integrated.v1',
-                working_set_policy=(('recent.v5' if config.get('working_set_policy') == 'recent.v6'
-                    else config.get('working_set_policy', 'recent.v2'))
+                working_set_policy=(config.get('working_set_policy', 'recent.v2')
                     if config.get('work_lifecycle') in {'integrated.v2', 'integrated.v3'} else None),
                 estimate_tokens=estimate_tokens,work_notes=work_notes,
                 require_work_notes=config.get('memory_protocol') == 'journal.v1',
@@ -4581,7 +4598,8 @@ class ToolApplication:
                 economical_after_turn=memory.get('attempted_through_turn', 0),
                 sparse_handoffs=config.get('context_checkpoint_policy') in {'economic.v2', 'economic.v3'},
                 summarized_through_turn=memory['through_turn'],
-                selected_records=selected_records,current_artifacts=sorted(current_artifacts),version_resolver=version,
+                selected_records=selected_records, priority_source_paths=priority_sources,
+                current_artifacts=sorted(current_artifacts), version_resolver=version,
                 block_request_counts=[turn.get('request_count',1) for turn in turns],
                 material_policy=('working' if config.get('context_checkpoint_policy') == 'economic.v3' else
                     'retained' if config.get('professional_operations') in RETAINED_PROFESSIONAL_CONTRACTS
@@ -4937,21 +4955,25 @@ class ToolApplication:
             if (integrated and self.state['config'].get('context_protocol') in _WORKING_CONTEXT_PROTOCOLS
                     and self.operations is not None):
                 if decision_observations is None:
-                    decision_observations = self._operation_observations()
+                    decision_observations = self._operation_observations(decision_views=decision_views)
                     accepted = (self.session.store.read_json('delivery.json')
                         if self.session.store.exists('delivery.json') else None)
                     decision_guidance = self.operations.delivery.working_guidance(
                         accepted, include_lifecycle=True, observations=decision_observations)
                 if working_memory is None:
-                    working_memory = self._working_memory(observations=decision_observations)
+                    working_memory = self._working_memory(observations=decision_observations,
+                        decision_views=decision_views)
             lifecycle = decision_guidance[0] if decision_guidance is not None else None
             schemas = self._closing_schemas(lifecycle=lifecycle) if closing else self.schemas
+            output_limit = conversation.closing_output_limit() if closing and integrated else None
+            projection_client = conversation.projection_client(output_limit)
             selection.clear()
-            messages = self._messages(client=client, working_memory=working_memory,
+            messages = self._messages(client=projection_client, working_memory=working_memory,
                 closing=closing, schemas=schemas, working_selection=selection,
                 decision_observations=decision_observations, decision_guidance=decision_guidance,
                 decision_views=decision_views)
-            value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
+            value = ConversationInput(messages, schemas, json.loads(messages[1]['content']),
+                output_limit=output_limit)
             if integrated and closing:
                 # A service must leave the caller an exit even if its result is
                 # incomplete. Do not offer it solely because request slots fit.
@@ -4967,11 +4989,12 @@ class ToolApplication:
                         schemas = [row for row in schemas
                             if row['function']['name'] in {'ask_user', 'deliver_result'}]
                     selection.clear()
-                    messages = self._messages(client=client, working_memory=working_memory,
+                    messages = self._messages(client=projection_client, working_memory=working_memory,
                         closing=True, schemas=schemas, working_selection=selection,
                         decision_observations=decision_observations, decision_guidance=decision_guidance,
                         decision_views=decision_views)
-                    value = ConversationInput(messages, schemas, json.loads(messages[1]['content']))
+                    value = ConversationInput(messages, schemas, json.loads(messages[1]['content']),
+                        output_limit=output_limit)
                     if self.state['config'].get('work_selection_policy') == 'native.v5':
                         value.closing_contract = 'batch_actions.v3'
                 exit_value = value
@@ -5111,6 +5134,8 @@ class ToolApplication:
             'estimated_followup_tokens': (floor['total_tokens'] if floor else
                 self._decision_tokens(client, messages, schemas=schemas)),
             'closing_required': closing,
+            **({'request_output_limit': value.output_limit}
+               if conversation is not None and value.output_limit is not None else {}),
             'tool_admission': 'work_selection.v1' if 'work_selection' in projection else 'offered.v1',
             **({'candidate_review_scope': 'explicit.v1'} if any(
                 row.get('function', {}).get('name') == 'review_result'
@@ -5151,7 +5176,9 @@ class ToolApplication:
                         if 'passage' in row else {})
                     for row in [*projection['retained_text_windows'], *projection['retained_source_passages'],
                         *(projection['material_supply']['native_context']
-                            if projection.get('context_protocol') in _CONVERSATION_CONTEXT_PROTOCOLS else [])]],
+                            if projection.get('context_protocol') in _CONVERSATION_CONTEXT_PROTOCOLS else []),
+                        *(entry['observation'] for entry in projection.get('working_view', {}).get('observations', ())
+                          if entry['version_status'] == 'matching')]],
                 'work_inputs': [{key: value for key, value in row.items() if key != 'data'} |
                     {'data': {key: value for key, value in row.get('data', {}).items() if key != 'text'}}
                     for row in projection.get('work_inputs', {}).get('windows', [])]},
@@ -5286,16 +5313,11 @@ class ToolApplication:
                         self.state['turns'][-1]['reply']).get('tool_calls', [])) != 1):
                 result = ToolResult(tool_name='focus_work', status='blocked',
                     error='Choose a work focus alone; queued actions must not silently change model ownership.')
-            elif (self.state['config'].get('professional_work') not in _PROFESSIONAL_WORK
-                    and not self.gateway.local_continuation(call['function']['name'])
-                    and professional_request):
+            elif professional_request and not self.gateway.local_continuation(call['function']['name']):
                 result = ToolResult(tool_name=call['function']['name'], status='blocked',
                     error='This historical task retains its original separate-operation contract; complete-work continuation requires a new task.',
                     data={'executed': False})
-            elif ((self.state['config'].get('professional_work') in _PROFESSIONAL_WORK
-                    or self.gateway.local_continuation(call['function']['name']))
-                    and professional_request
-                    and len(self.state['turns'][-1]['remaining']) > 1):
+            elif professional_request and len(self.state['turns'][-1]['remaining']) > 1:
                 result = ToolResult(tool_name=call['function']['name'], status='blocked',
                     error='A complete professional work unit must be last in this batch; dependent work uses its resulting artifacts.',
                     data={'executed': False})
@@ -5402,10 +5424,9 @@ class ToolApplication:
                         current_outputs=outputs,
                         current_result=self._operation_observation(payload, call, record),
                         retain=lambda: store.write_json('native_result.json', payload, kind='native_observation'),
-                        review_capacity=lambda: self.ledger.protect_remaining(
-                            self._review_floor(self._client(store.root.name),
-                                candidate=self._completion(call['function']['name']).kind == 'review'),
-                            yield_to_work=True),
+                        review_capacity=lambda: self._review_capacity(self._client(store.root.name),
+                            candidate=self._completion(call['function']['name']).kind == 'review',
+                            partial=bool(request.unresolved)),
                         may_start=start_review,
                         **({'candidate': True, 'review_scope': review_scope} if self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES
                             and self._completion(call['function']['name']).kind == 'review' else {}))
@@ -5415,17 +5436,13 @@ class ToolApplication:
             else:
                 # Saved canonical Writer contracts retain their original admission.
                 delivery = self.workspace.resolve_delivery(request, current_outputs=outputs)
-                hashes = self.workspace.artifact_hashes(delivery['artifacts'])
                 retained = payload.setdefault('metadata', {}).get('delivery_hashes')
-                if retained is not None and hashes != retained:
-                    payload.update(status='blocked', error='Final work outputs changed before delivery observation; no delivery or replay')
+                try:
+                    hashes = self.workspace.delivery_hashes(delivery, retained)
+                    delivery['summary'] = self.workspace.delivery_summary(delivery, hashes)
+                except (ValueError, OSError) as exc:
+                    payload.update(status='blocked', error=str(exc))
                     return payload
-                if request.summary_source is not None:
-                    try:
-                        delivery['summary'] = self.workspace.delivery_summary(delivery, hashes)
-                    except (ValueError, OSError) as exc:
-                        payload.update(status='blocked', error=str(exc))
-                        return payload
                 payload['metadata']['delivery_hashes'] = hashes
             if not self._completion(call['function']['name']).field:
                 payload['data'] = delivery
@@ -5707,11 +5724,12 @@ class ToolApplication:
         versioned_report = self.state['config'].get('report_protocol') == _REPORT_PROTOCOL
         report = self._report_projection()
         report_required = report['kind'] == 'report'
+        terminal_item = next((item for item in turn['tools'] if item['id'] == call['id']), None)
+        terminal = self.session.store.read_json(terminal_item['result']) if terminal_item is not None else None
+        retained = self._delivery(call, terminal) if terminal is not None else None
         if report_required or versioned_report:
             try:
                 arguments = json.loads(call['function']['arguments'])
-                retained = next((self._delivery(call, self.session.store.read_json(item['result']))
-                    for item in turn['tools'] if item['id'] == call['id']), None)
                 request = DeliveryRequest.model_validate(retained or self._delivery_arguments(call))
             except (ValueError, TypeError, KeyError):
                 return ''  # The tool's argument validator will reject this proposal.
@@ -5723,54 +5741,44 @@ class ToolApplication:
             except (ValueError, OSError, KeyError, RuntimeError) as exc:
                 return str(exc)
         observations = []
+        current = {item['id']: (terminal if item is terminal_item
+            else self.session.store.read_json(item['result'])) for item in turn['tools']}
         active = {domain: {id(row) for row in self._evidence_turns(domain)}
             for domain in ('sources', 'analysis', 'scientific', 'implementation')}
         for accepted in self.state['turns']:
             current_request = accepted.get('request_count', 1) == len(self.state['requests'])
-            calls_by_id = {row['id']: row for row in self.session.store.read_json(accepted['reply']).get('tool_calls', [])}
-            for item in accepted['tools']:
-                original = calls_by_id[item['id']]
+            for item, original in journal_tool_calls(self.session.store, accepted):
                 spec = self.gateway.registry.get(original['function']['name'])
                 if spec is not None and spec.domain in active and id(accepted) not in active[spec.domain]:
                     continue
+                observed = (current[item['id']] if accepted is turn
+                    else self.session.store.read_json(item['result']))
                 try:
                     arguments = json.loads(original['function']['arguments'])
                 except (ValueError, TypeError):
                     arguments = {}
-                observations.append({**self.session.store.read_json(item['result']),
-                    'arguments': arguments, 'record': item['result'], 'current_request': current_request})
+                observations.append({**observed, 'arguments': arguments, 'record': item['result'],
+                    'current_request': current_request})
         proposed = (ToolCall(tool_name=call['function']['name'],
-            arguments=json.loads(call['function']['arguments']))
-            if not any(item['id'] == call['id'] for item in turn['tools']) else None)
-        terminal = next((row for row in turn['tools'] if row['id'] == call['id']), None)
-        retained_delivery = (self._delivery(call, self.session.store.read_json(terminal['result']))
-            if terminal is not None else None)
-        arguments = json.loads(call['function']['arguments'])
-        delivery = retained_delivery or self._delivery_arguments(call)
+            arguments=json.loads(call['function']['arguments'])) if terminal is None else None)
         try:
-            failed = self.gateway.delivery_issues(observations, proposed=proposed, delivery=delivery,
+            failed = self.gateway.delivery_issues(observations, proposed=proposed,
+                delivery=retained or self._delivery_arguments(call),
                 require_current_origin=report['kind'] != 'conversion')
         except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
             return str(exc)
-        for item in turn['tools']:
-            observed = self.session.store.read_json(item['result'])
+        for identity, observed in current.items():
             data = observed.get('data') or {}
             if (observed.get('status') != 'ok' or data.get('returncode', 0) != 0
                     or (data.get('stop_reason') and not (observed.get('tool_name') == 'implement_code_task'
                         and data.get('status') == 'validated' and data.get('stop_reason') == 'stop_point'))):
-                failed.append(item['id'])
+                failed.append(identity)
         if failed:
             try:
-                terminal = next((row for row in turn['tools'] if row['id'] == call['id']), None)
-                if terminal is not None:
-                    observed = self.session.store.read_json(terminal['result'])
-                    retained_delivery = self._delivery(call, observed)
-                    if (observed.get('status') == 'ok' and retained_delivery is not None
-                            and DeliveryRequest.model_validate(retained_delivery).unresolved):
-                        return ''  # A domain may force honest partial delivery.
-                arguments = json.loads(call['function']['arguments'])
-                delivery = self._delivery_arguments(call)
-                if DeliveryRequest.model_validate(delivery).unresolved:
+                if (terminal is not None and terminal.get('status') == 'ok' and retained is not None
+                        and DeliveryRequest.model_validate(retained).unresolved):
+                    return ''  # A domain may force honest partial delivery.
+                if DeliveryRequest.model_validate(self._delivery_arguments(call)).unresolved:
                     return ''
             except (ValueError, TypeError, KeyError):
                 pass
@@ -6224,6 +6232,8 @@ class ToolApplication:
                 or self._failed_model_attempt({'kind':'model','attempt':entry.attempt_id},
                     current_only=False) is not None)
         if attempt.capability == 'native_action':
+            if self._failed_professional_model(attempt):
+                return True
             store = ArtifactStore(self.session.store.root / 'attempts' / entry.attempt_id)
             if (attempt.status != 'completed' or not store.exists('capability_result.json')
                     or not completed_llm_usage_is_accounted(row.to_dict() for row in self.ledger.entries
@@ -6442,11 +6452,70 @@ class ToolApplication:
             self._save()
             return record
 
+    def _failed_professional_model(self, attempt: AttemptManifest) -> bool:
+        """Identify a stopped professional model action with no accepted reply."""
+        if attempt.capability != 'native_action' or attempt.status != 'failed':
+            return False
+        store = ArtifactStore(self.session.store.root / 'attempts' / attempt.attempt_id)
+        if (store.exists('native_result.json') or not store.exists('action.json')
+                or not store.exists('capability_result.json')):
+            return False
+        action = store.read_json('action.json')
+        result = store.read_capability_result()
+        return (action.get('attempt') == attempt.attempt_id
+            and action.get('kind') == action.get('origin', {}).get('kind') == 'model'
+            and result.status == 'failed'
+            and all(ref.path == 'capability_result.json' for ref in (*attempt.outputs, *result.artifacts)))
+
+    @staticmethod
+    def _professional_action_identity(origin: dict, retry_of: str = '') -> str:
+        key = {**origin, 'retry_of': retry_of} if retry_of else origin
+        return 'native-action-' + hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:40]
+
+    def _retry_professional_model(self, parent: dict, model_selector: str) -> None:
+        action = parent.get('action') or {}
+        if action.get('kind') != 'model' or action.get('origin', {}).get('scope') != parent['inspection']:
+            raise ValueError('--retry-model requires a pending model decision inside the inspection')
+        if model_selector:
+            raise ValueError('Resume a professional model step with its saved connection')
+        identity = action['attempt']
+        store = ArtifactStore(self.session.store.root / 'attempts' / identity)
+        if action.get('result') or store.exists('native_result.json'):
+            return  # Ordinary recovery adopts the existing response.
+        attempts = self.session.list_attempts()
+        attempt = next((row for row in attempts if row.attempt_id == identity), None)
+        if attempt is None and action.get('retry_of'):
+            return  # The previously authorized retry has yet to dispatch.
+        if (attempt is None or not self._failed_professional_model(attempt)
+                or store.read_json('action.json') != action):
+            raise ValueError('Cannot prove a closed professional model failure without a response')
+        self._check_authorization_operations()
+        charges = [row for row in self.ledger.entries if row.attempt_id == identity]
+        if (not charges or any(row.status == 'settled' and row.actual.get('total_tokens')
+                and row.actual_source != 'estimated' for row in charges)
+                or not any(row.actual_source == 'transport_pre_dispatch'
+                    or row.actual_source == 'reservation_bound'
+                    and 'transport phase=possibly_dispatched' in row.reason
+                    or row.actual_source == 'estimated'
+                    and row.reason.startswith('provider attempt failed:') for row in charges)):
+            raise ValueError('The failed professional step has no retryable provider failure')
+        if any(self.ledger.remaining(key) == 0 for key in ('llm_requests', 'total_tokens')):
+            raise ValueError('Remaining model budget is exhausted')
+        self._client(parent['inspection'])
+        if self.session.manifest.status != 'running':
+            self.session.continue_with_revision('Explicit --retry-model continuation of ' + identity)
+        parent['action'] = {**action, 'retry_of': identity,
+            'attempt': self._professional_action_identity(action['origin'], identity)}
+        self._save()
+
     def _retry_model(self, model_selector: str = "") -> None:
         """Authorize one new decision, retaining failed attempts and all charges."""
+        pending = self.state['pending']
+        if pending and pending.get('inspection'):
+            self._retry_professional_model(pending, model_selector)
+            return
         if 'llm_client' in self.state['config'].get('runtime_dependencies', {}):
             raise ValueError('Injected clients do not support named-connection retries; restore their original service and reconcile the failed operation')
-        pending = self.state['pending']
         if not pending or pending['kind'] != 'model' or any(turn['remaining'] for turn in self.state['turns']):
             raise ValueError('--retry-model requires a pending native model decision, not a tool or new task')
         if self.session.manifest.status in {'created', 'completed', 'partial'}:
@@ -6512,8 +6581,11 @@ class ToolApplication:
         cap = client.effective_output_limit()
         if cap != saved_cap:
             raise ValueError('Retry requires the saved output setting; restore compatible settings without changing it')
-        if any(entry.status == 'unknown' and (saved_cap is None
-                or entry.reserved['total_tokens'] < saved_cap) for entry in entries):
+        failed_offer = ArtifactStore(self.session.store.root / 'attempts' / attempt.attempt_id)
+        failed_cap = (failed_offer.read_json('decision_budget.json').get('request_output_limit', saved_cap)
+            if failed_offer.exists('decision_budget.json') else saved_cap)
+        if any(entry.status == 'unknown' and (failed_cap is None
+                or entry.reserved['total_tokens'] < failed_cap) for entry in entries):
             raise ValueError('Unknown reservation does not cover the saved output cap; inspect before retry')
         budget = self.session.manifest.budget
         requests = self.ledger.remaining('llm_requests')
@@ -6525,8 +6597,15 @@ class ToolApplication:
         # effective cap as chat_turn. LLMClient still owns actual reservations
         # and each physical provider attempt, including its existing retries.
         tokens = self.ledger.remaining('total_tokens')
-        required = self._decision_tokens(client, self._messages(client=client,
-            native_history_start_turn=len(self.state['turns']) if model_selector else None))
+        from simple_ar.app.professional_conversation import ProfessionalConversation
+        conversation = ProfessionalConversation(client)
+        output_limit = (conversation.closing_output_limit()
+            if self.state['config'].get('work_lifecycle') in INTEGRATED_WORK_LIFECYCLES else None)
+        retry_client = conversation.projection_client(output_limit)
+        schemas = self._closing_schemas() if output_limit is not None else None
+        required = self._decision_tokens(retry_client, self._messages(client=retry_client,
+            closing=output_limit is not None, schemas=schemas,
+            native_history_start_turn=len(self.state['turns']) if model_selector else None), schemas=schemas)
         if (tokens is None and self.ledger.limits.get('total_tokens') is not None
                 or tokens is not None and tokens < required):
             raise ValueError('Remaining token budget cannot cover the saved output cap and decision input')
@@ -6584,16 +6663,13 @@ class ToolApplication:
             'missing historical versions are not reconstructed from current files.')
         from simple_ar.tools.delivery_versions import DeliveryVersions
         try:
+            versions = DeliveryVersions(self.session.store.root)
             result['delivery_versions'] = [{
-                'observation': v['observation'], 'request_count': v['request_count'],
-                'summary': v['delivery'].get('summary'), 'binding': v['binding'],
-                'status': v['status'], 'reason': v.get('reason'),
-                'receipt': (v['observation'].rsplit('/', 1)[0] + '/delivery-version/receipt.json'
-                    if v['status'] == 'retained' else None),
+                **versions.describe(number, v), 'reason': v.get('reason'),
                 'files': {locator: {'source': 'records/' + row['blob'].removeprefix('attempts/'),
                     'source_sha256': row['sha256'], 'size_bytes': row['size_bytes']}
-                    for locator, row in v['files'].items()}} for v in
-                DeliveryVersions(self.session.store.root).versions()]
+                    for locator, row in v['files'].items()}} for number, v in
+                enumerate(versions.versions(), 1)]
         except (OSError, ValueError, KeyError, TypeError) as exc:
             result['delivery_versions'] = []
             result['delivery_versions_error'] = str(exc)
@@ -6612,7 +6688,8 @@ class ToolApplication:
             decision: dict[str, str] | None = None,
             approve: Callable[[dict[str, Any], str], bool | ExecutionRejection] | None = None,
             progress: Callable[[str], None] = print,
-            should_stop: Callable[[], bool] | None = None) -> dict[str, Any]:
+            should_stop: Callable[[], bool] | None = None,
+            finish_declared_work: bool = False) -> dict[str, Any]:
         if remember_execution and not approved_execution:
             raise ValueError('Remembering execution requires the exact pending approval token')
         if independent_review_required is not None and (type(independent_review_required) is not bool
@@ -6729,6 +6806,7 @@ class ToolApplication:
                 self._submit_actions(actions)
             if (resource_allowances or additional_attempts or additional_no_progress) and self.session.manifest.status in {'paused', 'blocked', 'failed'}:
                 self.session.continue_with_revision('Explicit resource continuation: ' + authorization_id)
+            resumed = None
             try:
                 self._consume_feedback()
                 if self._commit_terminal(progress):
@@ -6762,21 +6840,29 @@ class ToolApplication:
                             and (not turns or turns[-1].get('request_count',1) < len(self.state['requests'])))
                         if not (correctable_text or unstarted_request) and (not turns or turns[-1].get('origin') != 'professional'
                                 or turns[-1].get('request_count', 1) != len(self.state['requests'])):
-                            return self.result_snapshot()
+                            if not finish_declared_work or not self._queue_declared_completion(should_stop):
+                                return self.result_snapshot()
+                            unstarted_request = True  # The caller's retained completion is now queued.
                         if not (correctable_text or unstarted_request):
                             retained = self.session.store.read_json(turns[-1]['reply'])
                             # Historical professional stops still require their
                             # owner's handback; recovery never replays the work.
                             completed_outcome = (turns[-1]['tools'] and not turns[-1]['remaining']
                                 and not retained.get('owner_stop'))
-                            if not completed_outcome and not self._professional_stop_can_resume(retained):
-                                return self.result_snapshot()
+                            if not completed_outcome:
+                                prepared = self._resume_professional_stop(retained)
+                                if prepared is None:
+                                    return self.result_snapshot()
+                                resumed = (turns[-1]['reply'], prepared)
                     attempts = self.session.list_attempts()
                     active = pending.get('action') if pending and pending.get('inspection') else pending
-                    if active is None or not any(a.attempt_id == active['attempt'] and a.status == 'running' for a in attempts):
+                    if self.session.manifest.status == 'paused' and (active is None or not any(
+                            a.attempt_id == active['attempt'] and a.status == 'running' for a in attempts)):
                         self.session.continue_with_revision('Resume pending work without resetting its budget')
                 with llm_call_stop_scope(should_stop):
-                    self._run(approved_execution, approve, progress, should_stop, remember_execution)
+                    self._run(approved_execution, approve, progress, should_stop, remember_execution, resumed=resumed)
+                    if finish_declared_work and self._queue_declared_completion(should_stop):
+                        self._run('', None, progress, should_stop)
             except LLMCallStopped:
                 # Preserve any budget block recorded by the attempt owner.
                 if self.session.manifest.status != 'blocked':
@@ -6789,6 +6875,19 @@ class ToolApplication:
                 self.session.manifest.status_reason = f"{type(exc).__name__}: {exc}"
                 self._save()
             return self.result_snapshot()
+
+    def _queue_declared_completion(self, should_stop: Callable[[], bool] | None) -> bool:
+        """Finish caller-declared local work under the same task lock and stop."""
+        if (self.session.manifest.status_reason != _CALLER_ACTIONS_CONSUMED
+                or self.session.manifest.budget.exhausted()
+                or (should_stop is not None and should_stop())):
+            return False
+        from simple_ar.app.research_intake import declared_collection_completion
+        actions = self.measurement_completion_actions() or declared_collection_completion(self)
+        if not actions:
+            return False
+        self._submit_actions(actions)
+        return True
 
     def _approve_action(self, pending: dict, approved_execution: str, approve: Any,
                         progress: Callable[[str], None], *, scoped: bool = False,
@@ -6821,10 +6920,8 @@ class ToolApplication:
             reusable = name in {'run_process', 'export_report'}
             grant = None
             if token is not None and not started and reusable and (grants or remember_execution):
-                current = offered
-                binding = {key: value for key, value in current['binding'].items() if key != 'call'}
-                if current['token'] == token and (name == 'export_report'
-                        or (binding.get('artifacts') or {}).get('inputs')):
+                binding = {key: value for key, value in offered['binding'].items() if key != 'call'}
+                if name == 'export_report' or (binding.get('artifacts') or {}).get('inputs'):
                     grant = self.workspace.approval_digest({
                         'name': name, 'arguments': json.loads(call['function']['arguments']), 'binding': binding})
             owner = self.gateway.domain_owner(name)
@@ -6843,13 +6940,14 @@ class ToolApplication:
                     if name in {'prepare_code_task', 'implement_code_task'}:
                         progress('Frozen CodeTask contract: ' + json.dumps(self.implementation.exact.model_dump(), ensure_ascii=False))
                     return False
+                offered = self.execution_approval(call)
+                if token != offered['token']:
+                    raise ValueError('Execution inputs changed during approval; approve the current identity')
             check_llm_call_stop()
             if token is not None and not started:
-                approval = (self.execution_approval(call)
+                approval = (offered
                     if self.gateway.session_owner(name) is not None or name == 'run_process'
-                    else {'token': self.approval_token(call)})
-                if token != approval['token']:
-                    raise ValueError('Execution inputs changed during approval; approve the current identity')
+                    else {'token': token})
                 if remember_execution and approved_execution == token and grant is not None and grant not in grants:
                     self.state['execution_grants'] = [*grants, grant]
                 pending['execution_approval'] = approval
@@ -6899,16 +6997,17 @@ class ToolApplication:
         if self._consume_feedback():
             raise _ActionSuspended()  # Prior child receipts stay with their original owner.
         origin = {'scope': scope, 'position': position, 'kind': kind}
-        identity = 'native-action-' + hashlib.sha256(json.dumps(origin,
-            sort_keys=True).encode()).hexdigest()[:40]
         parent = self.state['pending']
+        retained = parent.get('action')
+        retry_of = (retained.get('retry_of', '') if retained and retained.get('origin') == origin else '')
+        identity = self._professional_action_identity(origin, retry_of)
         action = {'attempt': identity, 'kind': kind, 'origin': origin,
+                  **({'retry_of': retry_of} if retry_of else {}),
                   **({'call': deepcopy(call)} if call is not None else {})}
         if kind == 'opinion':
             expected = perform(identity)  # Pure, already-completed professional conclusion.
             action['result_sha256'] = hashlib.sha256(json.dumps(expected,
                 sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-        retained = parent.get('action')
         if retained is not None and retained.get('origin') == origin:
             if any(retained.get(key) != value for key, value in action.items()):
                 raise ValueError('Accepted operation differs from its retained proposal; no replay')
@@ -6946,10 +7045,12 @@ class ToolApplication:
             scope, kind, position, call, perform, approved_execution, approve, progress, remember_execution)
         try:
             direct = pending['call']['function']['name'] == 'inspect_artifacts'
-            floor = ({} if direct and (self._terminal_batch() or self._caller_takeover())
-                else self._review_floor(self._client(scope), candidate=not direct
-                    and self._completion(pending['call']['function']['name']).kind == 'review'))
-            with self.ledger.protect_remaining(floor, yield_to_work=True):
+            arguments = self._recorded_arguments(pending['call'])
+            capacity = (nullcontext() if direct and (self._terminal_batch() or self._caller_takeover())
+                else self._review_capacity(self._client(scope), candidate=not direct
+                    and self._completion(pending['call']['function']['name']).kind == 'review',
+                    partial=isinstance(arguments, dict) and bool(arguments.get('unresolved'))))
+            with capacity:
                 final = self.operations.inspection.advance(scope, dispatch)
             opinion = dispatch('opinion', 'final-opinion', None,
                 lambda _identity: final.model_dump(mode='json'))
@@ -6977,7 +7078,8 @@ class ToolApplication:
         return direct or (review.get('data') or {}).get('inspection_pending')
 
     def _run(self, approved_execution: str, approve: Any, progress: Callable[[str], None],
-             should_stop: Callable[[], bool] | None = None, remember_execution: bool = False) -> None:
+             should_stop: Callable[[], bool] | None = None, remember_execution: bool = False, *,
+             resumed: tuple[str, tuple] | None = None) -> None:
         while True:
             self._consume_feedback()
             caller_takeover = self._caller_takeover()
@@ -6992,7 +7094,8 @@ class ToolApplication:
             pending = self.state["pending"]
             if pending is None:
                 if not self._queue_candidate_review():
-                    self._continue_professional_work()
+                    self._continue_professional_work(resumed)
+                resumed = None
                 if self.session.manifest.status == 'paused':
                     return
                 turns = self.state["turns"]
@@ -7045,7 +7148,7 @@ class ToolApplication:
                         return
                     if (self.state['config']['model'] is None
                             or caller_takeover):
-                        self.session.pause('Caller actions consumed; submit explicit next work or delivery. No model decision was requested.')
+                        self.session.pause(_CALLER_ACTIONS_CONSUMED)
                         return
                     if not self._can_request(1):
                         self.session.pause("Shared model request allowance exhausted, including professional calls; "

@@ -752,6 +752,48 @@ class OperationReportDeliveryTests(unittest.TestCase):
             request.unresolved = ['Publication has no verified owner receipt.']
             self.assertEqual(operation_report_publication(request, artifacts, [observed], publication=publication), [])
 
+    def test_retained_declaration_uses_publication_owner_for_completed_export(self):
+        from simple_ar.core.capabilities import ArtifactStore
+        from simple_ar.report.review_evidence import DECLARATION_ADOPTION_CONTRACT
+        from simple_ar.tools.publication import PublicationToolGateway
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+        from simple_ar.tools.writing import WritingToolGateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = WorkspaceToolGateway(root, {}, None)
+            writing = WritingToolGateway(root, workspace, None, 'fixture', 'task')
+            publication = PublicationToolGateway(root, workspace, None)
+            writing.check_publication_delivery = publication.check_report_delivery
+            project = workspace.workspace / 'publication'
+            project.mkdir()
+            (project / 'main.pdf').write_bytes(b'fixture')
+            (workspace.workspace / 'report.md').write_text('# Report', encoding='utf-8')
+            authoring = {'manuscript': 'report.md'}
+            export = ArtifactStore(root / 'tools/publications/publication')
+            export.write_json('request.json', {'markdown': 'report.md', 'report_identity': authoring})
+            export.write_json('result.json', {'report_identity': authoring})
+            group = {'execution_ref': 'execution', 'declarations': [{'id': 'statement'}]}
+            draft = {'editable_markdown': 'report.md', 'report_binding': {'obligation': {'formats': ['pdf']}},
+                'delivery_review': {'status': 'reviewed', 'declaration_adoption': {
+                    'contract': DECLARATION_ADOPTION_CONTRACT, 'producers': [group],
+                    'checks': [{'declaration_id': 'statement', 'status': 'satisfied_by_execution'}]}}}
+            rows = [{'tool_name': 'compose_document', 'status': 'ok', 'data': draft},
+                    {'tool_name': 'export_report', 'status': 'ok', 'data': {
+                        'project': 'publication', 'report_identity': authoring, 'manifest': {'compiled': True}}}]
+            delivery = {'summary': 'Report', 'artifacts': ['report.md', 'publication/main.pdf'],
+                        'report': {'status': 'canonical', 'manuscript': 'report.md', 'formats': ['pdf']}}
+            with patch('simple_ar.report.composition_receipts.accepted_composition_receipt',
+                       return_value=(export, {'delivery_review': {'producer_declarations': [group]}}, draft)), \
+                    patch('simple_ar.report.writing.validate_document_inspection'), \
+                    patch('simple_ar.tools.producer_declarations.declaration_group', return_value=group), \
+                    patch.object(writing, 'final_review', return_value={'review_status': 'reviewed'}), \
+                    patch.object(writing, 'publication_source', return_value=authoring), \
+                    patch.object(writing, 'check_delivery_set') as check_set, \
+                    patch.object(publication, '_bound_publication', return_value=({}, ['publication/main.pdf'])):
+                self.assertEqual(writing.delivery_adoptions(rows, delivery), [group])
+                check_set.assert_called_once_with(authoring, delivery['artifacts'], {project / 'main.pdf'})
+
 
 if __name__ == '__main__':
     unittest.main()

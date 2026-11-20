@@ -15,6 +15,33 @@ from tests import test_professional_work_loop as fixture
 
 
 class NativeWorkProjectionTests(unittest.TestCase):
+    def test_tight_exit_uses_its_measured_output_limit_without_changing_regular_calls(self):
+        from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.integrations.llm import LLMClient, LLMSettings
+
+        ledger = BudgetLedger({'llm_requests': 6, 'total_tokens': 64227})
+        client = LLMClient(LLMSettings(api_key='test', max_output_tokens=65536), budget_ledger=ledger)
+        conversation = ProfessionalConversation(client)
+        offered = []
+
+        def project(closing):
+            offered.append(closing)
+            return ConversationInput([{'role': 'user', 'content': 'Return the current result.'}], [], {},
+                output_limit=conversation.closing_output_limit() if closing else None)
+
+        value = conversation.prepare(project, followup=conversation.request_resources, exit_first=True)
+        self.assertEqual(offered, [True])
+        self.assertTrue(value.closing)
+        self.assertLess(conversation.tokens(value), 64227)
+        self.assertEqual(client.effective_output_limit(), 65536)
+        with patch.object(LLMClient, 'chat_turn', autospec=True) as send:
+            conversation.call(value, label='test', call_id='compact-exit', native=True)
+            self.assertEqual(send.call_args.args[0].effective_output_limit(), value.output_limit)
+        ample = BudgetLedger({'llm_requests': 6, 'total_tokens': 400000})
+        self.assertIsNone(ProfessionalConversation(LLMClient(client._settings,
+            budget_ledger=ample)).closing_output_limit())
+
     def test_budget_refusal_is_closed_without_becoming_inspection_evidence(self):
         from simple_ar.tools.inspection import InspectionToolGateway
         owner = InspectionToolGateway.__new__(InspectionToolGateway)

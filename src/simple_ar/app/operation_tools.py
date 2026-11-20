@@ -14,7 +14,7 @@ from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.permissions import ToolPermissionPolicy
 from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, NATIVE_WORK_METHODS, EXECUTABLE_WORK_METHODS, GOAL_WORK_METHOD, DIRECT_NATIVE_SELECTION_POLICIES, MODEL_REVIEW_SELECTIONS
 from simple_ar.tools.workspace import WorkspaceToolGateway, workspace_tool_specs
-from simple_ar.tools.sources import SourceToolGateway, source_tool_specs
+from simple_ar.tools.sources import SourceToolGateway
 from simple_ar.tools.publication import PublicationToolGateway, publication_tool_specs
 from simple_ar.tools.analysis import AnalysisToolGateway, analysis_tool_specs
 from simple_ar.tools.extensions import LocalExtension
@@ -294,29 +294,19 @@ class OperationTools:
         self.professional = config.get('professional_operations') in PROFESSIONAL_CONTRACTS
         self.observations = observations
         self.user_requests = user_requests
-        evidence = root / 'evidence'
-        evidence.mkdir(exist_ok=True)
-        self.workspace = WorkspaceToolGateway(root,
-            {**{key: Path(value) for key,value in config['sources'].items()},
-             'evidence':evidence, 'records':root/'attempts'}, ledger,
-            project_python=Path(config['project_python']) if config.get('project_python') else None,
-            record_artifacts=record_artifacts,
-            process_artifact_paths=config.get('process_artifact_paths'),
-            candidate_review_protocol=config.get('candidate_review_protocol'),
-            sandbox_execution=config.get('sandbox_execution', False))
+        self.workspace = WorkspaceToolGateway.for_task(root, config, ledger, record_artifacts=record_artifacts)
         self.registry = ToolRegistry()
         self.registry.register_package(workspace_tool_specs(candidate_review=config.get('work_method') in NATIVE_WORK_METHODS,
             process_artifact_paths=config.get('process_artifact_paths'),
             candidate_review_protocol=config.get('candidate_review_protocol'),
             sandbox_execution=config.get('sandbox_execution', False)),
             self.workspace, request_visible=True)
-        self.sources = SourceToolGateway(root, self.workspace, ledger, policy=config.get('research_policy'),
+        self.sources = SourceToolGateway.for_task(root, self.workspace, config,
             default_policy=config.get('source_policy_defaults'),
-            authority_revision=config.get('authority_revision', 0), execution_contract=config.get('execution_contract'),
-            client_factory=(lambda identity:client_factory(identity, 'task')) if config['model'] is not None else None,
+            client_factory=lambda identity: client_factory(identity, 'task'),
             feasibility_client_factory=feasibility_client_factory,
             registry=search_registry, user_requests=user_requests)
-        self.registry.register_package(source_tool_specs(), self.sources)
+        self.registry.register_package(self.sources.tool_specs(), self.sources)
         self.publication = PublicationToolGateway(root, self.workspace, ledger,
             work_lifecycle=config.get('work_lifecycle'),
             asset_protocol=config.get('publication_assets'), legacy_report_status=legacy_report_status)
@@ -538,11 +528,7 @@ class OperationTools:
             from simple_ar.tools.images import ImageToolGateway, image_tool_specs
             self.registry.register_package(image_tool_specs(),ImageToolGateway(self.workspace,ledger,
                 fallback_models_config=config.get('model_catalogs',{}).get('image')))
-        self.extensions = [LocalExtension(item,extension_host,host_protocol=config.get('extension_host_protocol'))
-            for item in config.get('extensions', [])]
-        for extension in self.extensions:
-            extension.verify()
-            self.registry.register_package(extension.specs(),extension,request_visible=True)
+        self.extensions = LocalExtension.register_task_packages(config, self.registry, extension_host)
         self.registry.register_package(coordination['specs'],coordination['owner'],request_visible=True)
         self.selection = None
         if config.get('work_method') == GOAL_WORK_METHOD:
@@ -561,22 +547,8 @@ class OperationTools:
                     prepared = spec.model_copy(deep=True)
                     prepared_report_delivery_schema(prepared.input_schema, prepared.completion.field)
                     self.registry.register(prepared, replace=True)
-        permissions = {'read_only','plan','write_patch'}
-        if config['allow_execution']:
-            permissions.add('execution')
-        if config.get('allow_network') or config.get('allow_vision') or config.get('max_images',0):
-            permissions.add('network')
-        blocked = {
-                spec.name for spec in self.registry.list_specs()
-                if spec.domain=='sources' and spec.permission_level=='network' and not config.get('allow_network')}
-        if exact:
-            blocked.update(spec.name for spec in self.registry.list_specs()
-                if spec.domain=='workspace' and spec.permission_level in {'write_patch','execution'})
-            if not config.get('scientific_lineage'):
-                blocked.update(spec.name for spec in self.registry.list_specs()
-                    if spec.domain=='scientific' and spec.permission_level=='execution')
-        self.gateway = CommonToolGateway(root,registry=self.registry,policy=ToolPermissionPolicy(
-            allowed_permissions=permissions,max_risk_level='high',blocked_tools=blocked),
+        self.gateway = CommonToolGateway(root, registry=self.registry,
+            policy=ToolPermissionPolicy.for_task(config, self.registry.list_specs()),
             work_input_owners={'inspection': feedback_owner} if feedback_owner else None)
         inspection_execution = config.get('inspection_execution_protocol')
         if inspection_execution not in {None, 'shared.v1', 'shared.v2'}:
@@ -645,13 +617,14 @@ class OperationTools:
         if self.config.get('work_method') != GOAL_WORK_METHOD:
             return None
         from simple_ar.app.professional_conversation import (
-            _working_view_encoder, prepare_recorded_work_messages, prepare_work_unit_messages)
+            prepare_recorded_work_messages, prepare_work_unit_messages)
+        from simple_ar.core.working_context import working_view_encoder
         if (self.config.get('work_selection_policy') not in DIRECT_NATIVE_SELECTION_POLICIES and self.work is not None
                 and self.work.source_work and self.work.selected() is not None):
             return None
         prepare = (prepare_work_unit_messages if self.config.get('work_selection_policy') in DIRECT_NATIVE_SELECTION_POLICIES
                    else prepare_recorded_work_messages)
-        encode = _working_view_encoder()
+        encode = working_view_encoder()
         return lambda messages: prepare(messages, encode_context=encode)
 
     def coordinator_eligible(self, spec: CommonToolSpec) -> bool:

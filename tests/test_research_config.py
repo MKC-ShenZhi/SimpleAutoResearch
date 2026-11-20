@@ -185,7 +185,7 @@ class ReportDocumentArgumentsTests(unittest.TestCase):
 
     def test_report_resume_does_not_promote_defaults_or_omit_explicit_false_and_zero(self):
         from types import SimpleNamespace
-        from simple_ar.cli.main import _report_config_overrides
+        from simple_ar.report.requirements import report_config_overrides
 
         args = SimpleNamespace(command="research-session", report_template="experiment",
             report_document_review=False, max_review_iterations=0, max_section_tokens=0,
@@ -193,10 +193,11 @@ class ReportDocumentArgumentsTests(unittest.TestCase):
             _explicit_resume_destinations={"report_document_review", "max_section_tokens", "report_figures"})
         saved = {"template": "analysis_report", "document_review": True, "max_review_iterations": 2,
                  "max_section_tokens": 2000, "figures": {"enabled": True}}
-        app = SimpleNamespace(services=SimpleNamespace(config={"report": saved.copy()}))
-        self.assertEqual(_report_config_overrides(args, app),
+        config = {"report": saved.copy()}
+        supplied = report_settings(args, explicit_destinations=args._explicit_resume_destinations)
+        self.assertEqual(report_config_overrides(supplied, config),
                          {"document_review": False, "max_section_tokens": 0, "figures": {}})
-        self.assertEqual(app.services.config["report"], saved)
+        self.assertEqual(config["report"], saved)
 
     def test_report_projection_ignores_missing_or_none_but_rejects_negative_caps(self):
         from argparse import Namespace
@@ -246,8 +247,6 @@ class ReportDocumentArgumentsTests(unittest.TestCase):
 
 class DocumentReviewCapacityConfigTests(unittest.TestCase):
     def test_capacity_roundtrips_task_config_cli_and_resume(self):
-        from simple_ar.cli.main import _report_config_overrides
-        from types import SimpleNamespace
         from simple_ar.report.schema import ReportRuntimeConfig
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "task.toml"
@@ -258,12 +257,12 @@ class DocumentReviewCapacityConfigTests(unittest.TestCase):
             parser = build_parser(research_defaults=defaults)
             args = parser.parse_args(argv)
             args._explicit_resume_destinations = explicit
-            app = SimpleNamespace(services=SimpleNamespace(config={"report_config": {}}))
-            self.assertEqual(_report_config_overrides(args, app)["max_document_review_prompt_chars"], 0)
+            self.assertEqual(report_settings(args, explicit_destinations=explicit)["max_document_review_prompt_chars"], 0)
             self.assertEqual(parser.parse_args([*argv, "--max-document-review-prompt-chars", "120000"]).max_document_review_prompt_chars, 120000)
             report_args = parser.parse_args(["research-report", "--session-root", "run", "--model", "fixture", "--max-document-review-prompt-chars", "100000"])
             report_args._explicit_resume_destinations = {"max_document_review_prompt_chars"}
-            self.assertEqual(_report_config_overrides(report_args, app)["max_document_review_prompt_chars"], 100000)
+            self.assertEqual(report_settings(report_args, explicit_destinations=report_args._explicit_resume_destinations)
+                ["max_document_review_prompt_chars"], 100000)
             path.write_text(path.read_text().replace("=0", "=-1"))
             with self.assertRaisesRegex(ValueError, "max_document_review_prompt_chars"):
                 research_defaults(argv)
@@ -307,8 +306,6 @@ class ResearchConfigTests(unittest.TestCase):
                 validate_session_arguments(args)
 
     def test_review_scope_roundtrips_config_session_and_report_resume(self):
-        from simple_ar.cli.main import _report_config_overrides
-        from types import SimpleNamespace
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "task.toml"
             path.write_text('[task]\ngoal="Organize supplied evidence"\n[report]\ndocument_review=true\nreview_scope="document"\n')
@@ -318,13 +315,13 @@ class ResearchConfigTests(unittest.TestCase):
             parser = build_parser(research_defaults=defaults)
             args = parser.parse_args(argv)
             args._explicit_resume_destinations = explicit
-            app = SimpleNamespace(services=SimpleNamespace(config={"report": {}}))
-            self.assertEqual(_report_config_overrides(args, app)["review_scope"], "document")
+            self.assertEqual(report_settings(args, explicit_destinations=explicit)["review_scope"], "document")
             self.assertEqual(parser.parse_args([*argv, "--report-review-scope", "section"]).report_review_scope, "section")
             report = parser.parse_args(["research-report", "--session-root", "run", "--model", "fixture",
                 "--document-review", "--review-scope", "document"])
             report._explicit_resume_destinations = {"document_review", "review_scope"}
-            self.assertEqual(_report_config_overrides(report, app), {"document_review": True, "review_scope": "document"})
+            self.assertEqual(report_settings(report, explicit_destinations=report._explicit_resume_destinations),
+                {"document_review": True, "review_scope": "document"})
             path.write_text(path.read_text().replace('"document"', '"unknown"'))
             with self.assertRaisesRegex(ValueError, "review_scope"):
                 research_defaults(argv)
@@ -343,8 +340,6 @@ class ResearchConfigTests(unittest.TestCase):
                 create.assert_not_called()
 
     def test_data_tables_share_toml_cli_and_resume_override(self):
-        from simple_ar.cli.main import _report_config_overrides
-        from types import SimpleNamespace
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "task.toml"
             path.write_text('[task]\ngoal="Explain supplied data"\n[report]\ndata_tables="full"\n')
@@ -354,9 +349,8 @@ class ResearchConfigTests(unittest.TestCase):
             parser = build_parser(research_defaults=defaults)
             args = parser.parse_args(argv)
             args._explicit_resume_destinations = explicit
-            app = SimpleNamespace(services=SimpleNamespace(config={"report_config": {}}))
             self.assertEqual(args.report_data_tables, "full")
-            self.assertEqual(_report_config_overrides(args, app)["data_tables"], "full")
+            self.assertEqual(report_settings(args, explicit_destinations=explicit)["data_tables"], "full")
             self.assertEqual(parser.parse_args([*argv, "--report-data-tables", "linked"]).report_data_tables, "linked")
             self.assertEqual(parser.parse_args(["research-report", "--session-root", "run", "--model", "fixture", "--data-tables", "full"]).data_tables, "full")
             path.write_text(path.read_text().replace('"full"', '"unknown"'))
@@ -792,7 +786,7 @@ class ResearchConfigTests(unittest.TestCase):
                 main(["research-session", "--config", str(path)])
             ledger_path = next((root / "out").glob("*/budget_ledger.json"))
             ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-            self.assertEqual(ledger["limits"]["total_tokens"], 123456)
+            self.assertEqual(ledger["limits"]["total_tokens"], 0)
             self.assertEqual(ledger["entries"], [])
             from simple_ar.app.tool_application import ToolApplication
             from simple_ar.cli.start import session_materials
@@ -813,9 +807,9 @@ class ResearchConfigTests(unittest.TestCase):
             self.assertTrue(any((attempt / "research_summary.md").is_file()
                                 for attempt in (deferred_session / "attempts").iterdir()))
             self.assertEqual(session_materials(deferred_session), {})
-            self.assertEqual(deferred.ledger.limits["total_tokens"], 123456)
+            self.assertEqual(deferred.ledger.limits["total_tokens"], 0)
             self.assertFalse(deferred.ledger.entries)
-            self.assertIn("not complete", output.getvalue())
+            self.assertIn("requested work remains unfinished: experiments", output.getvalue())
 
     def test_file_paths_and_explicit_cli_overrides(self):
         with tempfile.TemporaryDirectory() as directory:

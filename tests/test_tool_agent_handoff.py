@@ -1316,7 +1316,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_parent_material_seed_requires_current_authorized_complete_successful_receipts(self):
         from simple_ar.tools.materials import (journal_material_references, material_inventories,
-            material_observation_seed)
+            material_journal_scope, material_observation_seed)
 
         _, inputs, _, _, app, _ = self._historical_native_fixture()
         current = inputs / 'notes.txt'
@@ -1333,6 +1333,13 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(expanded[0], scoped[0])
         self.assertEqual([str(app.workspace.resolve(row['request']['path'])) for row in expanded],
             [str(current), str(other)])
+        from simple_ar.tools.materials import _journal_material_index
+        with patch('simple_ar.tools.materials._journal_material_index', wraps=_journal_material_index) as build:
+            with material_journal_scope():
+                for root, expected in ((inputs, expanded[::-1]), (current, scoped)):
+                    rows = journal_material_references(app.workspace, app.session.store, app.state['turns'], [str(root)])
+                    self.assertEqual(rows, expected)
+            build.assert_called_once()
         # A malformed neighbor or an unaccepted review must not hide valid reads.
         item = app.state['turns'][-1]['tools'][-1]
         item['review_result'] = 'attempts/unaccepted/native_result.json'
@@ -5555,7 +5562,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             with self.subTest(name=name, summary_source=sourced, overwrite=overwrite):
                 # Only the deferred export case requires the historical eager offer.
                 eager = {'tool_contracts': 'full', 'context_target': 64000} if name == 'export_report' else {}
-                _, _, fake, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1, **eager)
+                fixture = (self._historical_native_fixture if name in {'write_file', 'export_report', 'run_process'}
+                           else self._native_fixture)
+                _, _, fake, _, app, _ = fixture(mount_inputs=False, max_turns=1, **eager)
                 draft = app.workspace.workspace / 'draft.md'
                 draft.write_text('Bound result')
                 delivery = {'summary': 'Retained result', 'artifacts': ['workspace/draft.md'],

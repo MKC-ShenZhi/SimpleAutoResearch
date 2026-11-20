@@ -184,12 +184,23 @@ class CliTests(unittest.TestCase):
                     + 'process_invocations=4\nprocess_wall_seconds=32\n'
                     + '[execution]\n' + ''.join(f'{key}={_inline_value(value)}\n'
                         for key, value in execution.items()), encoding='utf-8')
+                from simple_ar.research.workflow_contracts import ResearchBrief
                 app = MagicMock()
                 app.run.return_value = {'status': 'completed'}
                 app.measurement_completion_actions.return_value = []
+                app.session.store.read_json.return_value = ResearchBrief(
+                    request_text='Compare literal conditions',
+                    objective='Compare literal conditions',
+                    requested_outputs=('experiments', 'report') if model else ('experiments',),
+                ).to_dict()
+                def _make_app(*_a, **kw):
+                    app.state = {'config': {'execution_contract': kw['execution_contract'],
+                        'model': kw.get('model'), 'report_requirement': kw.get('report_requirement')},
+                        'turns': [], 'requests': []}
+                    return app
                 with self.subTest(declaration=declaration), \
                         patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
-                        patch('simple_ar.app.tool_application.ToolApplication.create', return_value=app) as create, \
+                        patch('simple_ar.app.tool_application.ToolApplication.create', side_effect=_make_app) as create, \
                         patch('simple_ar.cli.main._render_native_result'), \
                         patch('simple_ar.app.research_application.create_session') as legacy, \
                         patch('subprocess.run') as process, contextlib.redirect_stdout(io.StringIO()):
@@ -382,7 +393,7 @@ code = "daily"
 
     def test_visual_review_sends_snapshot_preserves_original_and_recovers_without_call(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             image = root / "figure.png"
             image.write_bytes(b"rendered fixture")
             output = root / "review"
@@ -417,17 +428,18 @@ code = "daily"
             self.assertEqual(client.ask_json.call_count, 1)
 
     def test_writing_resume_keeps_explicit_paper_style_without_authorizing_execution(self):
-        from simple_ar.cli.main import _report_config_overrides
+        from simple_ar.cli.research_config import report_settings
+        from simple_ar.report.requirements import report_config_overrides
 
         args = SimpleNamespace(command="research-session", report_template="experiment",
                                _explicit_resume_destinations={"report_template"})
-        app = SimpleNamespace(services=SimpleNamespace(config={
-            "research_task_kind": "writing", "report": {"template": "analysis_report"}}))
-        self.assertEqual(_report_config_overrides(args, app), {"template": "experiment"})
-        app.services.config["report"]["template"] = "experiment"
-        self.assertEqual(_report_config_overrides(args, app), {})
-        app.services.config["research_task_kind"] = "survey"
-        self.assertEqual(_report_config_overrides(args, app), {"template": "survey"})
+        config = {"research_task_kind": "writing", "report": {"template": "analysis_report"}}
+        supplied = report_settings(args, explicit_destinations=args._explicit_resume_destinations)
+        self.assertEqual(report_config_overrides(supplied, config), {"template": "experiment"})
+        config["report"]["template"] = "experiment"
+        self.assertEqual(report_config_overrides(supplied, config), {})
+        config["research_task_kind"] = "survey"
+        self.assertEqual(report_config_overrides(supplied, config), {"template": "survey"})
 
     @contextlib.contextmanager
     def _structured_creation(self):
@@ -507,7 +519,7 @@ code = "daily"
 
     def test_structured_new_routes_outputs_roles_and_table_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             paper, notes, table = [root / name for name in ("paper.md", "notes.md", "values.csv")]
             paper.write_text("# Evidence\nReported observations.", encoding="utf-8")
             notes.write_text("User interpretation.", encoding="utf-8")
@@ -568,7 +580,7 @@ code = "daily"
         from simple_ar.app.tool_application import ToolApplication
 
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             paper, table = root / "paper.md", root / "values.csv"
             paper.write_text("# Method\nValidation supports reliability.\n", encoding="utf-8")
             table.write_text("value\n2\n4\n6\n", encoding="utf-8")
@@ -614,9 +626,9 @@ code = "daily"
                         self.assertEqual(status['status'], 'completed')
                         self.assertEqual(restored.ledger.to_dict(), before[0])
 
-    def test_survey_retained_sources_keep_material_role_and_reject_plain_notes(self):
+    def test_survey_accepts_retained_sources_and_notes_as_material(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             bundle, notes = root / "sources.json", root / "notes.md"
             notes.write_text("User notes", encoding="utf-8")
             write_json(bundle, {"schema_version": "document_bundle.v1", "documents": [{
@@ -627,11 +639,10 @@ code = "daily"
                 main(["research-session", "--topic", "Investigate evidence", "--task-kind", "survey",
                       "--material", str(bundle), "--model", "fixture", "--output-root", str(root / "runs")])
                 self.assertEqual(migrate.call_args.kwargs["sources"][0]["role"], "material")
-                migrate.reset_mock()
-                with self.assertRaisesRegex(SystemExit, "original-source"):
-                    main(["research-session", "--topic", "Investigate evidence", "--task-kind", "survey",
-                          "--material", str(notes)])
-                migrate.assert_not_called()
+                main(["research-session", "--topic", "Investigate evidence", "--task-kind", "survey",
+                      "--material", str(notes), "--model", "fixture", "--output-root", str(root / "runs")])
+                self.assertEqual(migrate.call_args.kwargs["sources"][0]["role"], "material")
+                self.assertEqual(Path(migrate.call_args.kwargs["sources"][0]["locator"]), notes)
 
     def test_code_task_init_same_second_reuses_unique_directory_owner(self):
         from datetime import datetime
@@ -702,7 +713,8 @@ code = "daily"
             self.assertEqual(sum(row.actual.get('llm_requests', 0) for row in ledger.entries), 1)
             self.assertEqual(sum(row.actual.get('total_tokens', 0) for row in ledger.entries), 8)
             self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in work), 4)
-            self.assertTrue(all(row.status == 'settled' for row in ledger.entries))
+            self.assertTrue(all(row.status == 'settled' for row in work))
+            self.assertTrue(all(row.status in {'settled', 'released'} for row in ledger.entries))
             self.assertEqual({row.session_id for row in ledger.entries}, {str(run.resolve())})
             self.assertEqual({row.attempt_id for row in ledger.entries}, {'standalone'})
             with SessionFileLock(run / 'code_task/meta/budget.lock'):
@@ -738,8 +750,19 @@ code = "daily"
             saved['code_task']['cli_accounting'] = saved['code_task'].pop('accounting')
             write_json(api_run / 'manifest.json', saved)
             run_code_task_baseline(api_run, skip_validation=True, timeout_sec=10)
+            foreign = LLMClient(settings, budget_ledger=BudgetLedger())
+            before = (api_run / 'budget_ledger.json').read_bytes()
+            with patch('simple_ar.integrations.llm._call_provider', return_value=provider):
+                generate_code_task_work_plan(api_run, llm_client=foreign, force=True)
+            self.assertEqual((api_run / 'budget_ledger.json').read_bytes(), before)
+            self.assertEqual(sum(row.actual.get('llm_requests', 0) for row in foreign.budget_ledger.entries), 1)
+            # A client carrying an older view of the saved ledger is rebound
+            # under the task lock before it spends anything.
+            same_task = LLMClient(settings, budget_ledger=BudgetLedger.load(api_run / 'budget_ledger.json'))
+            with patch('simple_ar.integrations.llm._call_provider', return_value=provider):
+                generate_code_task_work_plan(api_run, llm_client=same_task, force=True)
             api_ledger = BudgetLedger.load(api_run / 'budget_ledger.json')
-            self.assertEqual(sum(row.actual.get('llm_requests', 0) for row in api_ledger.entries), 3)
+            self.assertEqual(sum(row.actual.get('llm_requests', 0) for row in api_ledger.entries), 4)
             self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in api_ledger.entries
                 if row.purpose != 'code_probe'), 2)
             self.assertIsNone(client.budget_ledger)
@@ -762,7 +785,7 @@ code = "daily"
             ledger.reserve('old-agent', {'llm_requests': 0, 'total_tokens': 0}, purpose='external_agent')
             ledger.mark_unknown('old-agent', reason='Original external model usage was not reported')
             before = (run / 'budget_ledger.json').read_bytes()
-            with patch('simple_ar.cli.main.execute_code_task') as execute, \
+            with patch('simple_ar.code_task.orchestration.execute.execute_code_task') as execute, \
                     patch('simple_ar.cli.main.render_execute_header'), \
                     patch('simple_ar.cli.main.render_execute_result'):
                 main(['code-task', 'execute', str(run), '--no-llm', '--to-step', 'validate', '--no-review-inline'])
@@ -1143,7 +1166,7 @@ code = "daily"
                              'repair_rounds=2\n[environment]\nmode="current"\n', encoding="utf-8")
             code_run = root / "old-code-run"
             before = saved.read_bytes()
-            with patch("simple_ar.cli.main.execute_code_task") as execute, \
+            with patch("simple_ar.code_task.orchestration.execute.execute_code_task") as execute, \
                     patch("simple_ar.cli.main.render_execute_header"), \
                     patch("simple_ar.cli.main.render_execute_result"), \
                     patch("simple_ar.app.tool_application.ToolApplication.create") as native:
@@ -1182,7 +1205,7 @@ code = "daily"
 
     def test_brief_alias_uses_structured_summary_and_keeps_compatibility_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             paper = root / "source.md"
             paper.write_text("# Method\nReliable agents use validation.\n", encoding="utf-8")
             with self._structured_creation() as migrate:
@@ -1721,6 +1744,12 @@ code = "daily"
                     app = MagicMock()
                     app.brief = SimpleNamespace(requested_outputs=("experiments",))
                     app.services = SimpleNamespace(max_attempts=4, config=saved.copy())
+                    from simple_ar.report.requirements import report_config_overrides
+                    app.report_config_overrides.side_effect = (
+                        lambda supplied, session_resume=False: report_config_overrides(
+                            supplied, app.services.config, session_resume=session_resume
+                        )
+                    )
                     app.controller.manifest.budget.max_attempts = 4
                     app.view.return_value = SimpleNamespace(session_root=session_root,
                         status="completed", status_reason="", next_action=None,
@@ -1742,7 +1771,7 @@ code = "daily"
                     app.request_report.assert_called_once_with(**expected)
                     self.assertEqual(app.services.config, saved)
                     self.assertEqual(loader.call_args.kwargs["services"].config, {})
-                    app.advance.assert_called_once_with(max_actions=1)
+                    self.assertEqual(app.advance.call_args.kwargs['max_actions'], 12)
                     self.assertIn("Status: completed", stdout.getvalue())
                     self.assertIn(str(session_root / "attempts/report-001/report.md"), stdout.getvalue())
 
@@ -1773,8 +1802,9 @@ code = "daily"
                 state_refs={"report": SimpleNamespace(path="attempts/report-001/report.md")},
             )
             app.view.return_value = paused
+            app.report_config_overrides.return_value = {}
             app.continue_session.return_value = running
-            app.advance.side_effect = [running] * 9 + [completed]
+            app.advance.return_value = completed
             with (
                 patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()),
                 patch("simple_ar.app.research_application.load_session", return_value=app),
@@ -1784,7 +1814,7 @@ code = "daily"
             app.continue_session.assert_called_once_with(
                 reason="Resume the canonical report lifecycle within the persisted session budget.",
             )
-            self.assertEqual(app.advance.call_count, 10)
+            self.assertEqual(app.advance.call_args.kwargs['max_actions'], 11)
 
     def test_exhausted_report_resume_shows_bounded_authorization_entrypoint(self):
         from simple_ar.app.research_application import ResearchApplication
@@ -1810,6 +1840,7 @@ code = "daily"
             app.view.return_value = SimpleNamespace(
                 session_root=root, status="paused", next_action="report_write", state_refs={},
             )
+            app.report_config_overrides.return_value = {}
             app.continue_session.side_effect = RuntimeError("Session budget is exhausted.")
             output = io.StringIO()
             with (
@@ -1856,14 +1887,18 @@ code = "daily"
                  False, 0, 0, None),
             )
             with patch("simple_ar.cli.main._optional_research_llm_client", return_value=None), \
-                    patch("simple_ar.app.research_application.load_session", return_value=app), \
+                    patch("simple_ar.app.research_application.saved_research_intent",
+                          return_value=(app.brief, "survey")), \
+                    patch("simple_ar.app.research_application.load_session", return_value=app) as loader, \
                     patch("simple_ar.cli.start.migrate_structured_creation",
                           side_effect=AssertionError("Historical continuation must retain its owner")), \
                     contextlib.redirect_stdout(io.StringIO()):
                 for flags, recover, attempts, no_progress, resources in cases:
                     with self.subTest(flags=flags):
                         app.continue_session.reset_mock()
+                        loader.reset_mock()
                         main(base + flags)
+                        loader.assert_called_once()
                         app.continue_session.assert_called_once()
                         routed = app.continue_session.call_args.kwargs
                         self.assertEqual(routed["recover_interrupted"], recover)

@@ -792,7 +792,8 @@ class LLMClient:
                   if require_settled_response and _finish_reason_from_response(response) == 'length' else '')
         if tool_calls and not request.get('tools'):
             reason = 'Provider returned native tool calls to a text-only request; no tools were executed'
-        self._settle_budget(reservation_id, usage, **({'reason': reason} if reason else {}))
+        self._settle_budget(reservation_id, usage, reason=reason, estimated_input=prompt_tokens,
+            output_cap=output_cap)
         self._notify_usage(usage)
         if require_settled_response:
             unsettled = any(entry.reservation_id not in prior_reservations
@@ -1422,7 +1423,8 @@ class LLMClient:
             with self._usage_lock:
                 self._usage_callback(record)
 
-    def _settle_budget(self, reservation_id: str | None, usage: LLMUsage, *, reason: str = '') -> None:
+    def _settle_budget(self, reservation_id: str | None, usage: LLMUsage, *, reason: str,
+                       estimated_input: int, output_cap: int | None) -> None:
         if self._budget_ledger is None or reservation_id is None:
             return
         try:
@@ -1431,6 +1433,14 @@ class LLMClient:
                     reason="Vision provider usage missing; input reservation was estimated, not actual usage",
                     known_actual={"llm_requests": 1})
                 return
+            details = {'estimated_input': estimated_input}
+            if output_cap is not None:
+                details['output_cap'] = output_cap
+            if usage.source == 'provider':
+                if usage.prompt_tokens is not None:
+                    details['provider_input'] = usage.prompt_tokens
+                if usage.completion_tokens is not None:
+                    details['provider_output'] = usage.completion_tokens
             self._budget_ledger.settle(
                 reservation_id,
                 {
@@ -1439,6 +1449,7 @@ class LLMClient:
                 },
                 actual_source=usage.source,
                 reason=reason,
+                token_details=details,
             )
         except BudgetError as exc:
             raise LLMError(f"Could not settle LLM usage in budget ledger: {exc}") from exc

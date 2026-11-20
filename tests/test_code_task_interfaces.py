@@ -774,7 +774,7 @@ class CodeTaskInterfaceTests(unittest.TestCase):
         from simple_ar.core.budget import BudgetLedger
         from simple_ar.core.capabilities import ArtifactStore
         from simple_ar.tools.implementation import ImplementationRequest, ImplementationToolGateway
-        from simple_ar.tools.implementation_work import prepare_work
+        from simple_ar.tools.implementation_preparation import prepare_work
         from simple_ar.tools.workspace import WorkspaceToolGateway
 
         for parent_contract in ({}, {'producer_completion': 'goal_findings.v1'},

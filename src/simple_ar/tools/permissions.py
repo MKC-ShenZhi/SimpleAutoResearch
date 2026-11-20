@@ -28,6 +28,26 @@ class ToolPermissionPolicy(BaseModel):
         return True, "allowed"
 
     @classmethod
+    def for_task(cls, config: dict, specs: list[CommonToolSpec]) -> "ToolPermissionPolicy":
+        """Apply the saved task's grants to its actual registered tools."""
+        permissions = {PermissionLevel.READ_ONLY, PermissionLevel.PLAN, PermissionLevel.WRITE_PATCH}
+        if config['allow_execution']:
+            permissions.add(PermissionLevel.EXECUTION)
+        if config.get('allow_network') or config.get('allow_vision') or config.get('max_images', 0) > 0:
+            permissions.add(PermissionLevel.NETWORK)
+        blocked = {spec.name for spec in specs
+            if spec.domain == 'sources' and spec.permission_level == 'network'
+            and not config.get('allow_network')}
+        if config.get('code_task') is not None:
+            # The exact contract owns candidate mutations and execution.
+            blocked.update(spec.name for spec in specs
+                if spec.domain == 'workspace' and spec.permission_level in {'write_patch', 'execution'})
+            if not config.get('scientific_lineage'):
+                blocked.update(spec.name for spec in specs
+                    if spec.domain == 'scientific' and spec.permission_level == 'execution')
+        return cls(allowed_permissions=permissions, max_risk_level=RiskLevel.HIGH, blocked_tools=blocked)
+
+    @classmethod
     def read_only(cls) -> "ToolPermissionPolicy":
         return cls(allowed_permissions={PermissionLevel.READ_ONLY, PermissionLevel.PLAN})
 

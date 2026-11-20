@@ -54,7 +54,7 @@ def history_observation(call: dict, result: dict, record: str, *, navigation: bo
         and not (name == 'focus_work' and key == 'inputs')
         and not (key in indexed_arguments and value == indexed_arguments[key])
         and not (key == 'absolute_path' and value == indexed_arguments.get('path'))}
-    if navigation and 'returncode' in data:
+    if 'returncode' in data and (navigation or name == 'run_process' and result.get('status') == 'error'):
         for stream in ('stdout', 'stderr'):
             text = data.get(stream)
             if isinstance(text, str) and stream not in observed:
@@ -111,11 +111,7 @@ def _execution_projection(root: Path, manifest: dict, state: dict, ledger: Budge
             native_recipe is None or manifest.get('transition_recipe') != native_recipe
             or config.get('code_task') is not None):
         raise ValueError('Prepared approval is not available for this task owner')
-    workspace = WorkspaceToolGateway(root, {
-        **{alias: Path(path) for alias, path in config['sources'].items()},
-        'evidence': root / 'evidence', 'records': root / 'attempts'}, ledger,
-        project_python=Path(config['project_python']) if config.get('project_python') else None,
-        create_workspace=False, process_artifact_paths=config.get('process_artifact_paths'))
+    workspace = WorkspaceToolGateway.for_task(root, config, ledger, create_workspace=False)
     owner = (ImplementationToolGateway(root, workspace, ledger, config['model'], manifest['session_id'])
              if name == 'execute_implementation' else None)
     projection = workspace.execution_approval(call, pending=state['pending'], owner=owner)
@@ -210,14 +206,14 @@ def feedback_receipts(state: dict, read_record: RecordReader) -> list[dict]:
     return FeedbackSubmissions(records).receipts(state)
 
 
-def read_task_view(root: Path, *, read_record: RecordReader, ledger: BudgetLedger,
+def read_task_view(root: Path, *, read_record: RecordReader, ledger: BudgetLedger | None = None,
                    authorize_execution: Callable[[], None] | None = None,
                    native_recipe: str | None = None,
                    activity_limit: int = 24) -> dict:
     """Public saved-task view for CLI, GUI and result_snapshot consumers.
 
     ``read_record`` reads task-relative JSON under the caller's admission rules;
-    ``ledger`` is the existing ledger, used only for snapshots. The optional
+    ``ledger`` is the loaded task ledger, or is read from its saved reference. The optional
     callback admits execution inputs before approval owners read them (GUI launch
     grants, for example). It grants no execution. No application load is needed.
     Pass the caller's existing native recipe for prepared implementation approval;
@@ -234,6 +230,9 @@ def read_task_view(root: Path, *, read_record: RecordReader, ledger: BudgetLedge
     root = Path(root)
     manifest = read_record('session_manifest.json')
     state = read_record('actions.json')
+    if ledger is None:
+        ledger_path = (manifest.get('budget_ledger_ref') or {}).get('path', 'budget_ledger.json')
+        ledger = BudgetLedger.from_dict(read_record(ledger_path))
     approval, unavailable = _approval(root, manifest, state, ledger, read_record, authorize_execution, native_recipe)
     plan, activity = _activity(state, read_record, activity_limit)
     config = state['config']
@@ -254,6 +253,6 @@ def read_task_view(root: Path, *, read_record: RecordReader, ledger: BudgetLedge
             ('allow_network', 'allow_execution', 'sandbox_execution', 'allow_vision')},
         sources=list(config.get('sources', {})),
         resources=ledger.snapshot() | {'entries': [
-            {key: entry.to_dict()[key] for key in ('reservation_id', 'status', 'reserved', 'actual',
+            {key: getattr(entry, key) for key in ('reservation_id', 'status', 'reserved', 'actual',
                 'purpose', 'attempt_id', 'actual_source', 'reason')} for entry in ledger.entries]})
     return deepcopy(result)

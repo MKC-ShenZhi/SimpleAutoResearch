@@ -93,7 +93,9 @@ class CandidateReviewTests(unittest.TestCase):
         explicit = self.owner.review_delivery(claim, 'explicit', may_start=True,
             candidate=True, review_scope='delivery')
         self.assertNotIn('purpose', explicit['binding'])
-        historical = self.owner.review_delivery(claim, 'historical', may_start=True, candidate=True)
+        with patch.object(self.owner, 'validate_actual', wraps=self.owner.validate_actual) as validate:
+            historical = self.owner.review_delivery(claim, 'historical', may_start=True, candidate=True)
+        validate.assert_called_once()
         self.assertNotIn('purpose', historical['binding'])
 
         self.owner.config['delivery_review_selection'] = 'model.v3'
@@ -186,6 +188,10 @@ class CandidateReviewTests(unittest.TestCase):
         binding['artifacts'].pop(str(self.workspace.resolve('other.md')))
         other = direct.model_copy(update={'artifacts': ['other.md']})
         self.assertFalse(self.owner.requires_review(other))
+        self.workspace.resolve('replacement.md').write_text('Replacement', encoding='utf-8')
+        binding['artifacts'][str(self.workspace.resolve('other.md'))] = 'other-version'
+        revised = direct.model_copy(update={'artifacts': ['draft.md', 'replacement.md']})
+        self.assertTrue(self.owner.requires_review(revised))
         self.observations[-1]['current_request'] = False
         self.assertFalse(self.owner.requires_review(direct))
 
@@ -357,9 +363,11 @@ class CandidateReviewTests(unittest.TestCase):
         self.observations.append({'tool_name': 'deliver_result', 'status': 'ok', 'data': claim,
             'record': 'attempts/delivery/native_result.json', 'current_request': True})
         self.review.issues = Mock(return_value=['Independent check required'])
+        self.review.prepare = Mock(wraps=self.review.prepare)
 
         lifecycle, feedback = self.owner.working_guidance(None, include_lifecycle=True)
         self.assertEqual(self.review.issues.call_count, 1)
+        self.assertEqual(self.review.prepare.call_count, 1)
         self.assertIn('Independent check required', feedback['issues'])
         self.assertIn('Independent check required', [row['message'] for row in lifecycle['conditions']])
         first_binding = deepcopy(self.review.issues.call_args.args[1])
@@ -367,6 +375,7 @@ class CandidateReviewTests(unittest.TestCase):
         self.workspace.resolve('draft.md').write_text('# Changed finding\n', encoding='utf-8')
         self.owner.working_guidance(None, include_lifecycle=True)
         self.assertEqual(self.review.issues.call_count, 2)
+        self.assertEqual(self.review.prepare.call_count, 2)
         self.assertNotEqual(first_binding['artifacts'], self.review.issues.call_args.args[1]['artifacts'])
 
         self.observations.append({'tool_name': 'deliver_result', 'status': 'error',
@@ -388,7 +397,7 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         self.addCleanup(case.doCleanups)
         case.app = ToolApplication.create(case.root, 'Complete the requested work.',
             model='fixture', sources={}, services=case.services, max_turns=20,
-            max_tokens=900000, max_attempts=100, tool_contracts='full')
+            max_tokens=900000, max_attempts=100, tool_contracts='full', independent_review_required=False)
         case._write('first.md', 'The first candidate.\n')
         case._write('second.md', 'A different candidate.\n')
         case.review = lambda view: {'conclusion': 'incomplete', 'findings': [], 'evidence': [],
@@ -518,7 +527,7 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         self.assertGreater(len(case.inspection_requests), checked)
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
 
-    def test_caller_required_review_cannot_be_waived_and_reuses_the_reviewed_candidate(self):
+    def test_new_task_review_cannot_be_waived_and_reuses_the_reviewed_candidate(self):
         from simple_ar.app.tool_application import ToolApplication
         from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
 
@@ -527,8 +536,7 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         self.addCleanup(case.doCleanups)
         case.app = ToolApplication.create(case.root, 'Independently review the note before delivery.',
             model='fixture', sources={}, services=case.services, max_turns=20,
-            max_tokens=900000, max_attempts=100, tool_contracts='full',
-            independent_review_required=True)
+            max_tokens=900000, max_attempts=100, tool_contracts='full')
         case._write('note.md', 'A bounded explanation.\n')
         case.review = lambda view: {'conclusion': 'incomplete', 'findings': [], 'evidence': [],
             'limitations': ['The independent investigation is unfinished.']}
@@ -823,6 +831,63 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         self.assertFalse((case.root/'workspace/inspection-work/outside').exists())
         case._not_delivered()
 
+    def test_partial_delivery_hands_review_and_matching_originals_to_resumed_work(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
+
+        case = OperationsWorkLoopTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.app = ToolApplication.create(case.root, 'State the scope of the result in the editable note.',
+            model='fixture', sources={}, services=case.services, max_turns=20,
+            max_tokens=900000, max_attempts=100, tool_contracts='on_demand')
+        original = 'The sample contains three observations.\nThe entire population has the same mean.\n'
+        case._write('note.md', original)
+
+        def review(view):
+            reads = case._inspection_missing_reads(view, ['note.md'])
+            if reads:
+                return reads
+            note, = case._inspection_sources(view, 'note.md')
+            return {'conclusion': 'incomplete', 'limitations': [], 'findings': [],
+                'evidence': [note['subject']], 'investigations': [{
+                    'claim': 'The population mean equals the observed sample mean.',
+                    'scope': 'The sample description in the editable note.',
+                    'basis': 'observed',
+                    'method': 'Compare the scope stated in the note with the sample.',
+                    'reasoning': 'The sample is observed. There is no population measurement.',
+                    'evidence': [note['subject']], 'outcome': 'unresolved'}]}
+
+        case.review = review
+        claim = {'summary': 'Scope of the sample result', 'artifacts': ['note.md']}
+        case._submit(_action('review_result', **claim, review_scope='delivery'))
+        proof = case._ok('review_result', reviewed=True)['metadata']['delivery_review']
+        self.assertEqual(proof['result']['metadata']['delivery_assessment']['verdict'], 'incomplete')
+        case._submit(_action('deliver_result', **claim, unresolved=['Unresolved independent review.']))
+        case._run(feedback='Use the independent opinion and correct the scope.',
+            independent_review_required=True, should_stop=lambda: True)
+        case._reload()
+        before = case.app.ledger.to_dict()
+
+        def view():
+            return json.loads(case.app._messages()[1]['content'])
+
+        handoff = view()
+        revision = handoff['delivery_conditions']['revision']
+        self.assertIn('population mean', revision['open_checks'][0]['claim'])
+        self.assertTrue(any(row['observation'].get('text') == original
+            and row['observation']['record'] == revision['record']
+            and row['version_status'] == 'matching' for row in handoff['working_view']['observations']))
+
+        # Feedback still guides the producer after its file changes. Only the
+        # matching original can support an exact edit in the current version.
+        (case.root / 'workspace/note.md').write_text('The original text was revised.\n', encoding='utf-8')
+        revised = view()
+        self.assertEqual(revised['delivery_conditions']['revision'], revision)
+        self.assertFalse(any(row['observation'].get('text') == original
+            and row['version_status'] == 'matching' for row in revised['working_view']['observations']))
+        self.assertEqual(before, case.app.ledger.to_dict())
+
     def test_fresh_candidate_revision_final_opinion_reuse_and_feedback_reload(self):
         from simple_ar.app.tool_application import ToolApplication
         from tests.test_professional_work_loop import OperationsWorkLoopTests, _action
@@ -848,7 +913,17 @@ class IntegratedCandidateFlowTests(unittest.TestCase):
         ready = case._ok('review_result', reviewed=True)['metadata']['delivery_review']
         self.assertNotIn('purpose', ready['binding'])
         inspected = len(case.inspection_requests)
-        case._submit(_action('deliver_result', **final))
+        owner = case.app.operations.delivery
+        _, guidance = owner.working_guidance(None, include_lifecycle=True)
+        action = guidance['next_action']
+        self.assertEqual(action['tool'], 'deliver_result')
+        path = case.root/'workspace/final.md'
+        original = path.read_bytes()
+        path.write_bytes(original + b'Changed after independent review.\n')
+        _, stale = owner.working_guidance(None, include_lifecycle=True)
+        self.assertNotIn('next_action', stale)
+        path.write_bytes(original)
+        case._submit(_action(action['tool'], **action['arguments']))
         self.assertEqual(case.app.session.manifest.status, 'completed', case.app.result_snapshot())
         self.assertEqual(len(case.inspection_requests), inspected)
         before = case.app.ledger.to_dict()

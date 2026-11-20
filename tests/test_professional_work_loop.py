@@ -2942,6 +2942,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
         before = {p:p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
         ledger, calls = self.app.ledger.to_dict(), self.send.call_count
 
+        store = self.app.session.store
+        with patch.object(store, 'read_json', wraps=store.read_json) as read_json:
+            self.app._conversation_messages()
+        for item in reads:
+            self.assertEqual(sum(call.args == (item['result'],) for call in read_json.call_args_list), 1)
+
         for alteration in ('none', 'omit', 'field', 'range', 'version'):
             def project(result, record, **kwargs):
                 view = deepcopy(present(result, record, **kwargs))
@@ -4347,9 +4353,16 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._create()
         self._write('report.md', '# Observations\n\nThe recorded mean is 2.0.\n')
 
+        offers = []
+        self.review = lambda view: ([_action('read_file', path='measurements/conditions.txt')]
+            if self._inspection_sources(view, 'measurements/conditions.txt')[0] is None
+            else self._review_complete_targets(view))
+
         def interrupted(mode, request, **kwargs):
             if any(row['function']['name'] == 'record_inspection' for row in request.get('tools', [])):
-                raise LLMStreamError('Controlled independent review stream interrupted')
+                offers.append(deepcopy(request))
+                if len(offers) == 2:
+                    raise LLMStreamError('Controlled independent review stream interrupted')
             return self._provider(mode, request, **kwargs)
 
         self.send.side_effect = interrupted
@@ -4371,6 +4384,19 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.send.call_count, calls)
         self.assertEqual((self.root/'budget_ledger.json').read_bytes(), before)
         self.assertTrue(self.app.ledger.unknown_dimensions())
+        failed = pending['action']['attempt']
+        old_entries = self.app.ledger.to_dict()['entries']
+        self._run(retry_model=True)
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertEqual(self.send.call_count, calls + 1)
+        self.assertEqual(offers[-1], offers[-2])
+        entries = self.app.ledger.to_dict()['entries']
+        self.assertEqual(entries[:len(old_entries)], old_entries)
+        old, = [row for row in old_entries if row['attempt_id'] == failed and row['status'] == 'unknown']
+        new, = [row for row in entries[len(old_entries):] if row['actual'].get('llm_requests')]
+        self.assertEqual(new['logical_call_id'], old['logical_call_id'])
+        self.assertNotEqual(new['attempt_id'], old['attempt_id'])
+        self.assertEqual(new['status'], 'settled')
 
     def test_new_concern_after_interrupted_delivery_invalidates_reusable_opinion(self):
         from simple_ar.tools.delivery_versions import DeliveryVersions
@@ -7378,6 +7404,32 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     calls = self.send.call_count
                     self._run()
                     self.assertEqual(self.send.call_count,calls)
+
+    def test_single_file_mount_locator_is_reusable_for_editing_a_copy(self):
+        self._create()
+        draft = self.inputs / 'draft.md'
+        draft.write_text('Existing draft\n', encoding='utf-8')
+        self.app.workspace.mounts['draft'] = draft
+        workspace = self.app.workspace
+        read = workspace.call('read_file', {'path': 'draft', 'full_digest': True}, identity='read-draft')
+        blocked = workspace.call('copy_file', {'source': 'draft/draft.md', 'path': 'edited.md',
+            'source_sha256': read.data['sha256']}, identity='invalid-copy')
+        self.assertEqual(blocked.status, 'blocked')
+        self.assertIn("Use 'draft' as the path", blocked.error)
+        copied = workspace.call('copy_file', {'source': read.data['path'], 'path': 'edited.md',
+            'source_sha256': read.data['sha256']}, identity='copy-draft')
+        self.assertTrue(copied.ok, copied.error)
+        self.assertEqual((self.root / 'workspace/edited.md').read_bytes(), draft.read_bytes())
+
+    def test_too_long_timeout_leaves_the_shorter_validation_available(self):
+        self._create()
+        self.app.ledger.limits['process_wall_seconds'] = 2.5
+        blocked = self.app.workspace.call('run_process',
+            {'argv': ['python', '-c', 'print(1)'], 'timeout_sec': 3}, identity='long-command')
+        self.assertEqual(blocked.status, 'blocked')
+        self.assertEqual(blocked.data, {'max_timeout_sec': 2, 'executed': False})
+        self.assertFalse(self._process_receipts())
+        self.assertFalse(self.app.ledger.entries)
 
     def test_direct_resource_failure_stops_paid_investigation_and_feedback_keeps_prior_work(self):
         for name, arguments in (

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import math
 from pathlib import Path
@@ -49,6 +49,7 @@ class BudgetEntry:
     reason: str = ""
     created_at: str = ""
     updated_at: str = ""
+    token_details: dict[str, BudgetNumber] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the stable JSON representation of this entry."""
@@ -67,6 +68,7 @@ class BudgetEntry:
             "reason": self.reason,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            **({"token_details": dict(self.token_details)} if self.token_details else {}),
         }
 
     @classmethod
@@ -95,6 +97,7 @@ class BudgetEntry:
             reason=_optional_text(data.get("reason")),
             created_at=_optional_text(data.get("created_at")),
             updated_at=_optional_text(data.get("updated_at")),
+            token_details=_normalize_amounts(data.get("token_details", {}), field="token_details"),
         )
 
 
@@ -240,6 +243,11 @@ class BudgetLedger:
             data = read_json(Path(path))
         except (OSError, ValueError) as exc:
             raise BudgetError(f"Could not read budget ledger: {path}") from exc
+        return cls.from_dict(data, storage_path=path)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any], *, storage_path: Path | None = None) -> "BudgetLedger":
+        """Restore recorded charges for the task that continues this preparation."""
         if not isinstance(data, Mapping):
             raise BudgetError("Budget ledger must be a JSON object")
         if data.get("schema_version") != cls.schema_version:
@@ -250,7 +258,7 @@ class BudgetLedger:
         if not isinstance(raw_entries, list):
             raise BudgetError("Budget ledger entries must be a list")
 
-        ledger = cls(data.get("limits", {}), storage_path=Path(path))
+        ledger = cls(data.get("limits", {}), storage_path=storage_path)
         for raw_entry in raw_entries:
             entry = BudgetEntry.from_dict(raw_entry)
             if entry.reservation_id in ledger._entries:
@@ -322,11 +330,13 @@ class BudgetLedger:
         actual_source: str = "provider",
         provider_call_id: str = "",
         reason: str = "",
+        token_details: Mapping[str, BudgetNumber] | None = None,
     ) -> BudgetEntry:
         """Settle one reservation exactly once with measured or estimated use."""
 
         reservation_id = _required_text(reservation_id, "reservation_id")
         normalized = _normalize_amounts(actual, field="actual")
+        details = _normalize_amounts(token_details or {}, field="token_details")
         actual_source = _required_text(actual_source, "actual_source")
         with self._lock:
             entry = self._require_entry(reservation_id)
@@ -347,6 +357,7 @@ class BudgetLedger:
                 )
             entry.actual = normalized
             entry.actual_source = actual_source
+            entry.token_details = details
             if provider_call_id:
                 entry.provider_call_id = _optional_text(provider_call_id)
             entry.reason = _optional_text(reason)

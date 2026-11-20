@@ -1731,6 +1731,9 @@ class ImplementationDecisionTests(unittest.TestCase):
     def test_source_owner_can_reread_or_recall_before_submitting(self):
         for name, actions in (
                 ('duplicates', [{'read_windows': [{'path': 'inputs/note.txt'}]}] * 2),
+                ('same-batch', [{'read_windows': [{'path': 'inputs/note.txt'},
+                                                  {'path': 'inputs/note.txt'}]},
+                    {'read_windows': [{'path': 'inputs/note.txt'}]}]),
                 ('focus-reread', [{'focus_observations': []},
                     {'read_windows': [{'path': 'inputs/note.txt'}]}]),
                 ('different-ceilings', [{'read_windows': [{'path': 'inputs/note.txt', 'max_bytes': size}]}

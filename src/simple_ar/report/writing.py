@@ -452,6 +452,61 @@ class _SectionRecoveryStore(ArtifactStore):
         return self.original.write_json(path, payload, **options)
 
 
+def check_legacy_writer_receipt(store: ArtifactStore) -> None:
+    """Retain historical publication proof without upgrading input reuse."""
+    completed = store.read_json('professional_result.json')
+    if hashlib.sha256(store.resolve('writer/' + completed['writer_path']).read_bytes()).hexdigest() != completed['writer_sha256']:
+        raise ValueError('Report Writer evidence changed; no completed delivery')
+
+def completed_interrupted_writer(store: ArtifactStore, expected: dict[str, Any], identity: str) -> dict:
+    from simple_ar.report.schema import AgentReportResult
+
+    if not all(store.exists(path) for path in ('report_inputs.json', 'sections.json', 'writer.json')):
+        raise ValueError('Interrupted composition has no complete Writer; no blind replay')
+    snapshot = store.read_json('report_inputs.json')
+    # Reuse the Writer owner's identity rules, including historical path
+    # normalization. Never manufacture a new identity for retained work.
+    snapshot_id = snapshot.get('snapshot_id')
+    if (not isinstance(snapshot_id, str) or not re.fullmatch(r'[0-9a-f]{64}', snapshot_id)
+            or _writing_identity(snapshot) != _writing_identity(expected)):
+        raise ValueError('Writer input snapshot changed or is not bound to this request')
+    checkpoint = store.read_json('sections.json')
+    written = store.read_json('writer.json')
+    completed = checkpoint.get('completed', {})
+    if (checkpoint.get('snapshot_id') != snapshot_id or checkpoint.get('source_attempt') != identity
+            or written.get('snapshot_id') != snapshot_id
+            or written.get('schema_version') != 'report_agent_result.v1'
+            or written.get('input_snapshot') != store.ref('report_inputs.json',
+                kind='report_snapshot', schema='report_snapshot.v1').to_dict()
+            or completed.get('pending_draft', True) is not None
+            or any(key not in completed or written.get(key) != completed[key] for key in
+                ('memory', 'sections', 'iterations', 'reviewer_findings', 'tool_results'))):
+        raise ValueError('Writer result is partial or differs from its complete checkpoint')
+    payload = {key: written[key] for key in
+        ('memory', 'sections', 'iterations', 'reviewer_findings', 'tool_results', 'used_agent')}
+    result = AgentReportResult.model_validate({'report_body': '', **payload})
+    plans = expected['memory']['section_plan']
+    if (not result.used_agent or len(result.sections) != len(plans)
+            or [row.section_id for row in result.sections] != [row['section_id'] for row in plans]
+            or any(row.status == 'skipped' or not row.draft_markdown.strip() for row in result.sections)
+            or any(row.type in {'document_review_unavailable', 'document_revision_unavailable'}
+                for row in result.memory.reviewer_findings)):
+        raise ValueError('Writer did not complete; retained checkpoint is not an accepted article')
+    config = snapshot['config']
+    if config['reviewer'] != 'disabled' or config['document_review'] or config['max_review_iterations'] != 0:
+        raise ValueError('This composition cannot certify an interrupted review')
+    return written
+
+def check_retained_composition_writer(*, store: ArtifactStore, binding: dict[str, Any], identity: str) -> None:
+    """Use the proof required by the saved publication's writing contract."""
+    if (binding.get('writing_owner') == 'professional_report.v1'
+            and 'section_response_contract' not in binding
+            and binding['report_binding']['requirement']['method'] == 'sections'):
+        check_legacy_writer_receipt(store)
+        return
+    completed_composition_writer(store=store, binding=binding, identity=identity)
+
+
 def completed_composition_writer(*, store: ArtifactStore, binding: dict[str, Any], identity: str) -> None:
     """Prove a completed composition through its original Writer recovery owner.
 
@@ -1388,6 +1443,21 @@ def resolve_report_writing_resume(*, report_context: ReportContext, memory: Repo
                     path = Path('attempts') / attempt.attempt_id / refs[0].path
                     return None, store.read_json(path)['sections'][0]['draft_markdown']
     return None, ''
+
+
+def write_bound_document(*, owner: ArtifactStore, writer: ArtifactStore, identity: str,
+                         inputs: tuple[ArtifactRef, ...], request: ReportWritingRequest,
+                         response_contract: str | None = None, retry_unstarted: bool = False) -> CapabilityResult:
+    """Use one Writer for a document whose input and physical attempt are already bound."""
+    resume = (owner.ref(writer.root.relative_to(owner.root) / 'sections.json',
+        kind='report_checkpoint', schema='report_checkpoint.v1') if writer.exists('sections.json') else None)
+    client = request.llm_client
+    if response_contract in {'atomic_complete.v1', 'atomic_complete.v2'}:
+        client = retained_writing_client(store=writer, identity=identity, client=client,
+            contract=response_contract, retry_unstarted=retry_unstarted)
+    return run_report_writing_capability(context=CapabilityContext(writer, AttemptManifest(identity),
+        inputs=inputs + ((resume,) if resume is not None else ()), input_store=owner),
+        request=replace(request, llm_client=client, resume_ref=resume))
 
 
 def run_report_writing_capability(*, context: CapabilityContext, request: ReportWritingRequest) -> CapabilityResult:

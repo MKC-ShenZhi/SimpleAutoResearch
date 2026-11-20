@@ -42,7 +42,7 @@ from simple_ar.code_task.generation.task_contract import (
 from simple_ar.code_task.generation.writer import write_generated_project
 from simple_ar.code_task.generation.implementation_memory import initial_implementation_memory
 from simple_ar.code_task.generation.review import review_generated_project
-from simple_ar.integrations.llm import LLMClient, LLMError, bind_task_budget, task_budget_identity
+from simple_ar.integrations.llm import LLMClient, LLMError, bind_task_budget
 
 from .agent_backend import (
     check_agent_budget,
@@ -252,8 +252,6 @@ def generate_greenfield_code_task(
             generated_files=tuple(str(row["path"]) for row in artifacts.get("generated_files", [])
                                   if isinstance(row, dict) and row.get("path")),
         )
-    budget_ledger, session_id, attempt_id = task_budget_identity(llm_client, budget_ledger,
-        session_id=session_id, attempt_id=attempt_id)
     if should_use_agent_backend(implementation_provider):
         check_agent_budget(root, implementation_provider, enabled=implementation_allow_external_agent,
                            binary=implementation_agent_binary, mode=implementation_agent_mode, ledger=budget_ledger)

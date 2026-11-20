@@ -32,6 +32,10 @@ class CodeTaskReviewResult:
     warning_count: int
 
 
+def review_report_path(run_dir: Path, phase: str) -> Path:
+    return Path(run_dir) / _relative_meta_path(phase, "review_report")
+
+
 @account_code_task
 def review_code_task_changes(
     run_dir: Path,
@@ -100,7 +104,7 @@ def review_code_task_changes(
             "review_cluster_count": len(clusters),
         },
     )
-    report_path = paths.meta_dir / f"review_report{suffix}.json"
+    report_path = review_report_path(root, phase)
     findings = report.get("findings", [])
     for row in findings:
         if not isinstance(row, dict):

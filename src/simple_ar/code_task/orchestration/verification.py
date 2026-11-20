@@ -1,23 +1,34 @@
 """Review and validate applied repairs; experiment actions own measurement."""
 
 from dataclasses import dataclass
-import os
+import hashlib
 from pathlib import Path
-import shlex
-import subprocess
 from typing import Any, Callable, Mapping
 
-from simple_ar.core.artifacts import read_json
+from simple_ar.core.artifacts import read_json, read_text, write_json
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.code_task.runtime.accounting import account_code_task
 from simple_ar.code_task.editing.patching import apply_patch_edits
 from simple_ar.code_task.execution.repair import RepairEvidence, RepairProposalResult, propose_repair_edits
-from simple_ar.code_task.execution.runner import CodeTaskRunResult, recover_implementation_process, run_code_task_benchmark
+from simple_ar.code_task.execution.runner import CodeTaskRunResult, _argv_command, run_code_task_benchmark
 from simple_ar.code_task.execution.validation import validate_code_task
-from simple_ar.code_task.review import review_code_task_changes
-from simple_ar.integrations.llm import LLMClient, bind_task_budget, task_budget_identity
+from simple_ar.code_task.review import review_code_task_changes, review_report_path
+from simple_ar.code_task.execution.summary import write_code_task_summary
+from simple_ar.code_task.generation.review import review_generated_project
+from simple_ar.code_task.generation.task_contract import (
+    build_greenfield_task_contract, contract_coverage, load_task_contract, save_task_contract,
+)
+from simple_ar.code_task.memory import record_review_finding
+from simple_ar.code_task.runtime.state import (
+    CodeTaskPaths, code_task_paths, code_task_workspace_boundary, load_code_task_manifest,
+    manifest_section, read_optional_object, save_code_task_manifest, utcnow_iso,
+)
+from simple_ar.integrations.llm import LLMClient, bind_task_budget
 
 MessageCallback = Callable[[str], None]
+
+
+@account_code_task
 def validate_repair_patch(
     run_dir: Path, *, llm_client: LLMClient | None = None, model: str | None = None,
     use_llm: bool = True, message_callback: MessageCallback | None = None,
@@ -26,12 +37,11 @@ def validate_repair_patch(
     process_protection: dict[str, int | float] | None = None,
 ) -> None:
     """Review and statically validate an applied repair without measuring it."""
-    budget_ledger, session_id, attempt_id = task_budget_identity(llm_client, budget_ledger,
-        session_id=session_id, attempt_id=attempt_id)
     _emit(message_callback, "Reviewing embedded code-task repair before validation.")
-    from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest
-    report = code_task_paths(run_dir).meta_dir / 'review_report_post_repair.json'
-    retained = report.is_file() and code_task_paths(run_dir).manifest_path.is_file() and load_code_task_manifest(run_dir).get('code_task', {}).get('native_binding')
+    paths = code_task_paths(run_dir)
+    manifest = load_code_task_manifest(run_dir)
+    report = review_report_path(run_dir, 'post_repair')
+    retained = report.is_file() and manifest.get('code_task', {}).get('native_binding')
     review_status = read_json(report)['status'] if retained else review_code_task_changes(
         run_dir, llm_client=llm_client, phase="post_repair", model=model,
         use_llm=use_llm, message_callback=message_callback,
@@ -41,11 +51,9 @@ def validate_repair_patch(
             "Embedded code-task review blocked the repair patch. "
             f"See {report}."
         )
-    manifest = load_code_task_manifest(run_dir)
     if (manifest.get('code_task', {}).get('kind') == 'greenfield'
             and manifest.get('implementation', {}).get('mode') == 'controlled_patch'):
-        from simple_ar.code_task.orchestration.execute import _rerun_greenfield_review
-        whole = _rerun_greenfield_review(run_dir, code_task_paths(run_dir), max_files=6, max_generated_lines=1600)
+        whole = review_saved_greenfield(run_dir, paths, max_files=6, max_generated_lines=1600)
         if whole['status'] == 'failed':
             raise RuntimeError('Generated revision failed the retained whole-project/API contract')
     repaired_validation = validate_code_task(run_dir,
@@ -57,6 +65,154 @@ def validate_repair_patch(
             "Embedded code-task validation failed after repair. "
             f"See {repaired_validation.report_path}."
         )
+
+
+def review_saved_greenfield(
+    run_dir: Path,
+    paths: CodeTaskPaths,
+    *,
+    max_files: int,
+    max_generated_lines: int,
+) -> dict[str, Any]:
+    from simple_ar.code_task.generation.greenfield import result_schema_from_manifest
+    from simple_ar.code_task.runtime.state import review_workspace_boundary
+
+    manifest = load_code_task_manifest(run_dir)
+    boundary = review_workspace_boundary(paths.workspace_dir / 'generated_project',
+        boundary=code_task_workspace_boundary(run_dir))
+    code_artifacts = read_optional_object(paths.meta_dir / "code_artifacts.json")
+    resource_plan = _greenfield_resource_plan(paths, max_files=max_files, max_generated_lines=max_generated_lines)
+    if manifest.get('implementation', {}).get('mode') == 'controlled_patch':
+        if not (paths.meta_dir / 'task_contract.json').is_file():
+            raise ValueError('Generated revision is missing its original task contract')
+        resource_plan = read_json(paths.meta_dir / 'implementation_plan.json')['resource_plan']
+        project = paths.workspace_dir / 'generated_project'
+        from simple_ar.code_task.analysis.index import build_codebase_index
+        code_artifacts = {**code_artifacts, 'generated_files': [
+            {'path': row['path'], 'mode': 'controlled_revision',
+             'line_count': len((project / row['path']).read_text(encoding='utf-8', errors='replace').splitlines())}
+            for row in build_codebase_index(project, access_boundary=boundary)['files']]}
+    review = review_generated_project(
+        access_boundary=boundary,
+        project_dir=paths.workspace_dir / "generated_project",
+        code_artifacts=code_artifacts,
+        result_schema=result_schema_from_manifest(manifest),
+        resource_plan=resource_plan,
+        contract=greenfield_review_contract(paths),
+        dependency_advice=read_optional_object(paths.meta_dir / "dependency_advice.json"),
+        implementation_memory=read_optional_object(paths.task_dir / "memory" / "implementation_memory.json"),
+        architecture_plan=read_optional_object(paths.meta_dir / "architecture_plan.json"),
+        client=None,
+        meta_dir=paths.meta_dir,
+        use_llm=False,
+    )
+    report_path = paths.meta_dir / "review_report.json"
+    if report_path.is_file():
+        # Contract migration refreshes the active view, not historical facts.
+        # Keep the complete prior report before replacing that view; this is
+        # an immutable artifact, not another review state or replay policy.
+        previous = read_json(report_path)
+        digest = hashlib.sha256(report_path.read_bytes()).hexdigest()
+        historical = paths.meta_dir / "review_history" / f"{digest}.json"
+        if historical.is_file():
+            if read_json(historical) != previous:
+                raise ValueError("Retained historical review changed; refusing to replace the active report")
+        else:
+            write_json(historical, previous)
+    write_json(report_path, review)
+    record_generated_review_findings(run_dir, review)
+    manifest = load_code_task_manifest(run_dir)
+    implementation = manifest_section(manifest, "implementation")
+    implementation["review_status"] = review.get("status", "unknown")
+    implementation["status"] = "generated" if review.get("status") != "failed" else "review_failed"
+    implementation["reviewed_at"] = utcnow_iso()
+    manifest["implementation"] = implementation
+    save_code_task_manifest(run_dir, manifest)
+    write_code_task_summary(run_dir)
+    return review
+
+
+def record_generated_review_findings(run_dir: Path, report: Mapping[str, Any]) -> None:
+    findings = report.get("findings")
+    if not isinstance(findings, list):
+        return
+    for row in findings:
+        if not isinstance(row, dict):
+            continue
+        record_review_finding(
+            run_dir,
+            {
+                "key": row.get("key")
+                or f"greenfield:{row.get('category', '')}:{str(row.get('summary', ''))[:48]}",
+                "severity": row.get("severity", "info"),
+                "category": row.get("category", "general"),
+                "summary": row.get("summary", ""),
+                "evidence": row.get("evidence", []),
+                "recommendation": row.get("recommendation", ""),
+                "source": row.get("source", "greenfield-reviewer"),
+            },
+        )
+
+
+def _greenfield_resource_plan(paths: CodeTaskPaths, *, max_files: int, max_generated_lines: int) -> dict[str, Any]:
+    decision = read_optional_object(paths.meta_dir / "resource_decision.json")
+    return {
+        "schema_version": "code_task_greenfield_resource_plan.v1",
+        "profile": str(decision.get("profile") or "local_cpu"),
+        "allow_gpu": bool(decision.get("allow_gpu")),
+        "max_files": max_files,
+        "max_generated_lines": max_generated_lines,
+        "decision": decision,
+    }
+
+
+def greenfield_review_contract(paths: CodeTaskPaths) -> dict[str, Any]:
+    from simple_ar.code_task.generation.greenfield import result_schema_from_manifest
+
+    contract = load_task_contract(paths.meta_dir)
+    if contract:
+        architecture = read_optional_object(paths.meta_dir / "architecture_plan.json")
+        write_json(paths.meta_dir / "task_contract_coverage.json", contract_coverage(contract, architecture))
+        return contract
+    task_path = paths.task_dir / "task.md"
+    task = read_text(task_path) if task_path.is_file() else ""
+    manifest = load_code_task_manifest(paths.run_dir)
+    result_schema = result_schema_from_manifest(manifest)
+    architecture = read_optional_object(paths.meta_dir / "architecture_plan.json")
+    generation_plan = architecture.get("generation_plan") if isinstance(architecture.get("generation_plan"), dict) else {}
+    contract = build_greenfield_task_contract(
+        task,
+        benchmark_command=str((manifest.get("benchmark") or {}).get("command") or "python generated_project/main.py")
+        if isinstance(manifest.get("benchmark"), dict)
+        else "python generated_project/main.py",
+        max_files=_positive_int(generation_plan.get("max_files"), 8),
+        max_generated_lines=_positive_int(generation_plan.get("max_generated_lines"), 1600),
+        result_schema=result_schema,
+        source={
+            "kind": "legacy_reconstructed",
+            "task_file": "code_task/task.md",
+            "origin": "greenfield_review_repair_compatibility",
+        },
+    )
+    save_task_contract(paths.meta_dir, contract)
+    write_json(paths.meta_dir / "task_contract_coverage.json", contract_coverage(contract, architecture))
+    return contract
+
+
+def _positive_int(value: object, default: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
+
+
+
+
+
+
+
+
 @dataclass(frozen=True)
 class ImplementationVerificationResult:
     validation: CodeTaskRunResult
@@ -65,6 +221,7 @@ class ImplementationVerificationResult:
     repair: RepairProposalResult | None
 
 
+@account_code_task
 def apply_verified_repair(
     run_dir: Path, repair: RepairProposalResult, *, approval_note: str,
     llm_client: LLMClient, message_callback: MessageCallback | None = None,
@@ -79,7 +236,6 @@ def apply_verified_repair(
         raise ValueError("Applying a repair requires explicit isolated-workspace approval.")
     if repair.mode != "llm" or not repair.edit_count:
         raise ValueError("Applying a repair requires a nonempty model proposal.")
-    from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest
     plan = load_code_task_manifest(run_dir).get('plan', {})
     direct_without_plan = (direct_edit and isinstance(plan, dict) and plan.get('status') in (None, '', 'not_started')
         and not (code_task_paths(run_dir).task_dir / 'patch_plan.md').exists())
@@ -114,28 +270,25 @@ def verify_implementation(
         raise ValueError("Verification requires an approved nonempty command.")
     if type(max_repairs) is not int or max_repairs < 0:
         raise ValueError("max_repairs must be a non-negative integer")
-    budget_ledger, session_id, attempt_id = task_budget_identity(llm_client, budget_ledger,
-        session_id=session_id, attempt_id=attempt_id)
-
     def task_client(enabled: bool = True) -> LLMClient:
         if not enabled:
             return llm_client
         return bind_task_budget(llm_client, budget_ledger, session_id=session_id, attempt_id=attempt_id)
-    command_text = subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
-    from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest, implementation_file_hashes
+    command_text = _argv_command(list(command))
+    from simple_ar.code_task.runtime.state import implementation_file_hashes
     paths = code_task_paths(run_dir)
     binding = load_code_task_manifest(run_dir).get('code_task', {}).get('native_binding') if paths.manifest_path.is_file() else None
     report_path = paths.run_artifact_dir / 'patched' / 'execution_report.json'
+    def run_validation(*, recovery_only: bool = False):
+        return run_code_task_benchmark(run_dir, command=command_text, timeout_sec=timeout_sec,
+            skip_validation=True, run_label='patched', budget_ledger=budget_ledger,
+            session_id=session_id, attempt_id=attempt_id,
+            **({'process_scope': process_scope} if process_scope is not None else {}),
+            **({'_recovery_only': True} if recovery_only else {}))
+
     if binding is not None and budget_ledger is not None:
-        original = recover_implementation_process(run_dir, budget_ledger=budget_ledger,
-            session_id=session_id, attempt_id=attempt_id)
-        if original is not None:
-            # The runner consumes this finalized invocation and uses its normal
-            # result projection; it cannot launch another invocation here.
-            run_code_task_benchmark(run_dir, command=command_text, timeout_sec=timeout_sec,
-                skip_validation=True, run_label='patched', budget_ledger=budget_ledger,
-                session_id=session_id, attempt_id=attempt_id,
-                **({'process_scope': process_scope} if process_scope is not None else {}))
+        # Only the runner may reconcile a settled invocation with no report.
+        run_validation(recovery_only=True)
     recovered = None
     completed_repairs = 0
     repair = None
@@ -177,12 +330,7 @@ def verify_implementation(
     repairs: list[dict[str, Any]] = []
     failures: list[tuple[Path, Path]] = []
     for index in range(completed_repairs, max_repairs + 1):
-        validation = recovered or run_code_task_benchmark(
-            run_dir, command=command_text, timeout_sec=timeout_sec, skip_validation=True,
-            run_label="patched", budget_ledger=budget_ledger,
-            session_id=session_id, attempt_id=attempt_id,
-            **({'process_scope': process_scope} if process_scope is not None else {}),
-        )
+        validation = recovered or run_validation()
         recovered = None
         if repairs:
             repairs[-1]["outcome"] = validation.status

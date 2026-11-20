@@ -319,6 +319,22 @@ class ResearchFoundationTests(unittest.TestCase):
         self.assertEqual(hint["status"], "blocked")
         self.assertEqual(hint["reason"], "pdf_download_disabled")
 
+        from dataclasses import replace
+
+        def fetch(selected, **kwargs):
+            if selected.kind == 'pdf':
+                return replace(selected, status='fetch_failed', reason='TimeoutError')
+            return replace(selected, kind='html', status='cached')
+
+        with patch('simple_ar.research.documents.fulltext._cache_selected_hint', side_effect=fetch) as download:
+            manifest = build_fulltext_manifest(records=records,
+                source_plan=replace(source_plan, allow_pdf_download=True), cache_dir=TEST_ROOT)
+        self.assertEqual([call.args[0].url for call in download.call_args_list], [
+            'https://arxiv.org/pdf/2401.12345v1.pdf', 'https://arxiv.org/html/2401.12345v1'])
+        alternative = manifest['documents'][0]['hints'][1]
+        self.assertEqual(alternative['status'], 'cached')
+        self.assertEqual(alternative['content_scope'], 'source_webpage_not_verified_paper_fulltext')
+
     def test_local_fulltext_is_marked_cached_when_enabled(self) -> None:
         TEST_ROOT.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:

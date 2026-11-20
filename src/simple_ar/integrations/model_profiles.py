@@ -128,10 +128,21 @@ class ModelProfile(BaseModel):
         return self
 
     def credential(self) -> str:
+        from simple_ar.integrations.model_credentials import read_key
+
         value = os.environ.get(self.api_key_env, "")
+        if not value.strip():
+            value = read_key(self.api_key_env, self.base_url)
         if not value.strip():
             raise ModelConfigError(f"Missing credential environment variable: {self.api_key_env}")
         return value
+
+    def has_credential(self) -> bool:
+        try:
+            self.credential()
+        except ModelConfigError:
+            return False
+        return True
 
     def resolve_proxy(self) -> str | None:
         """Resolve transport-only configuration; never persist or echo its value."""
@@ -203,6 +214,10 @@ class ModelCatalog(BaseModel):
         return name, profile
 
 
+def default_catalog_path() -> Path:
+    return Path.home() / ".config" / "simple-ar" / "models.toml"
+
+
 def catalog_path(path: str | Path | None = None, *, fallback_path: str | Path | None = None) -> Path | None:
     """Explicit selection wins; a retained location is only a recovery hint.
 
@@ -221,7 +236,7 @@ def catalog_path(path: str | Path | None = None, *, fallback_path: str | Path | 
             raise ModelConfigError("A retained model catalog location must be absolute")
         if candidate.is_file():
             return candidate
-    candidate = Path.home() / ".config" / "simple-ar" / "models.toml"
+    candidate = default_catalog_path()
     return candidate if candidate.is_file() else None
 
 

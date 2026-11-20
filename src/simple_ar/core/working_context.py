@@ -179,6 +179,38 @@ def processed_journal_turns(rows: Sequence[Mapping[str, Any]],
     return sorted(turn for turn, originals in records.items() if originals <= covered)
 
 
+def working_view_encoder(*, compact: bool = False) -> Callable[[dict], str]:
+    """Serialize one selection, reusing its unchanged observation snapshots."""
+    separator, colon = (',', ':') if compact else (', ', ': ')
+    encoder = json.JSONEncoder(ensure_ascii=False, separators=(separator, colon))
+    cache: dict[int, tuple[dict, str]] = {}
+
+    def encode(context: dict) -> str:
+        nonlocal cache
+        view = context.get('working_view')
+        if not isinstance(view, dict) or not isinstance(view.get('observations'), list):
+            return encoder.encode(context)
+        if any(not isinstance(key, str) for key in (*context, *view)):
+            return encoder.encode(context)
+        retained = {}
+        observations = []
+        for item in view['observations']:
+            previous = cache.get(id(item))
+            encoded = previous[1] if previous is not None and previous[0] is item else encoder.encode(item)
+            retained[id(item)] = (item, encoded)
+            observations.append(encoded)
+        cache = retained
+
+        def mapping(value: dict, key: str, replacement: str) -> str:
+            return '{' + separator.join(encoder.encode(k) + colon + (
+                replacement if k == key else encoder.encode(v)) for k, v in value.items()) + '}'
+
+        working_view = mapping(view, 'observations', '[' + separator.join(observations) + ']')
+        return mapping(context, 'working_view', working_view)
+
+    return encode
+
+
 def select_working_context(
     *, user_requests: Sequence[str], system_text: str,
     base_context: Mapping[str, Any],
@@ -208,7 +240,7 @@ def select_working_context(
     context_authority: Literal['sources.v1'] | None = None,
     message_projector: Callable | None = None,
     preserve_material_observations: bool = False,
-    working_set_policy: Literal['recent.v2', 'recent.v3', 'recent.v4', 'recent.v5'] | None = None,
+    working_set_policy: Literal['recent.v2', 'recent.v3', 'recent.v4', 'recent.v5', 'recent.v6'] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -296,11 +328,11 @@ def select_working_context(
     """
     if context_authority is not None and context_authority != 'sources.v1':
         raise ValueError('Unknown context authority policy')
-    if working_set_policy not in (None, 'recent.v2', 'recent.v3', 'recent.v4', 'recent.v5'):
+    if working_set_policy not in (None, 'recent.v2', 'recent.v3', 'recent.v4', 'recent.v5', 'recent.v6'):
         raise ValueError('Unknown working set policy')
     recent_set = working_set_policy is not None
-    focused_working_set = working_set_policy == 'recent.v5'
-    active_material_policy = working_set_policy in {'recent.v3', 'recent.v4', 'recent.v5'}
+    focused_working_set = working_set_policy in {'recent.v5', 'recent.v6'}
+    active_material_policy = working_set_policy in {'recent.v3', 'recent.v4'} or focused_working_set
     # None preserves historical consumers. An explicit (possibly empty) supply
     # is derived by the message owner, never inferred from matching prose.
     def source_key(row: Mapping[str, Any]) -> str:
@@ -643,6 +675,29 @@ def select_working_context(
     prepared_projector = None
     prepared_operations = None
     prepared_overview = None
+    encode_context = working_view_encoder(compact=True)
+    encoded_messages: dict[int, tuple[dict, tuple, str]] = {}
+
+    def encode_messages(messages: list[dict[str, Any]]) -> str:
+        # Admission repeatedly changes the working view while replayed work
+        # and requests stay the same. Reuse their exact JSON representation.
+        # Do not cache the changing view or messages with mutable fields.
+        nonlocal encoded_messages
+        retained = {}
+        fragments = []
+        for index, message in enumerate(messages):
+            previous = encoded_messages.get(id(message))
+            if previous is not None and previous[0] is message and previous[1] == tuple(message.items()):
+                encoded = previous[2]
+                retained[id(message)] = previous
+            else:
+                encoded = json.dumps(message, ensure_ascii=False)
+                if index != 1 and all(type(value) in (str, int, float, bool, type(None))
+                                      for value in message.values()):
+                    retained[id(message)] = (message, tuple(message.items()), encoded)
+            fragments.append(encoded)
+        encoded_messages = retained
+        return '[' + ', '.join(fragments) + ']'
 
     def project() -> tuple[list[dict[str, Any]], int]:
         nonlocal prepared_turns, prepared_projector, prepared_operations, prepared_overview
@@ -721,7 +776,7 @@ def select_working_context(
             # final presentation. Avoid encoding and immediately decoding the
             # entire working view on every admission trial.
             messages = [{'role':'system','content':system_text},
-                        {'role':'user','content':dump(context) if message_projector is None else ''}]
+                        {'role':'user','content':encode_context(context) if message_projector is None else ''}]
             if context_authority == 'sources.v1':
                 messages[1].update(role='assistant', reasoning_content='')
             emitted = 0
@@ -737,7 +792,7 @@ def select_working_context(
                     prepared_projector = message_projector(messages)
                     prepared_turns = selection
                 messages = prepared_projector(context)
-            measured = schema_tokens+estimate_tokens(json.dumps(messages,ensure_ascii=False))
+            measured = schema_tokens + estimate_tokens(encode_messages(messages))
             # Recent omission locators are optional navigation, not required
             # input. Make room for the actual task before declaring overflow;
             # selected references and original receipts remain available.
@@ -1192,6 +1247,32 @@ def select_working_context(
         # a tiny new action must not buy the same failed summary each turn.
         new_work = [i for i in repeated if i >= economical_after_turn]
         replay_cost = estimate_tokens(dump([message for i in new_work for message in blocks[i]]))
+        # A source investigation can make progress before the first edit.
+        # Use exact original passage ranges so another query for the same
+        # evidence does not reopen the checkpoint on its own.
+        new_passages = False
+        if new_work and replay_cost > required_cost and active_material_policy and economical_after_turn:
+            seen = set()
+            for row in rows:
+                turn = row.get('turn')
+                if (type(turn) is not int or row.get('tool') != 'find_source_passages'
+                        or row.get('kind') != 'operation_result'):
+                    continue
+                try:
+                    receipt = json.loads(row['text'])
+                except (KeyError, TypeError, ValueError):
+                    continue  # Historical projections may contain only a readable description.
+                if not isinstance(receipt, dict):
+                    continue
+                if receipt.get('status') != 'ok':
+                    continue
+                data = receipt.get('data') or {}
+                for match in data.get('matches') or ():
+                    key = (data.get('document_sha256'), match.get('chunk_id'),
+                           match.get('character_start'), match.get('character_end'))
+                    if None not in key and key not in seen:
+                        new_passages |= turn in new_work
+                        seen.add(key)
         made_progress = (not active_material_policy or not economical_after_turn or any(
             operation.get('turn', -1) >= economical_after_turn
             and operation['observation'].get('status') == 'ok'
@@ -1200,7 +1281,7 @@ def select_working_context(
                 'work_document', 'export_report', 'review_result', 'deliver_result', 'inspect_artifacts'}
                 or operation['observation'].get('tool') == 'run_process'
                 and operation['observation'].get('artifacts'))
-            for operation in operations))
+            for operation in operations) or new_passages)
         if repeated and replay_cost > required_cost and made_progress:
             economical_history.update(repeated)
 

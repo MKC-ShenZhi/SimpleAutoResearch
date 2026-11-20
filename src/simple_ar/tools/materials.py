@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Literal
 from urllib.parse import unquote, urlsplit
@@ -511,6 +513,33 @@ def admit_text_window(retained: list[dict], observation: dict, *, pinned: Iterab
         'Whole original observation retained; overlapping decoded text may repeat, no byte slicing.'} if overlap else {})}]
 
 
+def journal_tool_calls(store: Any, turn: dict, *, newest_first: bool = False,
+                       skip_unmatched: bool = False, reply: dict | None = None):
+    """Pair closed observations with original calls without reading tool results."""
+    if not turn['tools']:
+        return
+    if reply is None:
+        reply = store.read_json(turn['reply'])
+    calls = {call['id']: call for call in reply.get('tool_calls', [])}
+    items = reversed(turn['tools']) if newest_first else turn['tools']
+    for item in items:
+        if not skip_unmatched or item['id'] in calls:
+            yield item, calls[item['id']]
+
+
+_MATERIAL_INDEX = ContextVar('material_journal_index', default=None)
+
+
+@contextmanager
+def material_journal_scope():
+    """Share the byte-receipt index within one read-only input preparation."""
+    token = _MATERIAL_INDEX.set({})
+    try:
+        yield
+    finally:
+        _MATERIAL_INDEX.reset(token)
+
+
 def journal_material_references(workspace: Any, store: Any, turns: list[dict],
                                 targets: list[str], *, include_cross_path: bool = False) -> list[dict]:
     """Locate original reads; optional cross-path lookup grants no target access.
@@ -519,23 +548,56 @@ def journal_material_references(workspace: Any, store: Any, turns: list[dict],
     The default preserves historical path-scoped provider behavior.
     """
     roots = [workspace.resolve_material_root(path) for path in targets]
+    if not roots and not include_cross_path:
+        return []
+    directories = {root for root in roots if root.is_dir()}
+    exact = set(roots)
+
+    def local(path: Path) -> bool:
+        return path in exact or any(path.is_relative_to(root) for root in directories)
+
+    index = _MATERIAL_INDEX.get()
+    if index is None:
+        if not include_cross_path:
+            return [reference for _, reference in _journal_material_index(workspace, store, turns, admit=local)]
+        rows = _journal_material_index(workspace, store, turns)
+    else:
+        key = (id(workspace), id(store), id(turns))
+        if key not in index:
+            index[key] = _journal_material_index(workspace, store, turns)
+        rows = index[key]
+    # Current roots lead the bounded reuse search. Keep original recency
+    # within each group, and let the consumer revalidate its actual candidate.
+    selected, cross_path = [], []
+    for path, reference in rows:
+        if local(path):
+            selected.append(reference.copy())
+        elif include_cross_path:
+            cross_path.append(reference.copy())
+    return selected + cross_path
+
+
+def _journal_material_index(workspace: Any, store: Any, turns: list[dict], *,
+                            admit: Callable[[Path], bool] | None = None) -> list[tuple[Path, dict]]:
     retained = []
-    def collect(receipt: dict, request: dict, record: str, digest: str) -> None:
+    def collect(receipt: dict, request: dict, record: str, receipt_digest: Callable[[], str]) -> None:
         try:
             windows = journal_read_windows(receipt, request)
         except (ValueError, TypeError, KeyError, AttributeError):
             return  # One malformed retained record does not hide other reads.
+        digest = None
         for row in windows:
             try:
                 path = workspace.resolve(row['request']['path'])
                 data = row.get('data') or {}
-                in_scope = any(path == root or root.is_dir() and path.is_relative_to(root) for root in roots)
-                if (not (include_cross_path or in_scope)
+                if (admit is not None and not admit(path)
                         or not isinstance(data.get('sha256'), str) or len(data['sha256']) != 64
                         or type(data.get('next_offset_bytes')) is not int
                         or type(data.get('size_bytes')) is not int):
                     continue
-                retained.append((not in_scope, {'request': row['request'],
+                if digest is None:
+                    digest = receipt_digest()
+                retained.append((path, {'request': row['request'],
                     **({'input_index': row['input_index']} if 'input_index' in row else {}),
                     'record': 'records/' + record.removeprefix('attempts/'),
                     'receipt_sha256': digest}))
@@ -543,9 +605,8 @@ def journal_material_references(workspace: Any, store: Any, turns: list[dict],
                 continue
 
     for turn in reversed(turns):
-        calls = {call['id']: call for call in store.read_json(turn['reply']).get('tool_calls', [])}
-        for item in reversed(turn['tools']):
-            call = calls.get(item['id'], {}).get('function', {})
+        for item, offered in journal_tool_calls(store, turn, newest_first=True, skip_unmatched=True):
+            call = offered.get('function', {})
             try:
                 request = json.loads(call['arguments'])
                 raw = store.resolve(item['result']).read_bytes()
@@ -554,7 +615,7 @@ def journal_material_references(workspace: Any, store: Any, turns: list[dict],
                     continue
             except (ValueError, TypeError, KeyError, OSError, RuntimeError):
                 continue
-            collect(receipt, request, item['result'], hashlib.sha256(raw).hexdigest())
+            collect(receipt, request, item['result'], lambda: hashlib.sha256(raw).hexdigest())
             if item.get('review_result'):
                 # Shared actions keep their own accepted observation rather than
                 # copying it into the producer's pending envelope. Read that
@@ -562,12 +623,10 @@ def journal_material_references(workspace: Any, store: Any, turns: list[dict],
                 # other journal observation; its opinion is not transferred.
                 try:
                     review = accepted_review_journal(workspace, store, item, receipt)
-                    collect(review['receipt'], {}, review['record'], review['sha256'])
+                    collect(review['receipt'], {}, review['record'], lambda: review['sha256'])
                 except (ValueError, TypeError, KeyError, OSError, RuntimeError):
                     continue
-    # Current roots lead the bounded reuse search; unrelated recent reads must
-    # not displace their original receipts. Preserve recency within each group.
-    return [reference for _, reference in sorted(retained, key=lambda item: item[0])]
+    return retained
 
 
 def _journal_receipt(workspace: Any, reference: dict) -> dict:

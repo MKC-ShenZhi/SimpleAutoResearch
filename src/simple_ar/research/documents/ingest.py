@@ -15,6 +15,7 @@ from typing import Any, Iterable, Mapping
 
 from simple_ar.core.capabilities import CapabilityContext, CapabilityResult
 from simple_ar.core.artifacts import read_json
+from simple_ar.core.budget import BudgetLedger
 from simple_ar.literature.models import Paper
 from simple_ar.research.contracts import DocumentRecord, DocumentSection, SourcePlan, TextChunk
 from simple_ar.research.documents.extractors import apply_fulltext_extraction
@@ -389,6 +390,8 @@ def run_document_ingest_capability(
     *,
     context: CapabilityContext,
     request: DocumentIngestRequest,
+    budget_ledger: BudgetLedger | None = None,
+    session_id: str = '',
 ) -> CapabilityResult:
     """Persist one document bundle as an explicit session handoff.
 
@@ -418,16 +421,18 @@ def run_document_ingest_capability(
     analysis_paths = {str(path.resolve()) for path in packages} | {str(path) for path in retained}
     source_plan = replace(request.source_plan, local_documents=[path for path in request.source_plan.local_documents
                          if str(Path(path).resolve()) not in analysis_paths])
-    bundle = build_document_bundle(
-        papers=list(request.papers),
-        supporting_records=request.supporting_records,
-        source_plan=source_plan,
-        cache_dir=request.cache_dir,
-        extraction_dir=request.extraction_dir,
-        max_chunks=request.max_chunks,
-        resolver=request.resolver,
-        parser=request.parser,
-    )
+    def collect() -> DocumentBundle:
+        return build_document_bundle(papers=list(request.papers), supporting_records=request.supporting_records,
+            source_plan=source_plan, cache_dir=request.cache_dir, extraction_dir=request.extraction_dir,
+            max_chunks=request.max_chunks, resolver=request.resolver, parser=request.parser)
+
+    if budget_ledger is not None and source_plan.require_fulltext and (request.papers or request.supporting_records):
+        from simple_ar.research.sources.capability import run_source_operation
+        attempt = context.attempt.attempt_id
+        bundle = run_source_operation(budget_ledger, f'source-ingest:{attempt}', 1, collect,
+            purpose='research ingest', attempt_id=attempt, session_id=session_id)
+    else:
+        bundle = collect()
     imported = []
     for index, path in enumerate(packages, start=1):
         from simple_ar.result_analysis.table import copy_analysis_package, table_markdown

@@ -7,17 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from simple_ar.core.capabilities import ArtifactStore
+from simple_ar.tools.implementation_preparation import REGISTERED_PROJECT_GENERATION
 from simple_ar.tools.implementation_run import candidate_source, execution_binding
 # Compatibility export for existing domain callers; stop proof and disposition
 # have a single implementation in the common outcome boundary.
 from simple_ar.tools.professional_outcomes import stop_decision
-
-
-# Historical consumers keep these imports; ordinary composition imports the
-# preparation primitive directly and never enters this continuation controller.
-from simple_ar.tools.implementation_preparation import (
-    PROFESSIONAL_GENERATION, REGISTERED_PROJECT_GENERATION, prepare_work,
-)
 
 
 def _repair_view(owner: Any, locator: str, observed: dict,

@@ -66,36 +66,6 @@ def continuation_blocks(blocks: list[list[dict]], *, policy: str | None, thinkin
     return projected
 
 
-def _working_view_encoder() -> Callable[[dict], str]:
-    """Serialize one selection, reusing its unchanged observation snapshots."""
-    cache: dict[int, tuple[dict, str]] = {}
-
-    def encode(context: dict) -> str:
-        nonlocal cache
-        view = context.get('working_view')
-        if not isinstance(view, dict) or not isinstance(view.get('observations'), list):
-            return json.dumps(context, ensure_ascii=False)
-        if any(not isinstance(key, str) for key in (*context, *view)):
-            return json.dumps(context, ensure_ascii=False)
-        retained = {}
-        observations = []
-        for item in view['observations']:
-            previous = cache.get(id(item))
-            encoded = previous[1] if previous is not None and previous[0] is item else json.dumps(item, ensure_ascii=False)
-            retained[id(item)] = (item, encoded)
-            observations.append(encoded)
-        cache = retained
-
-        def mapping(value: dict, key: str, replacement: str) -> str:
-            return '{' + ', '.join(json.dumps(k, ensure_ascii=False) + ': ' + (
-                replacement if k == key else json.dumps(v, ensure_ascii=False)) for k, v in value.items()) + '}'
-
-        working_view = mapping(view, 'observations', '[' + ', '.join(observations) + ']')
-        return mapping(context, 'working_view', working_view)
-
-    return encode
-
-
 def prepare_recorded_work_messages(messages: list[dict], *,
                                    encode_context: Callable[[dict], str] | None = None) -> Callable[[dict], list[dict]]:
     """Prepare the native history once for this selected set of work units."""
@@ -208,6 +178,7 @@ class ConversationInput:
     closing: bool = False
     reserve: dict | None = None
     closing_contract: str | None = None
+    output_limit: int | None = None
 
 
 class ProfessionalConversation:
@@ -255,10 +226,22 @@ class ProfessionalConversation:
 
     def tokens(self, value: ConversationInput) -> int:
         return (estimate_native_input_tokens(self.client, value.messages, value.tools)
-            + (self.client.effective_output_limit() or 0))
+            + (value.output_limit or self.client.effective_output_limit() or 0))
+
+    def closing_output_limit(self) -> int | None:
+        """Leave room for evidence when the normal output ceiling crowds out a short exit."""
+        limit = self.client.effective_output_limit()
+        remaining = self.ledger.remaining('total_tokens') if self.ledger is not None else None
+        if (limit is None or remaining is None or not 0 < remaining < 2 * limit
+                or not callable(getattr(self.client, 'with_output_limit', None))):
+            return None
+        return min(limit, max(1, int(remaining) // 3))
+
+    def projection_client(self, output_limit: int | None) -> Any:
+        return self.client if output_limit is None else self.client.with_output_limit(output_limit)
 
     def request_resources(self, value: ConversationInput) -> dict[str, int]:
-        """Measure one offered request with the client's unchanged output cap."""
+        """Measure one offered request with its effective output cap."""
         return {'llm_requests': 1, 'total_tokens': self.tokens(value)}
 
     @staticmethod
@@ -318,6 +301,7 @@ class ProfessionalConversation:
         def admission(value):
             floor = followup(exit_value if exit_value is not None else value)
             protect = bool(floor and continue_allowed and not force_close
+                and (exit_value is None or exit_value.output_limit is None)
                 and self.can_protect(value, floor))
             return floor, protect
 
@@ -354,6 +338,6 @@ class ProfessionalConversation:
              native: bool = False, additional: bool = False) -> dict:
         check_llm_call_stop()
         with self.ledger.protect_remaining(value.reserve or {}, additional=additional):
-            turn = self.client.chat_turn if native else (
-                getattr(self.client, 'tool_turn', None) or self.client.chat_turn)
+            client = self.projection_client(value.output_limit)
+            turn = client.chat_turn if native else (getattr(client, 'tool_turn', None) or client.chat_turn)
             return turn(value.messages, tools=value.tools, label=label, budget_call_id=call_id)

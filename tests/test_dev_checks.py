@@ -32,8 +32,9 @@ class DevChecksTests(unittest.TestCase):
             if name == "all":
                 continue
             for target in group.targets:
+                module_name = target.removeprefix("tests.").split(".", 1)[0]
                 self.assertTrue(
-                    (tests_dir / f"{target.removeprefix('tests.')}.py").is_file(),
+                    (tests_dir / f"{module_name}.py").is_file(),
                     f"{name} references missing test module {target}",
                 )
 

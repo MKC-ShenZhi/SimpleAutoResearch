@@ -143,6 +143,13 @@ class _Project(_Path):
         description="Explicit authorized data files or directories to inspect for presence/size, not contents.")
 
 
+class _ProjectResults(_Path):
+    deliveries: bool = Field(default=False,
+        description='Set true to list retained delivery versions of one selected task directory.')
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=12, ge=1, le=40)
+
+
 class ReportDelivery(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     status: Literal['candidate', 'canonical']
@@ -290,13 +297,18 @@ class _AnchoredReplacement(BaseModel):
 
 
 class _Copy(_Path):
-    source: str = Field(description='Authorized regular file, text or binary, at most 64 MiB; copied byte-for-byte without putting its contents in a model response.')
+    source: str = Field(description='Reuse the exact path from read_file, including a bare mount alias when it points to a file. Copies authorized regular files up to 64 MiB byte-for-byte.')
     source_sha256: str = Field(min_length=64, max_length=64, description='Observed full source digest; stale candidates are rejected.')
     expected_sha256: str = Field(default='', description='Observed destination digest required before replacing an existing file; empty for a new file.')
 
 
 class _CopyProject(_Path):
     source: str = Field(description='Authorized project directory; originals remain unchanged.')
+    delivery_version: int | None = Field(default=None, ge=1, exclude_if=lambda value: value is None,
+        description='Copy an earlier task’s retained delivery. Use its task directory as source and select the version listed by list_project_results.')
+    delivery_group: Literal['code_project', 'artifacts'] | None = Field(default=None,
+        exclude_if=lambda value: value is None,
+        description='With delivery_version, copy its declared project (default) or all retained artifacts in their saved layout, including older deliveries without a declared project.')
     archive_name: str | None = Field(default=None, pattern=r'^[A-Za-z0-9][A-Za-z0-9_.-]*\.zip$', max_length=100,
         exclude_if=lambda value: value is None,
         description='Optionally create a portable ZIP inside the new copy, containing exactly the copied files with relative paths. Existing copy exclusions and reported omissions apply; inspect them before claiming a complete package. No generated packaging script or process is needed.')
@@ -351,6 +363,7 @@ _TOOLS = {
     "compile_python": (_Path, "Check Python syntax in a workspace file without executing it or writing bytecode.", "read_only"),
     "search_files": (_Search, "Search literal text with ripgrep in a bounded mounted file batch; return line locations and explicit coverage limits.", "read_only"),
     "inspect_project": (_Project, "Read project instructions, dependency declarations and Python entry candidates using the existing preparation inspector. It also lists indexed project SKILL.md methods: read relevant files and judge applicability before use; their instructions grant no permissions. Returns a compact overview and a retained full observation. No imports of project code, installation, downloads or execution; metadata describes the inspecting interpreter, not readiness of the task environment. Use its evidence to choose the next necessary preparation or validation action, not to repeat an inventory.", "read_only"),
+    "list_project_results": (_ProjectResults, "Find earlier tasks in an authorized project task directory. Use deliveries=true to see retained versions and their delivered SKILL.md paths. Use copy_project to adopt a version, then read its method and investigate applicability to the current task. This reads saved results and grants no access, approvals, budget or execution authority.", "read_only"),
     "write_file": (_Write, "Create or replace a workspace text file; existing files require the observed digest.", "write_patch"),
     "copy_file": (_Copy, "Copy an observed file or generated candidate into the workspace without retransmitting its contents. Source digest must match; read_file with full_digest=true and a small max_bytes obtains a streamed full-file digest up to 64 MiB. Existing destinations require their digest and retain a byte backup through the shared atomic writer. Original sources stay unchanged. Does not execute or certify a repair.", "write_patch"),
     "copy_project": (_CopyProject, "Prepare a writable project copy and optional portable ZIP in one operation, including ordinary source, tests, configuration, documentation and binary assets. Destination must be a new workspace subdirectory. Uses existing conservative code-workspace copying: private/runtime paths, symlinks, caches/build outputs and oversized files are omitted and reported. Total bounds are checked before publishing. Keeps originals unchanged, records copied file and archive hashes, and reconciles the same interrupted operation only when its published files still match. Inspect omissions before claiming a complete deliverable. Not a complete Git clone, dependency install, execution or correctness certificate.", "write_patch"),
@@ -399,6 +412,8 @@ def resolve_mounted_path(mounts: dict[str, Path], value: str, *, write: bool = F
         base = mounts.get(alias)
     if base is None or (write and alias != "workspace"):
         raise ValueError("Path is outside the authorized mounts or writable workspace")
+    if parts and base.is_file():
+        raise ValueError(f"Mount {alias!r} is a file. Use {alias!r} as the path without a filename suffix.")
     if any(_private_name(part) for part in parts):
         raise ValueError("Private/runtime paths are not exposed to task tools")
     if authorize is not None:
@@ -459,9 +474,13 @@ def workspace_tool_specs(*, candidate_review: bool = False,
                 'Execution checks the hash atomically and rejects changed bytes. '
                 'Empty for a new destination file.')
         if name == 'run_process':
+            description += (' The tool already captures stdout and stderr. Prefer direct argv. '
+                'If a shell pipeline is necessary, preserve upstream failures with pipefail.')
             description += (' Task authorization permits execution in the workspace without per-command approval. '
                 'Processes cannot access original source mounts, the network or host GPU; copy needed sources '
-                'to the workspace. Request host_access when the work needs a wider scope.'
+                'to the workspace. Host process and CPU discovery via /proc is unavailable; '
+                'use an explicit bounded worker count if the program needs one. '
+                'Request host_access when the work needs a wider scope.'
                 if sandbox_execution else ' Requires exact process approval and is not a sandbox.')
             # Professional execution supplies this owner reference internally.
             # Ordinary commands retain their explicit file-list contract.
@@ -471,6 +490,7 @@ def workspace_tool_specs(*, candidate_review: bool = False,
             if process_artifact_paths == 'cwd.v1':
                 for field in ('inputs', 'outputs'):
                     schema['properties'][field]['description'] += (
+                        ' Use the workspace_path returned by a write, edit or copy for an existing workspace file. '
                         ' Plain relative paths are relative to cwd, like command file arguments. '
                         'Explicit mount aliases (workspace/..., source0/...) and absolute paths '
                         'keep mount semantics; use ./ for a cwd-relative name that matches an alias.')
@@ -532,6 +552,16 @@ def workspace_observation_view(result: dict, *, record: str, directory_path: str
     tool result, delivery inventory, or accepted tool-argument transformation.
     Project-copy previews link to the complete immutable file/version inventory.
     """
+    if result.get('tool_name') == 'run_process' and result.get('status') == 'error' and record:
+        data = result.get('data') or {}
+        projected = dict(data)
+        for stream, limit in (('stdout', 1200), ('stderr', 3200)):
+            text = data.get(stream)
+            if isinstance(text, str) and len(text) > limit:
+                projected.pop(stream)
+                projected[stream + '_tail'] = {'text': text[-limit:],
+                    'omitted_characters': len(text) - limit, 'record': record, 'field': 'data.' + stream}
+        return {**result, 'data': projected}
     if (result.get('tool_name') == 'edit_file' and result.get('status') == 'ok'
             and not result.get('error') and isinstance(record, str) and record):
         data = result.get('data')
@@ -605,6 +635,40 @@ class PartialProjectDelivery(ValueError):
     """A copied project cannot be reused whole, but delivered members may be portable."""
 
 
+def current_delivery_turn(manifest: dict, state: dict) -> dict | None:
+    """Find the closed turn that can contain delivery for the current request."""
+    if (manifest.get('status') not in {'completed', 'partial'} or state.get('pending')
+            or not state.get('turns')):
+        return None
+    turn = state['turns'][-1]
+    if (turn.get('remaining') or not turn.get('tools')
+            or turn.get('request_count', 1) != len(state.get('requests', []))):
+        return None
+    return turn
+
+
+def read_terminal_delivery(reader: Any, turn: dict, *, terminal: dict | None = None
+                           ) -> tuple[DeliveryRequest, dict]:
+    """Read the committed claim through the caller's record admission."""
+    item = turn['tools'][-1]
+    calls = reader.record(turn['reply']).get('tool_calls') or []
+    if not calls or calls[-1]['id'] != item['id']:
+        raise ValueError('Current delivery has no matching terminal call')
+    if terminal is None:
+        terminal = reader.record(item['result'])
+    name = calls[-1]['function']['name']
+    completion = tool_completion(name, reader.state['config'].get('tool_completions'))
+    if (completion is None or completion.kind != 'delivery'
+            or terminal.get('status') != 'ok' or terminal.get('tool_name') != name):
+        raise ValueError('Current delivery has no matching terminal observation')
+    data = terminal.get('data') or {}
+    bound = data.get(completion.field) if completion.field else data
+    delivery = DeliveryRequest.model_validate(reader.record('delivery.json'))
+    if DeliveryRequest.model_validate(bound) != delivery:
+        raise ValueError('Saved delivery differs from its terminal observation')
+    return delivery, terminal
+
+
 class RetainedDelivery:
     """Read the existing delivery and provenance without assembling executable owners.
 
@@ -650,7 +714,10 @@ class RetainedDelivery:
         return resolve_mounted_path(self.mounts, locator, discovery=True, authorize=self.admit)
 
     def hashes(self, locators: Iterable[str]) -> dict[str, str]:
-        paths = {value: self.resolve(value) for value in locators}
+        return self._resolved_hashes({value: self.resolve(value) for value in locators})
+
+    @staticmethod
+    def _resolved_hashes(paths: dict[str, Path]) -> dict[str, str]:
         hashes = {}
         for value, path in paths.items():
             if not path.is_file():
@@ -659,16 +726,10 @@ class RetainedDelivery:
                 hashes[value] = hashlib.file_digest(handle, 'sha256').hexdigest()
         return hashes
 
-    def reusable_materials(self) -> dict[str, list[Path]]:
-        state = self.state
-        if (self.manifest['status'] not in {'completed', 'partial'} or state['pending'] is not None
-                or not state['turns'] or state['turns'][-1]['remaining']
-                or not state['turns'][-1]['tools']
-                or state['turns'][-1].get('request_count', 1) != len(state['requests'])):
-            return {}
-        delivery = DeliveryRequest.model_validate(self.record('delivery.json'))
-        delivered = delivery.artifacts  # Saved deliveries already contain the expanded snapshot.
-        paths = {self.resolve(value) for value in delivered}
+    def _delivery_files(self, turn: dict) -> tuple[dict[str, Path], dict]:
+        delivery, terminal = read_terminal_delivery(self, turn)
+        delivered = {value: self.resolve(value) for value in delivery.artifacts}
+        paths = set(delivered.values())
         # External deliverables still require original controller registration.
         external = {p for p in paths if not any(p.is_relative_to(self.mounts[name])
             for name in ('workspace', 'evidence'))}
@@ -687,27 +748,24 @@ class RetainedDelivery:
             if any(not any(p == output or p.is_relative_to(output) and output.is_dir()
                            for output in registered) for p in external):
                 raise ValueError('Delivery references an unregistered external artifact')
-        turn = state['turns'][-1]
-        calls = self.record(turn['reply']).get('tool_calls') or []
-        observed = turn['tools'][-1]
-        terminal = self.record(observed['result'])
-        if not calls or calls[-1]['id'] != observed['id'] or terminal.get('status') != 'ok':
-            raise ValueError('Current delivery has no matching terminal observation')
-        name = calls[-1]['function']['name']
-        data = terminal.get('data') or {}
-        completion = tool_completion(name, state['config'].get('tool_completions'))
-        bound = (data.get(completion.field) if completion.field else data
-            ) if completion is not None and completion.kind == 'delivery' else None
-        if bound is None or DeliveryRequest.model_validate(bound) != delivery:
-            raise ValueError('Saved delivery differs from its terminal observation')
         pinned = terminal.get('metadata', {}).get('delivery_hashes')
-        actual = self.hashes(delivered)
+        actual = self._resolved_hashes(delivered)
         if pinned is not None and pinned != actual:
             raise ValueError('Current delivered files changed; retained results cannot certify their replacements')
-        available = {'artifacts': list(dict.fromkeys(self.resolve(value) for value in delivered))} if paths else {}
+        return delivered, terminal
+
+    def reusable_materials(self) -> dict[str, list[Path]]:
+        state = self.state
+        turn = current_delivery_turn(self.manifest, state)
+        if turn is None:
+            return {}
+        delivered, terminal = self._delivery_files(turn)
+        terminal_record = turn['tools'][-1]['result']
+        paths = set(delivered.values())
+        available = {'artifacts': list(dict.fromkeys(delivered.values()))} if paths else {}
         for turn in state['turns']:
             for item in turn['tools']:
-                row = self.record(item['result'])
+                row = terminal if item['result'] == terminal_record else self.record(item['result'])
                 if row.get('status') != 'ok':
                     continue
                 groups = row.get('metadata', {}).get('reusable_materials', {})
@@ -745,15 +803,17 @@ class RetainedDelivery:
         explicit root and complete member list. Neither proves code correctness,
         a checker, an environment or permission to execute in the next task.
         """
-        available = self.reusable_materials()
-        if not available:
+        turn = current_delivery_turn(self.manifest, self.state)
+        if turn is None:
             return None
-        terminal_item = self.state['turns'][-1]['tools'][-1]
-        terminal = self.record(terminal_item['result'])
+        paths, terminal = self._delivery_files(turn)
+        if not paths:
+            return None
+        terminal_item = turn['tools'][-1]
         pinned = terminal.get('metadata', {}).get('delivery_hashes')
         if pinned is None:
             raise ValueError('Project reuse requires a hash-bound terminal delivery')
-        delivered = {self.resolve(name): digest for name, digest in pinned.items()}
+        delivered = {path: pinned[name] for name, path in paths.items()}
         candidates, records, history = {}, {}, []
 
         position = 0
@@ -766,7 +826,7 @@ class RetainedDelivery:
                 call = calls.get(item['id'])
                 if call is None:
                     continue
-                observed = self.record(item['result'])
+                observed = terminal if item['result'] == terminal_item['result'] else self.record(item['result'])
                 name = call['function']['name']
                 data = observed.get('data') or {}
                 process_ref = (f'tools/processes/{Path(item["result"]).parent.name}/invocation.json'
@@ -877,6 +937,21 @@ class RetainedDelivery:
 
 
 class WorkspaceToolGateway:
+    @classmethod
+    def for_task(cls, root: Path, config: dict, ledger: BudgetLedger, *,
+                 record_artifacts: Any = None, create_workspace: bool = True) -> "WorkspaceToolGateway":
+        """Open the native workspace with the task's saved execution settings."""
+        evidence = root / 'evidence'
+        if create_workspace:
+            evidence.mkdir(exist_ok=True)
+        return cls(root, {**{alias: Path(path) for alias, path in config['sources'].items()},
+            'evidence': evidence, 'records': root / 'attempts'}, ledger,
+            project_python=Path(config['project_python']) if config.get('project_python') else None,
+            record_artifacts=record_artifacts, create_workspace=create_workspace,
+            process_artifact_paths=config.get('process_artifact_paths'),
+            candidate_review_protocol=config.get('candidate_review_protocol'),
+            sandbox_execution=config.get('sandbox_execution', False))
+
     def has_started(self, identity: str) -> bool:
         return (self.root / 'tools' / 'processes' / identity / 'invocation.json').is_file()
 
@@ -1456,7 +1531,7 @@ class WorkspaceToolGateway:
                             if not child.is_relative_to(target):
                                 continue
                             output(str(child), digest if trusted else None)
-                            if trusted and member != arguments.get('archive_name'):
+                            if trusted and not data.get('retained_delivery') and member != arguments.get('archive_name'):
                                 original = self.resolve(str(source / member))
                                 if original.is_relative_to(source):
                                     inputs[original] = digest
@@ -2295,6 +2370,14 @@ class WorkspaceToolGateway:
                 data = model.model_dump()
             elif name == "run_process":
                 recovering = (self.root / "tools" / "processes" / identity / "invocation.json").exists()
+                wall = self.ledger.remaining('process_wall_seconds') if self.ledger is not None else None
+                calls = self.ledger.remaining('process_invocations') if self.ledger is not None else None
+                if (not recovering and (calls is None or calls >= 1)
+                        and wall is not None and 1 <= wall < model.timeout_sec):
+                    return ToolResult(tool_name=name, status='blocked',
+                        error='Process timeout exceeds the remaining wall allowance. Choose a shorter check '
+                              'if it still answers the question, or report the missing allowance.',
+                        data={'max_timeout_sec': int(wall), 'executed': False})
                 data = self._run(model, identity, sandboxed=self.sandbox_execution and not model.host_access)
                 if not recovering:
                     receipt = self.root / data['receipt']
@@ -2302,7 +2385,8 @@ class WorkspaceToolGateway:
                 if data.get('output_binding_error'):
                     return ToolResult(tool_name=name, status='error', data=data,
                         error=data['output_binding_error'],
-                        summary='Process completed but its declared artifacts could not be bound; receipt retained, no delivery or replay.')
+                        summary=('Command reported exit 0, but required artifact binding failed. Use stdout and stderr '
+                                 'to diagnose the cause. For a shell pipeline, exit 0 may only describe its last command.'))
                 if model.delivery is not None:
                     if data.get('returncode') != 0 or data.get('stop_reason'):
                         return ToolResult(tool_name=name, status='blocked', data=data,
@@ -2314,6 +2398,8 @@ class WorkspaceToolGateway:
                         summary='Process did not complete successfully; logs and invocation retained.')
             elif name == "search_files":
                 data = self._search(model, identity)
+            elif name == "list_project_results":
+                data = self._project_results(model)
             elif name == "inspect_project":
                 from simple_ar.research.preparation import inspect_project_preparation
                 from simple_ar.code_task.review_pipeline import build_review_index
@@ -2371,7 +2457,7 @@ class WorkspaceToolGateway:
                             "has_more": model.offset + len(selected) < len(children)}
                 elif name == "read_file":
                     raw, data = self._read_file_window(target, model)
-                    data = {"text": raw.decode("utf-8", errors="replace"), **data}
+                    data = {"text": raw.decode("utf-8", errors="replace"), "path": model.path, **data}
                 else:
                     delivery = None
                     if name == "write_file" and model.delivery is not None:
@@ -2443,6 +2529,7 @@ class WorkspaceToolGateway:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
         return ToolResult(tool_name=name, data={"path": request.path, "absolute_path": str(target),
+            "workspace_path": "workspace/" + target.relative_to(self.workspace).as_posix(),
             "sha256": hashlib.sha256(encoded).hexdigest()})
 
     def _write_precondition(self, target: Path, request: _Write | _Edit | _Copy,
@@ -2518,11 +2605,39 @@ class WorkspaceToolGateway:
         if self.artifact_hashes(expected) != expected:
             raise ValueError('Registered project inputs changed during copying')
 
+    def _project_results(self, request: _ProjectResults) -> dict:
+        from simple_ar.tools.delivery_versions import DeliveryVersions
+        from simple_ar.tools.project_results import discover_project_tasks
+
+        root = self.resolve_material_root(request.path)
+
+        def admit(path: Path) -> Path:
+            return self.resolve_material_root(str(path))
+
+        if request.deliveries:
+            versions = DeliveryVersions(root, authorize=admit).catalog()
+            rows = [{
+                **{key: row[key] for key in ('version', 'status', 'project_root', 'artifact_count', 'unresolved')},
+                'summary': (row['summary'] or '')[:360],
+                'method_count': len(row['method_paths']),
+                'method_paths': row['method_paths'][:12],
+            } for row in reversed(versions)]
+            skipped = 0
+        else:
+            tasks, skipped = discover_project_tasks(root, authorize=admit)
+            rows = [{'path': self.locator(str(task.path)), 'goal': task.goal[:360],
+                     'status': task.status} for task in tasks]
+        end = request.offset + request.limit
+        return {'path': request.path, 'entries': rows[request.offset:end], 'skipped': skipped,
+                'next_offset': end if end < len(rows) else None}
+
     def _copy_project(self, request: _CopyProject, identity: str) -> ToolResult:
         from simple_ar.code_task.generation.common import generation_candidate
-        from simple_ar.code_task.workspace.copy import copy_code_workspace
+        from simple_ar.code_task.workspace.copy import CopyReport, copy_code_workspace
         from simple_ar.core.artifacts import read_json, write_json
 
+        if request.delivery_group is not None and request.delivery_version is None:
+            raise ValueError('Select a retained delivery version to copy a delivery group')
         source = self.resolve(request.source)
         target = self.resolve(request.path, write=True)
         if (target == self.workspace or source == target
@@ -2551,13 +2666,33 @@ class WorkspaceToolGateway:
                 return False
 
         with generation_candidate(target) as candidate:
-            report = copy_code_workspace(source, candidate, max_file_bytes=request.max_file_bytes,
-                max_files=request.max_files, max_total_bytes=request.max_total_bytes, path_allowed=allowed)
-            paths = [str(path) for path in candidate.rglob('*') if path.is_file()]
-            if not paths:
+            retained = None
+            if request.delivery_version is None:
+                report = copy_code_workspace(source, candidate, max_file_bytes=request.max_file_bytes,
+                    max_files=request.max_files, max_total_bytes=request.max_total_bytes, path_allowed=allowed)
+                hashes = self.artifact_hashes(str(path) for path in candidate.rglob('*') if path.is_file())
+                files = {str(Path(path).relative_to(candidate)): digest for path, digest in hashes.items()}
+            else:
+                from simple_ar.tools.delivery_versions import DeliveryVersions
+
+                owner = DeliveryVersions(source, authorize=lambda path: self.resolve_material_root(str(path)))
+                projection, members = owner.snapshot(request.delivery_version, [request.delivery_group or 'code_project'],
+                    max_bytes=request.max_total_bytes)
+                if len(members) > request.max_files or any(len(raw) > request.max_file_bytes for _, raw in members):
+                    raise ValueError('Retained project exceeds the selected copy limits')
+                project_root = PurePosixPath(projection.get('project_root', ''))
+                files = {}
+                for locator, raw in members:
+                    relative = PurePosixPath(locator).relative_to(project_root)
+                    output = resolve_mounted_path({'workspace': candidate}, f'workspace/{relative.as_posix()}', write=True)
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    with output.open('xb') as stream:
+                        stream.write(raw)
+                    files[relative.as_posix()] = projection['files'][locator]['sha256']
+                report = CopyReport(len(files), sum(len(raw) for _, raw in members), 0, ())
+                retained = {'session': projection['session'], 'version': projection['version']}
+            if not files:
                 raise ValueError('Project selection contains no copyable files')
-            hashes = self.artifact_hashes(paths)
-            files = {str(Path(path).relative_to(candidate)): digest for path, digest in hashes.items()}
             if request.archive_name is not None:
                 archive = candidate / request.archive_name
                 if archive.exists():
@@ -2568,6 +2703,8 @@ class WorkspaceToolGateway:
                 with archive.open('rb') as handle:
                     files[request.archive_name] = hashlib.file_digest(handle, 'sha256').hexdigest()
             data = {'absolute_path': str(target), 'source': str(source), 'copy': report.to_json(), 'files': files}
+            if retained is not None:
+                data['retained_delivery'] = retained
             # The existing attempt owns this receipt. Save before publishing so
             # a lost outer result can validate the tree, not blindly copy again.
             if target.exists():
@@ -2663,6 +2800,13 @@ class WorkspaceToolGateway:
         if request.start_line is not None:
             data.update(start_line=request.start_line, offset_bytes=offset)
         return raw, data
+
+    def delivery_hashes(self, delivery: dict, retained: dict[str, str] | None) -> dict[str, str]:
+        """Bind the current inventory while preserving any accepted version."""
+        hashes = self.artifact_hashes(delivery['artifacts'])
+        if retained is not None and hashes != retained:
+            raise ValueError('Final work outputs changed before delivery binding; no delivery or replay')
+        return hashes
 
     def delivery_summary(self, delivery: dict[str, Any], hashes: dict[str, str]) -> str:
         """Materialize only at the common post-production delivery binding.

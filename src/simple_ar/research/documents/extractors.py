@@ -108,6 +108,9 @@ def document_extraction_limitations(records: list[DocumentRecord]) -> tuple[str,
         if coverage.get("unpaired_unicode_replacements"):
             notes.append(f"Source {record.document_id} contains {coverage['unpaired_unicode_replacements']} "
                          "unpaired Unicode characters replaced during extraction; affected text needs source inspection.")
+        if coverage.get("escaped_control_characters"):
+            notes.append(f"Source {record.document_id} contains {coverage['escaped_control_characters']} "
+                         "extracted control characters shown as escape sequences; check the original for affected text.")
         if coverage.get("truncated") is True:
             notes.append(f"Source {record.document_id} extracted {coverage.get('extracted_pages')}/"
                          f"{coverage.get('total_pages')} PDF pages; unextracted pages are unavailable. "
@@ -233,6 +236,14 @@ def _parse_hint(
     text = _normalize_text(text)
     if text.count("\ufffd") > original_replacements:
         coverage["unpaired_unicode_replacements"] = text.count("\ufffd") - original_replacements
+    reuse_source = (parser_name == 'plain_text' and resolution.path.suffix.lower() in MATERIAL_TEXT_SUFFIXES)
+    if not reuse_source:
+        # Publish readable derived text without silently joining tokens across
+        # an extraction artifact. Keep the source itself and its provenance.
+        text, escaped = re.subn(r"[\x00-\x08\x0b\x0e-\x1f\x7f-\x9f]",
+                               lambda match: f"\\u{ord(match[0]):04x}", text)
+        if escaped:
+            coverage["escaped_control_characters"] = escaped
     if not text.strip():
         return record, _row(
             record,
@@ -242,8 +253,7 @@ def _parse_hint(
             hint=hint,
         )
 
-    text_path = resolution.path if (parser_name == 'plain_text'
-        and resolution.path.suffix.lower() in MATERIAL_TEXT_SUFFIXES) else _write_extracted_text(
+    text_path = resolution.path if reuse_source else _write_extracted_text(
         extraction_dir=extraction_dir,
         record=record,
         text=text,
@@ -400,7 +410,7 @@ def _html_to_text(text: str) -> str:
 
 def _write_extracted_text(*, extraction_dir: Path, record: DocumentRecord, text: str) -> Path:
     path = extraction_dir / f"{_safe_name(record.document_id)}.txt"
-    path.write_text(_normalize_text(text), encoding="utf-8")
+    path.write_text(text, encoding="utf-8")
     return path
 
 

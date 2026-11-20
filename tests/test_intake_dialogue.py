@@ -67,8 +67,10 @@ class AnalysisReportProposalTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'override explicit'):
                     validate_proposal(proposal(kind, options={'independent_review_required': False}), args,
                                       {'independent_review_required'})
-        with self.assertRaisesRegex(ValueError, 'model-backed report'):
-            validate_proposal(proposal(options={'independent_review_required': True}), args, set())
+        value = validate_proposal(proposal(options={'independent_review_required': True},
+            assets=[{'role': 'material', 'path_quote': 'dictionary.md'}]), args, set())
+        self.assertTrue(value['options']['independent_review_required'])
+        self.assertEqual(value['assets'][0]['path_quote'], 'dictionary.md')
         value = validate_proposal(proposal(options={'independent_review_required': True, 'with_report': True}),
                                   args, set())
         self.assertTrue(value['options']['independent_review_required'])
@@ -99,6 +101,25 @@ class IntakeDialogueTests(unittest.TestCase):
             with patch('sys.stdin.isatty', return_value=False), patch('simple_ar.cli.start.print_line'):
                 config = prepare_start(restored)
             self.assertTrue(research_defaults(['research-session', '--config', str(config)])['independent_review_required'])
+
+    def test_survey_accepts_supplied_research_material_through_the_common_entry(self):
+        from simple_ar.cli.research_config import validate_session_arguments
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            notes = root / 'research-notes.md'
+            notes.write_text('Open questions and source references.', encoding='utf-8')
+            args = self.args(root, '--kind', 'survey', '--model', 'fixture', locked={'kind', 'model'})
+            args.goal = f'Compare the research using {notes} as background.'
+            client = Client(proposal('survey', assets=[{'role': 'material', 'path_quote': str(notes)}]),
+                proposal('survey', options={'sources': 'materials'}))
+            resolved = self.converse(args, client, ['y', 'y'])
+            resolved.prepare_only = True
+            with patch('sys.stdin.isatty', return_value=False), patch('simple_ar.cli.start.print_line'):
+                config = prepare_start(resolved)
+            defaults = research_defaults(['research-session', '--config', str(config)])
+            command = build_parser(research_defaults=defaults).parse_args(['research-session'])
+            self.assertEqual(validate_session_arguments(command).materials, [str(notes.resolve())])
 
     def test_supplied_paper_url_becomes_attributed_excerpt_and_prepared_material_with_restore(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -293,6 +314,7 @@ class IntakeDialogueTests(unittest.TestCase):
 
     def test_public_acquisition_requires_source_basis_and_separate_permission(self):
         from simple_ar.cli.intake_dialogue import _discover_sources
+        from simple_ar.core.budget import BudgetLedger
         from simple_ar.research.sources.capability import SearchResult
         from simple_ar.literature.models import Paper
         args = build_parser().parse_args(['start', '--kind', 'reproduction'])
@@ -308,19 +330,22 @@ class IntakeDialogueTests(unittest.TestCase):
             result = SearchResult(status='partial', responses=(), diagnostics=('One provider unavailable',),
                 papers=(Paper(id='source', title='Public source', authors=[], abstract='Metadata only',
                               url='https://example.org/paper', fulltext_url='https://example.org/paper.pdf'),))
-            state = {}
+            state = {'budget_contract': 'task.v1'}
+            ledger = BudgetLedger(storage_path=root / 'setup_budget.json')
             with patch('simple_ar.research.sources.capability.search_sources', return_value=result) as search, \
                  patch('simple_ar.cli.intake_dialogue.print_line'), patch('builtins.input', return_value='n'):
-                self.assertFalse(_discover_sources(queries, args, state, root))
+                self.assertFalse(_discover_sources(queries, args, state, root, ledger=ledger))
                 search.assert_not_called()
             with patch('simple_ar.research.sources.capability.search_sources', return_value=result) as search, \
                  patch('simple_ar.cli.intake_dialogue.print_line'), patch('builtins.input', return_value='y'):
-                self.assertTrue(_discover_sources(queries, args, state, root))
+                self.assertTrue(_discover_sources(queries, args, state, root, ledger=ledger))
                 self.assertEqual(search.call_count, 1)
-                self.assertFalse(_discover_sources(queries, args, state, root))
+                self.assertFalse(_discover_sources(queries, args, state, root, ledger=ledger))
                 args.material = []  # Resume after saved response, before material adoption.
-                self.assertTrue(_discover_sources(queries, args, state, root))
+                self.assertTrue(_discover_sources(queries, args, state, root, ledger=ledger))
                 self.assertEqual(search.call_count, 1)
+            self.assertEqual(len(ledger.entries), 1)
+            self.assertEqual(ledger.entries[0].actual['source_operations'], 2)
             metadata = args.material[0].read_text(encoding='utf-8')
             self.assertIn('https://example.org/paper.pdf', metadata)
             self.assertIn('One provider unavailable', metadata)
@@ -329,7 +354,7 @@ class IntakeDialogueTests(unittest.TestCase):
             (Path(state['source_lookups'][0]['path']) / 'responses.json').unlink()
             with patch('simple_ar.research.sources.capability.search_sources') as search, \
                  patch('simple_ar.cli.intake_dialogue.print_line'):
-                self.assertFalse(_discover_sources(queries, args, state, root))
+                self.assertFalse(_discover_sources(queries, args, state, root, ledger=ledger))
                 search.assert_not_called()
         url = 'https://github.com/example/research'
         request = {'role': 'project', 'url': url, 'basis': [{'path': 'paper.md', 'quote': url}]}
@@ -555,10 +580,11 @@ class IntakeDialogueTests(unittest.TestCase):
                 validate_proposal(proposal('writing', material_read_requests=queries, assets=[
                     {'role': 'material', 'path_quote': 'another.txt'}]), args, set(), facts=facts)
             resumed = Client(proposal('writing', material_read_requests=queries),
-                proposal('writing', material_read_requests=queries))
+                proposal('writing', material_read_requests=queries), proposal('writing'))
             with patch('simple_ar.research.documents.extractors.LocalDocumentParser', side_effect=AssertionError('no reparse')):
-                self.assertIsNone(self.converse(self.args(root, '--resume-setup', str(setup.parent)), resumed, []))
-                self.assertEqual(read_json(setup)['last_read_result']['status'], 'no_progress')
+                self.converse(self.args(root, '--resume-setup', str(setup.parent)), resumed, ['y'])
+                self.assertEqual(read_json(setup)['last_read_result']['status'], 'cached')
+                self.assertEqual(len(resumed.requests), 3)
                 restored = self.converse(self.args(root, '--resume-setup', str(setup.parent), '--goal', 'Clarify without rereading', locked=('goal',)),
                     Client(proposal('writing')), ['y'])
             self.assertEqual(restored.material, [late.resolve()])
@@ -896,6 +922,35 @@ class IntakeDialogueTests(unittest.TestCase):
             self.assertEqual(again.kind, 'survey')
             self.assertEqual(offline.requests, [])
             self.assertEqual(ledger.read_bytes(), before)
+
+    def test_setup_allowance_and_charges_follow_the_configured_task(self):
+        from simple_ar.cli.start import _setup_preparation_ledger
+        from simple_ar.core.budget import BudgetLedger
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.converse(self.args(root, '--max-turns', '5', '--max-tokens', '10000',
+                locked={'max_turns', 'max_tokens'}),
+                Client(proposal('survey', options={'sources': 'search'})), ['stop'])
+            draft = self.draft(root)
+            ledger = BudgetLedger.load(draft.parent / 'setup_budget.json')
+            ledger.reserve('preparation-call', {'llm_requests': 1, 'total_tokens': 1000})
+            ledger.settle('preparation-call', {'llm_requests': 1, 'total_tokens': 600})
+            granted = self.args(root, '--resume-setup', str(draft.parent),
+                '--authorize-remaining', 'llm_requests=6', '--authorize-remaining', 'total_tokens=20000',
+                '--authorization-id', 'grant-1', '--authorization-reason', 'Continue the task',
+                locked={'authorize_remaining', 'authorization_id', 'authorization_reason'})
+            self.assertIsNone(self.converse(granted, Client(), ['stop']))
+            resumed = self.converse(self.args(root, '--resume-setup', str(draft.parent)), Client(), ['y'])
+            resumed.prepare_only = True
+            with patch('sys.stdin.isatty', return_value=False), patch('simple_ar.cli.start.print_line'):
+                config = prepare_start(resumed)
+            values = research_defaults(['research-session', '--config', str(config)])
+            self.assertEqual((values['llm_requests'], values['total_tokens']), (6, 20000))
+            restored = BudgetLedger.from_dict(_setup_preparation_ledger(
+                type('Arguments', (), {'config': config})()))
+            self.assertEqual([entry.reservation_id for entry in restored.entries], ['preparation-call', 'grant-1'])
+            self.assertEqual((restored.remaining('llm_requests'), restored.remaining('total_tokens')), (6, 20000))
 
     def test_accepting_saved_proposal_does_not_require_model_connection(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -1351,7 +1406,7 @@ class IntakeDialogueTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'indexed'):
                 validate_proposal(proposal('reproduction', read_requests=['../outside.py']), args, set(), facts={})
 
-    def test_complete_file_lookup_is_idempotent_not_a_billable_json_correction_or_unbounded_loop(self):
+    def test_complete_file_lookup_is_idempotent_and_keeps_the_setup_active(self):
         # Permissioned tool observations are not human clarification rounds.
         # A repository needing six source windows must still reach its proposal.
         with tempfile.TemporaryDirectory() as folder:
@@ -1376,12 +1431,17 @@ class IntakeDialogueTests(unittest.TestCase):
             self.assertEqual(read_json(self.draft(root)).get('project_read_paths'), [])
             self.assertFalse(read_json(self.draft(root)).get('rejected_proposals'))
         with tempfile.TemporaryDirectory() as folder:
+            from simple_ar.research.preparation import inspect_project_preparation
             root = Path(folder)
             (root / 'README.md').write_text('Documented instruction\n')
             args = self.args(root, '--kind', 'reproduction', '--project', str(root))
-            client = Client(proposal('reproduction', read_requests=['README.md']), proposal('reproduction', read_requests=['README.md']))
-            self.assertIsNone(self.converse(args, client, []))
-            self.assertEqual(len(client.requests), 2)
+            client = Client(proposal('reproduction', read_requests=['README.md']),
+                            proposal('reproduction', read_requests=['README.md']), proposal('reproduction'))
+            with patch('simple_ar.research.preparation.inspect_project_preparation', wraps=inspect_project_preparation) as inspect:
+                self.converse(args, client, ['y'])
+            self.assertEqual(inspect.call_count, 1)
+            self.assertEqual(len(client.requests), 3)
+            self.assertEqual(client.requests[2]['last_read_result']['already_supplied'], ['README.md'])
 
 
 if __name__ == "__main__":

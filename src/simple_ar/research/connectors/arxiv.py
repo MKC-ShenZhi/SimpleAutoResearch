@@ -20,7 +20,10 @@ class ArxivConnector:
         query = request.query
         # Plain provider-neutral keywords must not be left to implicit search
         # semantics. Keep explicit arXiv expressions intact for expert callers.
-        if not re.search(r'\b(?:AND|OR|ANDNOT)\b|[\w]+:|["()]', query):
+        if request.filters.get('match_title'):
+            title = query.replace('"', '').replace('\\', '')
+            query = f'ti:"{title}"'
+        elif not re.search(r'\b(?:AND|OR|ANDNOT)\b|[\w]+:|["()]', query):
             query = " AND ".join(f"all:{term}" for term in query.split())
         if scope is not None:
             query = (f"({query}) AND submittedDate:[{scope['start_year']:04d}01010000 "

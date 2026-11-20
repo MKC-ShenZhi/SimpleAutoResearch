@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from simple_ar.core.assessments import (applicable_delivery_scope, assessment_issues, assessment_state,
     current_assessments, finding_id)
 from simple_ar.tools.specs import ToolResult, tool_completion
-from simple_ar.tools.workspace import DeliveryRequest
+from simple_ar.tools.workspace import DeliveryRequest, current_delivery_turn, read_terminal_delivery
 
 
 def delivery_claim(request: DeliveryRequest, artifacts: list[str], resolve: Callable) -> dict:
@@ -39,6 +39,69 @@ def delivery_requires_review(request: DeliveryRequest, protocol: str) -> bool:
     return not request.unresolved and (protocol in {'task.v3', 'task.v4', 'task.v5'} or (
         request.report is not None and request.report.status == 'canonical'
         and bool(request.report.manuscript)))
+
+
+def selected_delivery_review(workspace: Any, request: DeliveryRequest | None, observations: list[dict], *,
+                             selection: str | None, completions: dict | None,
+                             request_start: Callable[[], int] | None = None) -> bool:
+    """Keep a selected whole-delivery review with the work it actually covered."""
+    if selection not in {'model.v2', 'model.v3'}:
+        return False
+    first = request_start() if request_start is not None else None
+    selected = None
+    for row in reversed(observations):
+        current = row.get('current_request', True) if first is None else row.get('request_count', 1) >= first
+        if not current:
+            continue
+        if selection == 'model.v2':
+            completion = tool_completion(row.get('tool_name', ''), completions)
+            if (completion is not None and completion.kind == 'review'
+                    and (row.get('arguments') or {}).get('review_scope') == 'delivery'):
+                return True  # Preserve the saved request-wide contract.
+            continue
+        if request is None:
+            return False
+        metadata = row.get('metadata') or {}
+        review = metadata.get('delivery_review') or {}
+        failed = review.get('error') if review else metadata.get('delivery_review_error')
+        completion = tool_completion(row.get('tool_name', ''), completions)
+        arguments = row.get('arguments') or {}
+        claim = arguments.get(completion.field) if completion and completion.field else arguments
+        explicitly_selected = (completion is not None and (
+            completion.kind == 'review' and arguments.get('review_scope') == 'delivery'
+            or completion.kind == 'delivery' and isinstance(claim, dict)
+               and claim.get('independent_review') is True))
+        if failed and not explicitly_selected:
+            continue  # A failed default check does not create a new requirement.
+        binding = review.get('binding') or {}
+        if binding.get('purpose'):
+            continue
+        artifacts = binding.get('artifacts')
+        if not isinstance(artifacts, dict):
+            # A failure before the review owner starts has no review binding.
+            # The ordinary delivery receipt already records the resolved
+            # inventory; it retains the choice, not a successful opinion.
+            artifacts = metadata.get('delivery_hashes') if failed else None
+            if not isinstance(artifacts, dict):
+                continue
+            try:
+                artifacts = {str(workspace.resolve(path)) for path in artifacts}
+            except (ValueError, OSError):
+                continue
+        if selected is None:
+            try:
+                resolved = workspace.resolve_delivery(request)
+                selected = {str(workspace.resolve(path)) for path in resolved['artifacts']}
+            except (ValueError, OSError):
+                return False  # The normal delivery owner reports invalid or unfinished outputs.
+        reviewed_work = set(artifacts)
+        # Replacing part of the same work cannot waive an explicitly selected
+        # final review. The review owner still decides which earlier opinion
+        # applies; retaining the choice does not reuse an unchecked opinion.
+        if (selected == reviewed_work and (selected or explicitly_selected)
+                or explicitly_selected and selected.intersection(reviewed_work)):
+            return True
+    return False
 
 
 def prepare_delivery_review(workspace: Any, request: DeliveryRequest, artifacts: list[str],
@@ -178,12 +241,8 @@ def recorded_delivery_review(reader: Any) -> dict | None:
     evidence or live files remain current, or that the opinion is correct.
     """
     state, manifest = reader.state, reader.manifest
-    if (manifest.get('status') not in {'completed', 'partial'} or state.get('pending')
-            or not state.get('turns')):
-        return None
-    turn = state['turns'][-1]
-    if (turn.get('remaining') or not turn.get('tools')
-            or turn.get('request_count', 1) != len(state.get('requests', []))):
+    turn = current_delivery_turn(manifest, state)
+    if turn is None:
         return None
     item = turn['tools'][-1]
     parent = None
@@ -201,22 +260,8 @@ def recorded_delivery_review(reader: Any) -> dict | None:
                 or possible['binding'].get('schema_version') != 'delivery_review.v3'
                 or DeliveryReview._pending_envelope(possible)):
             return None
-    calls = reader.record(turn['reply']).get('tool_calls') or []
-    if not calls or calls[-1].get('id') != item.get('id'):
-        raise ValueError('Delivery review has no matching terminal call')
-    completion = tool_completion(calls[-1]['function']['name'], state['config'].get('tool_completions'))
-    if completion is None or completion.kind != 'delivery':
-        raise ValueError('Review is not attached to a delivery')
-    if parent is None:
-        parent = reader.record(item['result'])
-    data, metadata = parent.get('data') or {}, parent.get('metadata') or {}
-    delivered = data.get(completion.field) if completion.field else data
-    if (parent.get('status') != 'ok' or parent.get('tool_name') != calls[-1]['function']['name']
-            or not isinstance(delivered, dict)):
-        raise ValueError('Review differs from the recorded terminal delivery')
-    request = DeliveryRequest.model_validate(delivered)
-    if request != DeliveryRequest.model_validate(reader.record('delivery.json')):
-        raise ValueError('Review differs from the recorded terminal delivery')
+    request, parent = read_terminal_delivery(reader, turn, terminal=parent)
+    metadata = parent.get('metadata') or {}
     envelope = metadata.get('delivery_review') or {}
     binding = envelope.get('binding') or {}
     if binding.get('schema_version') != 'delivery_review.v3':
@@ -301,6 +346,11 @@ class DeliveryReview:
         scope = getattr(self.inspector, 'presentation_scope', None)
         return scope() if scope is not None else nullcontext()
 
+    def prepare(self, request: DeliveryRequest, artifacts: list[str],
+                user_requests: Callable[[], list[str]], *, candidate: bool = False) -> dict | None:
+        return prepare_delivery_review(self.workspace, request, artifacts, user_requests,
+            protocol=self.protocol, candidate=candidate)
+
     def work_inputs(self, targets: list[str], *, include_observations: bool = False,
                     observations: list[dict] | None = None) -> list[dict]:
         if include_observations:
@@ -312,6 +362,48 @@ class DeliveryReview:
             if (row['result'].get('metadata') or {}).get('delivery_opinion')), None)
         return [{**row, 'result': self.inspector.compact_feedback(row['result'],
             historical=latest is not None and i > latest)} for i, row in enumerate(feedback)]
+
+    def revision_handoff(self, artifacts: list[str], observations: list[dict]) -> dict | None:
+        """Give the producer the accepted opinion on its unfinished delivery."""
+        from simple_ar.tools.materials import retained_delivery_targets
+
+        paths, _ = retained_delivery_targets(self.workspace, {'artifacts': artifacts})
+        selected = set(paths)
+        if artifacts and not selected:
+            return None
+        for observed in reversed(observations):
+            envelope = (observed.get('metadata') or {}).get('delivery_review') or {}
+            binding = envelope.get('binding')
+            if observed.get('status') != 'ok' or not binding:
+                continue
+            reviewed = binding['artifacts']
+            if (selected or reviewed) and not selected.intersection(reviewed):
+                continue
+            record = self._opinion_record(observed.get('review_record')
+                if self._pending_envelope(envelope) else observed.get('record'))
+            if record is None:
+                continue
+            feedback = self.feedback_from_observation(observed, guidance_only=True)
+            if not feedback or not feedback.get('opinion_available'):
+                continue
+            opinion = feedback['result']['metadata'].get('delivery_opinion')
+            if not opinion:
+                continue
+            if opinion['verdict'] == 'passed':
+                # A local pass doesn't answer a broader unfinished review.
+                if (observed.get('current_request', True)
+                        and binding.get('purpose', 'delivery') == 'delivery' and selected <= reviewed.keys()):
+                    return None
+                continue
+            open_checks = [check for check in opinion.get('investigations', ())
+                if check.get('necessary', True) and check['outcome'] != 'supported']
+            if open_checks or opinion['findings']:
+                return {'record': record, 'purpose': binding.get('purpose', 'delivery'),
+                    'findings': opinion['findings'],
+                    'open_checks': [{key: check[key] for key in ('claim', 'outcome', 'reasoning')}
+                        for check in open_checks],
+                    'status': opinion['verdict']}
+        return None
 
     def feedback_from_observation(self, observed: dict, *, guidance_only: bool = False) -> dict | None:
         """Resolve original opinions once for revision and completion consumers."""
@@ -1093,8 +1185,7 @@ class DeliveryReview:
             if request.unresolved:
                 raise ValueError('The selected review covers unfinished work')
             resolved = self.workspace.resolve_delivery(request)
-            current = prepare_delivery_review(self.workspace, request, resolved['artifacts'],
-                user_requests, protocol=self.protocol)
+            current = self.prepare(request, resolved['artifacts'], user_requests)
             if current != binding:
                 raise ValueError('The selected review no longer matches the current request or artifacts')
             issues = self.issues(observations, current)

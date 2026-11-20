@@ -6,6 +6,7 @@ from pathlib import Path
 
 from simple_ar.core import CapabilityRegistry, SessionController
 from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+from simple_ar.core.budget import BudgetExceededError, BudgetLedger
 from simple_ar.literature.cache import put_cache
 from simple_ar.literature.models import Paper
 from simple_ar.research.contracts import QueryPlan, ResearchQuestion
@@ -22,6 +23,34 @@ from simple_ar.research.sources.base import SearchQuery, SearchResponse
 
 
 class SearchCapabilityTests(unittest.TestCase):
+    def test_native_search_schema_and_omitted_arguments_use_the_effective_source_policy(self) -> None:
+        from simple_ar.tools.sources import SourceToolGateway
+
+        observed = []
+
+        class Connector:
+            source_name = "fixture"
+
+            def search(self, request):
+                observed.append(request)
+                return SearchResponse("fixture", request.query, [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = BudgetLedger({'source_operations': 2})
+            owner = SourceToolGateway(Path(directory), None, ledger,
+                default_policy={'providers': ['fixture', 'unregistered'], 'max_results': 3},
+                registry=SearchProviderRegistry({'fixture': Connector}))
+            spec = next(row for row in owner.tool_specs() if row.name == 'search_sources')
+            fields = spec.parameters_schema()['properties']
+            self.assertEqual(fields['providers']['items']['enum'], ['fixture'])
+            self.assertEqual(fields['max_results']['maximum'], 3)
+            self.assertTrue(owner.call('search_sources', {'query': 'interval calibration'}, identity='ready').ok)
+            self.assertEqual(observed[0].max_results, 3)
+            blocked = owner.call('search_sources',
+                {'query': 'interval calibration', 'max_results': 4}, identity='invalid')
+            self.assertIn('at most 3', blocked.error)
+            self.assertEqual(len(observed), 1)
+
     def test_temporal_eligibility_precedes_topk_even_when_provider_ignores_filters(self) -> None:
         scope = {"start_year": 2010, "end_year": 2014, "basis_quote": "2010 through 2014"}
         def paper(identifier, published, strong=False):
@@ -43,11 +72,13 @@ class SearchCapabilityTests(unittest.TestCase):
                 max_rounds=1, auto_expansion=False), max_documents=2)
         with tempfile.TemporaryDirectory() as directory:
             store = ArtifactStore(Path(directory))
+            ledger = BudgetLedger({'source_operations': 2})
             result = run_search_capability(
                 context=CapabilityContext(store, AttemptManifest("search")),
                 request=SearchRequest(queries=(query,), providers=("fixture",), cache_enabled=False,
                                       filters={"temporal_scope": scope}),
-                registry=SearchProviderRegistry({"fixture": Connector}), selection_policy=policy)
+                registry=SearchProviderRegistry({"fixture": Connector}), selection_policy=policy,
+                budget_ledger=ledger)
             saved = store.read_json(next(ref for ref in result.artifacts if ref.kind == "search_result"))
             self.assertEqual(set(saved["selected_paper_ids"]), {"first", "last"})
             restored = SearchResult.from_handoff_dict(saved)
@@ -64,13 +95,18 @@ class SearchCapabilityTests(unittest.TestCase):
             # must not reintroduce dates excluded by the original user scope.
             followup_store = ArtifactStore(Path(directory) / "followup")
             followup = run_search_capability(
-                context=CapabilityContext(followup_store, AttemptManifest("search")),
+                context=CapabilityContext(followup_store, AttemptManifest("followup")),
                 request=SearchRequest(queries=(query,), providers=("fixture",), cache_enabled=False,
                                       filters={"temporal_scope": scope}),
-                registry=SearchProviderRegistry({"fixture": Connector}))
+                registry=SearchProviderRegistry({"fixture": Connector}), budget_ledger=ledger)
             handoff = followup_store.read_json(next(ref for ref in followup.artifacts if ref.kind == "search_result"))
             self.assertEqual(set(handoff["selected_paper_ids"]), {"first", "last"})
             self.assertEqual(len(handoff["papers"]), 6)
+            self.assertEqual(ledger.remaining('source_operations'), 0)
+            with self.assertRaises(BudgetExceededError):
+                run_search_capability(context=CapabilityContext(store, AttemptManifest('extra')),
+                    request=SearchRequest(queries=(query,), providers=('fixture',)),
+                    registry=SearchProviderRegistry({"fixture": Connector}), budget_ledger=ledger)
         raw = search_sources(SearchRequest(queries=(query,), providers=("fixture",), cache_enabled=False),
                              registry=SearchProviderRegistry({"fixture": Connector}))
         legacy = select_search_result(raw, policy=policy)

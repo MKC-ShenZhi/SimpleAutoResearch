@@ -4,11 +4,12 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 import re
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 from threading import RLock
-from typing import Any, Callable, Iterable, Iterator, Literal, TypeVar
+from typing import Any, Callable, ContextManager, Iterable, Iterator, Literal, TypeVar
 
+from simple_ar.core.budget import BudgetLedger
 from simple_ar.core.capabilities import (
     ArtifactRef,
     ArtifactStore,
@@ -517,7 +518,12 @@ class SessionController:
         registry: CapabilityRegistry,
         profile: str | None = None,
         budget: BudgetState | None = None,
+        transition_recipe: str = "research-v1",
+        budget_ledger: BudgetLedger | None = None,
+        budget_producer: str | None = None,
+        initialize: Callable[["SessionController"], None] | None = None,
     ) -> "SessionController":
+        """Publish the first manifest after the owner has prepared initial records."""
         store = ArtifactStore(root)
         session_budget = (
             budget if budget is not None else _default_session_budget(profile)
@@ -527,13 +533,67 @@ class SessionController:
             topic=topic,
             profile=profile,
             budget=session_budget,
+            transition_recipe=transition_recipe,
         )
         controller = cls(store, registry, manifest)
         with controller._mutation_scope():
             if store.exists("session_manifest.json"):
                 raise FileExistsError("Session manifest already exists.")
+            if budget_ledger is not None:
+                controller._bind_budget(budget_ledger, producer=budget_producer)
+            if initialize is not None:
+                initialize(controller)
             controller._save_unlocked()
         return controller
+
+    def load_budget(self) -> BudgetLedger:
+        """Load the ledger bound to this session, including early saved tasks."""
+        ref = self.manifest.budget_ledger_ref
+        return BudgetLedger.load(self.store.resolve(ref.path if ref is not None else 'budget_ledger.json'))
+
+    @_locked_method
+    def close_inactive_reservations(self, ledger: BudgetLedger) -> None:
+        """Keep unknown usage attached to attempts that ended without a settlement."""
+        terminal = {attempt.attempt_id for attempt in self.list_attempts()
+                    if attempt.status in {"completed", "failed"}}
+        for entry in ledger.entries:
+            if entry.status == "reserved" and entry.attempt_id in terminal:
+                ledger.mark_unknown(entry.reservation_id, retain_reservation=True,
+                    reason="Attempt ended without persisted usage; retain its reservation, not zero consumption.")
+
+    @_locked_method
+    def advance_actions(
+        self, *, max_actions: int, select: Callable[[], str | None],
+        dispatch: Callable[[str], bool], finish: Callable[[str | None], None],
+        action_context: Callable[[str], ContextManager] | None = None,
+        observe: Callable[[], None] | None = None,
+    ) -> None:
+        """Drive an admitted sequence while its owner interprets each action and result."""
+        if max_actions < 1:
+            raise ValueError("max_actions must be positive.")
+        for _ in range(max_actions):
+            action = select()
+            if action is None:
+                finish(None)
+                return
+            with action_context(action) if action_context is not None else nullcontext():
+                progressed = dispatch(action)
+                finish(select())
+            if observe is not None:
+                observe()
+            if not progressed or self.manifest.status in {"paused", "blocked", "completed", "failed"}:
+                return
+
+    def attach_budget(self, ledger: BudgetLedger, *, producer: str | None = None) -> None:
+        """Bind the task ledger while creating a task or provisioning a legacy session."""
+        with self.mutation_scope():
+            self._bind_budget(ledger, producer=producer)
+            self._save_unlocked()
+
+    def _bind_budget(self, ledger: BudgetLedger, *, producer: str | None) -> None:
+        ledger.save(self.store.resolve('budget_ledger.json'))
+        self.manifest.budget_ledger_ref = self.store.ref('budget_ledger.json', kind='budget_ledger',
+            schema=ledger.schema_version, producer=producer)
 
     @classmethod
     def load(
@@ -611,6 +671,16 @@ class SessionController:
             if manifest_path.is_file():
                 manifests.append(self.store.read_attempt_manifest(manifest_path))
         return tuple(manifests)
+
+    def attempts_by_output(self) -> dict[str, AttemptManifest]:
+        """Project the latest producer of each declared output locator."""
+        producers = {}
+        for attempt in self.list_attempts():
+            prefix = f"attempts/{attempt.attempt_id}/"
+            for output in attempt.outputs:
+                producers[output.path] = attempt
+                producers[prefix + output.path.replace("\\", "/")] = attempt
+        return producers
 
     def attempt_lineage(self, attempt_id: str | None = None) -> tuple[AttemptManifest, ...]:
         """Return one persisted attempt lineage from root to the selected node.

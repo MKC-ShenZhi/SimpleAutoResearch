@@ -286,51 +286,43 @@ class DocumentWorkToolGateway:
                 if not resume['prepared']:
                     return self._resume_source(WorkDocumentRequest.model_validate(resume['request']), identity) is not None
                 selection = resume['selection_identity']
-                return bool(store.exists('candidate.json') or self._retained_report_selection(store, selection)
-                    or self._retained_report_selection(store, selection, allow_unstarted=True))
+                return bool(store.exists('candidate.json') or self._retained_work(store, selection, unstarted='allow'))
             except (OSError, ValueError, KeyError, TypeError):
                 return False
-        return (store.exists('candidate.json') or self._retained_final(store, identity) is not None
-            or self._retained_report_selection(store, identity) is not None)
+        return store.exists('candidate.json') or self._retained_work(store, identity) is not None
 
-    def _retained_report_selection(self, store: ArtifactStore, identity: str, *, allow_unstarted: bool = False):
-        """Resume a completed Writer or a checkpoint with complete recorded calls."""
-        writer = ArtifactStore(store.root / 'writer')
-        if (store.exists('failure.json') and not allow_unstarted or not (store.exists('report-writer-result.json')
-                or writer.exists('sections.json'))):
+    def _retained_work(self, store: ArtifactStore, identity: str, *,
+                       unstarted: Literal['reject', 'allow', 'require'] = 'reject'
+                       ) -> tuple[dict, list[dict], _Decision | _ReportDecision, int, dict | None] | None:
+        """Recover a final candidate or prove the remaining Writer work."""
+        if store.exists('failure.json') and unstarted != 'require':
             return None
         try:
-            if not store.exists('report-writer-result.json'):
+            binding, observations, final_input, response, step = self._retained_decision(store, identity)
+            if binding['contract'] != _REPORT_CONTRACT or store.exists(f'decisions/{step}/authored.json'):
+                if unstarted == 'require':
+                    return None
+                decision = self._saved_decision(store, binding, response, step)
+                return (binding, observations, decision, step, None) if decision.action == 'finish' else None
+            writer = ArtifactStore(store.root / 'writer')
+            completed = store.exists('report-writer-result.json')
+            if (completed and unstarted == 'require') or not (completed or writer.exists('sections.json')):
+                return None
+            decision = _ReportDecision.model_validate(response)
+            if decision.action != 'write':
+                return None
+            if not completed:
                 from simple_ar.report.writing import _retained_response
-                unstarted = 0
+                not_dispatched = 0
                 for path in (writer.root / 'model_calls').glob('*/request.json'):
                     call = ArtifactStore(path.parent)
-                    if allow_unstarted and call.exists('not_dispatched.json') and not call.exists('response.json'):
-                        unstarted += 1
+                    if unstarted != 'reject' and call.exists('not_dispatched.json') and not call.exists('response.json'):
+                        not_dispatched += 1
                         continue
                     _retained_response(call, 'request.json', call.read_json('request.json'))
-                if allow_unstarted and unstarted != 1:
+                if not_dispatched > 1 or unstarted == 'require' and not_dispatched != 1:
                     return None
-            elif allow_unstarted:
-                return None
-            binding = store.read_json('input.json')
-            if binding['contract'] != _REPORT_CONTRACT:
-                return None
-            observations = store.read_json('observations.json')
-            steps = [int(path.name) for path in (store.root / 'decisions').iterdir()
-                if path.is_dir() and path.name.isdecimal()]
-            step = max(steps)
-            snapshot = store.read_json(f'decisions/{step}/request.json')
-            record = store.read_json(f'decisions/{step}/response.json')
-            decision = _ReportDecision.model_validate(record['response'])
-            if (decision.action != 'write' or not record['accounting_known']
-                    or record['request_sha256'] != _digest(snapshot)
-                    or record['response_sha256'] != _digest(record['response'])
-                    or snapshot['budget_call_id'] != f'{identity}:document:{step}'
-                    or any(row not in observations for row in snapshot['input']['observations'])
-                    or not self._context_matches(binding, snapshot['input'], identity)):
-                return None
-            return binding, observations, decision, step, snapshot['input']['work_context']
+            return binding, observations, decision, step, final_input['work_context']
         except (ValueError, TypeError, KeyError, OSError):
             return None
 
@@ -343,7 +335,7 @@ class DocumentWorkToolGateway:
         source_id = relative.parts[0]
         source = self._store(source_id)
         selection_id = source.read_json('resume.json')['selection_identity'] if source.exists('resume.json') else source_id
-        selection = self._retained_report_selection(source, selection_id, allow_unstarted=True)
+        selection = self._retained_work(source, selection_id, unstarted='require')
         if not source.exists('failure.json') or selection is None:
             raise ValueError('Saved writing has no matching locally unstarted section; preserve its records')
         if request.goal.strip() and source.read_json('request.json')['goal'] != request.goal:
@@ -358,6 +350,7 @@ class DocumentWorkToolGateway:
         normalized = request.model_dump(mode='json')
         if store.exists('failure.json'):
             raise ValueError('This continuation has ended; use a new work attempt')
+        checkpoint = None
         if store.exists('resume.json'):
             resume = store.read_json('resume.json')
             if resume['request'] != normalized:
@@ -365,11 +358,12 @@ class DocumentWorkToolGateway:
         else:
             if store.exists('request.json'):
                 raise ValueError('This work attempt already has a different request')
-            _, selection_id = self._resume_source(request, identity)
+            checkpoint = self._resume_source(request, identity)
+            _, selection_id = checkpoint
             resume = {'request': normalized, 'selection_identity': selection_id, 'prepared': False}
             store.write_json('resume.json', resume)
         if not resume['prepared']:
-            source, selection_id = self._resume_source(request, identity)
+            source, selection_id = checkpoint or self._resume_source(request, identity)
             if selection_id != resume['selection_identity']:
                 raise ValueError('Writing source changed before continuation')
             for name in ('request.json', 'input.json', 'observations.json'):
@@ -379,48 +373,47 @@ class DocumentWorkToolGateway:
             resume['prepared'] = True
             store.write_json('resume.json', resume)
         if not store.exists('candidate.json'):
-            selection_id = resume['selection_identity']
-            report = (self._retained_report_selection(store, selection_id)
-                or self._retained_report_selection(store, selection_id, allow_unstarted=True))
-            if report is None:
-                raise ValueError('Saved section work has an unknown or changed request; no replay')
-            binding, observations, selection, step, work_context = report
-            client = None if store.exists('report-writer-result.json') else self._bound_client(identity)
-            self._complete_report(store, binding, observations, selection, step, identity,
-                work_context, client=client, retry_unstarted=True)
+            self._restore_candidate(store, identity, selection_id=resume['selection_identity'])
         return self._finish(store, identity)
 
-    def _retained_final(self, store: ArtifactStore, identity: str) -> tuple[dict, list[dict], _Decision, int] | None:
-        if store.exists('failure.json') or not store.exists('input.json') or not store.exists('observations.json'):
-            return None
-        directory = store.root / 'decisions'
-        if not directory.is_dir():
-            return None
-        steps = [int(path.name) for path in directory.iterdir()
-            if path.is_dir() and not path.is_symlink() and path.name.isdecimal()]
-        if not steps:
-            return None
-        step = max(steps)
+    def _retained_decision(self, store: ArtifactStore, identity: str) -> tuple[dict, list[dict], dict, dict, int]:
+        directory = store.resolve('decisions')
+        step = max(int(path.name) for path in directory.iterdir()
+            if path.is_dir() and not path.is_symlink() and path.name.isdecimal())
         if store.exists(f'decisions/{step}/selection-error.json'):
-            return None  # An accounted but rejected proposal is not a recoverable final candidate.
-        try:
-            binding = store.read_json('input.json')
-            snapshot = store.read_json(f'decisions/{step}/request.json')
-            record = store.read_json(f'decisions/{step}/response.json')
-            observations = store.read_json('observations.json')
-            decision = self._saved_decision(store, binding, record['response'], step)
-            if (decision.action != 'finish' or not record['accounting_known']
-                    or record['response_sha256'] != _digest(record['response'])
-                    or record['request_sha256'] != _digest(snapshot)
-                    or snapshot['budget_call_id'] != f'{identity}:document:{step}'
-                    or (snapshot['input']['observations'] != observations
-                        if binding['contract'] not in _WORKING_CONTRACTS else
-                        any(row not in observations for row in snapshot['input']['observations']))
-                    or not self._context_matches(binding, snapshot['input'], identity)):
-                return None
-            return binding, observations, decision, step
-        except (ValueError, TypeError, KeyError, OSError):
-            return None
+            raise ValueError('A rejected selection does not produce a recoverable candidate')
+        binding = store.read_json('input.json')
+        snapshot = store.read_json(f'decisions/{step}/request.json')
+        record = store.read_json(f'decisions/{step}/response.json')
+        observations = store.read_json('observations.json')
+        final_input, response = snapshot['input'], record['response']
+        supplied = final_input['observations']
+        if binding['contract'] in _WORKING_CONTRACTS:
+            by_id = {row['id']: row for row in observations}
+            observations_match = all(by_id.get(row['id']) == row for row in supplied)
+        else:
+            observations_match = supplied == observations
+        if (not record['accounting_known'] or record['response_sha256'] != _digest(response)
+                or record['request_sha256'] != _digest(snapshot)
+                or snapshot['budget_call_id'] != f'{identity}:document:{step}'
+                or not observations_match
+                or not self._context_matches(binding, final_input, identity)):
+            raise ValueError('Saved document selection differs from its accounted input or response')
+        return binding, observations, final_input, response, step
+
+    def _restore_candidate(self, store: ArtifactStore, identity: str, *, selection_id: str | None = None) -> None:
+        retained = self._retained_work(store, selection_id or identity, unstarted='allow' if selection_id else 'reject')
+        if retained is None:
+            raise ValueError('Document work stopped before a complete candidate; inspect its records and ledger, no blind replay')
+        binding, observations, decision, step, work_context = retained
+        if isinstance(decision, _Decision):
+            generated = self._generated_report_assets(store, binding, step, identity)
+            store.write_json('candidate.json', self._candidate(store, binding, observations, decision, step, identity,
+                generated=generated))
+            return
+        client = None if store.exists('report-writer-result.json') else self._bound_client(identity)
+        self._complete_report(store, binding, observations, decision, step, identity,
+            work_context, client=client, retry_unstarted=selection_id is not None)
 
     @staticmethod
     def _saved_decision(store: ArtifactStore, binding: dict, response: dict, step: int) -> _Decision:
@@ -509,19 +502,7 @@ class DocumentWorkToolGateway:
                 if store.read_json('request.json') != normalized:
                     raise ValueError('Document work request changed; use a new attempt')
                 if not store.exists('candidate.json'):
-                    retained = self._retained_final(store, identity)
-                    if retained is None:
-                        report = self._retained_report_selection(store, identity)
-                        if report is None:
-                            raise ValueError('Document work stopped before a complete candidate; inspect its records and ledger, no blind replay')
-                        binding, observations, selection, step, work_context = report
-                        client = None if store.exists('report-writer-result.json') else self._bound_client(identity)
-                        self._complete_report(store, binding, observations, selection, step, identity, work_context, client=client)
-                    else:
-                        binding, observations, decision, step = retained
-                        generated = self._generated_report_assets(store, binding, step, identity)
-                        store.write_json('candidate.json', self._candidate(store, binding, observations, decision, step, identity,
-                            generated=generated))
+                    self._restore_candidate(store, identity)
                 return self._finish(store, identity)
             store.write_json('request.json', normalized)
             self._produce(store, request, identity)
@@ -536,7 +517,7 @@ class DocumentWorkToolGateway:
             data = {'receipt_directory': f'records/{identity}/document_work'} if store else {}
             if store is not None and store.exists('input.json'):
                 selection_id = store.read_json('resume.json')['selection_identity'] if store.exists('resume.json') else identity
-                if self._retained_report_selection(store, selection_id, allow_unstarted=True):
+                if self._retained_work(store, selection_id, unstarted='require'):
                     data['resume_work'] = f'records/{identity}/document_work'
             artifacts = []
             if store is not None and store.exists('writer/sections.json'):
@@ -1032,20 +1013,28 @@ class DocumentWorkToolGateway:
         recalled = {row['id'] for row in prompt.get('read_results', []) if row.get('status') == 'recalled'}
         base['coverage'] += (' Only the supplied observation bodies are in this input. Repeat an original '
             'window/query request to recall its recorded observation without repeating the investigation.')
+        decoded: dict[str, Any] = {}
+        note_fields = {row['work_note'] for row in feedback if row.get('work_note')}
+
+        def observation_value(row):
+            text = row['text']
+            if text not in decoded:
+                decoded[text] = json.loads(text)
+            return decoded[text]
 
         def present(messages):
             def project(context):
                 context = dict(context)
                 view = context.pop('working_view')
                 selected = [row['observation'] for row in view['observations']]
-                context['observations'] = [json.loads(row['text']) for row in selected
+                context['observations'] = [observation_value(row) for row in selected
                     if not row.get('related_feedback') and not row.get('work_note')]
                 if feedback:
                     context['work_context'] = {**context['work_context'],
                         'related_feedback': [DocumentWorkToolGateway._feedback_view(row)
                                              for row in selected if row.get('related_feedback')]}
-                    for key in {row['work_note'] for row in feedback if row.get('work_note')}:
-                        context['work_context'][key] = [json.loads(row['text'])
+                    for key in note_fields:
+                        context['work_context'][key] = [observation_value(row)
                             for row in selected if row.get('work_note') == key]
                 return [messages[0], {'role': 'user', 'content': json.dumps(context, ensure_ascii=False)}]
             return project

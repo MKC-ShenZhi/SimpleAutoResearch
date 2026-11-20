@@ -103,13 +103,13 @@ def build_parser(
     from simple_ar.cli.start import add_data_options
     add_data_options(session_parser)
     session_parser.add_argument("--material", action="append", default=[],
-                                help="Writing: text/PDF or table_analysis.v1 analysis.json with copied data; not a verified experiment or bibliographic paper.")
+                                help="Research or writing: local notes, references or an analysis package; not a verified experiment or bibliographic paper.")
     session_parser.add_argument("--data-path", action="append", default=[], type=Path,
                                 help="Reproduction/measurement: named input data file or directory; records an external read-only asset, without automatic copying or command rewriting.")
     session_parser.add_argument("--total-tokens", type=int, default=None, help="Optional session API token budget; omitted means unlimited.")
     session_parser.add_argument("--llm-requests", type=int, default=None, help="Optional session API request budget; omitted means unlimited.")
     session_parser.add_argument("--max-output-tokens", type=int, default=None)
-    session_parser.add_argument("--independent-review-required", action="store_true",
+    session_parser.add_argument("--independent-review-required", action=argparse.BooleanOptionalAction,
         help="Require independent review for a new common task's complete delivery; partial delivery remains available.")
     session_parser.add_argument(
         "--max-section-tokens",

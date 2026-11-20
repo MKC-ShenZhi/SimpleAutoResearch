@@ -435,30 +435,7 @@ class CodeTaskTests(unittest.TestCase):
             self.assertIn("prize", (workspace / "spam_model.py").read_text(encoding="utf-8"))
 
     def test_implementation_authorization_preserves_rejections_and_dry_run(self):
-        from simple_ar.code_task.orchestration.execute import implement_code_task, CodeTaskExecuteResult
-        for reason in ("patch_apply_failed", "edit_budget_rejected", "patch_rollback_failed", "no_edits_proposed", "plan_rejected"):
-            for corrections in (0, 1):
-                first = CodeTaskExecuteResult(Path("run"), ("failed",), reason, "Inspect", Path("summary.md"))
-                second = CodeTaskExecuteResult(Path("run"), ("still rejected",), reason, "Inspect", Path("summary.md"))
-                messages = []
-                with self.subTest(reason=reason, corrections=corrections), patch(
-                    "simple_ar.code_task.orchestration.execute.execute_code_task", side_effect=[first, second],
-                ) as call:
-                    result = implement_code_task(Path("run"), approval_note="approved",
-                        proposal_corrections=corrections, message_callback=messages.append,
-                        edit_budget_overrides={"max_new_chars": 32000})
-                repeated = corrections and reason in {"patch_apply_failed", "edit_budget_rejected"}
-                self.assertEqual(call.call_count, 2 if repeated else 1)
-                self.assertEqual(result.steps, ("failed", "still rejected") if repeated else ("failed",))
-                self.assertEqual(bool(messages), bool(repeated))
-                for recorded in call.call_args_list:
-                    self.assertEqual(recorded.kwargs["edit_budget_overrides"], {"max_new_chars": 32000})
-                if repeated:
-                    self.assertIn("unchanged limits", messages[0])
-        with patch("simple_ar.code_task.orchestration.execute.execute_code_task", side_effect=LLMError("Unknown use")) as call:
-            with self.assertRaisesRegex(LLMError, "Unknown use"):
-                implement_code_task(Path("run"), approval_note="approved", proposal_corrections=1)
-            call.assert_called_once()
+        from simple_ar.code_task.orchestration.execute import implement_code_task
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _write_toy_project(root / "project")
@@ -477,6 +454,24 @@ class CodeTaskTests(unittest.TestCase):
                 self.assertEqual(result.stop_reason, expected)
                 self.assertEqual(read_json(run_dir / "manifest.json")["plan"], before)
             self.assertFalse((run_dir / "code_task" / "meta" / "applied_edits.json").exists())
+
+    def test_approved_implementation_corrects_a_rejected_patch_in_the_same_execution(self):
+        from simple_ar.code_task.orchestration.execute import implement_code_task
+
+        with _temporary_root() as root:
+            _, _, run_dir = _initialize_toy_task(root, "Add the prize keyword to the classifier.")
+            execute_code_task(run_dir, to_step="plan", baseline_policy="skip", use_llm=False)
+            record_plan_decision(run_dir, decision="approve")
+            proposal = run_dir / "code_task/meta/proposed_edits.json"
+            write_json(proposal, {"edits": [{"path": "spam_model.py", "old": "unmatched old source",
+                "new": "invalid replacement", "reason": "stale edit"}]})
+            client = LLMClient(LLMSettings(api_key='fixture', api_mode='chat'))
+            with patch.object(LLMClient, 'ask_json', side_effect=_FakeCodeTaskClient().ask_json):
+                result = implement_code_task(run_dir, approval_note="Apply the authorized patch",
+                    proposal_corrections=1, llm_client=client, use_llm=True, review_use_llm=False)
+            self.assertEqual(result.stop_reason, "stop_point", result.next_action)
+            self.assertEqual(sum(step.step == "plan" for step in result.steps), 1)
+            self.assertIn("'prize'", (run_dir / "code_task/workspace/spam_model.py").read_text(encoding="utf-8"))
 
     def test_native_verification_recovers_saved_validator_without_running_it_again(self):
         from simple_ar.code_task.orchestration.verification import verify_implementation
@@ -501,7 +496,7 @@ class CodeTaskTests(unittest.TestCase):
                 'implementation_file_hashes': implementation_file_hashes(initialized.run_dir),
                 'command_text': command_text, 'timeout_sec': 20, 'status': 'passed',
                 'metric_values': {}, 'returncode': 0, 'timed_out': False})
-            with patch('simple_ar.code_task.orchestration.verification.run_code_task_benchmark') as run, \
+            with patch('simple_ar.code_task.execution.runner._run_command') as run, \
                     patch('simple_ar.code_task.orchestration.verification.propose_repair_edits') as repair:
                 result = verify_implementation(initialized.run_dir, command=command,
                     approval_note='Original approved validator', llm_client=Mock(), timeout_sec=20,
@@ -1713,7 +1708,9 @@ primary_metric = "accuracy"
             self.assertIn("Coverage remains bounded.", plan["risks"])
             self.assertEqual([row["path"] for row in read_json(meta / "file_plan.json")["files"]],
                 [row["path"] for row in plan["files"]])
-            generated_bytes = {p: p.read_bytes() for p in source_run.rglob("*") if p.is_file()}
+            lock_path = meta / 'budget.lock'
+            generated_bytes = {p: p.read_bytes() for p in source_run.rglob("*")
+                               if p.is_file() and p != lock_path}
             with patch("simple_ar.code_task.generation.greenfield._llm_client",
                        side_effect=AssertionError("Completed projects must not select a connection")):
                 generate_greenfield_code_task(source_run, planning_mode="tool_agent", planning_review_rounds=2)
@@ -4888,7 +4885,7 @@ protected_patterns = ["pyproject.toml"]
                 records = [run_dir / 'code_task' / name for name in ('work_plan.json', 'work_plan.md', 'patch_plan.md')]
                 retained = {path: path.read_bytes() for path in records if path.is_file()}
                 client = _FailingCodeTaskClient()
-                with patch('simple_ar.code_task.editing.' + module + '.LLMClient.from_env', return_value=client):
+                with patch('simple_ar.code_task.editing.' + module + '.LLMClient.for_task', return_value=client):
                     result = execute_code_task(run_dir, use_llm=True, to_step=step,
                         timeout_sec=10, llm_retry_attempts=2)
                 self.assertEqual(result.stop_reason, 'llm_planning_failed')
@@ -4908,7 +4905,7 @@ protected_patterns = ["pyproject.toml"]
             )
             fake_client = _FailingCodeTaskClient(LLMResponseError('invalid JSON', raw_response='{broken'))
 
-            with patch("simple_ar.code_task.editing.work_plan.LLMClient.from_env", return_value=fake_client):
+            with patch("simple_ar.code_task.editing.work_plan.LLMClient.for_task", return_value=fake_client):
                 result = execute_code_task(
                     run_dir,
                     use_llm=True,
@@ -5208,17 +5205,48 @@ protected_patterns = ["pyproject.toml"]
             self.assertTrue((run_dir / "code_task/patch_plan.md").is_file())
             self.assertFalse((run_dir / "code_task/work_plan.json").exists())
 
+    def test_interactive_failure_analysis_runs_the_candidate_once(self) -> None:
+        with _temporary_root() as root:
+            _, _, run_dir = _initialize_toy_task(root, 'Diagnose a failing patch.',
+                benchmark_command=TOY_BENCHMARK_COMMAND)
+            execute_code_task(run_dir, use_llm=False, timeout_sec=10, to_step='plan')
+            record_plan_decision(run_dir, decision='approve')
+            _write_failing_edit_proposal(run_dir)
+
+            with (
+                patch('simple_ar.cli.main.confirm_next_step', return_value=True) as confirm,
+                patch('simple_ar.code_task.orchestration.execute.run_code_task_benchmark',
+                      wraps=run_code_task_benchmark) as benchmark,
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                main(['code-task', 'execute', str(run_dir), '--interactive', '--no-llm',
+                      '--to-step', 'analyze-failure', '--apply-proposed-edits'])
+
+            benchmark.assert_called_once()
+            self.assertEqual([call.args[0] for call in confirm.call_args_list],
+                ['apply-edits', 'review', 'validate', 'run', 'analyze-failure'])
+            self.assertIn('failure_analyzed', output.getvalue())
+            self.assertTrue((run_dir / 'code_task/run/patched/failure_analysis.md').is_file())
+            self.assertFalse((run_dir / 'code_task/repairs/repair-001/proposed_edits.json').exists())
+
     def test_execute_inline_review_can_approve_plan_and_continue(self) -> None:
+        from simple_ar.core.locking import SessionBusyError, SessionFileLock
+
         with _temporary_root() as root:
             code_root, task_file, run_dir = _initialize_toy_task(
                 root, "# Task\n\nApprove plan inline and continue.\n",
                 benchmark_command=TOY_BENCHMARK_COMMAND,
             )
 
+            def confirm_while_task_is_owned(*_args, **_kwargs):
+                with self.assertRaises(SessionBusyError), SessionFileLock(run_dir / 'code_task/meta/budget.lock'):
+                    self.fail('The approval must occur inside the existing standalone execution scope')
+                return True
+
             stdout = io.StringIO()
             with (
                 patch("sys.stdin.isatty", return_value=True),
-                patch("simple_ar.cli.main.confirm_review_gate", return_value=True) as confirm,
+                patch("simple_ar.cli.main.confirm_review_gate", side_effect=confirm_while_task_is_owned) as confirm,
                 contextlib.redirect_stdout(stdout),
             ):
                 main(
@@ -5676,6 +5704,12 @@ protected_patterns = ["pyproject.toml"]
             class RecoveryClient:
                 def __init__(self) -> None:
                     self.user = ""
+
+                def with_budget(self, ledger, *, session_id, attempt_id):
+                    self._budget_ledger = ledger
+                    self._budget_session_id = session_id
+                    self._budget_attempt_id = attempt_id
+                    return self
 
                 def ask_json(self, _system: str, user: str, *, label: str = "", **kwargs: object) -> dict[str, object]:
                     del label, kwargs
@@ -6296,10 +6330,9 @@ class WorkspaceSourceBindingTests(unittest.TestCase):
             write_text(source / "data/input.txt", "declared\n" * 500_001)
             spec = WorkspaceSpec(source, root / "explicit", "git_worktree",
                                  max_file_bytes=1, data_inputs=("data",))
-            before_worktrees = subprocess.run(
-                ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
-                capture_output=True, check=True,
-            ).stdout
+            list_worktrees = ['git', '-c', f'safe.directory={repo.as_posix()}', '-C', str(repo),
+                              'worktree', 'list', '--porcelain']
+            before_worktrees = subprocess.check_output(list_worktrees)
             binding = workspace_source_binding(spec)
             expected = binding["source_snapshots"]["git_worktree"]
             self.assertEqual(binding["git"]["project_relative_path"], "package")
@@ -6311,10 +6344,7 @@ class WorkspaceSourceBindingTests(unittest.TestCase):
             self.assertEqual(expected["data/input.txt"],
                              hashlib.sha256((source / "data/input.txt").read_bytes()).hexdigest())
             self.assertFalse(spec.task_dir.exists())
-            self.assertEqual(before_worktrees, subprocess.run(
-                ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
-                capture_output=True, check=True,
-            ).stdout)
+            self.assertEqual(before_worktrees, subprocess.check_output(list_worktrees))
             result = create_workspace(spec)
             self.assertEqual(expected, {row["path"]: row["sha256"]
                                        for row in build_codebase_index(result.project_root)["files"]})

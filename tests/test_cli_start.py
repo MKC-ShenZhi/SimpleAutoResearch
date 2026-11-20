@@ -9,7 +9,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from simple_ar.cli.parser import build_parser
 from simple_ar.cli.research_config import research_defaults
@@ -35,6 +35,7 @@ class StartTests(unittest.TestCase):
             'manifest': {'status': 'owner-projected-status'}, 'requests': ['Original request'],
             'plan': None, 'activity': [], 'approval': None, 'approval_unavailable': None,
             'resources': app.ledger.snapshot()}}
+        app.run.return_value.update(app.result_snapshot.return_value)
         return app
 
     def test_interactive_native_feedback_reuses_app_approval_and_ledger(self):
@@ -58,16 +59,63 @@ class StartTests(unittest.TestCase):
         self.assertFalse(initial['retry_model'])
         self.assertIsNone(initial['resource_allowances'])
         self.assertEqual(initial['read_only_sources'], ())
-        self.assertEqual(set(feedback), {'feedback', 'approve', 'progress'})
+        self.assertEqual(set(feedback), {'feedback', 'submission_id', 'approve', 'progress', 'should_stop'})
+        self.assertTrue(feedback['submission_id'])
         self.assertEqual(feedback['feedback'], '  Revise the explanation  ')
-        self.assertIs(feedback['approve'], initial['approve'])
         self.assertTrue(callable(feedback['approve']))
-        self.assertEqual(app.result_snapshot.call_count, 3)
+        self.assertFalse(feedback['should_stop']())
+        self.assertEqual(app.result_snapshot.call_count, 1)
         app.session.status_snapshot.assert_not_called()
         self.assertEqual(app.ledger.to_dict(), before)
         self.assertIn('owner-projected-status', output.getvalue())
         self.assertIn('Unknown command', output.getvalue())
         self.assertIn(str(app.session.store.root), output.getvalue())
+
+    def test_terminal_interrupt_pauses_and_resumes_the_original_task(self):
+        import signal
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.cli.main import _run_terminal_task
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve() / 'terminal'
+            app = ToolApplication.create(root, 'Keep the result', model=None, sources={})
+            actions = [
+                {'tool_name': 'write_file', 'arguments': {'path': 'result.txt', 'content': 'retained'}},
+                {'tool_name': 'ask_user', 'arguments': {'question': 'Please check the result'}},
+            ]
+
+            def interrupt_then_run(**options):
+                signal.raise_signal(signal.SIGINT)
+                return app.run(actions=actions, progress=lambda _: None, **options)
+
+            original_handler = signal.getsignal(signal.SIGINT)
+            paused = _run_terminal_task(interrupt_then_run)
+            self.assertEqual(signal.getsignal(signal.SIGINT), original_handler)
+            self.assertEqual(paused['status_reason'], 'Caller requested boundary stop')
+            self.assertFalse((root / 'workspace/result.txt').exists())
+            resumed = ToolApplication.load(root).run(progress=lambda _: None)
+            self.assertEqual(resumed['session_id'], paused['session_id'])
+            self.assertEqual((root / 'workspace/result.txt').read_text(), 'retained')
+
+    def test_structured_cli_creation_uses_the_common_terminal_stop(self):
+        import signal
+        from simple_ar.cli.start import _run_created_research
+
+        app = self._interactive_cli_app()
+        original = signal.getsignal(signal.SIGINT)
+
+        def start(selected, *, progress, should_stop):
+            self.assertIs(selected, app)
+            self.assertFalse(should_stop())
+            signal.raise_signal(signal.SIGINT)
+            self.assertTrue(should_stop())
+            return {'status': 'paused'}
+
+        with patch('simple_ar.app.research_intake.start_research_task', side_effect=start), \
+                patch('simple_ar.cli.main._render_native_result'), \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(SystemExit, 'paused'):
+            _run_created_research(app, root=app.session.store.root)
+        self.assertEqual(signal.getsignal(signal.SIGINT), original)
 
     def test_feedback_can_request_review_in_interactive_or_one_shot_cli(self):
         from simple_ar.cli.main import main
@@ -88,8 +136,9 @@ class StartTests(unittest.TestCase):
                 patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
                 contextlib.redirect_stdout(io.StringIO()):
             main(['start', '--resume-task', str(app.session.store.root),
-                  'Check the revised result', '--independent-review-required', '--yes'])
+                  'Check the revised result', '--independent-review-required', '--submission-id', 'review-1', '--yes'])
         self.assertEqual(app.run.call_args.kwargs['feedback'], 'Check the revised result')
+        self.assertEqual(app.run.call_args.kwargs['submission_id'], 'review-1')
         self.assertTrue(app.run.call_args.kwargs['independent_review_required'])
 
     def test_interactive_native_creation_enters_same_feedback_consumer(self):
@@ -221,7 +270,7 @@ class StartTests(unittest.TestCase):
             renderer.assert_called_once_with(app, app.run.return_value)
             app.result_snapshot.assert_not_called()
             prompt.assert_not_called()
-            self.assertEqual(callable(app.run.call_args.kwargs['approve']), tty)
+            self.assertEqual(callable(app.run.call_args.kwargs.get('approve')), tty)
 
     def test_interactive_rejects_nonterminal_and_structured_options_before_dispatch(self):
         from simple_ar.cli.main import main
@@ -768,7 +817,8 @@ class StartTests(unittest.TestCase):
             self.assertFalse(options['allow_network'])
 
     def test_prior_draft_locator_prefers_exact_source_then_shortest_valid_locator(self):
-        from simple_ar.cli.start import _creation_source_locator, migrate_new_start
+        from simple_ar.app.task_creation import _creation_source_locator
+        from simple_ar.cli.start import migrate_new_start
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             package = root / 'package'
@@ -858,7 +908,8 @@ class StartTests(unittest.TestCase):
     def test_project_tasks_main_listing_selection_feedback_and_read_only_boundaries(self):
         from simple_ar.app.tool_application import ToolApplication
         from simple_ar.cli.main import main
-        from simple_ar.cli.project_tasks import ProjectTask, handle_project_tasks
+        from simple_ar.cli.project_tasks import handle_project_tasks
+        from simple_ar.cli.task_options import resume_command
         with tempfile.TemporaryDirectory() as temporary, \
                 patch('simple_ar.integrations.llm.LLMClient.from_env',
                     side_effect=AssertionError('Discovery/selection must not resolve a model')), \
@@ -891,7 +942,7 @@ class StartTests(unittest.TestCase):
                 for selector in ('../a-task', str(app.session.store.root), 'hidden', 'broken', 'legacy'):
                     with self.subTest(selector=selector), self.assertRaisesRegex(SystemExit, 'exact listed'):
                         main(['start', '--tasks-in', str(root), '--resume-task', selector])
-                with patch('simple_ar.cli.project_tasks.MAX_ENTRIES', 2), self.assertRaisesRegex(SystemExit, 'narrower'):
+                with patch('simple_ar.tools.project_results.MAX_ENTRIES', 2), self.assertRaisesRegex(SystemExit, 'narrower'):
                     main(['start', '--tasks-in', str(root)])
                 with self.assertRaisesRegex(SystemExit, 'terminal'):
                     main(['start', '--tasks-in', str(root), '--select-task'])
@@ -902,7 +953,7 @@ class StartTests(unittest.TestCase):
             self.assertIn('status=partial', text)
             self.assertIn('Explain [saved] results', text)
             self.assertIn('partial retains unresolved work', text)
-            self.assertIn(ProjectTask(app.session.store.root, '', '').resume_command, text)
+            self.assertIn(resume_command(app.session.store.root), text)
             self.assertNotIn('Never scanned recursively', text)
             args = build_parser().parse_args(['start', '--tasks-in', str(root), '--select-task'])
             args._explicit_start_destinations = {'tasks_in', 'select_task'}
@@ -1181,6 +1232,8 @@ class StartTests(unittest.TestCase):
             app.state.setdefault('config', kwargs)
             app.state['config'] = kwargs
             app.state['requests'] = [args[1]]
+            if initialize := kwargs.get('initialize_session'):
+                initialize(app.session)
             return app
         create.side_effect = capture
         return app
@@ -1465,7 +1518,7 @@ class StartTests(unittest.TestCase):
             self.assertTrue(create.call_args.kwargs["allow_execution"])
             app.run.assert_called_once()
             self.assertEqual(app.run.call_args.kwargs["approved_execution"], "")
-            self.assertIsNone(app.run.call_args.kwargs["approve"])
+            self.assertIsNone(app.run.call_args.kwargs.get("approve"))
             process.assert_not_called()  # Summary consent never executes a command.
             # The explicit menu is an input preference; it enters the same owner.
             from simple_ar.cli.start import FUNCTION_LABELS
@@ -2195,12 +2248,15 @@ class StartTests(unittest.TestCase):
 
     def test_interactive_native_decline_creates_no_task_or_legacy_configuration(self):
         from simple_ar.cli.main import main
+        from simple_ar.integrations.llm import LLMClient, LLMSettings
         with tempfile.TemporaryDirectory() as directory:
             from unittest.mock import MagicMock
             app = MagicMock()
+            connection = LLMClient(LLMSettings(api_key='fixture', model='fixture', api_mode='chat'))
             with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=[
                 "survey", "Review this direction", "", "none", "n",
             ]) as prompts, patch("simple_ar.cli.start.select_start_model"), \
+                    patch('simple_ar.integrations.llm.LLMClient.from_env', return_value=connection), \
                     patch("simple_ar.app.tool_application.ToolApplication.create", return_value=app) as create, \
                     contextlib.redirect_stdout(io.StringIO()):
                 main(["start", "--guided", "--output-root", directory])
@@ -2598,7 +2654,9 @@ class StartTests(unittest.TestCase):
             app = self._capture_creation(create)
             app.state = {'turns': [], 'pending': {'attempt': 'first'}}
             app.measurement_completion_actions.return_value = []
-            def run_batch(*, actions, approve, progress):
+            def run_batch(*, actions, approve, progress, finish_declared_work, should_stop):
+                self.assertTrue(finish_declared_work)
+                self.assertFalse(should_stop())
                 turn = len(app.state['turns'])
                 app.state['turns'].append({'origin': 'caller', 'request_count': len(app.state['requests'])})
                 conditions = app.state['config']['execution_contract']['conditions']
@@ -2757,7 +2815,7 @@ class StartTests(unittest.TestCase):
                     self.assertEqual(options['process_limits'], {
                         'process_invocations': 2 if explicit_budget or materials_only else 2 + 4 * 4,
                         'process_wall_seconds': 10 if explicit_budget or materials_only else 10 + 4 * 120})
-                    app.run.assert_called_once_with(progress=print_line)
+                    app.run.assert_called_once_with(progress=print_line, should_stop=ANY)
                     app.measurement_completion_actions.assert_not_called()
                     self.assertEqual(app.scientific.mock_calls, [])
                     process.assert_not_called()
@@ -2813,7 +2871,7 @@ class StartTests(unittest.TestCase):
                     self.assertEqual(policy['require_summary'], 'summary' in outputs)
                     self.assertEqual(policy['selected_idea_id'], selected)
                     self.assertEqual(policy['interaction'], 'assisted')
-                    app.run.assert_called_once_with(progress=progress)
+                    app.run.assert_called_once_with(progress=progress, should_stop=ANY)
                     app.request_execution_confirmation.assert_not_called()
                     app.measurement_completion_actions.assert_not_called()
                     process.assert_not_called()

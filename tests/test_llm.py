@@ -65,6 +65,8 @@ class LLMParsingTests(unittest.TestCase):
             self.assertEqual(client.chat_turn(messages, tools=tools)['content'], 'ok')
         self.assertEqual(ledger.entries[0].reserved['total_tokens'], 160)
         self.assertEqual(ledger.entries[0].actual['total_tokens'], 122)
+        self.assertEqual(ledger.entries[0].token_details, {'estimated_input': 150, 'output_cap': 10,
+            'provider_input': 120, 'provider_output': 2})
         self.assertEqual(counter.call_count, 2)
         self.assertEqual(counter.call_args.kwargs['messages'], messages)
         self.assertEqual(counter.call_args.kwargs['tools'], tools)

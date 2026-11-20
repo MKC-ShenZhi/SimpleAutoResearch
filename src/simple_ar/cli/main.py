@@ -4,12 +4,14 @@ import argparse
 import os
 import shlex
 import shutil
+import signal
 import sys
+from threading import current_thread, main_thread
 from pathlib import Path
 from typing import Any, Callable, Sequence
+from uuid import uuid4
 
 from simple_ar.core.artifacts import read_json, read_text
-from simple_ar.code_task.runtime.accounting import standalone_task_accounting as _code_task_accounting
 from simple_ar.cli.research_view import ResearchConsole, report_audit_line
 from simple_ar.cli.code_task_view import (
     confirm_next_step,
@@ -27,7 +29,6 @@ from simple_ar.code_task import (
     build_code_task_context_pack,
     build_code_task_repo_map,
     create_code_task_batch,
-    execute_code_task,
     generate_code_task_work_plan,
     generate_patch_plan,
     initialize_code_task,
@@ -57,10 +58,10 @@ from simple_ar.app.cleanup import (
     confirm_clean_plan,
     render_clean_plan,
 )
-from simple_ar.code_task.runtime.config import EXECUTE_STEPS
+from simple_ar.code_task.orchestration.execute import execute_reviewed_code_task
 from simple_ar.app.research_execution import merge_result_schema
 from simple_ar.core.console import print_line
-from simple_ar.integrations.llm import LLMClient, LLMError
+from simple_ar.integrations.llm import LLMCallStopped, LLMClient, LLMError
 from simple_ar.retrieval.index import build_artifact_index
 from simple_ar.retrieval.search import search_artifacts
 from simple_ar.cli.parser import build_parser
@@ -348,11 +349,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             'execute': _print_code_task_execute,
         }
         if handler := accounted.get(args.code_task_command):
-            if args.code_task_command == 'execute' and args.interactive:
-                with _code_task_accounting(Path(args.run_dir), active=not args.dry_run) as accounting:
-                    handler(args, accounting)
-            else:
-                handler(args)
+            handler(args)
             return
         if args.code_task_command == "probe":
             _print_code_task_probe(args)
@@ -430,13 +427,13 @@ def _experiment_result_schema(args: argparse.Namespace) -> dict[str, object]:
 def _print_research_session(args: argparse.Namespace) -> None:
     """Run the canonical bounded research-to-report application."""
 
+    from simple_ar.app.research_intake import is_common_research_session
     from simple_ar.app.session_roots import new_research_session_root
     from simple_ar.research.workflow_contracts import ResearchBrief
 
     saved_outputs = ()
     if getattr(args, "session_root", None) is not None:
-        manifest = Path(args.session_root) / 'session_manifest.json'
-        if manifest.is_file() and read_json(manifest).get('transition_recipe') == 'native-tools-v1':
+        if is_common_research_session(args.session_root):
             from simple_ar.cli.start import resume_structured_task
             try:
                 resume_structured_task(args)
@@ -445,14 +442,14 @@ def _print_research_session(args: argparse.Namespace) -> None:
             return
         if 'independent_review_required' in getattr(args, '_explicit_resume_destinations', ()):
             raise SystemExit('This option requires an existing common task; historical research sessions retain their saved review contract.')
-        from simple_ar.app.research_application import load_session
+        from simple_ar.app.research_application import saved_research_intent
 
         try:
-            saved_app = load_session(args.session_root)
-            saved_outputs = saved_app.brief.requested_outputs
+            saved_brief, saved_kind = saved_research_intent(args.session_root)
+            saved_outputs = saved_brief.requested_outputs
             if not getattr(args, "topic", None):
-                args.topic = saved_app.brief.objective
-            if getattr(args, "task_kind", "auto") == "auto" and saved_app.task_kind == "data_analysis":
+                args.topic = saved_brief.objective
+            if getattr(args, "task_kind", "auto") == "auto" and saved_kind == "data_analysis":
                 args.task_kind = "data_analysis"
         except (OSError, RuntimeError, ValueError) as exc:
             raise SystemExit(f"Could not restore the saved session goal: {exc}") from exc
@@ -634,8 +631,8 @@ def _print_research_session(args: argparse.Namespace) -> None:
         "research_max_iterations": args.max_research_iterations,
         "report": report_config,
     }
-    if getattr(args, 'independent_review_required', False):
-        config['independent_review_required'] = True
+    if getattr(args, 'independent_review_required', None) is not None:
+        config['independent_review_required'] = args.independent_review_required
     if writing_method is not None:
         config["report_writing_method"] = writing_method
     if review_model and resume_root is None:
@@ -748,7 +745,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
                 report_config=report_config, writing_method=writing_method, research_config=config)
             return
         else:
-            from simple_ar.app.research_application import ResearchApplicationServices, load_session
+            from simple_ar.app.research_application import ResearchApplicationServices, load_session, run_research_handoff
             from dataclasses import replace
             llm_client = (None if analysis_only else _optional_research_llm_client(
                 args.model, "research session", max_output_tokens=getattr(args, "max_output_tokens", None)))
@@ -762,22 +759,17 @@ def _print_research_session(args: argparse.Namespace) -> None:
             services = ResearchApplicationServices(
                 llm_client=llm_client,
                 feasibility_llm_client=feasibility_client,
-                max_results=args.max_results,
-                max_chunks=args.max_chunks,
-                idea_limit=args.idea_limit,
                 cache_dir=Path(args.cache_dir).resolve() if args.cache_dir else None,
                 input_base_dir=Path.cwd(),
-                config=config,
                 budget_limits={
                     "llm_requests": args.llm_requests,
                     "total_tokens": args.total_tokens,
                     "process_invocations": args.process_invocations if getattr(args, "process_invocations", None) is not None else process_count,
                     "process_wall_seconds": args.process_wall_seconds if getattr(args, "process_wall_seconds", None) is not None else process_wall,
                 },
-                max_attempts=32 if code_task_spec is not None else 20,
                 message_callback=display.message,
             )
-            app = load_session(session_root, services=replace(services, config={}))
+            app = load_session(session_root, services=services)
             saved_review_model = str(app.services.config.get("feasibility_review_model") or "")
             if saved_review_model and app.services.feasibility_llm_client is None:
                 reviewer = _optional_research_llm_client(
@@ -821,16 +813,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
             model=getattr(llm_client, "model", "configured") if llm_client is not None else "deterministic",
             topic=app.brief.objective,
         )
-        for _ in range(app.controller.manifest.budget.max_attempts + 8):
-            if view.next_action is None:
-                view = app.advance(max_actions=1)
-                break
-            with display.action(view.next_action):
-                view = app.advance(max_actions=1)
-            display.state(view)
-            if view.status in {"completed", "paused", "blocked", "failed"}:
-                break
-        app.export_session()
+        view = run_research_handoff(app, action_context=display.action, observe=display.state)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
     print_line(f"Research session: {view.session_root}")
@@ -1105,16 +1088,6 @@ def _explicit_session_option_destinations(
     return destinations
 
 
-def _report_config_overrides(args: argparse.Namespace, app: Any) -> dict[str, object]:
-    """Compatibility projection for research-report; semantics belong to the application."""
-    from simple_ar.cli.research_config import report_settings
-    from simple_ar.report.requirements import report_config_overrides
-
-    supplied = report_settings(args, explicit_destinations=getattr(args, "_explicit_resume_destinations", set()))
-    return report_config_overrides(supplied, app.services.config,
-        session_resume=args.command == "research-session")
-
-
 def _resume_research_settings(args: argparse.Namespace) -> dict[str, object]:
     """Translate only explicitly supplied search/ingestion settings."""
     explicit = getattr(args, "_explicit_resume_destinations", set())
@@ -1144,12 +1117,12 @@ def _print_report_writing_plan(method: str, settings: dict) -> None:
 
 def _print_common_research_report(args: argparse.Namespace) -> None:
     """Continue the saved shared task using its existing Writer and budget."""
-    from simple_ar.app.tool_application import ToolApplication
+    from simple_ar.research import load_research_task
     from simple_ar.cli.research_config import report_settings
 
     root = Path(args.session_root)
     try:
-        app = ToolApplication.load(root)
+        app = load_research_task(root)
         if args.model is not None and args.model != app.state['config'].get('model'):
             raise ValueError('The common session retains its saved model; research-report cannot switch it.')
         saved = app.current_report_requirement()
@@ -1157,7 +1130,8 @@ def _print_common_research_report(args: argparse.Namespace) -> None:
         status = app.session.manifest.status
         settings = report_settings(args, explicit_destinations=explicit if saved is not None else None)
         request_report = app.request_report(settings, refresh=args.refresh)
-        result = app.run(progress=print_line) if request_report or status not in {'completed', 'partial'} else app.result_snapshot()
+        result = (_run_terminal_task(app.run, progress=print_line)
+                  if request_report or status not in {'completed', 'partial'} else app.result_snapshot())
         _render_native_result(app, result)
         _ensure_research_cli_success(result['status'], operation='Research report', root=root)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -1169,12 +1143,13 @@ def _print_research_report(args: argparse.Namespace) -> None:
 
     if args.max_review_iterations < 0:
         raise SystemExit("--max-review-iterations cannot be negative.")
-    manifest = Path(args.session_root) / 'session_manifest.json'
-    if manifest.is_file() and read_json(manifest).get('transition_recipe') == 'native-tools-v1':
+    from simple_ar.app.research_intake import is_common_research_session
+    if is_common_research_session(args.session_root):
         _print_common_research_report(args)
         return
     from simple_ar.cli.research_config import report_settings
-    report_settings(args)
+    explicit = getattr(args, '_explicit_resume_destinations', set())
+    settings = report_settings(args, explicit_destinations=explicit)
     session_root = Path(args.session_root)
     client = _optional_research_llm_client(args.model, "research report")
     if client is None:
@@ -1185,6 +1160,8 @@ def _print_research_report(args: argparse.Namespace) -> None:
         ResearchApplicationError,
         ResearchApplicationServices,
         load_session,
+        prepare_report_continuation,
+        run_research_handoff,
     )
 
     app = None
@@ -1201,42 +1178,22 @@ def _print_research_report(args: argparse.Namespace) -> None:
             "new research uses research-session. No legacy workflow was executed."
         ) from exc
     try:
-        view = app.view()
-        report_overrides = _report_config_overrides(args, app)
-        if args.refresh:
-            view = app.request_report(
-                refresh=True,
-                report_config=report_overrides,
-                reason="Explicitly regenerate the report from existing research evidence.",
-            )
-        elif report_overrides:
-            view = app.request_report(
-                report_config=report_overrides,
-                reason="Apply explicit report settings and rebuild only report deliverables from existing evidence.",
-            )
-        elif not ({"report", "paper", "full_paper"} & {
-            item.strip().lower() for item in app.brief.requested_outputs
-        }):
-            view = app.request_report()
-        elif view.status in {"paused", "blocked"} and view.next_action is not None:
-            view = app.continue_session(
-                reason="Resume the canonical report lifecycle within the persisted session budget.",
-            )
+        prepare_report_continuation(app, refresh=args.refresh, settings=settings)
         _print_report_writing_plan(app.services.config.get("report_writing_method", "sections"),
                                    app.services.config.get("report", {}))
-        for _ in range(app.controller.manifest.budget.max_attempts + 8):
-            if view.next_action is None and view.status != "running":
-                break
-            if view.next_action is not None:
-                print_line(f"Action: {view.next_action}")
-            view = app.advance(max_actions=1)
+        def observe(updated):
             print_line(
-                f"Status: {view.status}; next: {view.next_action or 'none'}"
-                + (f"; {view.status_reason}" if view.status_reason else "")
+                f"Status: {updated.status}; next: {updated.next_action or 'none'}"
+                + (f"; {updated.status_reason}" if updated.status_reason else "")
             )
-            if view.status in {"completed", "paused", "blocked", "failed"}:
-                break
-        app.export_session()
+        from contextlib import contextmanager
+
+        @contextmanager
+        def log_action(action):
+            print_line(f"Action: {action}")
+            yield
+
+        view = run_research_handoff(app, action_context=log_action, observe=observe)
     except (ResearchApplicationError, OSError, RuntimeError, TypeError, ValueError) as exc:
         guidance = _report_budget_authorization_guidance(app) if app is not None else None
         if guidance is not None:
@@ -2207,227 +2164,87 @@ def _print_code_task_repair(args: argparse.Namespace) -> None:
         print_line(f"- {path}")
 
 
-def _print_code_task_execute(args: argparse.Namespace, accounting: dict | None = None) -> None:
+def _print_code_task_execute(args: argparse.Namespace) -> None:
     """Run the state-aware code-task orchestrator and render progress."""
-    accounting = accounting or {}
     try:
         options = load_code_task_execute_options(config_path=args.config)
     except CodeTaskConfigError as exc:
         raise SystemExit(str(exc)) from exc
-    model = args.model or options.model
-    use_llm = False if args.no_llm else options.use_llm
-    timeout = args.timeout if args.timeout != 60 else options.timeout_sec
-    to_step = args.to_step or options.to_step
-    repair_rounds = args.repair_rounds if args.repair_rounds is not None else options.repair_rounds
-    planning_review_rounds = (
-        args.planning_review_rounds
-        if args.planning_review_rounds is not None
-        else options.planning_review_rounds
+    execution = options.execution_kwargs()
+    execution.update(
+        model=args.model or options.model,
+        use_llm=options.use_llm and not args.no_llm,
+        timeout_sec=args.timeout if args.timeout != 60 else options.timeout_sec,
+        to_step=args.to_step or options.to_step,
+        repair_rounds=options.repair_rounds if args.repair_rounds is None else args.repair_rounds,
+        planning_review_rounds=(options.planning_review_rounds if args.planning_review_rounds is None
+                                else args.planning_review_rounds),
+        max_files=args.max_files if args.max_files != 8 else options.max_files,
+        max_source_chars_per_file=(args.max_source_chars_per_file if args.max_source_chars_per_file != 4000
+                                   else options.max_source_chars_per_file),
+        validation_max_file_bytes=(args.validation_max_file_bytes if args.validation_max_file_bytes != 500_000
+                                   else options.validation_max_file_bytes),
+        env_mode=args.env_mode or options.env_mode,
+        python_executable=args.python_executable or options.python_executable,
+        allow_planning_fallback=args.allow_planning_fallback or options.allow_planning_fallback,
+        planning_mode=args.planning_mode or options.planning_mode,
+        llm_retry_attempts=args.llm_retry_attempts or options.llm_retry_attempts,
+        baseline_policy=args.baseline_policy or options.baseline_policy,
+        baseline_metrics_file=args.baseline_metrics_file or options.baseline_metrics_file,
+        review_gate=args.review_gate or options.review_gate,
+        skip_validation=args.skip_validation or options.skip_validation,
+        strict_validation=args.strict_validation or options.strict_validation,
+        direct_edit=False if args.interactive else None,
+        approve_direct_edits=not args.interactive and args.yes and not args.no_review_inline,
+        planning_snapshot_from=args.reuse_planning_from,
+        dry_run=args.dry_run,
+        message_callback=render_execute_message,
     )
-    max_files = args.max_files if args.max_files != 8 else options.max_files
-    max_source_chars = (
-        args.max_source_chars_per_file
-        if args.max_source_chars_per_file != 4000
-        else options.max_source_chars_per_file
-    )
-    validation_max_file_bytes = (
-        args.validation_max_file_bytes
-        if args.validation_max_file_bytes != 500_000
-        else options.validation_max_file_bytes
-    )
-    env_mode = args.env_mode or options.env_mode
-    python_executable = args.python_executable or options.python_executable
-    allow_planning_fallback = args.allow_planning_fallback or options.allow_planning_fallback
-    planning_mode = args.planning_mode or options.planning_mode
-    llm_retry_attempts = args.llm_retry_attempts or options.llm_retry_attempts
-    baseline_policy = args.baseline_policy or options.baseline_policy
-    baseline_metrics_file = args.baseline_metrics_file or options.baseline_metrics_file
-    review_gate = args.review_gate or options.review_gate
-    inline_apply_proposed_edits = False
-    inline_allow_large_edits = False
+    to_step = execution['to_step']
 
     run_dir = Path(args.run_dir)
-    direct_edit = False
-    if not args.interactive:
-        from simple_ar.code_task.orchestration.execute import direct_edit_available
-        from simple_ar.code_task.runtime.state import load_code_task_manifest
-        saved = load_code_task_manifest(run_dir)
-        direct_edit = direct_edit_available(saved, run_dir / 'code_task', to_step=to_step, use_llm=use_llm)
     render_execute_header(
         run_dir,
         to_step=to_step,
-        use_llm=use_llm,
-        timeout_sec=timeout,
+        use_llm=execution['use_llm'],
+        timeout_sec=execution['timeout_sec'],
         dry_run=args.dry_run,
     )
 
-    def run_execute(target_step: str, *, dry_run_override: bool | None = None):
-        dry_run = args.dry_run if dry_run_override is None else dry_run_override
-        return execute_code_task(
-            run_dir,
-            to_step=target_step,
-            dry_run=dry_run,
-            model=model,
-            planner_model=options.planner_model,
-            writer_model=options.writer_model,
-            reviewer_model=options.reviewer_model,
-            editor_model=options.editor_model,
-            repair_model=options.repair_model,
-            use_llm=use_llm,
-            timeout_sec=timeout,
-            skip_validation=args.skip_validation or options.skip_validation,
-            env_mode=env_mode,
-            python_executable=python_executable,
-            strict_validation=args.strict_validation or options.strict_validation,
-            validation_max_file_bytes=validation_max_file_bytes,
-            stream_benchmark_output=options.stream_benchmark_output,
-            baseline_policy=baseline_policy,
-            baseline_metrics_file=baseline_metrics_file,
-            apply_proposed_edits=(
-                args.apply_proposed_edits
-                or options.apply_proposed_edits
-                or inline_apply_proposed_edits
-                or (direct_edit and args.yes and not args.no_review_inline)
-            ),
-            allow_large_edits=(
-                args.allow_large_edits
-                or options.allow_large_edits
-                or inline_allow_large_edits
-                or (direct_edit and args.yes and not args.no_review_inline)
-            ),
-            direct_edit=direct_edit,
-            approval_note=('Caller approved the isolated code changes.' if direct_edit and (
-                (args.yes and not args.no_review_inline) or args.apply_proposed_edits
-                or options.apply_proposed_edits or inline_apply_proposed_edits) else ''),
-            allow_planning_fallback=allow_planning_fallback,
-            planning_mode=planning_mode,
-            planning_review_rounds=planning_review_rounds,
-            llm_retry_attempts=llm_retry_attempts,
-            repair_rounds=repair_rounds,
-            planning_snapshot_from=args.reuse_planning_from,
-            review_gate=review_gate,
-            budget_profile=options.budget_profile,
-            edit_budget_overrides=options.edit_budget_overrides,
-            max_batches=options.max_batches,
-            cost_cap_usd=options.cost_cap_usd,
-            max_files=max_files,
-            max_source_chars_per_file=max_source_chars,
-            max_generated_lines=options.max_generated_lines,
-            implementation_provider=options.implementation_provider,
-            implementation_agent_mode=options.implementation_agent_mode,
-            implementation_allow_external_agent=options.implementation_allow_external_agent,
-            implementation_agent_model=options.implementation_agent_model,
-            implementation_agent_binary=options.implementation_agent_binary,
-            implementation_agent_args=options.implementation_agent_args,
-            implementation_agent_timeout_sec=options.implementation_agent_timeout_sec,
-            message_callback=render_execute_message,
-            **accounting,
-        )
+    def confirm_step(step: str) -> bool:
+        render_step_preview(step)
+        return confirm_next_step(step)
 
-    staged_mode = bool(args.interactive)
-    if not staged_mode:
-        result = run_execute(to_step)
-        while True:
-            render_execute_result(result)
-            if not _inline_review_enabled(args):
-                return
-            action = _inline_review_action(result, to_step)
-            if action == "approve-plan":
-                render_review_gate(
-                    title="Patch Plan Review",
-                    artifact=run_dir / "code_task" / "patch_plan.md",
-                    action="approve this patch plan and continue to edit proposal generation",
-                    warning=(
-                        "Only approve if the plan matches the task, edit scope, "
-                        "benchmark, and expected files."
-                    ),
-                )
-                if not confirm_review_gate(
-                    "Approve the patch plan and continue?",
-                    assume_yes=bool(args.yes),
-                ):
-                    print_line("Execute stopped at patch-plan review.")
-                    return
-                record_plan_decision(
-                    run_dir,
-                    decision="approve",
-                    note="Approved from inline execute review.",
-                    reviewer="execute",
-                )
-                result = run_execute(to_step)
-                continue
-            if action == "apply-proposal":
-                render_review_gate(
-                    title="Edit Proposal Review",
-                    artifact=run_dir / "code_task" / "meta" / "proposed_edits.json",
-                    action="apply the reviewed proposal, validate, and run the patched benchmark",
-                    warning=(
-                        "Only continue after checking every old/new replacement, "
-                        "target path, and proposal warning."
-                    ),
-                )
-                if not confirm_review_gate(
-                    "Apply the reviewed edit proposal and continue?",
-                    assume_yes=bool(args.yes),
-                ):
-                    print_line("Execute stopped at edit-proposal review.")
-                    return
-                inline_apply_proposed_edits = True
-                result = run_execute(to_step)
-                continue
-            if action == "allow-large-edits":
-                render_review_gate(
-                    title="Large Edit Review",
-                    artifact=run_dir / "code_task" / "meta" / "proposed_edits.json",
-                    action="allow the large reviewed proposal and continue applying it",
-                    warning=(
-                        "Large edits have wider blast radius. Continue only if "
-                        "the larger patch is intentional and fully reviewed."
-                    ),
-                )
-                if not confirm_review_gate(
-                    "Allow this large edit proposal and continue?",
-                    assume_yes=bool(args.yes),
-                ):
-                    print_line("Execute stopped at large-edit review.")
-                    return
-                inline_apply_proposed_edits = True
-                inline_allow_large_edits = True
-                result = run_execute(to_step)
-                continue
-            return
-        return
+    def confirm_action(action: str) -> bool:
+        title, artifact, description, warning, prompt, stop = {
+            "approve-plan": ("Patch Plan Review", "patch_plan.md",
+                "approve this patch plan and continue to edit proposal generation",
+                "Only approve if the plan matches the task, edit scope, benchmark, and expected files.",
+                "Approve the patch plan and continue?", "patch-plan review"),
+            "apply-proposal": ("Edit Proposal Review", "meta/proposed_edits.json",
+                "apply the reviewed proposal, validate, and run the patched benchmark",
+                "Only continue if the exact proposed edits match the approved scope.",
+                "Apply the reviewed edit proposal and continue?", "edit-proposal review"),
+            "allow-large-edits": ("Large Edit Review", "meta/proposed_edits.json",
+                "allow the large reviewed proposal and continue applying it",
+                "Large edits have wider blast radius. Continue only if the larger patch is intentional and fully reviewed.",
+                "Allow this large edit proposal and continue?", "large-edit review"),
+        }[action]
+        render_review_gate(title=title, artifact=run_dir / "code_task" / artifact,
+            action=description, warning=warning)
+        if not confirm_review_gate(prompt, assume_yes=bool(args.yes)):
+            print_line(f"Execute stopped at {stop}.")
+            return False
+        return True
 
-    target_index = EXECUTE_STEPS.index(to_step)
-    rendered_steps: set[str] = set()
-    for step in EXECUTE_STEPS[: target_index + 1]:
-        if (step in {"work-plan", "batch"} and to_step not in {"work-plan", "batch"}
-                and not (Path(args.run_dir) / "code_task/work_plan.json").is_file()):
-            continue
-        preview = run_execute(step, dry_run_override=True)
-        current_preview = next((record for record in reversed(preview.steps) if record.step == step), None)
-        if current_preview is not None and current_preview.status == "skipped":
-            render_execute_result(preview, steps=(current_preview,))
-            rendered_steps.add(current_preview.step)
-            if preview.stop_reason != "stop_point":
-                return
-            continue
-        if preview.stop_reason != "dry_run":
-            unseen_steps = tuple(record for record in preview.steps if record.step not in rendered_steps)
-            render_execute_result(preview, steps=unseen_steps)
-            return
-        if not args.yes:
-            render_step_preview(step)
-            if not confirm_next_step(step, assume_yes=False):
-                print_line(f"Execute stopped before step: {step}")
-                return
-        result = run_execute(step)
-        current = next((record for record in reversed(result.steps) if record.step == step), None)
-        render_execute_result(result, steps=(current,) if current is not None else ())
-        if current is not None:
-            rendered_steps.add(current.step)
-        if result.stop_reason not in {"stop_point", "completed"}:
-            return
+    execute_reviewed_code_task(run_dir,
+        confirm=confirm_action if _inline_review_enabled(args) else None, observe=render_execute_result,
+        **{
+            **execution,
+            'apply_proposed_edits': args.apply_proposed_edits or options.apply_proposed_edits,
+            'allow_large_edits': args.allow_large_edits or options.allow_large_edits,
+            **({'before_step': confirm_step} if args.interactive and not args.yes and not args.dry_run else {}),
+        })
 
 
 def _inline_review_enabled(args: argparse.Namespace) -> bool:
@@ -2439,20 +2256,6 @@ def _inline_review_enabled(args: argparse.Namespace) -> bool:
         and not bool(args.interactive)
         and (bool(args.yes) or sys.stdin.isatty())
     )
-
-
-def _inline_review_action(result: object, to_step: str) -> str | None:
-    """Map an execute stop reason to an optional inline review action."""
-
-    target_index = EXECUTE_STEPS.index(to_step)
-    stop_reason = getattr(result, "stop_reason", "")
-    if stop_reason == "approval_required" and target_index > EXECUTE_STEPS.index("plan"):
-        return "approve-plan"
-    if stop_reason == "proposal_review_required" and target_index > EXECUTE_STEPS.index("propose-edits"):
-        return "apply-proposal"
-    if stop_reason == "large_edit_approval_required" and target_index > EXECUTE_STEPS.index("apply-edits"):
-        return "allow-large-edits"
-    return None
 
 
 def _artifact_rows(index: dict[str, object]) -> list[dict[str, object]]:
@@ -2495,28 +2298,31 @@ def _stage_status(item: dict[str, object]) -> str:
     return "done" if item.get("completed") else "pending"
 
 
-def _delivery_version_lines(root: Path) -> list[str]:
+def _delivery_version_lines(root: Path, versions: list[dict] | None = None) -> list[str]:
     """Discover retained bytes from original attempts, without changing state."""
     from simple_ar.tools.delivery_versions import DeliveryVersions
 
-    if not (root / 'session_manifest.json').is_file():
-        return []
-    try:
-        versions = DeliveryVersions(root).versions()
-    except (OSError, ValueError, KeyError, TypeError):
-        return ['Retained byte versions unavailable / 保留字节版本不可用；请检查原始交付回执。']
+    if versions is None:
+        if not (root / 'session_manifest.json').is_file():
+            return []
+        try:
+            versions = DeliveryVersions(root).catalog()
+        except (OSError, ValueError, KeyError, TypeError):
+            return ['Retained byte versions unavailable / 保留字节版本不可用；请检查原始交付回执。']
     retained = sum(version['status'] == 'retained' for version in versions)
     lines = [f'Retained byte versions / 已保留字节版本: {retained}']
     if not retained and (root / 'delivery.json').is_file():
         lines.append('Historical delivery bytes unavailable / 历史交付缺少可还原字节；不会从当前文件补建。')
-    for number, version in enumerate(versions, 1):
+    for version in versions:
+        number = version['version']
         if version['status'] != 'retained':
             lines.append(f"- version={number}; request={version['request_count']}; "
                 f"unavailable / 历史字节不可还原; observation={version['observation']}")
             continue
-        receipt = version['observation'].rsplit('/', 1)[0] + '/delivery-version/receipt.json'
-        lines.append(f"- version={number}; request={version['request_count']}; files={len(version['files'])}; "
-            f"binding={version['binding']}; receipt={receipt}")
+        lines.append(f"- version={number}; request={version['request_count']}; files={version['artifact_count']}; "
+            f"binding={version['binding']}; receipt={version['receipt']}")
+        if version['method_paths']:
+            lines.append('  Project methods / 项目方法: ' + ', '.join(version['method_paths']))
     if retained:
         lines.append('Reuse: simple-ar start --from-session SESSION --reuse artifacts --reuse-version N --goal "Your changes"; '
             'new work snapshots the selected version. / 新任务按原布局保全所选历史版本，不续行旧任务。')
@@ -2540,6 +2346,8 @@ def _render_native_result(app: Any, status: dict[str, Any], *, task_view: dict |
         except ValueError:
             return str(path)
 
+    if task_view is None:
+        task_view = status.get('task_view')
     if task_view is not None:
         status = {**status, **task_view['manifest']}
     pending = (task_view.get('pending') if task_view is not None else app.state.get('pending')) or {}
@@ -2554,6 +2362,8 @@ def _render_native_result(app: Any, status: dict[str, Any], *, task_view: dict |
         reason = "Prior usage is unknown / 先前用量未核清"
     elif reason.startswith("Process requires explicit approval"):
         reason = "Process awaits explicit approval / 执行等待明确授权"
+    elif reason == _TERMINAL_STOP_REASON:
+        reason = "Paused at a work boundary / 已在工作边界暂停"
     elif reason.startswith(('LLM', 'Connect', 'Timeout')):
         reason = "Model connection or response failed / 模型连接或响应失败；已保存调用记录"
     elif ":" in reason:
@@ -2587,7 +2397,8 @@ def _render_native_result(app: Any, status: dict[str, Any], *, task_view: dict |
     if status['status'] not in {"completed", "partial"}:
         lines.append("Current request has no confirmed delivery / 当前请求未确认交付")
         lines.append(f'Continue / 继续: simple-ar start --resume-task "{root}"')
-        lines.append('Resolve the stop condition first; approvals, unavailable services and exhausted budgets require action. / 先处理授权、服务或额度等停止条件，再继续原任务。')
+        if status.get('status_reason') != _TERMINAL_STOP_REASON:
+            lines.append('Resolve the stop condition first; approvals, unavailable services and exhausted budgets require action. / 先处理授权、服务或额度等停止条件，再继续原任务。')
         retained = status.get('retained_work') or {}
         last = retained.get('last_operation') or {}
         failure = {'image_reference': 'Image references are missing or outside this manuscript / 正文图片缺失或引用超出稿件目录',
@@ -2646,7 +2457,10 @@ def _render_native_result(app: Any, status: dict[str, Any], *, task_view: dict |
     else:
         lines.append("No saved delivery record / 无已保存交付记录")
 
-    lines.extend(_delivery_version_lines(root))
+    if status.get('delivery_versions_error'):
+        lines.append('Retained byte versions unavailable / 保留字节版本不可用；请检查原始交付回执。')
+    else:
+        lines.extend(_delivery_version_lines(root, status.get('delivery_versions')))
     budget = task_view['resources'] if task_view is not None else app.ledger.snapshot()
     entries = app.ledger.entries
     table = Table("Resource", "Cumulative accounting / 累计账目", "Remaining / 剩余", expand=True)
@@ -2668,30 +2482,76 @@ def _render_native_result(app: Any, status: dict[str, Any], *, task_view: dict |
     make_console().print(Panel(Group(Text("\n".join(lines)), table, note), title="Task result / 任务读出"))
 
 
+_TERMINAL_STOP_REASON = 'Caller requested boundary stop'
+
+
+def _run_terminal_task(run: Callable[..., dict[str, Any]], *args, approve=None, **options) -> dict[str, Any]:
+    """Translate terminal interrupt into the shared application's pause request."""
+    if current_thread() is not main_thread():
+        if approve is not None:
+            options['approve'] = approve
+        return run(*args, **options)
+    requested = False
+    waiting_for_approval = False
+
+    def request_stop(_signum, _frame):
+        nonlocal requested
+        requested = True
+        if waiting_for_approval:
+            raise LLMCallStopped()
+
+    def prompt(call, token):
+        nonlocal waiting_for_approval
+        waiting_for_approval = True
+        try:
+            if requested:
+                raise LLMCallStopped()
+            return approve(call, token)
+        finally:
+            waiting_for_approval = False
+
+    previous = signal.signal(signal.SIGINT, request_stop)
+    try:
+        if approve is not None:
+            options['approve'] = prompt
+        return run(*args, should_stop=lambda: requested, **options)
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 def _run_native_conversation(app: Any, initial_run: Callable[[], dict[str, Any]],
                              approve: Callable[[dict[str, Any], str], bool]) -> None:
     """Terminal input adapter; the existing app owns feedback, stops and recovery."""
     from simple_ar.cli.task_options import resume_command
+    from simple_ar.core.locking import SessionBusyError
 
     def retained() -> None:
         print_line(f'Task retained / 任务已保留: {app.session.store.root}')
         print_line(f'Resume: {resume_command(app.session.store.root)} --interactive')
 
-    def display() -> None:
+    def display(snapshot: dict | None = None) -> None:
         try:
-            snapshot = app.result_snapshot()
+            if snapshot is None or 'task_view' not in snapshot:
+                snapshot = app.result_snapshot()
             _render_native_result(app, snapshot, task_view=snapshot['task_view'])
         except (OSError, ValueError, KeyError, TypeError, RuntimeError, LLMError) as exc:
             print_line(f'Task view unavailable: {type(exc).__name__}: {str(exc)[:300]}')
             print_line(f'Diagnostics: {app.session.store.root / "session_manifest.json"}; {app.session.store.root / "attempts"}')
 
     def run(feedback: str | None = None, *, require_review: bool = False) -> bool:
+        submission_id = uuid4().hex if feedback is not None else None
+        snapshot = None
         try:
             if feedback is None:
-                initial_run()
+                snapshot = initial_run()
             else:
-                app.run(feedback=feedback, approve=approve, progress=print_line,
+                snapshot = _run_terminal_task(app.run, feedback=feedback, submission_id=submission_id,
+                    approve=approve, progress=print_line,
                     **({'independent_review_required': True} if require_review else {}))
+        except SessionBusyError:
+            if submission_id is None:
+                raise
+            print_line(f'Feedback {submission_id} received. The running task will adopt it at a safe boundary.')
         except (EOFError, KeyboardInterrupt):
             return False
         except (OSError, ValueError, RuntimeError, LLMError) as exc:
@@ -2700,12 +2560,12 @@ def _run_native_conversation(app: Any, initial_run: Callable[[], dict[str, Any]]
             print_line(f'Task action stopped: {type(exc).__name__}: {str(exc)[:300]}')
             print_line(f'Diagnostics: {app.session.store.root / "session_manifest.json"}; {app.session.store.root / "attempts"}')
             retained()
+        display(snapshot)
         return True
 
     try:
         if not run():
             return
-        display()
         print_line('Feedback / 反馈; /review FEEDBACK requires independent review; /status reads saved facts; /exit leaves this task saved.')
         while True:
             feedback = input('Task / 任务> ')
@@ -2724,14 +2584,12 @@ def _run_native_conversation(app: Any, initial_run: Callable[[], dict[str, Any]]
                     continue
                 if not run(revision, require_review=True):
                     return
-                display()
                 continue
             if command.startswith('/'):
                 print_line('Unknown command; use /status or /exit. No feedback submitted.')
                 continue
             if not run(feedback):
                 return
-            display()
     except (EOFError, KeyboardInterrupt):
         pass
     finally:
@@ -2744,6 +2602,7 @@ def _run_native_start(args: argparse.Namespace) -> None:
     from simple_ar.cli.start import native_creation_options, select_start_model
     from simple_ar.tools.workspace import resolve_source_mount
     from simple_ar.core.console import make_console, print_line
+    from simple_ar.core.locking import SessionBusyError
     from rich.panel import Panel
     from rich.text import Text
     interactive = sys.stdin.isatty()
@@ -2752,6 +2611,10 @@ def _run_native_start(args: argparse.Namespace) -> None:
         from simple_ar.cli.task_options import validate_interactive_options
         validate_interactive_options(args)
         conversation = getattr(args, 'interactive', False)
+        submission_id = getattr(args, 'submission_id', None)
+        if submission_id is not None and (not args.resume_task or not submission_id.strip()
+                or args.supply_task or args.switch_model or args.prepare_only):
+            raise ValueError('--submission-id requires --resume-task and a separate feedback operation')
         if conversation and any(getattr(args, name, None) is not None for name in
                                 ('_code_task', '_execution_contract', '_research_policy')):
             raise ValueError('--interactive supports ordinary native tasks only, not structured contracts')
@@ -2930,24 +2793,36 @@ def _run_native_start(args: argparse.Namespace) -> None:
             args.source = [resolve_source_mount(path) for path in args.source]
             select_start_model(args, interactive=interactive)
             creation_options = native_creation_options(args)
-            process_limits = creation_options['process_limits'] or {}
-            make_console().print(Panel(f"Goal: {args.request}\nRead-only sources: {args.source}\n"
-                f"Model: {args.model}\nAllowance: {args.max_turns} requests / {args.max_tokens} tokens\n"
-                f"Process allowance: {process_limits.get('process_invocations', args.max_turns * 10)} invocations / "
-                f"{process_limits.get('process_wall_seconds', args.max_turns * 300)} wall seconds\n"
-                f"Task settings: {getattr(args, '_task_config_source', 'command line / defaults')}; explicit CLI values take precedence\n"
-                f"Public source access: {args.allow_network}\n"
-                f"Rendered-image inspection: {args.allow_vision} (named vision route)\n"
-                f"Image submissions: {args.max_images} (named image route)\n"
-                f"Process proposals: {args.allow_execution}; workspace execution: {args.sandbox_execution}. "
-                + ("Ordinary commands run in the task workspace without per-command approval." if args.sandbox_execution
-                   else "Commands need approval, not an OS sandbox."),
-                title="Task / 任务"))
+
+            def show_creation(prepared: tuple) -> None:
+                config, _, limits, _ = prepared
+                file_fields = ', '.join(getattr(args, '_task_config_fields', []))
+                make_console().print(Panel(Text(f"Goal: {args.request}\nRead-only sources: {args.source}\n"
+                    f"Model: {config['model']}\nAllowance: {limits['llm_requests']} requests / {limits['total_tokens']} tokens\n"
+                    f"Process allowance: {limits['process_invocations']} invocations / {limits['process_wall_seconds']} wall seconds\n"
+                    f"Task settings: {getattr(args, '_task_config_source', 'command line / defaults')}"
+                    f"{f' ({file_fields})' if file_fields else ''}\n"
+                    f"Public sources: {config['allow_network']}; rendered-image inspection: {config['allow_vision']}\n"
+                    f"Image submissions: {limits['image_requests']}; independent review: {config.get('independent_review_required', False)}\n"
+                    f"Process proposals: {config['allow_execution']}; workspace execution: {config.get('sandbox_execution', False)}"),
+                    title="Task / 任务"))
+
+            verify_creation = show_creation
             if not args.yes and not args.prepare_only:
+                preview_root = Path(args.output_root).expanduser() / ('.preview-' + uuid4().hex)
+                prepared = ToolApplication.preview_creation(preview_root, args.request, **creation_options)
+                show_creation(prepared)
                 if not interactive or input("Start / 开始? [y/N]: ").strip().lower() not in {"y", "yes"}:
                     return
+                approved = ToolApplication.creation_binding(prepared)
+
+                def verify_confirmed_creation(actual: tuple) -> None:
+                    if ToolApplication.creation_binding(actual) != approved:
+                        raise ValueError('Effective task configuration changed after preview')
+
+                verify_creation = verify_confirmed_creation
             root = getattr(args, '_native_root', None) or new_research_session_root(args.output_root, args.request)
-            app = ToolApplication.create(root, args.request, **creation_options)
+            app = ToolApplication.create(root, args.request, verify_creation=verify_creation, **creation_options)
             feedback = ""
         print_line(f"Task session: {app.session.store.root}")
         print_line(f"Saved process allowance (including search backends): {app.ledger.limits.get('process_invocations')}; "
@@ -2987,29 +2862,35 @@ def _run_native_start(args: argparse.Namespace) -> None:
             return answer in {"y", "yes"}
 
         def run_initial():
-            status = app.run(feedback=feedback, approved_execution=args.approve_execution,
-                **({'independent_review_required': True}
-                   if args.resume_task and getattr(args, 'independent_review_required', False) else {}),
-                remember_execution=getattr(args, 'remember_execution', False),
-                retry_model=args.retry_model,
-                retry_model_selector=replacement_model if args.resume_task else '',
-                read_only_sources=tuple(args.source) if args.resume_task else (),
-                allow_execution=args.allow_execution if args.resume_task else False,
-                allow_network=args.allow_network if args.resume_task else False,
-                allow_vision=args.allow_vision if args.resume_task else False,
-                resource_allowances=allowances or None,
-                additional_attempts=additional_attempts if 'additional_attempts' in getattr(args, '_explicit_start_destinations', ()) else None,
-                additional_no_progress=additional_no_progress if 'additional_no_progress' in getattr(args, '_explicit_start_destinations', ()) else None,
-                authorization_id=authorization_id, authorization_reason=authorization_reason,
-                decision=decision, approve=approve if interactive else None, progress=print_line)
-            if (not conversation and args.resume_task and app.state['config'].get('model') is None
-                    and not feedback and not args.retry_model and not capacity
-                    and not (args.source or args.allow_execution or args.allow_network or args.allow_vision)):
-                completion = app.measurement_completion_actions()
-                if completion:
-                    status = app.run(actions=completion, progress=print_line)
-            return status
-
+            feedback_id = submission_id or (uuid4().hex if conversation and feedback else None)
+            finish_declared_work = (not conversation and bool(args.resume_task)
+                and app.state['config'].get('model') is None and not feedback and feedback_id is None
+                and not args.retry_model and not capacity
+                and not (args.source or args.allow_execution or args.allow_network or args.allow_vision))
+            try:
+                return _run_terminal_task(app.run, feedback=feedback, approved_execution=args.approve_execution,
+                    **({'submission_id': feedback_id} if feedback_id is not None else {}),
+                    **({'independent_review_required': args.independent_review_required}
+                       if args.resume_task and getattr(args, 'independent_review_required', None) is not None else {}),
+                    remember_execution=getattr(args, 'remember_execution', False),
+                    retry_model=args.retry_model,
+                    retry_model_selector=replacement_model if args.resume_task else '',
+                    read_only_sources=tuple(args.source) if args.resume_task else (),
+                    allow_execution=args.allow_execution if args.resume_task else False,
+                    allow_network=args.allow_network if args.resume_task else False,
+                    allow_vision=args.allow_vision if args.resume_task else False,
+                    resource_allowances=allowances or None,
+                    additional_attempts=additional_attempts if 'additional_attempts' in getattr(args, '_explicit_start_destinations', ()) else None,
+                    additional_no_progress=additional_no_progress if 'additional_no_progress' in getattr(args, '_explicit_start_destinations', ()) else None,
+                    authorization_id=authorization_id, authorization_reason=authorization_reason,
+                    decision=decision, approve=approve if interactive else None, progress=print_line,
+                    **({'finish_declared_work': True} if finish_declared_work else {}))
+            except SessionBusyError:
+                if feedback_id is None:
+                    raise
+                receipt = ToolApplication.feedback_status(app.session.store.root, submission_id=feedback_id)
+                print_line(f'Feedback {feedback_id}: {receipt["status"]}. The running task owns adoption.')
+                return app.result_snapshot()
         if conversation:
             _run_native_conversation(app, run_initial, approve)
         else:

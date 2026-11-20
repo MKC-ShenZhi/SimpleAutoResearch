@@ -264,16 +264,7 @@ def validate_session_arguments(args: argparse.Namespace) -> SessionArguments:
               args.data_mode != "observations", args.data_missing != "reject", args.figure_width != "wide", args.data_max_mb != 20, args.data_max_figures != 100,
               args.data_plot != "bar", args.x_column, args.x_unit, args.data_max_points != 10000, args.series_layout != "separate", args.paired_baseline, args.data_attribution, getattr(args, "data_association", "none") != "none")):
         raise SystemExit("Data options require --task-kind data_analysis.")
-    if materials and task_kind == "survey":
-        from simple_ar.research.documents.ingest import retained_document_materials
-        supplied = [Path(path).expanduser().resolve() for path in materials]
-        try:
-            valid_sources = retained_document_materials(supplied, original_sources_only=True)
-        except (OSError, ValueError) as exc:
-            raise SystemExit(str(exc)) from exc
-        if any(path.suffix.lower() != ".json" for path in supplied) or len(valid_sources) != len(supplied):
-            raise SystemExit("Survey materials must be saved original-source document bundles; use --local-document for ordinary sources.")
-    elif materials and task_kind not in {"writing", "data_analysis", "reproduction"} and not (measurement_report or execution_materials):
+    if materials and task_kind not in {"survey", "writing", "data_analysis", "reproduction"} and not (measurement_report or execution_materials):
         raise SystemExit("--material/assets.materials requires research sources, writing, analysis or an explicit execution declaration.")
     if task_kind == "writing":
         if command or execution_details or getattr(args, "code_task_config", None) or args.no_report or outputs not in (None, ["report"]):
@@ -283,15 +274,15 @@ def validate_session_arguments(args: argparse.Namespace) -> SessionArguments:
     if task_kind == "writing" or data_report:
         if args.queries or args.providers or getattr(args, "research_materials_only", None) is False or getattr(args, "research_allow_pdf_download", None):
             raise SystemExit("Material-based reports use supplied local material only; online research is a survey task.")
-    if task_kind == "writing" or data_report or measurement_report or execution_materials:
+    if task_kind in {"survey", "writing"} or data_report or measurement_report or execution_materials:
         supplied = [Path(path).expanduser().resolve() for path in [*materials, *args.local_document]]
         if len(supplied) != len(set(supplied)):
-            raise SystemExit("Writing material must have one unambiguous role per file; do not repeat a paper as material.")
+            raise SystemExit("Each supplied file needs one role; do not repeat a document as material.")
         from simple_ar.research.documents.ports import SUPPORTED_DOCUMENT_SUFFIXES, SUPPORTED_MATERIAL_SUFFIXES
         for paths, suffixes in ((args.local_document, SUPPORTED_DOCUMENT_SUFFIXES),
-                               (materials, SUPPORTED_MATERIAL_SUFFIXES if task_kind == "writing" or measurement_report or execution_materials else SUPPORTED_DOCUMENT_SUFFIXES)):
+                               (materials, SUPPORTED_MATERIAL_SUFFIXES if task_kind in {"survey", "writing"} or measurement_report or execution_materials else SUPPORTED_DOCUMENT_SUFFIXES)):
             if any(not Path(path).expanduser().is_file() or Path(path).suffix.lower() not in suffixes for path in paths):
-                raise SystemExit("Report inputs must be local text/HTML/PDF; writing also accepts JSON material and table_analysis.v1 packages.")
+                raise SystemExit("Report inputs must be local files in a supported document or material format.")
     code_delivery = bool(getattr(args, "code_task_config", None) and outputs and set(outputs) & {"bug_fix", "code_task"} and "experiments" not in outputs)
     if outputs and task_kind != "bug_fix" and not code_delivery and "experiments" not in outputs and (command or execution_details or getattr(args, "code_task_config", None)):
         raise SystemExit("Execution configuration requires experiments in --outputs/task.outputs.")

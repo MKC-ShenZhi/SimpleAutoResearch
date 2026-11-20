@@ -1315,7 +1315,7 @@ class InspectionOfferCoverageTests(unittest.TestCase):
         from tests.test_professional_work_loop import _action, _assessments
 
         text = 'A bounded observation for ordinary text review.\n' * 30
-        (self.case.root / 'workspace' / 'note.md').write_text(text, encoding='utf-8')
+        (self.case.root / 'workspace' / 'note.md').write_bytes(text.encode('utf-8'))
         def review(view):
             if 'proposed_delivery' in view:
                 return {'conclusion':'complete', 'findings':[], 'evidence':[], 'limitations':[]}
@@ -1337,7 +1337,7 @@ class InspectionOfferCoverageTests(unittest.TestCase):
         from tests.test_professional_work_loop import _assessments
 
         text = 'A report sentence and its supporting condition.\n' * 30
-        (self.case.root / 'workspace' / 'note.md').write_text(text, encoding='utf-8')
+        (self.case.root / 'workspace' / 'note.md').write_bytes(text.encode('utf-8'))
         self.case.review = lambda view: {'decisions':[{'subject':'target-1', 'conclusion':'complete',
             'findings':[{'severity':'required', 'message':'A conclusion still lacks its source.'}],
             'evidence':[], 'limitations':[]}]}
@@ -1594,7 +1594,7 @@ class ApplicableDeliveryInspectionTests(unittest.TestCase):
                 return missing
             bodies = {row['path']: ''.join(w['text'] for w in row['text_windows'])
                 for row in view['evidence']}
-            self.assertIn(output.read_text(encoding='utf-8'), bodies.values())
+            self.assertIn(output.read_bytes().decode('utf-8'), bodies.values())
             values = [float(value) for value in bodies[str(source)].splitlines()]
             self.assertEqual(sum(values) / len(values), 2)
             phases.append('observed')
@@ -1988,6 +1988,55 @@ class DemandDrivenDeliveryInspectionTests(unittest.TestCase):
         self.addCleanup(self.case.doCleanups)
         self.case._create(goal='Deliver the requested source and supporting appendix. Independently '
             'verify any empirical or numerical conclusions.', delivery_protocol=None)
+
+    def test_revision_closing_supplies_changed_sources_without_priming_unchanged_inventory(self):
+        inspector = self.case.app.operations.inspection
+        previous = {'identity': 'earlier', 'arguments': {}, 'targets': [], 'evidence': [],
+            'delivery_context': {'artifacts': {'report.md': 'old', 'observations.csv': 'same'}}}
+        saved = {'identity': 'current', 'arguments': {}, 'targets': [], 'evidence': [],
+            'inspection_material_policy': 'operations.v3', 'source_priming_policy': 'priority.v4',
+            'delivery_context': {'schema_version': 'delivery_review.v3', 'scope_policy': 'applicable.v2', 'claim': {},
+                'artifacts': {'report.md': 'new', 'observations.csv': 'same', 'new-appendix.csv': 'added'}},
+            'parent_process_receipts': {'unrelated-invocation.json': 'receipt'}}
+        with (patch.object(inspector.store, 'read_json', return_value=previous),
+                patch.object(inspector, '_digest', return_value='bound'),
+                patch.object(inspector, '_retained_inputs', return_value=[previous])):
+            inspector._inherit_investigation(saved, {'identity': 'earlier',
+                'binding': previous['delivery_context']}, [100])
+        with (patch.object(inspector.workspace, 'artifact_sources', return_value={}) as sources,
+                patch.object(inspector, '_prime_originals') as prime):
+            inspector._prime_delivery(saved, None, 'current', [100], None, [], terminal_only=True)
+        sources.assert_called_once_with({'report.md': 'new', 'new-appendix.csv': 'added'})
+        self.assertEqual(saved['introduced_artifacts'], ['new-appendix.csv'])
+        self.assertEqual(prime.call_args.args[6], [('report.md', 'new', []), ('new-appendix.csv', 'added', [])])
+        self.assertEqual(saved['delivery_context']['artifacts'],
+            {'report.md': 'new', 'observations.csv': 'same', 'new-appendix.csv': 'added'})
+
+    def test_revision_view_keeps_copy_proof_for_an_observed_unchanged_deliverable(self):
+        from simple_ar.tools.inspection import _DeliveryInspectionRequest
+
+        inspector = self.case.app.operations.inspection
+        artifact = 'workspace/reference/observations.csv'
+        original = 'materials/observations.csv'
+        digest = 'original-version'
+        saved = {'prior_required': [], 'targets': [], 'source_provenance': 'versions.v2',
+            'revision_sources': ['report.md'], 'introduced_artifacts': [],
+            'evidence': [{'subject': 'evidence-1', 'path': artifact, 'readable': True,
+                          'sha256': digest, 'complete': False, 'windows': []}],
+            'delivery_context': {'schema_version': 'delivery_review.v3', 'scope_policy': 'applicable.v2',
+                                 'claim': {}, 'artifacts': {'report.md': 'updated', artifact: digest}}}
+        copy = {'id': 1, 'state': 'recorded', 'owner': {'record': 'receipts/copy.json'},
+                'edges': [{'kind': 'copy', 'node': 2}]}
+        graph = {'root': 1, 'nodes': [copy, {'id': 2, 'path': original, 'sha256': digest}]}
+        request = _DeliveryInspectionRequest(goal='Check the revised index against its retained inputs.', targets=[], evidence=[])
+        with patch.object(inspector.workspace, 'artifact_sources', return_value={artifact: {'lineage': graph}}) as sources:
+            view = inspector._view(saved, request)
+            self.assertEqual(sources.call_args.args[0], {artifact: digest})
+            self.assertEqual(view['proposed_delivery']['recorded_copies']['files'], [
+                {'artifact': artifact, 'original_at_copy': original, 'sha256': digest, 'record': 'receipts/copy.json'}])
+            self.assertEqual(view['evidence'][0]['text_windows'], [])
+            saved['delivery_context']['artifacts'][artifact] = 'different-version'
+            self.assertNotIn('recorded_copies', inspector._view(saved, request)['proposed_delivery'])
 
     def test_inspector_selects_actual_work_without_automatic_inventory_reading_and_reuses_opinion(self):
         from tests.test_professional_work_loop import _action
