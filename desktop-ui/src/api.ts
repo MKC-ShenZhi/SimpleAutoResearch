@@ -105,7 +105,30 @@ export const api = {
     }),
 
   stopTask: (task: string) => apiPost<{ message: string }>({ op: 'stop', task }),
-  resumeTask: (task: string) => apiPost<{ task: string; message: string }>({ op: 'resume', task }),
+  resumeTask: (task: string, autoApprove?: boolean) =>
+    apiPost<{ task: string; message: string }>({
+      op: 'resume',
+      task,
+      ...(autoApprove !== undefined ? { auto_approve: autoApprove } : {}),
+    }),
+
+  grantAccess: (
+    task: string,
+    grants: { allow_execution?: boolean; allow_network?: boolean; auto_approve?: boolean }
+  ) =>
+    apiPost<{ task: string; granted: string[] }>({
+      op: 'grant_access',
+      task,
+      supply_id: crypto.randomUUID(),
+      ...grants,
+    }),
+
+  setAutoApprove: (task: string, autoApprove: boolean) =>
+    apiPost<{ task: string; auto_approve: boolean }>({
+      op: 'set_auto_approve',
+      task,
+      auto_approve: autoApprove,
+    }),
 
   approveExecution: (task: string, token: string, remember: boolean) =>
     apiPost<{ task: string; message: string }>({

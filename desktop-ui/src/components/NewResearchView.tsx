@@ -67,6 +67,7 @@ export function NewResearchView({
 
   const [selectedSelector, setSelectedSelector] = useState('');
   const [allowExecution, setAllowExecution] = useState(false);
+  const [autoApprove, setAutoApprove] = useState(true);
   const [allowNetwork, setAllowNetwork] = useState(false);
   const [requireReview, setRequireReview] = useState(false);
 
@@ -160,10 +161,13 @@ export function NewResearchView({
     if (!preview) return;
     try {
       setBusy('create');
+      const shouldAutoApprove = allowExecution && autoApprove;
       const res = await api.createTask({
         ...buildPayload(),
         preview_id: preview.preview_id,
+        auto_approve: shouldAutoApprove,
       });
+      await api.resumeTask(res.task, shouldAutoApprove).catch(() => {});
       setPreview(null);
       setGoal('');
       setMaterials([]);
@@ -405,6 +409,22 @@ export function NewResearchView({
                 <Terminal className="h-3.5 w-3.5" />
                 <span>允许执行</span>
               </button>
+
+              {allowExecution && (
+                <button
+                  onClick={() => setAutoApprove((v) => !v)}
+                  title="开启后将自动批准授权范围内的命令执行，无需逐条点击确认"
+                  className="inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[12px] transition-colors cursor-pointer"
+                  style={{
+                    backgroundColor: autoApprove ? 'var(--accent-soft)' : 'transparent',
+                    borderColor: autoApprove ? 'var(--accent)' : 'var(--border-subtle)',
+                    color: autoApprove ? 'var(--accent)' : 'var(--text-muted)',
+                  }}
+                >
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  <span>自动批准</span>
+                </button>
+              )}
 
               <button
                 onClick={() => {

@@ -105,7 +105,7 @@ export function App() {
     setActiveTask(taskName);
     setSelectedFile(null);
     setViewMode('session');
-    notify('研究会话已创建，点击“继续”或发送指令开始推进');
+    notify('研究会话已创建并开始运行');
   };
 
   return (

@@ -82,6 +82,7 @@ class Workspace:
         self.lock = threading.Lock()
         self.workers: dict[str, tuple[threading.Thread, threading.Event]] = {}
         self.errors: dict[str, str] = {}
+        self.auto_approve: set[str] = set()
         self.creation_key = secrets.token_bytes(32)
 
     def task(self, name: str) -> Path:
@@ -463,10 +464,11 @@ class Workspace:
             stopping = bool(live and worker[1].is_set())
             error = self.errors.get(name)
             local_workers = [task for task, (thread, _) in self.workers.items() if thread.is_alive()]
+            auto_approve = name in self.auto_approve
         return dict(view, task=name, source_access=source_access,
             mode='live execution' if live else 'saved results browser',
             worker_live=live, stop_requested=stopping, worker_error=error,
-            local_workers=local_workers)
+            local_workers=local_workers, auto_approve=auto_approve)
 
     def file(self, name: str, mount: str, relative: str) -> Path:
         root = self.task(name)
@@ -522,6 +524,36 @@ class Workspace:
             return self.save_model_profile(data)
         if op == 'set_models_config_path':
             return self.set_models_config_path(data)
+        if op == 'set_auto_approve':
+            root = self.task(name)
+            enabled = data.get('auto_approve') is True
+            with self.lock:
+                if enabled:
+                    self.auto_approve.add(name)
+                else:
+                    self.auto_approve.discard(name)
+            return {'task': name, 'auto_approve': enabled}
+        if op == 'grant_access':
+            root = self.task(name)
+            with self.lock:
+                if any(t.is_alive() for t, _ in self.workers.values()):
+                    raise ValueError('任务正在运行，请先暂停再调整权限。')
+                self.validate_sources(root)
+                changes = {}
+                if data.get('allow_execution') is True:
+                    changes['allow_execution'] = True
+                if data.get('allow_network') is True:
+                    changes['allow_network'] = True
+                if not changes:
+                    raise ValueError('请选择要授予的权限（允许执行或联网检索）。')
+                ToolApplication.load(root).supply(
+                    supply_id=str(data.get('supply_id') or secrets.token_hex(8)),
+                    reason='用户在桌面工作台授予会话权限',
+                    changes=changes,
+                )
+                if data.get('auto_approve') is True:
+                    self.auto_approve.add(name)
+            return {'task': name, 'granted': sorted(changes)}
         if op == 'feedback':
             root = self.task(name)
             for path in ('session_manifest.json', 'actions.json',
@@ -580,6 +612,8 @@ class Workspace:
                         raise ValueError('Effective configuration changed; preview and confirm again')
 
                 ToolApplication.create(root, args.request, verify_creation=verify, **options)
+                if data.get('auto_approve') is True and options.get('allow_execution'):
+                    self.auto_approve.add(root.name)
                 return {'task': root.name}
             root = self.task(name)
             # Launch grants also constrain execution of retained tasks. An old
@@ -619,16 +653,24 @@ class Workspace:
                     raise ValueError('Remembering execution must be a boolean choice')
                 kwargs['approved_execution'] = data['token']
                 kwargs['remember_execution'] = remember
+            elif op == 'resume':
+                if data.get('auto_approve') is True:
+                    self.auto_approve.add(name)
+                elif data.get('auto_approve') is False:
+                    self.auto_approve.discard(name)
             self.dispatch(name, root, kwargs)
             return {'task': name, 'message': 'Worker dispatched; task outcome remains in original manifest'}
 
     def dispatch(self, name: str, root: Path, kwargs: dict) -> None:
         """Launch a local worker under self.lock; no input or task state is owned here."""
         stop = threading.Event()
+        run_kwargs = dict(kwargs)
+        if name in self.auto_approve and 'approve' not in run_kwargs and 'approved_execution' not in run_kwargs:
+            run_kwargs['approve'] = lambda _call, _token: True
 
         def run():
             try:
-                ToolApplication.load(root).run(**kwargs, progress=lambda _: None, should_stop=stop.is_set)
+                ToolApplication.load(root).run(**run_kwargs, progress=lambda _: None, should_stop=stop.is_set)
             except Exception:
                 with self.lock:
                     self.errors[name] = 'Worker could not continue; inspect original task records with CLI'
@@ -769,7 +811,7 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
             except PermissionError:
                 self.send(403, {'error': 'Local host/origin/session protection rejected request'})
             except ValueError as exc:
-                if op in {'save_model_profile', 'set_models_config_path', 'switch'} and str(exc):
+                if op in {'save_model_profile', 'set_models_config_path', 'switch', 'grant_access'} and str(exc):
                     self.send(400, {'error': public_text(str(exc))})
                 else:
                     self.send(400, {'error': 'Action rejected; check confirmation, caps, current proposal and original task records'})

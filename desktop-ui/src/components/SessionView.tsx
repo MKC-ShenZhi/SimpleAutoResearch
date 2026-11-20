@@ -7,6 +7,7 @@ import {
   ChevronRight,
   Cpu,
   FileText,
+  Globe,
   Loader2,
   PanelRight,
   Pause,
@@ -127,6 +128,38 @@ export function SessionView({
       await onReload();
     } catch (err) {
       onNotify(err instanceof Error ? err.message : '拒绝失败', 'error');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleGrantAccess = async (kind: 'execution' | 'network') => {
+    try {
+      setBusy(`grant-${kind}`);
+      await api.grantAccess(
+        snapshot.task,
+        kind === 'execution'
+          ? { allow_execution: true, auto_approve: true }
+          : { allow_network: true }
+      );
+      onNotify(kind === 'execution' ? '已为本会话开启允许执行（自动批准）' : '已为本会话开启联网检索');
+      await onReload();
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '开启权限失败', 'error');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleToggleAutoApprove = async () => {
+    try {
+      setBusy('auto-approve');
+      const next = !snapshot.auto_approve;
+      await api.setAutoApprove(snapshot.task, next);
+      onNotify(next ? '已开启命令自动批准' : '已改为手动逐条审批');
+      await onReload();
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '切换审批模式失败', 'error');
     } finally {
       setBusy(null);
     }
@@ -554,19 +587,72 @@ export function SessionView({
             placeholder="补充修改意见、追问或下一步指令…（Ctrl + Enter 发送，只重做受影响部分）"
             className="w-full resize-none bg-transparent px-4 pt-3 pb-1 text-[13.5px] outline-none placeholder:opacity-55"
           />
-          <div className="flex items-center justify-between px-3.5 pb-2.5 pt-1">
-            <button
-              onClick={() => setRequireReview((v) => !v)}
-              className="inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px] transition-colors cursor-pointer"
-              style={{
-                backgroundColor: requireReview ? 'var(--accent-soft)' : 'transparent',
-                borderColor: requireReview ? 'var(--accent)' : 'var(--border-subtle)',
-                color: requireReview ? 'var(--accent)' : 'var(--text-muted)',
-              }}
-            >
-              <ShieldCheck className="h-3.5 w-3.5" />
-              <span>本次修改要求独立复核</span>
-            </button>
+          <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 pb-2.5 pt-1">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <button
+                onClick={() => {
+                  if (!snapshot.access?.allow_execution) void handleGrantAccess('execution');
+                }}
+                disabled={busy !== null || snapshot.worker_live || Boolean(snapshot.access?.allow_execution)}
+                title={snapshot.access?.allow_execution ? '本会话已授予执行权限' : '为本会话开启命令执行权限'}
+                className="inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[12px] transition-colors cursor-pointer disabled:cursor-default"
+                style={{
+                  backgroundColor: snapshot.access?.allow_execution ? 'var(--accent-soft)' : 'transparent',
+                  borderColor: snapshot.access?.allow_execution ? 'var(--accent)' : 'var(--border-subtle)',
+                  color: snapshot.access?.allow_execution ? 'var(--accent)' : 'var(--text-muted)',
+                }}
+              >
+                <Terminal className="h-3.5 w-3.5" />
+                <span>允许执行</span>
+              </button>
+
+              {snapshot.access?.allow_execution && (
+                <button
+                  onClick={() => void handleToggleAutoApprove()}
+                  disabled={busy !== null}
+                  title="切换是否自动批准授权范围内的命令执行"
+                  className="inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[12px] transition-colors cursor-pointer"
+                  style={{
+                    backgroundColor: snapshot.auto_approve ? 'var(--accent-soft)' : 'transparent',
+                    borderColor: snapshot.auto_approve ? 'var(--accent)' : 'var(--border-subtle)',
+                    color: snapshot.auto_approve ? 'var(--accent)' : 'var(--text-muted)',
+                  }}
+                >
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  <span>自动批准</span>
+                </button>
+              )}
+
+              <button
+                onClick={() => {
+                  if (!snapshot.access?.allow_network) void handleGrantAccess('network');
+                }}
+                disabled={busy !== null || snapshot.worker_live || Boolean(snapshot.access?.allow_network)}
+                title={snapshot.access?.allow_network ? '本会话已开启联网检索' : '为本会话开启联网检索权限'}
+                className="inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[12px] transition-colors cursor-pointer disabled:cursor-default"
+                style={{
+                  backgroundColor: snapshot.access?.allow_network ? 'var(--accent-soft)' : 'transparent',
+                  borderColor: snapshot.access?.allow_network ? 'var(--accent)' : 'var(--border-subtle)',
+                  color: snapshot.access?.allow_network ? 'var(--accent)' : 'var(--text-muted)',
+                }}
+              >
+                <Globe className="h-3.5 w-3.5" />
+                <span>联网检索</span>
+              </button>
+
+              <button
+                onClick={() => setRequireReview((v) => !v)}
+                className="inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[12px] transition-colors cursor-pointer"
+                style={{
+                  backgroundColor: requireReview ? 'var(--accent-soft)' : 'transparent',
+                  borderColor: requireReview ? 'var(--accent)' : 'var(--border-subtle)',
+                  color: requireReview ? 'var(--accent)' : 'var(--text-muted)',
+                }}
+              >
+                <ShieldCheck className="h-3.5 w-3.5" />
+                <span>独立复核</span>
+              </button>
+            </div>
             <div className="flex items-center gap-2">
               {meta && meta.profiles.length > 0 && (
                 <div

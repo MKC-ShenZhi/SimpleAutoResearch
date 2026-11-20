@@ -77,6 +77,7 @@ export interface TaskSnapshot {
   stop_requested: boolean;
   worker_error: string | null;
   local_workers: string[];
+  auto_approve?: boolean;
   manifest: {
     session_id?: string;
     topic?: string;
