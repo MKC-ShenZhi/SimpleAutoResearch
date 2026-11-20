@@ -361,8 +361,11 @@ class Workspace:
         tasks, _ = discover_project_tasks(self.tasks)
         with self.lock:
             live = {name for name, (thread, _) in self.workers.items() if thread.is_alive()}
-        return [dict(task=(name := '.' if task.path == self.tasks else task.path.name),
-                     topic=task.goal, status=task.status, worker_live=name in live) for task in tasks]
+        return [
+            dict(task=(name := '.' if task.path == self.tasks else task.path.name),
+                 topic=task.goal, status=task.status, **({'worker_live': True} if name in live else {}))
+            for task in tasks
+        ]
 
     def validate_sources(self, root: Path) -> None:
         config = self.record(root, 'actions.json')['config']
