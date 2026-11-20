@@ -9,11 +9,13 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Added
 
-- Rebuilt the local desktop workbench (`simple-ar-desktop`) with a modern React + Tailwind UI hosted in a native WebView2 window (`pywebview`), featuring dark/light themes, a three-pane layout (sessions sidebar, conversation & collapsible tool activity stream, and an on-demand artifact/file/ledger drawer), and inline Markdown, image, and paginated PDF previews.
-- Added an in-app Model & Connection Settings view backed by the shared `models.toml` catalog and Windows Credential Manager.
+- Rebuilt the local desktop workbench (`simple-ar-desktop`) with a modern React + Tailwind + KaTeX UI hosted in a native WebView2 window (`pywebview`), featuring dark/light themes, a three-pane layout, automatic start on creation, auto-approve & mid-session permission grants, one-click stop, real-time ledger aggregation, session archive/delete, inline assistant replies with LaTeX math rendering, and Markdown/image/paginated PDF previews.
+- Added an in-app Model & Connection Settings view backed by the shared `models.toml` catalog (with editable config path) and Windows Credential Manager, plus a bottom-bar model switcher.
 
 ### Improved
 
+- Completed deep codebase slimming and decoupling: decomposed five monolith modules (`tool_application.py`, `inspection.py`, `workspace.py`, `writing.py`, `cli/main.py`), extracted lightweight `app/services.py`, and retired the pre-v2.10 `research_application.py` legacy engine and dead adapters (net reduction of >12,600 lines; native v2.10 runtime is now completely decoupled from legacy orchestration).
+- Explanatory and Q&A tasks can now deliver directly in the chat reply without forcing placeholder `.md` artifact files.
 - Ordinary CLI tasks support Ctrl+C work-boundary pause and resume with the existing task and ledger.
 - The retained delivery catalog surfaces delivered `SKILL.md` paths so new tasks can pick a method version before adopting project outputs.
 - Interrupted declared measurements, source summaries, and table analyses can resume from saved receipts in the original session.
