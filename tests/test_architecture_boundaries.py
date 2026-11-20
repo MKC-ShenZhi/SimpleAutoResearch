@@ -111,6 +111,20 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
 
+    def test_native_runtime_does_not_load_legacy_research_application(self) -> None:
+        probe = (
+            "import sys; "
+            "import simple_ar.app.tool_application; "
+            "import simple_ar.tools.workspace; "
+            "import simple_ar.ui; "
+            "assert 'simple_ar.app.research_application' not in sys.modules"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True,
+            timeout=SUBPROCESS_TIMEOUT_SEC, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

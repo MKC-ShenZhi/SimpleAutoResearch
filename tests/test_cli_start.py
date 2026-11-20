@@ -1240,7 +1240,7 @@ class StartTests(unittest.TestCase):
 
     def test_structured_collection_preserves_original_settings_resources_and_cwd(self):
         from copy import deepcopy
-        from simple_ar.app.research_application import ResearchApplicationServices
+        from simple_ar.app.services import ResearchApplicationServices
         from simple_ar.app.research_intake import create_research_task
         from simple_ar.cli.start import migrate_structured_creation
         from simple_ar.research.workflow_contracts import ResearchBrief
@@ -2971,7 +2971,7 @@ class StartTests(unittest.TestCase):
         from copy import deepcopy
         from simple_ar.app.research_intake import create_research_task
         from simple_ar.app.research_intake import UnsupportedExecutionCreation
-        from simple_ar.app.research_application import ResearchApplicationServices
+        from simple_ar.app.services import ResearchApplicationServices
         from simple_ar.cli.start import create_declared_research
         from simple_ar.research.workflow_contracts import ResearchBrief
         with tempfile.TemporaryDirectory() as directory:

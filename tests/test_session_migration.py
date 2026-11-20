@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import unittest
 
-from simple_ar.app.research_application import ResearchApplicationServices
+from simple_ar.app.services import ResearchApplicationServices
 from simple_ar.app.session_migration import import_legacy_session
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.core import ArtifactStore

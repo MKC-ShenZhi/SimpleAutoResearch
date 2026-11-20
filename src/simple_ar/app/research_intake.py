@@ -253,11 +253,9 @@ def retry_research_experiment(root: str | Path, *, command: Sequence[str], cwd: 
             result_schema=dict(result_schema) if result_schema is not None else None,
             label=label, parent_attempt_id=parent_attempt_id, reason=reason,
             progress=progress or getattr(services, 'message_callback', None) or print)
-    from simple_ar.app.research_application import load_session
-    return load_session(root, services=services).retry_experiment(
-        command=command, cwd=cwd if cwd is not None else Path.cwd(), timeout_sec=timeout_sec,
-        result_schema=result_schema, label=label, parent_attempt_id=parent_attempt_id,
-        reason=reason if reason is not None else 'Retry the failed explicit experiment with a caller-supplied correction.')
+    raise ValueError(
+        f"{root} is not a native common research session; historical pre-v2.10 sessions are read-only."
+    )
 
 
 def _initial_collection_action(saved: dict, brief: ResearchBrief) -> dict:
