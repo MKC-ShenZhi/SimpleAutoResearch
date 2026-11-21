@@ -51,8 +51,7 @@ class WorkLifecycleTests(unittest.TestCase):
         app, client = self.app(requests=3, tokens=1500)
         app.state['turns'] = [{'origin': 'model'}]
         app._completion_floor = Mock(return_value={'llm_requests': 1, 'total_tokens': 1450})
-        floor = app._review_floor(client, candidate=True)
-        with app.ledger.protect_remaining(floor, yield_to_work=True):
+        with app._review_capacity(client, candidate=True):
             app.ledger.reserve('review', {'llm_requests': 1, 'total_tokens': 100})
             self.assertEqual(app.ledger.remaining('total_tokens'), 1400)
 

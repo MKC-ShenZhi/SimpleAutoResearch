@@ -1910,7 +1910,7 @@ class WorkspaceToolGateway:
             if before[:-1] != path_before[:-1]:
                 raise ValueError('File changed during material read; inspect its current window')
             size = before[3]
-            request.validate_read_size(size)
+            request.validate_read_size(size, full_digest_max_bytes=_FULL_DIGEST_MAX_BYTES)
             digest = None
             if size <= 256000 or request.full_digest or require_digest:
                 digest = hashlib.file_digest(handle, 'sha256').hexdigest()
@@ -1926,9 +1926,35 @@ class WorkspaceToolGateway:
                 raw = handle.read(request.max_bytes)
                 if 'max_lines' in request.model_fields_set:
                     raw = b''.join(io.BytesIO(raw).readlines()[:request.max_lines])
-            if (version() != before or self.resolve(request.path) != target
-                    or version(target.stat()) != path_before):
-                raise ValueError('File changed during material read; inspect its current window')
+            after = version()
+            path_after = version(target.stat())
+            if after != before or self.resolve(request.path) != target or path_after != path_before:
+                # Distributed filesystems (e.g. JuiceFS) can flush deferred write
+                # metadata on the first read, advancing mtime/ctime without
+                # altering file identity, size, or bytes. Accept only when path,
+                # inode, size, and re-verified bytes all remain unchanged and
+                # subsequent stat has stabilized.
+                same_identity = (
+                    self.resolve(request.path) == target
+                    and after[:4] == before[:4]
+                    and path_after[:4] == path_before[:4]
+                    and after[:-1] == path_after[:-1]
+                )
+                verified = False
+                if same_identity:
+                    if digest is not None:
+                        handle.seek(0)
+                        digest_after = hashlib.file_digest(handle, 'sha256').hexdigest()
+                        verified = digest_after == digest
+                    else:
+                        handle.seek(offset)
+                        raw_after = handle.read(len(raw))
+                        verified = raw_after == raw
+                    if verified:
+                        verified = (version() == after and version(target.stat()) == path_after
+                                    and self.resolve(request.path) == target)
+                if not verified:
+                    raise ValueError('File changed during material read; inspect its current window')
         data = {'sha256': digest, 'size_bytes': size,
             'next_offset_bytes': offset + len(raw), 'has_more': offset + len(raw) < size}
         if request.start_line is not None:

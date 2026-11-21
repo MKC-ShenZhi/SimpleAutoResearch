@@ -18,7 +18,7 @@ You set the research question, resources and scientific judgments. The assistant
 | A code requirement or an existing project | Create or modify code, investigate failures and validate behavior | Editable source, changes, execution logs and unresolved issues |
 | Data and a description of its fields | Check observations, analyse results and build figures | Analysis scripts, numerical tables, plots and explanations |
 | A paper, implementation and available resources | Scope and run a bounded reproduction | Actual protocol, environment, measurements and differences |
-| Existing results, figures or a draft | Revise a figure, reorganize arguments or assemble a report | Revised artifacts, retained originals, references and optional ACM LaTeX/PDF |
+| Existing results, figures or a draft | Revise a figure, reorganize arguments or assemble a report | Revised artifacts, retained originals, references and optional LaTeX/PDF (including Chinese XeLaTeX and supplied conference templates) |
 
 These capabilities can combine within one task. A figure revision can reuse saved data; writing can use existing calculations; a missing piece of evidence can send the assistant back to investigation. They are not a fixed pipeline that every request must traverse.
 
@@ -118,7 +118,16 @@ uv run simple-ar start --resume-task "SESSION" "Keep the first version, add a se
 uv run simple-ar results "SESSION"
 ```
 
-Open the actual paths printed by `results`. Check the text, sources, calculations, validation status and outstanding issues. Feedback continues with the saved materials, connections, permissions and budget; add `--source PATH` to supply more evidence. Approval, pause and recovery instructions are in [Get started](docs/USAGE.md).
+Open the actual paths printed by `results`. Check the text, sources, calculations, validation status and outstanding issues. Feedback continues with the saved materials, connections, permissions and budget; add `--source PATH` to supply more evidence, use `--from-session SESSION --reuse artifacts` to reuse delivered methods and code in a new task, or `--authorize-remaining` to continue after a budget pause. Approval, pause and recovery instructions are in [Get started](docs/USAGE.md).
+
+### Desktop workbench (optional)
+
+```bash
+uv sync --locked --extra desktop
+uv run simple-ar-desktop
+```
+
+The desktop workbench shares the same task ledger and `models.toml` catalog as the CLI, providing automatic start on creation, execution approval, inline budget continuation after pauses, session management, and previews for Markdown, math, images and paginated PDFs.
 
 ## Scope and review
 

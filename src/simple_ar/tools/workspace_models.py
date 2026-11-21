@@ -109,9 +109,10 @@ class FileWindow(_Path):
     max_lines: int = Field(default=200, ge=1, le=1000,
         description="Line count for start_line reads (default 200); when explicitly supplied for a byte-origin read, also cap that window by lines. max_bytes still bounds bytes and may end within a line. Continue at next_offset_bytes.")
 
-    def validate_read_size(self, size: int) -> None:
+    def validate_read_size(self, size: int, *, full_digest_max_bytes: int | None = None) -> None:
         """Shared file-dependent admission; content and digest still use the open file."""
-        if self.full_digest and size > _FULL_DIGEST_MAX_BYTES:
+        limit = _FULL_DIGEST_MAX_BYTES if full_digest_max_bytes is None else full_digest_max_bytes
+        if self.full_digest and size > limit:
             raise ValueError('Full-file digest exceeds 64 MiB')
         if self.start_line is not None and (self.offset_bytes or size > 256000):
             raise ValueError('Line reads require offset_bytes=0 and a file at most 256000 bytes; use byte windows otherwise')
