@@ -77,11 +77,20 @@ export function SessionView({
   const [rememberExec, setRememberExec] = useState(false);
   const [rejectReason, setRejectReason] = useState('');
   const [showRejectBox, setShowRejectBox] = useState(false);
+  const [extraTurns, setExtraTurns] = useState('15');
+  const [extraTokens, setExtraTokens] = useState('500000');
 
   const statusBadge = formatStatus(snapshot.manifest.status, snapshot.worker_live);
   const resSummary = summarizeResources(snapshot.resources);
   const usedTokens = resSummary.totalTokens;
   const usedCalls = resSummary.llmRequests;
+  const remaining = snapshot.resources?.remaining || {};
+  const needsMoreBudget =
+    !snapshot.worker_live &&
+    snapshot.manifest.status === 'paused' &&
+    ((typeof remaining.llm_requests === 'number' && remaining.llm_requests <= 0) ||
+      (typeof remaining.total_tokens === 'number' && remaining.total_tokens < 25000) ||
+      /allowance|budget|exhausted/i.test(snapshot.manifest.status_reason || ''));
 
   const handlePause = async () => {
     try {
@@ -153,6 +162,28 @@ export function SessionView({
       await onReload();
     } catch (err) {
       onNotify(err instanceof Error ? err.message : '开启权限失败', 'error');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleAuthorizeBudget = async () => {
+    const allowances: { llm_requests?: number; total_tokens?: number } = {};
+    const turns = parseInt(extraTurns, 10);
+    const tokens = parseInt(extraTokens, 10);
+    if (!Number.isNaN(turns) && turns > 0) allowances.llm_requests = turns;
+    if (!Number.isNaN(tokens) && tokens > 0) allowances.total_tokens = tokens;
+    if (!allowances.llm_requests && !allowances.total_tokens) {
+      onNotify('请填写大于 0 的追加轮次或 Token 额度', 'error');
+      return;
+    }
+    try {
+      setBusy('authorize');
+      const res = await api.authorizeRemaining(snapshot.task, allowances);
+      onNotify(res.message || '已追加额度并继续执行');
+      await onReload();
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '追加额度失败', 'error');
     } finally {
       setBusy(null);
     }
@@ -344,6 +375,56 @@ export function SessionView({
                 当前状态说明：
               </span>
               {snapshot.manifest.status_reason}
+            </div>
+          )}
+
+          {/* Budget Continuation Card */}
+          {needsMoreBudget && (
+            <div
+              className="rounded-xl border px-4 py-3 text-[12.5px] space-y-2.5"
+              style={{
+                backgroundColor: 'var(--bg-surface)',
+                borderColor: 'var(--accent)',
+              }}
+            >
+              <div className="font-medium" style={{ color: 'var(--text-primary)' }}>
+                额度已达上限，可在原会话追加剩余额度并无缝继续（保留全部已有成果与账本）：
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="inline-flex items-center gap-1.5" style={{ color: 'var(--text-secondary)' }}>
+                  <span>新剩余调用轮次</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={extraTurns}
+                    onChange={(e) => setExtraTurns(e.target.value)}
+                    className="w-20 rounded-lg border px-2 py-1 text-[12px] outline-none"
+                    style={{ backgroundColor: 'var(--bg-app)', borderColor: 'var(--border-subtle)', color: 'var(--text-primary)' }}
+                  />
+                </label>
+                <label className="inline-flex items-center gap-1.5" style={{ color: 'var(--text-secondary)' }}>
+                  <span>新剩余 Tokens</span>
+                  <input
+                    type="number"
+                    min={10000}
+                    step={50000}
+                    value={extraTokens}
+                    onChange={(e) => setExtraTokens(e.target.value)}
+                    className="w-28 rounded-lg border px-2 py-1 text-[12px] outline-none"
+                    style={{ backgroundColor: 'var(--bg-app)', borderColor: 'var(--border-subtle)', color: 'var(--text-primary)' }}
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={handleAuthorizeBudget}
+                  disabled={busy !== null}
+                  className="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium text-white cursor-pointer disabled:opacity-50"
+                  style={{ backgroundColor: 'var(--accent)' }}
+                >
+                  {busy === 'authorize' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                  <span>追加额度并继续</span>
+                </button>
+              </div>
             </div>
           )}
 

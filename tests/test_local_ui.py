@@ -1448,6 +1448,42 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     httpd.server_close()
                     serving.join(10)
 
+    def test_authorize_remaining_validates_and_dispatches_budget_continuation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tasks = root / 'tasks'
+            tasks.mkdir()
+            task_root = tasks / 'alpha'
+            ToolApplication.create(
+                task_root,
+                'Continue after budget pause',
+                model=None,
+                sources={},
+                process_limits={'process_invocations': 1, 'process_wall_seconds': 30},
+            )
+            workspace = Workspace(root, [root], tasks)
+            with self.assertRaisesRegex(ValueError, '至少指定一项'):
+                workspace.mutate({'op': 'authorize_remaining', 'task': 'alpha', 'allowances': {}})
+            with self.assertRaisesRegex(ValueError, '不支持的资源维度'):
+                workspace.mutate({'op': 'authorize_remaining', 'task': 'alpha', 'allowances': {'unknown': 5}})
+            with self.assertRaisesRegex(ValueError, '正数'):
+                workspace.mutate({'op': 'authorize_remaining', 'task': 'alpha', 'allowances': {'llm_requests': 0}})
+
+            dispatched = []
+            with patch.object(workspace, 'dispatch', side_effect=lambda name, r, kw: dispatched.append((name, r, kw))):
+                res = workspace.mutate({
+                    'op': 'authorize_remaining',
+                    'task': 'alpha',
+                    'authorization_id': 'auth-ui-1',
+                    'allowances': {'llm_requests': 10, 'total_tokens': 250000},
+                    'reason': 'UI continuation test',
+                })
+            self.assertEqual(res['authorized'], {'llm_requests': 10, 'total_tokens': 250000})
+            self.assertEqual(len(dispatched), 1)
+            self.assertEqual(dispatched[0][0], 'alpha')
+            self.assertEqual(dispatched[0][2]['resource_allowances'], {'llm_requests': 10, 'total_tokens': 250000})
+            self.assertEqual(dispatched[0][2]['authorization_id'], 'auth-ui-1')
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -679,6 +679,26 @@ class Workspace:
                 ToolApplication.load(root).switch_model(data['model'], switch_id=data['switch_id'],
                     reason=data['reason'], expected_connection=binding)
                 return {'task': name}
+            if op == 'authorize_remaining':
+                raw_allowances = data.get('allowances')
+                if not isinstance(raw_allowances, dict) or not raw_allowances:
+                    raise ValueError('请至少指定一项要追加的资源额度。')
+                allowed_dims = {'llm_requests', 'total_tokens', 'process_invocations', 'process_wall_seconds'}
+                allowances: dict[str, int | float] = {}
+                for dim, val in raw_allowances.items():
+                    if dim not in allowed_dims:
+                        raise ValueError(f'不支持的资源维度：{dim}')
+                    if isinstance(val, bool) or not isinstance(val, (int, float)) or val <= 0:
+                        raise ValueError(f'追加额度必须为正数：{dim}')
+                    allowances[dim] = float(val) if dim == 'process_wall_seconds' else int(val)
+                auth_id = str(data.get('authorization_id') or secrets.token_hex(8))
+                reason = str(data.get('reason') or '用户在桌面工作台追加额度并继续任务').strip()
+                self.dispatch(name, root, {
+                    'resource_allowances': allowances,
+                    'authorization_id': auth_id,
+                    'authorization_reason': reason,
+                })
+                return {'task': name, 'authorized': allowances, 'message': '已追加额度并继续执行'}
             if op not in {'resume', 'approve', 'reject'}:
                 raise ValueError('Unsupported operation')
             kwargs = {}
@@ -863,7 +883,7 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
             except PermissionError:
                 self.send(403, {'error': 'Local host/origin/session protection rejected request'})
             except ValueError as exc:
-                if op in {'save_model_profile', 'set_models_config_path', 'switch', 'grant_access', 'archive_task', 'delete_task'} and str(exc):
+                if op in {'save_model_profile', 'set_models_config_path', 'switch', 'grant_access', 'authorize_remaining', 'archive_task', 'delete_task'} and str(exc):
                     self.send(400, {'error': public_text(str(exc))})
                 else:
                     self.send(400, {'error': 'Action rejected; check confirmation, caps, current proposal and original task records'})

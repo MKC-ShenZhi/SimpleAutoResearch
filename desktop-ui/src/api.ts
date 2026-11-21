@@ -123,6 +123,24 @@ export const api = {
       ...grants,
     }),
 
+  authorizeRemaining: (
+    task: string,
+    allowances: {
+      llm_requests?: number;
+      total_tokens?: number;
+      process_invocations?: number;
+      process_wall_seconds?: number;
+    },
+    reason = '用户在桌面工作台追加额度并继续任务'
+  ) =>
+    apiPost<{ task: string; authorized: Record<string, number>; message: string }>({
+      op: 'authorize_remaining',
+      task,
+      authorization_id: crypto.randomUUID(),
+      allowances,
+      reason,
+    }),
+
   setAutoApprove: (task: string, autoApprove: boolean) =>
     apiPost<{ task: string; auto_approve: boolean }>({
       op: 'set_auto_approve',
