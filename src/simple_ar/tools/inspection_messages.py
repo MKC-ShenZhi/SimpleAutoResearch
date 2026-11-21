@@ -1325,7 +1325,7 @@ class _InspectionMessagesMixin:
         value = conversation.prepare(project,
             checkpoint=None if checkpoint_input is not None else checkpoint,
             followup=followup,
-            force_close=remaining[0] <= 0 or number >= 6, additional=True,
+            force_close=remaining[0] <= 0, additional=True,
             exit_first=exit_first)
         return conversation, value
 
