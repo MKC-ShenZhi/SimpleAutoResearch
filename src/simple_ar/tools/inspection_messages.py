@@ -485,7 +485,9 @@ class _InspectionMessagesMixin:
             block_request_counts=([len(saved['user_requests'])] * len(blocks)
                 if 'user_requests' in saved else None),
             schema_tokens=estimate_tokens(json.dumps(offered,ensure_ascii=False)),
-            context_token_target=target,estimate_tokens=estimate_tokens,
+            context_token_target=target,
+            steady_working_target=(min(target, max(36000, target // 3)) if economic else None),
+            estimate_tokens=estimate_tokens,
             priority_source_paths=(
                 [*self._delivery_source_paths(saved,
                     include_artifacts=prioritize_delivery),
@@ -1323,7 +1325,7 @@ class _InspectionMessagesMixin:
         value = conversation.prepare(project,
             checkpoint=None if checkpoint_input is not None else checkpoint,
             followup=followup,
-            force_close=remaining[0] <= 0, additional=True,
+            force_close=remaining[0] <= 0 or number >= 6, additional=True,
             exit_first=exit_first)
         return conversation, value
 

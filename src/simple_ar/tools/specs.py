@@ -87,6 +87,19 @@ def tool_completion(name: str, saved: dict[str, Any] | None) -> ToolCompletion |
     return None
 
 
+def _strip_schema_titles(value: Any) -> Any:
+    """Drop redundant Pydantic-generated string 'title' annotations without touching real 'title' properties."""
+    if isinstance(value, dict):
+        return {
+            key: _strip_schema_titles(item)
+            for key, item in value.items()
+            if not (key == "title" and isinstance(item, str))
+        }
+    if isinstance(value, list):
+        return [_strip_schema_titles(item) for item in value]
+    return value
+
+
 class CommonToolSpec(BaseModel):
     """Tool contract shared by local, OpenAI-style, and MCP-style adapters."""
 
@@ -114,7 +127,7 @@ class CommonToolSpec(BaseModel):
     def parameters_schema(self) -> dict[str, Any]:
         """Return an object JSON schema suitable for tool-call APIs."""
         if self.input_schema:
-            return self.input_schema
+            return _strip_schema_titles(self.input_schema)
         return {"type": "object", "properties": {}, "additionalProperties": False}
 
     def service_parameters_schema(self) -> dict[str, Any] | None:
