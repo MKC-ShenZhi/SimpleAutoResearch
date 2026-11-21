@@ -3732,7 +3732,7 @@ class CheckpointFailureTests(unittest.TestCase):
         app._work_connection = lambda binding,purpose:{'connection':{'max_output_tokens':2048}}
         app._request_capacity = lambda:5
         app._messages = lambda **kwargs:[]
-        app._decision_tokens = lambda client,messages:client.effective_output_limit()+100
+        app._decision_tokens = lambda client, messages, **kwargs: client.effective_output_limit() + 100
         app._save = Mock()
         return app
 

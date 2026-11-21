@@ -1025,7 +1025,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         manifest['public_artifacts'].extend(copied_records)
         for image in publication_view['image_mapping'].values():
             manifest['public_artifacts'].extend(image['files'])
-        natural_layout = (article and article_rendering['schema_version'] == 'article-rendering.v3') or natural_acm
+        natural_layout = (article and article_rendering['schema_version'] == 'article-rendering.v3') or natural_acm or bool(template_files)
         manifest['public_artifacts'].extend(_prepare_technical_content([title_inlines, subtitle_inlines, blocks, abstract], output,
             natural_layout=natural_layout))
 
