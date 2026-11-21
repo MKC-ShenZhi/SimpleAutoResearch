@@ -151,9 +151,10 @@ the current request without adopting an earlier verdict.
 | Provider connections and shared accounting | [integrations](../src/simple_ar/integrations/), [budget](../src/simple_ar/core/budget.py) |
 
 New Python research tasks use `create_research_task` and `start_research_task` from
-[research intake](../src/simple_ar/app/research_intake.py). Saved sessions and
-explicit compatibility APIs may still use [ResearchApplication](../src/simple_ar/app/research_application.py)
-and retain their recorded execution contracts.
+[research intake](../src/simple_ar/app/research_intake.py) together with
+[ToolApplication](../src/simple_ar/app/tool_application.py) and lightweight
+[services](../src/simple_ar/app/services.py); saved sessions retain their recorded
+execution contracts.
 
 New standalone Python code tasks use the shared editor for existing and new
 projects. An empty new project may create its own tests; copied validation

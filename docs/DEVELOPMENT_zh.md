@@ -80,8 +80,9 @@ flowchart LR
 | 模型连接与共享记账 | [integrations](../src/simple_ar/integrations/)、[预算](../src/simple_ar/core/budget.py) |
 
 新建 Python 研究任务使用[研究接入](../src/simple_ar/app/research_intake.py)中的
-`create_research_task` 和 `start_research_task`。已保存会话和显式兼容 API 仍可由
-[ResearchApplication](../src/simple_ar/app/research_application.py)承接，沿保存的执行合同恢复。
+`create_research_task` 和 `start_research_task`，由
+[ToolApplication](../src/simple_ar/app/tool_application.py) 与轻量
+[services](../src/simple_ar/app/services.py) 统一承接；已保存会话沿记录的执行合同恢复。
 
 新建独立 Python 代码任务对已有和新建项目均使用共同编辑器。空项目可创建自己的测试；复制项目的验证材料仍受保护。确需保留的实验性生成器时，可在 `initialize_code_task` 中显式传入 `direct_edit=False`；已保存任务继续使用原实现。
 

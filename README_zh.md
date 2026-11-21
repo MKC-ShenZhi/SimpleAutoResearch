@@ -1,158 +1,169 @@
-![SimpleAutoResearch](docs/assets/simpleautoresearch-logo.png)
+<p align="center">
+  <img src="docs/assets/simpleautoresearch-logo.png" alt="SimpleAutoResearch" width="680" />
+</p>
 
- # SimpleAutoResearch
+<h1 align="center">SimpleAutoResearch</h1>
 
-**持续科研助手：围绕同一任务组合资料、代码、数据、图形与可编辑报告。**
+<p align="center">
+  <strong>本地优先、证据可核验的持续科研助手：把文献调研、实验代码、科研绘图、独立复核与论文排版放进同一个可续作工作台。</strong>
+</p>
 
-[English](README.md) · [开始使用](docs/USAGE_zh.md) · [文档导航](docs/README_zh.md) · [成果展示](docs/showcase/README_zh.md)
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white" alt="Python 3.12+" />
+  <img src="https://img.shields.io/badge/Interface-Desktop%20Workbench%20%26%20CLI-2B3137" alt="Desktop Workbench & CLI" />
+  <img src="https://img.shields.io/badge/Privacy-Local--First%20%26%20Read--Only%20Sources-2E7D32" alt="Local-First" />
+  <img src="https://img.shields.io/badge/LaTeX-XeLaTeX%20%2F%20NeurIPS%20%2F%20ACM-008080" alt="LaTeX Export" />
+</p>
 
-科研工作需要持续传递上下文：资料影响方法，代码落实计算，结果进入图表和正文，反馈又改变下一步。SimpleAutoResearch 将这些工作保存在可继续的任务中，让你检查证据、复用已有结果，并通过新指令推进工作。
+<p align="center">
+  <a href="README.md">English</a> ·
+  <a href="#桌面研究工作台">桌面工作台</a> ·
+  <a href="#真实科研交付展示">成果展示</a> ·
+  <a href="#3-分钟快速开始">快速开始</a> ·
+  <a href="docs/README_zh.md">文档导航</a> ·
+  <a href="CHANGELOG_zh.md">更新记录</a>
+</p>
 
-你决定研究问题、资源和科学判断；助手在授权范围内调查材料、提出并调用工具，整理可供审阅的成果。
+---
 
-## 从你已有的工作开始
+科研很少是一次性脚本能跑完的流水线：文献决定假设，代码跑出测量，图表暴露问题，独立审稿抓出矛盾，人的反馈又决定下一步迭代。**SimpleAutoResearch** 把这些步骤保存在同一个可检查、可暂停、可复用的本地任务账本中——你掌握研究问题、权限审批与科学判断，助手在授权边界内自主调查、执行、自查并交付可编辑成果。
 
-| 你的起点 | 可以提出的任务 | 可以检查的交付 |
-| --- | --- | --- |
-| 一个研究方向和约束 | 查找来源、比较路线，深入调查值得尝试的方案 | 来源引用、比较、报告和待解决问题 |
-| 代码需求或已有项目 | 创建或修改代码、定位失败并验证行为 | 可编辑源码、修改、执行日志和未解决项 |
-| 数据及字段说明 | 检查观测、分析结果并绘图 | 分析脚本、数值表、图形和解释 |
-| 论文、实现和可用资源 | 确定并执行有限复现范围 | 实际协议、环境、测量与差异说明 |
-| 已有结果、图形或初稿 | 修改图形、重组论证或装配报告 | 修订成果、保留的原版、引用及可选 LaTeX/PDF（支持中文 XeLaTeX 与外供会议模板） |
+---
 
-这些能力可以在同一任务中组合。改图可以复用保存的数据，写作可以使用已有计算，缺少关键证据时可以回到调查。它们不是每项请求都必须走完的固定 pipeline。
+## 桌面研究工作台
 
-## 看实际交付
+内置基于 React + Tailwind + KaTeX 与原生 WebView 的桌面工作台（`simple-ar-desktop`），与 CLI 共享同一套任务账本与 `models.toml` 配置：支持深浅主题切换、新建即自动运行、执行权限审批、预算触顶一键追加额度续跑、历史会话检索，以及 Markdown、数学公式、图片与分页 PDF 的原生预览。
 
-可以先读完整报告，或直接复跑已交付图形。仓库包含源码、必要的保存结果和重建说明，不只是截图。以下是有人参与的开发案例，不是一键无人干预成果或 benchmark 成绩。
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/desktop-workbench-dark.jpg" alt="桌面研究工作台深色新建界面" />
+      <p align="center"><sub>深色模式 · 新建研究、挂载材料、权限开关与科研快捷模板</sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/assets/desktop-session-light.jpg" alt="桌面研究工作台浅色会话界面" />
+      <p align="center"><sub>浅色模式 · 结构化对话流、实时账本统计与底部反馈续作栏</sub></p>
+    </td>
+  </tr>
+</table>
 
-### 保存结果 → 分析、五面板图和报告
+---
 
-任务比较校准模型形式、更新策略、数据覆盖和记录的计算开销，经反馈修正图形与解释，交付六页 PDF、四张表、可编辑代码和冻结输入。报告阶段没有重新拟合模型。
+## 为什么选择 SimpleAutoResearch
+
+| 核心特性 | 具体能力 |
+|---|---|
+| **持续项目与跨任务复用** | 随时在安全边界暂停，沿原任务和原账本恢复；支持 `--resume-task` 定向反馈改图/改稿、`--from-session ... --reuse artifacts` 将已交付代码库与 `SKILL.md` 迁移到新数据集、`--retry-model` 断线无损续接、`--authorize-remaining` 追加额度继续。 |
+| **独立复核与诚实交付** | 默认由独立复核代理核查原始数据、代码实现与正文陈述之间的一致性；抓出真实矛盾时退回修订，若预算或能力受限则诚实落盘 `partial` 并列出精确 `unresolved` 清单，**绝不伪造 `completed`**。 |
+| **完整科研与出版闭环** | 联网检索公开文献（可核验 DOI / BibTeX）→ 从零编写或改造模块化实验代码 → 生成高分辨率出版图 → 导出可独立编译的中文 XeLaTeX 或外供会议模板（如 NeurIPS 2025 / ACM）PDF 工程。 |
+| **本地优先与安全边界** | 原始数据与文献只读挂载；命令执行需显式批准（Linux 支持 `bwrap` 沙箱隔离）；资源账本严格控制调用次数、Token 与进程预算；模型密钥仅保留在本地环境变量或系统凭据管理器。 |
+
+---
+
+## 真实科研交付展示
+
+这里展示的是框架真实跑出的交付物、复核记录与局限性，不作为“一键满分”或 benchmark 成功率承诺。完整源码、成本明细与复现条件见[成果展示](docs/showcase/README_zh.md)。
+
+### 1. 英文机器学习顶会论文闭环 + 跨数据集方法复用（NeurIPS 2025 模板）
+
+- **唯一输入**：仅只读挂载一份官方 `neurips_2025.sty` 模板，零预设代码、零预设数据、零人工干预。
+- **自主产出**：联网检索 8 篇可核验 DOI 的 BibTeX 文献 → 从零编写 7 模块 `cp_noise_lab/` 代码库 → 在 `digits` 与 `breast_cancer` 上完成 60 组配置 × 多随机种子 = **720 条受控实验** → 生成 3 张英文出版级 PNG 图 → 编译导出 **9 页官方 NeurIPS 2025 英文 PDF** 与可复用 `SKILL.md`。
+- **真实复核与跨项目复用**：独立复核精准抓出了 `SKILL.md` 的 2 处接口名漂移（主代理当场重写修正）以及正文 1 处过强表述，并在 70 次调用触顶时诚实落盘 `partial`；随后通过 `--from-session ... --reuse artifacts` 将这套代码库与 `SKILL.md` 迁移至全新 `wine` 三分类数据集，经独立复核通过并完成 `completed`（18 项交付）。
+
+<table>
+  <tr>
+    <td width="46%">
+      <img src="docs/showcase/assets/neurips-2025-cp-noise-page1.png" alt="官方 NeurIPS 2025 模板编译的 9 页英文论文首页" />
+      <p align="center"><sub>官方 <code>neurips_2025.sty</code> 编译的 9 页英文论文首页</sub></p>
+    </td>
+    <td width="54%">
+      <img src="docs/showcase/assets/neurips-2025-cp-noise-fig2.png" alt="双重污染下最差类覆盖率与预测集大小权衡图" />
+      <p align="center"><sub>图 2：不平衡 + 标签噪声下最差类覆盖率与预测集大小权衡</sub></p>
+    </td>
+  </tr>
+</table>
+
+### 2. 保存结果分析 → 五面板图与可复跑报告
+
+在不重做实验的前提下分析冻结校准结果，经人工反馈修正计时汇总、标签与解释，交付 6 页 PDF、五面板图、四张表、绘图源码与可编辑 TeX（[阅读报告](examples/saved-results-report/report/report.pdf) · [无需密钥复跑](examples/saved-results-report/README_zh.md)）。
 
 ![保存校准结果的五面板分析图](examples/saved-results-report/report/figures/monthly_update_panel.png)
 
-[阅读报告](examples/saved-results-report/report/report.pdf) · [无需密钥复跑](examples/saved-results-report/README_zh.md) · [版本、人工参与和成本](docs/showcase/README_zh.md)
+### 3. 不重做实验的图形反馈（离线可复跑）
 
-### 机器人方向 → 有出处的技术调研
-
-十页报告比较 VLA 策略与世界模型的预测目标、控制角色和公开证据范围，包含 16 项引用、两张说明图、两张表及可编辑 Markdown/LaTeX。这是范围有限的阅读报告，不是完整的 2026 年综述。
-
-![预测如何进入机器人控制](examples/robotics-survey/report/figures/fig1_prediction_in_loop.png)
-
-[阅读调研 PDF](examples/robotics-survey/report/survey.pdf) · [中文简报](examples/robotics-survey/report/briefing_zh.md) · [重建报告](examples/robotics-survey/README_zh.md)
-
-正文与绘图代码由框架任务生成，人提供目标、反馈、授权和独立检查。两项任务经历过开发修复与显式续接，仍保留 `partial` 状态；[来源、版本与成本](docs/showcase/README_zh.md)随案例说明，不作为一键完成或成功率承诺。
-
-### 不重做实验的图形反馈
-
-较早的一项已核任务将保存结果的横版图改为配对视觉比较，保留八个显示值、单位与明确尺度。源码与数据已公开，可以不调用模型复跑。
+通过定向反馈将保存结果的横版图重构为配对视觉对比，完整保留全部数值、单位与尺度，仅耗 11 次模型请求，无须重拟合（[无需密钥复跑源码](examples/figure-feedback/README_zh.md) · [前后对照](docs/showcase/README_zh.md#横版比较图当前可复跑导出)）。
 
 ![保存结果的反馈对比图](docs/showcase/assets/landscape-feedback-after.png)
 
-[无需 API 密钥，使用源码和保存数据复跑](examples/figure-feedback/README_zh.md) · [前后对照与成本](docs/showcase/README_zh.md#横版比较图当前可复跑导出)
+---
 
-该有界反馈任务用 11 次模型请求、211774 记录 tokens，没有重拟合。[较早的 Bike Sharing 与方法图](docs/showcase/README_zh.md#较早成果)保留原版本说明。案例的来源、人工参与和限制见[展示说明](docs/showcase/README_zh.md)。
+## 3 分钟快速开始
 
-## 一项任务怎样继续
-
-1. **说明目标，提供材料。** 从问题、文件、数据或项目开始，给出影响选择的资源与约束。
-2. **查看工作过程。** 助手从资料、代码、计算、图形和写作中选择下一步；保存的执行记录、模型用量和成果版本帮助你检查实际发生了什么。
-3. **检查交付，提出反馈。** 打开打印的成果路径，核对证据和未解决项，再沿同一任务提出具体修改或补充材料。
-
-命名 TOML profile 管理模型连接与用途路由。文本、代码、写作、视觉和图像生成可以使用不同后端；密钥通过环境变量或私有 `.env` 引用。配置方式见[模型配置参考](docs/CONFIG_REFERENCE_zh.md)。
-
-## 快速开始
-
-执行机器需要 Python 3.12+、Git、[uv](https://docs.astral.sh/uv/) 和 ripgrep（`rg`）。克隆 main 分支：
+执行机器需要 Python 3.12+、Git、[uv](https://docs.astral.sh/uv/) 和 ripgrep（`rg`）。
 
 ```bash
 git clone --branch main https://github.com/MKC-ShenZhi/SimpleAutoResearch.git
 cd SimpleAutoResearch
-uv sync --locked
+uv sync --locked --extra desktop
 ```
 
-### 先试一个离线案例
+### 方式 A：启动桌面研究工作台（推荐）
+
+```bash
+uv run simple-ar-desktop
+```
+
+在工作台左侧 **“模型与连接设置”** 中填写你的 OpenAI 兼容端点、模型 ID 和 API Key（与 CLI 共用 `models.toml`），即可在界面中新建任务、挂载目录/文件、一键启动并预览成果。
+
+### 方式 B：使用 CLI 运行、反馈与跨项目复用
+
+先体验一个无需 API Key 的离线绘图复跑：
 
 ```bash
 uv run python examples/figure-feedback/build_figure_v2.py --output runs/examples/figure-feedback/replay
 ```
 
-使用新的输出目录，打开其中的 `main.png` 或 `main.svg`。这会在保存结果上运行已交付源码，不需要密钥、联网或训练，也不是重新生成一次模型成果。完整图表与报告源码见[保存结果分析](examples/saved-results-report/README_zh.md)。
-
-### 再配置模型，完成新任务
-
-按[模型配置教程](docs/USAGE_zh.md)创建模型目录的 TOML 配置文件，定义名为 `daily` 的 profile，填写服务商实际端点、模型 ID 和凭据环境变量。教程包含默认文件位置、自定义路径和私有 `.env` 配置。
-
-检查本地配置能否解析：
+配置好 `models.toml` 中的 `daily` profile（详见[开始使用](docs/USAGE_zh.md)）后，即可启动真实任务：
 
 ```bash
-uv run simple-ar models --profile daily --purpose text
+# 1. 启动新任务（--allow-execution 允许提案执行；--allow-network 允许公开文献检索）
+uv run simple-ar start "分析这些实验结果，绘制多面板对比图并撰写可复跑报告。" \
+  --source ./results --model profile:daily --allow-execution --yes
+
+# 2. 查看交付物、账本与未解决项
+uv run simple-ar results "SESSION_PATH"
+
+# 3. 沿原会话提交定向反馈（复用已有计算，不重做无关部分）
+uv run simple-ar start --resume-task "SESSION_PATH" "补充缺失值敏感性分析并更新图 1。"
+
+# 4. 跨项目复用已交付方法与代码到新数据集
+uv run simple-ar start --from-session "SESSION_PATH" --reuse artifacts \
+  --source ./new_dataset --model profile:daily --allow-execution "将已有方法迁移至新数据集并对比结论。"
 ```
 
-此命令检查本地配置与凭据是否可找到，不证明远端 API 可用。
+---
 
-### 用仓库已有材料启动任务
+## 文档导航
 
-```bash
-uv run simple-ar start "根据所给曲线数据与配置写一份简短 Markdown 说明。区分演示值与实测实验，列出证据限制并保留初版。" --source examples/data-curves --model profile:daily --yes
-```
-
-这是使用给定演示数据的模型辅助任务。`--yes` 接受展示的任务摘要。运行自己的任务时替换目标和材料路径；重复 `--source PATH` 可添加材料。
-
-需要计算的数据分析任务可以请求执行工作：
-
-```bash
-uv run simple-ar start "分析这些结果。先检查字段和缺失值，再做一张多面板图和结果说明，交付可复跑源码。" --source ./results --model profile:daily --allow-execution
-```
-
-将 `./results` 换成执行机器上已存在的目录。`--allow-execution` 允许提出命令，每条命令仍需批准；需要获取公开来源时加 `--allow-network`。视觉、图像路由及其权限见[任务指南](docs/WORKFLOWS_zh.md)。
-
-### 查看成果并反馈
-
-将 `SESSION` 替换为终端打印的 `Task session` 路径：
-
-```bash
-uv run simple-ar results "SESSION"
-uv run simple-ar start --resume-task "SESSION" "保留初版，增加一节缺失值处理与证据限制，交付独立反馈版本。"
-uv run simple-ar results "SESSION"
-```
-
-打开 `results` 打印的实际路径，检查正文、来源、计算、验证状态和未解决项。反馈沿用保存的材料、连接、权限和预算；用 `--source PATH` 补充证据，用 `--from-session SESSION --reuse artifacts` 在新任务中复用已交付的方法与代码，或在配额耗尽后用 `--authorize-remaining` 追加额度继续。批准、暂停与恢复方式见[开始使用](docs/USAGE_zh.md)。
-
-### 桌面研究工作台（可选）
-
-```bash
-uv sync --locked --extra desktop
-uv run simple-ar-desktop
-```
-
-桌面工作台复用与 CLI 相同的任务账本和 `models.toml` 配置，支持新建自动运行、执行权限审批、预算触顶后一键追加额度续跑、历史会话管理，以及 Markdown、数学公式、图片与分页 PDF 预览。
-
-## 适用范围与审阅
-
-入门教程面向 main 分支。开发分支仍在改进长任务和反馈交付；请按所安装版本使用文档，不将开发进展视为已发布能力。
-
-项目目前为**源码可见预览**，原生 `start` 入口仍属实验性功能。当前重点是 Python 科研代码、常见表格数据、范围明确的调研与有限复现，以及有材料依据的报告。复杂环境准备、长篇调研、精细出版排版和稳定效率仍需改善。
-
-来源原件只读挂载，你审阅命令提案并批准执行；任务工作区不是操作系统沙箱。科学解释与交付证据仍由你核验，执行或 PDF 编译成功本身不证明科学结论正确。模型、服务、数据和环境影响结果与成本；案例的具体条件见[成果展示](docs/showcase/README_zh.md)。
-
-## 文档与贡献
-
-[文档导航](docs/README_zh.md)按入门、任务、参考和贡献开发分层。按需要阅读：
+[完整文档索引](docs/README_zh.md)按入门、任务、参考与开发分层：
 
 | 你想做什么 | 阅读入口 |
-| --- | --- |
-| 安装、配置并完成第一个任务 | [开始使用](docs/USAGE_zh.md) |
-| 选择输入并按任务配方操作 | [任务指南](docs/WORKFLOWS_zh.md) |
-| 查询命令、批准与恢复 | [CLI 参考](docs/CLI_REFERENCE_zh.md) |
-| 配置命名模型、路由和任务字段 | [配置参考](docs/CONFIG_REFERENCE_zh.md) |
-| 查看展示成果及其条件 | [成果展示](docs/showcase/README_zh.md) |
-| 理解代码与开发流程 | [开发指南](docs/DEVELOPMENT_zh.md) |
-| 了解近期变化 | [更新记录](CHANGELOG_zh.md) |
+|---|---|
+| 安装、配置模型并跑通第一个任务 | [开始使用](docs/USAGE_zh.md) |
+| 按调研 / 代码 / 数据 / 写作场景查看配方 | [任务指南](docs/WORKFLOWS_zh.md) |
+| 查看更多真实交付物、成本与边界条件 | [成果展示](docs/showcase/README_zh.md) |
+| 查询完整 CLI 参数、审批与恢复命令 | [CLI 参考](docs/CLI_REFERENCE_zh.md) |
+| 配置多模型路由、视觉/图像后端与预算字段 | [配置参考](docs/CONFIG_REFERENCE_zh.md) |
+| 了解架构设计与本地测试套件 | [开发指南](docs/DEVELOPMENT_zh.md) |
+| 查看版本演进与近期改动 | [更新记录](CHANGELOG_zh.md) |
 
-目前没有当前版本的官方 benchmark 成绩或总体成功率；公开案例用于展示具体工作及其边界。
+---
 
-欢迎提交可复现问题和脱敏诊断，请附目标、相关输入、命令、实际行为与预期结果。许可证尚未确定；代码贡献请先讨论，再提交 PR。
+## 适用范围与审阅边界
 
-任务协作设计参考了 [AutoResearchClaw](https://github.com/aiming-lab/AutoResearchClaw)、[OpenResearch](https://github.com/alphaXiv/OpenResearch) 和 [ARIS](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep)。
+- 项目目前为**源码可见预览**，重点面向 Python 科研代码、表格/数值实验、范围明确的文献调研与有限复现，以及有证据依据的学术报告与论文导出。
+- 原始来源始终只读挂载，命令执行由用户显式批准（普通模式非 OS 沙箱；Linux 环境下可通过 `--sandbox-execution` 启用 `bwrap` 沙箱）。
+- **科学判断与最终签收责任始终在人**：进程退出码为 0、独立复核通过或 PDF 编译成功，均不自动等同于科学结论无误；模型能力、服务稳定性与输入数据质量都会影响最终产出与成本。
+- 欢迎提交可复现的问题与脱敏诊断；许可证尚未确定，代码贡献请先沟通再提交 PR。
+
+任务协作与研究工作台理念参考了 [AutoResearchClaw](https://github.com/aiming-lab/AutoResearchClaw)、[OpenResearch](https://github.com/alphaXiv/OpenResearch) 与 [ARIS](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep)。
