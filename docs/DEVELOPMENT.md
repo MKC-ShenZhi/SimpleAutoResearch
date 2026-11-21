@@ -1,284 +1,98 @@
-# Development guide
+# Development Guide
 
-Use this guide to find the owner of a change, implement it and verify its effect.
-For installation and first use, start with [Get started](USAGE.md).
+This guide helps contributors set up the environment, understand core architectural invariants, locate module owners, and run verification suites. For installation and first-time usage, start with [Get started](USAGE.md).
 
 [中文](DEVELOPMENT_zh.md) · [CLI reference](CLI_REFERENCE.md) · [Configuration](CONFIG_REFERENCE.md) · [Showcase](showcase/README.md)
 
-## Set up a development environment
+---
 
-Use Python 3.12+, Git, uv and ripgrep. From the repository root:
+## 1. Set Up a Development Environment
+
+Requires Python 3.12+, Git, [uv](https://docs.astral.sh/uv/), and ripgrep (`rg`). Node.js 20+ is also required when modifying the desktop workbench frontend.
 
 ```bash
-uv sync --locked --extra examples
+uv sync --locked --extra examples --extra desktop
 uv run simple-ar --help
 uv run simple-ar-checks --list
 ```
 
-The `examples` extra supports execution cases. Offline checks need no model key;
-configure a connection only for checks that actually call a provider.
-Use `uv sync --inexact --extra examples` when a shared environment must retain
-additional scientific packages. Keep large benchmark environments separate.
+- Offline test suites require no model API keys; configure `models.toml` and `.env` only for live provider tests.
+- In shared scientific environments where extra installed packages should be preserved, use `uv sync --inexact --extra examples`.
 
-## Architecture and code ownership
+---
 
-A task supplies a goal, materials and authorization. The application selects
-necessary operations, observes their results and continues or delivers. Research,
-code, analysis and writing are reusable capabilities; a task may combine them.
+## 2. Core Architecture & Invariants
+
+SimpleAutoResearch centers on a **single resumable task session and shared resource ledger**, coordinating literature search, code work, data analysis, plotting, writing/publication, and independent review inside one native action loop:
 
 ```mermaid
 flowchart LR
-    I[CLI / Python / MCP] --> A[Shared action loop]
-    A --> T[Research, code, analysis and writing tools]
+    I[CLI / Desktop UI / Python] --> A[ToolApplication Action Loop]
+    A --> T[Workspace · Search · Code · Analysis · Writing · Export]
     T --> A
-    A --> D[Delivery and user feedback]
-    D --> A
-    A --> R[Sessions, permissions, execution and accounting]
+    A --> V[Independent Review & Delivery]
+    V --> A
+    A --> R[Session Store · Approvals · Shared Ledger · Process Runner]
     T --> R
 ```
 
-The application coordinates work; domain modules own their professional operations.
-Ordinary shared actions use the task's execution records and resource accounting.
-For new Python research integrations, import `ResearchBrief`, `create_research_task`,
-`load_research_task`, and `start_research_task` from `simple_ar.research`.
-Creation records the task. Use `start_research_task` for the initial structured
-work and `load_research_task(root).run()` to resume a saved task.
-Existing `ResearchApplication` callers and saved stepwise sessions use their original API.
-CodeTask initialization creates a ledger for standalone Python and CLI tasks;
-embedded work sets `standalone=False` and uses the enclosing task's ledger.
-Injected model clients must support the existing task-ledger binding.
-Environment, dependency-interface and external-interpreter probes use the task
-process ledger; an unaffordable optional probe is reported as unmeasured.
-An explicitly enabled external agent CLI uses the shared process runner and
-task ledger. Its model usage remains unknown; it cannot run under a finite
-request or token limit until it supports enforceable accounting.
-Task-local scripts remain subject to the task's permissions. The shared POSIX
-process runner enters process-group supervision before switching to the approved
-working directory and executable; the original argv and environment are preserved.
+Keep these five invariants intact when making changes:
 
-New ordinary tasks investigate, copy, edit and propose approved commands in the
-existing shared action loop. There is no mandatory source-assignment/return role
-transition before submitting a candidate. Delivery owns acceptance of the actual
-claim and versions, and delegates applicable independent investigation; producers
-need not finish an exhaustive self-audit first. Optional document, publication and other professional
-services retain their own responsibilities. Loading tools grants no authority.
-Saved source-role tasks keep their original scope, handoff and recovery behavior.
+1. **Read-only sources & explicit permissions**: user-supplied source materials are always mounted read-only; process commands require explicit approval (with optional Linux `bwrap` isolation via `--sandbox-execution`); loading tools or reading external text (including `SKILL.md`) never grants authority.
+2. **One ledger & honest accounting**: model calls, tokens, process invocations, and source operations share one task ledger. Interrupted or failed calls preserve unknown reservations rather than silently erasing them; continuation happens explicitly via `--retry-model` or `--authorize-remaining`.
+3. **Version binding & evidence provenance**: reads, edits, copies, publication exports, and reviews bind concrete paths and SHA-256 digests so prior versions are never silently overwritten and unexecuted checks are never fabricated.
+4. **Independent review & honest delivery**: an independent reviewer checks original evidence against claims, returning `needs_revision` on blocking defects. When budget or capability boundaries prevent full verification, the session preserves usable work and delivers an honest `partial` with explicit `unresolved` items—never faking `completed`.
+5. **Saved session compatibility**: new tasks use the current native contract (`ToolApplication` + `create_research_task` / `start_research_task`); existing saved sessions continue under their recorded contracts.
 
-New ordinary tasks return native tool batches directly to the action queue. There
-is no outer work-selection response or second compilation of the model's actions.
-Working history presents complete units with the original reply, actions and actual
-receipts. Independent inspection retains its own native operations and opinions on
-the same ledger. A workspace action can explicitly submit its produced work for
-delivery; other services cannot silently introduce completion effects. A completed
-reviewed claim can be selected for delivery without restating its inventory.
-Questions and explicit caller operations retain
-their own contracts. For new ordinary tasks, the shared material view prioritizes
-the current request, relevant feedback, selected references and observed source
-windows. Older work stays retrievable instead of filling unused context. Repeated
-windows of the same file version share their overlapping text. Saved selection,
-history and inspection policies stay unchanged on reload and unrelated material supply.
-Document handoffs retain their original feedback; the receiving operation fits
-its input using the same model-aware JSON request counter as the sender.
+---
 
-New ordinary tasks can submit an unfinished candidate for independent investigation
-before publication. Its dedicated request contains the current claim, existing files
-and known gaps; final report status and requested formats belong to final delivery.
-This binds the actual claim and files; its opinion is not a complete-delivery certificate. Final acceptance checks required outputs,
-publication versions and applicable independent findings. New native tasks with a model
-require independent review by default. The reviewer determines the appropriate depth
-from the request and evidence. Callers can make review optional. Saved tasks retain
-their existing review contract.
-Delivery projects current
-obligations into the shared work view. Early candidate investigation protects model capacity
-for revision, submission, a final independent check and a truthful fallback on the
-one ledger. Final delivery consumes that checking stage without recursively
-protecting another revision cycle. Resource minima are lower bounds, not guarantees
-of quality or completion; process capacity is not inferred from those model stages.
-When the remaining work is infeasible, useful actual
-outputs remain available for honest partial delivery.
+## 3. Code Ownership Map
 
-Explicitly selected retained deliveries can carry original observations covering
-only their selected bytes and related fallible working notes. The creation owner
-freezes this context with the input snapshot; the shared selector admits it alongside
-current work. Old instructions, permissions, costs and acceptance are not inherited.
-Publication can also verify an externally built PDF through accepted process-version
-lineage binding the current manuscript and referenced assets. This requires explicit
-inputs and outputs, does not discover hidden OS dependencies, and does not certify
-content. Editable TeX delivery retains the complete exporter-project contract.
+| Area | Primary modules |
+|---|---|
+| CLI entry & intake | [cli/main.py](../src/simple_ar/cli/main.py), [cli/code_task_commands.py](../src/simple_ar/cli/code_task_commands.py), [app/research_intake.py](../src/simple_ar/app/research_intake.py) |
+| Desktop workbench | [desktop.py](../src/simple_ar/desktop.py), [ui.py](../src/simple_ar/ui.py), [desktop-ui/](../desktop-ui/) |
+| Action loop, contracts & delivery | [app/tool_application.py](../src/simple_ar/app/tool_application.py), [app/tool_contracts.py](../src/simple_ar/app/tool_contracts.py), [app/tool_messages.py](../src/simple_ar/app/tool_messages.py), [app/tool_delivery.py](../src/simple_ar/app/tool_delivery.py), [app/services.py](../src/simple_ar/app/services.py) |
+| Context selection & memory | [core/working_context.py](../src/simple_ar/core/working_context.py), [app/work_memory.py](../src/simple_ar/app/work_memory.py) |
+| Workspace, copies & processes | [tools/workspace.py](../src/simple_ar/tools/workspace.py), [tools/workspace_models.py](../src/simple_ar/tools/workspace_models.py), [tools/workspace_delivery.py](../src/simple_ar/tools/workspace_delivery.py), [core/process.py](../src/simple_ar/core/process.py) |
+| Independent review & audit | [tools/inspection.py](../src/simple_ar/tools/inspection.py), [tools/inspection_contracts.py](../src/simple_ar/tools/inspection_contracts.py), [tools/inspection_evidence.py](../src/simple_ar/tools/inspection_evidence.py), [tools/inspection_messages.py](../src/simple_ar/tools/inspection_messages.py), [tools/delivery_review.py](../src/simple_ar/tools/delivery_review.py) |
+| Research, code & data analysis | [research/](../src/simple_ar/research/), [code_task/](../src/simple_ar/code_task/), [result_analysis/](../src/simple_ar/result_analysis/) |
+| Writing, revision & PDF export | [report/export.py](../src/simple_ar/report/export.py), [report/delivery.py](../src/simple_ar/report/delivery.py), [tools/writing.py](../src/simple_ar/tools/writing.py), [tools/publication.py](../src/simple_ar/tools/publication.py) |
+| Model connections & ledger | [integrations/llm.py](../src/simple_ar/integrations/llm.py), [integrations/model_settings.py](../src/simple_ar/integrations/model_settings.py), [core/budget.py](../src/simple_ar/core/budget.py) |
 
-For new ordinary tasks, run_process inputs/outputs without a mount prefix resolve
-relative to its cwd, like command file arguments. Explicit mount locators and
-absolute paths retain their access rules; ./ disambiguates a local name that
-matches a mount alias. The workspace owner captures these canonical versions for
-approval, execution and provenance without rewriting the original request. Saved
-tasks without this policy retain their original workspace-relative declarations.
+---
 
-New document work selects recorded observations through the shared model-capacity
-selector while retaining the complete original journal. Its measurements and
-editable candidate are work products, not independent evidence or acceptance.
-Correctable attachment-selection errors retain the draft and observations;
-authority or input changes stop the attempt. Revisions retain referenced local
-files at their bound relative paths, including data and source links. CommonMark
-references must resolve to planned outputs before materialization. Accepted copies
-enter shared provenance; matching bytes alone do not invent historical sources.
+## 4. Verification & Builds
 
-Known files and receipts survive a lost model reply; unknown charges and physical
-outcomes remain protected by ordinary recovery. Closed actions and outcomes whose
-reply lacks required reasoning history are presented as historical observations,
-retaining the original reply without fabricated reasoning or replay. Model plans
-and check recipes remain revisable choices, not user requirements. Partial delivery
-discloses unfinished work; standalone inspection and saved contracts stay available.
-
-Independent inspection owns its observations as well as its judgment. File windows
-and original operation outcomes share the bounded working view; compaction notes
-do not replace recorded calculations or certify their applicability to changed work.
-An invalid opinion does not erase its investigation. A subsequent review can read
-the original independent journal and reuse observations under current permissions
-and input versions. Retained runs remain historical, and the new review judges
-the current request without adopting an earlier verdict.
-
-| Change | Start here |
-| --- | --- |
-| CLI inputs and configuration | [CLI](../src/simple_ar/cli/), [task intake](../src/simple_ar/app/research_intake.py) |
-| Ordinary actions and historical work selection | [OperationTools](../src/simple_ar/app/operation_tools.py), [WorkSelection](../src/simple_ar/app/work_selection.py) |
-| Working knowledge and original observations | [work_memory](../src/simple_ar/app/work_memory.py), [working_context](../src/simple_ar/core/working_context.py) |
-| Feedback and task lifecycle | [ToolApplication](../src/simple_ar/app/tool_application.py), [OperationTools](../src/simple_ar/app/operation_tools.py) |
-| Files, edits and approved commands | [Workspace](../src/simple_ar/tools/workspace.py), [process lifecycle](../src/simple_ar/core/process.py) |
-| Retrieval, reading and source evidence | [research](../src/simple_ar/research/) |
-| Code creation, repair and validation | [code_task](../src/simple_ar/code_task/) |
-| Numerical analysis and data figures | [result_analysis](../src/simple_ar/result_analysis/) |
-| Writing, citations and publication | [report](../src/simple_ar/report/), [publication tool](../src/simple_ar/tools/publication.py) |
-| Provider connections and shared accounting | [integrations](../src/simple_ar/integrations/), [budget](../src/simple_ar/core/budget.py) |
-
-New Python research tasks use `create_research_task` and `start_research_task` from
-[research intake](../src/simple_ar/app/research_intake.py) together with
-[ToolApplication](../src/simple_ar/app/tool_application.py) and lightweight
-[services](../src/simple_ar/app/services.py); saved sessions retain their recorded
-execution contracts.
-
-New standalone Python code tasks use the shared editor for existing and new
-projects. An empty new project may create its own tests; copied validation
-inputs remain protected. To explicitly select the retained experimental
-generator for a new project, pass `direct_edit=False` to
-`initialize_code_task`. Saved tasks keep their original implementation owner.
-
-## Implement a change
-
-Trace one real consumer from its input to the delivered result:
-
-1. Define the user behavior and which module owns it.
-2. Reuse an existing operation or add a typed tool contract at the appropriate boundary.
-3. Connect its actual consumers, including feedback and recovery where relevant.
-4. Retire the implementation and duplicate tests it replaces.
-5. Verify the behavior with a different input or starting condition.
-
-Keep professional decisions in their domain. Consumers should use public results
-and provenance rather than the producer's private directories or repair rounds.
-A refactor should replace a responsibility, not merely move functions or wrap an
-old implementation. Prefer existing dependencies and mature libraries; a new
-library should remove work the project otherwise has to maintain.
-
-Tool interfaces live in [specifications](../src/simple_ar/tools/specs.py),
-[registration](../src/simple_ar/tools/registry.py) and
-[the gateway](../src/simple_ar/tools/gateway.py). For a trusted local skill or tool,
-follow [configuration reference](CONFIG_REFERENCE.md#trusted-local-packages) and the [runnable example](../examples/local_extension/extension.toml).
-That interface currently supports instructions and read-only/plan operations;
-permission declarations do not provide OS isolation.
-
-## Preserve task and result contracts
-
-| Boundary | What a change must preserve |
-| --- | --- |
-| Materials | Read-only originals, their identity and observed byte ranges; generated explanation is not original evidence. |
-| Execution | Approved scope, actual input versions, commands, exit status and logs. A workspace is not an OS sandbox. |
-| Results | Distinguish candidates, recorded production and accepted delivery. Keep source, tables, figures and requested exports consistent. |
-| Continuation | Retain useful prior work and its provenance. A recorded output hash does not certify its current bytes. |
-| Accounting | Share the existing ledger across all subcalls; retain failures and unknown charges. Never infer zero usage from a connection error. |
-| Recovery | Reconcile completed work through its owner. Do not blindly replay uncertain side effects or silently upgrade a saved contract. |
-
-Missing files or failed checks must remain visible without erasing other usable
-results. A successful process, valid citation marker or compiled PDF alone does
-not establish scientific correctness. Plain Markdown delivery needs no PDF unless
-the user requests publication.
-
-Exact settings belong in [Configuration](CONFIG_REFERENCE.md); commands for
-supplying inputs, approving work and resuming are in
-[Native recovery](CLI_REFERENCE.md#native-recovery). Do not edit a saved manifest
-or ledger to bypass those operations.
-
-## Verify a change
-
-Start with the affected behavior and its direct consumers. Use broader checks for
-shared-boundary changes or a release candidate, rather than after every small edit.
+### Run automated checks
 
 ```bash
-uv run simple-ar-checks --list
-uv run simple-ar-checks intake
-uv run --extra examples simple-ar-checks all
+# Fast sanity, core contract, and release regression (offline, no API key)
+uv run simple-ar-checks quick core release
+
+# Desktop local UI server & API tests
+uv run python -m unittest tests.test_local_ui
+
+# Context selection and independent review suites
+uv run python -m unittest tests.test_working_context tests.test_delivery_review tests.test_candidate_review_request
+
+# Real XeLaTeX / PDF publication export integration (requires Pandoc & TeX Live)
+SAR_TEST_EXPORT_INTEGRATION=1 uv run python -m unittest tests.test_analysis_writing tests.test_candidate_review_request
 ```
 
-| Area | Check groups |
-| --- | --- |
-| CLI and configuration | `quick`, `intake` |
-| Application, sessions and recovery | `core`, `application` |
-| Retrieval and code | `research`, `code-task` |
-| Analysis and writing | `data`, `report` |
-| Provider transport and real execution | `llm`, `execution` |
+### Rebuild desktop frontend assets
 
-Groups are selected smoke checks, not proof of complete domain coverage. Run a
-specific module when that gives a faster, meaningful answer:
+After editing `desktop-ui/`, rebuild and commit the updated bundle under `src/simple_ar/desktop_assets/`:
 
 ```bash
-uv run python -m unittest tests.test_working_context
-uv run --extra examples python -m unittest discover -s tests -t .
+cd desktop-ui
+npm install
+npm run build
 ```
 
-Use `-t .` for full discovery so shared fixtures resolve through the `tests` package.
-Prefer behavior tests over tests of every private helper. Consolidate duplicated
-scenarios without combining unrelated behaviors into a giant test method.
+---
 
-Real-task acceptance is separate: inspect delivered content, calculations, figures,
-feedback changes and reproducibility. Record model costs and human intervention;
-offline mocks and successful exits cannot replace those checks.
+## 5. Documentation & Submission Hygiene
 
-## Build and submit
-
-```bash
-git diff --check
-uv build
-```
-
-[Packaging rules](../pyproject.toml) include application source and report templates
-in the wheel. Installed commands must not depend on repository-only scripts or
-private planning files. Check the installed package when changing that boundary.
-
-Before submitting, confirm that callers and configuration agree, replaced code and
-tests have retired, and documented behavior matches the implementation. Keep keys,
-runtime outputs and caches out of the change. State any verification limits.
-Licensing has not yet been selected; discuss code contributions first.
-
-The [CI configuration](../.github/workflows/ci.yml) describes automated checks.
-Changing documentation does not require enabling repository workflows.
-
-## Maintain documentation
-
-Choose the page by the reader's question:
-
-| Reader needs | Page |
-| --- | --- |
-| Finish a first task | [Get started](USAGE.md) |
-| Follow a task recipe | [Task guides](WORKFLOWS.md) |
-| Look up a command or setting | [CLI](CLI_REFERENCE.md), [Configuration](CONFIG_REFERENCE.md) |
-| Add a trusted local package | [Configuration reference](CONFIG_REFERENCE.md#trusted-local-packages) |
-| Understand implementation and contribution | This guide |
-| Check demonstrated scope and limitations | [Showcase](showcase/README.md) |
-| See user-visible changes | [Changelog](../CHANGELOG.md) |
-
-Rewrite the relevant section when behavior changes. Keep one authoritative
-explanation and link to it; do not append patch histories or copy protocol details
-across pages. Examples should lead to a useful result, and reference entries should
-make values and constraints easy to find.
-
-Keep Chinese and English structure and facts aligned, and check links after changing
-headings. Follow the [dated changelog](../CHANGELOG.md) for dated entries.
-Public instructions must stand on their own without private `MDfiles/` records.
+- Record user-visible additions, improvements, and fixes in [CHANGELOG.md](../CHANGELOG.md) and [CHANGELOG_zh.md](../CHANGELOG_zh.md) using reverse-chronological date headings.
+- Before pushing, verify no `.env`, credentials, temporary run directories (`runs/`, `.tmp_tests/`), or unintended large binaries are tracked.

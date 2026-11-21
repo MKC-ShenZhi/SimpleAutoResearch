@@ -150,6 +150,8 @@ uv run simple-ar results "SESSION"
 
 反馈可继续调用模型或提出命令，沿用同一预算、材料、连接及批准规则。
 在同一任务补充证据时，在反馈命令中加入 `--source PATH`。
+若希望在新数据集或新项目上复用前序已交付的代码库与 `SKILL.md` 方法，可用 `--from-session "SESSION" --reuse artifacts` 创建新任务（不继承旧账本与权限）。
+若任务因触及额度上限暂停，可在确认后通过 `--authorize-remaining` 显式追加剩余额度续跑（示例见[任务配方](WORKFLOWS_zh.md)）。
 
 不提交新反馈，只恢复保存边界：
 
@@ -250,40 +252,21 @@ uv run simple-ar research-session --config examples/data-curves/research.toml
 原生 `--prepare-only` 仍检查连接与凭据，但不调用模型或进程；
 结构化准备可在无凭据时保存 TOML。
 
-## 本地工作区预览
+## 桌面研究工作台
 
-实验性浏览器界面仅绑定本机回环地址：
+如果不习惯命令行，可以直接启动本地桌面研究工作台（基于 `pywebview` 原生窗口与 React/Tailwind/KaTeX 界面）：
 
 ```bash
-uv run python -m simple_ar.ui --project-root /absolute/materials --task-root /absolute/native-tasks
+uv sync --locked --extra desktop
+uv run simple-ar-desktop --project-root /absolute/materials --task-root /absolute/native-tasks
 ```
 
-从包含私有 `.env` 的目录启动，沿用全局模型目录。打开本进程打印的完整链接；
-链接片段是本次本地会话的访问凭据，请勿分享或公开端口。
-远程服务器使用 SSH 转发相同端口，不修改绑定地址。
+- **模型配置**：点击左侧「模型与连接设置」即可可视化配置 Base URL、模型 ID 与 API 密钥，保存至与 CLI 共享的 `models.toml`（Windows 下支持系统凭据管理器，环境变量优先）。
+- **任务与权限**：在输入框挂载本地文件或目录，按需勾选「允许执行」「联网检索」「独立复核」，确认摘要后启动；运行中可审批命令、查看事件流、或在触达预算上限时直接追加剩余额度续跑。
+- **成果预览**：右侧「成果」抽屉内置 Markdown、LaTeX 公式、PNG 图表及分页 PDF 预览，并保留所有历史交付版本。
+- **纯浏览器回退**：在无桌面环境的远程 Linux 服务器上，可启动仅绑定本机回环的浏览器客户端 `uv run python -m simple_ar.ui --project-root /absolute/materials --task-root /absolute/native-tasks`，通过 SSH 端口转发访问打印的带访问令牌链接（切勿公网暴露端口）。
 
-### 在本地创建与继续
-
-页面列出任务根目录及其直接子目录中的原生任务。材料路径属于执行主机，
-必须在项目根目录或显式重复指定的 `--read-root PATH` 内。
-创建只保存已确认的连接、材料、权限和额度，点“继续执行”才开始工作。
-创建、批准命令或更换连接前，先核对接收方、操作与额度；
-提交失败后先检查任务，再决定是否重试。反馈和批准沿原任务及账本继续。
-反馈也可明确要求本次及后续正式交付独立复核；不勾选时保留已有要求。
-
-### 查看与停止工作
-
-检查最近活动、保存成果和未完成项。计划和待批准提案不是执行证据；
-界面空闲也不能证明外部工作进程已停止。“边界停止”等当前行动返回，
-不会取消在途请求或进程。请保持启动进程，直到它正常退出。
-
-### 预览限制与信任边界
-
-这是单用户客户端，不是沙箱或多用户服务。支持文本及位图预览，
-SVG/HTML 按文本显示，PDF 等支持的二进制文件下载后查看。
-来源摘录只展示声明的来源信息，不独立验证主张。
-文件预览/下载限 16 MiB，目录列表限 256 项。
-可信 Pandoc 模板的使用见[出版导出](WORKFLOWS_zh.md#使用提供的模板)。
+> 桌面与浏览器客户端均为单用户本地界面，复用相同的会话与权限边界（非沙箱或多用户服务）；项目外材料需通过 `--read-root PATH` 显式授权，预览/下载限 16 MiB。更多导出与任务配方见[任务配方](WORKFLOWS_zh.md)。
 
 ## 排错
 
@@ -299,4 +282,4 @@ SVG/HTML 按文本显示，PDF 等支持的二进制文件下载后查看。
 
 传输超时不是整项任务截止时间，重试可能延长总耗时。
 排错时保留会话和用量记录。
-固定代码任务与验证见[代码配方](WORKFLOWS_zh.md#代码工作)。
+常见科研与代码任务示例见[任务配方](WORKFLOWS_zh.md)。

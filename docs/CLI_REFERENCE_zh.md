@@ -2,7 +2,7 @@
 
 [English](CLI_REFERENCE.md) · [使用指南](USAGE_zh.md) · [配置参考](CONFIG_REFERENCE_zh.md)
 
-本页用于查语法、参数及恢复限制。从源码目录运行可在示例前加 `uv run`。SESSION、RUN_DIR 为保存目录的完整路径；大写占位符请替换。含空格路径需加引号。所有命令接受 `-h / --help`。research／start 的 `--command ARGV...` 放最后；后续 token 均属于子命令 argv，不作 shell 解释。
+本页用于查语法、参数及恢复限制。日常 90% 场景只需下方的「日常命令」或「本地桌面研究工作台」；其余子命令为独立工具与高级／兼容接口。从源码目录运行可在示例前加 `uv run`。SESSION、RUN_DIR 为保存目录的完整路径；大写占位符请替换。含空格路径需加引号。所有命令接受 `-h / --help`。research／start 的 `--command ARGV...` 放最后；后续 token 均属于子命令 argv，不作 shell 解释。
 
 ## 日常命令
 
@@ -16,10 +16,11 @@
 ## 本地桌面研究工作台
 
 ```powershell
-simple-ar-desktop --task-root "SESSION_PARENT" --project-root "PROJECT"
+uv sync --locked --extra desktop
+uv run simple-ar-desktop --task-root "SESSION_PARENT" --project-root "PROJECT"
 ```
 
-使用带 Tk 支持的 Python 打开原生窗口。建议选择包含会话的父目录。左侧切换会话，中间提交新的研究目标或向原会话发送反馈。可以从任务栏查看待审批操作、暂停或继续本地任务。右侧「成果」按需打开，支持查看交付版本、文本和 PNG。工作台复用现有会话与权限接口。项目之外的材料须通过 `--read-root` 指定访问范围。源码运行用 `python -m simple_ar.desktop`。
+使用 `pywebview` 原生窗口（内嵌 React/Tailwind/KaTeX 前端）打开桌面工作台，支持深色／浅色主题切换。建议选择包含会话的父目录。左侧切换会话，中间提交新的研究目标或向原会话发送反馈；可从任务栏审批待执行命令、暂停或继续本地任务，或在触达额度上限时直接追加剩余额度续跑。右侧「成果」抽屉按需打开，支持查看历史交付版本、Markdown／LaTeX 公式、PNG 图表与分页 PDF 预览。工作台复用现有会话与权限接口；项目之外的材料须通过 `--read-root` 指定访问范围。源码运行用 `uv run python -m simple_ar.desktop`。
 
 左侧「设置 · 模型连接」可以新增连接，编辑 Base URL、模型 ID 和凭据，并设定默认文本连接。保存使用 CLI 同一份 `models.toml`。Windows 下可用系统凭据管理器保存 Key，环境变量优先。留空可沿用原有凭据，改变 URL 后需要为新地址提供凭据。输入框右下角可选用已配置的 Chat 连接，已有会话换模要在操作边界显式确认。高级路由及其他连接类型仍可通过 [模型目录配置](CONFIG_REFERENCE_zh.md#model-file) 管理。
 

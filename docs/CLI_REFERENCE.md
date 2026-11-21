@@ -2,7 +2,7 @@
 
 [中文版本](CLI_REFERENCE_zh.md) · [Usage](USAGE.md) · [Configuration](CONFIG_REFERENCE.md)
 
-Look up syntax, parameters and recovery limits here. Prefix examples with `uv run` from a checkout. SESSION and RUN_DIR mean full saved directory paths; replace uppercase placeholders. Quote paths containing spaces. All commands accept `-h / --help`. Put research/start `--command ARGV...` last; subsequent tokens belong to the child argv without shell interpretation.
+Look up syntax, parameters and recovery limits here. For 90% of daily work you only need the Everyday commands or the Local desktop research workbench below; the remaining subcommands are standalone tools and advanced/compatibility interfaces. Prefix examples with `uv run` from a checkout. SESSION and RUN_DIR mean full saved directory paths; replace uppercase placeholders. Quote paths containing spaces. All commands accept `-h / --help`. Put research/start `--command ARGV...` last; subsequent tokens belong to the child argv without shell interpretation.
 
 ## Everyday commands
 
@@ -16,10 +16,11 @@ Look up syntax, parameters and recovery limits here. Prefix examples with `uv ru
 ## Local desktop research workspace
 
 ```text
-simple-ar-desktop --task-root "SESSION_PARENT" --project-root "PROJECT"
+uv sync --locked --extra desktop
+uv run simple-ar-desktop --task-root "SESSION_PARENT" --project-root "PROJECT"
 ```
 
-Open a native window with a Python installation that includes Tk. Select a directory containing saved sessions. Use the composer to start research or send feedback to an existing session. Review pending approvals and pause or resume local work from the task toolbar. Open the delivery pane for versions, text and PNG previews. The workspace uses the existing task and authorization interfaces. Add `--read-root` to grant access to material outside the project. To launch from source, use `python -m simple_ar.desktop`.
+Opens a native `pywebview` window with an embedded React/Tailwind/KaTeX UI and dark/light theme support. Select a directory containing saved sessions. Use the composer to start research or send feedback to an existing session, review pending command approvals, pause or resume local work, or grant additional budget inline when a task hits its ceiling. Open the right-hand **Deliverables** drawer for saved versions, Markdown/LaTeX math, PNG figures, and paginated PDF previews. The workbench reuses the existing task and authorization interfaces; add `--read-root` to grant access to materials outside the project. To launch from source, use `uv run python -m simple_ar.desktop`.
 
 Use Model Connections settings to edit a connection, its base URL, model ID, and credential, or select the default text connection. The desktop and CLI use the same `models.toml`. Windows Credential Manager can store keys by endpoint and credential reference, with existing environment variables taking precedence. The composer selects a configured Chat connection. Switching an existing session requires an explicit confirmation at a safe action boundary.
 

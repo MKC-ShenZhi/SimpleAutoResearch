@@ -157,6 +157,8 @@ uv run simple-ar results "SESSION"
 Feedback can call the model or propose commands under the same budget,
 materials, connection and approval rules. To add evidence in the same task,
 include `--source PATH` with your feedback.
+To transfer delivered code and `SKILL.md` methodology to a brand-new dataset or project without inheriting old ledger limits or permissions, start a successor with `--from-session "SESSION" --reuse artifacts`.
+When a task pauses at a budget ceiling, grant extra allowance explicitly via `--authorize-remaining` (see [Task recipes](WORKFLOWS.md)).
 
 To continue a saved boundary without new feedback:
 
@@ -265,47 +267,21 @@ This plots supplied demonstration coordinates, not an experiment.
 Native `--prepare-only` still checks the connection and credentials but makes
 no model/process call; structured preparation can save TOML without credentials.
 
-## Local workspace preview
+## Desktop Research Workbench
 
-An experimental browser client binds to the local loopback address:
+If you prefer a GUI over the terminal, launch the local Desktop Research Workbench (a native `pywebview` window powered by a React/Tailwind/KaTeX UI):
 
 ```bash
-uv run python -m simple_ar.ui --project-root /absolute/materials --task-root /absolute/native-tasks
+uv sync --locked --extra desktop
+uv run simple-ar-desktop --project-root /absolute/materials --task-root /absolute/native-tasks
 ```
 
-Run from the directory containing your private `.env`; use the existing global
-model catalog. Open the full URL printed by this process. Keep that URL private:
-its fragment grants access to this local session. Do not expose the port publicly.
-For remote hosts, forward the same port through SSH rather than changing its bind address.
+- **Visual model setup**: Open **Model & Connection Settings** in the left sidebar to configure Base URL, model ID, and API keys; settings are saved to the same `models.toml` used by the CLI (Windows Credential Manager supported; environment variables take precedence).
+- **Task & permission controls**: Attach local files or directories, toggle Execution / Network / Independent Review, confirm the summary, review command approvals, and grant additional budget inline when a task pauses at its ceiling.
+- **Built-in previews**: Open the right-hand **Deliverables** drawer for Markdown, LaTeX math, PNG figures, and paginated PDF previews across all saved versions.
+- **Browser fallback**: On headless remote Linux hosts, run the loopback-only web client with `uv run python -m simple_ar.ui --project-root /absolute/materials --task-root /absolute/native-tasks` and access the printed tokenised URL via SSH port forwarding (never expose the port publicly).
 
-### Create and continue locally
-
-The page lists native tasks in the task root and its direct children. Material
-paths refer to the execution host and must fall within the project root or an
-explicit repeatable `--read-root PATH`. Creating a task saves the confirmed
-connection, sources, permissions and caps; **Continue** starts execution.
-Review the destination, operation and caps before confirming creation, command
-approval or a connection change. After a failed submission, inspect the task
-before trying again. Feedback and approvals continue the same task and ledger.
-Feedback can also explicitly require independent review for this and later
-complete deliveries; leaving the option unchecked keeps the existing policy.
-
-### Inspect and stop work
-
-Inspect recent activity, saved results and unresolved work. Plans and pending
-proposals are not evidence of execution; an idle UI does not prove that an
-external worker has stopped. **Boundary stop** waits for the current action;
-it does not cancel an in-flight request or process. Keep the launcher alive
-until it exits.
-
-### Preview limits and trust
-
-This is a single-user client, not a sandbox or multi-user service. It previews
-text and raster images; SVG/HTML appear as text, and supported binary files
-such as PDFs must be downloaded. Source excerpts show declared provenance,
-not independently verified claims. File previews/downloads are limited to
-16 MiB and directory listings to 256 entries. For trusted Pandoc templates,
-see [publication export](WORKFLOWS.md#supplied-templates).
+> Both desktop and browser clients are single-user local interfaces that reuse the same task and authorization boundaries (not a sandbox or multi-user service). Materials outside the project root require explicit `--read-root PATH`, and previews/downloads are capped at 16 MiB. See [Task recipes](WORKFLOWS.md) for end-to-end examples.
 
 ## Troubleshooting
 
@@ -321,5 +297,4 @@ see [publication export](WORKFLOWS.md#supplied-templates).
 
 A transport timeout is not a whole-task deadline; retries may take longer.
 Keep session and usage records when diagnosing failure.
-CodeTask plan/proposal gates and bounded repairs are covered in
-[the code recipe](WORKFLOWS.md#code-work).
+For end-to-end research and code examples, see [Task recipes](WORKFLOWS.md).

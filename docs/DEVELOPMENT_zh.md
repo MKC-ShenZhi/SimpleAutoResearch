@@ -1,191 +1,98 @@
 # 开发指南
 
-这份指南帮助贡献者找到改动归属、接通消费者并验证结果。
-首次安装和使用请先读[开始使用](USAGE_zh.md)。
+这份指南帮助贡献者快速搭建环境、理解核心架构边界、定位代码归属并运行自动化测试。首次安装和使用请先读[开始使用](USAGE_zh.md)。
 
 [English](DEVELOPMENT.md) · [命令参考](CLI_REFERENCE_zh.md) · [配置参考](CONFIG_REFERENCE_zh.md) · [成果展示](showcase/README_zh.md)
 
-## 准备开发环境
+---
 
-需要 Python 3.12+、Git、uv 和 ripgrep。在仓库根目录运行：
+## 1. 准备开发环境
+
+需要 Python 3.12+、Git、[uv](https://docs.astral.sh/uv/) 和 ripgrep（`rg`）；如需修改桌面工作台前端，另需 Node.js 20+。
 
 ```bash
-uv sync --locked --extra examples
+uv sync --locked --extra examples --extra desktop
 uv run simple-ar --help
 uv run simple-ar-checks --list
 ```
 
-`examples` 包含执行示例所需依赖。离线检查不需要模型密钥，只有真实调用提供商时才需配置连接。
-共享科研环境如需保留额外依赖，使用 `uv sync --inexact --extra examples`；大型基准环境单独维护。
+- 离线测试不需要任何模型 API Key；只有在运行真实模型调用或外部集成测试时才需要配置 `models.toml` 与 `.env`。
+- 共享科研环境如需保留已有科学计算包，可使用 `uv sync --inexact --extra examples`。
 
-## 架构与代码归属
+---
 
-用户提供目标、材料和授权。应用层选择必要操作，观察结果，再继续工作或交付。
-调研、代码、分析和写作是可组合的能力，同一任务可以按需要调用它们。
+## 2. 核心架构与不变量
+
+SimpleAutoResearch 以**单一任务会话 + 共享资源账本**为核心，把文献检索、代码实现、数据分析、图形绘制、写作排版与独立复核组织在同一个原生行动循环中：
 
 ```mermaid
 flowchart LR
-    I[CLI / Python / MCP] --> A[共同行动循环]
-    A --> T[调研、代码、分析与写作工具]
+    I[CLI / Desktop UI / Python] --> A[ToolApplication 行动循环]
+    A --> T[工作区 · 检索 · 代码 · 分析 · 写作 · 出版]
     T --> A
-    A --> D[成果交付与用户反馈]
-    D --> A
-    A --> R[会话、权限、执行与记账]
+    A --> V[独立复核与交付验收]
+    V --> A
+    A --> R[会话存储 · 权限审批 · 共享账本 · 进程执行]
     T --> R
 ```
 
-应用层协调任务，领域模块承担专业操作；普通共同行动使用任务的执行记录和资源记账。
-新接入的 Python 研究代码从 `simple_ar.research` 导入 `ResearchBrief`、`create_research_task`、
-`load_research_task` 和 `start_research_task`。创建只登记任务。首次启动用
-`start_research_task`，续接已有任务用 `load_research_task(root).run()`。
-现有 `ResearchApplication` 调用方和已保存的分步研究会话沿原 API 继续。
-独立 CodeTask 无论由 Python 还是 CLI 创建，都使用自己的账本；内嵌任务设置 `standalone=False`，沿用所属任务账本。注入的模型客户端需支持现有任务账本绑定。
-环境、依赖接口和外部解释器探测使用任务进程账本；可选探测额度不足时如实显示未测量。
-独立 CodeTask 中显式启用的外部 Agent CLI 使用共同进程执行器和任务账本，模型用量记为未知；在支持可执行的用量限制前，不能在有限调用数或 token 额度下运行。
-已有工具不足时，可以在任务授权内生成解析器、分析脚本或绘图代码，再用真实运行结果继续工作。
-共同 POSIX 进程执行器在切换到批准的工作目录和程序前即进入进程组监督，保留原 argv 与环境。
+改动代码时请始终守住以下 5 条架构不变量：
 
-新普通任务在既有共同行动循环中调查、复制、编辑和提出批准执行的命令，无须先委派源码再交回角色才能提交候选。Delivery对实际主张和版本负责验收，并委托适用的独立调查；生产者不必先完成穷尽自查。文稿、出版等专业服务各守职责，加载工具不增加权限。已保存源码角色任务保留原范围、交接及恢复行为。
+1. **只读材料与显式授权**：用户提供的原始来源始终只读挂载；任何进程执行都需要显式审批（Linux 下可选 `--sandbox-execution` 启用 `bwrap` 隔离）；加载工具或读取外部文本（含 `SKILL.md`）绝不自动授予权限。
+2. **单一账本与诚实结算**：模型请求、Token、进程调用与外部检索共用同一个任务账本；断线或异常时保留未知预留而非静默清零，恢复必须通过显式 `--retry-model` 或 `--authorize-remaining`。
+3. **版本绑定与证据溯源**：所有文件读取、编辑、复制、出版导出与独立复核均绑定具体路径与 SHA-256 版本，不靠猜测覆盖用户改动，也不伪造未执行的检查。
+4. **独立复核与诚实交付**：独立复核代理基于原始证据独立判断，发现阻塞性缺陷返回 `needs_revision`；若预算或能力受限无法完成全部核查，保留实际可用产出并诚实落盘 `partial` + `unresolved`，绝不伪造 `completed`。
+5. **保留历史会话兼容**：新建任务使用当前原生契约（`ToolApplication` + `create_research_task` / `start_research_task`）；改动默认行为或上下文策略时，已保存历史会话沿其记录的合同恢复。
 
-新普通任务直接返回原生工具批次进入行动队列，退出外层工作选择回答及第二次行动编译。工作历史按完整单元供给原回复、动作和实际回执；独立检查保留自己的操作与意见，共用同一账本。工作区动作可明确提交自身成果，其他服务不能暗中引入完成效果；已通过复核的原声明可直接选择交付，无需重写清单。问题与显式调用者操作保留各自合同。共同材料视图优先近期完整工作与必要原文窗口，仅合并同文件版本中核实重叠的字节；归档观察仍可主动读取。重载或补充无关材料不改写已保存任务的选择、历史及检查策略。
+---
 
-新普通任务可以在出版前提交未完成候选，独立请求只描述当前主张、现有文件和已知缺口；最终报告状态及格式由正式交付声明。独立检查绑定实际主张和文件，不取得完整交付资格。最终验收核对必需输出、同版出版和适用意见；新建普通模型任务默认要求独立复核，复核方按原请求和证据决定需要核查的范围。调用者可明确将复核设为可选。历史任务沿原复核合同继续。Delivery将当前缺项投影到共同工作视图；早期候选调查在同一账本上保护后续修订、提交、最终独立检查和诚实退出的模型余量。最低资源只是下界，不保证质量或完成，也不据此推算进程余量；剩余工作不可行时，保留实际有用成果并诚实部分交付。
+## 3. 代码归属速查
 
-显式选中的历史交付可携带仅覆盖所选字节的原始观察及相关可修订认识，由创建负责人随输入快照冻结，交给共同选择器与当前工作一起供给；旧指令、权限、费用和完成状态不继承。外部构建的PDF也可由出版负责人沿已接受进程的版本来源核验，必须明确绑定当前稿与引用资产的输入输出；不发现隐藏的操作系统依赖，也不认证内容正确。可编辑TeX仍按完整导出工程合同交付。
+| 改动方向 | 主要模块 |
+|---|---|
+| CLI 入口与参数解析 | [cli/main.py](../src/simple_ar/cli/main.py)、[cli/code_task_commands.py](../src/simple_ar/cli/code_task_commands.py)、[app/research_intake.py](../src/simple_ar/app/research_intake.py) |
+| 桌面工作台前后端 | [desktop.py](../src/simple_ar/desktop.py)、[ui.py](../src/simple_ar/ui.py)、[desktop-ui/](../desktop-ui/) |
+| 主行动循环、契约与交付 | [app/tool_application.py](../src/simple_ar/app/tool_application.py)、[app/tool_contracts.py](../src/simple_ar/app/tool_contracts.py)、[app/tool_messages.py](../src/simple_ar/app/tool_messages.py)、[app/tool_delivery.py](../src/simple_ar/app/tool_delivery.py)、[app/services.py](../src/simple_ar/app/services.py) |
+| 上下文选择与工作记忆 | [core/working_context.py](../src/simple_ar/core/working_context.py)、[app/work_memory.py](../src/simple_ar/app/work_memory.py) |
+| 工作区文件、复制与进程执行 | [tools/workspace.py](../src/simple_ar/tools/workspace.py)、[tools/workspace_models.py](../src/simple_ar/tools/workspace_models.py)、[tools/workspace_delivery.py](../src/simple_ar/tools/workspace_delivery.py)、[core/process.py](../src/simple_ar/core/process.py) |
+| 独立复核与证据审计 | [tools/inspection.py](../src/simple_ar/tools/inspection.py)、[tools/inspection_contracts.py](../src/simple_ar/tools/inspection_contracts.py)、[tools/inspection_evidence.py](../src/simple_ar/tools/inspection_evidence.py)、[tools/inspection_messages.py](../src/simple_ar/tools/inspection_messages.py)、[tools/delivery_review.py](../src/simple_ar/tools/delivery_review.py) |
+| 文献检索、代码与数据分析 | [research/](../src/simple_ar/research/)、[code_task/](../src/simple_ar/code_task/)、[result_analysis/](../src/simple_ar/result_analysis/) |
+| 写作、修订与 LaTeX/PDF 出版 | [report/export.py](../src/simple_ar/report/export.py)、[report/delivery.py](../src/simple_ar/report/delivery.py)、[tools/writing.py](../src/simple_ar/tools/writing.py)、[tools/publication.py](../src/simple_ar/tools/publication.py) |
+| 模型连接、凭据与共享账本 | [integrations/llm.py](../src/simple_ar/integrations/llm.py)、[integrations/model_settings.py](../src/simple_ar/integrations/model_settings.py)、[core/budget.py](../src/simple_ar/core/budget.py) |
 
-新普通任务的工作视图优先提供当前请求、相关反馈、选中引用和已读取的原文；旧工作仍可检索，不为了填满上下文而反复回送。同版正文的重叠部分共享展示，已保存任务的选择与检查合同保持原样。文稿交接保留原始反馈，接收方使用与发送方一致的模型 JSON 请求计数来判断输入容量。
+---
 
-新普通任务的run_process输入／输出声明不带挂载前缀时，相对命令cwd解释；显式挂载路径和绝对路径仍遵守原访问规则。与挂载别名同名的局部路径用./区分。工作区负责人为审批、执行和来源追溯记录同一规范版本，原始请求不改写；未保存该策略的历史任务仍按原工作区相对路径解释。
+## 4. 验证与构建
 
-新文稿工作由共同模型容量选择器供给原始观察，完整日志继续保留。文本测量和可编辑候选是工作成果，不是独立证据或验收。可修正的附件选取错误保留正文与观察，权限或输入变化则停止尝试。改稿按绑定的相对路径承接本地引用，包括数据与源码；CommonMark引用必须在写出前对应实际输出。已接收复制进入共用来源图，不从相同字节猜测历史来源。
-
-模型回答丢失后，已知文件和回执仍可恢复，未知费用与物理结果沿普通恢复边界保留。回复缺少原生续行所需的reasoning时，新会话将已闭合动作与结果作为历史观察，保留原回复，不补造思考或重放工具。模型计划与检查方案是可修订的工作选择，不是用户要求；部分交付说明未完成内容，独立检查API和历史合同继续保留。
-
-独立检查同时负责实际观察与专业判断。文件窗口和原始操作结果共用有容量边界的工作视图；
-精简笔记不替代已有计算，也不证明旧结果仍适用于改动后的成果。
-意见不合法不抹去已做调查。后续检查可读取原始独立记录，并按当前权限和输入版本复用观察；
-保留的执行仍是历史事实，新检查对当前请求重判，不直接采用早先结论。
-
-| 需要修改 | 从这里开始 |
-| --- | --- |
-| 命令输入与配置 | [CLI](../src/simple_ar/cli/)、[任务输入适配](../src/simple_ar/app/research_intake.py) |
-| 普通行动与历史工作选择 | [OperationTools](../src/simple_ar/app/operation_tools.py)、[WorkSelection](../src/simple_ar/app/work_selection.py) |
-| 工作认识与原始观察 | [work_memory](../src/simple_ar/app/work_memory.py)、[working_context](../src/simple_ar/core/working_context.py) |
-| 反馈与任务生命周期 | [ToolApplication](../src/simple_ar/app/tool_application.py)、[OperationTools](../src/simple_ar/app/operation_tools.py) |
-| 文件、编辑与批准的命令 | [Workspace](../src/simple_ar/tools/workspace.py)、[进程生命周期](../src/simple_ar/core/process.py) |
-| 检索、阅读与来源依据 | [research](../src/simple_ar/research/) |
-| 创建、修复与验证代码 | [code_task](../src/simple_ar/code_task/) |
-| 数值分析与数据图 | [result_analysis](../src/simple_ar/result_analysis/) |
-| 写作、引用与出版 | [report](../src/simple_ar/report/)、[出版工具](../src/simple_ar/tools/publication.py) |
-| 模型连接与共享记账 | [integrations](../src/simple_ar/integrations/)、[预算](../src/simple_ar/core/budget.py) |
-
-新建 Python 研究任务使用[研究接入](../src/simple_ar/app/research_intake.py)中的
-`create_research_task` 和 `start_research_task`，由
-[ToolApplication](../src/simple_ar/app/tool_application.py) 与轻量
-[services](../src/simple_ar/app/services.py) 统一承接；已保存会话沿记录的执行合同恢复。
-
-新建独立 Python 代码任务对已有和新建项目均使用共同编辑器。空项目可创建自己的测试；复制项目的验证材料仍受保护。确需保留的实验性生成器时，可在 `initialize_code_task` 中显式传入 `direct_edit=False`；已保存任务继续使用原实现。
-
-## 实施一项改动
-
-沿一个真实消费者，从输入追到交付结果：
-
-1. 明确用户行为和负责的模块。
-2. 复用已有操作，或在适当边界定义有类型的工具契约。
-3. 接通实际消费者，包括相关的反馈和恢复路径。
-4. 删除被替代的实现及重复测试。
-5. 用另一种输入或起点核对行为。
-
-专业判断留在所属领域；消费者使用公开结果和来源信息，不依赖生产者的私有目录或修复轮次。
-重构应替换一项职责，不能只搬函数或在旧实现外再包一层。优先已有依赖和成熟库，
-新依赖应当减少项目需要自行维护的工作。
-
-工具接口从[声明](../src/simple_ar/tools/specs.py)、[注册器](../src/simple_ar/tools/registry.py)
-和[调用入口](../src/simple_ar/tools/gateway.py)阅读。
-可信本地 Skill 或工具按[配置参考](CONFIG_REFERENCE_zh.md#可信本地扩展)及[可运行示例](../examples/local_extension/extension.toml)接入；当前接口支持指令与只读／plan 操作，
-权限声明本身不提供操作系统隔离。
-
-## 守住任务与成果约束
-
-| 边界 | 改动必须保留的行为 |
-| --- | --- |
-| 材料 | 原件只读，保留身份与实际读取范围；生成解释不冒充原文。 |
-| 执行 | 核对授权范围、输入版本、命令、退出状态和日志；工作区不是操作系统沙箱。 |
-| 成果 | 区分候选、生成记录与已接受交付，源码、表格、图和请求的导出物应保持一致。 |
-| 续用 | 保留有效工作及来源；记录中的输出哈希不代表当前文件已经核查。 |
-| 记账 | 所有子调用共用既有账本，失败和未知费用保留；连接报错不代表用量为零。 |
-| 恢复 | 由原负责人核对保留结果，不盲目重放可能已有副作用的操作，不静默升级旧合同。 |
-
-个别文件缺失或检查失败应明确呈现，不能清空其余可用成果。
-进程成功、引用标记有效或 PDF 编译通过，单独都不能证明科学结论正确。
-普通 Markdown 交付无需生成 PDF，出版按用户要求进行。
-
-参数的确切含义见[配置参考](CONFIG_REFERENCE_zh.md)；补充材料、审批和续接命令见
-[原生任务恢复](CLI_REFERENCE_zh.md#原生任务恢复)。不要编辑已保存的 manifest 或账本绕过这些操作。
-
-## 验证改动
-
-先验证受影响行为和直接消费者；共享边界大改或发布候选再扩大检查，避免每次小改都跑全量。
+### 运行自动化测试
 
 ```bash
-uv run simple-ar-checks --list
-uv run simple-ar-checks intake
-uv run --extra examples simple-ar-checks all
+# 日常快速与核心发布回归（离线，无需 API Key）
+uv run simple-ar-checks quick core release
+
+# 桌面端本地服务与前端契约测试
+uv run python -m unittest tests.test_local_ui
+
+# 上下文与独立复核专项
+uv run python -m unittest tests.test_working_context tests.test_delivery_review tests.test_candidate_review_request
+
+# 真实 XeLaTeX / PDF 出版导出集成测试（需本机安装 Pandoc 与 TeX Live）
+SAR_TEST_EXPORT_INTEGRATION=1 uv run python -m unittest tests.test_analysis_writing tests.test_candidate_review_request
 ```
 
-| 改动范围 | 检查组 |
-| --- | --- |
-| CLI 与配置 | `quick`、`intake` |
-| 应用、会话与恢复 | `core`、`application` |
-| 检索与代码 | `research`、`code-task` |
-| 分析与写作 | `data`、`report` |
-| 模型传输与真实执行 | `llm`、`execution` |
+### 重新构建桌面端前端资产
 
-分组是选定的烟测集合，不代表该领域全部覆盖。需要更快定位时，可以直接选择测试模块：
+修改 `desktop-ui/` 后需重新构建并一并提交 `src/simple_ar/desktop_assets/`：
 
 ```bash
-uv run python -m unittest tests.test_working_context
-uv run --extra examples python -m unittest discover -s tests -t .
+cd desktop-ui
+npm install
+npm run build
 ```
 
-完整发现使用 `-t .`，让共享夹具从 `tests` 包导入。
-测试应保护用户行为，合并重复场景；不要求每个私有函数都有独立测试，也不要把无关行为塞进巨型方法。
+---
 
-真实任务验收另看正文、计算、图形、反馈修改和可复跑性，并记录模型成本与人工参与。
-离线 mock 和退出码不能代替这些检查。
+## 5. 文档与提交规范
 
-## 构建与提交
-
-```bash
-git diff --check
-uv build
-```
-
-[打包规则](../pyproject.toml)将应用源码与报告模板纳入 wheel。
-安装后的命令不能依赖仓库专用脚本或私有规划文件；修改打包边界时，要检查实际安装态。
-
-提交前确认入口、配置和消费者一致，被替代代码与测试已退出，文档与实现相符。
-不要混入密钥、运行成果或缓存；说明尚未验证的范围。许可证尚未确定，代码贡献请先沟通。
-
-[CI 配置](../.github/workflows/ci.yml)说明自动检查内容，修改文档不要求启用仓库工作流。
-
-## 维护文档
-
-先判断读者要解决什么问题：
-
-| 读者需要 | 文档 |
-| --- | --- |
-| 完成第一个任务 | [开始使用](USAGE_zh.md) |
-| 按具体目标操作 | [任务指南](WORKFLOWS_zh.md) |
-| 查命令或参数 | [命令参考](CLI_REFERENCE_zh.md)、[配置参考](CONFIG_REFERENCE_zh.md) |
-| 接入可信本地包 | [配置参考](CONFIG_REFERENCE_zh.md#可信本地扩展) |
-| 理解实现与参与开发 | 本文 |
-| 核对展示范围和限制 | [成果展示](showcase/README_zh.md) |
-| 了解用户可感知的变化 | [Changelog](../CHANGELOG_zh.md) |
-
-行为变化时重写对应章节；一项规则保留一个权威位置，其他页面给链接。
-不要追加补丁历史或跨页复制协议细节。教程先带人完成任务，参考页让字段值与约束容易查到。
-
-中英文结构与事实同步，改标题后检查链接。Changelog 按 `YYYY-MM-DD` 倒序，
-同日合并，以新增、优化、修复记录用户可感知的变化；不写提交流水账或工程测试统计。
-公开使用说明应能独立阅读，不依赖私有 `MDfiles/`。
+- 用户可见的新增、优化或修复请同步记录到 [CHANGELOG_zh.md](../CHANGELOG_zh.md) 与 [CHANGELOG.md](../CHANGELOG.md)（按纯日期标题倒序记录）。
+- 提交前确认工作树不包含 `.env`、个人凭据、临时运行目录（`runs/`、`.tmp_tests/`）或未授权的大文件。
