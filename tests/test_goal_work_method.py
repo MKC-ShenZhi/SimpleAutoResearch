@@ -131,6 +131,28 @@ class NativeGoalWorkTests(unittest.TestCase):
         self.assertEqual(text_final, final)
         self.assertEqual(text_bindings, bindings)
 
+        # A pure tool-call wrapper around `arguments` (tool-call or closing text)
+        # is unwrapped and audited, then validated against the exact same schema.
+        wrapped = {'name': 'record_inspection', 'arguments': original}
+        wrapped_call = {**call, 'function': {**call['function'], 'arguments': json.dumps(wrapped)}}
+        _, w_error, w_final, w_bindings = owner._admit_response(saved, [wrapped_call], offered, model,
+            set(), shared=True)
+        self.assertEqual(w_error, '')
+        self.assertEqual(w_final, final)
+        self.assertEqual(w_bindings[0], {'unwrapped_terminal_opinion_wrapper': ['arguments', 'name']})
+        _, wt_error, wt_final, wt_bindings = owner._admit_response(saved, [], offered, model,
+            set(), shared=True, content=json.dumps({'arguments': original}), closing=True)
+        self.assertEqual(wt_error, '')
+        self.assertEqual(wt_final, final)
+        self.assertEqual(wt_bindings[0], {'unwrapped_terminal_opinion_wrapper': ['arguments']})
+        # Substantive unknown sibling keys alongside `arguments` must still be rejected.
+        bad_wrapped = {'arguments': original, 'extra': 123}
+        bad_call = {**call, 'function': {**call['function'], 'arguments': json.dumps(bad_wrapped)}}
+        _, bad_error, bad_final, _ = owner._admit_response(saved, [bad_call], offered, model,
+            set(), shared=True)
+        self.assertIn("Additional properties are not allowed", bad_error)
+        self.assertIsNone(bad_final)
+
         # A readable file elsewhere in the task is still unavailable when the
         # reviewer never received its body. Keep the other supported finding.
         current = {**saved, 'inspection_evidence_policy': 'presented.v6', 'evidence': [

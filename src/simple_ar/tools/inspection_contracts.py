@@ -389,8 +389,10 @@ _DELIVERY_SYSTEM = (
     'use an empty artifact list for a defect in the completion claim itself. A valid answer may '
     'be delivered in the summary without files; do not demand a dummy document. '
     'Required findings are concrete defects preventing the requested outcome; optional polish is '
-    'advisory. Use incomplete for necessary unfinished investigation, not for inherent research '
-    'uncertainty or optional improvements. Reading files or matching hashes proves neither '
+    'advisory. Use incomplete only for necessary investigation that remains feasible with offered '
+    'read tools, not for inherent research uncertainty, unavailable capabilities (such as absent '
+    'vision/image inspection), or optional improvements—disclose those in limitations. Reading files '
+    'or matching hashes proves neither '
     'correctness nor completion. Do not invent evidence, execute code, impose a report or PDF, '
     'or claim direct visual inspection from text. The owner binds versions and derives the verdict.')
 _BINARY = {'.pdf', '.docx', '.xlsx', '.pptx', '.png', '.jpg', '.jpeg', '.gif',

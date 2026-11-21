@@ -761,15 +761,27 @@ class InspectionToolGateway(_InspectionEvidenceMixin, _InspectionMessagesMixin):
                                      f'at {error.json_path}: {error.message}')
 
             def terminal_opinion(value: Any) -> Any:
-                # Empty, undeclared containers carry no opinion to adopt. Keep
-                # the provider response intact in its receipt and validate the
-                # substantive opinion against the same evidence contract.
+                # Unwrap a pure tool-call wrapper around `arguments` (e.g.,
+                # {"arguments": {...}} or {"name": "record_inspection", "arguments": {...}})
+                # and drop empty, undeclared containers that carry no opinion.
+                # Keep the provider response intact in its receipt and validate
+                # the substantive opinion against the same evidence contract.
                 schema = schemas.get('record_inspection', {})
                 if (not isinstance(value, dict) or schema.get('additionalProperties') is not False
                         or schema.get('patternProperties')):
                     return value
+                props = schema.get('properties', {})
+                if ('arguments' not in props and isinstance(value.get('arguments'), dict)
+                        and all(
+                            key == 'arguments'
+                            or (key in {'tool', 'name', 'function'} and value[key] == 'record_inspection')
+                            or (key == 'type' and value[key] == 'function')
+                            for key in value
+                        )):
+                    owner_bindings.append({'unwrapped_terminal_opinion_wrapper': sorted(value)})
+                    value = value['arguments']
                 fields = sorted(key for key, item in value.items()
-                    if key not in schema.get('properties', {})
+                    if key not in props
                     and isinstance(item, (list, dict)) and not item)
                 if not fields:
                     return value
