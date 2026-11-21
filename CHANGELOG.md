@@ -13,8 +13,9 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ### Improved
 
-- Decoupled the steady working-set target (`steady_working_target`) from the hardware context window under `economic.v3` and stopped re-injecting retired handoff `authored_text` unless pinned, while preserving all `working.v4` observation invariants and read-history contracts (keeping long-session per-turn prompt size bounded around ~40k–62k tokens).
-- Aligned independent review with `steady_working_target`, restored the per-inspection 6-round investigation bound, and stripped redundant Pydantic string `"title"` metadata from tool parameter schemas.
+- Decoupled the steady working-set target (`steady_working_target`) from the hardware context window under `economic.v3` (including bounded `operation_overview` admission), pruned unreachable `$defs` in `CommonToolSpec.service_parameters_schema()` and redundant Pydantic string `"title"` metadata, and preserved all `working.v4` observation invariants and `read_history` pagination contracts (keeping long-session per-turn input around ~38k–48k tokens on average).
+- Hardened independent review closure: cleanly unwraps and audits pure tool-call wrappers around `record_inspection` arguments (e.g., `{"arguments": {...}}`) and distinguishes unavailable session capabilities (disclosed in `limitations`) from feasible unfinished investigations (`incomplete`).
+- Enabled natural separator-first identifier wrapping (`natural_layout`) for supplied conference LaTeX templates (e.g., NeurIPS / EMNLP) to prevent awkward mid-word line breaks in inline code and tables.
 
 ## 2026-11-20
 

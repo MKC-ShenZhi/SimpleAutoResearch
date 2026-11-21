@@ -13,8 +13,9 @@
 
 ### 优化
 
-- 上下文工作集与硬件窗口解耦：在 `economic.v3` 模式下引入常规工作集目标（`steady_working_target`），压缩交接不再重注已退出的冗长草稿原文，同时完整保留 `working.v4` 读写原文不变量与历史索引契约，实测长会话单轮输入稳定收敛在 ~40k–62k tokens。
-- 独立复核收敛与工具 Schema 瘦身：对齐复核侧 `steady_working_target`、恢复单次复核的 6 轮调查上限，并移除 Pydantic 自动生成的冗余字符串 `"title"` 字段，降低复核阶段 token 消耗并保持原有复核严谨度。
+- 上下文工作集与硬件窗口解耦：在 `economic.v3` 模式下引入常规工作集目标（`steady_working_target`）并同步约束历史操作导航（`operation_overview`），裁剪子服务工具 schema 中的无用 `$defs` 与 Pydantic 冗余字符串 `"title"` 字段，同时完整保留 `working.v4` 读写原文不变量与 `read_history` 分页契约，实测长会话单轮输入均耗收敛至 ~38k–48k tokens。
+- 独立复核鲁棒性增强：支持自动解包并审计模型偶发输出的纯工具包装层（如 `{"arguments": {...}}`），明确区分“可继续调查（`incomplete`）”与“会话未授权能力边界（写入 `limitations`）”，显著减少无解空转。
+- 外部会议 LaTeX 模板（如 NeurIPS / EMNLP）默认启用自然分隔符换行（`_breakable_technical_text`），减少行内与表格中长代码标识符的硬断字现象。
 
 ## 2026-11-20
 
