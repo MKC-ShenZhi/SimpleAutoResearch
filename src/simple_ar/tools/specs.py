@@ -100,6 +100,40 @@ def _strip_schema_titles(value: Any) -> Any:
     return value
 
 
+def _prune_unused_defs(schema: dict[str, Any]) -> dict[str, Any]:
+    """Drop unreachable JSON Schema $defs entries after removing an optional field."""
+    defs = schema.get("$defs")
+    if not isinstance(defs, dict) or not defs:
+        return schema
+
+    def collect_refs(node: Any, out: set[str]) -> None:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                out.add(ref[len("#/$defs/"):])
+            for key, value in node.items():
+                if key != "$defs":
+                    collect_refs(value, out)
+        elif isinstance(node, list):
+            for item in node:
+                collect_refs(item, out)
+
+    reachable: set[str] = set()
+    frontier: set[str] = set()
+    collect_refs(schema, frontier)
+    while frontier:
+        name = frontier.pop()
+        if name in reachable or name not in defs:
+            continue
+        reachable.add(name)
+        collect_refs(defs[name], frontier)
+    if reachable:
+        schema["$defs"] = {k: v for k, v in defs.items() if k in reachable}
+    else:
+        schema.pop("$defs", None)
+    return schema
+
+
 class CommonToolSpec(BaseModel):
     """Tool contract shared by local, OpenAI-style, and MCP-style adapters."""
 
@@ -143,6 +177,7 @@ class CommonToolSpec(BaseModel):
             if not completion.field or completion.field in schema.get('required', []):
                 return None
             schema.get('properties', {}).pop(completion.field, None)
+            _prune_unused_defs(schema)
         return schema
 
 

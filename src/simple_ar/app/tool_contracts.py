@@ -84,6 +84,7 @@ SYSTEM = (
     "When evidence is sufficient, implement or compose rather than repeat the inventory. "
     "Choose a coherent outcome-sized work unit: when inputs are known, a reviewable local script "
     "can calculate, plot and check in one approved run instead of many probes. "
+    "Batch independent read, search, listing or file-edit calls in one turn instead of issuing one small lookup per turn. "
     "Specialized tools own the work described in their catalog. Delegate a bounded outcome and "
     "authorized inputs rather than writing their answers first; do not force a particular tool "
     "or a fixed sequence when direct work is sufficient. "

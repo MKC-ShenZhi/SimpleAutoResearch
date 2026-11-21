@@ -921,6 +921,68 @@ class WorkingContextTests(unittest.TestCase):
         self.assertGreater(budget['recent_start_turn'], 0)
         self.assertTrue(budget['compaction_needed'])
 
+    def test_steady_working_target_bounds_optional_operation_overview(self):
+        blocks = [block(0, 'old-turn-0'), block(1, 'latest-turn')]
+        op_history = [
+            {
+                'turn': 0,
+                'reply': 'attempts/native-turn-0001/native_result.json',
+                'request_count': 1,
+                'call_id': f'call-{i}',
+                'observation': {
+                    'record': f'records/native-tool-{i:04d}/native_result.json',
+                    'tool': 'read_file',
+                    'status': 'ok',
+                    'summary': f'entry-{i}-' + ('z' * 400),
+                },
+            }
+            for i in range(12)
+        ]
+        _, budget = select(
+            turn_blocks=blocks,
+            observations=[],
+            operation_history=op_history,
+            context_token_target=20000,
+            steady_working_target=3800,
+            material_policy='working',
+            working_set_policy='recent.v6',
+            require_work_notes=True,
+            fit_work_notes=True,
+            processed_turns=(),
+            sparse_handoffs=True,
+            estimate_tokens=lambda text: len(text),
+        )
+        overview = budget['operation_overview']
+        self.assertGreater(overview['omitted_entries'], 0)
+        self.assertLessEqual(budget['estimated_input_tokens'], 4200)
+
+    def test_service_parameters_schema_prunes_unreferenced_defs(self):
+        from simple_ar.tools.specs import CommonToolSpec, ToolCompletion
+
+        spec = CommonToolSpec(
+            name='write_file',
+            description='Write a file',
+            completion=ToolCompletion(field='delivery', closing=True),
+            input_schema={
+                'type': 'object',
+                '$defs': {
+                    'DeliveryRequest': {'type': 'object', 'properties': {'win': {'$ref': '#/$defs/FileWindow'}}},
+                    'FileWindow': {'type': 'object', 'properties': {'path': {'type': 'string'}}},
+                    'KeptDef': {'type': 'object', 'properties': {'x': {'type': 'integer'}}},
+                },
+                'properties': {
+                    'path': {'type': 'string'},
+                    'kept': {'$ref': '#/$defs/KeptDef'},
+                    'delivery': {'$ref': '#/$defs/DeliveryRequest'},
+                },
+                'required': ['path'],
+            },
+        )
+        service = spec.service_parameters_schema()
+        self.assertIsNotNone(service)
+        self.assertNotIn('delivery', service['properties'])
+        self.assertEqual(set(service.get('$defs', {})), {'KeptDef'})
+
 
 class RetainedWorkingContextTests(unittest.TestCase):
     def test_current_revision_keeps_related_recent_inputs_together_before_old_inventory(self):

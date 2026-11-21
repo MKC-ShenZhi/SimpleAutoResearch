@@ -1003,7 +1003,7 @@ def select_working_context(
             if not indices:
                 return
             operation_indices.extend(indices)
-            if project()[1] <= context_token_target:
+            if project()[1] <= working_ceiling:
                 admissions.extend(('navigation', i) for i in indices)
                 return
             del operation_indices[-len(indices):]
@@ -1022,7 +1022,7 @@ def select_working_context(
             # and individual admission decisions.
             for i in ordered:
                 operation_indices.append(i)
-                if project()[1] > context_token_target:
+                if project()[1] > working_ceiling:
                     operation_indices.pop()
                 else:
                     admissions.append(('navigation', i))
