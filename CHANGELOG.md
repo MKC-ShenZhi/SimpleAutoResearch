@@ -5,6 +5,17 @@
 User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-11-21
+
+### Added
+
+- Desktop workbench now supports one-click budget continuation (`authorize_remaining`): when a session pauses due to exhausted model request, token, or process allowances, users can authorize additional remaining budget inline and resume seamlessly on the original session and ledger.
+
+### Improved
+
+- Decoupled the steady working-set target (`steady_working_target`) from the hardware context window under `economic.v3` and stopped re-injecting retired handoff `authored_text` unless pinned, while preserving all `working.v4` observation invariants and read-history contracts (keeping long-session per-turn prompt size bounded around ~40k–62k tokens).
+- Aligned independent review with `steady_working_target`, restored the per-inspection 6-round investigation bound, and stripped redundant Pydantic string `"title"` metadata from tool parameter schemas.
+
 ## 2026-11-20
 
 ### Added
