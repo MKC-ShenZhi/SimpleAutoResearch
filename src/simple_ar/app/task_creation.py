@@ -69,7 +69,7 @@ class NativeTaskInputs:
     independent_review_required: bool | None = None
     max_images: int = 0
     max_turns: int = 30
-    max_tokens: int = 600000
+    max_tokens: int = 1_200_000
     max_processes: int | None = None
     max_process_seconds: float | None = None
     _explicit_start_destinations: set[str] = field(default_factory=set)

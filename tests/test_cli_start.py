@@ -159,7 +159,7 @@ class StartTests(unittest.TestCase):
         self.assertFalse(options['allow_execution'])
         self.assertFalse(options['allow_network'])
         self.assertEqual(options['max_turns'], 30)
-        self.assertEqual(options['max_tokens'], 600000)
+        self.assertEqual(options['max_tokens'], 1200000)
 
     def test_interactive_status_and_exit_never_retry_failed_work(self):
         from simple_ar.cli.main import main
@@ -387,7 +387,7 @@ class StartTests(unittest.TestCase):
             self.assertFalse(options['allow_execution'])
             self.assertFalse(options['allow_network'])
             self.assertEqual(options['max_turns'],30)
-            self.assertEqual(options['max_tokens'],600000)
+            self.assertEqual(options['max_tokens'],1200000)
             self.assertIsNone(app.reusable_execution())
             self.assertEqual({path:path.read_bytes() for path in root.rglob('*') if path.is_file()},before)
 
@@ -652,7 +652,7 @@ class StartTests(unittest.TestCase):
                 self.assertFalse(options['allow_execution'])
                 self.assertFalse(options['allow_network'])
                 self.assertEqual(options['max_turns'], 30)
-                self.assertEqual(options['max_tokens'], 600000)
+                self.assertEqual(options['max_tokens'], 1200000)
                 self.assertIsNone(options['process_limits'])
                 self.assertEqual(args.allow, [])
                 self.assertIsNone(args.validate)
@@ -753,7 +753,7 @@ class StartTests(unittest.TestCase):
             self.assertFalse(options['allow_execution'])
             self.assertFalse(options['allow_network'])
             self.assertEqual(options['max_turns'], 30)
-            self.assertEqual(options['max_tokens'], 600000)
+            self.assertEqual(options['max_tokens'], 1200000)
             self.assertEqual(app.ledger.to_dict(), ledger)
             self.assertEqual({path: path.read_bytes() for path in app.session.store.root.rglob('*') if path.is_file()}, before)
 

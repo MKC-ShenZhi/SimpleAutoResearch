@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from typing import Any, Callable, Literal
 
 from simple_ar.app.tool_contracts import (
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_MAX_TURNS,
     _COMPLETION_POLICIES,
     _CONTEXT_PROTOCOLS,
     _CONVERSATION_CONTEXT_PROTOCOLS,
@@ -46,8 +48,8 @@ class _ToolConfigMixin:
     @classmethod
     def _configuration(cls, root: Path, goal: str, *, model: str | None, sources: dict[str, Path],
                allow_execution: bool = False, sandbox_execution: bool = False,
-               allow_network: bool = False, allow_vision: bool = False, max_turns: int | None = 30,
-               max_tokens: int | None = 600000, max_images: int = 0,
+               allow_network: bool = False, allow_vision: bool = False, max_turns: int | None = DEFAULT_MAX_TURNS,
+               max_tokens: int | None = DEFAULT_MAX_TOKENS, max_images: int = 0,
                project_python: Path | None = None, code_task: dict[str, Any] | None = None,
                process_limits: dict[str, int | float] | None = None,
                report_requirement: dict[str, Any] | None = None, report_protocol: str | None = None,
@@ -455,8 +457,8 @@ class _ToolConfigMixin:
     @classmethod
     def create(cls, root: Path, goal: str, *, model: str | None, sources: dict[str, Path],
                allow_execution: bool = False, sandbox_execution: bool = False,
-               allow_network: bool = False, allow_vision: bool = False, max_turns: int | None = 30,
-               max_tokens: int | None = 600000, max_images: int = 0,
+               allow_network: bool = False, allow_vision: bool = False, max_turns: int | None = DEFAULT_MAX_TURNS,
+               max_tokens: int | None = DEFAULT_MAX_TOKENS, max_images: int = 0,
                project_python: Path | None = None, code_task: dict[str, Any] | None = None,
                process_limits: dict[str, int | float] | None = None,
                report_requirement: dict[str, Any] | None = None, report_protocol: str | None = None,

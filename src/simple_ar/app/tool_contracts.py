@@ -15,6 +15,9 @@ from simple_ar.research.sources import SearchProviderRegistry
 from simple_ar.tools.specs import MODEL_REVIEW_SELECTIONS
 from simple_ar.tools.workspace import FileWindow
 
+DEFAULT_MAX_TURNS = 30
+DEFAULT_MAX_TOKENS = 1_200_000
+
 _CORE_COORDINATION = {'focus_work', 'load_tools', 'read_history'}
 _TOOL_CONTRACT_MODES = {'full', 'on_demand', 'outcomes'}
 _DEFERRED_WORKSPACE_TOOLS = {'write_file', 'edit_file', 'run_process'}

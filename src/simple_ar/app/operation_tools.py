@@ -56,8 +56,9 @@ def _goal_work_system(*, candidate: bool, recent: bool) -> str:
         'prepared in a temporary file. Reuse the supplied write and read results. Use the preserved '
         'inputs and prior versions as the baseline for checking the changed artifact. Use read_file '
         'or search_files for source inspection and compile_python when offered for Python syntax checks. '
-        'When generating figures, prevent overlapping labels, legends or annotations programmatically '
-        '(layout margins and bounding-box checks) and inspect rendered PNGs with inspect_images when available. '
+        'For generated figures, leave generous margins and clear label/legend spacing; prefer structured '
+        'layout tools (such as Graphviz/SVG) over freehand Matplotlib boxes for schematic diagrams, '
+        'and inspect rendered PNGs with inspect_images when available. '
         if recent else
         'Choose a coherent investigation or implementation that resolves a concrete gap; batch related '
         'reads and run a complete useful calculation rather than repeatedly inventorying or rerunning '

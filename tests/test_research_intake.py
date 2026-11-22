@@ -760,7 +760,7 @@ class ResearchIntakeTests(unittest.TestCase):
             direct = create_research_task(brief, root=base / 'new-defaults',
                 services=SimpleNamespace(llm_client=client), config={'research_materials_only': True})
             self.assertEqual(direct.ledger.limits['llm_requests'], 30)
-            self.assertEqual(direct.ledger.limits['total_tokens'], 600000)
+            self.assertEqual(direct.ledger.limits['total_tokens'], 1200000)
             self.assertEqual(client.budget_ledger, None)
 
     def test_custom_model_client_can_join_the_existing_task_ledger(self):

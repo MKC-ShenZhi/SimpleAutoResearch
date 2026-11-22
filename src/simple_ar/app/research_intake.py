@@ -50,8 +50,9 @@ def requested_research_outputs(brief: ResearchBrief) -> tuple[str, ...]:
 def _creation_model_limits(limits: Mapping, *, model_enabled: bool, preserve_unlimited: bool = False) -> dict:
     if not model_enabled:
         return {'llm_requests': 0, 'total_tokens': 0}
+    from simple_ar.app.tool_contracts import DEFAULT_MAX_TOKENS, DEFAULT_MAX_TURNS
     return {name: limits[name] if name in limits and (limits[name] is not None or preserve_unlimited) else default
-        for name, default in (('llm_requests', 30), ('total_tokens', 600000))}
+        for name, default in (('llm_requests', DEFAULT_MAX_TURNS), ('total_tokens', DEFAULT_MAX_TOKENS))}
 
 
 def declared_research_work(outputs: Iterable[str], sources: Iterable[Mapping],
