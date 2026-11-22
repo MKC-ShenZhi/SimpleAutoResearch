@@ -207,6 +207,11 @@ export function App() {
                 setSelectedFile(file);
                 setDrawerOpen(true);
               }}
+              onReuseVersion={(origin) => {
+                setReuseOrigin(origin);
+                setViewMode('new');
+                setDrawerOpen(false);
+              }}
               onReload={async () => {
                 if (activeTask) await loadActiveSession(activeTask);
                 await loadMetaAndTasks();

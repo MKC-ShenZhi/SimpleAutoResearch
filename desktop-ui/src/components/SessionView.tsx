@@ -7,6 +7,7 @@ import {
   ChevronRight,
   Cpu,
   FileText,
+  GitFork,
   Globe,
   Loader2,
   PanelRight,
@@ -22,6 +23,7 @@ import {
 import { api } from '../api';
 import type { DeliveryFile, DeliverySnapshot, MetaResponse, TaskSnapshot } from '../types';
 import { summarizeResources } from '../utils/resources';
+import { BudgetRingPopover } from './BudgetRingPopover';
 import { MarkdownView } from './MarkdownView';
 
 interface SessionViewProps {
@@ -31,6 +33,7 @@ interface SessionViewProps {
   drawerOpen: boolean;
   onToggleDrawer: () => void;
   onSelectArtifact: (file: DeliveryFile) => void;
+  onReuseVersion?: (origin: { from_session: string; reuse_version: number; reuse: string[]; label: string }) => void;
   onReload: () => Promise<void>;
   onNotify: (msg: string, tone?: 'info' | 'error') => void;
 }
@@ -64,6 +67,7 @@ export function SessionView({
   drawerOpen,
   onToggleDrawer,
   onSelectArtifact,
+  onReuseVersion,
   onReload,
   onNotify,
 }: SessionViewProps) {
@@ -189,6 +193,19 @@ export function SessionView({
     }
   };
 
+  const handleAuthorizeDirect = async (allowances: { llm_requests?: number; total_tokens?: number }) => {
+    try {
+      setBusy('authorize');
+      const res = await api.authorizeRemaining(snapshot.task, allowances);
+      onNotify(res.message || '已追加额度并继续执行');
+      await onReload();
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '追加额度失败', 'error');
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const handleToggleAutoApprove = async () => {
     try {
       setBusy('auto-approve');
@@ -294,6 +311,32 @@ export function SessionView({
               <span>继续</span>
             </button>
           ) : null}
+
+          {/* Reuse Latest Delivery */}
+          {onReuseVersion && delivery?.versions && delivery.versions.length > 0 && (
+            <button
+              onClick={() => {
+                const versions = delivery.versions || [];
+                const latest = versions[versions.length - 1];
+                if (latest?.origin) {
+                  onReuseVersion({
+                    ...latest.origin,
+                    label: snapshot.manifest.topic || snapshot.task,
+                  });
+                }
+              }}
+              title="基于本会话最新交付成果与 SKILL.md 新建研究"
+              className="inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12.5px] transition-colors cursor-pointer"
+              style={{
+                backgroundColor: 'var(--bg-surface)',
+                borderColor: 'var(--border-subtle)',
+                color: 'var(--text-secondary)',
+              }}
+            >
+              <GitFork className="h-3.5 w-3.5" />
+              <span className="hidden md:inline">复用</span>
+            </button>
+          )}
 
           {/* Toggle Right Artifact Drawer */}
           <button
@@ -785,6 +828,13 @@ export function SessionView({
               </button>
             </div>
             <div className="flex items-center gap-2">
+              <BudgetRingPopover
+                summary={resSummary}
+                workerLive={snapshot.worker_live}
+                busy={busy === 'authorize'}
+                onAuthorize={handleAuthorizeDirect}
+              />
+
               {meta && meta.profiles.length > 0 && (
                 <div
                   className="inline-flex items-center gap-1.5 rounded-lg border px-2 py-1"

@@ -342,7 +342,7 @@ export function NewResearchView({
                     setMaxTurns(e.target.value);
                     setPreview(null);
                   }}
-                  placeholder={String(meta?.creation_defaults.max_turns ?? 24)}
+                  placeholder={String(meta?.creation_defaults.max_turns ?? 30)}
                   className="rounded-lg border px-2.5 py-1.5 font-mono text-[12.5px] outline-none"
                   style={{ borderColor: 'var(--border-subtle)', backgroundColor: 'var(--bg-surface)' }}
                 />
@@ -358,7 +358,7 @@ export function NewResearchView({
                     setMaxTokens(e.target.value);
                     setPreview(null);
                   }}
-                  placeholder={String(meta?.creation_defaults.max_tokens ?? 500000)}
+                  placeholder={String(meta?.creation_defaults.max_tokens ?? 1200000)}
                   className="rounded-lg border px-2.5 py-1.5 font-mono text-[12.5px] outline-none"
                   style={{ borderColor: 'var(--border-subtle)', backgroundColor: 'var(--bg-surface)' }}
                 />
