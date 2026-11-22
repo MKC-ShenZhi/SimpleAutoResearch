@@ -1775,7 +1775,8 @@ class WorkspaceToolGateway:
         source = self.resolve(request.source)
         target = self.resolve(request.path, write=True)
         if (target == self.workspace or source == target
-                or source.is_relative_to(target) or not source.is_dir()):
+                or source.is_relative_to(target) or target.is_relative_to(source)
+                or not source.is_dir()):
             raise ValueError('Use a project directory and a distinct new workspace subdirectory')
         record = self.root / 'attempts' / identity / 'project-copy.json'
         if record.exists():

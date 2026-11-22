@@ -62,7 +62,7 @@ class WorkLifecycleTests(unittest.TestCase):
         self.assertFalse(value.closing)
         self.assertEqual(value.reserve['llm_requests'], 2)
         self.assertEqual(estimate['llm_requests'], 1)
-        self.assertGreater(value.reserve['total_tokens'], estimate['total_tokens'])
+        self.assertEqual(value.reserve['total_tokens'], estimate['total_tokens'])
         self.assertEqual(app.ledger.to_dict(), before)
 
         def send(*args, **kwargs):
@@ -161,6 +161,7 @@ class WorkLifecycleTests(unittest.TestCase):
     def test_token_shortfall_also_removes_unfunded_owner_operations(self):
         app, client = self.app(4)
         _, _, _, estimate = self.prepare(app, client)
+        app.operations.delivery.lifecycle_requirements.return_value['minimum_resources']['total_tokens'] = estimate['total_tokens']
         app.ledger.limits['total_tokens'] = 2 * estimate['total_tokens']
         _, value, _, _ = self.prepare(app, client)
         self.assertTrue(value.closing)

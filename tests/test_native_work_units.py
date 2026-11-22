@@ -711,6 +711,11 @@ class NativeWorkQueueTests(unittest.TestCase):
 
     def test_new_task_can_deliver_without_unnecessary_independent_review(self):
         c = self.case
+        c.root = c.directory / 'optional-review'
+        c.app = ToolApplication.create(c.root, 'Deliver a short note without review.',
+            model='fixture', sources={}, services=c.services,
+            max_turns=8, max_tokens=200000, max_attempts=20,
+            independent_review_required=False)
         c._write('note.md', 'A short note.\n')
         c.decisions.append(fixture._action('deliver_result', summary='A short note',
             artifacts=['note.md'], independent_review=False))

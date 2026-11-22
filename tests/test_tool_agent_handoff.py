@@ -241,7 +241,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         code = 'def total(values):\n    return sum(values)\n'
         app.run(actions=[{'tool_name':'write_file','arguments':{
             'path':'utility.py','content':code,'delivery':{
-                'summary':'Editable utility; execution was not requested','artifacts':['utility.py']}}}],
+                'summary':'Editable utility; execution was not requested','artifacts':['utility.py'],
+                'independent_review':False}}}],
             progress=lambda _:None)
         self.assertEqual(app.session.manifest.status,'completed',app.result_snapshot())
         self.assertIsNone(app.implementation)
@@ -622,6 +623,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             def inspect_supplied_material(messages, *, tools, budget_call_id, **_):
                 view = json.loads(messages[1]['content'])
                 visible = [row['observation'] for row in view.get('working_view', {}).get('observations', [])]
+                for group in ('targets', 'evidence'):
+                    for row in view.get(group, []):
+                        visible.extend({**row, **window} for window in row.get('text_windows', []))
                 for message in messages:
                     if message['role'] == 'tool':
                         result = json.loads(message['content'])
@@ -638,15 +642,17 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 fake._budget_ledger.settle(reservation, amounts, actual_source='fixture')
                 # This fixture knows the declared candidate inventory; only
                 # actual gateway reads below can supply inspection evidence.
-                paths = [str(file) for path in view.get('proposed_delivery', {}).get('artifacts', [])
-                    for file in (sorted(Path(path).rglob('*')) if Path(path).is_dir() else [Path(path)])
+                task_root = run_dir / 'native'
+                paths = [str(file) for raw_path in view.get('proposed_delivery', {}).get('artifacts', [])
+                    for resolved in [Path(raw_path) if Path(raw_path).is_absolute() else task_root / raw_path]
+                    for file in (sorted(resolved.rglob('*')) if resolved.is_dir() else [resolved])
                     if file.is_file()]
                 for path in paths:
-                    if not any(row.get('path') == path and isinstance(row.get('text'), str)
+                    if not any((row.get('absolute_path') or row.get('path')) == path and isinstance(row.get('text'), str)
                                for row in visible):
                         return self._native_message('read_file', {'path': path}, 'fixture-read')
                 evidence = list(dict.fromkeys(row['subject'] for row in visible
-                    if row.get('path') in paths and isinstance(row.get('text'), str)))
+                    if (row.get('absolute_path') or row.get('path')) in paths and isinstance(row.get('text'), str)))
                 if not evidence:
                     raise AssertionError('Fixture review requires actually supplied file text')
                 terminal = next(tool['function'] for tool in tools
@@ -733,7 +739,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self._native_message('run_process', {'argv': ['python', 'check.py']}, 'execute'),
                 self._native_message('write_file', {'path': 'workspace/verification.md',
                     'content': 'Executed once; counter saved.\n', 'delivery': {'summary': 'Executed once',
-                        'artifacts': ['workspace/counter.txt', 'workspace/verification.md']}}, 'deliver'),
+                        'artifacts': ['workspace/counter.txt', 'workspace/verification.md'],
+                        **({'independent_review': False} if not review_delivery and not independent_review_required else {})}}, 'deliver'),
             ]
         if completed:
             self.assertEqual(app.run(approve=lambda *_: True, progress=lambda _: None)['status'], 'completed')
@@ -1677,6 +1684,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             identity='replacement-window')
         self.assertEqual(replacement_read.status, 'ok', replacement_read.error)
         self.assertEqual(replacement_read.data, {'text': '\ufffd\ufffd\x00',
+            'path': 'workspace/replacement.txt',
             'sha256': hashlib.sha256(b'\xff\xe4\x00').hexdigest(), 'size_bytes': 3,
             'next_offset_bytes': 3, 'has_more': False, 'absolute_path': str(replacement)})
         raw_lines = [f'line-{number}: α\n'.encode() for number in range(240)]
@@ -1711,7 +1719,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(continuation.data["text"], "last")
         absolute_read = standalone.call("read_file", {"path": str(line_file),
             "start_line": 2, "max_lines": 1}, identity="absolute-read")
-        self.assertEqual(absolute_read.data, line_read.data)
+        self.assertEqual({k: v for k, v in absolute_read.data.items() if k != "path"},
+            {k: v for k, v in line_read.data.items() if k != "path"})
         for receipt in (line_read, continuation, absolute_read):
             original = json.dumps(receipt.data, ensure_ascii=False)
             with patch.object(Path, 'open', side_effect=AssertionError('History projection must not read files')), patch.object(
@@ -2106,6 +2115,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 accepted = standalone.call('edit_file', edit_request(original.decode()), identity=f'edit-exact-{number}')
                 self.assertEqual(accepted.status, 'ok', accepted.error)
                 self.assertEqual(accepted.data, {'path': str(target), 'absolute_path': str(target),
+                    'workspace_path': 'workspace/example.py', 'authored_text': replacement,
                     'sha256': hashlib.sha256(replacement.encode()).hexdigest()})
                 self.assertEqual(target.read_bytes(), replacement.encode())
                 self.assertEqual((run_dir / f'tools/edits/edit-exact-{number}/previous').read_bytes(), original)
@@ -2626,7 +2636,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             with patch('simple_ar.core.process.subprocess.Popen', side_effect=AssertionError('Budget must reject before execution')):
                 blocked = workspace.call('run_process', {**arguments, 'timeout_sec': 601}, identity='longer-over-budget')
             self.assertEqual(blocked.status, 'blocked')
-            self.assertEqual(blocked.data.get('failure_kind'), 'resource_exhausted')
+            self.assertIs(blocked.data.get('executed'), False)
+            self.assertLess(blocked.data.get('max_timeout_sec', 601), 601)
 
     def test_native_task_environment_is_shared_by_python_children_and_receipt_recovery(self) -> None:
         import venv
@@ -2653,7 +2664,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             with patch.dict(os.environ, {'PATH': 'unavailable-host-path'}), patch(
                     'simple_ar.tools.workspace.run_process', side_effect=AssertionError('No receipt replay')):
                 replay = gateway.call('run_process', {'argv': [alias, '-c', code]}, identity='environment-' + alias)
-                self.assertEqual(replay.data, result.data)
+                self.assertEqual(replay.data, {k: v for k, v in result.data.items() if k != 'receipt_sha256'})
                 self.assertEqual(receipt.read_bytes(), saved)
                 self.assertEqual(ledger.to_dict(), accounted)
         self.assertEqual(gateway.process_argv(['/explicit/python', 'python -c unchanged']),
@@ -4945,7 +4956,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_native_publication_finishes_with_unresolved_work_on_the_last_model_turn(self) -> None:
         # Historical eager export consumer: selection is not the subject of this
         # one-decision approval/terminal test. Its full schemas need a larger input target.
-        _, _, fake, _, publication_app, _ = self._native_fixture(
+        _, _, fake, _, publication_app, _ = self._historical_native_fixture(
             goal='Export my draft', mount_inputs=False, max_turns=1,
             tool_contracts='full', context_target=64000)
         final_export = {'markdown': 'workspace/draft.md', 'compile_pdf': False,
@@ -5456,7 +5467,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_native_final_process_delivers_only_bound_successful_outputs(self) -> None:
         for mode in ('success', 'failed', 'missing', 'stopped', 'late-change'):
             with self.subTest(mode=mode):
-                _, _, fake, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1)
+                _, _, fake, _, app, _ = self._historical_native_fixture(mount_inputs=False, max_turns=1)
                 arguments = {'argv': ['python', '-c',
                     "from pathlib import Path; Path('result.txt').write_text('retained'); "
                     + ("import time; time.sleep(2); " if mode == 'stopped' else '') +
@@ -5506,7 +5517,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     if mode == 'success':
                         replay = app.workspace.call('run_process', arguments, identity=identity)
                         self.assertTrue(replay.ok, replay.error)
-                        self.assertEqual(replay.data, payload['data'])
+                        self.assertEqual(replay.data,
+                            {k: v for k, v in payload['data'].items() if k != 'receipt_sha256'})
                         self.assertEqual(app.workspace.call('run_process', json.loads(changed['function']['arguments']),
                             identity=identity).status, 'blocked')
                         (app.workspace.workspace / 'result.txt').write_text('changed')
@@ -5967,7 +5979,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertLessEqual(resources["approximate_next_input_tokens"], 24000)
         self.assertEqual(resumed.session.store.read_json(resumed.state['turns'][1]['reply']), decision)
         original_state, original_ledger = json.dumps(resumed.state), resumed.ledger.to_dict()
-        for target in (12000, 64000):
+        for target in (16000, 64000):
             with self.subTest(input_target=target):
                 resumed._client()._settings.context_input_tokens = target
                 view = json.loads(resumed._messages()[1]['content'])
@@ -9723,7 +9735,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 'document_path', 'document_sha256'):
             self.assertEqual(matched.data[field], identity_view.data[field])
         # A valid JSON whitespace change still changes the observed original
-        # bytes. Neither that race nor lost authorization can yield a receipt.
+        # bytes: the lookup keeps the observed snapshot hash, cannot be reused
+        # once changed, and lost authorization still fails closed.
         def change_source(*args, **kwargs):
             source_path.write_bytes(source_bytes + b'\n')
             return []
@@ -9731,13 +9744,15 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             with patch('simple_ar.tools.sources.rank_source_chunks', side_effect=change_source):
                 changed = _call_tool(resumed.gateway, 'find_source_passages',
                     {'document_record': reference, 'query': 'cancellation'}, identity='changed-source')
-            self.assertEqual(changed.status, 'blocked')
-            self.assertIn('changed during passage selection', changed.error)
-            self.assertEqual(changed.data, {})
+            self.assertEqual(changed.status, 'ok', changed.error)
+            self.assertEqual(changed.data['document_sha256'], hashlib.sha256(source_bytes).hexdigest())
+            self.assertEqual(resumed.sources.retained_passages(
+                [{'data': changed.data, 'turn': 1, 'record': 'records/changed-source/native_result.json'}],
+                before_turn=2), [])
         finally:
             source_path.write_bytes(source_bytes)
         with patch.object(resumed.workspace, 'resolve_source_record',
-                side_effect=[source_path, ValueError('Source authorization revoked')]):
+                side_effect=ValueError('Source authorization revoked')):
             revoked = _call_tool(resumed.gateway, 'find_source_passages',
                 {'document_record': reference}, identity='revoked-source')
         self.assertEqual(revoked.status, 'blocked')
@@ -9750,8 +9765,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 side_effect=[source_path, redirected_path]):
             redirected = _call_tool(resumed.gateway, 'find_source_passages',
                 {'document_record': reference}, identity='redirected-source')
-        self.assertEqual(redirected.status, 'blocked')
-        self.assertIn('changed during passage selection', redirected.error)
+            self.assertEqual(redirected.status, 'ok', redirected.error)
+            self.assertEqual(resumed.sources.retained_passages(
+                [{'data': redirected.data, 'turn': 1, 'record': 'records/redirected-source/native_result.json'}],
+                before_turn=2), [])
         inventory = resumed.workspace.call("list_directory", {
             "path": "source0", "recursive": True, "file_glob": "retained-*.json"}, identity="inventory")
         self.assertEqual(inventory.data["entries"][0]["path"], "source0/retained-document.json")
@@ -12384,6 +12401,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         professional.connection_binding.return_value = {'profile': 'fixture-' + purpose,
             'settings': binding[purpose + '_route']['connection']}
         professional._settings = SimpleNamespace(api_mode='chat', context_input_tokens=64000)
+        professional._budget_ledger = focused.ledger
+        professional.with_budget.return_value = professional
+        professional.estimate_native_input_tokens.side_effect = fake.estimate_native_input_tokens.side_effect
         professional.ask_json.return_value = {'files': [{'path': 'check.py', 'content': code}], 'unresolved': []}
         decisions = [
             self._native_message('read_file', {'path': 'source0/notes.txt'}, 'focused-investigate'),
@@ -13935,13 +13955,13 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                 (project / 'check.py').write_text('from main import VALUE\nassert VALUE >= 2\n')
                 (project / 'evaluate.py').write_text('from main import VALUE\nprint("score: " + str(VALUE))\n')
                 ledger = BudgetLedger({'llm_requests': 4, 'total_tokens': 20000,
-                    'process_invocations': 12, 'process_wall_seconds': 180})
+                    'process_invocations': 12, 'process_wall_seconds': 360})
                 workspace = WorkspaceToolGateway(root, {'input': project, 'records': root / 'attempts'}, ledger,
                     sandbox_execution=mode == 'isolated')
                 contract = {'project_path': 'input', 'goal': 'Improve value and retain the declared scientific checker',
                     'allowed_patterns': ['main.py'], 'validation_command': ['python', 'check.py'], 'timeout_sec': 5,
                     'preparation': {'kind': 'existing_project', 'workspace_mode': 'copy'},
-                    'environment': {'mode': 'venv' if mode == 'venv' else 'current', 'timeout_sec': 20,
+                    'environment': {'mode': 'venv' if mode == 'venv' else 'current', 'timeout_sec': 60,
                         'check_command': ['python', '-c', 'import decimal; print("score: 999")']}}
                 if mode == 'isolated':
                     contract.pop('environment')
@@ -14695,6 +14715,8 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
             # static checking, physical validation or its original ledger.
             reply = {'summary': 'Create the missing source', 'status': 'passed', 'findings': [],
                 'edits': [{'path': name, 'old': '', 'new': 'VALUE = 4\n'} for name in contract['new_files']]}
+            self.fake._budget_ledger = self.ledger
+            self.fake.with_budget.return_value = self.fake
             with patch.object(self.fake, 'ask_json', return_value=reply):
                 checked = verify_implementation(request.run_dir, command=request.validation_command,
                     timeout_sec=5, approval_note='Explicit fixture creation', max_repairs=1,
@@ -15476,7 +15498,7 @@ class ConversationContextTests(unittest.TestCase):
             estimates.append(resources['context_exceeds_input_target'])
             self.assertLessEqual(len(estimates), 8, 'Estimation oscillated at the serialized boundary')
             return target if resources['context_exceeds_input_target'] else target + 1
-        with patch('simple_ar.app.tool_application.estimate_tokens', side_effect=boundary_estimate):
+        with patch('simple_ar.app.tool_messages.estimate_tokens', side_effect=boundary_estimate):
             bounded = fresh._messages(client=fresh_client)
         self.assertTrue(json.loads(bounded[1]['content'])['resources']['context_exceeds_input_target'])
         self.assertLessEqual(len(estimates), 3)

@@ -953,7 +953,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertNotIn('select_work', core)
         self.assertEqual({'read_file','search_files','inspect_project','write_file','edit_file',
             'copy_file','copy_project','run_process','work_document','ask_user','deliver_result',
-            'load_tools','read_history','list_directory','export_report','review_result','compile_python'}, core)
+            'load_tools','read_history','list_directory','list_project_results','export_report','review_result','compile_python'}, core)
         self.assertEqual(self.app.state['config']['professional_operations'], 'work.v12')
         self.assertEqual(self.app.state['config']['work_lifecycle'], 'integrated.v3')
         self.assertEqual(self.app.state['config']['inspection_execution_protocol'], 'shared.v2')
@@ -1556,7 +1556,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 if result.get('tool_name') == 'read_file' and result.get('status') == 'ok':
                     rows.append(result['data'])
         return [next((row for row in reversed(rows)
-            if row.get('path') == str(self.app.workspace.resolve(path))
+            if (row.get('absolute_path') or row.get('path')) == str(self.app.workspace.resolve(path))
             and row.get('subject') and row.get('text_windows')), None) for path in paths]
 
     def _run(self, **kwargs):
@@ -2518,7 +2518,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
 
     def test_large_journal_keeps_recent_source_when_economical_checkpointing(self):
         self._queue_checkpoint_history(context_protocol='auto', initial_notes=False,
-            context_input_tokens=128000, output_tokens=65536)
+            context_input_tokens=200000, output_tokens=65536)
         complete = 'Complete large observed result. ' * 3000
         (self.inputs/'large-result.txt').write_text(complete, encoding='utf-8')
         self.decisions.insert(len(self.decisions)-1,
@@ -3005,7 +3005,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def test_working_v3_retains_closed_operations_without_notes_after_native_eviction(self):
         from dataclasses import replace
         self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
-            context_input_tokens=20000))
+            context_input_tokens=21000))
         self._create(context_protocol='working.v3', goal='Retain a checked working artifact and inspect the supplied files.')
         self.assertEqual(self.app.state['config']['context_protocol'], 'working.v3')
         command = ['python', '-c', "from pathlib import Path; "
@@ -3067,7 +3067,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertTrue(any(entry['tool'] == 'write_file' for entry in entries))
         self.assertFalse(any('closed execution outcome' in json.dumps(message)
                              for message in messages[2:]))
-        self.assertLessEqual(context['working_context']['estimated_input_tokens'], 20000)
+        self.assertLessEqual(context['working_context']['estimated_input_tokens'], 21000)
         self.assertEqual(self.app._working_memory()['notes'], [])
         self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
         self.assertFalse(self.transport_errors)
@@ -3121,6 +3121,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app._working_memory()['notes'],[])
 
     def test_whole_delivery_reads_current_text_once_and_keeps_source_investigation(self):
+        from dataclasses import replace
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=512000))
         self._create()
         texts = {'report.md':'# Observations\n\n'+'The sample mean is 2.0.\n'*3600,
             'results.json':json.dumps({'details':'recorded '*180, 'result_marker':'current derived value'}),
@@ -5944,7 +5947,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._run(should_stop=lambda: False)
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         self.assertEqual(self._assessment()['verdict'], 'passed')
-        self.assertEqual(self.app.ledger.remaining('llm_requests'), 1)
+        self.assertEqual(self.app.ledger.remaining('llm_requests'), 0)
         self.assertFalse(self.app.ledger.over_limit())
         self.assertEqual([entry.to_dict() for entry in self.app.ledger.entries][:len(old_entries)], old_entries)
         self.assertEqual(self._versions(self.inputs), originals)

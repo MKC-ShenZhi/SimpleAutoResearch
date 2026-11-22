@@ -399,6 +399,7 @@ class EvidenceOutlineTests(unittest.TestCase):
         self.assertIn(self.context.problem_markdown, view["objective"])
         self.assertNotIn("argument_plan", view["document_plan"])
         reviewer = Mock()
+        reviewer.prepared_publication_for_review = None
         reviewer.ask_json.return_value = {"section_reviews": []}
         review_document(client=reviewer, template=template, memory=frozen, sections=[draft], config=config,
             execution_summary={}, metric_summary={}, writing_objective=self.context.problem_markdown)
