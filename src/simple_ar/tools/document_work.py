@@ -15,7 +15,7 @@ from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from simple_ar.code_task.generation.agent_step import (
+from simple_ar.core.budget import (
     response_accounting_known, response_accounting_snapshot,
 )
 from simple_ar.core.capabilities import ArtifactStore
@@ -312,7 +312,7 @@ class DocumentWorkToolGateway:
             if decision.action != 'write':
                 return None
             if not completed:
-                from simple_ar.report.writing import _retained_response
+                from simple_ar.core.retained_response import retained_response as _retained_response
                 not_dispatched = 0
                 for path in (writer.root / 'model_calls').glob('*/request.json'):
                     call = ArtifactStore(path.parent)

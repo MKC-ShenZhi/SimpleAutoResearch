@@ -706,3 +706,66 @@ def _optional_text_or_none(value: object) -> str | None:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@dataclass(frozen=True)
+class ResponseAccountingSnapshot:
+    """Call-local evidence; never grants or releases budget capacity."""
+
+    ledger: BudgetLedger
+    unknown_records: tuple[dict[str, Any], ...]
+    entry_ids: frozenset[str]
+
+
+def response_accounting_snapshot(client: Any) -> ResponseAccountingSnapshot | None:
+    """Capture complete independent records before an operation/model call."""
+    budget = getattr(client, "_budget_ledger", None)
+    if not isinstance(budget, BudgetLedger):
+        return None
+    return ResponseAccountingSnapshot(
+        budget,
+        tuple(entry.to_dict() for entry in budget.entries if entry.status == "unknown"),
+        frozenset(entry.reservation_id for entry in budget.entries),
+    )
+
+
+def response_accounting_known(
+    client: Any,
+    before: ResponseAccountingSnapshot | None = None,
+    *,
+    completed_response: bool = False,
+) -> bool:
+    """Allow only unchanged unknown history explicitly captured before the call.
+
+    Without a snapshot retain the conservative whole-ledger check. Reserved
+    entries (including older in-flight work) always block. Every prior unknown
+    must still exist with its entire record unchanged, even if now settled.
+    This is response-correction eligibility, not budget admission. Only adoption
+    of an actually completed response may retain newly bounded failed attempts
+    of the same now-settled logical call. This never enables automatic correction,
+    releases a charge, or adopts an incomplete/unknown response.
+    """
+    budget = getattr(client, "_budget_ledger", None)
+    if not isinstance(budget, BudgetLedger):
+        return before is None
+    if before is not None and before.ledger is not budget:
+        return False
+    entries = {entry.reservation_id: entry.to_dict() for entry in budget.entries}
+    retained = {row["reservation_id"]: row for row in before.unknown_records} if before else {}
+    if any(entries.get(key) != row for key, row in retained.items()):
+        return False
+    newly_accounted = (
+        completed_response
+        and before is not None
+        and completed_llm_usage_is_accounted(
+            row for key, row in entries.items() if key not in before.entry_ids
+        )
+    )
+    return all(
+        row["status"] in ("settled", "released")
+        or (
+            row["status"] == "unknown"
+            and (retained.get(key) == row or (newly_accounted and key not in before.entry_ids))
+        )
+        for key, row in entries.items()
+    )

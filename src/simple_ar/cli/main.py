@@ -182,7 +182,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
     if args.command == "image-review":
         from simple_ar.core.budget import BudgetLedger
-        from simple_ar.code_task.reviewing import run_visual_review
+        from simple_ar.reviewing.visual import run_visual_review
         from simple_ar.integrations.usage import record_usage
         try:
             output = args.output.expanduser().resolve()

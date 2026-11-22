@@ -9,7 +9,7 @@ from typing import Any, Callable
 from pydantic import BaseModel, ConfigDict, Field
 
 from simple_ar.core.capabilities import ArtifactStore
-from simple_ar.code_task.reviewing import run_visual_review
+from simple_ar.reviewing.visual import run_visual_review
 from simple_ar.integrations.llm import LLMClient, LLMDeadlineError, LLMImageInputError, LLMResponseError, MAX_VISION_BYTES, MAX_VISION_PIXELS
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import tempfile
 import time
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Iterator
+import uuid
 
 
 PRIVATE_PATH_COMPONENTS = frozenset({'.git', '.aws', '.ssh', '.codex', '.agents', '__pycache__', '.venv', 'venv'})
@@ -143,3 +145,39 @@ def relative_to_run(run_dir: Path, path: Path | None) -> str | None:
         return str(path.relative_to(run_dir)).replace("\\", "/")
     except ValueError:
         return str(path)
+
+
+@contextmanager
+def generation_candidate(destination: Path, *, validate: Callable[[Path], None] | None = None) -> Iterator[Path]:
+    """Publish completed files, retaining old projects and failed candidates.
+
+    The caller owns the exact output directory. This is not a session transaction
+    or a lock: its existing task owner must serialize generation and metadata.
+    """
+    destination = Path(destination).absolute()
+    if (
+        destination == Path(destination.anchor)
+        or destination == Path.cwd().absolute()
+        or any(path.is_symlink() for path in (destination, *destination.parents))
+        or (destination.exists() and not destination.is_dir())
+    ):
+        raise ValueError("Generation requires a concrete, non-symlink output directory")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    candidate = Path(tempfile.mkdtemp(prefix=f".{destination.name}.candidate-", dir=destination.parent))
+    try:
+        yield candidate
+        if validate is not None:
+            validate(candidate)
+    except BaseException as exc:
+        exc.add_note(f"Generated candidate retained at {candidate}; previous output was not replaced")
+        raise
+    previous = None
+    if destination.exists():
+        previous = destination.with_name(f".{destination.name}.previous-{uuid.uuid4().hex}")
+        destination.rename(previous)
+    try:
+        candidate.rename(destination)
+    except BaseException:
+        if previous is not None:
+            previous.rename(destination)
+        raise

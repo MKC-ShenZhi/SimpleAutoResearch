@@ -1766,9 +1766,8 @@ class WorkspaceToolGateway:
                 'next_offset': end if end < len(rows) else None}
 
     def _copy_project(self, request: _CopyProject, identity: str) -> ToolResult:
-        from simple_ar.code_task.generation.common import generation_candidate
+        from simple_ar.core.artifacts import generation_candidate, read_json, write_json
         from simple_ar.code_task.workspace.copy import CopyReport, copy_code_workspace
-        from simple_ar.core.artifacts import read_json, write_json
 
         if request.delivery_group is not None and request.delivery_version is None:
             raise ValueError('Select a retained delivery version to copy a delivery group')

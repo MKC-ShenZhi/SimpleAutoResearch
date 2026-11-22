@@ -1,43 +1,18 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-from pathlib import Path, PurePosixPath, PureWindowsPath
-import tempfile
-import uuid
-from typing import Any, Callable, Iterator, Mapping
+from pathlib import PurePosixPath, PureWindowsPath
+from typing import Any, Mapping
 
+from simple_ar.core.artifacts import generation_candidate
 
-@contextmanager
-def generation_candidate(destination: Path, *, validate: Callable[[Path], None] | None = None) -> Iterator[Path]:
-    """Publish completed files, retaining old projects and failed candidates.
-
-    The caller owns the exact output directory. This is not a session transaction
-    or a lock: its existing task owner must serialize generation and metadata.
-    """
-    destination = Path(destination).absolute()
-    if (destination == Path(destination.anchor) or destination == Path.cwd().absolute()
-            or any(path.is_symlink() for path in (destination, *destination.parents))
-            or (destination.exists() and not destination.is_dir())):
-        raise ValueError("Generation requires a concrete, non-symlink output directory")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    candidate = Path(tempfile.mkdtemp(prefix=f".{destination.name}.candidate-", dir=destination.parent))
-    try:
-        yield candidate
-        if validate is not None:
-            validate(candidate)
-    except BaseException as exc:
-        exc.add_note(f"Generated candidate retained at {candidate}; previous output was not replaced")
-        raise
-    previous = None
-    if destination.exists():
-        previous = destination.with_name(f".{destination.name}.previous-{uuid.uuid4().hex}")
-        destination.rename(previous)
-    try:
-        candidate.rename(destination)
-    except BaseException:
-        if previous is not None:
-            previous.rename(destination)
-        raise
+__all__ = [
+    "generation_candidate",
+    "safe_relative_path",
+    "text",
+    "string_list",
+    "mapping_list",
+    "scalar_list",
+]
 
 
 def safe_relative_path(value: str) -> str:
