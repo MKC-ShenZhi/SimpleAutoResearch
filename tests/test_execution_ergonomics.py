@@ -32,6 +32,7 @@ class _FakeSession:
 
 class _FakeLedger:
     limits = {"llm_requests": 30, "total_tokens": 1200000}
+    entries: list = []
 
     def snapshot(self) -> dict:
         return {"limits": self.limits, "settled": {}, "reserved": {}, "unknown": []}
