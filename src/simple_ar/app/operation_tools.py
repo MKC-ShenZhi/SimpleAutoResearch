@@ -50,11 +50,14 @@ def _goal_work_system(*, candidate: bool, recent: bool) -> str:
     """Compose the saved work contract without rewriting prompt substrings."""
     action = (
         'Choose the next concrete change or the missing evidence that blocks it. Use supplied '
-        'original text for exact edits and retrieve only missing ranges. When a replacement is '
-        'ready, apply it to the requested artifact, including when it was prepared in a temporary '
-        'file. Reuse the supplied write and read results. Use the preserved inputs and prior '
-        'versions as the baseline for checking the changed artifact. Use read_file or search_files '
-        'for source inspection and compile_python when offered for Python syntax checks. '
+        'original text for exact edits and retrieve only missing ranges. Batch independent '
+        'reads, searches, listings or edits in one turn rather than issuing one small call per turn. '
+        'When a replacement is ready, apply it to the requested artifact, including when it was '
+        'prepared in a temporary file. Reuse the supplied write and read results. Use the preserved '
+        'inputs and prior versions as the baseline for checking the changed artifact. Use read_file '
+        'or search_files for source inspection and compile_python when offered for Python syntax checks. '
+        'When generating figures, prevent overlapping labels, legends or annotations programmatically '
+        '(layout margins and bounding-box checks) and inspect rendered PNGs with inspect_images when available. '
         if recent else
         'Choose a coherent investigation or implementation that resolves a concrete gap; batch related '
         'reads and run a complete useful calculation rather than repeatedly inventorying or rerunning '
