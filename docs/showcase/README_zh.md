@@ -4,6 +4,18 @@
 
 这里展示框架任务生成的正文、图形和源码，并提供阅读与复跑入口。运行中，人提供目标、执行授权、缺陷反馈、环境准备和独立检查。部分任务经历过框架修复与显式续接，因此案例同时说明人工参与、成本与未完成部分。
 
+## 单卡 RTX 3090 真实 GPU 持续学习研究（Mammoth / Split CIFAR-100）
+
+**需求：** 在单张 RTX 3090 上仅挂载干净的 `aimagelab/mammoth` 只读代码库（不预下载数据集、不预设改进算法），要求框架自主探测环境与获取 CIFAR-100、联网检索持续学习文献、定位源码设计并实现候选方法、在 `seq-cifar100`（10 个增量任务）上完成 3 种子基线/候选严格对照实验、绘制出版级图表并撰写完整论文草稿，再在二期会话中通过 `--from-session --auto-approve-execution --allow-vision` 自动审修全部图表。
+
+**交付与实测结果：**
+- **主研究会话（RTX 3090，89 次请求 / 434.4 万 tokens / 累计进程耗时 36.6 分钟，含 3 次 `--authorize-remaining` 断点无重跑续接）**：自主定位本机 `/root/autodl-pub/cifar-100` 并校验、修补 `mammoth/datasets/__init__.py` 兼容问题、完成 14 次 arXiv/OpenAlex 文献检索，设计单变量候选方法 **ER-AM**（仅对当前任务行屏蔽未见类 logit）。经 1-epoch 冒烟标定后完成 3 种子 `ER`（18.38 ± 0.77%，遗忘 53.59%）与 `ER-AM`（18.61 ± 0.57%，配对差 +0.23 pp，*t* = 0.30）训练，并**主动追加 3 种子 `ER-ACE` 参照消融**（28.97 ± 0.27%，遗忘 20.88%，+10.60 pp，*t* = 17.9），诚实报告受控负结果与机制归因。独立审查器自行编写 `verify_numbers.py` 复算全部指标并核验 CUDA/PyTorch 版本后签收交付（`version=1`，26 项产物，规范 Markdown 稿件，无 Pandoc/LaTeX 环境未编 PDF）。
+- **二期零审批视觉审修会话（`--from-session ... --reuse artifacts --auto-approve-execution --allow-vision`）**：复用主会话产物，调用视觉路由自动诊断并消除 `fig1` y 轴截断、`fig2` 标题/标签紧凑与 `fig3` 图例碰柱等全部排版瑕疵，全程 0 次人工审批中断。
+
+| 10 任务增量平均准确率曲线（v2 视觉审修后） | 最终平均准确率与平均遗忘率对比（v2 视觉审修后） |
+| --- | --- |
+| ![Split CIFAR-100 学习曲线](assets/mammoth-3090-fig1-learning-curve.png) | ![最终准确率与遗忘率对比](assets/mammoth-3090-fig2-final-metrics.png) |
+
 ## 机器学习顶会论文闭环 + 跨数据集复用（NeurIPS 2025 模板）
 
 **需求：** 围绕“类别不平衡与标签噪声双重污染下的概率校准与共形预测”，仅挂载一份官方 `neurips_2025.sty` 模板，要求自主联网检索文献、从零编写模块化实验代码库、在多个真实表格数据集上开展受控实验、绘制出版级英文图表、编译 NeurIPS 2025 英文 PDF 并沉淀可迁移方法手册 `SKILL.md`；随后在新会话中通过 `--from-session ... --reuse artifacts` 将方法迁移至全新 `wine` 三分类数据集。
