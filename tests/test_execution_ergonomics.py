@@ -35,7 +35,13 @@ class _FakeLedger:
     entries: list = []
 
     def snapshot(self) -> dict:
-        return {"limits": self.limits, "settled": {}, "reserved": {}, "unknown": []}
+        return {
+            "limits": self.limits,
+            "remaining": {"llm_requests": 8, "total_tokens": 10941},
+            "settled": {"llm_requests": 22, "total_tokens": 1189059},
+            "reserved": {},
+            "unknown": [],
+        }
 
 
 class _FakeApp:
