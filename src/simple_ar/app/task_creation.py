@@ -30,7 +30,7 @@ FIELDS = {
     'kind': str, 'project': str, 'document': list, 'material': list,
     'extensions': list, 'from_session': str, 'reuse': list, 'reuse_version': int,
     'data_file': str, 'data_path': list,
-    'project_python': str, 'allow_execution': bool, 'sandbox_execution': bool, 'allow_network': bool,
+    'project_python': str, 'allow_execution': bool, 'sandbox_execution': bool, 'sandbox_gpu': bool, 'allow_network': bool,
     'allow_vision': bool, 'independent_review_required': bool,
     'max_images': int, 'max_turns': int, 'max_tokens': int,
     'max_processes': int, 'max_process_seconds': (int, float),
@@ -64,6 +64,7 @@ class NativeTaskInputs:
     with_report: bool = False
     allow_execution: bool = False
     sandbox_execution: bool = False
+    sandbox_gpu: bool = False
     allow_network: bool = False
     allow_vision: bool = False
     independent_review_required: bool | None = None
@@ -395,6 +396,7 @@ def native_creation_options(args: NativeTaskInputs) -> dict:
         context_protocol='auto',
         sources={f'source{index}': path for index, path in enumerate(args.source)},
         allow_execution=args.allow_execution, sandbox_execution=getattr(args, 'sandbox_execution', False),
+        sandbox_gpu=getattr(args, 'sandbox_gpu', False),
         allow_network=args.allow_network, allow_vision=args.allow_vision,
         independent_review_required=getattr(args, 'independent_review_required', None),
         max_turns=args.max_turns, max_tokens=args.max_tokens, max_images=args.max_images,

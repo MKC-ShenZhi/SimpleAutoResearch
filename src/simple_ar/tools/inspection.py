@@ -228,7 +228,8 @@ class InspectionToolGateway(_InspectionEvidenceMixin, _InspectionMessagesMixin):
                  'Independently judge the proposed delivery against the actual user requests. ') +
                 'Choose the consequential claims and the smallest sufficient investigation; '
                 'batch independent read_file, search_files or list_directory calls in one turn rather than '
-                'reading one file per turn, and use available original sources and recorded work before commissioning more. '
+                'reading one file per turn, never use run_process merely to inspect or read files, and use '
+                'available original sources and recorded work before commissioning more. '
                 'For numerical comparisons identify both quantities, reference conditions and direction. '
                 'Test important interpretations against alternatives consistent with the observations. '
                 'State what was observed, derived, executed or not checked, and its actual scope. '

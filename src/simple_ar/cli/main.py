@@ -1470,9 +1470,13 @@ def _render_native_result(app: Any, status: dict[str, Any], *, task_view: dict |
     pending = (task_view.get('pending') if task_view is not None else app.state.get('pending')) or {}
     reason = str(status.get("status_reason") or "")
     # Exception messages can contain provider URLs, headers or credentials.
-    if reason.startswith("BudgetExceededError:") or (
-        reason.startswith("RuntimeError: Operation failed; inspect saved diagnostics: LLMError: ")
-        and "LLM budget prevented provider attempt " in reason
+    if (
+        reason.startswith("BudgetExceededError:")
+        or "exceeds the remaining token allowance" in reason
+        or (
+            reason.startswith("RuntimeError: Operation failed; inspect saved diagnostics: LLMError: ")
+            and "LLM budget prevented provider attempt " in reason
+        )
     ):
         reason = "Insufficient remaining budget before dispatch / 发送前剩余额度不足"
     elif reason.startswith("BudgetUnknownError:"):
@@ -1921,7 +1925,9 @@ def _run_native_start(args: argparse.Namespace) -> None:
                     f"{f' ({file_fields})' if file_fields else ''}\n"
                     f"Public sources: {config['allow_network']}; rendered-image inspection: {config['allow_vision']}\n"
                     f"Image submissions: {limits['image_requests']}; independent review: {config.get('independent_review_required', False)}\n"
-                    f"Process proposals: {config['allow_execution']}; workspace execution: {config.get('sandbox_execution', False)}"),
+                    f"Process proposals: {config['allow_execution']}; workspace execution: {config.get('sandbox_execution', False)}"
+                    f"{'; sandbox GPU: True' if config.get('sandbox_gpu') else ''}"
+                    f"{'; auto-approve execution: True (un-sandboxed host)' if getattr(args, 'auto_approve_execution', False) else ''}"),
                     title="Task / 任务"))
 
             verify_creation = show_creation
@@ -1950,6 +1956,10 @@ def _run_native_start(args: argparse.Namespace) -> None:
         if args.prepare_only:
             return
 
+        auto_approve_execution = bool(getattr(args, 'auto_approve_execution', False))
+        if auto_approve_execution and not (args.allow_execution or app.state['config'].get('allow_execution')):
+            raise ValueError('--auto-approve-execution requires --allow-execution')
+
         def approve(call: dict[str, Any], token: str):
             print_line(f"Execution proposal ({call['function']['name']}): {call['function']['arguments']}")
             if call['function']['name'] == 'execute_implementation':
@@ -1968,6 +1978,9 @@ def _run_native_start(args: argparse.Namespace) -> None:
                 print_line('Approval binds the project inventory, protected validator files and process environment. '
                     + ('Preparation only; implementation and each formal measurement require separate approval.'
                        if call['function']['name'] == 'prepare_code_task' else f'Includes at most {repairs} technical repairs.'))
+            if auto_approve_execution:
+                print_line(f"Auto-approved execution proposal (un-sandboxed host; token={token}).")
+                return True
             print_line("Execution is not sandboxed. Inspect the generated code before approving.")
             if not interactive:
                 return False
@@ -2000,7 +2013,7 @@ def _run_native_start(args: argparse.Namespace) -> None:
                     additional_attempts=additional_attempts if 'additional_attempts' in getattr(args, '_explicit_start_destinations', ()) else None,
                     additional_no_progress=additional_no_progress if 'additional_no_progress' in getattr(args, '_explicit_start_destinations', ()) else None,
                     authorization_id=authorization_id, authorization_reason=authorization_reason,
-                    decision=decision, approve=approve if interactive else None, progress=print_line,
+                    decision=decision, approve=approve if (interactive or auto_approve_execution) else None, progress=print_line,
                     **({'finish_declared_work': True} if finish_declared_work else {}))
             except SessionBusyError:
                 if feedback_id is None:

@@ -84,7 +84,8 @@ class WorkspaceToolGateway:
             record_artifacts=record_artifacts, create_workspace=create_workspace,
             process_artifact_paths=config.get('process_artifact_paths'),
             candidate_review_protocol=config.get('candidate_review_protocol'),
-            sandbox_execution=config.get('sandbox_execution', False))
+            sandbox_execution=config.get('sandbox_execution', False),
+            sandbox_gpu=config.get('sandbox_gpu', False))
 
     def has_started(self, identity: str) -> bool:
         return (self.root / 'tools' / 'processes' / identity / 'invocation.json').is_file()
@@ -105,7 +106,7 @@ class WorkspaceToolGateway:
                  project_python: Path | None = None, record_artifacts: Any | None = None,
                  create_workspace: bool = True, process_artifact_paths: str | None = None,
                  candidate_review_protocol: str | None = None,
-                 sandbox_execution: bool = False) -> None:
+                 sandbox_execution: bool = False, sandbox_gpu: bool = False) -> None:
         if process_artifact_paths not in (None, 'cwd.v1'):
             raise ValueError('Unsupported saved process artifact paths')
         self.process_artifact_paths = process_artifact_paths
@@ -130,6 +131,7 @@ class WorkspaceToolGateway:
         self.ledger = ledger
         self.record_artifacts = record_artifacts
         self.sandbox_execution = sandbox_execution
+        self.sandbox_gpu = sandbox_gpu
 
     def process_sandbox(self, cwd: Path, *, extra_read: tuple[Path, ...] = (),
                         python: Path | None = None, writable: Path | None = None):
@@ -145,7 +147,7 @@ class WorkspaceToolGateway:
             workspace.joinpath(*relative.parts[:2])
             if len(relative.parts) >= 2 and relative.parts[0] == 'inspection-work' else workspace)
         return ProcessSandbox(workspace=workspace, writable=permitted, python=python or self.python,
-                              extra_read=extra_read)
+                              extra_read=extra_read, allow_gpu=self.sandbox_gpu)
 
     def within_task_scope(self, name: str, binding: dict[str, Any]) -> bool:
         if not self.sandbox_execution or name != 'run_process':

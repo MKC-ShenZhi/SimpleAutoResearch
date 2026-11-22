@@ -48,6 +48,7 @@ class _ToolConfigMixin:
     @classmethod
     def _configuration(cls, root: Path, goal: str, *, model: str | None, sources: dict[str, Path],
                allow_execution: bool = False, sandbox_execution: bool = False,
+               sandbox_gpu: bool = False,
                allow_network: bool = False, allow_vision: bool = False, max_turns: int | None = DEFAULT_MAX_TURNS,
                max_tokens: int | None = DEFAULT_MAX_TOKENS, max_images: int = 0,
                project_python: Path | None = None, code_task: dict[str, Any] | None = None,
@@ -85,11 +86,14 @@ class _ToolConfigMixin:
             raise ValueError('A required independent review needs a model and the common operation delivery owner')
         if type(sandbox_execution) is not bool or sandbox_execution and not allow_execution:
             raise ValueError('Workspace execution requires explicit process authorization')
+        if type(sandbox_gpu) is not bool or (sandbox_gpu and not sandbox_execution):
+            raise ValueError('Sandbox GPU passthrough requires --sandbox-execution')
         if sandbox_execution:
-            import shutil
             import sys
-            if not sys.platform.startswith('linux') or shutil.which('bwrap') is None:
+            if not sys.platform.startswith('linux'):
                 raise ValueError('Workspace execution requires bubblewrap on a Linux execution host')
+            from simple_ar.core.process_sandbox import probe_bwrap_sandbox
+            probe_bwrap_sandbox()
         if completion_policy is None:
             completion_policy = _OPERATION_EXIT if control_protocol is not None else 'closing_decision.v2'
         frozen_extensions = freeze_extensions(extensions or [])
@@ -299,6 +303,8 @@ class _ToolConfigMixin:
             config['control_protocol'] = control_protocol
         if sandbox_execution:
             config['sandbox_execution'] = True
+        if sandbox_gpu:
+            config['sandbox_gpu'] = True
         if frozen_extensions:
             config['extensions'] = frozen_extensions
             config['extension_host_protocol'] = 'nested_calls.v1'
@@ -457,6 +463,7 @@ class _ToolConfigMixin:
     @classmethod
     def create(cls, root: Path, goal: str, *, model: str | None, sources: dict[str, Path],
                allow_execution: bool = False, sandbox_execution: bool = False,
+               sandbox_gpu: bool = False,
                allow_network: bool = False, allow_vision: bool = False, max_turns: int | None = DEFAULT_MAX_TURNS,
                max_tokens: int | None = DEFAULT_MAX_TOKENS, max_images: int = 0,
                project_python: Path | None = None, code_task: dict[str, Any] | None = None,
@@ -489,6 +496,7 @@ class _ToolConfigMixin:
         """
         prepared = cls.preview_creation(root, goal, model=model, sources=sources,
             allow_execution=allow_execution, sandbox_execution=sandbox_execution,
+            sandbox_gpu=sandbox_gpu,
             allow_network=allow_network, allow_vision=allow_vision,
             max_turns=max_turns, max_tokens=max_tokens, max_images=max_images, project_python=project_python,
             code_task=code_task, process_limits=process_limits, report_requirement=report_requirement, report_protocol=report_protocol,

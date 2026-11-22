@@ -125,6 +125,8 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     native.add_argument("--source", action="append", default=[], type=Path, help="Native task: read-only file/directory mount, repeatable; on resume, explicitly add materials after confirmation.")
     native.add_argument("--allow-execution", action="store_true", help="Native task: allow proposing process commands; each command still needs approval. Not an OS sandbox.")
     native.add_argument("--sandbox-execution", action="store_true", help="With --allow-execution, authorize ordinary commands and report rendering inside the Linux task workspace; requires bubblewrap. Source materials must be copied into the workspace and process networking is disabled.")
+    native.add_argument("--sandbox-gpu", action="store_true", help="With --sandbox-execution, bind host GPU devices (/dev/nvidia*, /dev/dri) into the Linux bubblewrap sandbox while keeping network and filesystem isolation.")
+    native.add_argument("--auto-approve-execution", action="store_true", help="CLI opt-in for trusted hosts/containers (e.g., dedicated cloud GPU instances where bubblewrap namespaces are disabled): automatically approve each execution proposal after printing its exact command and approval token. Not an OS sandbox.")
     native.add_argument("--allow-network", action="store_true", help="Native task: authorize public source search/acquisition, including bounded PDFs; no installation or command authorization.")
     native.add_argument("--allow-vision", action="store_true", help="Native task: authorize sending mounted rendered images to the named TOML vision route, sharing the task model budget.")
     native.add_argument("--independent-review-required", action=argparse.BooleanOptionalAction,
