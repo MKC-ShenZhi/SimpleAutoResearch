@@ -5,6 +5,26 @@
 按日期倒序记录用户可见的新增、优化与修复。
 当前用法见[使用指南](docs/USAGE_zh.md)，案例与限制见[成果展示](docs/showcase/README_zh.md)。
 
+## 2026-11-22
+
+### 新增
+
+- 桌面研究工作台在会话底部模型选择器旁新增紧凑型环形额度指示器（`BudgetRingPopover`），悬停或点击即可查看 Token / 轮次用量与剩余额度，并支持快捷预设或自定义增量随时追加预算；同时在会话顶部新增“复用”按钮（一键跳转到新建页并预填 `--from-session`）。
+- CLI 新增两项面向 Linux / 云 GPU 科研场景的可选执行参数：
+  - `--sandbox-gpu`：配合 `--sandbox-execution` 在保持 `bubblewrap` 网络与文件隔离的前提下透传宿主机 `/dev/nvidia*` 与 `/dev/dri` GPU 设备，并在任务创建阶段预检容器 user namespace 可用性；
+  - `--auto-approve-execution`：面向禁用 user namespace 的专属云 GPU 容器（如 AutoDL / Docker），在 CLI 审批回调层完整打印并审计每条命令及审批 token 后自动放行，不削弱核心 `ToolApplication` 校验契约。
+
+### 优化
+
+- 架构收敛与解耦：原生路径（`tools/document_work.py`、`tools/materials.py`、`tools/visual.py`）与 `code_task/`、`report/writing.py` 彻底解耦，抽离共享模块（`core/budget.py`、`core/artifacts.py`、`core/retained_response.py`、`reviewing/visual.py`）；`app/tool_application.py` 按职责拆分为 `tool_config.py`、`tool_memory.py`、`tool_legacy.py`、`tool_recovery.py` 四个内聚模块（主文件从 4,763 行收敛至 2,778 行）。
+- 统一默认预算单一事实来源（`30 turns / 1,200,000 tokens`，CLI 与桌面端对齐），强化 `operations.v1` 生产与独立审查侧的批量读写与只读工具优先规范（禁止为读文件调用 `run_process`），并补充图表留白与视觉审图提示。
+- 精简用户与开发文档（`docs/USAGE*.md`、`docs/WORKFLOWS*.md`、`docs/DEVELOPMENT*.md`、`docs/CLI_REFERENCE*.md`），与当前 `pywebview` + React 桌面端及原生工作流保持一致。
+
+### 修复
+
+- 修复 `workspace.py` 中 `copy_project` 允许目标路径位于源目录内部导致递归自拷贝的问题。
+- 修复剩余 Token 不足触发暂停时 CLI 将原因折叠为 `Saved stop detail withheld` 的问题，现直接提示“发送前剩余额度不足”。
+
 ## 2026-11-21
 
 ### 新增

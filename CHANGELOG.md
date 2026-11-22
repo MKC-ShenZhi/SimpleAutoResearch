@@ -5,6 +5,26 @@
 User-visible additions, improvements and fixes in reverse chronological order.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-11-22
+
+### Added
+
+- Desktop workbench now includes a compact circular budget ring (`BudgetRingPopover`) beside the composer model selector with hover/click progress meters and inline additive budget top-ups (`authorize_remaining`), plus a one-click session reuse button (`--from-session`) in the session header.
+- Added two opt-in CLI execution flags for Linux and cloud GPU workflows:
+  - `--sandbox-gpu`: with `--sandbox-execution`, binds host `/dev/nvidia*` and `/dev/dri` devices into the Linux `bubblewrap` sandbox while keeping `--unshare-all` network and filesystem isolation, with upfront namespace readiness probing;
+  - `--auto-approve-execution`: for dedicated cloud GPU containers where `bubblewrap` user namespaces are disabled, automatically approves execution proposals at the CLI callback layer after logging each exact command and approval token without weakening core `ToolApplication` token verification or audit trails.
+
+### Improved
+
+- Architecture consolidation and decoupling: removed all `code_task/` and `report/writing.py` imports from native tool paths (`tools/document_work.py`, `tools/materials.py`, `tools/visual.py`) via shared modules (`core/budget.py`, `core/artifacts.py`, `core/retained_response.py`, `reviewing/visual.py`), and decomposed `app/tool_application.py` from 4,763 to 2,778 lines across four cohesive mixins (`tool_config.py`, `tool_memory.py`, `tool_legacy.py`, `tool_recovery.py`).
+- Unified default task budgets (`30 turns / 1,200,000 tokens`) across CLI and desktop UI, reinforced batched read/edit and read-only tool hygiene (reserving `run_process` for actual computation rather than reading files) in both producer and independent reviewer contracts, and refined figure layout guidance.
+- Streamlined user and developer documentation (`docs/USAGE*.md`, `docs/WORKFLOWS*.md`, `docs/DEVELOPMENT*.md`, `docs/CLI_REFERENCE*.md`) to match the current `pywebview` + React desktop workbench and native workflows.
+
+### Fixed
+
+- Blocked recursive self-copy in `workspace.py` (`copy_project`) when the destination directory lies inside the source tree.
+- Fixed CLI status rendering withholding the stop reason (`Saved stop detail withheld`) when remaining tokens are insufficient before model dispatch; it now reports `Insufficient remaining budget before dispatch` clearly.
+
 ## 2026-11-21
 
 ### Added
