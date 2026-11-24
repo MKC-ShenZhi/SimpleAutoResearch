@@ -426,9 +426,7 @@ class OperationTools:
                 'with return_source_work. Do not rebuild that work as a coordinator-run audit project. '
                 'Choose necessary work from the original user requirements; derived packaging and '
                 'checking recipes remain working choices rather than new acceptance conditions.')
-        if config.get('work_method') == 'goal.v1':
-            self.system = _goal_work_system(candidate=False, recent=False)
-        elif config.get('work_method') in EXECUTABLE_WORK_METHODS and config.get('professional_operations') not in PRODUCTION_OWNER_CONTRACTS:
+        if config.get('work_method') in EXECUTABLE_WORK_METHODS and config.get('professional_operations') not in PRODUCTION_OWNER_CONTRACTS:
             self.system = _executable_work_system(scoped_code=config.get('code_work_policy') == 'shared.v2')
         if exact or (preparation is not None or source_owner) and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
@@ -478,9 +476,9 @@ class OperationTools:
         if (config['model'] is not None and (
                 professional and (config.get('professional_operations') in PRODUCTION_OWNER_CONTRACTS | {'work.v1', 'work.v2', 'work.v12'}
                     or config.get('code_work_policy') in {'shared.v1', 'shared.v2'}
-                    or config.get('document_context_policy') in {'working.v2', 'working.v3', 'working.v4'}
+                    or config.get('document_context_policy') == 'working.v4'
                        and config.get('report_requirement') is not None)
-                or config.get('document_context_policy') in {'working.v3', 'working.v4'}
+                or config.get('document_context_policy') == 'working.v4'
                    and config.get('report_requirement') is not None)):
             from simple_ar.tools.document_work import DocumentWorkToolGateway, document_work_tool_specs
             if config.get('document_context_policy') == 'working.v4' and work_context is not None:
@@ -488,7 +486,7 @@ class OperationTools:
                     return work_context(targets, include_retained_delivery=True)
             else:
                 document_context = work_context
-            if config.get('document_context_policy') in {'working.v2', 'working.v3', 'working.v4'} and config.get('report_requirement') is not None:
+            if config.get('document_context_policy') == 'working.v4' and config.get('report_requirement') is not None:
                 from simple_ar.report.requirements import working_report_requirement
                 base_document_context = document_context
                 def document_context(targets):
@@ -502,7 +500,7 @@ class OperationTools:
                     if alias not in {'workspace', 'records'}], sources=self.sources,
                 context_policy=config.get('document_context_policy'),
                 report_requirement=(config.get('report_requirement')
-                    if config.get('document_context_policy') in {'working.v3', 'working.v4'} else None))
+                    if config.get('document_context_policy') == 'working.v4' else None))
             self.registry.register_package(document_work_tool_specs(
                 bind_current=config.get('document_context_policy') == 'working.v4'), self.document, request_visible=True)
             self.system += (' For coherent manuscript drafting or substantive document revision, work_document '

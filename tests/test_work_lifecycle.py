@@ -23,7 +23,7 @@ class WorkLifecycleTests(unittest.TestCase):
         app = ToolApplication.__new__(ToolApplication)
         app.ledger = BudgetLedger({'llm_requests': requests, 'total_tokens': tokens})
         app.state = {'config': {'memory_protocol': 'journal.v1',
-            'completion_policy': 'available_operations.v2', 'work_method': 'execute.v2',
+            'completion_policy': 'available_operations.v2', 'work_method': 'execute.v3',
             **({'work_lifecycle': 'integrated.v3'} if integrated else {})},
             'turns': [], 'pending': {'skip_memory_checkpoint': True}}
         app.session = SimpleNamespace(manifest=SimpleNamespace(

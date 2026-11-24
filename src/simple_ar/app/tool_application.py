@@ -143,7 +143,7 @@ class ToolApplication(_ToolConfigMixin, _ToolMemoryMixin, _ToolLegacyMixin, _Too
         from simple_ar.app.professional_conversation import NATIVE_HISTORY_POLICY
         if config.get('native_history_policy') not in (None, NATIVE_HISTORY_POLICY):
             raise ValueError('Unsupported saved native history policy')
-        if config.get('document_context_policy') not in (None, 'working.v1', 'working.v2', 'working.v3', 'working.v4'):
+        if config.get('document_context_policy') not in (None, 'working.v4'):
             raise ValueError('Unsupported saved document context policy')
         if config.get('scientific_condition_reuse') not in (None, 'unchanged.v1'):
             raise ValueError('Unsupported saved scientific condition reuse policy')
@@ -1716,7 +1716,7 @@ class ToolApplication(_ToolConfigMixin, _ToolMemoryMixin, _ToolLegacyMixin, _Too
                     {'llm_requests':1, 'total_tokens':conversation.tokens(value)}
                     if operation_exit else self._completion_floor(client, value.messages)),
                 checkpoint=None if ((self.state.get('pending') or {}).get('skip_memory_checkpoint')
-                    or not journal and self.state['config'].get('context_protocol') != 'working.v1') else checkpoint,
+                    or not journal) else checkpoint,
                 closing_enabled=operation_exit or self.state['config'].get('completion_policy') == 'closing_decision.v2',
                 exit_first=operation_exit or integrated,
                 continue_allowed=self._can_request(2) and (

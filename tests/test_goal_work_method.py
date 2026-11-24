@@ -1398,11 +1398,9 @@ class GoalWorkTests(unittest.TestCase):
         self.assertFalse(case.app.workspace.call('write_file', {'path': 'measurements/observations.csv',
             'content': 'Forbidden source mutation'}, identity='source-write').ok)
         case.app.state['config']['work_method'] = 'goal.v1'
-        case.app.state['config'].pop('inspection_material_policy', None)
         case.app._save()
-        case._reload()
-        self.assertIn('review_result', {tool['function']['name'] for tool in case.app.schemas})
-        self.assertEqual(case.app.state['config']['work_method'], 'goal.v1')
+        with self.assertRaisesRegex(ValueError, 'Unsupported saved professional working method'):
+            case._reload()
 
     def test_claim_owned_defect_survives_rejected_opinion_reload_and_revision(self):
         case = self.case
@@ -1709,7 +1707,7 @@ class GoalWorkTests(unittest.TestCase):
 
     def test_claimed_execution_or_unfinished_check_cannot_become_required_defect(self):
         inspector = self.case.app.operations.inspection
-        saved = {'work_method': 'goal.v1', 'source_rounds': [], 'targets': [],
+        saved = {'work_method': 'goal.v2', 'source_rounds': [], 'targets': [],
             'evidence': [{'subject': 'evidence-1', 'readable': True, 'sha256': 'a' * 64,
                           'windows': [{'text': 'Actual observed text.'}]}],
             'delivery_context': {'schema_version': 'delivery_review.v3', 'scope_policy': 'applicable.v2',
@@ -1720,7 +1718,7 @@ class GoalWorkTests(unittest.TestCase):
                 'basis': 'executed', 'execution_records': ['made-up-receipt'], 'method': 'Claimed a run.',
                 'reasoning': 'No actual computation was performed.', 'evidence': ['evidence-1'],
                 'outcome': 'unresolved'}]}
-        for method in ('goal.v1', 'execute.v2', 'execute.v3'):
+        for method in ('execute.v3',):
             with self.subTest(method=method):
                 saved['work_method'] = method
                 opinion = deepcopy(value)

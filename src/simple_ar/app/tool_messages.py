@@ -984,7 +984,7 @@ class _ToolMessagesMixin:
             decision_views = {}
         working_mode = config.get('context_protocol') in _WORKING_CONTEXT_PROTOCOLS
         receipt_supply = config.get('native_supply_policy') in RECEIPT_SUPPLY_POLICIES
-        operation_history = [] if config.get('context_protocol') in {'working.v3', 'working.v4'} else None
+        operation_history = [] if config.get('context_protocol') == 'working.v4' else None
         declared = config.get('input_contract') == _DECLARED_INPUTS
         client = client or self._client(purpose=self._coordinator_purpose(decision_views=decision_views))
         focus = self._work_focus(decision_views=decision_views)

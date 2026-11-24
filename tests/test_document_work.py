@@ -113,7 +113,7 @@ class DocumentWorkTests(unittest.TestCase):
         client = Client(ledger, 'citation', None)
         gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
             material_roots=lambda: ['source0'], sources=SourceToolGateway(root, workspace, ledger),
-            context_policy='working.v3', report_requirement=requirement)
+            context_policy='working.v4', report_requirement=requirement)
         result = gateway.call('work_document', {'goal': 'Explain the source'}, identity='citation')
         self.assertTrue(result.ok, result.error)
         bibliography = workspace.resolve('workspace/document-work/citation/references.bib').read_text(encoding='utf-8')
@@ -394,7 +394,7 @@ class DocumentWorkTests(unittest.TestCase):
         client = Client(ledger, 'backtrack', None)
         gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
             material_roots=lambda: ['source0'], sources=SourceToolGateway(root, workspace, ledger),
-            context_policy='working.v3', report_requirement=requirement)
+            context_policy='working.v4', report_requirement=requirement)
         from simple_ar.core.capabilities import ArtifactStore
         write = ArtifactStore.write_json
         def interrupt_after_reads(owner, path, payload, **options):
@@ -470,7 +470,7 @@ class DocumentWorkTests(unittest.TestCase):
         gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
             material_roots=lambda: ['source0'], work_context=lambda _: {'user_requests': ['Explain the observed result'],
                 'requested_report': {'template': template.template_markdown}},
-            context_policy='working.v3', report_requirement=requirement)
+            context_policy='working.v4', report_requirement=requirement)
         from simple_ar.core.capabilities import ArtifactStore
         write = ArtifactStore.write_json
         def interrupt_assembly(owner, path, *args, **kwargs):
@@ -555,7 +555,7 @@ class DocumentWorkTests(unittest.TestCase):
 
         client = Client(ledger, 'sections', None)
         gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
-            material_roots=lambda: ['source0'], context_policy='working.v3', report_requirement=requirement)
+            material_roots=lambda: ['source0'], context_policy='working.v4', report_requirement=requirement)
         from simple_ar.core.capabilities import ArtifactStore
         write = ArtifactStore.write_json
         def interrupt_checkpoint(owner, path, payload, **options):
@@ -608,7 +608,7 @@ class DocumentWorkTests(unittest.TestCase):
 
         gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session',
             client_factory=lambda identity: Client(ledger, identity, None),
-            material_roots=lambda: ['source0'], context_policy='working.v3', report_requirement=requirement)
+            material_roots=lambda: ['source0'], context_policy='working.v4', report_requirement=requirement)
         arguments = {'goal': 'Write the requested brief'}
         result = gateway.call('work_document', arguments, identity='partial-report')
         self.assertFalse(result.ok)
@@ -679,7 +679,7 @@ class DocumentWorkTests(unittest.TestCase):
                 return response
         gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session',
             client_factory=lambda identity: Client(ledger, identity, None),
-            material_roots=lambda: ['source0'], context_policy='working.v3', report_requirement=requirement)
+            material_roots=lambda: ['source0'], context_policy='working.v4', report_requirement=requirement)
         result = gateway.call('work_document', {'goal': 'Write the requested brief'}, identity='unknown-report')
         self.assertFalse(result.ok)
         self.assertIn('partial_manuscript', result.data)
@@ -720,7 +720,7 @@ class DocumentWorkTests(unittest.TestCase):
         client = Client(ledger, 'revision', None)
         gateway = DocumentWorkToolGateway(root, workspace, ledger, 'session', client_factory=lambda _: client,
             material_roots=lambda: ['source0'], work_context=lambda _: {'user_requests': ['Qualify the claim']},
-            context_policy='working.v3', report_requirement=requirement)
+            context_policy='working.v4', report_requirement=requirement)
         result = gateway.call('work_document', {'goal': 'Qualify the claim', 'prior_draft': 'source0/draft.md',
             'prior_sha256': sha(previous.read_bytes())}, identity='revision')
         self.assertTrue(result.ok, result.error)
@@ -770,7 +770,7 @@ class DocumentWorkTests(unittest.TestCase):
                 'selected_observation_ids': [observations['material_window']]}
 
         gateway, clients = self.gateway(root, source, ledger, workspace, decide, context=context)
-        gateway.context_policy = 'working.v2'
+        gateway.context_policy = 'working.v4'
         from simple_ar.core.capabilities import ArtifactStore
         write = ArtifactStore.write_json
         def interrupt_candidate(owner, path, *args, **kwargs):
@@ -822,6 +822,7 @@ class DocumentWorkTests(unittest.TestCase):
 
     def test_shared_context_keeps_large_observation_history_without_a_cumulative_read_gate(self):
         root, source, ledger, workspace = self.workspace()
+        ledger.limits['total_tokens'] = 400_000
         for number in range(1, 6):
             (source / f'part-{number}.txt').write_text(str(number) * 40000, encoding='utf-8')
 
@@ -839,7 +840,7 @@ class DocumentWorkTests(unittest.TestCase):
                 'selected_observation_ids': [f'o{i}' for i in range(1, 6)]}
 
         gateway, clients = self.gateway(root, source, ledger, workspace, decide)
-        gateway.context_policy = 'working.v1'
+        gateway.context_policy = 'working.v4'
         from simple_ar.core.capabilities import ArtifactStore
         write = ArtifactStore.write_json
         def interrupt_candidate(owner, path, *args, **kwargs):
@@ -933,7 +934,7 @@ class DocumentWorkTests(unittest.TestCase):
         root, source, ledger, workspace = self.workspace()
         gateway, clients = self.gateway(root, source, ledger, workspace,
             lambda *_: self.fail('An overflowing required input cannot buy a response'))
-        gateway.context_policy = 'working.v1'
+        gateway.context_policy = 'working.v4'
         factory = gateway.client_factory
         def constrained(identity):
             client = factory(identity)

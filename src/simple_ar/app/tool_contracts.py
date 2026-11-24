@@ -32,8 +32,8 @@ _SHARED_OWNERS = 'owners.v2'
 _ADOPTING_OWNERS = 'owners.v3'
 _REQUEST_OWNER = 'requests.v1'
 _DECLARED_INPUTS = 'declared_inputs.v1'
-_WORKING_CONTEXT_PROTOCOLS = {'working.v1', 'working.v2', 'working.v3', 'working.v4'}
-_REFERENCED_CONTEXT_PROTOCOLS = {'working.v2', 'working.v3', 'working.v4'}
+_WORKING_CONTEXT_PROTOCOLS = {'working.v4'}
+_REFERENCED_CONTEXT_PROTOCOLS = {'working.v4'}
 _CONVERSATION_CONTEXT_PROTOCOLS = {'conversation.v1', *_WORKING_CONTEXT_PROTOCOLS}
 _CONTEXT_PROTOCOLS = {None, *_CONVERSATION_CONTEXT_PROTOCOLS}
 

@@ -488,7 +488,7 @@ class _ToolConfigMixin:
                creation_declarations: dict[str, Any] | None = None,
                verify_creation: Callable[[tuple[dict[str, Any], list, dict[str, Any], int]], None] | None = None,
                initialize_session: Callable[[SessionController], None] | None = None,
-               context_protocol: Literal['auto', 'conversation.v1', 'working.v1', 'working.v2', 'working.v3', 'working.v4'] | None = 'auto') -> ToolApplication:
+               context_protocol: Literal['auto', 'conversation.v1', 'working.v4'] | None = 'auto') -> ToolApplication:
         """Create work on the operation-composed loop.
 
         Historical professional controllers are load-only. Loading and supply
@@ -964,8 +964,7 @@ class _ToolConfigMixin:
                 # Supplying a report is an explicit new request: route its new
                 # document work to the same Writer used at task creation.
                 # Started operations retain their own saved document contract.
-                config['document_context_policy'] = ('working.v4' if old.get('document_context_policy') == 'working.v4'
-                    else 'working.v3')
+                config['document_context_policy'] = 'working.v4'
             if supplied.get('sandbox_execution') is True and old.get('control_protocol') == 'operations.v1':
                 # Explicitly granting isolation is a new execution contract;
                 # supply cancels unstarted work and never rewrites started work.

@@ -9,9 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Saved method identities select behavior; loading never upgrades an old task.
 GOAL_WORK_METHOD = 'goal.v2'
-CLAIM_WORK_METHODS = frozenset({'execute.v2', 'execute.v3', GOAL_WORK_METHOD})
-EXECUTABLE_WORK_METHODS = frozenset({'execute.v1', *CLAIM_WORK_METHODS})
-NATIVE_WORK_METHODS = EXECUTABLE_WORK_METHODS | {'goal.v1'}
+CLAIM_WORK_METHODS = frozenset({'execute.v3', GOAL_WORK_METHOD})
+EXECUTABLE_WORK_METHODS = CLAIM_WORK_METHODS
+NATIVE_WORK_METHODS = CLAIM_WORK_METHODS
 CURRENT_WORK_METHOD = GOAL_WORK_METHOD
 MODEL_REVIEW_SELECTIONS = frozenset({'model.v3'})
 # Native work-unit projection is shared; v5 also permits an explicitly

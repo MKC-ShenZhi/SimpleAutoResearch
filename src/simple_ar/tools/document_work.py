@@ -256,7 +256,7 @@ class DocumentWorkToolGateway:
                  material_roots: Callable[[], list[str]] | None = None,
                  sources: Any | None = None, context_policy: str | None = None,
                  report_requirement: dict | None = None) -> None:
-        if context_policy not in (None, 'working.v1', 'working.v2', 'working.v3', 'working.v4'):
+        if context_policy not in (None, 'working.v4'):
             raise ValueError('Unknown document context policy')
         self.context_policy = context_policy
         self.report_requirement = report_requirement
@@ -634,9 +634,8 @@ class DocumentWorkToolGateway:
             excluded_paths=source_paths | ({prior_path} if prior_path else set()),
             **({'remaining_bytes': context_input_tokens * 4}
                if self.context_policy else {}))
-        contract = (_REPORT_CONTRACT if self.context_policy in {'working.v3', 'working.v4'} and self.report_requirement is not None else
-                    'document_work_operation.v5' if self.context_policy in {'working.v2', 'working.v3', 'working.v4'} else
-                    'document_work_operation.v4' if self.context_policy else 'document_work_operation.v3')
+        contract = (_REPORT_CONTRACT if self.context_policy == 'working.v4' and self.report_requirement is not None else
+                    'document_work_operation.v5' if self.context_policy == 'working.v4' else 'document_work_operation.v3')
         binding = {'contract': contract,
             'request_sha256': _digest(request.model_dump(mode='json')),
             'context': base, 'inventories': inventories, 'seed': seed}
