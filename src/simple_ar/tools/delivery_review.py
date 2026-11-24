@@ -34,11 +34,9 @@ def delivery_claim(request: DeliveryRequest, artifacts: list[str], resolve: Call
 
 def delivery_requires_review(request: DeliveryRequest, protocol: str) -> bool:
     """Saved delivery admission and capacity obligation; partial remains an exit."""
-    if protocol not in {'task.v1', 'task.v2', 'task.v3', 'task.v4', 'task.v5'}:
+    if protocol != 'task.v5':
         raise ValueError('Unknown delivery review protocol')
-    return not request.unresolved and (protocol in {'task.v3', 'task.v4', 'task.v5'} or (
-        request.report is not None and request.report.status == 'canonical'
-        and bool(request.report.manuscript)))
+    return not request.unresolved
 
 
 def selected_delivery_review(workspace: Any, request: DeliveryRequest | None, observations: list[dict], *,
@@ -110,28 +108,18 @@ def prepare_delivery_review(workspace: Any, request: DeliveryRequest, artifacts:
     """
     if not candidate and not delivery_requires_review(request, protocol):
         return None
-    if candidate and protocol not in {'task.v3', 'task.v4', 'task.v5'}:
-        raise ValueError('Candidate investigation requires the whole-work review contract')
+    if protocol != 'task.v5':
+        raise ValueError('Unsupported delivery review protocol')
     artifacts = sorted({str(workspace.resolve(path)) for path in artifacts})
     requests = user_requests()
     if not isinstance(requests, list) or any(not isinstance(text, str) for text in requests):
         raise ValueError('Delivery review requires exact original request and feedback strings')
-    if protocol in {'task.v3', 'task.v4', 'task.v5'}:
-        claim = delivery_claim(request, artifacts, workspace.resolve)
-        return {'schema_version': 'delivery_review.v3',
-                **({'purpose': 'candidate', 'unfinished': list(request.unresolved)} if candidate else {}),
-                **({'scope_policy': 'applicable.v2' if protocol == 'task.v5' else 'applicable.v1'}
-                   if protocol in {'task.v4', 'task.v5'} else {}),
-                'requests': list(requests),
-                'claim': claim,
-                'authorized_roots': {name: str(path) for name, path in workspace.mounts.items()},
-                'artifacts': workspace.artifact_hashes(artifacts)}
-    manuscript = str(workspace.resolve(request.report.manuscript))
-    if manuscript not in artifacts:
-        raise ValueError('Delivery review requires the actual manuscript among delivered artifacts')
-    return {'schema_version': 'delivery_review.v2' if protocol == 'task.v2' else 'delivery_review.v1',
+    claim = delivery_claim(request, artifacts, workspace.resolve)
+    return {'schema_version': 'delivery_review.v3',
+            **({'purpose': 'candidate', 'unfinished': list(request.unresolved)} if candidate else {}),
+            'scope_policy': 'applicable.v2',
             'requests': list(requests),
-            'manuscript': manuscript, 'formats': sorted(set(request.report.formats)),
+            'claim': claim,
             'authorized_roots': {name: str(path) for name, path in workspace.mounts.items()},
             'artifacts': workspace.artifact_hashes(artifacts)}
 
@@ -323,10 +311,10 @@ def recorded_delivery_review(reader: Any) -> dict | None:
 class DeliveryReview:
     def __init__(self, workspace: Any, inspector: Any, *,
                  observations: Callable[[], list[dict]] | None = None,
-                 protocol: str = 'task.v1', track_findings: bool = False,
+                 protocol: str = 'task.v5', track_findings: bool = False,
                  include_package_feedback: bool = True,
                  supply_work_feedback: bool = False, compact_work_feedback: bool = False) -> None:
-        if protocol not in {'task.v1', 'task.v2', 'task.v3', 'task.v4', 'task.v5'}:
+        if protocol != 'task.v5':
             raise ValueError('Unknown delivery review protocol')
         self.workspace, self.inspector = workspace, inspector
         self.observations = observations
@@ -567,9 +555,8 @@ class DeliveryReview:
         return result
 
     def _validate_scope(self, binding: dict) -> None:
-        if (applicable_delivery_scope(binding) != (self.protocol in {'task.v4', 'task.v5'})
-                or self.protocol in {'task.v4', 'task.v5'} and binding.get('scope_policy') != (
-                    'applicable.v2' if self.protocol == 'task.v5' else 'applicable.v1')):
+        if (not applicable_delivery_scope(binding)
+                or binding.get('scope_policy') != 'applicable.v2'):
             raise ValueError('Delivery scope policy differs from the saved review protocol')
 
     def _reassessed_ids(self, identity: str, assessment: _DeliveryAssessment) -> list[str]:
@@ -1217,7 +1204,7 @@ class DeliveryReview:
                 return [*self._result_issues(result, binding),
                         *self._concern_issues(observations, binding)] if self.track_findings else self._result_issues(result, binding)
             return [('Current delivery lacks a complete independent whole-delivery review'
-                     if self.protocol in {'task.v3', 'task.v4', 'task.v5'} else
+                     if self.protocol == 'task.v5' else
                      'Current canonical delivery lacks a complete independent whole-delivery review')]
         except _ERRORS as exc:
             return ['Delivery review cannot be verified: ' + str(exc)]

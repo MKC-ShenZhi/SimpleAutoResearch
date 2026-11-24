@@ -186,7 +186,7 @@ class ToolApplication(_ToolConfigMixin, _ToolMemoryMixin, _ToolLegacyMixin, _Too
         if config.get('memory_protocol') and (config.get('context_protocol') != 'working.v4'
                 or config.get('professional_operations') not in RETAINED_PROFESSIONAL_CONTRACTS):
             raise ValueError('Journal continuity requires the saved shared native work context')
-        if config.get('delivery_review_protocol') not in {None, 'task.v1', 'task.v2', 'task.v3', 'task.v4', 'task.v5'}:
+        if config.get('delivery_review_protocol') not in {None, 'task.v5'}:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
         if config.get('delivery_review_selection') not in {None, *MODEL_REVIEW_SELECTIONS}:
             raise ValueError('Unsupported saved delivery review selection')
@@ -200,7 +200,7 @@ class ToolApplication(_ToolConfigMixin, _ToolMemoryMixin, _ToolLegacyMixin, _Too
         if ('independent_review_required' in config
                 and (type(config['independent_review_required']) is not bool
                      or config['independent_review_required'] and config.get('delivery_review_protocol')
-                         not in {'task.v3', 'task.v4', 'task.v5'})):
+                         != 'task.v5')):
             raise ValueError('The required review needs the shared whole-delivery review contract')
         if (config.get('candidate_review_protocol') not in {None, 'candidate.v1'}
                 or config.get('candidate_review_protocol') is not None and (
@@ -219,7 +219,7 @@ class ToolApplication(_ToolConfigMixin, _ToolMemoryMixin, _ToolLegacyMixin, _Too
             raise ValueError('Unsupported saved inspection finding policy; no silent migration')
         if (config.get('inspection_finding_policy') == 'linked.v1'
                 and (config.get('inspection_coverage_policy') != 'offered.v2'
-                     or config.get('delivery_review_protocol') not in {'task.v3', 'task.v4', 'task.v5'})):
+                     or config.get('delivery_review_protocol') != 'task.v5')):
             raise ValueError('Linked findings require shared inspection and delivery review')
         if (config.get('inspection_coverage_policy') == 'offered.v2'
                 and (config.get('inspection_protocol') != 'subjects.v3'

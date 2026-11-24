@@ -531,7 +531,7 @@ class _InspectionEvidenceMixin:
         prefix = source_prefix if source_record else None
         if prefix is None and not source.get('record'):
             prefix = nested if binding.get('schema_version') in {
-                'delivery_review.v1', 'delivery_review.v2', 'delivery_review.v3'} else ''
+                'delivery_review.v3'} else ''
         result = cls.coordination_result(ToolResult.model_validate(feedback['result']),
             receipt_path=record, receipt_prefix=prefix)
         subjects = feedback.get('subjects', [])

@@ -168,7 +168,7 @@ def _work_principles(owned_delivery: bool = False, automatic_memory: bool = Fals
     "remain evidence. ")
     + ("Work in complete useful units: investigate enough, implement and run when needed, interpret "
        "the result and deliver; do not repeatedly recheck an unchanged result without a concrete gap. "
-       if delivery_protocol in {'task.v3', 'task.v4', 'task.v5'} else
+       if delivery_protocol == 'task.v5' else
        "Work in complete useful units: investigate enough, implement and run, interpret the "
        "result, then inspect and deliver; do not repeatedly recheck an unchanged result without a concrete gap. ")
     + ("Submit the prepared proposed delivery and actual artifacts when the requested work is ready. "
@@ -177,23 +177,7 @@ def _work_principles(owned_delivery: bool = False, automatic_memory: bool = Fals
        "every file by default. Preserve capacity for checks; address genuine required findings and "
        "disclose unfinished work as unresolved. Local checks may inform the investigation but do not "
        "automatically certify the complete task. "
-       if delivery_protocol in {'task.v4', 'task.v5'} else
-       "Submit the actual completion claim and delivered artifacts when the requested work is ready. "
-       "The delivery owner automatically reviews that claim and the complete bound inventory against "
-       "the original requests before acceptance, using this same ledger, including ordinary code, "
-       "tables and text deliveries without a report claim. Leave shared model capacity for that review. "
-       "Local inspect_artifacts checks are optional investigation aids, not a prerequisite or a substitute; "
-       "do not add a local-then-whole review sequence merely to satisfy completion. Address genuine "
-       "required findings while preserving useful outputs. Disclose unfinished work as unresolved for "
-       "partial delivery; this exit does not start an automatic whole-delivery review or claim completion. "
-       if delivery_protocol == 'task.v3' else
-       "For a formal report, keep one editable manuscript and submit its canonical delivery when the "
-       "requested work is ready; export that same version if PDF/TeX is requested. The delivery owner "
-       "independently reviews the complete requested work and actual delivery inventory before acceptance, "
-       "using this same ledger. Leave shared model capacity for that review. Local inspect_artifacts "
-       "checks are optional aids and cannot substitute for it; do not add a separate review merely to "
-       "satisfy a completion gate. Address genuine required findings, preserving useful outputs. "
-       if owned_delivery else
+       if delivery_protocol == 'task.v5' else
        "For a formal report, keep one editable manuscript, independently inspect it against actual original "
        "evidence using inspect_artifacts, and export that same version if PDF/TeX is requested. Check the "
        "claims and methods, not only agreement between generated text and generated tables. A narrow "
@@ -201,7 +185,7 @@ def _work_principles(owned_delivery: bool = False, automatic_memory: bool = Fals
     + ("For a formal report claim, identify the editable manuscript and requested formats; existing "
        "report and publication rules still apply. Authorized scripts may produce PDF artifacts; "
        "a PDF suffix alone does not make an artifact a formal report. "
-       if delivery_protocol in {'task.v3', 'task.v4', 'task.v5'} else
+       if delivery_protocol == 'task.v5' else
        "A canonical report claim identifies the inspected manuscript and requested formats in the delivery. ")
     + "Fix actual required findings; "
     "a process exit code or files existing is not a scientific or visual certificate. Use image inspection "
@@ -296,7 +280,7 @@ class OperationTools:
         self.root, self.config = root, config
         # Compatibility is selected once from the loaded contract, not exposed
         # as a model option or inferred from report status, paths or contents.
-        legacy_report_status = config.get('delivery_review_protocol') not in {'task.v4', 'task.v5'}
+        legacy_report_status = config.get('delivery_review_protocol') != 'task.v5'
         self.professional = config.get('professional_operations') in PROFESSIONAL_CONTRACTS
         self.observations = observations
         self.user_requests = user_requests
@@ -349,7 +333,7 @@ class OperationTools:
             coverage_policy=config.get('inspection_coverage_policy')),
             self.inspection)
         self.delivery_review = None
-        if config.get('delivery_review_protocol') in {'task.v1', 'task.v2', 'task.v3', 'task.v4', 'task.v5'}:
+        if config.get('delivery_review_protocol') == 'task.v5':
             from simple_ar.tools.delivery_review import DeliveryReview
             self.delivery_review = DeliveryReview(workspace=self.workspace, inspector=self.inspection,
                 observations=observations,

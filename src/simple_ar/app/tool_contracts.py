@@ -404,7 +404,7 @@ def _review_requirement(config: dict[str, Any], required: bool) -> dict[str, Any
     if type(required) is not bool:
         raise ValueError('Independent review selection must be a boolean')
     if required and (config.get('model') is None or config.get('control_protocol') != 'operations.v1'
-            or config.get('delivery_review_protocol') not in {'task.v3', 'task.v4', 'task.v5'}):
+            or config.get('delivery_review_protocol') != 'task.v5'):
         raise ValueError('This task needs a model and shared delivery review to require an independent review')
     updated = {**config, 'independent_review_required': required}
     selection = updated.get('delivery_review_selection')

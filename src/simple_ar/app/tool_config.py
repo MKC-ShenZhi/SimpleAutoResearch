@@ -851,7 +851,7 @@ class _ToolConfigMixin:
                 raise ValueError('Reconcile the started operation before supplying contracts')
             old = json.loads(json.dumps(self.state['config']))
             if (supplied.get('independent_review_required') is True
-                    and old.get('delivery_review_protocol') not in {'task.v3', 'task.v4', 'task.v5'}):
+                    and old.get('delivery_review_protocol') != 'task.v5'):
                 raise ValueError('This saved task has no shared whole-delivery review contract')
             if _runtime_bindings(self.services) != old.get('runtime_dependencies', {}):
                 raise ValueError('Restore unchanged runtime dependencies before supplying new contracts')

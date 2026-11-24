@@ -100,7 +100,7 @@ class Delivery:
         self.config, self.observations, self.user_requests = config, observations, user_requests
         self.user_request_count = user_request_count
         self.review_request_start = review_request_start
-        self.legacy_report_status = config.get('delivery_review_protocol') not in {'task.v4', 'task.v5'}
+        self.legacy_report_status = config.get('delivery_review_protocol') != 'task.v5'
 
     def _committed_review(self, request: DeliveryRequest | None, observations: list[dict]) -> bool:
         return selected_delivery_review(self.workspace, request, observations,
@@ -363,7 +363,7 @@ class Delivery:
         # to domain owners and applicability to DeliveryReview. Old process path
         # ownership cannot re-certify an ordinary edited delivery. Saved contracts
         # retain both their producer gate and its publication-input exception.
-        if self.config.get('delivery_review_protocol') not in {'task.v4', 'task.v5'}:
+        if self.config.get('delivery_review_protocol') != 'task.v5':
             try:
                 conversion_inputs = self.publication.conversion_inputs(observations, resolved['artifacts'])
                 self.workspace.check_artifact_producers((path for path in resolved['artifacts']
@@ -385,7 +385,7 @@ class Delivery:
         scoped_review = self.requires_review(request, observations=observations)
         direct = (not scoped_review and self.config.get('delivery_review_selection') in MODEL_REVIEW_SELECTIONS
                   and request.independent_review is False)
-        package_review = scoped_review and self.review_owner.protocol in {'task.v3', 'task.v4', 'task.v5'}
+        package_review = scoped_review and self.review_owner.protocol == 'task.v5'
         # Admission need not already have the review it is about to perform.
         # The whole-work owner reconsiders retained local opinions against this
         # exact claim and inventory; a second local gate would force duplicate
@@ -501,7 +501,7 @@ class Delivery:
         metadata = payload.setdefault('metadata', {})
         hashes = self.workspace.delivery_hashes(delivery, metadata.get('delivery_hashes'))
         package_review = (self.review_owner is not None
-            and self.review_owner.protocol in {'task.v3', 'task.v4', 'task.v5'})
+            and self.review_owner.protocol == 'task.v5')
         if package_review and request.summary_source is not None:
             delivery['summary'] = self.workspace.delivery_summary(delivery, hashes)
         if not candidate and not self.requires_review(request, observations=observations):

@@ -510,7 +510,7 @@ class _InspectionMessagesMixin:
                     selected_paths=[row['path'] for row in saved['targets']]
                         + (list(saved['delivery_context']['artifacts']) if
                             saved.get('delivery_context', {}).get('schema_version') in
-                                {'delivery_review.v2','delivery_review.v3'} else []))),
+                                {'delivery_review.v3'} else []))),
                 'processed_turns':processed_journal_turns(journal_rows, memory['compacted_records']),
                 **({'archived_turns':processed_journal_turns(journal_rows, memory.get('archived_records', ())) }
                    if economic and saved.get('work_method') in NATIVE_WORK_METHODS else {})
@@ -1381,7 +1381,7 @@ class _InspectionMessagesMixin:
             size, cursor = window['size_bytes'], window['review_next_offset_bytes']
             count = size - cursor
             # Historical owners retain their original one-read allocation.
-            bound = (256000 if saved.get('delivery_context', {}).get('schema_version') == 'delivery_review.v2'
+            bound = (256000 if False
                 else 64000)
             if not 0 < count <= min(bound, remaining[0], headroom):
                 continue
@@ -1489,7 +1489,7 @@ class _InspectionMessagesMixin:
             self._prime_originals(saved, request, identity, remaining, client, offered,
                 originals, priority=priority, leave_read_window=not terminal_only)
             return
-        if not self.adaptive or delivery.get('schema_version') not in {'delivery_review.v2','delivery_review.v3'}:
+        if not self.adaptive or delivery.get('schema_version') != 'delivery_review.v3':
             return
         targets = {row['path'] for row in saved['targets']}
         if saved.get('source_priming_policy') not in _PRIORITY_SOURCE_POLICIES:

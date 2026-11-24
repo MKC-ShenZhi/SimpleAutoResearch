@@ -1528,7 +1528,7 @@ class InspectionToolGateway(_InspectionEvidenceMixin, _InspectionMessagesMixin):
             if delivery_context is not None:
                 if (not isinstance(delivery_context, dict)
                         or delivery_context.get('schema_version') not in
-                            {'delivery_review.v1', 'delivery_review.v2', 'delivery_review.v3'}):
+                            {'delivery_review.v3'}):
                     raise ValueError('Delivery inspection requires its owner-bound context')
                 saved['delivery_context'] = deepcopy(delivery_context)
                 if applicable and self.work_method in CLAIM_WORK_METHODS and self.finding_policy == 'linked.v1':

@@ -580,7 +580,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.app = None
 
     def _create(self, *, report=False, allow_execution=True, delivery_files=None, context_protocol='auto', goal=None,
-                saved_scope=False, delivery_protocol='task.v4', current_method=False, selection_policy=None,
+                saved_scope=False, delivery_protocol='task.v5', current_method=False, selection_policy=None,
                 professional_contract='work.v5', tool_contracts='full'):
         if saved_scope:
             from tests.native_history_fixture import load_prepared_operation_history
@@ -589,7 +589,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     'model_connection':self.services.llm_client.connection_binding(),
                     'professional_operations':'work.v4', 'source_generation_protocol':None,
                     'source_decision_protocol':None, 'context_protocol':'working.v4',
-                    'delivery_review_protocol':'task.v1', 'publication_assets':'referenced.v2',
+                    'delivery_review_protocol':'task.v5', 'publication_assets':'referenced.v2',
                     'allow_execution':allow_execution, 'tool_contracts':'full', 'max_turns':70},
                 limits={'llm_requests':70, 'total_tokens':900000,
                     'process_invocations':48, 'process_wall_seconds':360},
@@ -3664,7 +3664,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             config={'model': 'fixture', 'sources': {'measurements': self.inputs},
                 'professional_operations': 'work.v2', 'source_generation_protocol': None,
                 'source_decision_protocol': None, 'context_protocol': 'working.v2',
-                'delivery_review_protocol': 'task.v1', 'tool_contracts': 'full', 'max_turns': 30},
+                'delivery_review_protocol': 'task.v5', 'tool_contracts': 'full', 'max_turns': 30},
             limits={'llm_requests': 30, 'total_tokens': 300000}, max_attempts=70, services=self.services)
         self._document_work_chain()
 
@@ -5448,7 +5448,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 'model_connection':self.services.llm_client.connection_binding(),
                 'professional_operations':'work.v5', 'source_generation_protocol':None,
                 'source_decision_protocol':None, 'context_protocol':'working.v4',
-                'delivery_review_protocol':'task.v1', 'inspection_coverage_policy':'offered.v2',
+                'delivery_review_protocol':'task.v5', 'inspection_coverage_policy':'offered.v2',
                 'inspection_execution_protocol':'shared.v1', 'inspection_finding_policy':None,
                 'allow_execution':True, 'tool_contracts':'full', 'max_turns':70},
             limits={'llm_requests':70, 'total_tokens':900000,
