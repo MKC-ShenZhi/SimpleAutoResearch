@@ -45,19 +45,13 @@ def selected_delivery_review(workspace: Any, request: DeliveryRequest | None, ob
                              selection: str | None, completions: dict | None,
                              request_start: Callable[[], int] | None = None) -> bool:
     """Keep a selected whole-delivery review with the work it actually covered."""
-    if selection not in {'model.v2', 'model.v3'}:
+    if selection != 'model.v3':
         return False
     first = request_start() if request_start is not None else None
     selected = None
     for row in reversed(observations):
         current = row.get('current_request', True) if first is None else row.get('request_count', 1) >= first
         if not current:
-            continue
-        if selection == 'model.v2':
-            completion = tool_completion(row.get('tool_name', ''), completions)
-            if (completion is not None and completion.kind == 'review'
-                    and (row.get('arguments') or {}).get('review_scope') == 'delivery'):
-                return True  # Preserve the saved request-wide contract.
             continue
         if request is None:
             return False

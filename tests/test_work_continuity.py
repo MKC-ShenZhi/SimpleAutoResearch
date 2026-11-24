@@ -169,7 +169,7 @@ class SelectedWorkContinuityTests(unittest.TestCase):
                 'scope_policy': 'applicable.v2', 'artifacts': {str(copied): digest}},
             'targets': [{'subject': 'target-1', 'path': str(copied), 'sha256': digest,
                 'readable': True, 'complete': False, 'windows': []}], 'evidence': [],
-            'source_priming_policy': 'priority.v3', 'source_provenance': 'versions.v2',
+            'source_priming_policy': 'priority.v4', 'source_provenance': 'versions.v2',
             'execution_protocol': 'shared.v2', 'identity': 'fresh-review'}
         inspector = fresh.operations.inspection
         historical = deepcopy(saved)

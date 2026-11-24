@@ -584,10 +584,7 @@ class OperationTools:
         guidance = (' For a completed delivery, set independent_review=false only when the request and result '
             'do not need independent review. Keep independent review when the user requests it or the result needs a separate '
             'assessment. Omit the field to use the default review; this choice cannot waive an unresolved finding.')
-        if self.config.get('delivery_review_selection') == 'model.v2':
-            guidance += (' A selected delivery-scope review remains part of this request; '
-                'candidate-scope investigations do not require a final review.')
-        elif self.config.get('delivery_review_selection') == 'model.v3':
+        if self.config.get('delivery_review_selection') == 'model.v3':
             guidance += ' A selected delivery-scope review remains associated with that work.'
         return guidance
 

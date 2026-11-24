@@ -104,7 +104,7 @@ class InspectionToolGateway(_InspectionEvidenceMixin, _InspectionMessagesMixin):
             raise ValueError('Unknown inspection context authority')
         if execution_protocol not in (None, *_SHARED_EXECUTION_PROTOCOLS):
             raise ValueError('Unknown inspection execution protocol')
-        if coverage_policy not in (None, 'offered.v1', 'offered.v2'):
+        if coverage_policy not in (None, 'offered.v2'):
             raise ValueError('Unknown inspection coverage policy')
         if finding_policy not in (None, 'linked.v1'):
             raise ValueError('Unknown inspection finding policy')
@@ -191,9 +191,9 @@ class InspectionToolGateway(_InspectionEvidenceMixin, _InspectionMessagesMixin):
     @staticmethod
     def _offered_coverage(saved: dict) -> bool:
         policy = saved.get('coverage_policy')
-        if policy not in (None, 'offered.v1', 'offered.v2'):
+        if policy not in (None, 'offered.v2'):
             raise ValueError('Unknown saved inspection coverage policy')
-        return policy in {'offered.v1', 'offered.v2'}
+        return policy == 'offered.v2'
 
     def _system(self, saved: dict) -> str:
         if saved.get('execution_protocol') == 'shared.v2':
@@ -1510,8 +1510,7 @@ class InspectionToolGateway(_InspectionEvidenceMixin, _InspectionMessagesMixin):
                 if self.operation_specs is None or self.operation_call is None:
                     raise ValueError('Shared inspection requires the actual operation specs and operation gateway')
                 saved['execution_protocol'] = self.execution_protocol
-                saved['source_priming_policy'] = ('priority.v4' if self.material_policy == 'operations.v3'
-                    else 'priority.v2')
+                saved['source_priming_policy'] = 'priority.v4'
                 saved['source_provenance'] = 'versions.v2'
                 if self.material_policy == 'operations.v3':
                     saved['inspection_destinations'] = 'work-relative.v1'
@@ -1637,7 +1636,7 @@ class InspectionToolGateway(_InspectionEvidenceMixin, _InspectionMessagesMixin):
                             if path in artifacts and Path(path).suffix.lower() not in _BINARY:
                                 size = self.workspace.resolve(path).stat().st_size
                                 priority[path] = max(priority.get(path, 0), min(window, size))
-                    if priority or saved.get('source_priming_policy') in {'priority.v2', 'priority.v3', 'priority.v4'}:
+                    if priority or saved.get('source_priming_policy') == 'priority.v4':
                         reserve = min(remaining[0], window + sum(priority.values()))
                         reusable = [remaining[0] - reserve]
                 if self.adaptive and self.material_observations is not None:

@@ -1609,7 +1609,7 @@ class _InspectionEvidenceMixin:
                 break
         owners = {(row['path'], row['sha256']):row for row in saved['evidence'] if row.get('sha256')}
         selected_paths = None
-        if saved.get('source_priming_policy') in {'priority.v3', 'priority.v4'}:
+        if saved.get('source_priming_policy') == 'priority.v4':
             selected_paths = {row['path'] for row in [*saved['targets'], *saved['evidence']]
                 if row.get('path')}
             if 'delivery_context' in saved:

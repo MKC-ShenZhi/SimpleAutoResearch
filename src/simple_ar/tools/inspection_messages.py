@@ -470,7 +470,7 @@ class _InspectionMessagesMixin:
             if row['result'].get('tool_name') in {'run_process', 'inspect_images'}]
             if continuity and saved.get('inspection_material_policy') in _WORK_MATERIAL_POLICIES else [])
         if execution_facts is not None:
-            if saved.get('source_priming_policy') in {'priority.v3', 'priority.v4'}:
+            if saved.get('source_priming_policy') == 'priority.v4':
                 selected_records.extend(self._relevant_execution_sources(saved, execution_facts))
             else:
                 pending = {path for finding in saved['prior_required'] for path in finding['pending_subjects']}
@@ -1100,7 +1100,7 @@ class _InspectionMessagesMixin:
                 execution_facts = self._execution_facts(saved, retained=parents)
             facts = {value['source_record']:record for record,value in execution_facts.items()}
             relevant = (self._relevant_execution_sources(saved, execution_facts)
-                if saved.get('source_priming_policy') in {'priority.v3', 'priority.v4'} else None)
+                if saved.get('source_priming_policy') == 'priority.v4' else None)
             for parent in parents:
                 observations.extend({'record':row['record'],
                     'kind':'operation_result', 'role':'historical_observation',
@@ -1433,7 +1433,7 @@ class _InspectionMessagesMixin:
             # This contract primes the whole delivery, so its other originals
             # must get a window before a long manuscript consumes the input.
             return list(dict.fromkeys([*primary, *artifacts]))
-        if saved.get('source_priming_policy') in {'priority.v2', 'priority.v3', 'priority.v4'} and len(saved['delivery_context']['artifacts']) > 1:
+        if saved.get('source_priming_policy') == 'priority.v4' and len(saved['delivery_context']['artifacts']) > 1:
             # A multi-file inventory does not identify which sources answer
             # the claim. The inspector can select other files when needed.
             return primary

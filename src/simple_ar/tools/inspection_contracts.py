@@ -20,7 +20,7 @@ class _InspectionDispatchRaised(BaseException):
 
 
 _SHARED_EXECUTION_PROTOCOLS = frozenset({'shared.v1', 'shared.v2'})
-_PRIORITY_SOURCE_POLICIES = frozenset({'priority.v1', 'priority.v2', 'priority.v3', 'priority.v4'})
+_PRIORITY_SOURCE_POLICIES = frozenset({'priority.v4'})
 _PRESENTED_EVIDENCE_POLICIES = frozenset({'presented.v6'})
 
 SHARED_INSPECTION_OPERATIONS = frozenset({'read_file', 'list_directory', 'search_files', 'compile_python',

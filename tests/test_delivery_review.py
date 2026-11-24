@@ -834,7 +834,7 @@ class DeliveryFindingContractTests(unittest.TestCase):
             publication=SimpleNamespace(check_requested_delivery=lambda *args, **kwargs: None,
                 conversion_inputs=lambda *args: set()),
             review_owner=self.owner, config={'delivery_review_protocol': 'task.v3',
-                'delivery_review_selection': 'model.v1'},
+                'delivery_review_selection': 'model.v3'},
             observations=lambda: self.observations, user_requests=lambda: self.requests)
         issues = owner.issues(self.observations, {**self.delivery, 'independent_review': False})
         self.assertTrue(any('Check the original sample scope' in item for item in issues), issues)
@@ -1434,20 +1434,11 @@ class InspectionOfferCoverageTests(unittest.TestCase):
         self.assertEqual(assessment['scope'], {'start':len(actual_lines[0]),
             'end':len(b''.join(actual_lines[:3])), 'size_bytes':len(b''.join(actual_lines))})
 
-        # A previously saved task keeps its own policy, even when resumed on
-        # a newer application. Its recorded opinion is never upgraded.
+        # Retired offered.v1 coverage policy is rejected explicitly on load.
         self.case.app.state['config']['inspection_coverage_policy'] = 'offered.v1'
-        self.case.app.state['config'].pop('inspection_finding_policy')
         self.case.app._save()
-        self.case._reload()
-        old = self.case._inspect([target], [])
-        self.assertEqual((_assessments(old)[0]['coverage'], _assessments(old)[0]['verdict']),
-            ('partial', 'incomplete'))
-        owner = self.case.app.operations.inspection
-        identity = Path(old['data']['record']).parts[1]
-        saved = owner.store.read_json(owner._path(identity, 'input'))
-        owner.coverage_policy = 'offered.v2'
-        self.assertEqual(owner.call('inspect_artifacts', saved['arguments'], identity).model_dump(mode='json'), old)
+        with self.assertRaisesRegex(ValueError, 'Unsupported saved inspection coverage policy'):
+            self.case._reload()
 
     def test_empty_source_and_frozen_coverage_contract(self):
         from tests.test_professional_work_loop import _assessments

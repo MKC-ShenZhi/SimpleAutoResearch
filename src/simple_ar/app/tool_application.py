@@ -207,7 +207,7 @@ class ToolApplication(_ToolConfigMixin, _ToolMemoryMixin, _ToolLegacyMixin, _Too
                     config.get('work_method') != GOAL_WORK_METHOD
                     or config.get('delivery_review_protocol') != 'task.v5')):
             raise ValueError('Unsupported saved candidate review request contract; no silent migration')
-        if config.get('inspection_coverage_policy') not in {None, 'offered.v1', 'offered.v2'}:
+        if config.get('inspection_coverage_policy') not in {None, 'offered.v2'}:
             raise ValueError('Unsupported saved inspection coverage policy; no silent migration')
         if config.get('working_set_policy') not in {None, 'recent.v4', 'recent.v6'}:
             raise ValueError('Unsupported saved working set policy')
@@ -221,7 +221,7 @@ class ToolApplication(_ToolConfigMixin, _ToolMemoryMixin, _ToolLegacyMixin, _Too
                 and (config.get('inspection_coverage_policy') != 'offered.v2'
                      or config.get('delivery_review_protocol') not in {'task.v3', 'task.v4', 'task.v5'})):
             raise ValueError('Linked findings require shared inspection and delivery review')
-        if (config.get('inspection_coverage_policy') in {'offered.v1', 'offered.v2'}
+        if (config.get('inspection_coverage_policy') == 'offered.v2'
                 and (config.get('inspection_protocol') != 'subjects.v3'
                      or config.get('inspection_execution_protocol') not in {'shared.v1', 'shared.v2'})):
             raise ValueError('Offered inspection coverage requires the shared subject inspection contract')

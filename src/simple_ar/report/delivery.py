@@ -121,7 +121,7 @@ class Delivery:
         # checked candidate merely because its spelling changed.
         if (request.independent_review is not None and (
                 self.config.get('independent_review_required')
-                or self.config.get('delivery_review_selection') in {'model.v2', 'model.v3'} and (
+                or self.config.get('delivery_review_selection') == 'model.v3' and (
                     request.independent_review is True or self._committed_review(request, observations)))):
             request = request.model_copy(update={'independent_review': None})
         return request
@@ -247,8 +247,6 @@ class Delivery:
         if (not self.config.get('independent_review_required')
                 and self.config.get('delivery_review_selection') in MODEL_REVIEW_SELECTIONS
                 and request.independent_review is False):
-            if self.config.get('delivery_review_selection') == 'model.v1':
-                return False
             if observations is None:
                 observations = self.observations()
             if not self._committed_review(request, observations):
@@ -348,9 +346,7 @@ class Delivery:
                 'statement, not a current obligation. Reconsider it against the request and actual work. '
                 + ('The caller requires an independent review before complete delivery. '
                    if caller_requires_review else
-                   ('The selected delivery-scope review remains part of this request. '
-                    if self.config.get('delivery_review_selection') == 'model.v2' else
-                    'The selected delivery-scope review remains applicable to this work. ')
+                   'The selected delivery-scope review remains applicable to this work. '
                    if committed_review else
                    'The planning floor may preserve an opportunity for an optional check; it does not require one. ')
                 + 'This is not a pass or an exact cost forecast. '
@@ -498,7 +494,7 @@ class Delivery:
         """
         producer_declined = request.independent_review is False
         caller_requires_review = self.config.get('independent_review_required')
-        observations = (self.observations() if self.config.get('delivery_review_selection') in {'model.v2', 'model.v3'}
+        observations = (self.observations() if self.config.get('delivery_review_selection') == 'model.v3'
             and producer_declined and not caller_requires_review else None)
         request = self.resolve_request(request, observations or [])
         delivery = self.workspace.resolve_delivery(request, current_outputs=current_outputs)
