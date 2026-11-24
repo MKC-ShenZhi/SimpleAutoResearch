@@ -53,7 +53,7 @@ def rogue(arguments, services):
         # Keep exercising the original outcome contract after new creation moves
         # to native work units. Native service consumers have their own chain test.
         self.case.app.state['config'].update(work_selection_policy='outcomes.v1',
-            work_lifecycle='integrated.v2', inspection_execution_protocol='shared.v1')
+            work_lifecycle='integrated.v3', inspection_execution_protocol='shared.v1')
         self.case.app._save()
         self.case._reload()
         self.assertEqual(self.case.app.state['config']['work_selection_policy'], 'outcomes.v1')

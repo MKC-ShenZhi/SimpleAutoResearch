@@ -87,10 +87,6 @@ class _ToolMessagesMixin:
                     'is independent evidence, not formal delivery. Final acceptance remains unchanged.')
                 if (selection := getattr(self.operations, 'selection', None)) is not None and selection.policy == 'outcomes.v1':
                     exit_text = selection.closing_system
-            if closing and (scope_exit := self.operations.scope_exit_tool()) is not None:
-                exit_text = ('Return the current professional candidate and actual gaps with ' + scope_exit
-                    + ', or ask an indispensable question. Do not propose more work. This returns '
-                    'the scope to coordination; it is not independent acceptance or task delivery.')
             return self.operations.system_text() + ('\n\n'+exit_text if closing else '')
         # Do not append delegation advice to the old do-everything solver role:
         # professional owners now hold the complete investigation-to-result unit.
@@ -187,9 +183,7 @@ class _ToolMessagesMixin:
                 return False
         if not queued or len(queued) > space:
             return False
-        scope_exit = self.operations.scope_exit_tool() if self.operations is not None else None
-        exits = [self._terminal_intent(call) or scope_exit is not None and call['function']['name'] == scope_exit
-                 for call in queued]
+        exits = [self._terminal_intent(call) for call in queued]
         return exits[-1] and sum(exits) == 1
 
     def _last_available_action(self) -> bool:
@@ -279,12 +273,10 @@ class _ToolMessagesMixin:
                 'Other selected operations keep their actual receipts; no work is replayed.')
         elif name == 'compose_document' and binding.get('document_request') is not None:
             try:
-                if binding['document_request'] not in {'work.v1', 'work.v2'}:
+                if binding['document_request'] != 'work.v2':
                     raise ValueError('Unknown saved document request contract')
                 from simple_ar.tools.writing import DocumentWorkRequest
-                request = DocumentWorkRequest.model_validate_json(call['function']['arguments'])
-                if binding['document_request'] == 'work.v1' and request.prior_result:
-                    raise ValueError('prior_result was not supplied by the historical document request contract')
+                DocumentWorkRequest.model_validate_json(call['function']['arguments'])
             except ValueError as exc:
                 error = ('Professional document requests accept an outcome, material roots, prior draft '
                     'and publication/finish options, not coordinator-selected evidence or attachments. '

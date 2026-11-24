@@ -697,7 +697,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         if operation_control:
             # Keep the primitive execution/permission matrix on its saved method.
             # GoalWorkTests cover current selection, automatic handoff and recovery.
-            with patch('simple_ar.app.tool_application.CURRENT_WORK_METHOD', 'execute.v2'):
+            with patch('simple_ar.app.tool_application.CURRENT_WORK_METHOD', 'execute.v3'):
                 app = ToolApplication.create(run_dir / 'native', goal,
                     model='fixture', sources={'source0': inputs} if mount_inputs else {},
                     allow_execution=allow_execution, allow_network=allow_network,

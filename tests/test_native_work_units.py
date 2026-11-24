@@ -65,14 +65,10 @@ class NativeWorkProjectionTests(unittest.TestCase):
 
         context = {'claim': {}, 'scope_policy': 'applicable.v2',
             'artifacts': {'tool.py': 'a' * 64, 'output.pdf': 'b' * 64}}
-        saved = {'delivery_context': context, 'source_priming_policy': 'priority.v2'}
+        saved = {'delivery_context': context, 'source_priming_policy': 'priority.v4'}
         select = InspectionToolGateway._delivery_source_paths
         self.assertEqual(select(saved), [])
-        self.assertEqual(select({**saved, 'source_priming_policy': 'priority.v3'}), [])
-        self.assertEqual(select({**saved, 'source_priming_policy': 'priority.v4'}), [])
-        self.assertEqual(select({**saved, 'source_priming_policy': 'priority.v4'},
-            include_artifacts=True), ['tool.py'])
-        self.assertEqual(select({**saved, 'source_priming_policy': 'priority.v1'}), ['tool.py'])
+        self.assertEqual(select(saved, include_artifacts=True), ['tool.py'])
         one = {**context, 'artifacts': {'tool.py': 'a' * 64}}
         self.assertEqual(select({**saved, 'delivery_context': one}), ['tool.py'])
         named = {**context, 'claim': {'report': {'manuscript': 'tool.py'}}}
@@ -115,7 +111,7 @@ class NativeWorkProjectionTests(unittest.TestCase):
             for name in ('selected.txt', 'supporting.txt')]}
         owner._retained_inputs = lambda _: [parent]
         saved = {'inspection_material_policy': 'operations.v3', 'work_lifecycle': 'integrated.v3',
-            'source_priming_policy': 'priority.v3', 'arguments': {}, 'targets': [], 'evidence': [],
+            'source_priming_policy': 'priority.v4', 'arguments': {}, 'targets': [], 'evidence': [],
             'delivery_context': {'claim': {}, 'artifacts': {'selected.txt': 'version'}}}
         remaining = [100]
         owner._inherit_investigation(saved, {'identity': 'earlier', 'binding': {}, 'arguments': {}}, remaining)

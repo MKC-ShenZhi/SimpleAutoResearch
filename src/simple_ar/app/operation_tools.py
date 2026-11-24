@@ -23,15 +23,8 @@ from simple_ar.app.professional_conversation import RETAINED_PROFESSIONAL_CONTRA
 
 
 PROTOCOL = 'operations.v1'
-PROFESSIONAL_CONTRACTS = {'work.v1': 'source_owner.v1', 'work.v2': 'source_owner.v2',
-                          'work.v3': None, 'work.v4': None, 'work.v5': None,
-                          'work.v6': 'source_owner.v2', 'work.v7': 'source_owner.v2',
-                          'work.v8': 'source_owner.v2', 'work.v9': 'source_owner.v3', 'work.v10': None, 'work.v11': None,
-                          'work.v12': None}
+PROFESSIONAL_CONTRACTS = {'work.v5': None, 'work.v12': None}
 CURRENT_PROFESSIONAL_CONTRACT = 'work.v12'
-SOURCE_WORK_CONTRACTS = frozenset({'work.v10', 'work.v11'})
-PRODUCTION_OWNER_CONTRACTS = frozenset({'work.v6', 'work.v7', 'work.v8', 'work.v9', *SOURCE_WORK_CONTRACTS})
-COORDINATED_OWNER_CONTRACTS = frozenset({'work.v7', 'work.v8', 'work.v9', *SOURCE_WORK_CONTRACTS})
 
 
 _DIRECT_WORK = (
@@ -361,67 +354,25 @@ class OperationTools:
         if preparation not in {None,'prepared.v1','prepared.v2','prepared.v3'}:
             raise ValueError('Unsupported source generation protocol')
         exact = config.get('code_task') is not None
-        self.shared_native = config.get('professional_operations') in RETAINED_PROFESSIONAL_CONTRACTS | {'work.v3', 'work.v4'} and not exact
+        self.shared_native = config.get('professional_operations') in RETAINED_PROFESSIONAL_CONTRACTS and not exact
         if self.shared_native and preparation is not None:
             raise ValueError('Shared native professional work cannot acquire a historical preparation controller')
         self.methods = self.work = None
-        if self.shared_native and config.get('professional_operations') == 'work.v3':
-            from simple_ar.tools.professional_method import ProfessionalMethodTools, professional_method_specs
-            self.methods = ProfessionalMethodTools(workspace=self.workspace, observations=observations,
-                user_requests=user_requests, work_context=work_context)
-            self.registry.register_package(professional_method_specs(), self.methods, request_visible=True)
-        elif self.shared_native and config.get('professional_operations') in {'work.v4', *SOURCE_WORK_CONTRACTS}:
-            from simple_ar.tools.professional_work import ProfessionalWorkTools, professional_work_specs, source_work_specs
-            self.work = self.methods = ProfessionalWorkTools(root=root, workspace=self.workspace,
-                observations=observations, user_requests=user_requests, work_context=work_context,
-                material_observations=material_observations,
-                route_validator=native_route_validator,
-                source_work=config.get('professional_operations') in SOURCE_WORK_CONTRACTS,
-                batch_transition=config.get('professional_operations') == 'work.v11')
-            self.registry.register_package(source_work_specs(batch_transition=config.get('professional_operations') == 'work.v11')
-                if self.work.source_work else professional_work_specs(),
-                self.work, request_visible=True)
         professional = self.professional
-        source_owner = (PROFESSIONAL_CONTRACTS[config['professional_operations']]
-            if professional and not exact and preparation is None else None)
         self.system = (_SOURCE_COORDINATION
-            if source_owner or not exact and preparation in {'prepared.v2','prepared.v3'} else _DIRECT_WORK) + _work_principles(
+            if not exact and preparation in {'prepared.v2','prepared.v3'} else _DIRECT_WORK) + _work_principles(
                 self.delivery_review is not None, config.get('memory_protocol') == 'journal.v1',
                 delivery_protocol=self.delivery_review.protocol if self.delivery_review is not None else None)
-        if config.get('professional_operations') in COORDINATED_OWNER_CONTRACTS:
-            self.system = (_result_coordination_start(flexible=config.get('document_context_policy') == 'working.v4')
-                + ('' if config.get('professional_operations') in SOURCE_WORK_CONTRACTS else
-                   'Use execute_implementation for a registered execution proposal after ordinary exact approval. ')
-                + _result_coordination_end(bind_draft=config.get('document_context_policy') == 'working.v4')
-                + _work_principles(self.delivery_review is not None,
-                config.get('memory_protocol') == 'journal.v1',
-                delivery_protocol=self.delivery_review.protocol if self.delivery_review is not None else None))
-            if config.get('professional_operations') in {'work.v8', 'work.v9', *SOURCE_WORK_CONTRACTS}:
-                self.system += (' Independent acceptance belongs to deliver_result and its inspection owner, '
-                    'not a separate local audit scheduled by coordination. Producers investigate the originals '
-                    'and create the requested work; analysis and authorized execution can establish necessary '
-                    'facts. Submit the actual useful candidate for independent checking, and send bound required '
-                    'findings back to its producer. A review requested by the user is itself work to produce, '
-                    'not authority to certify every claim in historical drafts or to add new obligations.')
-        if config.get('professional_operations') in SOURCE_WORK_CONTRACTS:
-            self.system += (" Source work runs directly in this task's shared queue after "
-                'prepare_implementation accepts its goal. Its code decisions can read, copy, edit '
-                'and propose approved run_process commands, then return actual files and interpretation '
-                'with return_source_work. Do not rebuild that work as a coordinator-run audit project. '
-                'Choose necessary work from the original user requirements; derived packaging and '
-                'checking recipes remain working choices rather than new acceptance conditions.')
-        if config.get('work_method') in EXECUTABLE_WORK_METHODS and config.get('professional_operations') not in PRODUCTION_OWNER_CONTRACTS:
+        if config.get('work_method') in EXECUTABLE_WORK_METHODS:
             self.system = _executable_work_system(scoped_code=config.get('code_work_policy') == 'shared.v2')
-        if exact or (preparation is not None or source_owner) and config['model'] is not None:
+        if exact or preparation is not None and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
             self.implementation = ImplementationToolGateway(root,self.workspace,ledger,config['model'],session_id,
                 client_factory=lambda identity:client_factory(identity,'code'), exact=config.get('code_task'),
-                preparation_only=not exact and source_owner != 'source_owner.v3',
-                source_owner_contract=source_owner,
+                preparation_only=not exact,
                 input_contract='bounded_inputs.v2' if not exact and preparation in {'prepared.v2','prepared.v3'} else None,
                 source_edit_contract='bound_content.v1' if not exact and preparation == 'prepared.v3' else None,
-                decision_protocol=('native.v1' if config.get('professional_operations') in PRODUCTION_OWNER_CONTRACTS
-                    else config.get('source_decision_protocol')) if not exact else None,
+                decision_protocol=config.get('source_decision_protocol') if not exact else None,
                 execution_observations=execution_observations if not exact else None,
                 work_context=work_context if not exact or config.get('code_work_policy') in {'shared.v1', 'shared.v2'} else None,
                 code_work_policy=config.get('code_work_policy') if exact else None,
@@ -442,23 +393,13 @@ class OperationTools:
                 candidate_outputs=(lambda record:self.scientific.candidate_outputs(record) if self.scientific else {})
                     if exact else None)
             self.registry.register_package(implementation_tool_specs(exact=exact,preparation_only=not exact,
-                source_owner_contract=source_owner, sandboxed_execution=self.implementation.sandboxed_execution,
+                sandboxed_execution=self.implementation.sandboxed_execution,
                 defer_code_review=self.implementation.defer_code_review,
                 defer_greenfield_review=self.implementation.defer_greenfield_review),
                 self.implementation,request_visible=True)
-            if source_owner == 'source_owner.v3':
-                # The common queue invokes this primitive for the admitted source
-                # unit. Coordination cannot start another local review loop.
-                self.registry.register_package([spec for spec in implementation_tool_specs()
-                    if spec.name == 'investigate_implementation'], self.implementation, request_visible=False)
-                self.system += (' Source work includes its proposed approved execution and interpretation '
-                    'through the same action queue. Use execution_requested=false for source-only work. '
-                    'The returned findings describe this unit, not independent acceptance of the task. '
-                    'Reuse the candidate and findings for document work or delivery; do not rebuild '
-                    'the unit as a separate coordinator-run verification project.')
         self.document = None
         if (config['model'] is not None and (
-                professional and (config.get('professional_operations') in PRODUCTION_OWNER_CONTRACTS | {'work.v1', 'work.v2', 'work.v12'}
+                professional and (config.get('professional_operations') == 'work.v12'
                     or config.get('code_work_policy') in {'shared.v1', 'shared.v2'}
                     or config.get('document_context_policy') == 'working.v4'
                        and config.get('report_requirement') is not None)
@@ -545,7 +486,7 @@ class OperationTools:
         self.inspection.operation_specs = lambda: [spec for spec in self.registry.list_specs()
             if spec.name in SHARED_INSPECTION_OPERATIONS
                 and (spec.domain == 'workspace' or spec.name == 'inspect_images')
-                and (spec.name != 'copy_project' or config.get('professional_operations') in {'work.v11', 'work.v12'})
+                and (spec.name != 'copy_project' or config.get('professional_operations') == 'work.v12')
                 and self.gateway.policy.is_allowed(spec)[0]]
         self.inspection.operation_call = lambda name, arguments, identity: self.gateway.call(
             ToolCall(tool_name=name, arguments=arguments, trace_id=identity))
@@ -614,45 +555,11 @@ class OperationTools:
 
     def coordinator_eligible(self, spec: CommonToolSpec) -> bool:
         """Consumer role, not authorization; callers and inspectors keep primitives."""
-        return self._coordinator_eligible(spec, self._source_scope())
-
-    def _source_scope(self) -> dict | None:
-        return (self.work.selected() if self.config.get('professional_operations') in SOURCE_WORK_CONTRACTS
-                and self.work is not None else None)
-
-    def scope_exit_tool(self) -> str | None:
-        return (self.work.return_tool if self.config.get('professional_operations') == 'work.v11'
-                and self._source_scope() is not None else None)
-
-    def _coordinator_eligible(self, spec: CommonToolSpec, scope: dict | None) -> bool:
         if self.config.get('work_selection_policy') in DIRECT_NATIVE_SELECTION_POLICIES and spec.name == 'update_work_plan':
             return False  # New work uses its actual unit and journal, not the saved agenda controller.
-        contract = self.config.get('professional_operations')
-        if contract in SOURCE_WORK_CONTRACTS:
-            if scope is not None:
-                if spec.name in {'read_history', 'load_tools'}:
-                    return True  # Shared journal/discovery services do not transfer task control.
-                if spec.name == self.work.return_tool:
-                    return True
-                if spec.name in {self.work.entry_tool, 'deliver_result', 'review_result'}:
-                    return False
-                if spec.permission_level == 'execution' and not scope['data']['execution_requested']:
-                    return False
-                if contract == 'work.v11':
-                    if spec.domain in {'coordination', 'professional_work', 'inspection'}:
-                        return False
-                    return (spec.completion is not None and spec.completion.kind == 'question'
-                        or spec.service_parameters_schema() is not None)
-                return (spec.domain in {'workspace', 'sources', 'analysis', 'scientific'}
-                    or spec.domain.startswith('extension:'))
-            if spec.name == self.work.return_tool:
-                return False
-        if contract in {'work.v8', 'work.v9', 'work.v12', *SOURCE_WORK_CONTRACTS} and spec.domain == 'inspection':
+        if self.config.get('professional_operations') == 'work.v12' and spec.domain == 'inspection':
             return False  # Delivery owns independent acceptance; the explicit API remains registered.
-        if contract == 'work.v9' and spec.name == 'investigate_implementation':
-            return False  # An admitted source unit owns its post-execution interpretation.
-        return (contract not in COORDINATED_OWNER_CONTRACTS
-            or spec.domain != 'workspace' or spec.name in {'list_directory', 'ask_user', 'deliver_result'})
+        return True
 
     def direct_completion_allowed(self, spec: CommonToolSpec) -> bool:
         """Whether this task's direct work may explicitly finish via the tool."""
@@ -678,15 +585,6 @@ class OperationTools:
                     row['function']['parameters'] = schema
                     result.append(row)
             return result
-        if self.config.get('professional_operations') != 'work.v11' or self._source_scope() is None:
-            return schemas
-        for row in schemas:
-            spec = self.registry.get(row['function']['name'])
-            if spec.completion is not None and spec.completion.field:
-                schema = spec.service_parameters_schema()
-                if schema is None:
-                    raise ValueError('Task completion is not separable from this operation')
-                row['function']['parameters'] = schema
         return schemas
 
     def service_error(self, spec: CommonToolSpec, arguments: dict, *, selected_work: bool = False) -> str:
@@ -699,12 +597,6 @@ class OperationTools:
             if (spec.service_parameters_schema() is None
                     or arguments.get(completion.field) is not None):
                 return 'Selected work is a service operation; submit the current claim with an explicit review or delivery decision.'
-        if (self.config.get('professional_operations') == 'work.v11'
-                and spec.completion is not None and spec.completion.kind != 'question'
-                and self._source_scope() is not None):
-            completion = spec.completion
-            if not completion.field or arguments.get(completion.field) is not None:
-                return 'Return professional work before requesting task review or delivery; service operations cannot finish this scope.'
         return ''
 
     def selected_work_service(self, call: dict, turn: dict, store: Any, requests: list[str]) -> bool:
@@ -742,9 +634,6 @@ class OperationTools:
 
     def presentation(self, selected: set[str], mode: str):
         active, catalog = set(), {}
-        # One role observation per directory, never one history replay per tool.
-        # Execution admission still reads the current role independently.
-        scope = self._source_scope()
         # Explicit frozen work keeps the operations required by its domain owner.
         executable = (self.config.get('work_method') in EXECUTABLE_WORK_METHODS and not any(
             self.config.get(key) for key in
@@ -752,7 +641,7 @@ class OperationTools:
         for spec in self.registry.list_specs():
             if not self.gateway.policy.is_allowed(spec)[0]:
                 continue
-            if not self._coordinator_eligible(spec, scope):
+            if not self.coordinator_eligible(spec):
                 continue
             # Saved preparation contracts keep their original presentation.
             # Ordinary source work is owned by these common workspace tools.
@@ -766,12 +655,6 @@ class OperationTools:
                 deferred = (not self.registry.request_visible(spec.name)
                     or executable and mode == 'on_demand' and spec.name == 'review_result'
                     and self.config.get('work_lifecycle') not in INTEGRATED_WORK_LIFECYCLES)
-            if (self.config.get('professional_operations') == 'work.v6'
-                    and spec.domain == 'workspace' and spec.name not in {'ask_user', 'deliver_result'}):
-                # Ordinary intake offers outcome-producing owners. Primitives
-                # remain explicitly loadable and available to independent
-                # investigation; this changes ownership, never permissions.
-                deferred = True
             if mode == 'full' or not deferred or spec.name in selected:
                 active.add(spec.name)
             else:

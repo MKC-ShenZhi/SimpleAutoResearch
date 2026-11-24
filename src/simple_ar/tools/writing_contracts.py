@@ -14,7 +14,7 @@ from simple_ar.tools.specs import CommonToolSpec
 from simple_ar.tools.workspace import DeliveryRequest, FileWindow
 
 _DOCUMENT_WORK_CONTRACT = 'document_work.v2'
-_DOCUMENT_WORK_CONTRACTS = {'document_work.v1', 'document_work.v2'}
+_DOCUMENT_WORK_CONTRACTS = {'document_work.v2'}
 _DELIVERY_SUBJECT_CONTRACT = 'declared_delivery_subjects.v1'
 _FIGURE_SELECTION_CONTRACT = 'compose_figure.v1'
 

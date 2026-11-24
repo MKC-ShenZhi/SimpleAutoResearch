@@ -146,28 +146,6 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertIn('review_result',status['next_tools'])
         self.assertFalse((self.root/'delivery.json').exists())
 
-    def test_optional_review_has_room_after_work_and_feedback_without_becoming_mandatory(self):
-        self.owner.config.update(delivery_review_selection='model.v1',
-            candidate_review_protocol='candidate.v1')
-        self.owner.gateway.registry.get = lambda name: (
-            SimpleNamespace(permission_level='write_patch') if name == 'edit_file' else None)
-        self.assertEqual(self.owner.lifecycle_requirements()['minimum_resources']['llm_requests'], 0)
-        self.observations.append({'tool_name': 'edit_file', 'status': 'ok', 'current_request': True})
-        self.assertEqual(self.owner.lifecycle_requirements()['minimum_resources']['llm_requests'], 1)
-        with patch.object(self.owner, 'observations', side_effect=AssertionError('Saved v1 needs no history scan')):
-            self.assertFalse(self.owner.requires_review(DeliveryRequest.model_validate({
-                'summary': 'A small note', 'artifacts': ['draft.md'], 'independent_review': False})))
-
-        self.owner.config['tool_completions']['deliver_result'] = {'kind': 'delivery'}
-        previous = {'summary': 'Earlier explanation', 'artifacts': ['draft.md']}
-        self.observations[:] = [{'tool_name': 'deliver_result', 'status': 'ok', 'data': previous,
-                                 'current_request': False}]
-        self.assertEqual(self.owner.lifecycle_requirements(accepted_delivery=previous)
-                         ['minimum_resources']['llm_requests'], 1)
-        self.observations[0]['current_request'] = True
-        self.assertEqual(self.owner.lifecycle_requirements(accepted_delivery=previous)
-                         ['minimum_resources']['llm_requests'], 0)
-
     def test_selected_final_review_applies_to_its_work_and_current_request(self):
         self.owner.config.update(delivery_review_selection='model.v3',
             candidate_review_protocol='candidate.v1')
@@ -193,17 +171,6 @@ class CandidateReviewTests(unittest.TestCase):
         revised = direct.model_copy(update={'artifacts': ['draft.md', 'replacement.md']})
         self.assertTrue(self.owner.requires_review(revised))
         self.observations[-1]['current_request'] = False
-        self.assertFalse(self.owner.requires_review(direct))
-
-    def test_saved_v2_review_selection_keeps_its_original_request_scope(self):
-        self.owner.config['delivery_review_selection'] = 'model.v2'
-        self.observations.append({'tool_name': 'review_result', 'status': 'ok',
-            'arguments': {'review_scope': 'delivery'}, 'current_request': True})
-        self.workspace.resolve('other.md').write_text('Different work', encoding='utf-8')
-        direct = DeliveryRequest.model_validate({
-            'summary': 'Another result', 'artifacts': ['other.md'], 'independent_review': False})
-        self.assertTrue(self.owner.requires_review(direct))
-        self.observations[0]['current_request'] = False
         self.assertFalse(self.owner.requires_review(direct))
 
     def test_delivery_review_must_have_started_before_it_is_retained(self):

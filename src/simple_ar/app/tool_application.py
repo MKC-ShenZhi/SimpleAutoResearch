@@ -544,17 +544,11 @@ class ToolApplication(_ToolConfigMixin, _ToolMemoryMixin, _ToolLegacyMixin, _Too
         schemas = [row for row in operations
             if (contract := self._completion(row['function']['name'])) is not None and contract.closing
                 and (include_compound or not contract.field)]
-        scope_exit = self.operations.scope_exit_tool() if self.operations is not None else None
-        if scope_exit is not None:
-            schemas.extend(row for row in operations if row['function']['name'] == scope_exit)
         result = []
         for original in schemas:
             schema = json.loads(json.dumps(original))
             function = schema['function']
             contract = self._completion(function['name'])
-            if function['name'] == scope_exit:
-                result.append(schema)
-                continue
             if contract.field:
                 parameters = function['parameters']
                 delivery = parameters.get('properties', {}).get(contract.field)
