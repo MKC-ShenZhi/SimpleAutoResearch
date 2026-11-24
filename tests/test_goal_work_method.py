@@ -67,17 +67,14 @@ class NativeGoalWorkTests(unittest.TestCase):
         self.assertEqual(error, '')
         self.assertNotIn('evidence_windows', legacy['investigations'][0])
         self.assertNotIn('reassessed_prior', legacy['investigations'][0])
-        current = {**saved, 'inspection_evidence_policy': 'presented.v1'}
-        _, error, new, _ = admit(current, opinion)
+        current = {**saved, 'inspection_evidence_policy': 'presented.v6'}
+        opinion_v6 = {**opinion, 'requested_outcomes': [
+            {'outcome': 'Requested result', 'status': 'uncertain', 'artifacts': [], 'explanation': 'Missing source.'}]}
+        _, error, new, _ = admit(current, opinion_v6)
         self.assertEqual(error, '')
         self.assertEqual(new['investigations'][0]['evidence_windows'], [])
         self.assertEqual(new['investigations'][0]['reassessed_prior'], [])
         self.assertTrue(admit(saved, new)[1])
-        revised = {**saved, 'inspection_evidence_policy': 'presented.v2'}
-        _, error, newer, _ = admit(revised, opinion)
-        self.assertEqual(error, '')
-        self.assertEqual(newer['investigations'][0]['evidence_windows'], [])
-        self.assertIsNot(owner._claim_response_model(current), owner._claim_response_model(revised))
 
     def test_review_keeps_supported_finding_when_another_check_has_no_execution_receipt(self):
         from simple_ar.tools.inspection import InspectionToolGateway
@@ -90,7 +87,7 @@ class NativeGoalWorkTests(unittest.TestCase):
         owner._check_inspection_versions = lambda *args, **kwargs: None
         saved = {'identity': 'review', 'work_method': GOAL_WORK_METHOD,
             'finding_policy': 'linked.v1', 'inspection_material_policy': 'operations.v3',
-            'inspection_evidence_policy': 'presented.v3', 'coverage_policy': 'offered.v2',
+            'inspection_evidence_policy': 'presented.v6', 'coverage_policy': 'offered.v2',
             'delivery_context': {'schema_version': 'delivery_review.v3', 'artifacts': {'report.md': 'version'}},
             'prior_required': [], 'evidence': [], 'targets': [
                 {'subject': 'evidence-1', 'readable': True, 'sha256': 'version', 'windows': [{}]}]}
@@ -98,7 +95,7 @@ class NativeGoalWorkTests(unittest.TestCase):
         schema = owner._delivery_schema(saved, model)
         self.assertNotIn('findings', schema['properties'])
         self.assertIn('no separate top-level findings', schema['properties']['investigations']['description'])
-        investigations = schema['$defs']['_PresentedClaimInvestigationV3']['properties']
+        investigations = schema['$defs']['_PresentedClaimInvestigation']['properties']
         self.assertNotIn('evidence_windows', investigations)
         response = {'conclusion': 'incomplete', 'applicability': 'Check the report and its calculations.',
             'investigations': [
@@ -109,7 +106,9 @@ class NativeGoalWorkTests(unittest.TestCase):
                 {'claim': 'The metrics were independently executed.', 'method': 'Run the check.',
                  'reasoning': 'The script was run.', 'scope': 'The metrics.', 'basis': 'executed',
                  'execution_records': [], 'evidence': ['evidence-1'], 'outcome': 'supported', 'findings': []}],
-            'limitations': [], 'reassessed_prior': [], 'findings': []}
+            'limitations': [], 'reassessed_prior': [], 'findings': [],
+            'requested_outcomes': [{'outcome': 'Report split matches code', 'status': 'missing',
+                'artifacts': ['report.md'], 'explanation': 'Split rows disagree.'}]}
         original = deepcopy(response)
         call = {'id': 'final', 'type': 'function', 'function': {
             'name': 'record_inspection', 'arguments': json.dumps(response)}}
@@ -710,15 +709,7 @@ class GoalWorkTests(unittest.TestCase):
         self.assertEqual(saved['inspection_evidence_policy'], 'presented.v6')
         self.assertEqual(saved['prior_reference_policy'], 'short.v1')
         self.assertEqual(len(saved['prior_required'][0]['id']), 64)
-        legacy_receipt = deepcopy(receipt)
-        legacy_receipt['response'].pop('requested_outcomes', None)
-        bindings = owner._stored_shared_bindings(saved, receipt['response'])
-        with patch.object(owner, '_stored_shared_bindings', return_value=bindings):
-            legacy, error = owner._delivery_assessment({**saved, 'inspection_evidence_policy': 'presented.v3'},
-                                                       legacy_receipt, identity, '', check_versions=False)
-        self.assertEqual(error, '')
-        self.assertEqual(legacy['verdict'], 'incomplete')
-        self.assertEqual(legacy['reassessed_prior'], [])
+        self.assertIn('requested_outcomes', receipt['response'])
         case._submit(_action('deliver_result', **claim))
         self.assertEqual(case.app.session.manifest.status, 'completed')
 
@@ -781,14 +772,7 @@ class GoalWorkTests(unittest.TestCase):
         owner = case.app.operations.inspection
         saved = owner.store.read_json(owner._path(identity, 'input'))
         receipt = owner.store.read_json(owner._path(identity, 'response'))
-        legacy_receipt = deepcopy(receipt)
-        legacy_receipt['response'].pop('requested_outcomes', None)
-        bindings = owner._stored_shared_bindings(saved, receipt['response'])
-        with patch.object(owner, '_stored_shared_bindings', return_value=bindings):
-            legacy, error = owner._delivery_assessment({**saved, 'inspection_evidence_policy': 'presented.v4'},
-                                                       legacy_receipt, identity, '', check_versions=False)
-        self.assertEqual(error, '')
-        self.assertEqual(legacy['verdict'], 'incomplete')
+        self.assertEqual(saved['inspection_evidence_policy'], 'presented.v6')
         with patch.object(owner, '_read_retained_result', wraps=owner._read_retained_result) as read:
             with owner.presentation_scope():
                 first = owner._cached(identity)
@@ -910,82 +894,6 @@ class GoalWorkTests(unittest.TestCase):
         case._submit(_action('review_result', summary='A corrected note.', artifacts=['note.md']))
         assessed = case._last('review_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
         self.assertEqual(assessed['verdict'], 'passed')
-
-    def test_review_reassesses_each_concern_using_its_supplied_evidence_windows(self):
-        from simple_ar.tools.inspection import InspectionToolGateway, _PresentedClaimDeliveryResponseV2
-
-        # Historical reviews may still provide explicit windows.
-        contract = patch.object(InspectionToolGateway, '_claim_response_model',
-                                return_value=_PresentedClaimDeliveryResponseV2)
-        contract.start()
-        self.addCleanup(contract.stop)
-
-        case = self.case
-        case._write('note.md', 'The measured value is wrong.\n')
-        case._write('support.txt', '0123456789abcdef' * 8)
-        claim = {'summary': 'A measured note.', 'artifacts': ['note.md', 'support.txt']}
-        state = {'revised': False, 'end': 16}
-
-        def review(view):
-            paths = ['note.md', 'support.txt']
-            sources = case._inspection_sources(view, *paths)
-            if any(row is None for row in sources):
-                return [_action('read_file', path=path) for path, row in zip(paths, sources) if row is None]
-            note, support = (row['subject'] for row in sources)
-            first = {'claim': 'The reported value matches the observation.',
-                'scope': 'The current note.', 'basis': 'observed', 'necessary': True,
-                'method': 'Compare the value in the current note.',
-                'reasoning': 'The controlled note was read.', 'evidence': [note],
-                'outcome': 'supported' if state['revised'] else 'contradicted',
-                'findings': [] if state['revised'] else [{'severity': 'required',
-                    'message': 'Correct the measured value.', 'artifacts': [str(case.root / 'workspace/note.md')]}]}
-            checks = [first]
-            if state['revised']:
-                first['reassessed_prior'] = [row['id'] for row in view['prior_required']]
-                checks.append({'claim': 'The supporting record contains the reported observation.',
-                    'scope': 'Only the selected prefix.', 'basis': 'observed', 'necessary': True,
-                    'method': 'Read the selected prefix.', 'reasoning': 'The controlled prefix was read.',
-                    'evidence': [support], 'evidence_windows': [{'subject': support, 'start': 0, 'end': state['end']}],
-                    'outcome': 'contradicted' if state['end'] == 16 else 'supported',
-                    'findings': ([{'severity': 'required', 'message': 'Correct the supporting record.',
-                                   'artifacts': [str(case.root / 'workspace/support.txt')]}]
-                                 if state['end'] == 16 else [])})
-            return {'conclusion': 'complete', 'applicability': 'Check the note and its support.',
-                'investigations': checks, 'limitations': [], 'reassessed_prior': []}
-
-        case.review = review
-        case._submit(_action('deliver_result', **claim))
-        self.assertEqual(case._last('deliver_result', reviewed=True)['metadata']['delivery_review']
-                         ['result']['metadata']['delivery_assessment']['verdict'], 'needs_revision')
-        case._submit(_action('write_file', path='note.md', content='The measured value is correct.\n',
-            expected_sha256=hashlib.sha256((case.root / 'workspace/note.md').read_bytes()).hexdigest()))
-        state['revised'] = True
-
-        original = InspectionToolGateway._offered_text_ranges
-        support_path = str(case.root / 'workspace/support.txt')
-        def partial_supply(owner, saved, **kwargs):
-            offered = original(owner, saved, **kwargs)
-            for key, ranges in list(offered.items()):
-                if key[0] == support_path:
-                    offered[key] = [(start, min(end, 8)) for start, end in ranges if start < 8]
-            return offered
-
-        with patch.object(InspectionToolGateway, '_offered_text_ranges', partial_supply):
-            case._submit(_action('deliver_result', **claim))
-            partial = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
-            self.assertEqual((partial['coverage'], partial['verdict']), ('partial', 'incomplete'))
-            self.assertEqual(partial['findings'], [])
-            self.assertEqual(len(partial['reassessed_prior']), 1)
-            self.assertFalse(case.app.operations.delivery_review.pending_concerns(claim['artifacts']))
-            self.assertNotEqual(case.app.session.manifest.status, 'completed')
-
-            state['end'] = 8
-            case._submit(_action('deliver_result', **claim))
-            final = case._last('deliver_result', reviewed=True)['metadata']['delivery_review']['result']['metadata']['delivery_assessment']
-            self.assertEqual((final['coverage'], final['verdict']), ('complete', 'passed'))
-            self.assertEqual(case.app.session.manifest.status, 'completed')
-            case._reload()
-            self.assertFalse(case.app.operations.delivery_review.pending_concerns(claim['artifacts']))
 
     def test_review_uses_presented_source_without_requiring_byte_coordinates(self):
         from simple_ar.tools.inspection import InspectionToolGateway
@@ -1640,8 +1548,8 @@ class GoalWorkTests(unittest.TestCase):
                     self.assertTrue(error)
                     self.assertIsNone(final)
             for policy, closing, tools in [('operations.v1', True, offered),
-                    (None, True, offered), ('operations.v2', False, offered),
-                    ('operations.v2', True, offered*2)]:
+                    (None, True, offered), ('operations.v3', False, offered),
+                    ('operations.v3', True, offered*2)]:
                 previous = {**saved, 'inspection_material_policy':policy}
                 self.assertIsNone(owner._admit_response(previous, [], tools,
                     response_model, set(), shared=True, content=content, closing=closing)[2])

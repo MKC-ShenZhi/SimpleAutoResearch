@@ -21,11 +21,11 @@ class _InspectionDispatchRaised(BaseException):
 
 _SHARED_EXECUTION_PROTOCOLS = frozenset({'shared.v1', 'shared.v2'})
 _PRIORITY_SOURCE_POLICIES = frozenset({'priority.v1', 'priority.v2', 'priority.v3', 'priority.v4'})
-_PRESENTED_EVIDENCE_POLICIES = frozenset({'presented.v2', 'presented.v3', 'presented.v4', 'presented.v5', 'presented.v6'})
+_PRESENTED_EVIDENCE_POLICIES = frozenset({'presented.v6'})
 
 SHARED_INSPECTION_OPERATIONS = frozenset({'read_file', 'list_directory', 'search_files', 'compile_python',
     'write_file', 'edit_file', 'copy_file', 'copy_project', 'run_process', 'inspect_images'})
-_WORK_MATERIAL_POLICIES = frozenset({'operations.v1', 'operations.v2', 'operations.v3'})
+_WORK_MATERIAL_POLICIES = frozenset({'operations.v1', 'operations.v3'})
 
 
 class _InspectionHistory(BaseModel):
@@ -143,9 +143,8 @@ class _ClaimInvestigation(_ScopedInvestigation):
 
 
 class _PresentedClaimInvestigation(_ClaimInvestigation):
-    evidence_windows: list[_EvidenceWindow] = Field(default_factory=list,
-        description='When using only part of a selected source, identify the actual supplied byte '
-            'ranges used. Omit a subject here only when all of its recorded read windows were supplied.')
+    # The inspection owner already records the actual supplied ranges.
+    evidence_windows: SkipJsonSchema[list[_EvidenceWindow]] = Field(default_factory=list)
     reassessed_prior: list[str] = Field(default_factory=list,
         description='Prior concern IDs this specific check actually re-examined. '
             'Leave other concerns for their own checks.')
@@ -170,31 +169,6 @@ class _ClaimDeliveryResponse(BaseModel):
         return [finding for row in self.investigations for finding in row.findings]
 
 
-class _PresentedClaimDeliveryResponse(_ClaimDeliveryResponse):
-    investigations: list[_PresentedClaimInvestigation]
-
-
-class _PresentedClaimInvestigationV2(_PresentedClaimInvestigation):
-    evidence_windows: list[_EvidenceWindow] = Field(default_factory=list,
-        description='Optional byte ranges used from a selected source. Without explicit ranges, '
-            'the check is limited to the source text actually presented to you, not its entire '
-            'recorded file. Describe any material limits in the check or limitations.')
-
-
-class _PresentedClaimDeliveryResponseV2(_PresentedClaimDeliveryResponse):
-    investigations: list[_PresentedClaimInvestigationV2]
-
-
-class _PresentedClaimInvestigationV3(_PresentedClaimInvestigationV2):
-    # The inspection owner already records the actual supplied ranges. Older
-    # responses can still be decoded, but a new reviewer need not transcribe them.
-    evidence_windows: SkipJsonSchema[list[_EvidenceWindow]] = Field(default_factory=list)
-
-
-class _PresentedClaimDeliveryResponseV3(_PresentedClaimDeliveryResponseV2):
-    investigations: list[_PresentedClaimInvestigationV3]
-
-
 class _RequestedOutcome(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     outcome: str = Field(min_length=1, description='One distinct outcome requested by the user.')
@@ -207,7 +181,8 @@ class _RequestedOutcome(BaseModel):
         'Name missing files here and use investigations for evidence outside the delivery.')
 
 
-class _PresentedClaimDeliveryResponseV4(_PresentedClaimDeliveryResponseV3):
+class _PresentedClaimDeliveryResponse(_ClaimDeliveryResponse):
+    investigations: list[_PresentedClaimInvestigation]
     requested_outcomes: list[_RequestedOutcome] = Field(min_length=1, description=
         'Assess each distinct requested outcome against the exact proposed delivery inventory and text. '
         'For requested code or supporting files, name the included artifacts needed to use the result. '

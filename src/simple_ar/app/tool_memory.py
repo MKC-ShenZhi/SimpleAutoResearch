@@ -240,6 +240,6 @@ class _ToolMemoryMixin:
                 'native_supply_policy':self.state['config'].get('native_supply_policy'),
                 'additional_protection':additional_protection,
                 **({'economic_floor':economic_floor} if economic_floor is not None
-                    and self.state['config'].get('context_checkpoint_policy') in {'economic.v2', 'economic.v3'} else {})}
+                    and self.state['config'].get('context_checkpoint_policy') == 'economic.v3' else {})}
                if journal else {}))
         return refs

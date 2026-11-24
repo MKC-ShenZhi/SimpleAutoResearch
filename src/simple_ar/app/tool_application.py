@@ -167,14 +167,14 @@ class ToolApplication(_ToolConfigMixin, _ToolMemoryMixin, _ToolLegacyMixin, _Too
             raise ValueError('Unsupported saved working memory; no silent migration')
         if config.get('native_supply_policy') is not None and config['native_supply_policy'] not in RECEIPT_SUPPLY_POLICIES:
             raise ValueError('Unsupported saved native material supply policy')
-        if config.get('context_checkpoint_policy') not in {None, 'economic.v1', 'economic.v2', 'economic.v3'}:
-            raise ValueError('Unsupported saved context checkpoint policy')
+        if config.get('context_checkpoint_policy') not in {None, 'economic.v3'}:
+            raise ValueError('Unsupported saved context checkpoint policy (retired in v2.12; start a new task or reuse artifacts via --from-session)')
         if config.get('work_method') is not None and config['work_method'] not in NATIVE_WORK_METHODS:
             raise ValueError('Unsupported saved professional working method')
         if config.get('work_method') and (config.get('memory_protocol') != 'journal.v1'
                 or config.get('context_checkpoint_policy') != 'economic.v3'):
             raise ValueError('Goal working method requires the shared working journal')
-        if config.get('inspection_material_policy') not in (None, 'operations.v1', 'operations.v2', 'operations.v3'):
+        if config.get('inspection_material_policy') not in (None, 'operations.v1', 'operations.v3'):
             raise ValueError('Unsupported saved inspection material policy')
         if config.get('inspection_material_policy') and config.get('work_method') != GOAL_WORK_METHOD:
             raise ValueError('Inspection work observations require the goal working contract')
@@ -1686,7 +1686,7 @@ class ToolApplication(_ToolConfigMixin, _ToolMemoryMixin, _ToolLegacyMixin, _Too
                 memory_refs = self._compact_work(context, client, cutoff,
                     decision_tokens=decision_tokens, additional_protection=True, selected_turns=omitted,
                     **({'economic_floor':selection['required_input_tokens']}
-                       if self.state['config'].get('context_checkpoint_policy') in {'economic.v2', 'economic.v3'}
+                       if self.state['config'].get('context_checkpoint_policy') == 'economic.v3'
                           and selection.get('economical_compaction', False) else {}))
             if inspection is not None:
                 inspection.clear_presentation_scope()

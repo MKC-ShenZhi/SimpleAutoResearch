@@ -46,12 +46,7 @@ from simple_ar.tools.inspection_contracts import (  # noqa: F401
     _PRESENTED_EVIDENCE_POLICIES,
     _PRIORITY_SOURCE_POLICIES,
     _PresentedClaimDeliveryResponse,
-    _PresentedClaimDeliveryResponseV2,
-    _PresentedClaimDeliveryResponseV3,
-    _PresentedClaimDeliveryResponseV4,
     _PresentedClaimInvestigation,
-    _PresentedClaimInvestigationV2,
-    _PresentedClaimInvestigationV3,
     _ProvidedInspectionHistory,
     _REVIEW_SYSTEM,
     _RequestedOutcome,
@@ -172,13 +167,9 @@ class InspectionToolGateway(_InspectionEvidenceMixin, _InspectionMessagesMixin):
 
     @staticmethod
     def _claim_response_model(saved: dict) -> type[_ClaimDeliveryResponse]:
-        return {'presented.v1': _PresentedClaimDeliveryResponse,
-                'presented.v2': _PresentedClaimDeliveryResponseV2,
-                'presented.v3': _PresentedClaimDeliveryResponseV3,
-                'presented.v4': _PresentedClaimDeliveryResponseV3,
-                'presented.v5': _PresentedClaimDeliveryResponseV3,
-                'presented.v6': _PresentedClaimDeliveryResponseV4}.get(
-                    saved.get('inspection_evidence_policy'), _ClaimDeliveryResponse)
+        return (_PresentedClaimDeliveryResponse
+                if saved.get('inspection_evidence_policy') == 'presented.v6'
+                else _ClaimDeliveryResponse)
 
     def _review_artifact_name(self, path: str) -> str:
         """Present workspace artifacts by their existing mount-relative name."""
@@ -813,7 +804,7 @@ class InspectionToolGateway(_InspectionEvidenceMixin, _InspectionMessagesMixin):
             if not self.adaptive and len(parsed) > 8:
                 raise ValueError('Inspection allows at most eight source calls in one response')
             content_final = (shared and closing and not calls and isinstance(content, str)
-                and saved.get('inspection_material_policy') in {'operations.v2', 'operations.v3'}
+                and saved.get('inspection_material_policy') == 'operations.v3'
                 and len(offered) == 1 and set(schemas) == {'record_inspection'})
             if finals or content_final:
                 # A terminal-only offer has no operation to dispatch. Preserve
@@ -868,7 +859,7 @@ class InspectionToolGateway(_InspectionEvidenceMixin, _InspectionMessagesMixin):
                             for check in final['investigations']:
                                 check['execution_records'] = [executions.get(path, path)
                                     for path in check['execution_records']]
-                    if saved.get('inspection_evidence_policy') in {'presented.v3', 'presented.v4', 'presented.v5', 'presented.v6'}:
+                    if saved.get('inspection_evidence_policy') == 'presented.v6':
                         final, resolutions = self._retain_valid_investigations(
                             saved, final, unavailable_evidence=unavailable_evidence)
                         owner_bindings.extend(resolutions)
@@ -980,7 +971,7 @@ class InspectionToolGateway(_InspectionEvidenceMixin, _InspectionMessagesMixin):
                 choices(properties['reassessed_prior'], list(self._prior_references(saved)))
         if response_model is _DeliveryResponseLinked or nested:
             choices(schema['properties']['reassessed_prior'], list(self._prior_references(saved)))
-            if nested and saved.get('inspection_evidence_policy') in {'presented.v1', *_PRESENTED_EVIDENCE_POLICIES}:
+            if nested and saved.get('inspection_evidence_policy') == 'presented.v6':
                 schema['properties']['reassessed_prior']['description'] = (
                     'Legacy package-level reassessments. Prefer placing each concern ID in the '
                     'investigation that actually rechecked it, and leave this list empty.')

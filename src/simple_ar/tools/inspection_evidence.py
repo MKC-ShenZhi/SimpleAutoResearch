@@ -22,7 +22,7 @@ from simple_ar.tools.inspection_contracts import (
     _PRESENTED_EVIDENCE_POLICIES,
     _PRIORITY_SOURCE_POLICIES,
     _PresentedClaimDeliveryResponse,
-    _PresentedClaimDeliveryResponseV4,
+    _PresentedClaimDeliveryResponse,
     _PresentedClaimInvestigation,
     _Response,
     _ReviewResponse,
@@ -318,7 +318,7 @@ class _InspectionEvidenceMixin:
                     for record in investigation.get('execution_records', []):
                         if record not in facts:
                             raise ValueError('Selected independent execution is no longer applicable')
-                        if (execution_scopes and saved.get('inspection_evidence_policy') in {'presented.v1', *_PRESENTED_EVIDENCE_POLICIES}
+                        if (execution_scopes and saved.get('inspection_evidence_policy') == 'presented.v6'
                                 and self._applicable_scope(saved) and reassessed):
                             bindings['execution:' + record] = facts[record]['dependencies']
                         for path, digest in facts[record]['dependencies'].items():
@@ -1485,7 +1485,7 @@ class _InspectionEvidenceMixin:
         if any(not finding.message.strip() or any(path not in artifacts for path in finding.artifacts)
                 for finding in decision.findings):
             raise ValueError('Package findings must name affected bound artifacts and a concrete defect')
-        if isinstance(decision, _PresentedClaimDeliveryResponseV4) and any(
+        if isinstance(decision, _PresentedClaimDeliveryResponse) and any(
                 path not in artifacts for row in decision.requested_outcomes for path in row.artifacts):
             raise ValueError('Requested outcomes may name only artifacts in the proposed delivery')
         return decision
@@ -1780,7 +1780,7 @@ class _InspectionEvidenceMixin:
         supplied_for_package = (all(supplied(row, key) for row in decision.investigations for key in row.evidence)
             if scoped and saved.get('inspection_evidence_policy') in _PRESENTED_EVIDENCE_POLICIES
             else all(covered for covered, _ in scopes))
-        complete_opinion = (scoped and saved.get('inspection_evidence_policy') in {'presented.v5', 'presented.v6'}
+        complete_opinion = (scoped and saved.get('inspection_evidence_policy') == 'presented.v6'
             and decision.conclusion == 'complete' and supplied_for_package
             and all(not row.necessary or row.outcome == 'supported' for row in decision.investigations))
 
@@ -1822,9 +1822,7 @@ class _InspectionEvidenceMixin:
                 if any(row.outcome != 'supported' or not row.evidence
                        or not all(supplied(row, subject) for subject in row.evidence) for row in checks):
                     continue
-                supporting = (checks if saved.get('inspection_evidence_policy') != 'presented.v4' else
-                    [row for row in decision.investigations if row.outcome == 'supported' and row.evidence
-                     and all(supplied(row, subject) for subject in row.evidence)])
+                supporting = checks
                 row_scopes = [bindings['evidence:' + subject] for row in supporting for subject in row.evidence]
                 row_scopes.extend(bindings['execution:' + record] for row in supporting
                     for record in row.execution_records if 'execution:' + record in bindings)
