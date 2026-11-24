@@ -209,7 +209,7 @@ class ToolApplication(_ToolConfigMixin, _ToolMemoryMixin, _ToolLegacyMixin, _Too
             raise ValueError('Unsupported saved candidate review request contract; no silent migration')
         if config.get('inspection_coverage_policy') not in {None, 'offered.v1', 'offered.v2'}:
             raise ValueError('Unsupported saved inspection coverage policy; no silent migration')
-        if config.get('working_set_policy') not in {None, 'recent.v3', 'recent.v4', 'recent.v5', 'recent.v6'}:
+        if config.get('working_set_policy') not in {None, 'recent.v4', 'recent.v6'}:
             raise ValueError('Unsupported saved working set policy')
         if config.get('action_offer_policy') not in {None, 'observed_edit.v1'}:
             raise ValueError('Unsupported saved action offer policy')

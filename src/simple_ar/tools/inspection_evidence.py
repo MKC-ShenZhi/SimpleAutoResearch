@@ -1586,7 +1586,7 @@ class _InspectionEvidenceMixin:
         # to a later final scope. Only its observations transfer; the current
         # reviewer still decides applicability and receives no inherited pass.
         previous_arguments = (reference.get('arguments', saved['arguments'])
-            if saved.get('work_lifecycle') in {'integrated.v1', 'integrated.v2', 'integrated.v3'} else saved['arguments'])
+            if saved.get('work_lifecycle') == 'integrated.v3' else saved['arguments'])
         if (previous.get('delivery_context') != reference['binding']
                 or previous.get('arguments') != previous_arguments):
             raise ValueError('Retained investigation differs from its delivery owner scope')

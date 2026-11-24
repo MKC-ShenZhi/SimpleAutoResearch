@@ -1280,7 +1280,7 @@ class RetainedWorkingContextTests(unittest.TestCase):
         estimate = Mock(side_effect=len)
         options = dict(user_requests=['Use the recorded research'], material_policy='working',
             require_work_notes=True, fit_work_notes=True, processed_turns=[], sparse_handoffs=True,
-            working_set_policy='recent.v5', operation_history=operations,
+            working_set_policy='recent.v6', operation_history=operations,
             context_token_target=150000, estimate_tokens=estimate)
         messages, budget = select(**options)
         overview = json.loads(messages[1]['content'])['working_view']['operation_overview']
@@ -1314,7 +1314,7 @@ class RetainedWorkingContextTests(unittest.TestCase):
             operation(3, 3, 'search_files', {'text': 'Current search'})]
         messages, _ = select(user_requests=['Research', 'Revise', 'Review the revised work'],
             material_policy='working', require_work_notes=True, fit_work_notes=True,
-            processed_turns=[], sparse_handoffs=True, working_set_policy='recent.v5',
+            processed_turns=[], sparse_handoffs=True, working_set_policy='recent.v6',
             operation_history=operations, context_token_target=20000)
         overview = json.loads(messages[1]['content'])['working_view']['operation_overview']
         entries = [item for group in expand_history_view(overview['entries']) for item in group['observations']]

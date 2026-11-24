@@ -94,7 +94,7 @@ class SelectedWorkContinuityTests(unittest.TestCase):
         app = ToolApplication.create(self.base / 'native', 'Use the original source without changing it',
             model='fixture', sources={'original': self.file}, services=services,
             max_turns=8, max_tokens=600000, tool_contracts='full')
-        app.state['config']['work_lifecycle'] = 'integrated.v2'
+        app.state['config']['work_lifecycle'] = 'integrated.v3'
         calls = []
         def provider(_mode, request, **_):
             number = len(calls)
@@ -133,11 +133,7 @@ class SelectedWorkContinuityTests(unittest.TestCase):
         self.assertEqual(sum(len(row['text'].encode()) for row in originals), len(self.file.read_bytes()))
         self.assertEqual(app.state, state)
         self.assertEqual(app.ledger.to_dict(), ledger)
-        app.state['config']['work_lifecycle'] = 'integrated.v1'
-        with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as old:
-            app._messages(client=client, schemas=app.schemas, working_memory=memory)
-        self.assertTrue(all('kind' not in row for row in old.call_args.kwargs['observations']
-            if row.get('tool') == 'read_file'))
+
 
     def test_selected_partial_original_observation_reaches_common_working_input(self):
         old = {name: (self.app.session.store.root / name).read_bytes()
@@ -323,7 +319,7 @@ class WorkingSupplyContinuityTests(unittest.TestCase):
             work_notes=[{'text': 'Keep the established result', 'records': ['old-needed']}],
             version_resolver=lambda _: 'a' * 64)
         previous, _ = select_working_context(**arguments, working_set_policy='recent.v4')
-        focused, selection = select_working_context(**arguments, working_set_policy='recent.v5')
+        focused, selection = select_working_context(**arguments, working_set_policy='recent.v6')
         self.assertIn('UNRELATED HISTORICAL BODY', json.dumps(previous))
         self.assertNotIn('UNRELATED HISTORICAL BODY', json.dumps(focused))
         self.assertNotIn('UNRELATED OLD WORK', json.dumps(focused))
@@ -490,9 +486,9 @@ class WorkingSupplyContinuityTests(unittest.TestCase):
             material_policy='working', require_work_notes=True, fit_work_notes=True,
             sparse_handoffs=True, processed_turns=[0, 1, 2, 3, 4], archived_turns=[0, 1, 2, 3, 4],
             work_notes=[{'text': 'Prior work retained in the journal'}], version_resolver=lambda _: 'a' * 64)
-        _, previous = select_working_context(**common, working_set_policy='recent.v3')
+        _, previous = select_working_context(**common, working_set_policy='recent.v6')
         self.assertNotIn('records/1.json', {x['source']['record'] for x in previous['selected_records']})
-        for policy, inspection_observations in ((policy, inspected) for policy in ('recent.v4', 'recent.v5')
+        for policy, inspection_observations in ((policy, inspected) for policy in ('recent.v4',)
                                                 for inspected in (False, True)):
             with self.subTest(policy=policy, inspection_observations=inspection_observations):
                 observations = deepcopy(rows)
@@ -525,9 +521,7 @@ class WorkingSupplyContinuityTests(unittest.TestCase):
             estimate_tokens=len, material_policy='working', require_work_notes=True, fit_work_notes=True,
             sparse_handoffs=True, processed_turns=[0, 1, 2, 3], archived_turns=[0, 1, 2, 3],
             work_notes=[{'text': 'Prior work retained in the journal'}], version_resolver=lambda _: 'a' * 64)
-        _, old = select_working_context(**common, working_set_policy='recent.v2')
-        _, new = select_working_context(**common, working_set_policy='recent.v3')
-        self.assertEqual(old['selected_records'], [])
+        _, new = select_working_context(**common, working_set_policy='recent.v6')
         self.assertEqual({x['source']['record'] for x in new['selected_records']},
                          {'records/1.json', 'records/3.json'})
 
@@ -546,12 +540,12 @@ class WorkingSupplyContinuityTests(unittest.TestCase):
             processed_turns=[0], archived_turns=[0], work_notes=[{'text': 'Use the original scope',
                 'records': ['needed']}], version_resolver=lambda _: 'a' * 64)
         before = deepcopy(arguments)
-        messages, selected = select_working_context(**arguments, working_set_policy='recent.v2')
+        messages, selected = select_working_context(**arguments, working_set_policy='recent.v6')
         self.assertIn(1, selected['selected_turns'])
         shown = json.loads(messages[1]['content'])['working_view']['observations']
         self.assertEqual([item['observation']['text'] for item in shown], ['NEEDED ORIGINAL'])
         self.assertEqual(arguments, before)
-        _, explicit = select_working_context(**arguments, working_set_policy='recent.v2',
+        _, explicit = select_working_context(**arguments, working_set_policy='recent.v6',
             selected_records=['unused'])
         self.assertTrue(any(item['source']['record'] == 'unused' for item in explicit['selected_records']))
 
@@ -585,7 +579,7 @@ class WorkingSupplyContinuityTests(unittest.TestCase):
             estimate_tokens=len, material_policy='working', require_work_notes=True,
             fit_work_notes=True, sparse_handoffs=True, processed_turns=[], archived_turns=[],
             selected_records=['read/full'], version_resolver=lambda _: 'a' * 64,
-            working_set_policy='recent.v2')
+            working_set_policy='recent.v6')
         supplied = json.loads(messages[1]['content'])['working_view']['observations']
         self.assertEqual([row['observation']['text'] for row in supplied], ['ab', 'ij'])
         slices = [row['source']['record_text_slice'] for row in selection['selected_records']
@@ -695,12 +689,12 @@ class InspectionWorkingContinuityTests(unittest.TestCase):
 
             arguments = {'goal': 'Check the claim', 'targets': ['workspace/original.txt']}
             request = InspectionRequest.model_validate(arguments)
-            owner = gateway('integrated.v1')
+            owner = gateway('integrated.v3')
             prepared = owner.call('inspect_artifacts', arguments, identity='inspection')
             self.assertEqual(prepared.data, {'inspection_pending': 'inspection'})
             path = owner._path('inspection', 'input')
             saved = owner.store.read_json(path)
-            self.assertEqual(saved['work_lifecycle'], 'integrated.v1')
+            self.assertEqual(saved['work_lifecycle'], 'integrated.v3')
             before = owner.store.resolve(path).read_bytes()
             resumed = gateway(None)
             self.assertEqual(resumed.call('inspect_artifacts', arguments, identity='inspection').data,
@@ -774,7 +768,7 @@ class InspectionWorkingContinuityTests(unittest.TestCase):
             historical = deepcopy(saved)
             historical.pop('work_lifecycle')
             owner.store.write_json(path, historical)
-            current = gateway('integrated.v1')
+            current = gateway('integrated.v3')
             frozen = owner.store.resolve(path).read_bytes()
             current.call('inspect_artifacts', arguments, identity='inspection')
             self.assertEqual(owner.store.resolve(path).read_bytes(), frozen)

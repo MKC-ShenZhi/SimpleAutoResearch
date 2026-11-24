@@ -24,7 +24,7 @@ class WorkLifecycleTests(unittest.TestCase):
         app.ledger = BudgetLedger({'llm_requests': requests, 'total_tokens': tokens})
         app.state = {'config': {'memory_protocol': 'journal.v1',
             'completion_policy': 'available_operations.v2', 'work_method': 'execute.v2',
-            **({'work_lifecycle': 'integrated.v1'} if integrated else {})},
+            **({'work_lifecycle': 'integrated.v3'} if integrated else {})},
             'turns': [], 'pending': {'skip_memory_checkpoint': True}}
         app.session = SimpleNamespace(manifest=SimpleNamespace(
             budget=SimpleNamespace(max_attempts=100, attempts=0)))
@@ -133,18 +133,14 @@ class WorkLifecycleTests(unittest.TestCase):
         item = next(item for turn in reversed(app.state['turns']) for item in turn['tools']
                     if item.get('review_result'))
         review = 'records/' + item['review_result'].removeprefix('attempts/')
-        # The saved v5 contract presents completed review windows; v6 leaves a
-        # clean completed opinion navigable without resending its original text.
-        app.state['config']['working_set_policy'] = 'recent.v5'
+        # v6 leaves a clean completed opinion navigable without resending its original text.
+        app.state['config']['working_set_policy'] = 'recent.v6'
         with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select:
             app._messages(client=app._client())
         rows = [row for row in select.call_args.kwargs['observations']
                 if row.get('record') == review and row.get('kind') == 'source_text'
                 and row.get('absolute_path') == str(app.workspace.resolve('note.md'))]
-        self.assertTrue(rows)
-        self.assertTrue(all(type(row.get('offset_bytes')) is int for row in rows))
-        self.assertTrue(all(len(row['text'].encode()) == row['next_offset_bytes'] - row['offset_bytes']
-                            for row in rows))
+        self.assertEqual(rows, [])
 
     def test_closure_never_offers_unfunded_check_and_keeps_partial_exit(self):
         for requests, expected_reserve in ((2, 1), (1, 0)):

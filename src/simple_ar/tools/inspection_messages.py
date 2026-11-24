@@ -239,7 +239,7 @@ class _InspectionMessagesMixin:
         if checkpoint_policy not in (None, 'economic.v3'):
             raise ValueError('Unknown saved inspection checkpoint policy')
         economic = checkpoint_policy == 'economic.v3'
-        if saved.get('work_lifecycle') not in (None, 'integrated.v1', 'integrated.v2', 'integrated.v3'):
+        if saved.get('work_lifecycle') not in (None, 'integrated.v3'):
             raise ValueError('Unknown saved inspection work lifecycle')
         if economic and not continuity:
             raise ValueError('Inspection checkpoint policy requires its saved journal')
@@ -496,9 +496,9 @@ class _InspectionMessagesMixin:
             material_policy='working' if economic else 'retained' if retained else 'ranked',
             selected_records=selected_records,
             native_observations=native_observations,
-            preserve_material_observations=saved.get('work_lifecycle') == 'integrated.v1',
-            working_set_policy=(saved.get('working_set_policy') or 'recent.v2')
-                if saved.get('work_lifecycle') in {'integrated.v2', 'integrated.v3'} else None,
+            preserve_material_observations=False,
+            working_set_policy=(saved.get('working_set_policy') or 'recent.v4')
+                if saved.get('work_lifecycle') == 'integrated.v3' else None,
             version_resolver=version if retained else None,
             **({'work_notes':notes, 'require_work_notes':True, 'fit_work_notes':True,
                 'economical_checkpoint':economic,

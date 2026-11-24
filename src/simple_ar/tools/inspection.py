@@ -119,7 +119,7 @@ class InspectionToolGateway(_InspectionEvidenceMixin, _InspectionMessagesMixin):
             raise ValueError('Inspection checkpoint policy requires journal continuity')
         if work_method is not None and work_method not in NATIVE_WORK_METHODS or work_method and protocol != 'subjects.v3':
             raise ValueError('Unsupported inspection working method')
-        if work_lifecycle not in (None, 'integrated.v1', 'integrated.v2', 'integrated.v3') or work_lifecycle and protocol != 'subjects.v3':
+        if work_lifecycle not in (None, 'integrated.v3') or work_lifecycle and protocol != 'subjects.v3':
             raise ValueError('Unsupported inspection work lifecycle')
         if working_set_policy not in (None, 'recent.v4'):
             raise ValueError('Unsupported inspection working set policy')

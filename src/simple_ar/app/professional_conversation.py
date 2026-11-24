@@ -17,7 +17,7 @@ from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES
 # Production contracts consume the same retained observations and working memory.
 RETAINED_PROFESSIONAL_CONTRACTS = frozenset({'work.v5', 'work.v6', 'work.v7', 'work.v8', 'work.v9', 'work.v10', 'work.v11', 'work.v12'})
 NATIVE_HISTORY_POLICY = 'closed_observations.v1'
-INTEGRATED_WORK_LIFECYCLES = frozenset({'integrated.v1', 'integrated.v2', 'integrated.v3'})
+INTEGRATED_WORK_LIFECYCLES = frozenset({'integrated.v3'})
 
 
 def continuation_blocks(blocks: list[list[dict]], *, policy: str | None, thinking_mode: str) -> list[list[dict]]:

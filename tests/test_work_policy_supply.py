@@ -30,9 +30,9 @@ class WorkPolicySupplyTests(unittest.TestCase):
         if policy is not None:
             config['work_selection_policy'] = policy
         if policy == 'outcomes.v1':
-            config['work_lifecycle'] = 'integrated.v2'
+            config['work_lifecycle'] = 'integrated.v3'
         elif policy == 'native.v3':
-            config['work_lifecycle'] = 'integrated.v1'
+            config['work_lifecycle'] = 'integrated.v3'
         case.app = load_prepared_operation_history(case.root, goal, config=config,
             limits={'llm_requests': 30, 'total_tokens': 900000}, services=case.services)
         action = fixture._action('write_file', path='note.md', content='Three supplied observations.\n')

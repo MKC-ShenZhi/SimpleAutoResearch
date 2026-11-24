@@ -240,7 +240,7 @@ def select_working_context(
     context_authority: Literal['sources.v1'] | None = None,
     message_projector: Callable | None = None,
     preserve_material_observations: bool = False,
-    working_set_policy: Literal['recent.v2', 'recent.v3', 'recent.v4', 'recent.v5', 'recent.v6'] | None = None,
+    working_set_policy: Literal['recent.v4', 'recent.v6'] | None = None,
     steady_working_target: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
@@ -329,11 +329,11 @@ def select_working_context(
     """
     if context_authority is not None and context_authority != 'sources.v1':
         raise ValueError('Unknown context authority policy')
-    if working_set_policy not in (None, 'recent.v2', 'recent.v3', 'recent.v4', 'recent.v5', 'recent.v6'):
+    if working_set_policy not in (None, 'recent.v4', 'recent.v6'):
         raise ValueError('Unknown working set policy')
     recent_set = working_set_policy is not None
-    focused_working_set = working_set_policy in {'recent.v5', 'recent.v6'}
-    active_material_policy = working_set_policy in {'recent.v3', 'recent.v4'} or focused_working_set
+    focused_working_set = working_set_policy == 'recent.v6'
+    active_material_policy = recent_set
     # None preserves historical consumers. An explicit (possibly empty) supply
     # is derived by the message owner, never inferred from matching prose.
     def source_key(row: Mapping[str, Any]) -> str:
@@ -874,7 +874,7 @@ def select_working_context(
         paths = {location(i) for i in current_reads if observed_turn(i) in read_turns}
         active_material = {i for i in current_reads if location(i) in paths}
         reusable_material = active_material
-        if working_set_policy in {'recent.v4', 'recent.v5'}:
+        if working_set_policy == 'recent.v4':
             # A checkpoint is a summary, not proof that earlier originals are
             # no longer useful. Let this request's observed, current sources
             # compete for remaining capacity after recent work.

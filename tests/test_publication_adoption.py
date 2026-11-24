@@ -30,7 +30,7 @@ class PublicationAdoptionTests(unittest.TestCase):
             outputs=['paper.pdf'], **options), approve=lambda *_: True)
         return self.case._ok('run_process')
 
-    def check(self, lifecycle='integrated.v1', formats=None):
+    def check(self, lifecycle='integrated.v3', formats=None):
         owner = PublicationToolGateway(self.case.root, self.case.app.workspace, self.case.app.ledger,
             work_lifecycle=lifecycle)
         return owner.check_requested_delivery([], ['report.md', 'paper.pdf'],
@@ -178,7 +178,7 @@ class PublicationAdoptionTests(unittest.TestCase):
         self.publish()
         self.case._write('attachment.pdf', '%PDF unrelated attachment')
         owner = PublicationToolGateway(self.case.root, self.case.app.workspace, self.case.app.ledger,
-            work_lifecycle='integrated.v1')
+            work_lifecycle='integrated.v3')
         verified = owner.check_requested_delivery([], ['report.md', 'old.pdf', 'paper.pdf', 'attachment.pdf'],
             formats=['markdown', 'pdf'], manuscript='report.md')
         self.assertEqual(verified, {self.case.app.workspace.resolve('paper.pdf')})

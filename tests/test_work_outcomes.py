@@ -116,13 +116,13 @@ class OutcomeQueueTests(unittest.TestCase):
             allow_execution=True, max_turns=24, max_tokens=900000, tool_contracts='on_demand')
         # This suite exercises the saved outcome interpreter, not new defaults.
         case.app.state['config'].update(work_selection_policy='outcomes.v1',
-            work_lifecycle='integrated.v2', inspection_execution_protocol='shared.v1')
+            work_lifecycle='integrated.v3', inspection_execution_protocol='shared.v1')
         case.app.state['config'].pop('candidate_review_protocol', None)
         case.app.state['config'].pop('delivery_review_selection', None)
         case.app._save()
         case._reload()
         self.assertEqual(case.app.state['config']['work_selection_policy'], 'outcomes.v1')
-        self.assertEqual(case.app.state['config']['work_lifecycle'], 'integrated.v2')
+        self.assertEqual(case.app.state['config']['work_lifecycle'], 'integrated.v3')
         case._reload()
 
     def drain(self, **kwargs):

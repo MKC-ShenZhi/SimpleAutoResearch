@@ -1206,7 +1206,7 @@ class _ToolMessagesMixin:
                             working_rows.append({**supplied[-1], 'text':text,
                                 **({'kind': 'authored_text', 'size_bytes': len(text.encode('utf-8')),
                                     'offset_bytes': 0, 'next_offset_bytes': len(text.encode('utf-8'))}
-                                   if config.get('work_lifecycle') in {'integrated.v2', 'integrated.v3'} else {}),
+                                   if config.get('work_lifecycle') == 'integrated.v3' else {}),
                                 **{key:data[key] for key in ('absolute_path','sha256') if key in data}})
                             if receipt_supply and turn.get('origin') != 'professional':
                                 native_observations.append({key: value for key, value in working_rows[-1].items() if key != 'text'})
@@ -1301,7 +1301,7 @@ class _ToolMessagesMixin:
                             'tool': source_tool, 'role': 'historical_observation',
                             **({'kind': 'source_text', 'call_id': call_id,
                                 **({'size_bytes': row['size_bytes']} if 'size_bytes' in row else {})}
-                               if config.get('work_lifecycle') in {'integrated.v2', 'integrated.v3'} else {}),
+                               if config.get('work_lifecycle') == 'integrated.v3' else {}),
                             **({'path': indexed['arguments']['path']}
                                 if 'path' in indexed['arguments'] and field == 'data.text' else {}),
                             **{key: row[key] for key in ('path', 'absolute_path', 'sha256', 'offset_bytes',
@@ -1562,9 +1562,9 @@ class _ToolMessagesMixin:
                 steady_working_target=(min(target, max(36000, target // 3))
                     if config.get('context_checkpoint_policy') == 'economic.v3' else None),
                 native_observations=native_observations if receipt_supply else None,
-                preserve_material_observations=config.get('work_lifecycle') == 'integrated.v1',
-                working_set_policy=(config.get('working_set_policy', 'recent.v2')
-                    if config.get('work_lifecycle') in {'integrated.v2', 'integrated.v3'} else None),
+                preserve_material_observations=False,
+                working_set_policy=(config.get('working_set_policy', 'recent.v6')
+                    if config.get('work_lifecycle') == 'integrated.v3' else None),
                 estimate_tokens=estimate_tokens,work_notes=work_notes,
                 require_work_notes=config.get('memory_protocol') == 'journal.v1',
                 fit_work_notes=config.get('memory_protocol') == 'journal.v1',
