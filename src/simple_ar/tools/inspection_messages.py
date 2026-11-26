@@ -82,13 +82,28 @@ class _InspectionMessagesMixin:
             if self._applicable_scope(saved):
                 view['proposed_delivery']['scope_policy'] = saved['delivery_context']['scope_policy']
                 if 'revision_sources' in saved:
+                    changed_set = set(saved['revision_sources'])
+                    added_set = set(saved.get('introduced_artifacts', []))
+                    delivery_artifacts = saved.get('delivery_context', {}).get('artifacts', {})
+                    unchanged = [
+                        {'artifact': self._review_artifact_name(path), 'sha256_prefix': digest[:12]}
+                        for path, digest in sorted(delivery_artifacts.items())
+                        if path not in changed_set and path not in added_set and isinstance(digest, str) and digest
+                    ]
                     view['proposed_delivery']['revision'] = {
                         'changed': saved['revision_sources'],
                         'added': saved.get('introduced_artifacts', []),
                         'removed': saved.get('removed_artifacts', []),
-                        'scope': 'Investigate new or changed claims and the sources affected by this revision. '
+                        **({'unchanged_since_prior_review': unchanged} if unchanged else {}),
+                        'scope': (
+                            'Incremental re-review: prioritize reassessed_prior concerns and changed/added artifacts. '
+                            'Artifacts in unchanged_since_prior_review are byte-identical to the prior review; '
+                            'avoid repeating environment/version probes or redundant checks on unchanged files '
+                            'unless a changed artifact or new claim invalidates them. '
                             'Retained original observations can support unchanged claims when applicable. '
-                            'This inventory comparison does not transfer an earlier verdict.'}
+                            'This inventory comparison does not transfer an earlier verdict.'
+                        ),
+                    }
                 history = saved.get('source_history', {})
                 view['source_history'] = {'indexed_paths': len(history.get('entries', [])),
                     'scope': history.get('scope', 'No parent read locators available; use authorized roots.'),

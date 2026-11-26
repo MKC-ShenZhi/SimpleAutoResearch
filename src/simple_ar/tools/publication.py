@@ -16,6 +16,7 @@ from simple_ar.core.process import ProcessSpec, run_process
 from simple_ar.report.export import (ReportExportError, ReportExportResourceError, export_acm_report,
     _asset_path, ARTICLE_RENDERING_VERSION, ARTICLE_RENDERING_VERSIONS,
     publication_template_inputs, report_image_targets, validate_publication_checks)
+from simple_ar.report.html_export import export_html_report
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 from simple_ar.tools.workspace import DeliveryRequest, _private_name, resolve_mounted_path
 
@@ -83,6 +84,9 @@ class PublicationRequest(BaseModel):
     title: str = Field(default="", max_length=500)
     compile_pdf: bool = Field(default=True,
         description='Compile the explicitly requested publication to PDF. Set false for an editable TeX project only. Ordinary Markdown/figure delivery does not require this export tool; the historical default within an export request is unchanged.')
+    format: Literal['latex', 'html'] | None = Field(default=None,
+        exclude_if=lambda value: value is None,
+        description='Optional export format. Omit or set "latex" for the standard TeX/PDF exporter. Set "html" for a pure-Python self-contained academic HTML file (Base64-embedded figures, browser print-to-PDF ready) when Pandoc/LaTeX are unavailable. HTML export never satisfies an explicit PDF requirement.')
     layout: Literal['article', 'acm'] | None = Field(default=None,
         exclude_if=lambda value: value is None,
         description='Built-in layout: article is a single-column report; acm is the ACM manuscript. Article selects pdfLaTeX or XeLaTeX with CTeX/Fandol from the content. Choose layout or a trusted template; omit both for historical ACM. This does not request export or certify quality.')
@@ -104,6 +108,12 @@ class PublicationRequest(BaseModel):
     def validate_preview(self) -> PublicationRequest:
         if self.layout is not None and self.template is not None:
             raise ValueError('Choose a built-in layout or a supplied template, not both')
+        if self.format == 'html':
+            if self.template is not None or self.layout is not None:
+                raise ValueError('format="html" cannot be combined with LaTeX layout or template')
+            if self.render_preview or self.checks is not None:
+                raise ValueError('format="html" does not support PDF render_preview or PDF checks')
+            return self
         if self.render_preview and not self.compile_pdf:
             raise ValueError("render_preview requires compile_pdf=true")
         if self.checks is not None and not self.compile_pdf:
@@ -161,7 +171,7 @@ def export_input_binding(source: Path, request: ExportRequest, *, output_root: P
         if policy not in ({'schema_version': version} for version in ARTICLE_RENDERING_VERSIONS):
             raise ValueError('Unsupported article rendering policy; retain the saved publication')
         fields['article_rendering'] = policy
-    if (request.layout in {None, 'acm'} and request.template is None
+    if (request.format != 'html' and request.layout in {None, 'acm'} and request.template is None
             and (saved is None or 'technical_rendering' in saved)):
         policy = saved['technical_rendering'] if saved is not None else 'natural'
         if policy != 'natural':
@@ -666,7 +676,7 @@ class PublicationToolGateway:
                 raise ValueError('Candidate preparation cannot satisfy final publication delivery')
             if self.workspace.resolve(proposed['markdown']) != self.workspace.resolve(source):
                 raise ValueError('Proposed publication uses a different authoring version')
-            if 'pdf' in formats and not proposed.get('compile_pdf', True):
+            if 'pdf' in formats and (not proposed.get('compile_pdf', True) or proposed.get('format') == 'html'):
                 raise ValueError('The declared PDF obligation requires compilation')
             return set()  # Recheck actual owner results before terminal commit.
         delivered = {self.workspace.resolve(path) for path in artifacts}
@@ -903,24 +913,35 @@ class PublicationToolGateway:
                     return _authorized_image(self.workspace, path)
 
                 try:
-                    caption_owner = ('markdown' if request.caption_source == 'adjacent' else
-                        request.caption_source or (report_identity or {}).get('figure_caption_owner', 'markdown'))
-                    manifest = export_acm_report(render_source.parent, output, title=request.title or None,
-                        body_name=source.name, compile_pdf=request.compile_pdf, render_preview=request.render_preview, runner=render,
-                        preflight=preflight,
-                        validate_asset=validate_asset,
-                        **({'resolve_image': resolve_image}
-                           if binding.get('image_binding_version') == 2 else {}),
-                        caption_owner=caption_owner,
-                        **({'adjacent_captions': True} if request.caption_source == 'adjacent' else {}),
-                        **({'layout': request.layout} if request.layout is not None else {}),
-                        **({'article_rendering': binding.get('article_rendering',
-                            {'schema_version': 'article-rendering.v1'})} if request.layout == 'article' else {}),
-                        **({'technical_rendering': binding.get('technical_rendering', 'legacy')}
-                           if request.layout in {None, 'acm'} and request.template is None else {}),
-                        **({'citation_style': request.citation_style} if request.citation_style is not None else {}),
-                        **({'checks': request.checks.model_dump(exclude_none=True)} if request.checks is not None else {}),
-                        **({'template': request.template.model_dump()} if request.template is not None else {}))
+                    if request.format == 'html':
+                        manifest = export_html_report(
+                            render_source.parent,
+                            output,
+                            title=request.title or None,
+                            body_name=source.name,
+                            validate_asset=validate_asset,
+                            **({'resolve_image': resolve_image}
+                               if binding.get('image_binding_version') == 2 else {}),
+                        )
+                    else:
+                        caption_owner = ('markdown' if request.caption_source == 'adjacent' else
+                            request.caption_source or (report_identity or {}).get('figure_caption_owner', 'markdown'))
+                        manifest = export_acm_report(render_source.parent, output, title=request.title or None,
+                            body_name=source.name, compile_pdf=request.compile_pdf, render_preview=request.render_preview, runner=render,
+                            preflight=preflight,
+                            validate_asset=validate_asset,
+                            **({'resolve_image': resolve_image}
+                               if binding.get('image_binding_version') == 2 else {}),
+                            caption_owner=caption_owner,
+                            **({'adjacent_captions': True} if request.caption_source == 'adjacent' else {}),
+                            **({'layout': request.layout} if request.layout is not None else {}),
+                            **({'article_rendering': binding.get('article_rendering',
+                                {'schema_version': 'article-rendering.v1'})} if request.layout == 'article' else {}),
+                            **({'technical_rendering': binding.get('technical_rendering', 'legacy')}
+                               if request.layout in {None, 'acm'} and request.template is None else {}),
+                            **({'citation_style': request.citation_style} if request.citation_style is not None else {}),
+                            **({'checks': request.checks.model_dump(exclude_none=True)} if request.checks is not None else {}),
+                            **({'template': request.template.model_dump()} if request.template is not None else {}))
                 except ReportExportError:
                     if not (output / 'export.json').is_file():
                         raise
@@ -956,7 +977,7 @@ class PublicationToolGateway:
                 # another mutable task state or a second Markdown parser.
                 manifest['consumed_inputs'] = consumed
                 ArtifactStore(output).write_json('export.json', manifest)
-            artifacts = [f"{prefix}/{file}" for file in ("main.tex", "body.tex", "references.bib", "source.md", "export.json", "main.pdf")
+            artifacts = [f"{prefix}/{file}" for file in ("main.tex", "body.tex", "references.bib", "source.md", "index.html", "export.json", "main.pdf")
                          if (output / file).is_file()]
             completed = manifest['status'] in {'exported', 'compiled'}
             if request.checks is not None:
