@@ -77,6 +77,10 @@ export interface TaskSnapshot {
   worker_live: boolean;
   stop_requested: boolean;
   worker_error: string | null;
+  live_progress?: {
+    message: string;
+    updated_at: number;
+  } | null;
   local_workers: string[];
   auto_approve?: boolean;
   replies?: Array<{

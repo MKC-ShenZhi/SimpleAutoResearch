@@ -132,6 +132,7 @@ class WorkspaceToolGateway:
         self.record_artifacts = record_artifacts
         self.sandbox_execution = sandbox_execution
         self.sandbox_gpu = sandbox_gpu
+        self.process_progress: Any = None
 
     def process_sandbox(self, cwd: Path, *, extra_read: tuple[Path, ...] = (),
                         python: Path | None = None, writable: Path | None = None):
@@ -2114,11 +2115,16 @@ class WorkspaceToolGateway:
         # do not reinterpret that owned command as another public invocation.
         binding = (self.process_artifact_binding(request.model_dump(exclude_none=True), identity=identity)
                    if request.inputs or request.outputs or request.input_snapshot is not None else None)
+        progress_sink = self.process_progress
+        progress_cb = (
+            (lambda elapsed, stream, line: progress_sink(f"  [{int(elapsed)}s {stream}] {line}"))
+            if callable(progress_sink) else None
+        )
         result = run_process(ProcessSpec(argv=argv, cwd=cwd, timeout_sec=request.timeout_sec,
             env=self.process_environment(), output_dir=output, invocation_id=identity, tail_bytes=12000, log_bytes=200000,
             input_binding={'workspace_artifacts': binding} if binding is not None else None,
             sandbox=self.process_sandbox(cwd) if sandboxed else None),
-            budget_ledger=self.ledger)
+            budget_ledger=self.ledger, progress_callback=progress_cb)
         if binding is not None and result.returncode == 0 and not result.stop_reason:
             from simple_ar.core.artifacts import write_json
 

@@ -716,13 +716,23 @@ export function SessionView({
                 color: 'var(--text-secondary)',
               }}
             >
-              <div className="flex items-center gap-2">
-                <Loader2 className="h-4 w-4 animate-spin" style={{ color: 'var(--accent)' }} />
-                <span>
-                  {snapshot.stop_requested
-                    ? '已请求打断，正在当前操作边界安全保存并暂停…'
-                    : '研究任务正在推进中，界面将自动刷新最新回执与成果…'}
-                </span>
+              <div className="min-w-0 flex-1 pr-3">
+                <div className="flex items-center gap-2">
+                  <Loader2 className="h-4 w-4 shrink-0 animate-spin" style={{ color: 'var(--accent)' }} />
+                  <span>
+                    {snapshot.stop_requested
+                      ? '已请求打断，正在当前操作边界安全保存并暂停…'
+                      : '研究任务正在推进中，界面将自动刷新最新回执与成果…'}
+                  </span>
+                </div>
+                {snapshot.live_progress?.message && (
+                  <div
+                    className="mt-1 truncate pl-6 font-mono text-[12px] opacity-85"
+                    title={snapshot.live_progress.message}
+                  >
+                    {snapshot.live_progress.message}
+                  </div>
+                )}
               </div>
               {!snapshot.stop_requested && (
                 <button

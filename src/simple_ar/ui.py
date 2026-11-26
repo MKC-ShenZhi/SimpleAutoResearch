@@ -18,6 +18,7 @@ import re
 import secrets
 import sys
 import threading
+import time
 import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -82,6 +83,7 @@ class Workspace:
         self.lock = threading.Lock()
         self.workers: dict[str, tuple[threading.Thread, threading.Event]] = {}
         self.errors: dict[str, str] = {}
+        self.live_progress: dict[str, dict[str, Any]] = {}
         self.auto_approve: set[str] = set()
         self.creation_key = secrets.token_bytes(32)
 
@@ -468,6 +470,7 @@ class Workspace:
             live = bool(worker and worker[0].is_alive())
             stopping = bool(live and worker[1].is_set())
             error = self.errors.get(name)
+            live_progress = dict(self.live_progress[name]) if live and name in self.live_progress else None
             local_workers = [task for task, (thread, _) in self.workers.items() if thread.is_alive()]
             auto_approve = name in self.auto_approve
         replies = []
@@ -494,6 +497,7 @@ class Workspace:
         return dict(view, task=name, source_access=source_access,
             mode='live execution' if live else 'saved results browser',
             worker_live=live, stop_requested=stopping, worker_error=error,
+            live_progress=live_progress,
             local_workers=local_workers, auto_approve=auto_approve, replies=replies)
 
     def file(self, name: str, mount: str, relative: str) -> Path:
@@ -739,12 +743,22 @@ class Workspace:
         if name in self.auto_approve and 'approve' not in run_kwargs and 'approved_execution' not in run_kwargs:
             run_kwargs['approve'] = lambda _call, _token: True
 
+        def record_progress(message: str) -> None:
+            text = public_text(str(message).strip()[:300])
+            if not text:
+                return
+            with self.lock:
+                self.live_progress[name] = {'message': text, 'updated_at': time.time()}
+
         def run():
             try:
-                ToolApplication.load(root).run(**run_kwargs, progress=lambda _: None, should_stop=stop.is_set)
+                ToolApplication.load(root).run(**run_kwargs, progress=record_progress, should_stop=stop.is_set)
             except Exception:
                 with self.lock:
                     self.errors[name] = 'Worker could not continue; inspect original task records with CLI'
+            finally:
+                with self.lock:
+                    self.live_progress.pop(name, None)
 
         thread = threading.Thread(target=run, daemon=True)
         self.errors.pop(name, None)

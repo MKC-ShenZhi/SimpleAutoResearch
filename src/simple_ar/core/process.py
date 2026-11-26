@@ -176,6 +176,88 @@ class _Capture:
         }
 
 
+class ThrottledProcessProgress:
+    """Thread-safe throttled live-tail observer for long-running processes.
+
+    Captures the latest non-empty trimmed line across stdout/stderr (handling
+    carriage-return progress bars) and emits at most once per ``interval_sec``.
+    Display-sink errors (e.g. ``BrokenPipeError``) are suppressed so a closed
+    terminal or UI listener never aborts an active computation.
+    """
+
+    def __init__(
+        self,
+        callback: Callable[[float, str, str], None],
+        *,
+        started: float | None = None,
+        interval_sec: float = 5.0,
+        max_line_chars: int = 240,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if interval_sec <= 0 or max_line_chars < 16:
+            raise ValueError("interval_sec must be positive and max_line_chars >= 16")
+        self._callback: Callable[[float, str, str], None] | None = callback
+        self._clock = clock
+        self._started = clock() if started is None else started
+        self._interval = interval_sec
+        self._max_chars = max_line_chars
+        self._lock = threading.Lock()
+        self._buffers: dict[str, str] = {"stdout": "", "stderr": ""}
+        self._latest_line: str = ""
+        self._latest_stream: str = "stdout"
+        self._dirty = False
+        self._last_emit: float | None = None
+
+    def feed(self, stream: str, chunk: str) -> None:
+        if not chunk:
+            return
+        emit_args: tuple[float, str, str] | None = None
+        with self._lock:
+            if self._callback is None:
+                return
+            buf = self._buffers.get(stream, "") + chunk
+            # Normalize CR-based progress bars (e.g. tqdm) alongside newlines.
+            parts = re.split(r"[\r\n]+", buf)
+            self._buffers[stream] = parts[-1][-self._max_chars * 2 :] if parts else ""
+            for candidate in parts[:-1]:
+                trimmed = candidate.strip()
+                if trimmed:
+                    self._latest_line = trimmed[: self._max_chars]
+                    self._latest_stream = stream
+                    self._dirty = True
+            now = self._clock()
+            if self._dirty and (self._last_emit is None or now - self._last_emit >= self._interval):
+                self._last_emit = now
+                self._dirty = False
+                emit_args = (max(0.0, now - self._started), self._latest_stream, self._latest_line)
+        if emit_args is not None:
+            self._emit(*emit_args)
+
+    def tick(self) -> None:
+        """Flush a pending line once ``interval_sec`` has elapsed since last emit."""
+        emit_args: tuple[float, str, str] | None = None
+        with self._lock:
+            if self._callback is None or not self._dirty:
+                return
+            now = self._clock()
+            if self._last_emit is None or now - self._last_emit >= self._interval:
+                self._last_emit = now
+                self._dirty = False
+                emit_args = (max(0.0, now - self._started), self._latest_stream, self._latest_line)
+        if emit_args is not None:
+            self._emit(*emit_args)
+
+    def _emit(self, elapsed: float, stream: str, line: str) -> None:
+        cb = self._callback
+        if cb is None:
+            return
+        try:
+            cb(elapsed, stream, line)
+        except OSError:
+            with self._lock:
+                self._callback = None
+
+
 def process_observation(record: dict, output_dir: Path, *, tail_bytes: int = 12000) -> dict:
     """Project finalized output without executing or rewriting an invocation.
 
@@ -218,6 +300,8 @@ def run_process(
     budget_ledger: BudgetLedger | None = None,
     output_complete_callback: Callable[[], None] | None = None,
     accounting_purpose: str = "local_process",
+    progress_callback: Callable[[float, str, str], None] | None = None,
+    progress_interval_sec: float = 5.0,
 ) -> ProcessResult:
     """Execute one invocation, optionally reserving and settling shared budget.
 
@@ -226,7 +310,9 @@ def run_process(
     """
     if budget_ledger is None:
         return _run_process(spec, output_callback=output_callback, cancel=cancel,
-                            output_complete_callback=output_complete_callback)
+                            output_complete_callback=output_complete_callback,
+                            progress_callback=progress_callback,
+                            progress_interval_sec=progress_interval_sec)
     if spec.output_dir is None:
         raise ValueError("Ledger-backed execution requires a persistent output_dir")
     reservation = f"process-{spec.invocation_id}"
@@ -239,7 +325,9 @@ def run_process(
     )
     try:
         result = _run_process(spec, output_callback=output_callback, cancel=cancel,
-                              output_complete_callback=output_complete_callback)
+                              output_complete_callback=output_complete_callback,
+                              progress_callback=progress_callback,
+                              progress_interval_sec=progress_interval_sec)
     except BaseException:
         record_path = spec.output_dir / "invocation.json"
         if record_path.is_file():
@@ -298,6 +386,8 @@ def _run_process(
     output_callback: Callable[[str, str], None] | None,
     cancel: threading.Event | None,
     output_complete_callback: Callable[[], None] | None = None,
+    progress_callback: Callable[[float, str, str], None] | None = None,
+    progress_interval_sec: float = 5.0,
 ) -> ProcessResult:
     """Run argv without a shell; return bounded tails and observed execution facts.
 
@@ -353,20 +443,32 @@ def _run_process(
             raise
         return _watch_process(spec, process, record, save, started, launch_error,
             output_callback=output_callback, cancel=cancel,
-            output_complete_callback=output_complete_callback)
+            output_complete_callback=output_complete_callback,
+            progress_callback=progress_callback,
+            progress_interval_sec=progress_interval_sec)
 
 
 def _watch_process(spec, process, record, save, started, launch_error, *,
-                   output_callback, cancel, output_complete_callback):
+                   output_callback, cancel, output_complete_callback,
+                   progress_callback=None, progress_interval_sec=5.0):
     """One lifetime/output owner, including actual command startup on POSIX."""
     job = None
     captures = {name: _Capture(spec, name) for name in ("stdout", "stderr")}
     errors: list[Exception] = []
     failed = threading.Event()
+    throttled = (ThrottledProcessProgress(progress_callback, started=started,
+                                          interval_sec=progress_interval_sec)
+                 if progress_callback is not None else None)
 
     def drain(name: str) -> None:
         try:
-            callback = (lambda chunk: output_callback(name, chunk)) if output_callback else None
+            def on_chunk(chunk: str) -> None:
+                if output_callback is not None:
+                    output_callback(name, chunk)
+                if throttled is not None:
+                    throttled.feed(name, chunk)
+
+            callback = on_chunk if (output_callback is not None or throttled is not None) else None
             captures[name].drain(getattr(process, name), callback)
         except Exception as exc:
             errors.append(exc)
@@ -396,6 +498,8 @@ def _watch_process(spec, process, record, save, started, launch_error, *,
             if time.monotonic() - started >= spec.timeout_sec:
                 stop_reason = "timeout"
                 break
+            if throttled is not None:
+                throttled.tick()
             failed.wait(0.05)
     except Exception as exc:
         record.update(status="execution_error", error=str(exc))

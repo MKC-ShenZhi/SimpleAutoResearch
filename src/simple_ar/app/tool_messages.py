@@ -29,6 +29,7 @@ from simple_ar.app.tool_contracts import (
     _REQUEST_OWNER,
     _WORKING_CONTEXT_PROTOCOLS,
 )
+from simple_ar.core.budget import budget_pacing_notice
 from simple_ar.core.working_context import RECEIPT_SUPPLY_POLICIES, history_view, input_capacity
 from simple_ar.integrations.llm import (
     LLMClient,
@@ -1027,6 +1028,10 @@ class _ToolMessagesMixin:
                 'scope': 'Original historical observations in native messages, not current file state or verified facts. '
                     'No read text or write payload is replaced. Archived text is not supplied; use read_history for original receipts.'},
         }
+        if not closing:
+            pacing_notice = budget_pacing_notice(self.ledger)
+            if pacing_notice is not None:
+                context['resources']['pacing_notice'] = pacing_notice
         files = {alias: path.name for alias, path in self.workspace.mounts.items() if path.is_file()}
         if files:
             context['file_mounts'] = {'paths': files,

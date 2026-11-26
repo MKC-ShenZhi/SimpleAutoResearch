@@ -769,3 +769,45 @@ def response_accounting_known(
         )
         for key, row in entries.items()
     )
+
+
+def budget_pacing_notice(
+    ledger: BudgetLedger,
+    *,
+    request_ratio: float = 0.20,
+    request_floor: int = 4,
+    token_ratio: float = 0.15,
+) -> str | None:
+    """Return a single-line low-watermark pacing advisory, or ``None`` when healthy.
+
+    Pure read-only projection over ``ledger.limits`` and ``ledger.remaining()``.
+    Adds zero overhead when remaining capacity is above all watermarks and never
+    alters limits, reservations, permissions, or tool contracts.
+    """
+    warnings: list[str] = []
+    req_limit = ledger.limits.get("llm_requests")
+    if req_limit is not None and req_limit > 0:
+        req_rem = ledger.remaining("llm_requests")
+        if req_rem is not None:
+            ratio = req_rem / req_limit
+            if req_rem <= request_floor or ratio <= request_ratio:
+                warnings.append(
+                    f"llm_requests {int(req_rem)}/{int(req_limit)} remaining ({ratio:.0%})"
+                )
+    tok_limit = ledger.limits.get("total_tokens")
+    if tok_limit is not None and tok_limit > 0:
+        tok_rem = ledger.remaining("total_tokens")
+        if tok_rem is not None:
+            ratio = tok_rem / tok_limit
+            if ratio <= token_ratio:
+                warnings.append(
+                    f"total_tokens {int(tok_rem)}/{int(tok_limit)} remaining ({ratio:.0%})"
+                )
+    if not warnings:
+        return None
+    return (
+        "Low budget watermark ("
+        + "; ".join(warnings)
+        + "). Prioritize convergence, verification/review, and truthful delivery over new exploration; "
+        "tool contracts and permissions are unchanged."
+    )

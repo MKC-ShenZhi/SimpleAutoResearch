@@ -84,7 +84,8 @@ function paragraph(parent, text, className = '') {
 }
 function renderActivity() {
   $('worker').textContent = snapshot.worker_live
-    ? snapshot.stop_requested ? '本界面工作线程仍在运行；已请求在行动边界停止。' : '本界面工作线程正在运行。'
+    ? (snapshot.stop_requested ? '本界面工作线程仍在运行；已请求在行动边界停止。' : '本界面工作线程正在运行。')
+      + (snapshot.live_progress?.message ? ' ' + snapshot.live_progress.message : '')
     : '本界面没有运行中的工作线程；下方是保存记录，外部进程状态未知。';
   if (!snapshot.worker_live && snapshot.local_workers?.length) {
     $('worker').textContent += ' 本界面正在执行其他任务，请等待或切回该任务请求停止：' + snapshot.local_workers.join('、');

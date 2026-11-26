@@ -2391,10 +2391,15 @@ class ToolApplication(_ToolConfigMixin, _ToolMemoryMixin, _ToolLegacyMixin, _Too
                     if self.session.manifest.status == 'paused' and (active is None or not any(
                             a.attempt_id == active['attempt'] and a.status == 'running' for a in attempts)):
                         self.session.continue_with_revision('Resume pending work without resetting its budget')
-                with llm_call_stop_scope(should_stop):
-                    self._run(approved_execution, approve, progress, should_stop, remember_execution, resumed=resumed)
-                    if finish_declared_work and self._queue_declared_completion(should_stop):
-                        self._run('', None, progress, should_stop)
+                previous_process_progress = getattr(self.workspace, 'process_progress', None)
+                self.workspace.process_progress = progress
+                try:
+                    with llm_call_stop_scope(should_stop):
+                        self._run(approved_execution, approve, progress, should_stop, remember_execution, resumed=resumed)
+                        if finish_declared_work and self._queue_declared_completion(should_stop):
+                            self._run('', None, progress, should_stop)
+                finally:
+                    self.workspace.process_progress = previous_process_progress
             except LLMCallStopped:
                 # Preserve any budget block recorded by the attempt owner.
                 if self.session.manifest.status != 'blocked':
