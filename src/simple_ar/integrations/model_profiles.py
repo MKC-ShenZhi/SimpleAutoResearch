@@ -189,8 +189,8 @@ class ModelCatalog(BaseModel):
     def references(self) -> "ModelCatalog":
         if not self.profiles or any(not name.strip() or ":" in name for name in self.profiles):
             raise ValueError("Profiles need nonempty names without ':'")
-        if set(self.routes) - {"default", "text", "code", "writing", "vision", "image"}:
-            raise ValueError("Unknown route; use default, text, code, writing, vision or image")
+        if set(self.routes) - {"default", "text", "code", "writing", "review", "vision", "image"}:
+            raise ValueError("Unknown route; use default, text, code, writing, review, vision or image")
         if set(self.routes.values()) - set(self.profiles):
             raise ValueError("Route refers to an unknown profile")
         return self
@@ -200,13 +200,13 @@ class ModelCatalog(BaseModel):
             name = selector.removeprefix("profile:")
         else:
             route = selector.removeprefix("route:") if selector and selector.startswith("route:") else purpose
-            if route not in {"default", "text", "code", "writing", "vision", "image"}:
+            if route not in {"default", "text", "code", "writing", "review", "vision", "image"}:
                 raise ModelConfigError("Unknown model route")
             name = self.routes.get(route) or self.routes.get("default", "")
         if name not in self.profiles:
             raise ModelConfigError("Model profile/route is missing; configure it explicitly")
         profile = self.profiles[name]
-        required = {"image": "image_generate", "writing": "text"}.get(purpose, purpose)
+        required = {"image": "image_generate", "writing": "text", "review": "text"}.get(purpose, purpose)
         if required not in profile.capabilities:
             raise ModelConfigError(f"Profile {name!r} does not declare capability {required!r}")
         if selector and not selector.startswith(("profile:", "route:")) and selector != profile.model:

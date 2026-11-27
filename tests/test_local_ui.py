@@ -1205,7 +1205,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                         self.assertEqual(defaults[field], owner_limits[field])
                         self.assertGreater(defaults[field], 0)
                     self.assertEqual(set(defaults), {'max_turns', 'max_tokens', 'max_images',
-                        'allow_execution', 'sandbox_execution', 'allow_network', 'allow_vision',
+                        'allow_execution', 'sandbox_execution', 'sandbox_gpu', 'allow_network', 'allow_vision',
                         'independent_review_required',
                         'process_invocations', 'process_wall_seconds'})
                     # Application defaults flow into metadata without a second UI default.

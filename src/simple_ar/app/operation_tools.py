@@ -297,7 +297,7 @@ class OperationTools:
             sandbox_execution=config.get('sandbox_execution', False)), self.publication,
             request_visible=config.get('professional_operations') in RETAINED_PROFESSIONAL_CONTRACTS)
         self.inspection = InspectionToolGateway(root, self.workspace,
-            client_factory=lambda identity:client_factory(identity, 'writing'),
+            client_factory=lambda identity:client_factory(identity, 'review'),
             protocol=config.get('inspection_protocol'),
             context_authority=config.get('context_authority'),
             coverage_policy=config.get('inspection_coverage_policy'),

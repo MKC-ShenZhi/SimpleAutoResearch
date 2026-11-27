@@ -1366,7 +1366,7 @@ class ToolApplication(_ToolConfigMixin, _ToolMemoryMixin, _ToolLegacyMixin, _Too
         # Vision does not consume the code route. Pin only its own non-secret
         # identity, retaining the existing operational compatibility rules.
         return {key: value for key, value in client.connection_binding().items()
-                if key not in {'code_route', 'writing_route'}}
+                if key not in {'code_route', 'writing_route', 'review_route'}}
 
     @staticmethod
     def _work_connection(binding: dict[str, Any], purpose: str) -> dict[str, Any]:
@@ -1438,11 +1438,11 @@ class ToolApplication(_ToolConfigMixin, _ToolMemoryMixin, _ToolLegacyMixin, _Too
     @classmethod
     def _text_client(cls, client: LLMClient, purpose: str, *, native: bool = True) -> LLMClient:
         connection = cls._work_connection(client.connection_binding(), purpose)
-        if purpose == 'code' or (purpose == 'writing' and connection.get('profile')):
+        if purpose == 'code' or (purpose in {'writing', 'review'} and connection.get('profile')):
             client = LLMClient.for_task(client=client, purpose=purpose)
         # Writer owns its text protocol, including Responses; native decisions
         # retain structured Chat history and must never silently change protocol.
-        if purpose == 'writing' and not native:
+        if purpose in {'writing', 'review'} and not native:
             return client
         if client._settings.api_mode != "chat":
             raise ValueError("Native tools require the saved Chat protocol; no protocol fallback")

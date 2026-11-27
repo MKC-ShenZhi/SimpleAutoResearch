@@ -904,6 +904,11 @@ class LLMClient:
             writing = catalog.profiles[writing_name]
             binding["writing_route"] = {"profile": writing_name, "connection": writing.model_dump(
                 mode="json", exclude={"proxy_env"} | ({"http2"} if not writing.http2 else set()))}
+        review_name = catalog.routes.get("review")
+        if review_name:
+            review = catalog.profiles[review_name]
+            binding["review_route"] = {"profile": review_name, "connection": review.model_dump(
+                mode="json", exclude={"proxy_env"} | ({"http2"} if not review.http2 else set()))}
         return binding
 
     @classmethod
@@ -939,6 +944,9 @@ class LLMClient:
                     selector = f"profile:{client._profile_name}"
                 if selector is None and purpose == "writing" and "writing" not in client._model_catalog.routes:
                     selector = f"profile:{client._profile_name}"
+                if selector is None and purpose == "review" and "review" not in client._model_catalog.routes:
+                    selector = ("route:writing" if "writing" in client._model_catalog.routes
+                                else f"profile:{client._profile_name}")
                 name, profile = client._model_catalog.select(selector, purpose=purpose)
                 settings = LLMSettings(**profile.text_settings())
             except ModelConfigError as exc:

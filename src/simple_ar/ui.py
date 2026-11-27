@@ -203,12 +203,28 @@ class Workspace:
             os.environ['SIMPLE_AR_MODELS_CONFIG'] = str(target)
         return dict(settings=self.model_settings(), profiles=self.profiles())
 
+    def vision_route_status(self) -> dict:
+        """Report whether models.toml declares a usable vision route (non-secret)."""
+        try:
+            catalog = load_model_catalog()
+            if catalog is None:
+                return {'available': False, 'profile': None, 'model': None}
+            name = catalog.routes.get('vision')
+            if not name or name not in catalog.profiles:
+                return {'available': False, 'profile': None, 'model': None}
+            profile = catalog.profiles[name]
+            if 'vision' not in profile.capabilities or not profile.has_credential():
+                return {'available': False, 'profile': name, 'model': profile.model}
+            return {'available': True, 'profile': name, 'model': profile.model}
+        except Exception:
+            return {'available': False, 'profile': None, 'model': None}
+
     def creation_defaults(self) -> dict:
         args = native_arguments()
         options = native_creation_options(args)
         limits = ToolApplication.creation_limits(args.max_turns, args.max_tokens, args.max_images)
         return {key: options[key] for key in ('max_turns', 'max_tokens', 'max_images',
-                    'allow_execution', 'sandbox_execution', 'allow_network', 'allow_vision',
+                    'allow_execution', 'sandbox_execution', 'sandbox_gpu', 'allow_network', 'allow_vision',
                     'independent_review_required')} | {
             key: limits[key] for key in ('process_invocations', 'process_wall_seconds')}
 
@@ -263,7 +279,9 @@ class Workspace:
                 args.reuse_version = data.get('reuse_version')
             args.allow_execution = data.get('execution') is True
             args.sandbox_execution = data.get('sandbox_execution') is True
+            args.sandbox_gpu = data.get('sandbox_gpu') is True
             args.allow_network = data.get('network') is True
+            args.allow_vision = data.get('allow_vision') is True
             args.independent_review_required = data.get('independent_review_required')
             for field, destination in (('max_turns', 'max_turns'), ('max_tokens', 'max_tokens'),
                     ('process_invocations', 'max_processes'), ('process_wall_seconds', 'max_process_seconds')):
@@ -832,7 +850,9 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
                 if url.path == '/api/meta':
                     self.send(200, dict(project=str(workspace.project), reads=list(map(str, workspace.reads)),
                                         tasks=str(workspace.tasks), profiles=workspace.profiles(),
-                                        creation_defaults=workspace.creation_defaults()))
+                                        creation_defaults=workspace.creation_defaults(),
+                                        platform=sys.platform,
+                                        vision_route=workspace.vision_route_status()))
                 elif url.path == '/api/model-settings':
                     self.send(200, workspace.model_settings())
                 elif url.path == '/api/tasks':

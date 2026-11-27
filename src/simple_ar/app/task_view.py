@@ -28,7 +28,12 @@ _APPROVAL_TOKEN = re.compile(r'Process requires explicit approval; token=([a-f0-
 
 def saved_work_connection(binding: dict, purpose: str) -> dict:
     """Resolve the saved professional route or original task settings."""
-    route = binding.get(f'{purpose}_route') if purpose in {'code', 'writing'} else None
+    if purpose == 'review':
+        route = binding.get('review_route') or binding.get('writing_route')
+    elif purpose in {'code', 'writing'}:
+        route = binding.get(f'{purpose}_route')
+    else:
+        route = None
     return route or {'connection': binding.get('settings') if purpose != 'code' else None}
 
 
@@ -92,6 +97,8 @@ def saved_model_recipients(binding: dict) -> dict:
     connections = {'task': settings}
     connections.update({purpose: saved_work_connection(binding, purpose).get('connection')
                         for purpose in ('code', 'writing')})
+    if 'review_route' in binding:
+        connections['review'] = saved_work_connection(binding, 'review').get('connection')
     return {purpose: {key: value.get(key) for key in ('base_url', 'model', 'api', 'api_mode') if key in value}
             if value else None for purpose, value in connections.items()}
 

@@ -14,6 +14,7 @@ export interface CreationDefaults {
   max_images: number;
   allow_execution: boolean;
   sandbox_execution: boolean;
+  sandbox_gpu?: boolean;
   allow_network: boolean;
   allow_vision: boolean;
   independent_review_required: boolean;
@@ -27,6 +28,12 @@ export interface MetaResponse {
   tasks: string;
   profiles: ModelProfileSummary[];
   creation_defaults: CreationDefaults;
+  platform?: string;
+  vision_route?: {
+    available: boolean;
+    profile?: string | null;
+    model?: string | null;
+  };
 }
 
 export interface TaskListItem {

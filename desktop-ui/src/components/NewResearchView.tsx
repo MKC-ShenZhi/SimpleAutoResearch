@@ -3,11 +3,13 @@ import {
   ArrowUp,
   CheckCircle2,
   Cpu,
+  Eye,
   FilePlus2,
   FolderPlus,
   Globe,
   Loader2,
   Paperclip,
+  Shield,
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
@@ -67,8 +69,11 @@ export function NewResearchView({
 
   const [selectedSelector, setSelectedSelector] = useState('');
   const [allowExecution, setAllowExecution] = useState(false);
+  const [sandboxExecution, setSandboxExecution] = useState(false);
+  const [sandboxGpu, setSandboxGpu] = useState(false);
   const [autoApprove, setAutoApprove] = useState(true);
   const [allowNetwork, setAllowNetwork] = useState(false);
+  const [allowVision, setAllowVision] = useState(false);
   const [requireReview, setRequireReview] = useState(false);
 
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -86,10 +91,16 @@ export function NewResearchView({
     }
     if (meta.creation_defaults) {
       setAllowExecution(Boolean(meta.creation_defaults.allow_execution));
+      setSandboxExecution(Boolean(meta.creation_defaults.sandbox_execution));
+      setSandboxGpu(Boolean(meta.creation_defaults.sandbox_gpu));
       setAllowNetwork(Boolean(meta.creation_defaults.allow_network));
+      setAllowVision(Boolean(meta.creation_defaults.allow_vision));
       setRequireReview(Boolean(meta.creation_defaults.independent_review_required));
     }
   }, [meta]);
+
+  const isLinux = Boolean(meta?.platform?.startsWith('linux'));
+  const visionRouteAvailable = Boolean(meta?.vision_route?.available);
 
   const currentProfile = meta?.profiles.find((p) => p.selector === selectedSelector);
 
@@ -127,8 +138,10 @@ export function NewResearchView({
       binding_id: currentProfile.binding_id,
       materials,
       execution: allowExecution,
-      sandbox_execution: false,
+      sandbox_execution: isLinux && allowExecution ? sandboxExecution : false,
+      sandbox_gpu: isLinux && allowExecution && sandboxExecution ? sandboxGpu : false,
       network: allowNetwork,
+      allow_vision: allowVision,
       independent_review_required: requireReview,
     };
     if (reuseOrigin) {
@@ -425,6 +438,72 @@ export function NewResearchView({
                   <span>自动批准</span>
                 </button>
               )}
+
+              {isLinux && allowExecution && (
+                <button
+                  onClick={() => {
+                    setSandboxExecution((v) => {
+                      if (v) setSandboxGpu(false);
+                      return !v;
+                    });
+                    setPreview(null);
+                  }}
+                  title="在 Linux Bubblewrap 沙箱中隔离执行命令"
+                  className="inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[12px] transition-colors cursor-pointer"
+                  style={{
+                    backgroundColor: sandboxExecution ? 'var(--accent-soft)' : 'transparent',
+                    borderColor: sandboxExecution ? 'var(--accent)' : 'var(--border-subtle)',
+                    color: sandboxExecution ? 'var(--accent)' : 'var(--text-muted)',
+                  }}
+                >
+                  <Shield className="h-3.5 w-3.5" />
+                  <span>沙箱</span>
+                </button>
+              )}
+
+              {isLinux && allowExecution && sandboxExecution && (
+                <button
+                  onClick={() => {
+                    setSandboxGpu((v) => !v);
+                    setPreview(null);
+                  }}
+                  title="向 Linux 沙箱穿透宿主机 GPU（--sandbox-gpu）"
+                  className="inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[12px] transition-colors cursor-pointer"
+                  style={{
+                    backgroundColor: sandboxGpu ? 'var(--accent-soft)' : 'transparent',
+                    borderColor: sandboxGpu ? 'var(--accent)' : 'var(--border-subtle)',
+                    color: sandboxGpu ? 'var(--accent)' : 'var(--text-muted)',
+                  }}
+                >
+                  <Cpu className="h-3.5 w-3.5" />
+                  <span>GPU 穿透</span>
+                </button>
+              )}
+
+              <button
+                onClick={() => {
+                  setAllowVision((v) => !v);
+                  setPreview(null);
+                }}
+                title={
+                  visionRouteAvailable
+                    ? `已检测到可用视觉路由（${meta?.vision_route?.profile}），建议开启自动审图`
+                    : '允许调用视觉模型检查生成的图表与页面预览'
+                }
+                className="inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px] transition-colors cursor-pointer"
+                style={{
+                  backgroundColor: allowVision ? 'var(--accent-soft)' : 'transparent',
+                  borderColor: allowVision
+                    ? 'var(--accent)'
+                    : visionRouteAvailable
+                      ? 'var(--accent)'
+                      : 'var(--border-subtle)',
+                  color: allowVision ? 'var(--accent)' : 'var(--text-muted)',
+                }}
+              >
+                <Eye className="h-3.5 w-3.5" />
+                <span>{visionRouteAvailable && !allowVision ? '自动审图（推荐）' : '自动审图'}</span>
+              </button>
 
               <button
                 onClick={() => {
